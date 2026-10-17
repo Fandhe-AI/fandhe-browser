@@ -16,32 +16,23 @@
 //! 将来仕様（REPAIR-3）: ホストに `/ai/navigate` が実装されたら MCP の navigate 経由へ切り替える。
 //! in-process の `dispatch`（TCP なし）系列の追加は別 Issue 候補（#385 からの申し送り）。
 
-#[cfg(unix)]
 #[path = "mcp_envelope/app_host.rs"]
 mod app_host;
-#[cfg(unix)]
 #[path = "mcp_envelope/harness.rs"]
 mod harness;
-#[cfg(unix)]
 #[path = "mcp_envelope/host.rs"]
 mod host;
-#[cfg(unix)]
 #[path = "mcp_envelope/jsonrpc.rs"]
 mod jsonrpc;
-#[cfg(unix)]
 #[path = "mcp_envelope/mcp_client.rs"]
 mod mcp_client;
-#[cfg(unix)]
 #[path = "mcp_envelope/report.rs"]
 mod report;
-#[cfg(unix)]
 #[path = "mcp_envelope/stats.rs"]
 mod stats;
-#[cfg(unix)]
 #[path = "token_reduction/tokens.rs"]
 mod tokens;
 
-#[cfg(unix)]
 fn parse_iterations(args: &[String]) -> Result<usize, String> {
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -59,7 +50,6 @@ fn parse_iterations(args: &[String]) -> Result<usize, String> {
     Ok(30)
 }
 
-#[cfg(unix)]
 fn run() -> Result<(), String> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let iterations = parse_iterations(&args)?;
@@ -86,7 +76,6 @@ fn run() -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(unix)]
 fn main() -> std::process::ExitCode {
     match run() {
         Ok(()) => std::process::ExitCode::SUCCESS,
@@ -95,11 +84,4 @@ fn main() -> std::process::ExitCode {
             std::process::ExitCode::FAILURE
         }
     }
-}
-
-/// 非 unix では `Profile::open` が `Unsupported` を返す（AppState を構築できない）ため測定不能。
-#[cfg(not(unix))]
-fn main() -> std::process::ExitCode {
-    eprintln!("mcp_envelope: unsupported on this platform (profile requires unix)");
-    std::process::ExitCode::FAILURE
 }

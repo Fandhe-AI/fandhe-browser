@@ -375,7 +375,7 @@ pub(crate) mod tests {
         #[test]
         fn xos7_open_app_state_succeeds_under_local_app_data_on_windows() {
             let dir = TempDir::new();
-            // 前提: 一時ディレクトリ（`temp_dir()` 基点）が `%LOCALAPPDATA%` 配下であること。
+            // 前提: 一時ディレクトリ（`test_base_dir()` 基点）が `%LOCALAPPDATA%` 配下であること。
             let base = local_app_data();
             let owned = std::fs::canonicalize(&dir.owned).expect("temp dir exists");
             assert!(
@@ -418,11 +418,9 @@ pub(crate) mod tests {
         }
     }
 
-    // Windows でも `%LOCALAPPDATA%` 配下なら `Profile::open` で構築できるようになった（Issue #928）。
-    // 本モジュールの Windows 対応（`cfg(unix)` の解除）は後続 issue で扱う。それまでは unix 限定
-    // （任意の skip ではない。cdp の結合テストと同じ扱い）。
-    #[cfg(unix)]
-    mod unix {
+    // Windows でも `%LOCALAPPDATA%` 配下なら `Profile::open` で構築できる（Issue #928・#955）。
+    // テストの一時ルートは `%TEMP%`（`%LOCALAPPDATA%\Temp`）配下のため 3 OS 共通で実行する。
+    mod listener {
         use std::io::{Read, Write};
         use std::net::TcpStream;
         use std::time::Duration;
@@ -961,9 +959,7 @@ pub(crate) mod tests {
 
         impl TempDir {
             pub(crate) fn new() -> Self {
-                let base = std::env::temp_dir()
-                    .canonicalize()
-                    .unwrap_or_else(|_| std::env::temp_dir());
+                let base = fandhe_browser_profile::test_base_dir();
                 loop {
                     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
                     let owned = base.join(format!("fandhe-cli-test-{}-{n}", std::process::id()));

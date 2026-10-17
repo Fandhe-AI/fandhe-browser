@@ -34,7 +34,7 @@ const SESSION_TIMEOUT: Duration = Duration::from_secs(300);
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 
 /// 実行対象バイナリを解決する。環境変数優先（絶対パスかつ実在ファイル必須）。未指定なら
-/// `<manifest_dir>/../../target/release/fandhe-browser-mcp`。どちらも無ければビルド手順付きでエラー。
+/// `<manifest_dir>/../../target/release/fandhe-browser-mcp`（Windows は `.exe` 付き）。どちらも無ければビルド手順付きでエラー。
 pub fn resolve_bin(env_value: Option<&str>, manifest_dir: &Path) -> Result<PathBuf, String> {
     let (path, origin) = match env_value {
         Some(v) => (PathBuf::from(v), BIN_ENV),
@@ -44,7 +44,10 @@ pub fn resolve_bin(env_value: Option<&str>, manifest_dir: &Path) -> Result<PathB
                 .join("..")
                 .join("target")
                 .join("release")
-                .join("fandhe-browser-mcp"),
+                .join(format!(
+                    "fandhe-browser-mcp{}",
+                    std::env::consts::EXE_SUFFIX
+                )),
             "default location",
         ),
     };

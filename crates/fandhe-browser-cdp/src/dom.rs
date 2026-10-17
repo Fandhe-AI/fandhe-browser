@@ -1347,9 +1347,6 @@ mod tests {
         assert_eq!(r, Err(CdpError::ISSUED_LIMIT_EXCEEDED));
         assert_eq!(calls, 1);
     }
-    // CdpState は AppState（Profile::open）が必要で、非 unix では構築手段が無い
-    // （protocol.rs のテストと同じ理由）ため、状態を要するテストは unix 限定。
-    #[cfg(unix)]
     mod dispatch {
         use super::*;
         use crate::protocol::Dispatcher;
@@ -1366,9 +1363,7 @@ mod tests {
         impl TempDir {
             fn new() -> Self {
                 let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-                let base = std::env::temp_dir()
-                    .canonicalize()
-                    .unwrap_or_else(|_| std::env::temp_dir());
+                let base = fandhe_browser_profile::test_base_dir();
                 Self(base.join(format!("fandhe-cdp-dom-test-{}-{n}", std::process::id())))
             }
         }

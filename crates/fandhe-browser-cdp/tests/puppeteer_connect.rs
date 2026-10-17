@@ -5,10 +5,9 @@
 //! 同じ流儀）。実 Puppeteer を使う試験ターゲットは puppeteer-core 導入の承認後に追加する
 //! （harness/puppeteer-connect/README.md「導入状況」）。TASK-45.2（#481）で段階別結果（`stages`）の
 //! 回収・検証を追加した。
-//! `Profile::open` が非 unix で `Unsupported` を返す仕様のため `#[cfg(unix)]`
-//! （任意の skip ではなく `tests/devtools_browser.rs` と同じ理由）。
-
-#![cfg(unix)]
+//! `Profile::open` は Windows でも `%LOCALAPPDATA%` 配下なら成功するため 3 OS 共通（Issue #955）。
+//! ただし孫プロセスのテストだけは unix の `sleep` とプロセスグループ kill を前提とするため個別に
+//! `#[cfg(unix)]` とする。
 
 mod script_harness;
 
@@ -349,6 +348,9 @@ fn keeps_only_last_of_many_result_lines() {
 }
 
 /// CDP-3: 孫プロセスがパイプを握り続けても、ハングせず出力済みの結果行も取りこぼさない。
+/// 偽スクリプトの `grandchild` モードが unix の `sleep` コマンドで孫を作り、後始末も unix 限定の
+/// プロセスグループ kill に頼るため unix 限定（Windows では孫が作れず検証にならない）。
+#[cfg(unix)]
 #[test]
 fn does_not_hang_when_grandchild_holds_pipe() {
     let started = std::time::Instant::now();

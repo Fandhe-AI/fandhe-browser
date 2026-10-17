@@ -1,7 +1,7 @@
 //! スクリプト実行・結果行の解析（`script_harness` の中核。サーバー起動を含まない）。
 //!
 //! `mod.rs` から再エクスポートされるほか、`Profile::open` に依存しない契約テスト
-//! （`tests/puppeteer_contract.rs`）が単独で取り込む（unix 限定にしないため）。
+//! （`tests/puppeteer_contract.rs`）が単独で取り込む（サーバー起動を含まない最小の単位にするため）。
 
 use std::io::Read;
 use std::path::PathBuf;

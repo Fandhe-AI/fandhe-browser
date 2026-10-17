@@ -191,7 +191,7 @@ case "${name}" in
       cargo bench -p fandhe-browser-ai --bench mcp_envelope -- ${MCP_ENVELOPE_ARGS}
     ;;
   check-mcp-envelope)
-    unix_only || skip "${name} supports unix only (Profile is unix-only)"
+    unix_only || skip "${name} supports unix only (Windows run of the MCP e2e is not verified yet)"
     cargo build -p fandhe-browser-mcp
     out="$(mktemp)"
     trap 'rm -f "${out}"' EXIT

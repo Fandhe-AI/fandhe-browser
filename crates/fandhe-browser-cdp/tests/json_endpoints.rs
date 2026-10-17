@@ -2,12 +2,9 @@
 //! （TASK-41（41.3）・#172、ビヘイビア `CDP-1`・MS-3）。
 //!
 //! TCP bind はせず、`parse_request_head` で作ったリクエストヘッドを `Router::dispatch` へ
-//! 直接渡す。`CdpState` の構築には `AppState`、すなわち `Profile::open` が必要で、これは
-//! 非 unix では `ProfileError::Unsupported` を返す仕様（`XOS-7`〜`XOS-10` 未実装）のため
-//! `#[cfg(unix)]` とする。任意の skip ではなく、非 unix では `AppState` を構築する手段自体が
-//! 無いためである（`tests/state.rs` と同じ理由）。
-
-#![cfg(unix)]
+//! 直接渡す。`CdpState` の構築には `AppState`、すなわち `Profile::open` が必要で、Windows でも
+//! `%LOCALAPPDATA%` 配下（一時ディレクトリを含む）なら成功するため 3 OS 共通で実行する
+//! （Issue #955。`tests/state.rs` と同じ）。
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -28,9 +25,7 @@ struct TempDir(PathBuf);
 impl TempDir {
     fn new() -> Self {
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let base = std::env::temp_dir()
-            .canonicalize()
-            .unwrap_or_else(|_| std::env::temp_dir());
+        let base = fandhe_browser_profile::test_base_dir();
         Self(base.join(format!("fandhe-cdp-json-test-{}-{n}", std::process::id())))
     }
 }

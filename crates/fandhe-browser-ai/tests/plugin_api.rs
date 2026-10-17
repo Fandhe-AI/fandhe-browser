@@ -84,10 +84,8 @@ fn plug6_register_rejects_invalid_language() {
     assert_eq!(plugins_body(&registry), b"{\"plugins\":[]}");
 }
 
-/// `AppState` の構築に `Profile::open` が必要で、非 unix では `Unsupported` を返す仕様のため
-/// unix 限定（任意の skip ではなく構築手段自体が無いため）。純粋部は `src/plugin_api.rs` の
-/// ユニットテストが 3 OS で検証する。
-#[cfg(unix)]
+/// `AppState` の構築に `Profile::open` が必要。Windows でも `%LOCALAPPDATA%` 配下なら成功する
+/// ため 3 OS 共通で実行する（Issue #955）。
 mod ai_state {
     use std::path::PathBuf;
     use std::sync::Arc;
@@ -105,9 +103,7 @@ mod ai_state {
     impl TempDir {
         fn new() -> Self {
             let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-            let base = std::env::temp_dir()
-                .canonicalize()
-                .unwrap_or_else(|_| std::env::temp_dir());
+            let base = fandhe_browser_profile::test_base_dir();
             Self(base.join(format!("fandhe-ai-plugin-test-{}-{n}", std::process::id())))
         }
     }
@@ -169,9 +165,8 @@ mod ai_state {
 }
 
 /// HTTP 経由（`POST /ai/plugins/register` → `GET /ai/plugins`）の通しテスト。TCP bind はせず
-/// `Router::dispatch` へ直接渡す。`AppState` 構築に `Profile::open` が必要で非 unix では
-/// `Unsupported` のため unix 限定（任意の skip ではなく構築手段自体が無いため）。
-#[cfg(unix)]
+/// `Router::dispatch` へ直接渡す。`AppState` 構築の `Profile::open` は Windows でも
+/// `%LOCALAPPDATA%` 配下なら成功するため 3 OS 共通で実行する（Issue #955）。
 mod http_flow {
     use std::path::PathBuf;
     use std::sync::Arc;
@@ -196,9 +191,7 @@ mod http_flow {
     impl TempDir {
         fn new() -> Self {
             let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-            let base = std::env::temp_dir()
-                .canonicalize()
-                .unwrap_or_else(|_| std::env::temp_dir());
+            let base = fandhe_browser_profile::test_base_dir();
             Self(base.join(format!(
                 "fandhe-ai-plugin-flow-test-{}-{n}",
                 std::process::id()

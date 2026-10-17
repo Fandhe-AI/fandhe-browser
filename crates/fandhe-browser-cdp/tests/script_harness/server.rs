@@ -1,5 +1,5 @@
-//! テスト用 CDP サーバーの起動と `/json/version` 取得（`Profile::open` を使うため unix 限定の
-//! テストから使う。契約テストは取り込まない）。
+//! テスト用 CDP サーバーの起動と `/json/version` 取得（`Profile::open` を使うため、
+//! サーバーを要する結合テストだけが使う。契約テストは取り込まない）。
 
 use std::future::Future;
 use std::io::{Read, Write};
@@ -29,9 +29,7 @@ impl TempDir {
     /// 排他的に（`create_dir` で）新規作成できたパスだけを所有する。同名の既存ディレクトリ
     /// （PID 再利用・前回の異常終了の残骸）は流用も削除もせず、別名で作り直す。
     pub fn new() -> Self {
-        let base = std::env::temp_dir()
-            .canonicalize()
-            .unwrap_or_else(|_| std::env::temp_dir());
+        let base = fandhe_browser_profile::test_base_dir();
         for _ in 0..1000 {
             let n = COUNTER.fetch_add(1, Ordering::Relaxed);
             let path = base.join(format!("fandhe-cdp-script-{}-{n}", std::process::id()));

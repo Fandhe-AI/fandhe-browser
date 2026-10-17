@@ -13,10 +13,8 @@
 //! TASK-43.3n（#1042）で `newPage()` の到達（stage がすべて成功・失敗応答なし・クリーンアップなし）を確認し、
 //! 到達として固定した。`goto()`・セレクタ取得は範囲外（TASK-44）。
 //!
-//! `CdpState` の構築に `Profile::open` が必要で、非 unix では `ProfileError::Unsupported` を返す仕様のため
-//! `#[cfg(unix)]` とする（任意の skip ではなく `tests/devtools_browser.rs` と同じ理由）。
-
-#![cfg(unix)]
+//! `CdpState` の構築に `Profile::open` が必要で、Windows でも `%LOCALAPPDATA%` 配下なら成功するため
+//! 3 OS 共通で実行する（Issue #955。`tests/devtools_browser.rs` と同じ）。
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
@@ -93,9 +91,7 @@ struct TempDir(PathBuf);
 
 impl TempDir {
     fn new() -> Self {
-        let base = std::env::temp_dir()
-            .canonicalize()
-            .unwrap_or_else(|_| std::env::temp_dir());
+        let base = fandhe_browser_profile::test_base_dir();
         for _ in 0..64 {
             let n = COUNTER.fetch_add(1, Ordering::Relaxed);
             let nanos = std::time::SystemTime::now()

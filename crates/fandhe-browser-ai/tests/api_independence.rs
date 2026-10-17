@@ -19,10 +19,7 @@
 //!   cli のテスト（TASK-19.3・19.4、`AISNAP-6`）が担う。
 //! - TCP bind はしない: ai の依存に bind 手段が無く、追加は承認事項のため
 //!   合成済み `Router` を `Router::dispatch` で直接駆動する（`tests/api.rs` と同方式）。
-//! - `#![cfg(unix)]`: `Profile::open` が非 unix で `Unsupported` を返し `AppState` を
-//!   作れないため（`tests/api.rs` と同じ。任意の skip ではない）。
-
-#![cfg(unix)]
+//! - 3 OS 共通: `Profile::open` は Windows でも `%LOCALAPPDATA%` 配下なら成功する（Issue #955）。
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -46,9 +43,7 @@ struct TempDir(PathBuf);
 impl TempDir {
     fn new() -> Self {
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let base = std::env::temp_dir()
-            .canonicalize()
-            .unwrap_or_else(|_| std::env::temp_dir());
+        let base = fandhe_browser_profile::test_base_dir();
         Self(base.join(format!(
             "fandhe-ai-independence-test-{}-{n}",
             std::process::id()

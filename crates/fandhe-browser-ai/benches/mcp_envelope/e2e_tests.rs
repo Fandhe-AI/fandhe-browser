@@ -4,9 +4,8 @@
 //! `--ignored` 付きで実行する。環境変数未設定は skip せず失敗にする。
 //! トークン・バイト列は固定値（`PINNED`）と、`docs/design/mcp-envelope-report.md` への逐語掲載を検査する
 //! （TASK-97.2・#386）。レイテンシは環境依存のため検査しない。
-//! 非 unix では `Profile::open` が使えず AppState を構築できないため全体を `cfg(unix)` とする。
-
-#![cfg(unix)]
+//! `Profile::open` は Windows でも `%LOCALAPPDATA%` 配下なら成功するため cfg で除外しない
+//! （Issue #955）。実行入口 `make check-mcp-envelope` が unix 限定である点は `scripts/harness.sh` 参照。
 
 #[path = "app_host.rs"]
 mod app_host;

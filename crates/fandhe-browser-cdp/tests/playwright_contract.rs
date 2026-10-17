@@ -3,7 +3,7 @@
 //!
 //! node 必須のため既定の `cargo test` では `#[ignore]` とし、`make check-playwright-connect`
 //! （`harness/playwright-connect/self-test.sh`）が `--ignored --exact` で実行する。
-//! `Profile::open` を使わないため `cfg(unix)` を付けない（`puppeteer_contract.rs` と同じ構成）。
+//! `Profile::open` を使わず `cfg(unix)` を付けない（`puppeteer_contract.rs` と同じ構成）。
 
 #[path = "script_harness/runner.rs"]
 mod script_harness;
