@@ -12,7 +12,8 @@
 #   scripts/ci-changes.sh --self-test
 #
 # 入力: 標準入力に 1 行 1 パス（リポジトリルート相対）。
-# 出力: 標準出力に `rust=true|false`・`harness=true|false`・`servo=true|false` の 3 行
+# 出力: 標準出力に `rust=true|false`・`harness=true|false`・`servo=true|false`・
+#       `native=true|false` の 4 行
 #       （GITHUB_OUTPUT へそのまま追記できる形式）。
 #       macOS・Windows ジョブを pull_request で走らせるかは本スクリプトの判定ではなく、
 #       ワークフロー側がイベント種別で決める（.claude/rules/ci.md「3 OS CI」）。
@@ -34,14 +35,35 @@
 #      ルート Cargo.toml が exclude しており、本体のビルド・テストは読まない（分離は
 #      scripts/check-servo-host-isolation.sh が検証。契約 fixture は crates/ 側に置く）。
 #      docs/design/render-host-protocol* は docs/design/* の rust 判定と両立する（rust=true かつ servo=true）。
-# 入力が 1 行も無い場合は判定材料が無いため rust・harness・servo をすべて true にする。
+#   6. native 判定（rust・harness・servo とは独立の軸）: pull_request で macOS・Windows の
+#      rust-test ジョブ（rust-test-macos・rust-test-windows）まで走らせるかの判断材料。
+#      OS 依存のテスト失敗が main への push 後にしか分からない問題の再発防止（案 A）。
+#      次のいずれかで native=true にする。
+#        a. crates/fandhe-browser-profile/ 配下の変更（パス・ロック・ファイルシステム依存）
+#        b. 環境変数 CI_CHANGES_RS_DIFF_FILE が指す unified diff（`git diff -U0 -- '*.rs'` の出力）の
+#           追加・削除行に cfg(windows / cfg(unix / cfg(not(windows / cfg(not(unix / target_os /
+#           target_family 等の OS 分岐が含まれる。cfg(any(...)・cfg!(・cfg_attr( 内の同キーワードも拾う
+#      diff ファイルが指定されているのに読めない場合は native=true（fail-closed）。未指定のときは
+#      パス判定だけを行う（自己テスト用。ワークフローは常に指定する）。
+# 入力が 1 行も無い場合は判定材料が無いため rust・harness・servo・native をすべて true にする。
 # bash の case パターンの `*` は `/` もまたぐため、`*.md` は任意階層、`docs/*` は
 # docs/spec（submodule ポインタ）を含む docs/ 配下全体に一致する。
 set -euo pipefail
 
-# 1 行 1 パスの入力を判定して `rust=` / `harness=` / `servo=` を出力する。
+# 追加・削除行に OS 分岐のキーワードを含むかを diff ファイルから判定する（native 軸 6b）。
+# $1: unified diff のパス。ヘッダー行（+++ / ---）は対象外。読めない場合は 2 を返す。
+diff_has_os_cfg() {
+  [ -r "$1" ] || return 2
+  local rc=0
+  grep -E '^[+-]' -- "$1" | grep -vE '^(\+\+\+|---)' \
+    | grep -qE 'cfg(_attr|!)?\(.*(windows|unix)|target_os|target_family' || rc=$?
+  # grep -q: 0=一致 1=不一致 それ以外=エラー（fail-closed のため 2 に寄せる）
+  case "$rc" in 0) return 0 ;; 1) return 1 ;; *) return 2 ;; esac
+}
+
+# 1 行 1 パスの入力を判定して `rust=` / `harness=` / `servo=` / `native=` を出力する。
 classify() {
-  local rust=false harness=false servo=false seen=false path
+  local rust=false harness=false servo=false native=false seen=false path
   while IFS= read -r path || [ -n "$path" ]; do
     # 末尾の CR を除去（Windows 由来の改行混入対策）。空行は無視する
     path="${path%$'\r'}"
@@ -94,25 +116,55 @@ classify() {
         ;;
       *) ;;
     esac
+    # native 軸（独立判定）。profile crate はパス・ロック・FS 依存で OS 差が出やすい
+    case "$path" in
+      crates/fandhe-browser-profile/*) native=true ;;
+      *) ;;
+    esac
   done
   if [ "$seen" = false ]; then
     rust=true
     harness=true
     servo=true
+    native=true
   fi
-  printf 'rust=%s\nharness=%s\nservo=%s\n' "$rust" "$harness" "$servo"
+  if [ -n "${CI_CHANGES_RS_DIFF_FILE:-}" ] && [ "$native" = false ]; then
+    local drc=0
+    diff_has_os_cfg "$CI_CHANGES_RS_DIFF_FILE" || drc=$?
+    # 0=一致 2=読めない（fail-closed）-> native=true。1=不一致は据え置き
+    [ "$drc" -eq 1 ] || native=true
+  fi
+  printf 'rust=%s\nharness=%s\nservo=%s\nnative=%s\n' "$rust" "$harness" "$servo" "$native"
 }
 
-# 自己テスト。期待値は「rust=<値> harness=<値> servo=<値>」の 1 行表記で比較する。
+# 自己テスト。期待値は「rust=<値> harness=<値> servo=<値>」の 1 行表記で比較する
+# （native は expect_native で別に検証する。expect では native 行を除いて比較）。
 self_test() {
   local fail=0
   expect() { # $1=ケース名 $2=期待値 $3=入力（改行区切り）
     local got
-    got="$(printf '%s' "$3" | classify | tr '\n' ' ' | sed 's/ $//')"
+    got="$(printf '%s' "$3" | classify | grep -v '^native=' | tr '\n' ' ' | sed 's/ $//')"
     if [ "$got" = "$2" ]; then
       echo "OK(self-test): $1 -> $got"
     else
       echo "NG(self-test): $1 expected '$2' but got '$got'" >&2
+      fail=1
+    fi
+  }
+  expect_native() { # $1=ケース名 $2=期待 native 値 $3=入力パス $4=diff 内容（空=diff 未指定、__missing__=読めない diff）
+    local got dfile="" tmp
+    tmp="$(mktemp)"
+    case "$4" in
+      "") ;;
+      __missing__) dfile="$tmp.absent" ;;
+      *) printf '%s\n' "$4" > "$tmp"; dfile="$tmp" ;;
+    esac
+    got="$(printf '%s' "$3" | CI_CHANGES_RS_DIFF_FILE="$dfile" classify | grep '^native=' )"
+    rm -f "$tmp"
+    if [ "$got" = "native=$2" ]; then
+      echo "OK(self-test): native $1 -> $got"
+    else
+      echo "NG(self-test): native $1 expected 'native=$2' but got '$got'" >&2
       fail=1
     fi
   }
@@ -160,6 +212,23 @@ self_test() {
   expect "rust-toolchain.toml" "rust=true harness=false servo=true" $'rust-toolchain.toml'
   expect "empty input runs all (fail-closed)" "rust=true harness=true servo=true" ''
   expect "blank lines only run all" "rust=true harness=true servo=true" $'\n\n'
+  local rs=$'crates/fandhe-browser-core/src/lib.rs'
+  expect_native "profile crate path" true $'crates/fandhe-browser-profile/src/lib.rs' ""
+  expect_native "profile crate test path" true $'crates/fandhe-browser-profile/tests/a.rs' $'+let x = 1;'
+  expect_native "no cfg in diff" false "$rs" $'--- a/x.rs\n+++ b/x.rs\n@@ -1 +1 @@\n-let a = 1;\n+let a = 2;'
+  expect_native "cfg(windows added" true "$rs" $'+#[cfg(windows)]'
+  expect_native "cfg(unix removed" true "$rs" $'-#[cfg(unix)]'
+  expect_native "cfg(not(windows" true "$rs" $'+#[cfg(not(windows))]'
+  expect_native "cfg(not(unix" true "$rs" $'+#[cfg(not(unix))]'
+  expect_native "cfg(any(unix, ...))" true "$rs" $'+#[cfg(any(unix, target_os = "wasi"))]'
+  expect_native "target_os in code" true "$rs" $'+if cfg!(target_os = "macos") {}'
+  expect_native "target_family" true "$rs" $'+#[cfg(target_family = "unix")]'
+  expect_native "windows word in unchanged context only" false "$rs" $' cfg(windows) context\n--- a/windows.rs\n+++ b/windows.rs'
+  expect_native "windows word without cfg" false "$rs" $'+// Windows notes'
+  expect_native "diff unreadable (fail-closed)" true "$rs" __missing__
+  expect_native "diff not provided, no profile" false "$rs" ""
+  expect_native "empty input runs all" true "" ""
+  expect_native "docs only" false $'README.md' $'+let x = 1;'
   if [ "$fail" -ne 0 ]; then
     echo "NG: ci-changes.sh self-test failed" >&2
     return 1
