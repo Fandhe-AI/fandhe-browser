@@ -3,10 +3,10 @@
 //!
 //! node 必須のため既定の `cargo test` では `#[ignore]` とし、`make check-puppeteer-connect`
 //! （`harness/puppeteer-connect/self-test.sh`。CI では `puppeteer-connect-selftest` ジョブ・3 OS）が
-//! `--ignored` 付きで実行する。`Profile::open` を使わないため `puppeteer_connect.rs` と違い
-//! `cfg(unix)` を付けず、Windows でも実際にコンパイル・実行する。
+//! `--ignored` 付きで実行する。`Profile::open` を使わず、Windows でも実際にコンパイル・実行する
+//! （`puppeteer_connect.rs` も Issue #955 で cfg を外し 3 OS 共通になった）。
 
-// `Profile::open`（unix 限定）に依存するサーバー起動を含む `script_harness` 全体ではなく、
+// `Profile::open` に依存するサーバー起動を含む `script_harness` 全体ではなく、
 // 実行・解析部分（runner.rs）だけを取り込む。
 #[path = "script_harness/runner.rs"]
 mod script_harness;

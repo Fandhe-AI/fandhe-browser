@@ -149,6 +149,11 @@ impl fmt::Display for StartupError {
             Self::ConfigPathEmpty => f.write_str(CONFIG_PATH_EMPTY_MESSAGE),
             Self::ProfileRootNotWired => f.write_str(PROFILE_ROOT_NOT_WIRED_MESSAGE),
             Self::Profile(ProfileError::Unsupported { .. }) => f.write_str(UNSUPPORTED_OS_MESSAGE),
+            // InvalidLayout の理由はパスを含まない固定文言のため表示する
+            // （symlink 祖先の実体パス案内など。PROF-4・#1089）。
+            Self::Profile(ProfileError::InvalidLayout { reason, .. }) => {
+                write!(f, "invalid profile directory: {reason}")
+            }
             Self::Profile(_) => f.write_str("failed to open profile"),
             Self::WebSocketConfig(_) => f.write_str("failed to build websocket config"),
             Self::RouteConflict(_) => f.write_str("router merge conflict"),
@@ -314,6 +319,13 @@ pub(crate) mod tests {
             path: std::path::PathBuf::from("p"),
         });
         assert_eq!(other.to_string(), "failed to open profile");
+
+        // PROF-4・#1089: InvalidLayout は理由のみ表示しパスは出さない。
+        let layout = StartupError::Profile(ProfileError::InvalidLayout {
+            path: "secret-dir".into(),
+            reason: "x",
+        });
+        assert_eq!(layout.to_string(), "invalid profile directory: x");
     }
 
     /// 設定ファイルの I/O エラーは固定文言へ写像され、パスが表示に漏れない。
@@ -375,7 +387,7 @@ pub(crate) mod tests {
         #[test]
         fn xos7_open_app_state_succeeds_under_local_app_data_on_windows() {
             let dir = TempDir::new();
-            // 前提: 一時ディレクトリ（`temp_dir()` 基点）が `%LOCALAPPDATA%` 配下であること。
+            // 前提: 一時ディレクトリ（`test_base_dir()` 基点）が `%LOCALAPPDATA%` 配下であること。
             let base = local_app_data();
             let owned = std::fs::canonicalize(&dir.owned).expect("temp dir exists");
             assert!(
@@ -418,11 +430,9 @@ pub(crate) mod tests {
         }
     }
 
-    // Windows でも `%LOCALAPPDATA%` 配下なら `Profile::open` で構築できるようになった（Issue #928）。
-    // 本モジュールの Windows 対応（`cfg(unix)` の解除）は後続 issue で扱う。それまでは unix 限定
-    // （任意の skip ではない。cdp の結合テストと同じ扱い）。
-    #[cfg(unix)]
-    mod unix {
+    // Windows でも `%LOCALAPPDATA%` 配下なら `Profile::open` で構築できる（Issue #928・#955）。
+    // テストの一時ルートは `%TEMP%`（`%LOCALAPPDATA%\Temp`）配下のため 3 OS 共通で実行する。
+    mod listener {
         use std::io::{Read, Write};
         use std::net::TcpStream;
         use std::time::Duration;
@@ -961,9 +971,7 @@ pub(crate) mod tests {
 
         impl TempDir {
             pub(crate) fn new() -> Self {
-                let base = std::env::temp_dir()
-                    .canonicalize()
-                    .unwrap_or_else(|_| std::env::temp_dir());
+                let base = fandhe_browser_profile::test_base_dir();
                 loop {
                     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
                     let owned = base.join(format!("fandhe-cli-test-{}-{n}", std::process::id()));

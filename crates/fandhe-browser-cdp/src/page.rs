@@ -924,7 +924,10 @@ mod tests {
     use std::net::{TcpListener, TcpStream};
     use std::thread;
 
-    fn drain_request_head(stream: &mut TcpStream) {
+    /// リクエストヘッダー終端（`\r\n\r\n`）まで読み切り、読んだ内容を返す。
+    /// 未読データを残したまま close すると Windows は RST を送り、クライアントが応答を
+    /// 読む前に接続エラーになるため、長い URL（`MAX_URL_LEN` 超）でも読み切れる上限にする。
+    fn drain_request_head(stream: &mut TcpStream) -> String {
         let mut buf = [0u8; 1024];
         let mut data = Vec::new();
         while let Ok(n) = stream.read(&mut buf) {
@@ -932,10 +935,11 @@ mod tests {
                 break;
             }
             data.extend_from_slice(&buf[..n]);
-            if data.windows(4).any(|w| w == b"\r\n\r\n") || data.len() > 8192 {
+            if data.windows(4).any(|w| w == b"\r\n\r\n") || data.len() > 65536 {
                 break;
             }
         }
+        String::from_utf8_lossy(&data).into_owned()
     }
 
     /// 接続ごとに `status` と `body` を返すループバックサーバー。ポート番号を返す。
@@ -1491,9 +1495,6 @@ mod tests {
         assert_eq!(nav.latest().unwrap().url(), "about:blank");
     }
 
-    // CdpState は AppState（Profile::open）が必要で非 unix では構築手段が無いため unix 限定
-    // （protocol.rs の `mod dispatch` と同じ理由）。
-    #[cfg(unix)]
     mod dispatch {
         use super::*;
         use crate::protocol::{DispatchOutcome, Dispatcher};
@@ -1510,9 +1511,7 @@ mod tests {
         impl TempDir {
             fn new() -> Self {
                 let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-                let base = std::env::temp_dir()
-                    .canonicalize()
-                    .unwrap_or_else(|_| std::env::temp_dir());
+                let base = fandhe_browser_profile::test_base_dir();
                 Self(base.join(format!("fandhe-cdp-page-test-{}-{n}", std::process::id())))
             }
         }
@@ -1785,9 +1784,7 @@ mod tests {
                 for mut s in listener.incoming().flatten() {
                     let long = long.clone();
                     thread::spawn(move || {
-                        let mut buf = [0u8; 1024];
-                        let n = s.read(&mut buf).unwrap_or(0);
-                        let head = String::from_utf8_lossy(&buf[..n]).into_owned();
+                        let head = drain_request_head(&mut s);
                         let resp = if head.starts_with("GET / ") {
                             format!(
                                 "HTTP/1.1 302 Found\r\nLocation: {long}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"

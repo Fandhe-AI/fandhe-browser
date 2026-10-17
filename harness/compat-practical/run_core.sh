@@ -120,8 +120,10 @@ BIN_RESOLVED=""
 if [ "$NO_SPAWN" -eq 0 ]; then
   case "$(uname -s)" in
     MINGW* | MSYS* | CYGWIN*)
-      # Windows は Profile::open が Unsupported（XOS-7〜XOS-10 待ち）で起動できない。成功を装わない
-      die "spawning the binary is not supported on Windows yet (profile ACL pending); use --no-spawn" ;;
+      # 計測用プロファイルは XDG_DATA_HOME・HOME の一時ディレクトリで隔離しているが、Windows の
+      # バイナリはこれらを見ず `%LOCALAPPDATA%` 配下を使うため、起動すると利用者の実プロファイルに
+      # 触れて隔離の約束が崩れる。Windows での起動は未確認でもある。成功を装わず fail-closed にする
+      die "spawning the binary is not supported on Windows yet (profile isolation via XDG_DATA_HOME/HOME does not apply on Windows); use --no-spawn" ;;
   esac
   # バイナリは待ち受けポートを引数・環境変数で変更できず 9333 固定のため、別ポートでは readiness を観測できない。
   # 起動モードでは 9333 以外を拒否する（別ポートの既存サーバーへ接続するなら --no-spawn を使う）

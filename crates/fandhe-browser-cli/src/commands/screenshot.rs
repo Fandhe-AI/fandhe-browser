@@ -147,7 +147,14 @@ pub(crate) fn validate_output_path(path: &Path) -> Result<(), OutputPathError> {
         return Err(OutputPathError::Empty);
     }
     // `Path::file_name` は末尾の区切り文字を無視するため、文字列で明示的に拒否する。
-    if path.file_name().is_none() || text.ends_with('/') || text.ends_with(MAIN_SEPARATOR) {
+    // Windows の `\\?\` 付きパス（verbatim）では `..` が通常の名前として解釈され `file_name` が
+    // `Some("..")` を返すため、末尾の生セグメントも文字列で明示的に検査して 3 OS で揃える。
+    let last_segment = text.rsplit(['/', MAIN_SEPARATOR]).next().unwrap_or("");
+    if path.file_name().is_none()
+        || last_segment == ".."
+        || text.ends_with('/')
+        || text.ends_with(MAIN_SEPARATOR)
+    {
         return Err(OutputPathError::NotAFilePath);
     }
     let parent = match path.parent() {
@@ -524,8 +531,11 @@ mod tests {
             validate_output_path(Path::new("")).unwrap_err(),
             OutputPathError::Empty
         ));
+        // Windows の verbatim パスへ `join("..")` すると `..` が正規化されて親ディレクトリになるため、
+        // 文字列で連結して `..` 終端のパスを組み立てる。
+        let dotdot = PathBuf::from(format!("{}{MAIN_SEPARATOR}..", dir.owned.display()));
         assert!(matches!(
-            validate_output_path(&dir.owned.join("..")).unwrap_err(),
+            validate_output_path(&dotdot).unwrap_err(),
             OutputPathError::NotAFilePath
         ));
         let trailing = format!("{}{MAIN_SEPARATOR}x{MAIN_SEPARATOR}", dir.owned.display());

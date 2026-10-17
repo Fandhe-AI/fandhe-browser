@@ -516,7 +516,7 @@ impl Dispatcher {
     /// 受信テキスト 1 件を処理する。パース失敗・未登録メソッド・ハンドラのエラーは
     /// すべてエラー応答になり、成功応答を捏造しない（`SEC-2`）。パースと名前検証を通った
     /// メソッド名だけが受信ログへ記録される（パース失敗は記録しない。`CDP-6`）。
-    #[cfg(all(test, unix))]
+    #[cfg(test)]
     pub async fn dispatch(&self, state: &Arc<CdpState>, text: &str) -> DispatchOutcome {
         self.dispatch_on(state, None, text).await
     }
@@ -761,9 +761,6 @@ mod tests {
         assert!(Dispatcher::builtin().is_ok());
     }
 
-    // CdpState は AppState（Profile::open）が必要で、非 unix では構築手段が無い
-    // （tests/state.rs と同じ理由）ため、状態を要するディスパッチのテストは unix 限定。
-    #[cfg(unix)]
     mod dispatch {
         use super::*;
         use fandhe_browser_core::AppState;
@@ -777,9 +774,7 @@ mod tests {
         impl TempDir {
             fn new() -> Self {
                 let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-                let base = std::env::temp_dir()
-                    .canonicalize()
-                    .unwrap_or_else(|_| std::env::temp_dir());
+                let base = fandhe_browser_profile::test_base_dir();
                 Self(base.join(format!(
                     "fandhe-cdp-protocol-test-{}-{n}",
                     std::process::id()

@@ -1,10 +1,9 @@
 //! `fandhe_browser_cdp` の状態型の公開 API を通した結合テスト
 //! （TASK-41（41.2）・#170、ビヘイビア `CDP-1`・`AISNAP-6`・`PROF-1`）。
 //!
-//! `TargetRegistry` のテストは 3 OS 共通。`CdpState` の構築には `AppState`、すなわち
-//! `Profile::open` が必要で、これは非 unix では `ProfileError::Unsupported` を返す仕様
-//! （`XOS-7`〜`XOS-10` 未実装）のため、構築を伴うテストは `#[cfg(unix)]` とする。
-//! 任意の skip ではなく、非 unix では `AppState` を構築する手段自体が無いためである。
+//! `TargetRegistry` のテストも `CdpState` 構築を伴うテストも 3 OS 共通。`CdpState` の構築には
+//! `AppState`、すなわち `Profile::open` が必要で、Windows でも `%LOCALAPPDATA%` 配下
+//! （一時ディレクトリを含む）なら成功する（Issue #955）。
 
 use fandhe_browser_cdp::{CdpStateError, TargetKind, TargetRegistry};
 
@@ -30,7 +29,6 @@ fn cdp1_error_display_is_english_and_hides_input() {
     );
 }
 
-#[cfg(unix)]
 mod cdp_state {
     use fandhe_browser_cdp::{BrowserId, CdpState, TargetKind};
     use fandhe_browser_core::AppState;
@@ -47,9 +45,7 @@ mod cdp_state {
     impl TempDir {
         fn new() -> Self {
             let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-            let base = std::env::temp_dir()
-                .canonicalize()
-                .unwrap_or_else(|_| std::env::temp_dir());
+            let base = fandhe_browser_profile::test_base_dir();
             Self(base.join(format!("fandhe-cdp-state-test-{}-{n}", std::process::id())))
         }
     }
