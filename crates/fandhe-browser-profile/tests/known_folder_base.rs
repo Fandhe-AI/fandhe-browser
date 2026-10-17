@@ -16,8 +16,11 @@
 //! - (c) `USERPROFILE` を偽の場所へ向ける観測。レジストリの値は `%USERPROFILE%\AppData\Local`
 //!   （REG_EXPAND_SZ）で、`SHGetKnownFolderPath` がプロセスの環境で展開するかは一次情報で
 //!   確定していない。観測結果（基準が動いたか）は標準エラーへ出し、CI の記録に残す
-//!   （`REPAIR-3`: 未確定の挙動を断定しない）。観測は 2 値のどちらかであることだけを要求し、
-//!   想定外のエラーは失敗にする。
+//!   （`REPAIR-3`: 未確定の挙動を断定しない）。観測は 3 値（基準が動かない・動いた・既知フォルダ
+//!   が解決不能で fail-closed）のいずれかであることだけを要求し、想定外のエラーは失敗にする。
+//!   展開先 `%USERPROFILE%\AppData\Local` が存在しないと、`KF_FLAG_DEFAULT` の
+//!   `SHGetKnownFolderPath` は検証に失敗し `resolve_root` が `DefaultRootUnavailable` になる
+//!   （main の CI で観測。run 39009500988）。これは偽の場所へ書かない側の結果で正当。
 
 #![cfg(windows)]
 
@@ -40,6 +43,8 @@ const EXIT_OK: i32 = 10;
 const EXIT_BASE_UNCHANGED: i32 = 11;
 /// (c): 基準が `USERPROFILE` に従った。
 const EXIT_BASE_FOLLOWED: i32 = 12;
+/// (c): 既知フォルダが解決できず `DefaultRootUnavailable`（fail-closed。偽の場所へは書かない）。
+const EXIT_BASE_UNRESOLVED: i32 = 14;
 /// 想定外のエラー・前提違反。
 const EXIT_UNEXPECTED: i32 = 13;
 
@@ -89,8 +94,10 @@ fn child_no_localappdata(root: &Path) -> i32 {
 }
 
 fn child_fake_userprofile(fake_profile: &Path) -> i32 {
-    let Ok(resolved) = OsDefaultStore::new().resolve_root() else {
-        return EXIT_UNEXPECTED;
+    let resolved = match OsDefaultStore::new().resolve_root() {
+        Ok(resolved) => resolved,
+        Err(ProfileError::DefaultRootUnavailable { .. }) => return EXIT_BASE_UNRESOLVED,
+        Err(_) => return EXIT_UNEXPECTED,
     };
     if resolved.path().starts_with(fake_profile) {
         EXIT_BASE_FOLLOWED
@@ -190,6 +197,11 @@ fn xos7_observe_userprofile_expansion_of_known_folder() {
         }
         EXIT_BASE_FOLLOWED => {
             eprintln!("[known-folder-observation] USERPROFILE DOES move the base directory")
+        }
+        EXIT_BASE_UNRESOLVED => {
+            eprintln!(
+                "[known-folder-observation] USERPROFILE expansion made the known folder unresolvable (fail-closed)"
+            )
         }
         other => panic!("(c) の子が想定外の終了コード {other}"),
     }
