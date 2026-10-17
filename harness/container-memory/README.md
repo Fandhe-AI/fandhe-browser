@@ -50,7 +50,7 @@ harness/container-memory/measure.sh \
 | `--no-doubling` | 無効 | 指定しないと列の末尾の後も倍々（1000, 2000, …）に増やす |
 | `--max-n` | 8192 | 倍々の上限。到達すると `stop_reason=max_n` |
 | `--conditions` | `idle,loaded` | `loaded` は `--url` が必須 |
-| `--url` | なし | loaded でナビゲートする公開 http(s) URL。`file:`・loopback・プライベート・IPv6 リテラルは拒否（fandhe の SSRF ガードと同方針）。`--target chromium` は Page.navigate が本体のガードを通らないため、測定側でホストを解決して全アドレスが公開帯であることを確認し、`--host-resolver-rules` でその IP に固定する（他ホスト・リダイレクト先・サブリソースは名前解決不可。loaded 以外でも全ホスト解決不可） |
+| `--url` | なし | loaded でナビゲートする公開 http(s) URL。`file:`・loopback・プライベート・IPv6 リテラルは拒否（fandhe の SSRF ガードと同方針）。`--target chromium` は Page.navigate が本体のガードを通らないため、測定側でホストを解決して全アドレスが公開帯であることを確認し、`--host-resolver-rules` でその IP に固定する（他ホスト名は名前解決不可。IP リテラル宛てのリダイレクト・サブリソースは到達不能プロキシ `--proxy-server` と対象ホスト名のみの `--proxy-bypass-list`〔`<-loopback>` 付き〕で遮断。loaded 以外でも全ホスト解決不可） |
 | `--ready-timeout` | 30 | 起動待ちの上限秒数（`CTR-7`。#306 のオーナー判断で 30 秒） |
 | `--host-mem-limit-pct` | 80 | ホストの使用メモリがこの割合に達したら、次へ進まずに止まる |
 | `--settle` | 5 | 起動後、cgroup を読む前の待ち秒数 |

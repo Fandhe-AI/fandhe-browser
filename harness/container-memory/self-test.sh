@@ -346,6 +346,7 @@ new_scene
 expect_rc "chromium run" 0 --target chromium --n-list 2 --no-doubling --conditions idle,loaded --url https://example.com/p
 REFPIN="mcr.microsoft.com/playwright@${REF_DIGEST}"
 expect_jq "chromium: target" "chromium" '.target'
+expect_eq "chromium: every launch routes non-target traffic to a dead proxy" "0" "$(grep -- '--headless=new' "$S/calls.log" | grep -vc -- '--proxy-server=http://127.0.0.1:9 --proxy-bypass-list=<-loopback>;example.com' || true)"
 expect_eq "chromium: every launch pins the checked IP" "0" "$(grep -- '--headless=new' "$S/calls.log" | grep -vc -- '--host-resolver-rules=MAP example.com 93.184.216.34, MAP \* ~NOTFOUND' || true)"
 expect_jq "chromium: pinned digest" "$REFPIN" '.image.pinned_digest'
 expect_jq "chromium: image ref is the pin" "$REFPIN" '.image.ref'

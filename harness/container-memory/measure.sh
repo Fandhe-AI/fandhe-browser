@@ -271,7 +271,7 @@ is_public_ipv4() {
 # $1 = URL のホスト（ポートなし）。DNS を測定側で解決し、全 A レコードが公開帯であることを確認して
 # 先頭の IP へ固定する。出力は Chromium の --host-resolver-rules の値。
 # 他のホスト（リダイレクト先・サブリソース）は ~NOTFOUND で名前解決させず、内部宛て通信を作らせない。
-# Chromium 側で再解決しないため DNS rebinding も防ぐ。
+# Chromium 側で再解決しないため DNS rebinding も防ぐ。IP リテラル宛ては呼び出し側の到達不能プロキシで遮断する。
 chromium_resolver_rules() {
   local host="$1" out ip first=""
   out=$("$RESOLVE" ahostsv4 "$host" 2>/dev/null | awk '{print $1}' | sort -u) || return 1
@@ -606,7 +606,9 @@ main() {
   local want_loaded=0
   for c in "${CONDS[@]}"; do [ "$c" != loaded ] || want_loaded=1; done
   # chromium は既定で外部への名前解決を禁止する（loaded では下で対象ホストのみ許可に置き換える）
-  [ "$TARGET" != chromium ] || CHROMIUM_ARGS=("--host-resolver-rules=MAP * ~NOTFOUND" "${CHROMIUM_ARGS[@]}")
+  # IP リテラル宛て（リダイレクト・サブリソース）は resolver rules が効かないため、到達不能なプロキシへ全通信を
+  # 向け、bypass は対象ホスト名のみ（<-loopback> で loopback・link-local の暗黙 bypass も外す）にする。先頭 3 要素が置換対象
+  [ "$TARGET" != chromium ] || CHROMIUM_ARGS=("--host-resolver-rules=MAP * ~NOTFOUND" "--proxy-server=http://127.0.0.1:9" "--proxy-bypass-list=<-loopback>" "${CHROMIUM_ARGS[@]}")
   if [ "$want_loaded" -eq 1 ]; then
     [ -n "$URL" ] || die "--url is required for the loaded condition"
     require_match "--url" "$URL" "$URL_RE"
@@ -621,7 +623,7 @@ main() {
       # Page.navigate は Chromium へ直送され本体の SSRF ガードを通らない。解決結果の検査と IP 固定を行う
       local rules
       rules=$(chromium_resolver_rules "${url_host%%:*}") || die "--url host does not resolve, or resolves to a non-public address (SSRF guard)"
-      CHROMIUM_ARGS=("--host-resolver-rules=${rules}" "${CHROMIUM_ARGS[@]:1}")
+      CHROMIUM_ARGS=("--host-resolver-rules=${rules}" "--proxy-server=http://127.0.0.1:9" "--proxy-bypass-list=<-loopback>;${url_host%%:*}" "${CHROMIUM_ARGS[@]:3}")
     fi
   fi
 
