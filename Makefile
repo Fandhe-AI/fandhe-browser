@@ -27,7 +27,7 @@
 	check-workspace-manifest fmt fmt-check lint test test-harness lint-rendering test-rendering \
 	check-render-isolation check-js-engine-isolation check-publish-private deny deny-servo-host license-inventory license-inventory-servo-host check-deny-license-reject ci \
 	check-compat-practical check-compat-regression bench-record check-ci-changes check-bench-record \
-	check-binary-size check-static-link measure-mcp-envelope check-mcp-envelope measure-plugin-overhead check-plugin-overhead measure-js-binary-size measure-container-size check-container-smoke check-container-memory measure-container-memory compare-container-memory measure-cssom-profile-cost \
+	check-binary-size check-static-link measure-mcp-envelope check-mcp-envelope measure-plugin-overhead check-plugin-overhead measure-js-binary-size measure-container-size check-container-smoke check-container-js-smoke check-container-memory measure-container-memory compare-container-memory measure-cssom-profile-cost \
 	docker-build docker-shell docker-ci trace-playwright check-playwright-trace check-puppeteer-connect check-playwright-connect test-playwright-connect
 
 help: ## ターゲット一覧を表示する（Make 非依存の一覧: scripts/help.sh）
@@ -175,6 +175,9 @@ measure-container-memory: ## コンテナを N 個同時起動したときの集
 
 compare-container-memory: ## 2 つの測定結果 JSON（fandhe・Chromium）から同じ N・同じ条件の削減率を算出する（TASK-67・CTR-3・CTR-6。要 jq。CONTAINER_MEMORY_COMPARE_ARGS で --fandhe・--chromium を指定）
 	@scripts/harness.sh compare-container-memory
+
+check-container-js-smoke: ## 既定コンテナ内で V8（musl）の JS 実行（評価・関数注入・DOM 風バインド）を確認する（TASK-66.3・CTR-2。要 docker・node）
+	@scripts/harness.sh check-container-js-smoke
 
 check-container-smoke: ## コンテナ（軽量 / 既定）でローカルフィクスチャ 12 種の代表タスクを確認する（TASK-66.1・CTR-2。要 docker・jq）
 	@scripts/harness.sh check-container-smoke

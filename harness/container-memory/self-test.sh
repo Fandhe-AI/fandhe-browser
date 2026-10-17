@@ -529,7 +529,7 @@ CMP="${HERE}/compare.sh"
 mk_result() {
   jq -n --arg t "$1" --arg c "$2" --argjson steps "$3" '
     {schema: "container-memory/v1", target: $t,
-     args: {image: "x", ready_timeout_s: 30, settle_s: 5, host_mem_limit_pct: 80, url: "https://example.com/"},
+     args: {image: "x", ready_timeout_s: 30, settle_s: 5, host_mem_limit_pct: 80, url: "https://example.com/", navigate_concurrency: 8},
      image: {ref: "x", pinned_digest: null},
      environment: {arch: "x86_64", kernel: "6.8.0", mem_total_bytes: 1024, cgroup_driver: "systemd"},
      conditions: [{condition: $c, stop_reason: "completed", max_ok_n: null, steps: $steps}]}'
@@ -615,6 +615,10 @@ mk_result chromium loaded "[$(mk_step 100 1000 1000)]" >"$CS/c.json"
 jq '.args.url = "https://example.org/"' "$CS/c.json" >"$CS/c2.json"
 cmp_rc "compare: url mismatch (loaded)" 0 --fandhe "$CS/f.json" --chromium "$CS/c2.json"
 cmp_jq "compare: url mismatch makes it incomparable" "args_mismatch:url" '.reasons[0]'
+jq '.args.navigate_concurrency = 64' "$CS/c.json" >"$CS/c2.json"
+cmp_rc "compare: navigate_concurrency mismatch (loaded)" 0 --fandhe "$CS/f.json" --chromium "$CS/c2.json"
+cmp_jq "compare: navigate_concurrency mismatch makes it incomparable" "args_mismatch:navigate_concurrency" '.reasons[0]'
+cmp_jq "compare: navigate_concurrency mismatch has no reductions" "0" '[.comparisons[] | select(.reduction_pct != null)] | length'
 cmp_rc "compare: loaded same url" 0 --fandhe "$CS/f.json" --chromium "$CS/c.json"
 cmp_jq "compare: loaded same url comparable" "true" '.comparable'
 mk_result fandhe idle "[$(mk_step 100 500 500)]" >"$CS/f.json"
@@ -642,6 +646,17 @@ jq '.conditions[0].steps[0].memory_peak_bytes.sum = -5' "$CS/f.json" >"$CS/bad.j
 cmp_rc "compare: negative bytes" 2 --fandhe "$CS/bad.json" --chromium "$CS/c.json"
 jq '.conditions += .conditions' "$CS/f.json" >"$CS/bad.json"
 cmp_rc "compare: duplicate condition" 2 --fandhe "$CS/bad.json" --chromium "$CS/c.json"
+for del in 'del(.environment.arch)' '.environment = {}' '.args = {}' 'del(.args.settle_s)' '.environment.mem_total_bytes = 0' \
+  '.args.host_mem_limit_pct = 0'; do
+  jq "$del" "$CS/f.json" >"$CS/bad.json"
+  cmp_rc "compare: missing required field [$del]" 2 --fandhe "$CS/bad.json" --chromium "$CS/c.json"
+done
+mk_result fandhe loaded "[$(mk_step 100 500 500)]" >"$CS/lf.json"
+mk_result chromium loaded "[$(mk_step 100 1000 1000)]" >"$CS/lc.json"
+for del in 'del(.args.url)' '.args.url = "file:///etc/passwd"' 'del(.args.navigate_concurrency)' '.args.navigate_concurrency = 0' '.args.navigate_concurrency = 65'; do
+  jq "$del" "$CS/lf.json" >"$CS/bad.json"
+  cmp_rc "compare: invalid loaded field [$del]" 2 --fandhe "$CS/bad.json" --chromium "$CS/lc.json"
+done
 cmp_rc "compare: missing file" 2 --fandhe "$CS/none.json" --chromium "$CS/c.json"
 cmp_rc "compare: missing --chromium" 2 --fandhe "$CS/f.json"
 cmp_rc "compare: unknown option" 2 --bogus

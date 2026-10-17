@@ -96,7 +96,7 @@ Chromium の起動条件（fandhe と揃える点・非対称な点を含めて�
 - 両方に実測があり、両方とも完走・破綻 0・全コンテナ測定済み（`measured == started == n`）の N にだけ削減率を出す。
   同じ N の実測が無い、または破綻・不完全のときは数値を出さず `reason` を出す（外挿値を実測として扱わない）。
 - 実行環境（`arch`・`kernel`・`mem_total_bytes`・`cgroup_driver`）や条件（`ready_timeout_s`・`settle_s`・`host_mem_limit_pct`、
-  loaded では `url`）が食い違う 2 つは `comparable: false` と `reasons[]` を出し、削減率を 1 件も出さない（exit 0）。
+  loaded では `url`・`navigate_concurrency`）が食い違う 2 つは `comparable: false` と `reasons[]` を出し、削減率を 1 件も出さない（exit 0）。
 - 削減率は `(1 − fandhe / chromium) × 100` を小数第 2 位で切り捨てる（`memory_peak` と `memory_current` の合計で計算。負の値はそのまま）。
 - `reference_thresholds` に `CTR-3`（50%）・`CTR-6`（90%）の参考判定（N=100・`memory_peak`）を出す。合否は人間が確定する。
 - `--poc1-chromium-per-instance-bytes`・`--poc8-fandhe-n100-bytes` を渡したときだけ、別オブジェクト `extrapolation`（`kind: extrapolated`）に

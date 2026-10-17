@@ -8,7 +8,7 @@
 # 方針:
 #   - 削減率は「両方に実測があり、両方とも完走（complete）・破綻 0・全コンテナ測定済み」の N だけに出す。
 #     同じ N の実測が無ければ数値を出さず reason を出す（外挿値を実測として扱わない）。
-#   - 実行環境（arch・kernel・メモリ量・cgroup ドライバ）や測定条件（起動待ち・settle・ホスト上限・loaded の URL）が
+#   - 実行環境（arch・kernel・メモリ量・cgroup ドライバ）や測定条件（起動待ち・settle・ホスト上限・loaded の URL・並列数）が
 #     食い違う 2 つの結果は比較できない。comparable=false と理由だけを出し、削減率は 1 件も出さない。
 #   - 外挿値（PoC-1 の Chromium 1 インスタンスあたり RSS など）は引数で渡されたときだけ別オブジェクト
 #     `extrapolation`（kind=extrapolated）に出し、削減率の計算には使わない。
@@ -55,10 +55,20 @@ VALIDATE_JQ='
   type == "object" and .schema == "container-memory/v1"
   and ((.target // "fandhe") == $want)
   and (.environment | type == "object")
+  and ((.environment.arch | type == "string" and length > 0)
+       and (.environment.kernel | type == "string" and length > 0)
+       and (.environment.cgroup_driver | type == "string" and length > 0)
+       and (.environment.mem_total_bytes | num) and (.environment.mem_total_bytes >= 1))
   and (.args | type == "object")
+  and ((.args.ready_timeout_s | num) and (.args.settle_s | num)
+       and (.args.host_mem_limit_pct | num) and (.args.host_mem_limit_pct >= 1) and (.args.host_mem_limit_pct <= 100))
   and (.conditions | type == "array") and (.conditions | length) > 0
   and ([.conditions[] | (.condition == "idle" or .condition == "loaded") and (.steps | type == "array") and ([.steps[] | step_ok] | all)] | all)
   and ([.conditions[].condition] | (length == (unique | length)))
+  and (if ([.conditions[].condition] | index("loaded")) != null
+       then (.args.url | type == "string" and test("^https?://[^ ]+$"))
+            and (.args.navigate_concurrency | num) and (.args.navigate_concurrency >= 1) and (.args.navigate_concurrency <= 64)
+       else true end)
   and ([.conditions[] | .steps | [.[].n] | (length == (unique | length))] | all)
 '
 
@@ -102,6 +112,7 @@ main() {
     ([env_diff("arch"), env_diff("kernel"), env_diff("mem_total_bytes"), env_diff("cgroup_driver"),
       arg_diff("ready_timeout_s"), arg_diff("settle_s"), arg_diff("host_mem_limit_pct"),
       (if ($common | index("loaded")) != null then arg_diff("url") else empty end),
+      (if ($common | index("loaded")) != null then arg_diff("navigate_concurrency") else empty end),
       (if ($common | length) == 0 then "no_common_condition" else empty end)]) as $reasons
     | ($reasons | length == 0) as $comparable
 
