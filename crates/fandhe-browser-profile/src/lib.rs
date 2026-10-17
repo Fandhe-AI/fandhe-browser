@@ -50,11 +50,11 @@
 //!   `Profile::open`（Windows）は verbatim ルートも `canonicalize` して判定する
 //! - Windows のアクセス制限（`XOS-7`〜`XOS-10`）は第 1 段階として実装済み（Issue #928）。
 //!   プロファイルルートが `%LOCALAPPDATA%` 配下のときだけ `Profile::open` が成功し、
-//!   アクセス制限は OS の既定の継承 ACL（SYSTEM・Administrators・本人のみ。Administrators
-//!   と SYSTEM は読める）に依存する。ACL の設定・検証はせず、配下外のルートは
-//!   `ProfileError::Unsupported` で拒否してディレクトリを作らない。Win32 API で ACL を
-//!   明示設定して任意のパスを許可する第 2 段階は、依存の feature 追加と `unsafe` の
-//!   承認が要るため未実装（後続。未判断）。Windows の `Profile` はルートのディレクトリ
+//!   新規に作るルートには作成時に保護付き DACL（SYSTEM・Administrators・本人のみ。
+//!   Administrators と SYSTEM は読める）を付けて読み戻し検証する（Issue #952）。既存ルートの
+//!   所有者・DACL の検証は未実装（#953）。配下外のルートは
+//!   `ProfileError::Unsupported` で拒否してディレクトリを作らない。ACL を
+//!   明示設定して任意のパスを許可する第 2 段階は未実装（後続。未判断）。Windows の `Profile` はルートのディレクトリ
 //!   ハンドルと `profile.lock` を改名・削除を共有しない形で保持する。ルートまでの各要素・
 //!   `profile.lock`・データ種別ディレクトリの作成と open は、親のハンドルを起点にした
 //!   NT API（`win32` モジュール。`unsafe` はこのモジュールに限る。Issue #949・#950）で行い、

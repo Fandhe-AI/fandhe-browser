@@ -33,7 +33,7 @@
 //!   verbatim ルートも `canonicalize` して `%LOCALAPPDATA%` 配下かを判定する（Issue #928）
 //! - 名前正規化（`XOS-9`、TASK-62）は将来この層へ差し込む。Windows の [`Profile::open`] は
 //!   `%LOCALAPPDATA%` 配下のルートだけ成功し、配下外は `Unsupported` を返す
-//!   （ACL は設定・検証しない。`XOS-7`・`XOS-10`）。[`ProfileStore::open_or_create`] も
+//!   （新規ルートには保護付き DACL を付け、既存ルートの ACL は検証しない。`XOS-7`・`XOS-10`）。[`ProfileStore::open_or_create`] も
 //!   それをそのまま伝える
 
 use std::ffi::OsString;

@@ -29,12 +29,13 @@
 //!   差し替え後の実体だと境界外を消しかねないため。unix 側も途中で作ったディレクトリを戻さない
 //!   方針に揃える）。
 //!
-//! アクセス制限は OS の既定の継承 ACL に依存し、ACL の設定・検証はしない
-//! （既定の継承 ACL のままなら、`%LOCALAPPDATA%` 配下に新規作成したディレクトリは
-//! SYSTEM・Administrators・本人のみにアクセス権が付く。実測は Issue #813 のコメント）。
-//! Administrators と SYSTEM は読める。ACL を明示設定して任意のパスを許可する第 2 段階
-//! は後続（#952・#953）。対応するビヘイビアは `PROF-1`・`PROF-4`・`PROF-6`・`XOS-7`・`XOS-10`
-//! （Issue #928、#813、#950）。
+//! アクセス制限: Windows で新規に作るルートには、作成時に保護付き DACL（親からの継承を切り、
+//! 本人・SYSTEM・Administrators だけを許可。配下へは継承）を `win32::open_or_create_protected_dir_at`
+//! が渡し、作成直後に読み戻して検証する。失敗すれば `open` は失敗する（Issue #952）。
+//! Administrators と SYSTEM は読める。`profile.lock`・データ種別ディレクトリはルートの DACL を
+//! 継承する。中間ディレクトリは親から継承のまま（DACL を付けない）。既存ルートの所有者・DACL は
+//! 検証しない（#953）。対応するビヘイビアは `PROF-1`・`PROF-4`・`PROF-6`・`XOS-7`・`XOS-10`
+//! （Issue #928、#813、#950、#952）。
 //!
 //! ## 前提とする攻撃者像
 //!
@@ -70,8 +71,10 @@
 //!   実体に解決した（正規化後の）パスを開く（拒否はしない。unix は途中の symlink を
 //!   すべて拒否するので差がある）。固定の段階で見つかる再解析ポイントは拒否する。
 //!   `Local` 配下に OneDrive 等の再解析ポイントがある環境では、それを通る経路は拒否される。
-//! - 既存のルート・既存の中間ディレクトリの ACL は確認しない。独自の ACL が設定されて
-//!   いれば、継承 ACL の前提は成り立たない（#952・#953）。
+//! - 既存のルート・既存の中間ディレクトリの ACL は確認しない。保護付き DACL を付けるのは
+//!   新規に作るルートだけで、既存ルートの検証は #953。中間ディレクトリには DACL を付けない
+//!   ため、その名前が他ユーザーから見える可能性は残る。所有者は設定しない（昇格トークンでは
+//!   既定の所有者が Administrators になる）。
 //! - 既知フォルダの値の出所はレジストリ（`HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\
 //!   User Shell Folders`）で、同じユーザーは書き換えられる。同じユーザーによる付け替えは防げない
 //!   （Issue #947 で受容した攻撃者像の範囲）。本変更で得られるのは、プロセスの環境ブロック
@@ -525,6 +528,26 @@ fn open_or_create_child_dir(
     }
 }
 
+/// `pin_root` の最後の要素（プロファイルのルート）用の継ぎ目。Windows は
+/// `win32::open_or_create_protected_dir_at`（新規作成時に保護付き DACL を付けて検証する。
+/// Issue #952）、非 Windows は [`open_or_create_child_dir`] に委ねる（骨格。挙動は同じ）。
+fn open_or_create_root_dir(
+    parent: &File,
+    parent_path: &Path,
+    name: &OsStr,
+) -> Result<File, ProfileError> {
+    #[cfg(windows)]
+    {
+        crate::win32::open_or_create_protected_dir_at(parent, name)
+            .map(|opened| opened.file)
+            .map_err(|err| with_full_path(err, parent_path))
+    }
+    #[cfg(not(windows))]
+    {
+        open_or_create_child_dir(parent, parent_path, name)
+    }
+}
+
 /// 親ハンドル `parent` の直下にファイル `name`（`profile.lock`）を読み書き可能で作成する
 /// （既にあれば開く）。[`open_lock_file`] から呼ばれる継ぎ目で、方針は
 /// [`open_or_create_child_dir`] と同じ（Windows は `win32::open_or_create_file_at`、
@@ -574,7 +597,8 @@ fn open_or_create_child_file(
 }
 
 /// `LOCALAPPDATA` からルートまでを 1 要素ずつ親のハンドル相対で作成・open し（既にあれば開く）、
-/// 各ディレクトリのハンドルを保持して経路を固定する。
+/// 各ディレクトリのハンドルを保持して経路を固定する。最後の要素（ルート）だけは新規作成時に
+/// 保護付き DACL を付ける（[`open_or_create_root_dir`]。Issue #952）。
 ///
 /// 起点の `LOCALAPPDATA` だけはパスで開く（`canonicalize` 済み・再解析ポイント検査あり。
 /// 既知フォルダ API は #951 まで未対応）。以降は [`open_or_create_child_dir`] により、
@@ -591,15 +615,21 @@ pub(crate) fn pin_root(plan: &RootPlan) -> Result<PinnedPath, ProfileError> {
         .map_err(|_| unsupported(REASON_OUTSIDE))?;
     let mut dirs = vec![open_dir(&plan.base)?];
     let mut current = plan.base.clone();
-    for component in relative.components() {
+    let mut components = relative.components().peekable();
+    while let Some(component) = components.next() {
         let Component::Normal(name) = component else {
             return Err(unsupported(REASON_UNSUPPORTED_FORM));
         };
+        let is_root = components.peek().is_none();
         let parent = dirs.last().ok_or(ProfileError::InvalidLayout {
             path: current.clone(),
             reason: "no pinned directory handle",
         })?;
-        let handle = open_or_create_child_dir(parent, &current, name)?;
+        let handle = if is_root {
+            open_or_create_root_dir(parent, &current, name)?
+        } else {
+            open_or_create_child_dir(parent, &current, name)?
+        };
         current.push(name);
         dirs.push(handle);
     }

@@ -16,9 +16,10 @@
 //!
 //! - Windows のアクセス制限（`XOS-7`〜`XOS-10`）は第 1 段階（Issue #928）として、
 //!   ルートが `%LOCALAPPDATA%` 配下のときだけ `Profile::open` が成功する
-//!   （[`crate::local_root`]）。アクセス制限は既定の継承 ACL に依存し（Administrators
-//!   と SYSTEM は読める）、ACL の設定・検証はしない。配下外のルートは
-//!   `Err(ProfileError::Unsupported)` を返してディレクトリを作らず、既定 ACL のまま
+//!   （[`crate::local_root`]）。新規に作るルートには作成時に保護付き DACL（本人・SYSTEM・
+//!   Administrators のみ。Administrators と SYSTEM は読める）を付けて読み戻し検証し、失敗すれば
+//!   `open` も失敗する（Issue #952）。既存ルートの所有者・DACL の検証は未実装（#953）。
+//!   配下外のルートは `Err(ProfileError::Unsupported)` を返してディレクトリを作らず、
 //!   機密データを書き込む偽装成功を避ける（security.md「偽装・回避機能の禁止」）。
 //!   ACL を明示設定して任意のパスを許可する第 2 段階は未実装（後続・未判断）。
 //!   ルートまでの各要素・`profile.lock`・データ種別ディレクトリの作成と open は、親の
@@ -128,10 +129,10 @@ pub enum ProfileError {
     /// 現在のプラットフォームではプロファイルの隔離を安全に実施できないため、
     /// あえてプロファイルを作成せず `open` を失敗させる場合に返す。
     ///
-    /// Windows は ACL の設定・検証を実装していない（`XOS-7`〜`XOS-10`）。既定の継承 ACL
-    /// のままであれば本人・Administrators・SYSTEM に限られる `%LOCALAPPDATA%` 配下の
-    /// ルートだけを許可し（Issue #928。配下の既存ディレクトリに独自の ACL が設定されていれば
-    /// この前提は成り立たず、本 crate はそれを確認しない）、それ以外のルートでは
+    /// Windows は新規ルートにだけ保護付き DACL を付け（Issue #952）、既存ルートの ACL 検証は
+    /// 未実装（#953。`XOS-7`〜`XOS-10`）。本人・Administrators・SYSTEM に限られる
+    /// `%LOCALAPPDATA%` 配下のルートだけを許可し（Issue #928。既存の中間ディレクトリや
+    /// 既存ルートに独自の ACL が設定されていれば本 crate はそれを確認しない）、それ以外のルートでは
     /// 何もせず成功を返すと Cookie・Storage 等の機密データが他ユーザーから読める
     /// 場所に置かれ得るため、`open` 自体を拒否する。「未実装の機能で成功を一律に
     /// 返すフォールバックを禁止する」方針（security.md・REPAIR-3）による。
@@ -545,12 +546,12 @@ impl Profile {
     /// を drop した後もこのファイル自体は残り続ける（unlink しない理由は
     /// [`crate::lock`] のモジュール doc を参照）。
     ///
-    /// Windows ではパーミッション 700 の代わりに OS の既定の継承 ACL に依存し、
-    /// ルートが `%LOCALAPPDATA%` の厳密な配下にあるときだけ許可する（新規ルートも
-    /// 既存ルートも通る。Issue #928。`PROF-1`・`PROF-6`・`XOS-7`・`XOS-10`）。既定の
-    /// 継承 ACL のままであれば、`%LOCALAPPDATA%` 配下のディレクトリは SYSTEM・
-    /// Administrators・本人のみにアクセス権が付き、別の標準ユーザーからは読めない
-    /// （Administrators と SYSTEM は読める。実測は #813）。ACL の設定と検証はしない。
+    /// Windows ではパーミッション 700 の代わりに、新規に作るルートへ保護付き DACL（親からの
+    /// 継承を切り、本人・SYSTEM・Administrators のみ許可。配下へ継承）を作成時に付け、作成直後に
+    /// 読み戻して検証する（失敗すれば `open` も失敗。Issue #952）。Administrators と SYSTEM は
+    /// 読める。ルートが `%LOCALAPPDATA%` の厳密な配下にあるときだけ許可し（新規ルートも
+    /// 既存ルートも通る。Issue #928。`PROF-1`・`PROF-6`・`XOS-7`・`XOS-10`）、既存ルートの
+    /// 所有者・DACL は検証しない（#953）。中間ディレクトリには DACL を付けない（親から継承）。
     /// `%LOCALAPPDATA%` 自体、配下外、基準（既知フォルダ `FOLDERID_LocalAppData`。環境変数
     /// `LOCALAPPDATA` は見ない。Issue #951）を取得できない・UNC・
     /// `...\AppData\Local` で終わらない場合、不正な名前（予約デバイス名・`:` 等）は何も作らず
@@ -565,7 +566,7 @@ impl Profile {
     /// 親のハンドル相対（Issue #950）で行い、作成の途中の再解析ポイント化でも配下外に作らず、
     /// ロックはルートの実体の `profile.lock` に取る。Windows の限界（起点の基準ディレクトリは
     /// パスで開くこと、実機の FSCTL では未検証であること、内側へ向くジャンクションを許可する
-    /// こと、既存ディレクトリの ACL を確認しないこと、`profile.lock` の所有者・ハードリンク数を
+    /// こと、既存ディレクトリの ACL を確認しないこと（新規ルートは検証する）、`profile.lock` の所有者・ハードリンク数を
     /// 検査しないこと等）は `local_root.rs` のモジュール doc「限界」を参照。
     ///
     /// # エラー
@@ -601,7 +602,7 @@ impl Profile {
     /// `mkdirat(0700)` で作られるため誤って拒否されない。`ExplicitStore` の
     /// `open_or_create` から呼ばれる。
     ///
-    /// Windows では ACL を検証しない（オーナー判断）ため共有ルートの検査は行わず、
+    /// Windows では既存ルートの ACL を検証しない（#953）ため共有ルートの検査は行わず、
     /// [`Profile::open`] と同じ `%LOCALAPPDATA%` 配下の判定だけが拒否の根拠になる
     /// （`PROF-1`・`XOS-10`）。
     pub(crate) fn open_rejecting_shared_root(root: &Path) -> Result<Profile, ProfileError> {
@@ -611,9 +612,10 @@ impl Profile {
     fn open_impl(root: &Path, reject_shared_root: bool) -> Result<Profile, ProfileError> {
         #[cfg(windows)]
         {
-            // Windows は ACL を設定・検証しないため、`%LOCALAPPDATA%` 配下のルートに限って
-            // 開く（Issue #928。`PROF-1`・`PROF-6`・`XOS-7`・`XOS-10`）。共有ルートの
-            // 拒否（unix の group/other 権限検査）は ACL の検証が要るため行わず、
+            // Windows は新規ルートにだけ保護付き DACL を付けて検証し（Issue #952）、
+            // `%LOCALAPPDATA%` 配下のルートに限って開く（Issue #928。`PROF-1`・`PROF-6`・
+            // `XOS-7`・`XOS-10`）。共有ルートの拒否（unix の group/other 権限検査）は
+            // 既存ルートの ACL 検証（#953）が要るため行わず、
             // 配下判定が同じ役割（他者が読めない場所のみ許可）を担う。
             let _ = reject_shared_root;
             // 基準ディレクトリは既知フォルダ API で決め、環境変数 `LOCALAPPDATA` は見ない
@@ -741,7 +743,7 @@ impl Profile {
     /// どおりであることを `canonicalize` で事後に再確認する、③ ルートのハンドル相対で
     /// `profile.lock` を開いてロックを取る、④ ルートのハンドル相対で 4 つのデータ種別
     /// ディレクトリを作る。②〜④ はパスを再解決して作成しない（`local_root.rs` の「限界」）。
-    /// アクセス制限は既定の継承 ACL に依存し、ACL の設定・検証はしない（`PROF-1`・`PROF-6`・`XOS-7`・`XOS-10`）。
+    /// 新規ルートには保護付き DACL を付けて検証する。既存ルートの ACL は検証しない（#953。`PROF-1`・`PROF-6`・`XOS-7`・`XOS-10`・Issue #952）。
     #[cfg(windows)]
     fn open_with_base(
         root: &Path,
@@ -2022,7 +2024,7 @@ fn open_dir_all_verified(path: &Path) -> Result<OwnedFd, ProfileError> {
 /// （PR #437 レビュー指摘）。
 ///
 /// Windows は POSIX パーミッションを持たないため本関数は unix 限定で、Windows の
-/// `Profile::open` は既定の継承 ACL に依存する（`%LOCALAPPDATA%` 配下のみ許可。
+/// `Profile::open` は新規ルートに保護付き DACL を付ける（`%LOCALAPPDATA%` 配下のみ許可。
 /// `XOS-7`〜`XOS-10`・Issue #928）。coding-rust.md「クロスプラットフォーム」で
 /// OS 固有処理を `cfg(target_os = ...)` に局所化する方針に従う。
 /// ハンドル `fd` のディレクトリが他者にアクセス可能な形（group/other の権限ビット・

@@ -22,6 +22,8 @@ rustix = { workspace = true }
 windows-sys = { workspace = true, features = [
   "Wdk_Foundation",
   "Wdk_Storage_FileSystem",
+  # 新規ルートの保護付き DACL（SDDL 変換・読み戻し。Issue #952。#947 承認範囲の feature 追加のみ）
+  "Win32_Security_Authorization",
   "Win32_Storage_FileSystem",
   "Win32_System_Com",
   "Win32_System_IO",
