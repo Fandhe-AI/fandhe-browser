@@ -131,9 +131,10 @@
 //! - 子は ES module 用フレームを検証したうえでエンジンへ dispatch する。boa は
 //!   静的 import のグラフを評価する（動的 `import()`・top-level await を含む
 //!   モジュールは compile が `NotYetImplemented`。Issue #1114）。V8 も静的 import の
-//!   compile・link・評価を実装済み（同期に完了するグラフのみ。Issue #1111）。
-//!   V8 の top-level await・`Pending`・`import.meta.url` と、両エンジンの動的 import
-//!   は後続 issue で、`NotYetImplemented`（設計 `es-module-design.md` §9 の 4〜5）。
+//!   compile・link・評価に加え、`import.meta.url`・top-level await・Promise の
+//!   `Fulfilled` / `Pending` / `Rejected`・評価後の microtask checkpoint を実装済み
+//!   （Issue #1111・#1112）。両エンジンの動的 import は後続 issue で、`NotYetImplemented`
+//!   （設計 `es-module-design.md` §9 の 4〜5）。
 //! - 子 → 親へ `ObjectHandle` を渡す経路（オブジェクト参照の往復・親の handle
 //!   照合）は未実装で、現状は fail-closed で拒否する（`TASK-29.5b` の
 //!   後続作業。REPAIR-3）。setter（書き込み可能プロパティ）も未対応。

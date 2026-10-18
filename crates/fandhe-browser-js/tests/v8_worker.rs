@@ -102,6 +102,8 @@ fn main() -> ExitCode {
     js_4_module_frames_dispatch_to_v8_worker_and_dynamic_import_is_not_yet_implemented();
     eprintln!("case: js_4_module_graph_roundtrips_through_the_v8_worker");
     js_4_module_graph_roundtrips_through_the_v8_worker();
+    eprintln!("case: js_4_module_import_meta_url_and_promise_states_through_the_v8_worker");
+    js_4_module_import_meta_url_and_promise_states_through_the_v8_worker();
     eprintln!("case: js_1_handshake_rejects_hello_naming_a_different_engine");
     js_1_handshake_rejects_hello_naming_a_different_engine();
     eprintln!("case: js_1_handshake_rejects_hello_with_wrong_length");
@@ -700,6 +702,76 @@ fn js_4_module_graph_roundtrips_through_the_v8_worker() {
         pid,
         "the child must survive module failures"
     );
+}
+
+/// JS-4・REPAIR-3・Issue #1112: 実際の V8 子プロセスで、静的 import 先を含む
+/// `import.meta.url` が compile 時の URL と一致し、評価の Promise が `Fulfilled` /
+/// `Pending` / `Rejected` に対応づくこと。評価中に積んだ microtask の効果は戻り時点で
+/// 反映済みで、classic 評価と子（pid）は変わらない。
+fn js_4_module_import_meta_url_and_promise_states_through_the_v8_worker() {
+    let options = EvaluateOptions::default();
+    let mut engine = V8ProcessEngine::new();
+    let dep = engine
+        .compile_module(
+            "https://example.test/lib/dep.js",
+            "globalThis.depUrl = import.meta.url; export const d = 1;",
+        )
+        .expect("compile dep");
+    let root = engine
+        .compile_module(
+            "https://example.test/app/main.js",
+            "import { d } from './dep.js'; globalThis.rootUrl = import.meta.url; \
+             Promise.resolve().then(() => { globalThis.tick = d; }); export {};",
+        )
+        .expect("compile root");
+    engine
+        .link_module(
+            root.id(),
+            &[ModuleResolution::new("./dep.js".to_string(), dep.id())],
+        )
+        .expect("link");
+    assert_eq!(
+        engine.evaluate_module(root.id(), &options).expect("eval"),
+        ModuleEvaluation::Fulfilled
+    );
+    let pid = engine.worker_pid_for_test();
+    assert_eq!(
+        JsEngine::evaluate_script(&mut engine, "depUrl + '|' + rootUrl + '|' + tick", &options)
+            .expect("eval"),
+        JsValue::String(
+            "https://example.test/lib/dep.js|https://example.test/app/main.js|1".to_string()
+        )
+    );
+
+    let pending = engine
+        .compile_module(
+            "https://example.test/p.js",
+            "await new Promise(() => {}); export {};",
+        )
+        .expect("compile pending");
+    assert_eq!(
+        engine
+            .evaluate_module(pending.id(), &options)
+            .expect("eval"),
+        ModuleEvaluation::Pending
+    );
+    let rejected = engine
+        .compile_module(
+            "https://example.test/r.js",
+            "await Promise.reject(new Error('tla boom')); export {};",
+        )
+        .expect("compile rejected");
+    match engine.evaluate_module(rejected.id(), &options) {
+        Ok(ModuleEvaluation::Rejected { message, .. }) => {
+            assert!(message.contains("tla boom"), "unexpected: {message}")
+        }
+        other => panic!("expected Rejected, got: {other:?}"),
+    }
+    assert_eq!(
+        JsEngine::evaluate_script(&mut engine, "1 + 1", &options).expect("eval"),
+        JsValue::Number(2.0)
+    );
+    assert_eq!(engine.worker_pid_for_test(), pid, "the child must survive");
 }
 
 /// codex レビュー指摘 #503 P1「Hello のエンジン種別を無視している」の

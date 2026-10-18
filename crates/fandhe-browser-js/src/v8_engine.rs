@@ -24,9 +24,12 @@
 //! [`V8Engine::evaluate_module`]。`JS-4`・Issue #1111）を実装済みである。以下は
 //! 未実装（実装済みを装わない。REPAIR-3）。
 //!
-//! - ES module の top-level await・Promise の `Pending`・microtask checkpoint・
-//!   `import.meta.url`・動的 `import()`（`TAKE_DYNAMIC_IMPORTS` 等）。TLA は compile が、
-//!   `Pending` は evaluate が `NotYetImplemented` を返す（#1112 以降）
+//! - ES module の動的 `import()`（`TAKE_DYNAMIC_IMPORTS` 等。host callback が無いため
+//!   `import()` の Promise は reject される）。後続 issue で対応する
+//!
+//! なお ES module の `import.meta.url`・top-level await・Promise の
+//! `Fulfilled` / `Pending` / `Rejected` の分類・評価後の microtask checkpoint は
+//! 実装済みである（`JS-4`・`REPAIR-3`・Issue #1112）。
 //!
 //! - [`super::engine_trait::JsEngine`] トレイトへの集約（`TASK-29.6.2`・Issue #548）。
 //!   本モジュールは同トレイトと同じシグネチャの inherent メソッドとして
@@ -92,15 +95,24 @@
 //!   将来の複数回利用（cli の再起動なしの再初期化等）と相性が悪い
 //!
 //! `dispose` に関する `unsafe` は本モジュールでは使わない。本モジュールの
-//! `unsafe` は、ES module の resolve callback（`resolve_module_callback`）の
-//! `v8::callback_scope!(unsafe ...)` 1 か所だけである（`JS-4`・Issue #1111。
-//! リポジトリオーナー承認 2026-10-18。
-//! <https://github.com/Fandhe-AI/fandhe-browser/issues/1111#issuecomment-6248402182>）。
-//! v8 152.2.0 の `instantiate_module` に渡せる callback は値を捕捉できない `fn`
-//! で、依存先の `Local<Module>` を返すには callback の中で scope を作る必要があり、
-//! それを安全に行う API が無いため。`// SAFETY:` に不変条件（呼び出し中のみ・
-//! scope と `Local` を持ち出さない・JS を実行しない）を明記している。それ以外では
-//! `unsafe` を使わない（TASK-29・Issue #503・JS プロセス分離の設計書
+//! `unsafe` は、次の 2 か所の `v8::callback_scope!(unsafe ...)` だけである。
+//!
+//! 1. ES module の resolve callback（`resolve_module_callback`。`JS-4`・Issue #1111。
+//!    リポジトリオーナー承認 2026-10-18。
+//!    <https://github.com/Fandhe-AI/fandhe-browser/issues/1111#issuecomment-6248402182>）。
+//!    v8 152.2.0 の `instantiate_module` に渡せる callback は値を捕捉できない `fn`
+//!    で、依存先の `Local<Module>` を返すには callback の中で scope を作る必要があり、
+//!    それを安全に行う API が無いため
+//! 2. `import.meta` の初期化 callback（`import_meta_callback`。`JS-4`・Issue #1112。
+//!    リポジトリオーナー承認。
+//!    <https://github.com/Fandhe-AI/fandhe-browser/issues/1112#issuecomment-6248402334>）。
+//!    `HostInitializeImportMetaObjectCallback` も `Local` だけを受け取る
+//!    `extern "C" fn` で、`import.meta` へ `url` を設定するには callback の中で scope を
+//!    作る必要があるため
+//!
+//! いずれも `// SAFETY:` に不変条件（呼び出し中のみ・scope と `Local` を持ち出さない・
+//! JS を実行しない）を明記している。microtask checkpoint と Promise 状態の取得は
+//! `unsafe` を使わない。それ以外では `unsafe` を使わない（TASK-29・Issue #503・JS プロセス分離の設計書
 //! §5「案 X」。以前存在した `near_heap_limit_callback`〔Issue #507 で承認
 //! した `unsafe`〕は、ヒープ上限到達時の挙動を「V8 の既定の fatal
 //! OOM で Isolate を含むプロセスが終了する」ことに一本化したため削除した。
@@ -659,6 +671,8 @@ impl V8Engine {
         });
         // ES module のモジュールマップ（`JS-4`・Issue #1111）。resolve callback が読む。
         isolate.set_slot(ModuleMap::new());
+        // `import.meta.url` の初期化（`JS-4`・Issue #1112）。
+        isolate.set_host_initialize_import_meta_object_callback(import_meta_callback);
         Ok(Self { context, isolate })
     }
 
@@ -1726,6 +1740,8 @@ fn native_proxy_callback(
 
 /// モジュールマップが保持する compile 済みモジュール 1 件。
 struct ModuleEntry {
+    /// compile 時に渡された URL（`import.meta.url` の値。`JS-4`・Issue #1112）。
+    url: String,
     /// compile 済みの V8 モジュール。
     module: v8::Global<v8::Module>,
     /// ソースに書かれた依存の specifier（出現順・重複なし・検証済み）。
@@ -1862,67 +1878,39 @@ fn resolve_module_callback<'s>(
     found
 }
 
-/// ソースに `import.meta` の使用らしきものがあるか（保守的な検出。`JS-4`・`REPAIR-3`）。
+/// `import.meta` の初期化 callback（`JS-4`・Issue #1112）。
 ///
-/// `import.meta` の初期化 callback は未実装（#1112）で、そのまま評価すると
-/// `import.meta.url` が `undefined` のまま成功してしまう。対応するまで
-/// [`V8Engine::compile_module`] はこれを `NotYetImplemented` で拒否する。
+/// V8 が各モジュールの `import.meta` に初めて触れたとき 1 回だけ呼ばれ、compile 時の
+/// URL を `url` プロパティ（通常のデータプロパティ）として設定する。モジュールマップを
+/// 読むだけで、JS は実行しない。未登録のモジュール（防御経路）では何も設定しない。
 ///
-/// トークン `import` の後に trivia を挟んで `.`、さらに trivia を挟んで `meta` または
-/// `\`（識別子の Unicode エスケープの開始。fail-closed で拒否）が続くものを探す。
-/// 不変条件: [`skip_trivia`] が読み飛ばす集合は JS の WhiteSpace・LineTerminator・
-/// Comment の上位集合で、余分に読み飛ばすのは誤検出（拒否側）にしかならない。文字列・
-/// コメント中の `import.meta` を拒否する誤検出も fail-closed 側として許容する。
-/// **#1112 で `import.meta.url` を実装したらこの検出を外す。**
-/// 入力は上限検証済みのソースで、添字アクセスは `get` のみ。
-fn uses_import_meta(source: &str) -> bool {
-    source.match_indices("import").any(|(index, word)| {
-        let after_import = skip_trivia(source, index.saturating_add(word.len()));
-        if source
-            .get(after_import..)
-            .and_then(|rest| rest.chars().next())
-            != Some('.')
-        {
-            return false;
-        }
-        let after_dot = skip_trivia(source, after_import.saturating_add(1));
-        source
-            .get(after_dot..)
-            .is_some_and(|rest| rest.starts_with("meta") || rest.starts_with('\\'))
-    })
-}
+/// 本モジュールで 2 か所目の `unsafe` の使用箇所（リポジトリオーナー承認。
+/// Issue #1112 のコメント
+/// <https://github.com/Fandhe-AI/fandhe-browser/issues/1112#issuecomment-6248402334>）。
+extern "C" fn import_meta_callback(
+    context: v8::Local<v8::Context>,
+    module: v8::Local<v8::Module>,
+    meta: v8::Local<v8::Object>,
+) {
+    // SAFETY: この callback は、V8 が同じスレッドで `import.meta` を初めて評価している
+    // 間にだけ呼ばれ、`context` はその時点の current context で生きている。作る scope と
+    // そこから得る `Local` は callback の外へ持ち出さず、callback の中で JS を実行しない
+    // （モジュールマップを読んで `meta` に `url` のデータプロパティを作るだけ）。
+    v8::callback_scope!(unsafe scope, context);
 
-/// 行末記号（LF・CR・U+2028・U+2029）か。
-fn is_line_terminator(c: char) -> bool {
-    matches!(c, '\n' | '\r' | '\u{2028}' | '\u{2029}')
-}
-
-/// 空白（Unicode White_Space に U+FEFF を加えたもの。VT・FF・NBSP・LS・PS を含む）・
-/// 行コメント（任意の行末記号で終わる）・ブロックコメント（`*/` まで。閉じ忘れは末尾まで）を
-/// 読み飛ばした位置（バイト位置）を返す。
-fn skip_trivia(source: &str, start: usize) -> usize {
-    let mut index = start;
-    loop {
-        let Some(rest) = source.get(index..) else {
-            return index;
-        };
-        let Some(c) = rest.chars().next() else {
-            return index;
-        };
-        if c.is_whitespace() || c == '\u{feff}' {
-            index = index.saturating_add(c.len_utf8());
-        } else if rest.starts_with("//") {
-            let line_len = rest.find(is_line_terminator).unwrap_or(rest.len());
-            index = index.saturating_add(line_len);
-        } else if let Some(body) = rest.strip_prefix("/*") {
-            let consumed = body
-                .find("*/")
-                .map_or(rest.len(), |end| end.saturating_add(4));
-            index = index.saturating_add(consumed);
-        } else {
-            return index;
-        }
-    }
+    let Some(url) = scope
+        .get_slot::<ModuleMap>()
+        .and_then(|map| map.entries.values().find(|e| module == e.module))
+        .map(|entry| entry.url.clone())
+    else {
+        return;
+    };
+    let (Some(key), Some(value)) = (v8::String::new(scope, "url"), v8::String::new(scope, &url))
+    else {
+        return;
+    };
+    // 失敗しても（例外・false）何もしない。呼び出し元の JS 側では `url` が無いだけになる。
+    let _ = meta.create_data_property(scope, key.into(), value.into());
 }
 
 /// 重複込みの import 宣言数の上限（走査・確保コストの上限。`MAX_MODULE_REQUESTS` は一意な件数）。
@@ -1960,8 +1948,9 @@ impl V8Engine {
     /// - ソース長・登録数（[`MAX_MODULES_PER_WORKER`]）・依存の件数・specifier の長さを
     ///   確保の前に上限と比べる（超過は `ResourceLimitExceeded` / `EvaluationFailed`。
     ///   エラー文言に specifier・URL は含めない）
-    /// - import attributes 付きの import・`import defer` / source phase・重複した
-    ///   specifier・top-level await は compile 失敗にする（成功を装わない。REPAIR-3）
+    /// - import attributes 付きの import・`import defer` / source phase は compile 失敗にする
+    ///   （top-level await は compile できる。評価時に `Pending` / `Rejected` になる。Issue #1112）（成功を装わない。REPAIR-3）
+    /// - 重複した specifier は出現順で最初の 1 件に畳む
     /// - 監視は compile の前に起動し、`timeout` を過ぎると `Timeout`
     ///
     /// 動的 `import()` は compile 時には検出しない。実行時は host callback が無いため
@@ -1978,11 +1967,6 @@ impl V8Engine {
             return Err(JsEngineError::EvaluationFailed(format!(
                 "module source exceeds the maximum supported length of {MAX_SCRIPT_SOURCE_BYTES} bytes"
             )));
-        }
-        if uses_import_meta(source) {
-            return Err(JsEngineError::NotYetImplemented(
-                "compile_module: import.meta is not supported yet".to_string(),
-            ));
         }
         self.ensure_no_native_call_fatal()?;
         let (next_id, following_id) = {
@@ -2027,6 +2011,7 @@ impl V8Engine {
         map.entries.insert(
             next_id,
             ModuleEntry {
+                url: url.to_string(),
                 module: compiled.module,
                 requests: compiled.requests,
                 links: HashMap::new(),
@@ -2104,11 +2089,6 @@ impl V8Engine {
         };
 
         let invalid = |msg: &str| JsEngineError::EvaluationFailed(msg.to_string());
-        if module.has_top_level_await() {
-            return Err(JsEngineError::NotYetImplemented(
-                "compile_module: top-level await is not supported yet".to_string(),
-            ));
-        }
         let raw_requests = module.get_module_requests();
         // V8 の一覧は import 宣言ごと（同じ specifier が重複しうる）。重複を除いた
         // 一意な件数で `MAX_MODULE_REQUESTS` を判定し、重複込みの生の件数にも走査・確保の
@@ -2177,9 +2157,15 @@ impl V8Engine {
     ///   `Rejected(message)`（ユーザーコードを実行せずに取り出し、切り詰める）
     /// - 監視は instantiate の前に起動し、`options.timeout()` を過ぎると `Timeout`
     ///
-    /// 未実装（REPAIR-3）: top-level await・Promise の `Pending`・microtask checkpoint・
-    /// `import.meta.url` は別 issue（#1112）。これらは `NotYetImplemented` を返し、
-    /// 成功を装わない。
+    /// - evaluate の後に microtask checkpoint を行い（監視はその間も有効。無限に
+    ///   microtask を積むスクリプトは `Timeout`）、評価 Promise の状態を読む。
+    ///   未確定（top-level await が解決されない Promise を待つ等）は `Pending`
+    ///   （`JS-4`・`REPAIR-3`・Issue #1112）
+    /// - `import.meta.url` は compile 時の URL（[`import_meta_callback`]）
+    ///
+    /// `Rejected` のメッセージは `options.max_result_bytes()` を超えると
+    /// `EvaluationFailed`（boa と同じ契約）。メッセージに URL は含めない
+    /// （行番号のみ付く）。
     pub(crate) fn evaluate_module(
         &mut self,
         root: ModuleId,
@@ -2214,7 +2200,8 @@ impl V8Engine {
         };
 
         let watchdog = Watchdog::start(isolate_handle, timeout);
-        let outcome = Self::run_module(&tc, module);
+        let mut tc = tc;
+        let outcome = Self::run_module(&mut tc, module);
         watchdog.stop();
         let was_terminated = tc.has_terminated();
         tc.cancel_terminate_execution();
@@ -2227,9 +2214,7 @@ impl V8Engine {
         }
         match outcome {
             ModuleOutcome::Fulfilled => Ok(ModuleEvaluation::Fulfilled),
-            ModuleOutcome::Unsupported(what) => Err(JsEngineError::NotYetImplemented(format!(
-                "evaluate_module: {what} is not supported yet"
-            ))),
+            ModuleOutcome::Pending => Ok(ModuleEvaluation::Pending),
             ModuleOutcome::Rejected(message) => {
                 if message.len() > options.max_result_bytes() {
                     return Err(JsEngineError::EvaluationFailed(format!(
@@ -2243,22 +2228,32 @@ impl V8Engine {
         }
     }
 
-    /// instantiate・evaluate を行い、結果を分類する（監視スレッドが生きている間に呼ぶ。
-    /// メッセージの取り出しもユーザーコードを実行しない経路だけを使う）。
+    /// instantiate・evaluate・microtask checkpoint を行い、結果を分類する（監視スレッドが
+    /// 生きている間に呼ぶ。メッセージの取り出しもユーザーコードを実行しない経路だけを使う）。
+    ///
+    /// 評価が返す Promise は checkpoint の後に読む。同期に完了すれば `Fulfilled`、
+    /// 同期の例外・reject された TLA は `Rejected`、未確定のままなら `Pending`。
     fn run_module(
-        tc: &v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
+        tc: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
         module: v8::Local<v8::Module>,
     ) -> ModuleOutcome {
         if module.instantiate_module(tc, resolve_module_callback) != Some(true) {
             return ModuleOutcome::Rejected(failure_message(tc, tc.message(), tc.exception()));
         }
-        if module.is_graph_async() {
-            return ModuleOutcome::Unsupported("top-level await");
-        }
         let Some(value) = module.evaluate(tc) else {
             return ModuleOutcome::Rejected(failure_message(tc, tc.message(), tc.exception()));
         };
+        // 評価中に積まれた microtask（`Promise.resolve().then(...)`・TLA の継続）を
+        // 流し切る。例外は microtask 内で処理され、ここへは伝わらない。
+        tc.perform_microtask_checkpoint();
+        if tc.has_terminated() {
+            // 呼び出し側が Timeout にする。
+            return ModuleOutcome::Pending;
+        }
         if module.get_status() == v8::ModuleStatus::Errored {
+            if let Ok(promise) = v8::Local::<v8::Promise>::try_from(value) {
+                promise.mark_as_handled();
+            }
             return ModuleOutcome::Rejected(exception_message(tc, module.get_exception()));
         }
         match v8::Local::<v8::Promise>::try_from(value) {
@@ -2268,9 +2263,13 @@ impl V8Engine {
                     promise.mark_as_handled();
                     ModuleOutcome::Rejected(exception_message(tc, promise.result(tc)))
                 }
-                v8::PromiseState::Pending => ModuleOutcome::Unsupported("a pending evaluation"),
+                v8::PromiseState::Pending => ModuleOutcome::Pending,
             },
-            Err(_) => ModuleOutcome::Unsupported("an evaluation result that is not a promise"),
+            // V8 の `Module::Evaluate` は常に Promise を返す。返さない場合は評価が
+            // 完了したと断定できないため、成功を装わず `Rejected` にする。
+            Err(_) => {
+                ModuleOutcome::Rejected("module evaluation did not return a promise".to_string())
+            }
         }
     }
 }
@@ -2278,9 +2277,9 @@ impl V8Engine {
 /// [`V8Engine::run_module`] の分類結果。
 enum ModuleOutcome {
     Fulfilled,
+    /// microtask checkpoint の後も未確定（top-level await が待ち続けている等）。
+    Pending,
     Rejected(String),
-    /// 本 issue の範囲外（`NotYetImplemented` にする）。
-    Unsupported(&'static str),
 }
 
 /// 投げられた値（`Module::get_exception`・Promise の拒否理由）から、ユーザーコードを
@@ -3961,14 +3960,6 @@ mod tests {
     #[test]
     fn js_4_v8_module_compile_rejects_unsupported_and_invalid_sources() {
         let mut engine = module_engine();
-        assert!(matches!(
-            engine.compile_module(
-                "https://example.test/a.js",
-                "await 0; export {};",
-                MODULE_TIMEOUT
-            ),
-            Err(JsEngineError::NotYetImplemented(_))
-        ));
         match engine.compile_module(
             "https://example.test/j.js",
             "import x from './a.json' with { type: 'json' }; export { x };",
@@ -4178,38 +4169,155 @@ mod tests {
         assert_eq!(eval_str(&mut engine, "got"), JsValue::Number(1.0));
     }
 
-    /// JS-4・REPAIR-3・Issue #1111: `import.meta` は未実装のため compile が
-    /// `NotYetImplemented`。`import.meta` を含まない通常のモジュール（`import(` や
-    /// `important` など）は影響を受けない。
+    /// JS-4・Issue #1112: `import.meta.url` は compile 時の URL と一致する。
+    /// 静的 import 先のモジュールでも、それぞれ自身の URL になる。
     #[test]
-    fn js_4_v8_module_import_meta_is_not_yet_implemented() {
+    fn js_4_v8_module_import_meta_url_matches_compile_url_for_each_module() {
         let mut engine = module_engine();
-        for source in [
-            "globalThis.u = import.meta.url; export {};",
-            "globalThis.u = import . meta . url; export {};",
-            "globalThis.u = import/* c */.\n// c\nmeta.url; export {};",
-            "globalThis.u = import//c\r.meta.url; export {};",
-            "globalThis.u = import//c\u{2028}.meta.url; export {};",
-            "globalThis.u = import//c\u{2029}.meta.url; export {};",
-            "globalThis.u = import\u{b}.\u{c}meta.url; export {};",
-            "globalThis.u = import\u{a0}.\u{feff}meta.url; export {};",
-            "globalThis.u = import.\\u006deta.url; export {};",
-        ] {
-            match engine.compile_module("https://example.test/m.js", source, MODULE_TIMEOUT) {
-                Err(JsEngineError::NotYetImplemented(msg)) => assert!(msg.contains("import.meta")),
-                other => panic!("expected NotYetImplemented for {source:?}, got: {other:?}"),
-            }
-        }
-        // 拒否した compile は id を消費せず、通常のモジュールは評価できる。
-        let ok = compile_ok(
+        let dep = compile_ok(
             &mut engine,
-            "https://example.test/ok.js",
-            "const important = 1; globalThis.p = import('./x.js'); globalThis.m = important; export {};",
+            "https://example.test/lib/dep.js",
+            "globalThis.depUrl = import.meta.url; export const x = 1;",
         );
-        assert_eq!(ok.id(), ModuleId::from_raw(1));
-        engine
-            .evaluate_module(ok.id(), &EvaluateOptions::default())
+        let root = compile_ok(
+            &mut engine,
+            "https://example.test/app/main.js?v=2",
+            "import { x } from './dep.js'; globalThis.rootUrl = import.meta.url; \
+             globalThis.sameMeta = import.meta === import.meta; globalThis.x = x;",
+        );
+        link_ok(&mut engine, &root, &[("./dep.js", &dep)]);
+        let result = engine
+            .evaluate_module(root.id(), &EvaluateOptions::default())
             .expect("module must evaluate");
-        assert_eq!(eval_str(&mut engine, "m"), JsValue::Number(1.0));
+        assert_eq!(result, ModuleEvaluation::Fulfilled);
+        assert_eq!(
+            eval_str(&mut engine, "depUrl"),
+            JsValue::String("https://example.test/lib/dep.js".to_string())
+        );
+        assert_eq!(
+            eval_str(&mut engine, "rootUrl"),
+            JsValue::String("https://example.test/app/main.js?v=2".to_string())
+        );
+        assert_eq!(eval_str(&mut engine, "sameMeta"), JsValue::Bool(true));
+        assert_eq!(eval_str(&mut engine, "x"), JsValue::Number(1.0));
+    }
+
+    /// JS-4・REPAIR-3・Issue #1112: 同期に完了するモジュールは `Fulfilled`、解決されない
+    /// Promise を待つ TLA は `Pending`、reject される TLA は `Rejected(message)`。
+    #[test]
+    fn js_4_v8_module_promise_state_is_fulfilled_pending_or_rejected() {
+        let mut engine = module_engine();
+        let sync = compile_ok(
+            &mut engine,
+            "https://example.test/s.js",
+            "export const a = 1;",
+        );
+        let pending = compile_ok(
+            &mut engine,
+            "https://example.test/p.js",
+            "globalThis.beforeAwait = 1; await new Promise(() => {}); globalThis.afterAwait = 1;",
+        );
+        let rejected = compile_ok(
+            &mut engine,
+            "https://example.test/r.js",
+            "await Promise.reject(new Error('tla boom'));",
+        );
+        let resolved = compile_ok(
+            &mut engine,
+            "https://example.test/f.js",
+            "await Promise.resolve(); globalThis.resolvedTla = 1;",
+        );
+        let opts = EvaluateOptions::default();
+        assert_eq!(
+            engine.evaluate_module(sync.id(), &opts).expect("sync"),
+            ModuleEvaluation::Fulfilled
+        );
+        assert_eq!(
+            engine
+                .evaluate_module(pending.id(), &opts)
+                .expect("pending"),
+            ModuleEvaluation::Pending
+        );
+        assert_eq!(eval_str(&mut engine, "beforeAwait"), JsValue::Number(1.0));
+        assert_eq!(
+            eval_str(&mut engine, "typeof afterAwait"),
+            JsValue::String("undefined".to_string())
+        );
+        match engine
+            .evaluate_module(rejected.id(), &opts)
+            .expect("rejected")
+        {
+            ModuleEvaluation::Rejected { message } => {
+                assert!(message.contains("tla boom"), "unexpected: {message}");
+                assert!(!message.contains("example.test"), "url leaked: {message}");
+            }
+            other => panic!("expected Rejected, got: {other:?}"),
+        }
+        // 解決済みの Promise を待つ TLA は checkpoint で完了して `Fulfilled`。
+        assert_eq!(
+            engine.evaluate_module(resolved.id(), &opts).expect("tla"),
+            ModuleEvaluation::Fulfilled
+        );
+        assert_eq!(eval_str(&mut engine, "resolvedTla"), JsValue::Number(1.0));
+    }
+
+    /// JS-4・REPAIR-3・Issue #1112: モジュール評価中に積まれた microtask の効果は、
+    /// `evaluate_module` の戻り時点で反映されている。
+    #[test]
+    fn js_4_v8_module_microtasks_are_flushed_before_evaluate_returns() {
+        let mut engine = module_engine();
+        let record = compile_ok(
+            &mut engine,
+            "https://example.test/m.js",
+            "globalThis.order = []; \
+             Promise.resolve().then(() => { globalThis.order.push('then'); \
+               return Promise.resolve().then(() => globalThis.order.push('nested')); }); \
+             globalThis.order.push('sync'); export {};",
+        );
+        let result = engine
+            .evaluate_module(record.id(), &EvaluateOptions::default())
+            .expect("module must evaluate");
+        assert_eq!(result, ModuleEvaluation::Fulfilled);
+        assert_eq!(
+            eval_str(&mut engine, "order.join(',')"),
+            JsValue::String("sync,then,nested".to_string())
+        );
+    }
+
+    /// JS-6・Issue #1112: 無限に microtask を積むモジュールも監視で止まり `Timeout`。
+    /// エンジンは使い続けられる。
+    #[test]
+    fn js_6_v8_module_infinite_microtask_loop_times_out() {
+        let mut engine = module_engine();
+        let record = compile_ok(
+            &mut engine,
+            "https://example.test/loop.js",
+            "const f = () => Promise.resolve().then(f); f(); export {};",
+        );
+        let opts = EvaluateOptions::default().with_timeout(Duration::from_millis(300));
+        let started = std::time::Instant::now();
+        assert!(matches!(
+            engine.evaluate_module(record.id(), &opts),
+            Err(JsEngineError::Timeout(_))
+        ));
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(eval_str(&mut engine, "1 + 1"), JsValue::Number(2.0));
+    }
+
+    /// JS-6・Issue #1112: `Rejected` のメッセージが `max_result_bytes` を超えると
+    /// `EvaluationFailed`（boa と同じ契約）。
+    #[test]
+    fn js_6_v8_module_rejected_message_respects_result_limit() {
+        let mut engine = module_engine();
+        let record = compile_ok(
+            &mut engine,
+            "https://example.test/big.js",
+            "await Promise.reject(new Error('x'.repeat(200)));",
+        );
+        let opts = EvaluateOptions::default().with_max_result_bytes(16);
+        assert!(matches!(
+            engine.evaluate_module(record.id(), &opts),
+            Err(JsEngineError::EvaluationFailed(_))
+        ));
     }
 }
