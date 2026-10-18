@@ -1682,6 +1682,13 @@ async fn run_event_loop(
         let mut dynamic_queue: VecDeque<DynamicImportRequest> = VecDeque::new();
         loop {
             if let Some(kind) = tripped_abort_kind(ctx)? {
+                // 取り出し済みで未処理の動的 import は reject として計上してから打ち切る。
+                for _ in dynamic_queue.drain(..) {
+                    dynamic_imports.rejected = dynamic_imports.rejected.saturating_add(1);
+                    dynamic_imports
+                        .failures
+                        .push(DynamicImportFailureKind::Limit(kind.clone()));
+                }
                 *abort = Some(PageAbort { kind, index: None });
                 break;
             }

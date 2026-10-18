@@ -975,6 +975,12 @@ fn call_finish(
         Err(Error::JsEvaluation(JsEngineError::NotYetImplemented(_))) => {
             Err(GraphError::Unsupported)
         }
+        // 拒否メッセージの上限超過等。静的 evaluate_root と同様にこの要求だけの reject とし、
+        // ページは継続する（`EvaluationFailed` として数える）。
+        Err(Error::JsEvaluation(JsEngineError::EvaluationFailed(_))) => Ok(Finished {
+            settlement: ModuleEvaluation::rejected(String::new()),
+            delivered,
+        }),
         Err(e) => {
             let (kind, message) = engine_error_abort(&e, scope, ctx.options);
             Err(GraphError::Abort(kind, message))
@@ -1043,15 +1049,7 @@ pub(super) async fn pump_one_dynamic_import(
         ))
     );
     // ページの実時間が尽きたときは JS を走らせない。それ以外は reject してから打ち切る。
-    // 評価に入る前にページ時間が尽きていたか（JS 未実行）。実際に評価して Page 側の時間切れに
-    // なった場合は reject 済みのため、この判定には含めない。
-    let js_skipped = page_wall
-        || script_budget(
-            ctx.options.script_wall_time,
-            ctx.options.page_wall_time,
-            ctx.page_start.elapsed(),
-        )
-        .is_none();
+    // どちらも取り出し時に requested へ計上済みのため、rejected に必ず数える（件数の不変条件）。
     let finished = if page_wall {
         Err(page_clock_abort(ctx))
     } else {
@@ -1069,14 +1067,11 @@ pub(super) async fn pump_one_dynamic_import(
             return Ok(false);
         }
         (_, Err(GraphError::Abort(kind, _))) => {
-            // 評価中の予算超過など、エンジンが reject して打ち切ったものは reject として数える。
-            // 評価に入る前にページの実時間が尽きた場合だけは JS を走らせず reject もしないため数えない。
-            if !js_skipped {
-                report.rejected = report.rejected.saturating_add(1);
-                report
-                    .failures
-                    .push(DynamicImportFailureKind::Limit(kind.clone()));
-            }
+            // 評価中の予算超過・評価前の時間切れのいずれも、要求は取り出し時に計上済みのため reject として数える。
+            report.rejected = report.rejected.saturating_add(1);
+            report
+                .failures
+                .push(DynamicImportFailureKind::Limit(kind.clone()));
             *abort = Some(PageAbort { kind, index: None });
             return Ok(false);
         }
@@ -1110,13 +1105,14 @@ pub(super) async fn pump_one_dynamic_import(
             report.failures.push(kind.clone());
         }
     }
-    // shim は op のエラー（操作予算切れ）を握りつぶすため、先に検出して打ち切る（`JS-6`）。
-    if let Some(kind) = tripped_abort_kind(ctx)? {
+    // `then` / `catch` の反応内の `queueMicrotask` を実行する。
+    if let Some((kind, _)) = microtask_checkpoint(rt, ctx) {
         *abort = Some(PageAbort { kind, index: None });
         return Ok(false);
     }
-    // `then` / `catch` の反応内の `queueMicrotask` を実行する。
-    if let Some((kind, _)) = microtask_checkpoint(rt, ctx) {
+    // shim は op のエラー（操作予算切れ）を握りつぶすため、checkpoint の後に検出して打ち切る（`JS-6`）。
+    // 打ち切ると呼び出し側が取り出し済みの残り要求を reject として計上する。
+    if let Some(kind) = tripped_abort_kind(ctx)? {
         *abort = Some(PageAbort { kind, index: None });
         return Ok(false);
     }

@@ -3,6 +3,7 @@
 //! 実エンジン（V8）での結合は `tests/support/page_runner_cases.rs` の `run_module_graph` が担う。
 
 use super::*;
+use crate::event_loop::EventLoopLimits;
 use crate::fetch::FetchOptions;
 use crate::page_runner::{
     PageRunInput, PageRunOptions, PageRunOutput, run_with_fetcher_and_factory,
@@ -43,6 +44,10 @@ struct FakeModuleEngine {
     take_unsupported: bool,
     /// `slow-take` を含む module を compile すると、要求を返す `take` がこの時間ブロックする。
     take_sleep: Option<Duration>,
+    /// `__dom.op` の束縛（checkpoint でタイマーを登録して上限超過を再現する用）。
+    op: Option<NativeFn>,
+    /// `checkpoint-timers` を含む module を compile すると、checkpoint の評価でタイマーを複数登録する。
+    checkpoint_timers: bool,
 }
 
 impl FakeModuleEngine {
@@ -77,6 +82,18 @@ impl JsEngine for FakeModuleEngine {
         script: &str,
         _options: &EvaluateOptions,
     ) -> Result<JsValue, JsEngineError> {
+        if script == "__fandheRunMicrotasks()" && self.checkpoint_timers {
+            if let Some(op) = self.op.as_mut() {
+                for _ in 0..3 {
+                    let _ = op(&[
+                        JsValue::String("timerSet".to_string()),
+                        JsValue::Number(1.0),
+                        JsValue::Bool(false),
+                    ]);
+                }
+            }
+            return Ok(JsValue::Undefined);
+        }
         let specs = Self::scan(script, "dynamic-doc");
         self.push_dynamic(None, specs);
         Ok(JsValue::Undefined)
@@ -93,8 +110,9 @@ impl JsEngine for FakeModuleEngine {
     fn bind_dom_like_object(
         &mut self,
         _name: &str,
-        _methods: Vec<(String, NativeFn)>,
+        methods: Vec<(String, NativeFn)>,
     ) -> Result<(), JsEngineError> {
+        self.op = methods.into_iter().find(|(n, _)| n == "op").map(|(_, f)| f);
         Ok(())
     }
 
@@ -107,6 +125,9 @@ impl JsEngine for FakeModuleEngine {
         }
         if source.contains("no-dyn-support") {
             self.take_unsupported = true;
+        }
+        if source.contains("checkpoint-timers") {
+            self.checkpoint_timers = true;
         }
         if source.contains("slow-take") {
             self.take_sleep = Some(Duration::from_millis(400));
@@ -139,6 +160,14 @@ impl JsEngine for FakeModuleEngine {
         resolutions: &[ModuleResolution],
     ) -> Result<(), JsEngineError> {
         let mut log = self.log.lock().expect("log");
+        // `slow-link`: link で時間を使い、取得・compile の後でページ時計を尽きさせる。
+        if log
+            .sources
+            .get(&referrer.raw())
+            .is_some_and(|src| src.contains("slow-link"))
+        {
+            std::thread::sleep(Duration::from_millis(500));
+        }
         for r in resolutions {
             log.events.push(format!(
                 "link:{}:{}={}",
@@ -231,6 +260,11 @@ impl JsEngine for FakeModuleEngine {
                     log.events.push(format!("finish:{}:timeout", id.raw()));
                     return Err(JsEngineError::Timeout("finish timeout".to_string()));
                 }
+                if src.contains("finish-too-large") {
+                    // 拒否メッセージが結果サイズ上限を超えたエンジン側の失敗（Promise は reject 済み）。
+                    log.events.push(format!("finish:{}:too-large", id.raw()));
+                    return Err(JsEngineError::EvaluationFailed("x".repeat(16)));
+                }
                 let settlement = if src.contains("settle-throw") {
                     ModuleEvaluation::rejected("boom".to_string())
                 } else if src.contains("settle-pending") {
@@ -264,6 +298,8 @@ fn fake_factory(log: Arc<Mutex<EngineLog>>) -> impl FnOnce() -> crate::Result<Js
                 next_dyn: 0,
                 take_unsupported: false,
                 take_sleep: None,
+                op: None,
+                checkpoint_timers: false,
             }),
         ))
     }
@@ -1503,5 +1539,74 @@ fn js_6_dynamic_import_page_scope_eval_timeout_is_counted_rejected() {
     assert_eq!(out.abort().map(|a| a.kind().clone()), Some(kind.clone()));
     let r = out.dynamic_imports();
     assert_eq!((r.requested(), r.fulfilled(), r.rejected()), (1, 0, 1));
+    assert_eq!(r.failures(), &[DynamicImportFailureKind::Limit(kind)]);
+}
+
+/// `JS-6`・Issue #1117: 取得・link の後でページ時計が尽きて完了を呼べなくても、要求は rejected に計上する
+/// （requested = fulfilled + rejected + pending）。
+#[test]
+fn js_6_dynamic_import_clock_expired_before_finish_is_counted_rejected() {
+    let (port, _hits) = spawn_server(|_| js("slow-link"));
+    let html = "<script type=module>dynamic \"/s.js\"</script>";
+    let limit = Duration::from_millis(300);
+    let opts = module_options().with_page_wall_time(limit);
+    let (out, _) = run(html, port, &opts);
+    let kind = AbortKind::WallTime {
+        scope: WallTimeScope::Page,
+        limit,
+    };
+    assert_eq!(out.abort().map(|a| a.kind().clone()), Some(kind.clone()));
+    let r = out.dynamic_imports();
+    assert_eq!(
+        (r.requested(), r.fulfilled(), r.rejected(), r.pending()),
+        (1, 0, 1, 0)
+    );
+    assert_eq!(r.failures(), &[DynamicImportFailureKind::Limit(kind)]);
+}
+
+/// `JS-6`・Issue #1117: 結果サイズ上限を超える拒否は、その要求だけの reject として数え、ページは継続する
+/// （静的 evaluate_root・classic 評価と同じ扱い）。
+#[test]
+fn js_6_dynamic_import_oversized_rejection_continues_page() {
+    let (port, _hits) = spawn_server(|path| {
+        if path == "/big.js" {
+            js("finish-too-large")
+        } else {
+            js("1")
+        }
+    });
+    let html = "<script type=module>dynamic \"/big.js\";dynamic \"/ok.js\"</script>";
+    let (out, _) = run(html, port, &module_options());
+    assert!(out.abort().is_none());
+    let r = out.dynamic_imports();
+    assert_eq!(
+        (r.requested(), r.fulfilled(), r.rejected(), r.pending()),
+        (2, 1, 1, 0)
+    );
+    assert_eq!(r.failures(), &[DynamicImportFailureKind::EvaluationFailed]);
+}
+
+/// `JS-6`・Issue #1117: checkpoint で資源上限に達して打ち切るとき、取り出し済みの残り要求を rejected に
+/// 計上する（requested = fulfilled + rejected + pending）。
+#[test]
+fn js_6_dynamic_import_checkpoint_limit_counts_remaining_queue() {
+    let (port, _hits) = spawn_server(|path| {
+        if path == "/a.js" {
+            js("checkpoint-timers")
+        } else {
+            js("1")
+        }
+    });
+    let html = "<script type=module>dynamic \"/a.js\";dynamic \"/b.js\"</script>";
+    let opts = module_options()
+        .with_event_loop_limits(EventLoopLimits::default().with_max_registered_timers(1));
+    let (out, _) = run(html, port, &opts);
+    let kind = AbortKind::RegisteredTimers { limit: 1 };
+    assert_eq!(out.abort().map(|a| a.kind().clone()), Some(kind.clone()));
+    let r = out.dynamic_imports();
+    assert_eq!(
+        (r.requested(), r.fulfilled(), r.rejected(), r.pending()),
+        (2, 1, 1, 0)
+    );
     assert_eq!(r.failures(), &[DynamicImportFailureKind::Limit(kind)]);
 }
