@@ -42,6 +42,12 @@
 //!   応答は `RESULT(Undefined)`（成功）または `ERROR{Binding}`（失敗）。
 //!   親の送信（`process_engine`）・子の処理（`worker`）は実装済み
 //!   （`TASK-29.5b`・Issue #525）。`JS-1`・`TASK-29.5a`・Issue #524
+//! - [`tag::COMPILE_MODULE`]・[`tag::MODULE_COMPILED`]・[`tag::LINK_MODULE`]・
+//!   [`tag::EVALUATE_MODULE`]・[`tag::MODULE_RESULT`]・
+//!   [`tag::TAKE_DYNAMIC_IMPORTS`]・[`tag::DYNAMIC_IMPORTS`]・
+//!   [`tag::FINISH_DYNAMIC_IMPORT`]: ES module 用（プロトコル v6。
+//!   [`module_frames`]。`JS-4`・Issue #1110）。子はまだ全操作に
+//!   `ERROR{NotYetImplemented}` を返す（`REPAIR-3`）
 //!
 //! # 検証方針（外部入力として扱う。coding-rust.md「外部入力」節）
 //!
@@ -103,7 +109,16 @@ pub(crate) const MARKER_ENV_VAR: &str = "FANDHE_BROWSER_JS_WORKER";
 /// （`timeout_ms`・`max_result_bytes`）を追加（`TASK-109`・Issue #776）。
 /// ヘッダ無しのフレームをスクリプトと誤解釈しないよう世代差をハンドシェイクで
 /// 検出する。
-pub(crate) const PROTOCOL_VERSION: u16 = 5;
+///
+/// 6: ES module 用フレーム（親 → 子の [`tag::COMPILE_MODULE`]・
+/// [`tag::LINK_MODULE`]・[`tag::EVALUATE_MODULE`]・[`tag::TAKE_DYNAMIC_IMPORTS`]・
+/// [`tag::FINISH_DYNAMIC_IMPORT`]、子 → 親の [`tag::MODULE_COMPILED`]・
+/// [`tag::MODULE_RESULT`]・[`tag::DYNAMIC_IMPORTS`]）と
+/// [`ErrorKind::NotYetImplemented`]・[`ErrorKind::ModuleResolution`]（ワイヤ値
+/// 4・5）を追加（`JS-4`・Issue #1110・設計 `es-module-design.md` §4）。旧世代の
+/// 子は新 tag をプロトコル違反として終了し、旧世代の親は新しいエラー種別を
+/// 解釈できないため、世代差をハンドシェイクで検出できるよう上げた。
+pub(crate) const PROTOCOL_VERSION: u16 = 6;
 
 /// フレームの `tag` バイトの値。
 ///
@@ -151,7 +166,29 @@ pub(crate) mod tag {
         )
     )]
     pub(crate) const BIND_DOM_LIKE_OBJECT: u8 = 9;
+    /// 親 → 子。ES module の compile（`super::module_frames::encode_compile_module`。
+    /// `JS-4`・Issue #1110）。応答は [`MODULE_COMPILED`] / `ERROR`。
+    pub(crate) const COMPILE_MODULE: u8 = 10;
+    /// 子 → 親。compile 結果（module id と依存 specifier 列）。
+    pub(crate) const MODULE_COMPILED: u8 = 11;
+    /// 親 → 子。依存の対応表による link。応答は `RESULT(Undefined)` / `ERROR`。
+    pub(crate) const LINK_MODULE: u8 = 12;
+    /// 親 → 子。link 済みモジュールの評価。応答は [`MODULE_RESULT`] / `ERROR`。
+    pub(crate) const EVALUATE_MODULE: u8 = 13;
+    /// 子 → 親。モジュール評価後の Promise の状態。
+    pub(crate) const MODULE_RESULT: u8 = 14;
+    /// 親 → 子。保留中の動的 import の取り出し（ペイロードなし）。応答は
+    /// [`DYNAMIC_IMPORTS`] / `ERROR`。
+    pub(crate) const TAKE_DYNAMIC_IMPORTS: u8 = 15;
+    /// 子 → 親。保留中の動的 import の一覧。
+    pub(crate) const DYNAMIC_IMPORTS: u8 = 16;
+    /// 親 → 子。動的 import の完了通知。応答は `RESULT(Undefined)` / `ERROR`。
+    pub(crate) const FINISH_DYNAMIC_IMPORT: u8 = 17;
 }
+
+/// ES module 用フレームのコーデック・上限定数・id 台帳（`JS-4`・`JS-6`・
+/// Issue #1110）。
+pub(crate) mod module_frames;
 
 /// 注入するグローバル関数名の最大バイト数（`JS-1`・`TASK-29.4`・
 /// Issue #155）。親の事前検証・登録フレームの decode・子の
@@ -248,6 +285,10 @@ pub(crate) const MAX_NATIVE_CALL_ARGS: usize = 64;
 /// エラーをプロトコル違反として扱い、相手側のプロセスとの通信を打ち切る
 /// （設計書 §3.5「プロトコル違反は子を kill する」）。
 #[derive(Debug)]
+#[cfg_attr(
+    not(any(test, feature = "js-v8", feature = "js-boa")),
+    allow(dead_code)
+)]
 pub(crate) enum ProtocolError {
     /// 下層の I/O エラー（読み取り・書き込み失敗。[`write_frame`]・
     /// [`read_frame`] が返す。`js-v8` feature 有効時のみ非テストで構築
@@ -271,20 +312,10 @@ pub(crate) enum ProtocolError {
         allow(dead_code)
     )]
     FrameTooLarge { len: usize, max: usize },
-    /// 未知の tag バイト。呼び出し元（`super::worker`・
-    /// `super::process_engine`）がタグの意味解釈をした結果として構築する
-    /// 想定であり、`read_frame` 自体はタグの妥当性を検証しない
-    /// （テストのみが構築する。§7 W3 時点では `super::worker` 側の
-    /// 不明タグ処理は独自のエラーメッセージで済ませており、本 variant は
-    /// 未構築のまま）。
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "呼び出し側がタグの意味解釈をした結果として構築する想定の variant。\
-                      現時点では未構築（REPAIR-3）"
-        )
-    )]
+    /// 未知の tag バイト。呼び出し元がタグの意味解釈をした結果として構築する
+    /// （`read_frame` 自体はタグの妥当性を検証しない。現状の構築元は
+    /// `super::worker` の module フレーム処理の防御的な分岐とテスト。
+    /// `JS-4`・Issue #1110）。
     UnknownTag(u8),
     /// 値のデコード時に、未知の [`JsValue`] タグバイトを受け取った
     /// （[`decode_js_value`]。W4（process_engine.rs）から使われるまで
@@ -440,6 +471,34 @@ pub(crate) enum ProtocolError {
         )
     )]
     DuplicateDomLikeMemberName,
+    /// ES module 1 件の依存 specifier 数、または 1 回の link の対応表の行数が
+    /// [`module_frames::MAX_MODULE_REQUESTS`] を超えた（`JS-6`・Issue #1110）。
+    TooManyModuleRequests { count: usize, max: usize },
+    /// specifier が [`module_frames::MAX_MODULE_SPECIFIER_BYTES`] を超えた。
+    ModuleSpecifierTooLong { len: usize, max: usize },
+    /// モジュールの URL が [`module_frames::MAX_MODULE_URL_BYTES`] を超えた。
+    ModuleUrlTooLong { len: usize, max: usize },
+    /// モジュールの URL が空。
+    EmptyModuleUrl,
+    /// 1 つのフレーム内で specifier が重複した（名前は保持しない）。
+    DuplicateModuleSpecifier,
+    /// 動的 import の件数が [`module_frames::MAX_PENDING_DYNAMIC_IMPORTS`] を超えた。
+    TooManyDynamicImports { count: usize, max: usize },
+    /// 動的 import の id が重複した（1 フレーム内、または保留中の id と）。
+    DuplicateDynamicImportId,
+    /// `MODULE_RESULT` の status バイトが未知。
+    InvalidModuleResultStatus(u8),
+    /// `FINISH_DYNAMIC_IMPORT` の status バイトが未知。
+    InvalidFinishStatus(u8),
+    /// `DYNAMIC_IMPORTS` の referrer 有無フラグが 0/1 以外。
+    InvalidReferrerFlag(u8),
+    /// 台帳に無い module id を参照した。
+    UnknownModuleId,
+    /// compile 済みとして通知された module id が既知の id と重複した。
+    DuplicateModuleId,
+    /// 1 つの子が保持するモジュール数が
+    /// [`module_frames::MAX_MODULES_PER_WORKER`] を超えた。
+    TooManyModules { count: usize, max: usize },
 }
 
 impl std::fmt::Display for ProtocolError {
@@ -508,6 +567,52 @@ impl std::fmt::Display for ProtocolError {
             Self::DuplicateDomLikeMemberName => write!(
                 f,
                 "worker protocol DOM-like object has a duplicate member name"
+            ),
+            Self::TooManyModuleRequests { count, max } => write!(
+                f,
+                "worker protocol module frame has {count} requests, exceeding the {max}-request limit"
+            ),
+            Self::ModuleSpecifierTooLong { len, max } => write!(
+                f,
+                "worker protocol module specifier of {len} bytes exceeds the {max}-byte limit"
+            ),
+            Self::ModuleUrlTooLong { len, max } => write!(
+                f,
+                "worker protocol module URL of {len} bytes exceeds the {max}-byte limit"
+            ),
+            Self::EmptyModuleUrl => write!(f, "worker protocol module URL must not be empty"),
+            Self::DuplicateModuleSpecifier => {
+                write!(f, "worker protocol module frame has a duplicate specifier")
+            }
+            Self::TooManyDynamicImports { count, max } => write!(
+                f,
+                "worker protocol has {count} dynamic imports, exceeding the {max}-import limit"
+            ),
+            Self::DuplicateDynamicImportId => {
+                write!(f, "worker protocol has a duplicate dynamic import id")
+            }
+            Self::InvalidModuleResultStatus(byte) => write!(
+                f,
+                "worker protocol module result status byte {byte} is unknown"
+            ),
+            Self::InvalidFinishStatus(byte) => write!(
+                f,
+                "worker protocol dynamic import finish status byte {byte} is neither 0 (Ok) nor 1 (Err)"
+            ),
+            Self::InvalidReferrerFlag(byte) => write!(
+                f,
+                "worker protocol referrer flag byte {byte} is neither 0 nor 1"
+            ),
+            Self::UnknownModuleId => write!(f, "worker protocol references an unknown module id"),
+            Self::DuplicateModuleId => {
+                write!(
+                    f,
+                    "worker protocol announced a module id that already exists"
+                )
+            }
+            Self::TooManyModules { count, max } => write!(
+                f,
+                "worker protocol would hold {count} modules, exceeding the {max}-module limit"
             ),
         }
     }
@@ -817,7 +922,7 @@ pub(crate) const MAX_EVALUATE_TIMEOUT: Duration = Duration::from_secs(3600);
 /// `EVALUATE` ヘッダのバイト数（`u64 timeout_ms` ＋ `u64 max_result_bytes`）。
 /// フレーム上限 `MAX_FRAME_PAYLOAD_PARENT_TO_CHILD`（スクリプト上限 1 MiB
 /// ＋ 64 KiB の余白）に十分収まる。
-const EVALUATE_HEADER_BYTES: usize = 16;
+pub(super) const EVALUATE_HEADER_BYTES: usize = 16;
 
 /// ワイヤ上の評価タイムアウト（ミリ秒単位へ切り上げ、[`MAX_EVALUATE_TIMEOUT`]
 /// でクランプした値）。
@@ -842,24 +947,32 @@ pub(crate) fn wire_timeout(options: &EvaluateOptions) -> Duration {
     allow(dead_code)
 )]
 pub(crate) fn encode_evaluate(script: &str, options: &EvaluateOptions) -> Vec<u8> {
-    let timeout_ms = u64::try_from(wire_timeout(options).as_millis()).unwrap_or(u64::MAX);
-    let max_bytes = u64::try_from(options.max_result_bytes()).unwrap_or(u64::MAX);
     let mut out = Vec::with_capacity(EVALUATE_HEADER_BYTES + script.len());
-    out.extend_from_slice(&timeout_ms.to_le_bytes());
-    out.extend_from_slice(&max_bytes.to_le_bytes());
+    out.extend_from_slice(&encode_evaluate_header(options));
     out.extend_from_slice(script.as_bytes());
     out
 }
 
-/// [`encode_evaluate`] の逆変換。子（[`super::worker`]）が親からの
-/// `Evaluate` フレーム（untrusted）を検証する経路で使う。ヘッダ不足は
-/// [`ProtocolError::Truncated`]、不正 UTF-8 は [`ProtocolError::InvalidUtf8`]。
-/// タイムアウトは [`MAX_EVALUATE_TIMEOUT`] で再クランプする（多層防御）。
-#[cfg_attr(
-    not(any(test, feature = "js-v8", feature = "js-boa")),
-    allow(dead_code)
-)]
-pub(crate) fn decode_evaluate(payload: &[u8]) -> Result<(EvaluateOptions, String), ProtocolError> {
+/// `EVALUATE`・`EVALUATE_MODULE` が共有する 16 バイトのヘッダ
+/// （`u64 LE timeout_ms` ＋ `u64 LE max_result_bytes`）を組み立てる。
+/// タイムアウトの丸め規則を [`wire_timeout`] に一本化するための共通部
+/// （`JS-6`・Issue #1110）。
+pub(super) fn encode_evaluate_header(options: &EvaluateOptions) -> [u8; EVALUATE_HEADER_BYTES] {
+    let timeout_ms = u64::try_from(wire_timeout(options).as_millis()).unwrap_or(u64::MAX);
+    let max_bytes = u64::try_from(options.max_result_bytes()).unwrap_or(u64::MAX);
+    let mut out = [0u8; EVALUATE_HEADER_BYTES];
+    let (timeout_part, max_part) = out.split_at_mut(8);
+    timeout_part.copy_from_slice(&timeout_ms.to_le_bytes());
+    max_part.copy_from_slice(&max_bytes.to_le_bytes());
+    out
+}
+
+/// [`encode_evaluate_header`] の逆変換。ヘッダ後ろの残りのバイト列を返す。
+/// ヘッダ不足は [`ProtocolError::Truncated`]。タイムアウトは
+/// [`MAX_EVALUATE_TIMEOUT`] で再クランプする（多層防御）。
+pub(super) fn decode_evaluate_header(
+    payload: &[u8],
+) -> Result<(EvaluateOptions, &[u8]), ProtocolError> {
     let timeout_bytes: [u8; 8] = payload
         .get(..8)
         .and_then(|b| b.try_into().ok())
@@ -871,15 +984,28 @@ pub(crate) fn decode_evaluate(payload: &[u8]) -> Result<(EvaluateOptions, String
     let body = payload
         .get(EVALUATE_HEADER_BYTES..)
         .ok_or(ProtocolError::Truncated)?;
-    let script = std::str::from_utf8(body)
-        .map(str::to_string)
-        .map_err(|_| ProtocolError::InvalidUtf8)?;
     let timeout =
         Duration::from_millis(u64::from_le_bytes(timeout_bytes)).min(MAX_EVALUATE_TIMEOUT);
     let max_result_bytes = usize::try_from(u64::from_le_bytes(max_bytes)).unwrap_or(usize::MAX);
     let options = EvaluateOptions::default()
         .with_timeout(timeout)
         .with_max_result_bytes(max_result_bytes);
+    Ok((options, body))
+}
+
+/// [`encode_evaluate`] の逆変換。子（[`super::worker`]）が親からの
+/// `Evaluate` フレーム（untrusted）を検証する経路で使う。ヘッダ不足は
+/// [`ProtocolError::Truncated`]、不正 UTF-8 は [`ProtocolError::InvalidUtf8`]。
+/// タイムアウトは [`MAX_EVALUATE_TIMEOUT`] で再クランプする（多層防御）。
+#[cfg_attr(
+    not(any(test, feature = "js-v8", feature = "js-boa")),
+    allow(dead_code)
+)]
+pub(crate) fn decode_evaluate(payload: &[u8]) -> Result<(EvaluateOptions, String), ProtocolError> {
+    let (options, body) = decode_evaluate_header(payload)?;
+    let script = std::str::from_utf8(body)
+        .map(str::to_string)
+        .map_err(|_| ProtocolError::InvalidUtf8)?;
     Ok((options, script))
 }
 
@@ -912,6 +1038,14 @@ pub(crate) enum ErrorKind {
     /// `JS-1`・`TASK-32.2`・Issue #166）。子プロセスと Context は生きている
     /// ため、親は "context was discarded" を付けずにそのまま返す。
     ResourceLimit,
+    /// 子がまだ対応していない操作（[`JsEngineError::NotYetImplemented`] に
+    /// 対応。ワイヤ値 4。`JS-4`・`REPAIR-3`・Issue #1110）。子と Context は
+    /// 生きている。
+    NotYetImplemented,
+    /// モジュールの解決・link の失敗（[`JsEngineError::ModuleResolutionFailed`]
+    /// に対応。ワイヤ値 5。メッセージには specifier・URL を入れず固定の種別
+    /// 文言にする。`JS-4`・Issue #1110）。子と Context は生きている。
+    ModuleResolution,
 }
 
 impl ErrorKind {
@@ -925,6 +1059,8 @@ impl ErrorKind {
             Self::Binding => 1,
             Self::Timeout => 2,
             Self::ResourceLimit => 3,
+            Self::NotYetImplemented => 4,
+            Self::ModuleResolution => 5,
         }
     }
 
@@ -938,6 +1074,8 @@ impl ErrorKind {
             1 => Ok(Self::Binding),
             2 => Ok(Self::Timeout),
             3 => Ok(Self::ResourceLimit),
+            4 => Ok(Self::NotYetImplemented),
+            5 => Ok(Self::ModuleResolution),
             other => Err(ProtocolError::InvalidErrorKind(other)),
         }
     }
@@ -1990,6 +2128,8 @@ mod tests {
             ErrorKind::Binding,
             ErrorKind::Timeout,
             ErrorKind::ResourceLimit,
+            ErrorKind::NotYetImplemented,
+            ErrorKind::ModuleResolution,
         ] {
             let payload = encode_error(kind, "boom");
             let (decoded_kind, message) = decode_error(&payload).expect("decode must succeed");
@@ -2038,6 +2178,34 @@ mod tests {
             ProtocolError::InvalidNativeReturnStatus(9),
             ProtocolError::ErrorMessageTooLong { len: 10, max: 5 },
             ProtocolError::NativeCallPayloadTooLarge { size: 10, max: 5 },
+            ProtocolError::TooManyModuleRequests {
+                count: 300,
+                max: 256,
+            },
+            ProtocolError::ModuleSpecifierTooLong {
+                len: 3000,
+                max: 2048,
+            },
+            ProtocolError::ModuleUrlTooLong {
+                len: 5000,
+                max: 4096,
+            },
+            ProtocolError::EmptyModuleUrl,
+            ProtocolError::DuplicateModuleSpecifier,
+            ProtocolError::TooManyDynamicImports {
+                count: 300,
+                max: 256,
+            },
+            ProtocolError::DuplicateDynamicImportId,
+            ProtocolError::InvalidModuleResultStatus(9),
+            ProtocolError::InvalidFinishStatus(9),
+            ProtocolError::InvalidReferrerFlag(9),
+            ProtocolError::UnknownModuleId,
+            ProtocolError::DuplicateModuleId,
+            ProtocolError::TooManyModules {
+                count: 2000,
+                max: 1024,
+            },
         ];
         for err in errors {
             assert!(!err.to_string().is_empty());
@@ -2345,7 +2513,7 @@ mod tests {
     #[test]
     fn js_1_marker_env_var_and_protocol_version_have_the_documented_values() {
         assert_eq!(MARKER_ENV_VAR, "FANDHE_BROWSER_JS_WORKER");
-        assert_eq!(PROTOCOL_VERSION, 5);
+        assert_eq!(PROTOCOL_VERSION, 6);
     }
 
     /// JS-1: 想定される tag 値が予約分も含め重複しないこと（プロトコル
@@ -2362,6 +2530,14 @@ mod tests {
             tag::SHUTDOWN,
             tag::REGISTER_GLOBAL_FUNCTION,
             tag::BIND_DOM_LIKE_OBJECT,
+            tag::COMPILE_MODULE,
+            tag::MODULE_COMPILED,
+            tag::LINK_MODULE,
+            tag::EVALUATE_MODULE,
+            tag::MODULE_RESULT,
+            tag::TAKE_DYNAMIC_IMPORTS,
+            tag::DYNAMIC_IMPORTS,
+            tag::FINISH_DYNAMIC_IMPORT,
         ];
         let mut sorted = tags.to_vec();
         sorted.sort_unstable();
