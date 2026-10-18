@@ -25,6 +25,14 @@
 //! [`AbortKind`] に写し、原因の entry を `Aborted`、以降を `NotExecuted` にする（classic と同じ単位）。
 //! 診断に URL・クエリは残さない。
 //!
+//! # 動的 `import()`（Issue #1117）
+//!
+//! イベントループ段が [`pump_one_dynamic_import`] を 1 件ずつ呼ぶ。specifier を referrer の URL に
+//! 対して解決し、静的 import と同じ経路（`Fetcher`・MIME・同一オリジン・重複排除・上限）で対象を
+//! 取得・compile・link して `finish_dynamic_import` で resolve する。失敗は `Err` で reject し、
+//! メッセージは固定文字列 `dynamic import failed: <種別>` だけ（URL・specifier を含めない）。
+//! 件数・総バイト・深さ・実時間の超過は reject したうえで `AbortKind` に写してページを打ち切る。
+//!
 //! # スタブ・簡易実装の残り（REPAIR-3）
 //!
 //! - 同一オリジンの module だけを取得する（設計 §6 の案 (a)）。別オリジンを許す案 (b)・(c) と
@@ -32,7 +40,12 @@
 //! - 応答の MIME は JavaScript MIME type の essence に限る（Content-Type が無い応答も拒否）。
 //!   classic の `src` が Content-Type を検査しないこととの差異は意図的（module は MIME 検査が必須）。
 //! - `compile_module` は期限を引数に取れない（エンジンの既定値）。compile の前後でページ時計を確認する。
-//! - 動的 `import()` の取得は未対応（#1117）。件数の計上枠（`attempted`）だけ用意してある。
+//! - 動的 `import()`: `referrer=None`（classic スクリプトからの呼び出し）は外部スクリプトの URL では
+//!   なく文書の base URL を基準に解決する近似。動的 import の対象は新しい root（深さ 0）として扱い、
+//!   連鎖は `max_modules` と [`super::MAX_PAGE_DYNAMIC_IMPORTS`] で抑える。V8 の
+//!   `finish_dynamic_import` は内部で microtask checkpoint を回すため、上限で打ち切る場合も
+//!   `catch` ハンドラが 1 回だけ走り得る。評価済み entry の `ScriptOutcome::ModulePending` は
+//!   動的 import の完了後に遡って更新しない。
 //! - module の評価中は `document.currentScript` を設定しない（WHATWG では module は null）。
 //!   実行順は classic と同じ文書順（`async` / `defer` の順序近似は行わない）。
 
@@ -40,14 +53,16 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::Duration;
 
 use fandhe_browser_js::{
-    EvaluateOptions, JsEngineError, ModuleEvaluation, ModuleId, ModuleResolution,
+    DynamicImportRequest, EvaluateOptions, JsEngineError, ModuleEvaluation, ModuleId,
+    ModuleResolution,
 };
 use reqwest::Url;
 
 use super::{
-    AbortKind, MAX_MODULE_GRAPH_DEPTH, PageAbort, RunContext, ScriptBytesScope, ScriptOutcome,
-    SrcFailure, SrcFetchErrorKind, WallTimeScope, check_src_response, classify_fetch_error,
-    engine_error_abort, lossy_len_exceeds, page_wall_abort, script_budget,
+    AbortKind, DynamicImportFailureKind, DynamicImportReport, MAX_MODULE_GRAPH_DEPTH,
+    MAX_PAGE_DYNAMIC_IMPORTS, PageAbort, RunContext, ScriptBytesScope, ScriptOutcome, SrcFailure,
+    SrcFetchErrorKind, WallTimeScope, check_src_response, classify_fetch_error, engine_error_abort,
+    lossy_len_exceeds, microtask_checkpoint, page_wall_abort, script_budget, tripped_abort_kind,
 };
 use crate::error::Error;
 use crate::fetch::Fetcher;
@@ -188,6 +203,10 @@ pub(super) struct ModuleGraph {
     module_bytes: usize,
     /// evaluate 済みの root と、その結果（同じ module を二度 evaluate せず、再参照には同じ結果を返す）。
     evaluated: HashMap<ModuleId, EvalState>,
+    /// compile 済みモジュールの referrer URL（動的 `import()` の解決基準。件数は `max_modules` で頭打ち）。
+    referrers: HashMap<ModuleId, Url>,
+    /// これまでに処理を始めた動的 `import()` の要求数（[`MAX_PAGE_DYNAMIC_IMPORTS`] で頭打ち）。
+    dynamic_requests: usize,
 }
 
 /// evaluate 済み root の結果（再参照時に同じ結果を返すために保持する）。
@@ -208,6 +227,8 @@ impl ModuleGraph {
             classic_bytes: 0,
             module_bytes: 0,
             evaluated: HashMap::new(),
+            referrers: HashMap::new(),
+            dynamic_requests: 0,
         }
     }
 
@@ -435,11 +456,20 @@ async fn fetch_and_compile(
     // `import.meta.url` とモジュール同一性のため、要求のフラグメントを戻す。
     final_url.set_fragment(url.fragment());
     let (id, deps) = compile_source(rt, ctx, &final_url, &text)?;
+    graph.referrers.insert(id, final_url);
     Ok(ReadyModule {
         id,
         deps,
         linked: false,
     })
+}
+
+/// グラフの root。
+enum GraphRoot<'a> {
+    /// inline module の本文（マップに登録しない）。
+    Inline(&'a str),
+    /// URL で指す module（`src`・動的 `import()` の対象）。
+    Url { specifier: &'a str, url: Url },
 }
 
 /// entry のグラフを取得・compile・link し、root の id を返す。
@@ -449,6 +479,26 @@ async fn load_graph(
     graph: &mut ModuleGraph,
     source: &ScriptSource,
 ) -> Result<ModuleId, GraphError> {
+    let root = match source {
+        ScriptSource::Inline(text) => GraphRoot::Inline(text),
+        ScriptSource::External(src) => GraphRoot::Url {
+            specifier: src,
+            url: ctx
+                .base
+                .join(src)
+                .map_err(|_| ModuleFailure::Fetch(SrcFetchErrorKind::InvalidUrl))?,
+        },
+    };
+    load_graph_root(rt, ctx, graph, root).await
+}
+
+/// `root` のグラフを取得・compile・link し、root の id を返す（静的 entry と動的 `import()` 共通）。
+async fn load_graph_root(
+    rt: &mut JsRuntime,
+    ctx: &RunContext<'_>,
+    graph: &mut ModuleGraph,
+    root: GraphRoot<'_>,
+) -> Result<ModuleId, GraphError> {
     let mut queue: VecDeque<(Dep, usize)> = VecDeque::new();
     let mut seen: HashSet<String> = HashSet::new();
     let mut to_link: Vec<String> = Vec::new();
@@ -456,26 +506,23 @@ async fn load_graph(
     let mut inline_root: Option<(ModuleId, Vec<Dep>)> = None;
     let mut root_key: Option<String> = None;
 
-    match source {
-        ScriptSource::Inline(text) => {
+    match root {
+        GraphRoot::Inline(text) => {
             reserve_module_slot(ctx, graph)?;
             add_module_bytes(ctx, graph, text.len())?;
             let (id, deps) = compile_source(rt, ctx, ctx.base, text)?;
+            graph.referrers.insert(id, ctx.base.clone());
             for dep in &deps {
                 queue.push_back((dep.clone(), 1));
             }
             inline_root = Some((id, deps));
         }
-        ScriptSource::External(src) => {
-            let resolved = ctx
-                .base
-                .join(src)
-                .map_err(|_| ModuleFailure::Fetch(SrcFetchErrorKind::InvalidUrl))?;
-            let (key, url) = module_key(resolved);
+        GraphRoot::Url { specifier, url } => {
+            let (key, url) = module_key(url);
             root_key = Some(key.clone());
             queue.push_back((
                 Dep {
-                    specifier: src.clone(),
+                    specifier: specifier.to_string(),
                     key,
                     url,
                 },
@@ -816,6 +863,208 @@ pub(super) async fn run_module_entry(
         }
     }
     evaluate_root(rt, ctx, graph, root, index, abort)
+}
+
+/// 動的 `import()` の失敗を `finish_dynamic_import` に渡す固定メッセージにする（URL を含めない）。
+fn failure_message(kind: &DynamicImportFailureKind) -> String {
+    format!("dynamic import failed: {}", kind.as_str())
+}
+
+/// 要求 1 件の対象を解決・取得・compile・link し、対象の id を返す（`JS-4`・`JS-8`）。
+async fn load_dynamic_target(
+    rt: &mut JsRuntime,
+    ctx: &RunContext<'_>,
+    graph: &mut ModuleGraph,
+    request: &DynamicImportRequest,
+) -> Result<ModuleId, DynamicImportError> {
+    // `referrer=None` は classic スクリプト。文書の base URL で近似する（REPAIR-3）。
+    let referrer = match request.referrer() {
+        None => ctx.base.clone(),
+        Some(id) => graph
+            .referrers
+            .get(&id)
+            .cloned()
+            .ok_or(DynamicImportError::UnknownReferrer)?,
+    };
+    let url = resolve_specifier(&referrer, request.specifier())
+        .map_err(|kind| DynamicImportError::Graph(ModuleFailure::Fetch(kind).into()))?;
+    load_graph_root(
+        rt,
+        ctx,
+        graph,
+        GraphRoot::Url {
+            specifier: request.specifier(),
+            url,
+        },
+    )
+    .await
+    .map_err(DynamicImportError::Graph)
+}
+
+/// [`load_dynamic_target`] の失敗。
+enum DynamicImportError {
+    Graph(GraphError),
+    UnknownReferrer,
+}
+
+/// `finish_dynamic_import` を、残り時間の確認つきで呼ぶ。
+///
+/// `finish` は期限を引数に取れないため、呼ぶ前に残りを確認し、呼んだ後にページ時計を確認する。
+/// `Ok` の対象を engine が受け付けない（`ModuleResolutionFailed`）ときは 1 回だけ `Err` で完了し直し、
+/// そのとき `Ok(false)` を返す（呼び出し側は reject として数える）。
+fn call_finish(
+    rt: &mut JsRuntime,
+    ctx: &RunContext<'_>,
+    id: fandhe_browser_js::DynamicImportId,
+    result: Result<ModuleId, String>,
+) -> Result<bool, GraphError> {
+    let Some((_, scope)) = script_budget(
+        ctx.options.script_wall_time,
+        ctx.options.page_wall_time,
+        ctx.page_start.elapsed(),
+    ) else {
+        return Err(page_clock_abort(ctx));
+    };
+    let was_ok = result.is_ok();
+    let mut delivered = true;
+    let mut outcome = rt.finish_dynamic_import(id, result);
+    if was_ok
+        && matches!(
+            outcome,
+            Err(Error::JsEvaluation(JsEngineError::ModuleResolutionFailed(
+                _
+            )))
+        )
+    {
+        delivered = false;
+        let kind = DynamicImportFailureKind::Fetch(SrcFetchErrorKind::Other);
+        outcome = rt.finish_dynamic_import(id, Err(failure_message(&kind)));
+    }
+    let page_expired = ctx.page_start.elapsed() > ctx.options.page_wall_time;
+    match outcome {
+        Ok(()) if page_expired => Err(page_clock_abort(ctx)),
+        Ok(()) => Ok(delivered),
+        Err(Error::JsEvaluation(JsEngineError::NotYetImplemented(_))) => {
+            Err(GraphError::Unsupported)
+        }
+        Err(e) => {
+            let (kind, message) = engine_error_abort(&e, scope, ctx.options);
+            Err(GraphError::Abort(kind, message))
+        }
+    }
+}
+
+/// 動的 `import()` を 1 件取得して完了させ、microtask checkpoint を回す（`JS-4`・`JS-6`・`JS-8`・`SEC-2`）。
+///
+/// 呼び出し元: [`super::run_event_loop`]（gate 有効のページだけ）。継続してよければ `true`、
+/// 打ち切った（`abort` を設定した）なら `false`。上限・実時間の超過は reject してから打ち切る
+/// （ページの実時間が尽きた場合は JS を走らせる予算が無いため reject せずに打ち切る）。
+/// 評価する文字列は固定の関数名だけで、specifier・URL は埋め込まない。
+pub(super) async fn pump_one_dynamic_import(
+    rt: &mut JsRuntime,
+    ctx: &RunContext<'_>,
+    graph: &mut ModuleGraph,
+    request: &DynamicImportRequest,
+    report: &mut DynamicImportReport,
+    abort: &mut Option<PageAbort>,
+) -> crate::Result<bool> {
+    report.requested = report.requested.saturating_add(1);
+    let id = request.id();
+    // 失敗の種別と、打ち切りの理由（打ち切るときだけ）。
+    let verdict: Result<ModuleId, (DynamicImportFailureKind, Option<AbortKind>)> =
+        if graph.dynamic_requests >= MAX_PAGE_DYNAMIC_IMPORTS {
+            Err((
+                DynamicImportFailureKind::Limit(AbortKind::ResourceLimit),
+                Some(AbortKind::ResourceLimit),
+            ))
+        } else {
+            graph.dynamic_requests = graph.dynamic_requests.saturating_add(1);
+            match load_dynamic_target(rt, ctx, graph, request).await {
+                Ok(target) => Ok(target),
+                Err(DynamicImportError::UnknownReferrer) => {
+                    Err((DynamicImportFailureKind::UnknownReferrer, None))
+                }
+                Err(DynamicImportError::Graph(GraphError::Failed(f))) => Err((
+                    match f {
+                        ModuleFailure::Fetch(kind) => DynamicImportFailureKind::Fetch(kind),
+                        ModuleFailure::Exception { .. } => DynamicImportFailureKind::CompileFailed,
+                    },
+                    None,
+                )),
+                Err(DynamicImportError::Graph(GraphError::Unsupported)) => {
+                    Err((DynamicImportFailureKind::Unsupported, None))
+                }
+                Err(DynamicImportError::Graph(GraphError::Abort(kind, _))) => {
+                    Err((DynamicImportFailureKind::Limit(kind.clone()), Some(kind)))
+                }
+            }
+        };
+
+    let result = match &verdict {
+        Ok(target) => Ok(*target),
+        Err((kind, _)) => Err(failure_message(kind)),
+    };
+    let page_wall = matches!(
+        &verdict,
+        Err((
+            _,
+            Some(AbortKind::WallTime {
+                scope: WallTimeScope::Page,
+                ..
+            })
+        ))
+    );
+    // ページの実時間が尽きたときは JS を走らせない。それ以外は reject してから打ち切る。
+    let finished = if page_wall {
+        Err(page_clock_abort(ctx))
+    } else {
+        call_finish(rt, ctx, id, result)
+    };
+    match (&verdict, finished) {
+        (Err((kind, Some(abort_kind))), _) => {
+            report.rejected = report.rejected.saturating_add(1);
+            report.failures.push(kind.clone());
+            // finish が失敗しても、打ち切りの理由は元の超過を優先する。
+            *abort = Some(PageAbort {
+                kind: abort_kind.clone(),
+                index: None,
+            });
+            return Ok(false);
+        }
+        (_, Err(GraphError::Abort(kind, _))) => {
+            *abort = Some(PageAbort { kind, index: None });
+            return Ok(false);
+        }
+        (_, Err(_)) => {
+            *abort = Some(PageAbort {
+                kind: AbortKind::EngineError,
+                index: None,
+            });
+            return Ok(false);
+        }
+        (Ok(_), Ok(true)) => report.fulfilled = report.fulfilled.saturating_add(1),
+        (Ok(_), Ok(false)) => {
+            report.rejected = report.rejected.saturating_add(1);
+            report
+                .failures
+                .push(DynamicImportFailureKind::Fetch(SrcFetchErrorKind::Other));
+        }
+        (Err((kind, None)), Ok(_)) => {
+            report.rejected = report.rejected.saturating_add(1);
+            report.failures.push(kind.clone());
+        }
+    }
+    // shim は op のエラー（操作予算切れ）を握りつぶすため、先に検出して打ち切る（`JS-6`）。
+    if let Some(kind) = tripped_abort_kind(ctx)? {
+        *abort = Some(PageAbort { kind, index: None });
+        return Ok(false);
+    }
+    // `then` / `catch` の反応内の `queueMicrotask` を実行する。
+    if let Some((kind, _)) = microtask_checkpoint(rt, ctx) {
+        *abort = Some(PageAbort { kind, index: None });
+        return Ok(false);
+    }
+    Ok(true)
 }
 
 #[cfg(test)]

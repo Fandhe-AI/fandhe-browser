@@ -59,6 +59,9 @@
 //!   グラフを [`Fetcher`] 経由で取得し、件数（[`PageRunOptions::max_modules`]）・深さ
 //!   （[`MAX_MODULE_GRAPH_DEPTH`]）・バイト数・実時間・MIME・オリジン（初版は同一オリジンのみ）を
 //!   fail-closed で検査する。詳細と差異は `module_graph` の doc を参照。
+//!   動的 `import()` はイベントループ段で（ネット要求・タイマーより先に）1 件ずつ取り出し、同じ経路で
+//!   取得して完了させる（Issue #1117。要求数の上限は [`MAX_PAGE_DYNAMIC_IMPORTS`]、処理結果は
+//!   [`PageRunOutput::dynamic_imports`]）。boa は動的 `import()` 未対応のため要求が生じない。
 //! - `src` の取得は呼び出し側が所有する [`Fetcher`] 経由のみ。scheme・内部アドレス・
 //!   リダイレクト先の検査は Fetcher に一元化されており（SSRF 対策。`SEC-2`）、拒否された
 //!   スクリプトは [`ScriptOutcome::SrcFetchFailed`] として後続の実行を続ける。診断には
@@ -92,9 +95,10 @@
 //!   （ソースの書き換えによる回避はしない）。
 
 use std::cell::Cell;
+use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
-use fandhe_browser_js::{EvaluateOptions, JsEngineError};
+use fandhe_browser_js::{DynamicImportRequest, EvaluateOptions, JsEngineError};
 use reqwest::Url;
 
 use crate::config::JsConfig;
@@ -135,6 +139,10 @@ pub const DEFAULT_MAX_PAGE_MODULES: usize = 64;
 /// module グラフの深さの上限（32。entry を 0 とし、33 段目のモジュールは取得しない。
 /// `JS-6`・Issue #1116）。
 pub const MAX_MODULE_GRAPH_DEPTH: usize = 32;
+/// ページあたりの動的 `import()` 要求数の上限（256。js crate の保留キューの上限と同じ。
+/// キャッシュに当たる要求は件数枠を消費しないため、繰り返しによる無限の周回をここで抑える。
+/// `JS-6`・Issue #1117）。
+pub const MAX_PAGE_DYNAMIC_IMPORTS: usize = 256;
 
 /// `src` 取得用の [`FetchOptions`]（本文上限を [`DEFAULT_MAX_SRC_SCRIPT_BYTES`] にしたもの）。
 ///
@@ -669,6 +677,71 @@ impl EventLoopReport {
     }
 }
 
+/// 動的 `import()` が失敗した理由の種別（`JS-4`・`JS-8`・Issue #1117）。
+///
+/// URL・specifier・エンジンの生メッセージは残さない（クエリにトークンを含み得るため）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum DynamicImportFailureKind {
+    /// 解決・取得の失敗（bare specifier・別オリジン・MIME・ステータス等）。
+    Fetch(SrcFetchErrorKind),
+    /// 構文エラー等で compile できなかった。
+    CompileFailed,
+    /// エンジンが module に未対応。
+    Unsupported,
+    /// 呼び出し元 module を特定できなかった（子の再起動後等。fail-closed）。
+    UnknownReferrer,
+    /// 上限・実時間・エンジン不能でページを打ち切った（打ち切りの種別）。
+    Limit(AbortKind),
+}
+
+impl DynamicImportFailureKind {
+    /// ログ・診断・`import()` の reject メッセージで使う安定した表記。
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Fetch(kind) => kind.as_str(),
+            Self::CompileFailed => "module_compile_failed",
+            Self::Unsupported => "module_unsupported",
+            Self::UnknownReferrer => "unknown_referrer",
+            Self::Limit(kind) => kind.as_str(),
+        }
+    }
+}
+
+/// 動的 `import()` の処理結果（`JS-4`・Issue #1117）。gate 無効のページでは全項目 0。
+///
+/// 失敗の記録は種別だけで URL を含まない。件数は [`MAX_PAGE_DYNAMIC_IMPORTS`] で頭打ち。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct DynamicImportReport {
+    pub(crate) requested: usize,
+    pub(crate) fulfilled: usize,
+    pub(crate) rejected: usize,
+    pub(crate) failures: Vec<DynamicImportFailureKind>,
+}
+
+impl DynamicImportReport {
+    /// エンジンから取り出した要求の件数。
+    pub fn requested(&self) -> usize {
+        self.requested
+    }
+
+    /// 取得・評価に成功して resolve した件数。
+    pub fn fulfilled(&self) -> usize {
+        self.fulfilled
+    }
+
+    /// reject した件数（打ち切りで reject したものを含む）。
+    pub fn rejected(&self) -> usize {
+        self.rejected
+    }
+
+    /// reject の理由（種別のみ。処理順）。
+    pub fn failures(&self) -> &[DynamicImportFailureKind] {
+        &self.failures
+    }
+}
+
 /// ランナーの結果。
 #[derive(Debug, Clone)]
 #[non_exhaustive]
@@ -682,6 +755,7 @@ pub struct PageRunOutput {
     elapsed: Duration,
     event_loop: EventLoopReport,
     net: NetReport,
+    dynamic_imports: DynamicImportReport,
 }
 
 impl PageRunOutput {
@@ -728,6 +802,11 @@ impl PageRunOutput {
     /// ページ内 `fetch` / `XMLHttpRequest` の実行結果（`JS-8`）。
     pub fn net(&self) -> &NetReport {
         &self.net
+    }
+
+    /// 動的 `import()` の処理結果（`JS-4`。gate 無効なら全項目 0。Issue #1117）。
+    pub fn dynamic_imports(&self) -> &DynamicImportReport {
+        &self.dynamic_imports
     }
 
     /// ページ時計で測った経過時間（JS 実行の開始から。`src` の取得時間は含まない）。
@@ -1272,7 +1351,16 @@ async fn execute(
     }
 
     let lifecycle = fire_lifecycle(&ctx, runtime.as_mut(), &mut abort)?;
-    let event_loop = run_event_loop(&ctx, fetcher, runtime.as_mut(), &mut abort).await?;
+    let mut dynamic_imports = DynamicImportReport::default();
+    let event_loop = run_event_loop(
+        &ctx,
+        fetcher,
+        runtime.as_mut(),
+        &mut graph,
+        &mut dynamic_imports,
+        &mut abort,
+    )
+    .await?;
 
     let elapsed = page_start.elapsed();
     let net = bridge.net_report().map_err(bridge_error)?;
@@ -1298,6 +1386,7 @@ async fn execute(
             elapsed,
             event_loop,
             net,
+            dynamic_imports,
         },
     ))
 }
@@ -1570,15 +1659,70 @@ async fn run_event_loop(
     ctx: &RunContext<'_>,
     fetcher: &Fetcher,
     runtime: Option<&mut JsRuntime>,
+    graph: &mut module_graph::ModuleGraph,
+    dynamic_imports: &mut DynamicImportReport,
     abort: &mut Option<PageAbort>,
 ) -> crate::Result<EventLoopReport> {
     if abort.is_none()
         && let Some(rt) = runtime
     {
+        // 動的 `import()` は gate 有効のページだけ取り出す（無効なら `take` を呼ばない。`JS-4`）。
+        let mut take_dynamic = ctx.options.collection.execute_modules();
+        // 取り出し済み・未処理の要求（1 周に 1 件処理する）。
+        let mut dynamic_queue: VecDeque<DynamicImportRequest> = VecDeque::new();
         loop {
             if let Some(kind) = tripped_abort_kind(ctx)? {
                 *abort = Some(PageAbort { kind, index: None });
                 break;
+            }
+            // 動的 `import()` の保留を取り出し、1 件ずつ取得して完了させる（Issue #1117）。
+            // ネット要求・タイマーより先に処理する（応答は仮想時間 0 の近似）。
+            if take_dynamic
+                && dynamic_queue.is_empty()
+                && script_budget(
+                    ctx.options.script_wall_time,
+                    ctx.options.page_wall_time,
+                    ctx.page_start.elapsed(),
+                )
+                .is_some()
+            {
+                match rt.take_dynamic_import_requests() {
+                    Ok(requests) => dynamic_queue.extend(requests),
+                    // boa 等の未対応エンジンは「要求なし」。以降このページでは呼ばない。
+                    Err(Error::JsEvaluation(JsEngineError::NotYetImplemented(_))) => {
+                        take_dynamic = false;
+                    }
+                    Err(e) => {
+                        let (kind, _) = engine_error_abort(&e, WallTimeScope::Page, ctx.options);
+                        *abort = Some(PageAbort { kind, index: None });
+                        break;
+                    }
+                }
+            }
+            if let Some(request) = dynamic_queue.pop_front() {
+                if script_budget(
+                    ctx.options.script_wall_time,
+                    ctx.options.page_wall_time,
+                    ctx.page_start.elapsed(),
+                )
+                .is_none()
+                {
+                    *abort = Some(page_wall_abort(ctx.options, None));
+                    break;
+                }
+                if !module_graph::pump_one_dynamic_import(
+                    rt,
+                    ctx,
+                    graph,
+                    &request,
+                    dynamic_imports,
+                    abort,
+                )
+                .await?
+                {
+                    break;
+                }
+                continue;
             }
             // 保留中のネットワーク要求（ページ内 fetch / XHR。`JS-8`）は、タイマーより先に
             // 1 件ずつ取得して配送する（応答は仮想時間 0 の遅延の近似）。
@@ -1763,6 +1907,7 @@ struct RunTail {
     elapsed: Duration,
     event_loop: EventLoopReport,
     net: NetReport,
+    dynamic_imports: DynamicImportReport,
 }
 
 /// 実行結果と収集時の診断を通し番号で統合して出力にまとめる。
@@ -1795,6 +1940,7 @@ fn finish(
         elapsed: tail.elapsed,
         event_loop: tail.event_loop,
         net: tail.net,
+        dynamic_imports: tail.dynamic_imports,
     }
 }
 
