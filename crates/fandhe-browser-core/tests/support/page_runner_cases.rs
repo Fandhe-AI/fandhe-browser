@@ -14,8 +14,8 @@ use fandhe_browser_core::dom_bridge::TimerCallbackSource;
 use fandhe_browser_core::fetch::{FetchOptions, Fetcher};
 use fandhe_browser_core::{
     AbortKind, Config, EventLoopLimits, LifecycleOutcome, NetRejectKind, NetRequestKind,
-    PageNetLimits, PageRunInput, PageRunOptions, PageRunOutput, ScriptOutcome, USER_AGENT,
-    WallTimeScope, run_page_scripts,
+    PageNetLimits, PageRunInput, PageRunOptions, PageRunOutput, ScriptCollectionOptions,
+    ScriptOutcome, SrcFetchErrorKind, USER_AGENT, WallTimeScope, run_page_scripts,
 };
 
 const BASE: &str = "https://example.test/";
@@ -997,6 +997,201 @@ pub fn run_fetch_promises(engine: &str) {
         out.html()
     );
     assert_eq!(hit_count(&hits), before);
+}
+
+/// 指定パスへの要求回数（ヒットの先頭行の request target で数える）。
+fn path_hits(hits: &Hits, path: &str) -> usize {
+    hits.lock()
+        .map(|h| {
+            h.iter()
+                .filter(|head| head.split_whitespace().nth(1) == Some(path))
+                .count()
+        })
+        .unwrap_or(usize::MAX)
+}
+
+fn module_options() -> PageRunOptions {
+    PageRunOptions::default()
+        .with_collection(ScriptCollectionOptions::default().with_execute_modules(true))
+}
+
+/// JavaScript MIME type で `body` を返す module サーバーの応答。
+fn js_response(body: &str) -> (&'static str, String, String) {
+    (
+        "200 OK",
+        "Content-Type: text/javascript\r\n".to_string(),
+        body.to_string(),
+    )
+}
+
+fn outcome_of(out: &PageRunOutput, i: usize) -> ScriptOutcome {
+    out.scripts()
+        .get(i)
+        .expect("script record")
+        .outcome()
+        .clone()
+}
+
+/// ES module のグラフを Fetcher 経由で取得して評価するケース（`JS-4`・`JS-6`・`JS-8`・
+/// Issue #1116）。実エンジンが静的 import のグラフ（循環を含む）を link・evaluate できることを確かめる。
+///
+/// boa は動的 `import()`・TLA が未対応のため V8 のテストだけが呼ぶ（boa への展開は別途判断）。
+#[allow(dead_code)]
+pub fn run_module_graph(engine: &str) {
+    let opts = module_options();
+
+    eprintln!("case: JS-4 module graph with a cycle (inline -> a -> b -> a) is evaluated once");
+    let (port, hits) = spawn_recording_server(|path| match path {
+        "/a.js" => js_response("import {v} from './b.js'; export const w = v + 1;"),
+        "/b.js" => js_response("import './a.js'; export const v = 2;"),
+        _ => ("404 Not Found", String::new(), "nope".to_string()),
+    });
+    let base = format!("http://127.0.0.1:{port}/");
+    let html = "<body><script type=module>import {w} from './a.js'; \
+        document.body.setAttribute('data-r', String(w)); globalThis.__r = w;</script></body>";
+    let out = run_page_at(engine, html, &base, &opts, &loopback_fetcher());
+    assert_eq!(
+        outcome_of(&out, 0),
+        ScriptOutcome::Succeeded,
+        "{}",
+        out.html()
+    );
+    assert!(out.html().contains("data-r=\"3\""), "{}", out.html());
+    assert_eq!(path_hits(&hits, "/a.js"), 1);
+    assert_eq!(path_hits(&hits, "/b.js"), 1);
+
+    eprintln!("case: JS-8 a shared module is fetched and evaluated once across entries");
+    let (port, hits) = spawn_recording_server(|path| match path {
+        "/shared.js" => js_response(
+            "globalThis.__c = (globalThis.__c || 0) + 1; export const n = globalThis.__c;",
+        ),
+        _ => ("404 Not Found", String::new(), "nope".to_string()),
+    });
+    let base = format!("http://127.0.0.1:{port}/");
+    let html = "<body>\
+        <script type=module>import {n} from './shared.js'; document.body.setAttribute('data-a', String(n));</script>\
+        <script type=module>import {n} from './shared.js'; document.body.setAttribute('data-b', String(n));</script>\
+        </body>";
+    let out = run_page_at(engine, html, &base, &opts, &loopback_fetcher());
+    assert_eq!(
+        outcome_of(&out, 0),
+        ScriptOutcome::Succeeded,
+        "{}",
+        out.html()
+    );
+    assert_eq!(outcome_of(&out, 1), ScriptOutcome::Succeeded);
+    assert!(out.html().contains("data-a=\"1\""), "{}", out.html());
+    assert!(out.html().contains("data-b=\"1\""), "{}", out.html());
+    assert_eq!(path_hits(&hits, "/shared.js"), 1);
+
+    eprintln!("case: JS-8 non-JS MIME / bare / data: / cross-origin are rejected with a kind");
+    let (other, other_hits) = spawn_recording_server(|_| js_response("export {};"));
+    let (port, hits) = spawn_recording_server(|path| match path {
+        "/text.js" => (
+            "200 OK",
+            "Content-Type: text/plain\r\n".to_string(),
+            "export {};".to_string(),
+        ),
+        _ => js_response("export {};"),
+    });
+    let base = format!("http://127.0.0.1:{port}/");
+    let cases = [
+        (
+            "./text.js".to_string(),
+            SrcFetchErrorKind::UnsupportedMimeType,
+            1,
+        ),
+        ("foo".to_string(), SrcFetchErrorKind::BareSpecifier, 0),
+        (
+            "data:text/javascript,export{}".to_string(),
+            SrcFetchErrorKind::DisallowedScheme,
+            0,
+        ),
+        (
+            format!("http://127.0.0.1:{other}/x.js"),
+            SrcFetchErrorKind::CrossOrigin,
+            0,
+        ),
+    ];
+    for (spec, kind, expected_hits) in cases {
+        let before = hit_count(&hits);
+        let html = format!("<body><script type=module>import '{spec}';</script></body>");
+        let out = run_page_at(engine, &html, &base, &opts, &loopback_fetcher());
+        assert_eq!(
+            outcome_of(&out, 0),
+            ScriptOutcome::SrcFetchFailed { kind },
+            "{spec}"
+        );
+        assert_eq!(hit_count(&hits) - before, expected_hits, "{spec}");
+    }
+    assert_eq!(hit_count(&other_hits), 0);
+
+    eprintln!("case: JS-6 module count limit (entry + 63 ok, +64 aborts)");
+    let (port, hits) = spawn_recording_server(|_| js_response("export {};"));
+    let base = format!("http://127.0.0.1:{port}/");
+    let imports = |n: usize| {
+        (0..n)
+            .map(|i| format!("import './m{i}.js';"))
+            .collect::<String>()
+    };
+    let html = |n: usize| format!("<body><script type=module>{}</script></body>", imports(n));
+    let out = run_page_at(engine, &html(63), &base, &opts, &loopback_fetcher());
+    assert_eq!(outcome_of(&out, 0), ScriptOutcome::Succeeded);
+    let before = hit_count(&hits);
+    let out = run_page_at(engine, &html(64), &base, &opts, &loopback_fetcher());
+    assert_eq!(
+        outcome_of(&out, 0),
+        ScriptOutcome::Aborted {
+            kind: AbortKind::ScriptCount { limit: 64 },
+            message: None
+        }
+    );
+    assert_eq!(hit_count(&hits) - before, 63);
+
+    eprintln!("case: JS-6 module graph depth limit (32 ok, 33 aborts)");
+    let chain = |last: usize| {
+        spawn_recording_server(move |path| {
+            let n: usize = path
+                .trim_start_matches("/d")
+                .trim_end_matches(".js")
+                .parse()
+                .unwrap_or(0);
+            if n >= last {
+                js_response("export {};")
+            } else {
+                js_response(&format!("import './d{}.js';", n + 1))
+            }
+        })
+    };
+    let html = "<body><script type=module>import './d1.js';</script></body>";
+    let (port, _) = chain(32);
+    let base = format!("http://127.0.0.1:{port}/");
+    let out = run_page_at(engine, html, &base, &opts, &loopback_fetcher());
+    assert_eq!(outcome_of(&out, 0), ScriptOutcome::Succeeded);
+    let (port, hits) = chain(33);
+    let base = format!("http://127.0.0.1:{port}/");
+    let out = run_page_at(engine, html, &base, &opts, &loopback_fetcher());
+    assert_eq!(
+        outcome_of(&out, 0),
+        ScriptOutcome::Aborted {
+            kind: AbortKind::ResourceLimit,
+            message: Some("module graph depth limit exceeded".to_string())
+        }
+    );
+    assert_eq!(path_hits(&hits, "/d33.js"), 0);
+
+    eprintln!("case: JS-4 gate off keeps type=module skipped and never fetches");
+    let (port, hits) = spawn_recording_server(|_| js_response("export {};"));
+    let base = format!("http://127.0.0.1:{port}/");
+    let out = run_page_at(
+        engine,
+        "<body><script type=module>import './a.js';</script></body>",
+        &base,
+        &PageRunOptions::default(),
+        &loopback_fetcher(),
+    );
+    assert_eq!(outcome_of(&out, 0).as_str(), "skipped");
+    assert_eq!(hit_count(&hits), 0);
 }
 pub fn run(engine: &str) {
     let opts = PageRunOptions::default();

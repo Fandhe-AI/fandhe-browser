@@ -59,7 +59,8 @@ use std::time::Instant;
 // 注入関数の型を core 経由で使えるよう再公開する（js crate へ直接依存してよいのは
 // core のみという crate 間の許可依存を、harness 等の利用側に守らせるため）。
 use fandhe_browser_js::{
-    CreateEngineError, EngineKind, EvaluateOptions, JsEngine, JsValue, create_engine,
+    CreateEngineError, EngineKind, EvaluateOptions, JsEngine, JsValue, ModuleEvaluation, ModuleId,
+    ModuleRecord, ModuleResolution, create_engine,
 };
 pub use fandhe_browser_js::{JsEngineError, NativeFn};
 
@@ -218,6 +219,57 @@ impl JsRuntime {
                 let value = js_value_to_display_string(&js_value)?;
                 Ok(JsExecutionOutput { value, js_value })
             }
+        }
+    }
+
+    /// ES module のソースを compile し、依存の一覧を返す（`JS-4`・Issue #1116）。
+    ///
+    /// 呼び出し元: `page_runner` の module グラフ解決。JS 無効のランタイムは成功を装わず
+    /// `JsExecutionUnavailable`、エンジンの失敗は [`crate::Error::JsEvaluation`] に包む。
+    /// `url`・`source` はエラーメッセージに埋め込まない。
+    pub fn compile_module(&mut self, url: &str, source: &str) -> crate::Result<ModuleRecord> {
+        match &mut self.state {
+            RuntimeState::Disabled => Err(crate::Error::JsExecutionUnavailable {
+                message: DISABLED_MESSAGE.to_string(),
+            }),
+            RuntimeState::Enabled { engine, .. } => engine
+                .compile_module(url, source)
+                .map_err(crate::Error::JsEvaluation),
+        }
+    }
+
+    /// `referrer` の依存を対応表どおりに link する（`JS-4`・Issue #1116）。契約は
+    /// [`JsEngine::link_module`] と [`compile_module`](Self::compile_module) に同じ。
+    pub fn link_module(
+        &mut self,
+        referrer: ModuleId,
+        resolutions: &[ModuleResolution],
+    ) -> crate::Result<()> {
+        match &mut self.state {
+            RuntimeState::Disabled => Err(crate::Error::JsExecutionUnavailable {
+                message: DISABLED_MESSAGE.to_string(),
+            }),
+            RuntimeState::Enabled { engine, .. } => engine
+                .link_module(referrer, resolutions)
+                .map_err(crate::Error::JsEvaluation),
+        }
+    }
+
+    /// link 済みの `root` を evaluate し、microtask checkpoint 後の状態を返す
+    /// （`JS-4`・`JS-6`・Issue #1116）。`options` の実時間上限は instantiate・evaluate・checkpoint
+    /// 全体にかかる。契約は [`JsEngine::evaluate_module`] に同じ。
+    pub fn evaluate_module(
+        &mut self,
+        root: ModuleId,
+        options: &EvaluateOptions,
+    ) -> crate::Result<ModuleEvaluation> {
+        match &mut self.state {
+            RuntimeState::Disabled => Err(crate::Error::JsExecutionUnavailable {
+                message: DISABLED_MESSAGE.to_string(),
+            }),
+            RuntimeState::Enabled { engine, .. } => engine
+                .evaluate_module(root, options)
+                .map_err(crate::Error::JsEvaluation),
         }
     }
 
@@ -700,6 +752,40 @@ mod tests {
             .inject_global_function("f", Box::new(|_| Ok(JsValue::Undefined)))
             .expect_err("常に失敗する");
         assert!(matches!(err, Error::JsExecutionUnavailable { .. }));
+    }
+
+    /// JS-4（Issue #1116）: JS 無効のランタイムは module API でも成功を装わず
+    /// `JsExecutionUnavailable` を返す。
+    #[test]
+    fn js_4_module_api_on_disabled_runtime_fails() {
+        let mut rt = JsRuntime::disabled();
+        let err = rt
+            .compile_module("https://example.test/m.js", "export {}")
+            .expect_err("常に失敗する");
+        assert!(matches!(err, Error::JsExecutionUnavailable { .. }));
+        let id = ModuleId::from_raw(1);
+        let err = rt.link_module(id, &[]).expect_err("常に失敗する");
+        assert!(matches!(err, Error::JsExecutionUnavailable { .. }));
+        let err = rt
+            .evaluate_module(id, &EvaluateOptions::default())
+            .expect_err("常に失敗する");
+        assert!(matches!(err, Error::JsExecutionUnavailable { .. }));
+    }
+
+    /// JS-4（Issue #1116）: module API の未対応エンジンの失敗は種別を保って包まれる。
+    #[test]
+    fn js_4_module_api_default_engine_reports_not_yet_implemented() {
+        let (mut rt, _scripts, _binds) = fake_runtime(Ok(JsValue::Undefined));
+        let err = rt
+            .compile_module("https://example.test/m.js", "export {}")
+            .expect_err("FakeEngine は未対応");
+        assert!(
+            matches!(
+                err,
+                Error::JsEvaluation(JsEngineError::NotYetImplemented(_))
+            ),
+            "{err}"
+        );
     }
 
     /// REPAIR-9: recorder 付きの失敗呼び出しは `JsStub` / `Failure` を 1 件記録する。

@@ -749,6 +749,40 @@ impl Fetcher {
         result
     }
 
+    /// ES module のグラフ取得用の取得（`JS-8`・`JS-6`・`SEC-2`。呼び出し元は `page_runner` の
+    /// module グラフ解決。Issue #1116）。
+    ///
+    /// [`Fetcher::get_for_page_net`] と同じく同一オリジンのリダイレクトだけを許し（別オリジンへの
+    /// リダイレクトは送信前に [`Error::CrossOriginRedirect`]）、`deadline`（ページの残り実時間）を
+    /// 全体タイムアウトに適用する。`deadline` が 0 なら送信せず [`Error::Timeout`]。
+    ///
+    /// [`Fetcher::get_with_max_body`] と同様、非 2xx で本文が上限を超える応答は空本文のまま
+    /// ステータスを返す（巨大なエラーページが「サイズ超過」に化けず、`HttpStatus` として分類される。
+    /// classic の `src` 取得と同じ扱い）。`get_with_max_body` には期限の引数が無く、取得待ちを
+    /// ページ時計で打ち切れないため、本メソッドを別に設けた。
+    pub(crate) async fn get_for_module(
+        &self,
+        url: &str,
+        max_body_bytes: u64,
+        deadline: Duration,
+    ) -> Result<FetchResponse> {
+        if deadline.is_zero() {
+            return Err(Error::Timeout {
+                limit: Duration::ZERO,
+            });
+        }
+        let start = self.options.recorder.is_enabled().then(Instant::now);
+        let result = self
+            .get_inner(url, max_body_bytes, true, Some(deadline), true)
+            .await;
+        if let Some(start) = start {
+            self.options
+                .recorder
+                .record_result(OperationKind::Fetch, &result, start.elapsed());
+        }
+        result
+    }
+
     /// `url` の形式・scheme・IP リテラル host を、ネットワークへ出ずに事前検査する。
     ///
     /// [`Fetcher::get`] が送信前に行う検査（解析・scheme・アドレス）と同一で、cdp の

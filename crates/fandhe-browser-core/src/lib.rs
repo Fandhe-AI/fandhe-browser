@@ -164,10 +164,11 @@ pub use page_net::{
     NetRejection, NetReport, NetRequestKind, PageNetLimits,
 };
 pub use page_runner::{
-    AbortKind, DEFAULT_MAX_SRC_SCRIPT_BYTES, DEFAULT_MAX_TOTAL_SCRIPT_BYTES,
-    DEFAULT_PAGE_WALL_TIME, DEFAULT_SCRIPT_WALL_TIME, EventLoopReport, LifecycleEvent,
-    LifecycleEventRecord, LifecycleOutcome, MAX_SCRIPT_ERROR_MESSAGE_BYTES, PageAbort,
-    PageRunInput, PageRunOptions, PageRunOutput, ScriptBytesScope, ScriptOutcome, ScriptRunRecord,
+    AbortKind, DEFAULT_MAX_PAGE_MODULES, DEFAULT_MAX_SRC_SCRIPT_BYTES,
+    DEFAULT_MAX_TOTAL_SCRIPT_BYTES, DEFAULT_PAGE_WALL_TIME, DEFAULT_SCRIPT_WALL_TIME,
+    EventLoopReport, LifecycleEvent, LifecycleEventRecord, LifecycleOutcome,
+    MAX_MODULE_GRAPH_DEPTH, MAX_SCRIPT_ERROR_MESSAGE_BYTES, PageAbort, PageRunInput,
+    PageRunOptions, PageRunOutput, ScriptBytesScope, ScriptOutcome, ScriptRunRecord,
     SrcFetchErrorKind, WallTimeScope, page_script_fetch_options, run_page_scripts,
 };
 pub use page_script::{
