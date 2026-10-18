@@ -681,6 +681,20 @@ pub(crate) fn worker_main(marker_value: &str) -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             }
+            // JS-4・REPAIR-3・Issue #1110: ES module 用フレーム。ペイロードは
+            // 検証するが評価は後続 issue で実装するため、成功を装わず
+            // `ERROR{NotYetImplemented}` を返す（V8・boa 共通）。デコード失敗
+            // （プロトコル違反）は他の登録系と同じく終了する。
+            tag::COMPILE_MODULE
+            | tag::LINK_MODULE
+            | tag::EVALUATE_MODULE
+            | tag::TAKE_DYNAMIC_IMPORTS
+            | tag::FINISH_DYNAMIC_IMPORT => {
+                if let Err(err) = handle_module_frame(frame_tag, &payload, &mut stdout) {
+                    eprintln!("fandhe-browser-js worker: failed to handle a module frame: {err}");
+                    return ExitCode::FAILURE;
+                }
+            }
             tag::SHUTDOWN => return ExitCode::SUCCESS,
             other => {
                 eprintln!("fandhe-browser-js worker: protocol violation: unexpected tag {other}");
@@ -972,16 +986,54 @@ fn classify_evaluation_error(err: &JsEngineError) -> (ErrorKind, String) {
             ErrorKind::ResourceLimit,
             worker_protocol::truncate_for_wire(msg),
         ),
-        // モジュール系の 2 variant もワイヤ上に専用の `ErrorKind` が無いため
-        // `Evaluation` に畳む（プロトコル v6 で扱う。設計 §9 の 2。現状は
-        // evaluate_script から発生しない。`JS-4`・Issue #1109）。
-        JsEngineError::EngineUnavailable(msg)
-        | JsEngineError::ModuleResolutionFailed(msg)
-        | JsEngineError::NotYetImplemented(msg) => (
+        // プロトコル v6 でモジュール系の 2 variant に専用の `ErrorKind` を
+        // 持たせた（`JS-4`・Issue #1110）。`ModuleResolution` のメッセージは
+        // specifier・URL を含めない固定の種別文言であることが契約。
+        JsEngineError::NotYetImplemented(msg) => (
+            ErrorKind::NotYetImplemented,
+            worker_protocol::truncate_for_wire(msg),
+        ),
+        JsEngineError::ModuleResolutionFailed(msg) => (
+            ErrorKind::ModuleResolution,
+            worker_protocol::truncate_for_wire(msg),
+        ),
+        JsEngineError::EngineUnavailable(msg) => (
             ErrorKind::Evaluation,
             worker_protocol::truncate_for_wire(msg),
         ),
     }
+}
+
+/// 親 → 子の ES module 用フレーム 1 件を検証し、「未対応」の `ERROR` を返す
+/// （`JS-4`・`REPAIR-3`・Issue #1110）。
+///
+/// 呼び出し元: [`worker_main`] のフレームループ。モジュールの compile・link・
+/// 評価・動的 import は後続 issue（設計 §9 の 3〜6）で `ChildEngine` に足すまで
+/// 未実装のため、ペイロードの検証（上限・UTF-8・重複）だけ行い成功を装わない。
+/// `Err` はデコード失敗（プロトコル違反）または応答送信の I/O 失敗で、
+/// 呼び出し元が子を終了する。
+fn handle_module_frame(
+    frame_tag: u8,
+    payload: &[u8],
+    stdout: &mut impl Write,
+) -> Result<(), ProtocolError> {
+    use worker_protocol::module_frames as frames;
+    let operation = match frame_tag {
+        tag::COMPILE_MODULE => frames::decode_compile_module(payload).map(|_| "compile_module"),
+        tag::LINK_MODULE => frames::decode_link_module(payload).map(|_| "link_module"),
+        tag::EVALUATE_MODULE => frames::decode_evaluate_module(payload).map(|_| "evaluate_module"),
+        tag::TAKE_DYNAMIC_IMPORTS => {
+            frames::decode_take_dynamic_imports(payload).map(|()| "take_dynamic_import_requests")
+        }
+        tag::FINISH_DYNAMIC_IMPORT => {
+            frames::decode_finish_dynamic_import(payload).map(|_| "finish_dynamic_import")
+        }
+        other => Err(ProtocolError::UnknownTag(other)),
+    }?;
+    let err = super::engine_trait::module_api_not_yet_implemented(operation);
+    let (kind, message) = classify_evaluation_error(&err);
+    let body = worker_protocol::encode_error(kind, &message);
+    send_frame(stdout, tag::ERROR, &body)
 }
 
 /// フレームを書き込んで即座に `flush` する。子・親どちらも stdio は
@@ -1154,6 +1206,71 @@ mod tests {
             classify_evaluation_error(&JsEngineError::EngineUnavailable("gone".to_string()));
         assert_eq!(kind, ErrorKind::Evaluation);
         assert_eq!(message, "gone");
+    }
+
+    /// JS-4・Issue #1110: モジュール系の 2 variant は専用の `ErrorKind` で送る。
+    #[test]
+    fn js_4_classify_evaluation_error_maps_module_variants_to_dedicated_kinds() {
+        let (kind, message) = classify_evaluation_error(&JsEngineError::NotYetImplemented(
+            "compile_module: x".to_string(),
+        ));
+        assert_eq!(kind, ErrorKind::NotYetImplemented);
+        assert_eq!(message, "compile_module: x");
+
+        let (kind, message) = classify_evaluation_error(&JsEngineError::ModuleResolutionFailed(
+            "unresolved module".to_string(),
+        ));
+        assert_eq!(kind, ErrorKind::ModuleResolution);
+        assert_eq!(message, "unresolved module");
+    }
+
+    fn read_frame_for_module_test(written: Vec<u8>) -> (u8, Vec<u8>) {
+        worker_protocol::read_frame(&mut io::Cursor::new(written), 4096)
+            .expect("frame must be readable")
+            .expect("one frame must have been written")
+    }
+
+    /// JS-4・REPAIR-3・Issue #1110: 子は新 tag を検証したうえで
+    /// `ERROR{NotYetImplemented}` を返し、不正なペイロードはデコードエラーにする。
+    #[test]
+    fn js_4_handle_module_frame_responds_not_yet_implemented_after_validation() {
+        let compile = worker_protocol::module_frames::encode_compile_module(
+            "https://example.test/a.js",
+            "export {};",
+            &EvaluateOptions::default(),
+        )
+        .expect("encode");
+        let mut out = Vec::new();
+        handle_module_frame(tag::COMPILE_MODULE, &compile, &mut out).expect("handled");
+        let (frame_tag, payload) = read_frame_for_module_test(out);
+        assert_eq!(frame_tag, tag::ERROR);
+        let (kind, message) = worker_protocol::decode_error(&payload).expect("error frame");
+        assert_eq!(kind, ErrorKind::NotYetImplemented);
+        assert!(message.starts_with("compile_module:"), "{message}");
+
+        let mut out = Vec::new();
+        handle_module_frame(tag::TAKE_DYNAMIC_IMPORTS, &[], &mut out).expect("handled");
+        let (_, payload) = read_frame_for_module_test(out);
+        let (kind, message) = worker_protocol::decode_error(&payload).expect("error frame");
+        assert_eq!(kind, ErrorKind::NotYetImplemented);
+        assert!(
+            message.starts_with("take_dynamic_import_requests:"),
+            "{message}"
+        );
+
+        let mut out = Vec::new();
+        assert!(matches!(
+            handle_module_frame(tag::TAKE_DYNAMIC_IMPORTS, &[0], &mut out),
+            Err(ProtocolError::TrailingBytes { .. })
+        ));
+        assert!(
+            out.is_empty(),
+            "no response is sent for a protocol violation"
+        );
+        assert!(matches!(
+            handle_module_frame(tag::COMPILE_MODULE, &[1, 2, 3], &mut out),
+            Err(ProtocolError::Truncated)
+        ));
     }
 
     /// JS-1・Issue #503: 未知のプロトコルバージョン文字列は Hello を

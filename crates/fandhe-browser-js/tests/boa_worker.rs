@@ -290,6 +290,47 @@ fn js_1_boa_is_disabled_on_macos() {
     }
 }
 
+/// JS-4・REPAIR-3・Issue #1110: boa の子でもモジュール API 5 メソッドの新フレームが
+/// 検証され、成功を装わず `NotYetImplemented` が返ること（子の未対応応答は
+/// V8 と共通のフレームループにある）。classic 評価と Context は子と共に残る。
+#[cfg(not(target_os = "macos"))]
+fn js_4_boa_module_frames_return_not_yet_implemented() {
+    use fandhe_browser_js::{DynamicImportId, ModuleId};
+
+    let mut engine = boa_engine();
+    let options = EvaluateOptions::default();
+    eval(&mut *engine, "globalThis.kept = 7").expect("eval");
+
+    let results = [
+        engine
+            .compile_module("https://example.test/a.js", "export const a = 1;")
+            .map(|_| ()),
+        engine.link_module(ModuleId::from_raw(1), &[]),
+        engine
+            .evaluate_module(ModuleId::from_raw(1), &options)
+            .map(|_| ()),
+        engine.take_dynamic_import_requests().map(|_| ()),
+        engine.finish_dynamic_import(DynamicImportId::from_raw(1), Err("failed".to_string())),
+    ];
+    for (index, result) in results.iter().enumerate() {
+        match result {
+            Err(JsEngineError::NotYetImplemented(msg)) => {
+                assert!(
+                    !msg.is_empty(),
+                    "operation {index} returned an empty message"
+                )
+            }
+            other => panic!("operation {index}: expected NotYetImplemented, got: {other:?}"),
+        }
+    }
+
+    // 子は破棄されていない（永続 Context の変数が残っている）。
+    assert_eq!(
+        eval(&mut *engine, "kept").expect("eval"),
+        JsValue::Number(7.0)
+    );
+}
+
 fn main() -> ExitCode {
     // 子プロセスとして再実行された場合は、他の出力より前にワーカーへ制御を渡す
     // （stdout はフレーム専用）。
@@ -306,6 +347,8 @@ fn main() -> ExitCode {
     {
         eprintln!("case: js_1_boa_evaluates_in_a_child_process");
         js_1_boa_evaluates_in_a_child_process();
+        eprintln!("case: js_4_boa_module_frames_return_not_yet_implemented");
+        js_4_boa_module_frames_return_not_yet_implemented();
         eprintln!("case: js_1_boa_native_calls_cross_the_process_boundary");
         js_1_boa_native_calls_cross_the_process_boundary();
         eprintln!("case: js_1_boa_wall_clock_limit_kills_the_child_and_recovers");
