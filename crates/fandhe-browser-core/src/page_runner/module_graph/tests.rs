@@ -115,6 +115,23 @@ impl JsEngine for FakeModuleEngine {
         if src.contains("tla-pending") {
             return Ok(ModuleEvaluation::Pending);
         }
+        // 1 回目は保留、再 evaluate では確定する（後続の classic が待ちを解いた状況の模擬）。
+        let tag = format!("eval:{}", root.raw());
+        let seen = log.events.iter().filter(|e| **e == tag).count();
+        if src.contains("tla-later-fulfil") {
+            return Ok(if seen <= 1 {
+                ModuleEvaluation::Pending
+            } else {
+                ModuleEvaluation::Fulfilled
+            });
+        }
+        if src.contains("tla-later-reject") {
+            return Ok(if seen <= 1 {
+                ModuleEvaluation::Pending
+            } else {
+                ModuleEvaluation::rejected("late".to_string())
+            });
+        }
         if let Some(m) = src.strip_prefix("reject:") {
             return Ok(ModuleEvaluation::rejected(m.to_string()));
         }
@@ -387,6 +404,38 @@ fn js_4_repeated_src_reports_first_result() {
         ]
     );
     assert_eq!(hit_count(&hits, "/r.js"), 1);
+}
+
+/// `JS-4`: 保留の module は再参照でエンジンの現在の状態を取り直し、確定した結果へ更新する。
+#[test]
+fn js_4_pending_module_is_rechecked_on_rereference() {
+    let (port, hits) = spawn_server(|path| match path {
+        "/f.js" => js("tla-later-fulfil"),
+        _ => js("tla-later-reject"),
+    });
+    let html = "<script type=module src=\"/f.js\"></script>\
+                <script type=module src=\"/f.js\"></script>\
+                <script type=module src=\"/f.js\"></script>\
+                <script type=module src=\"/x.js\"></script>\
+                <script type=module src=\"/x.js\"></script>\
+                <script type=module src=\"/x.js\"></script>";
+    let (out, _) = run(html, port, &module_options());
+    let exception = ScriptOutcome::Exception {
+        message: "module evaluation failed".to_string(),
+        truncated: false,
+    };
+    assert_eq!(
+        outcomes(&out),
+        vec![
+            ScriptOutcome::ModulePending,
+            ScriptOutcome::Succeeded,
+            ScriptOutcome::Succeeded,
+            ScriptOutcome::ModulePending,
+            exception.clone(),
+            exception
+        ]
+    );
+    assert_eq!(hit_count(&hits, "/f.js"), 1);
 }
 
 /// `JS-4`: フラグメントだけが違う URL は別モジュール。URL にはフラグメントが残り、取得時は除く。

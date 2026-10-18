@@ -805,13 +805,15 @@ pub(super) async fn run_module_entry(
         Err(GraphError::Abort(kind, message)) => return aborted(kind, message, index, abort),
     };
     if let Some(state) = graph.evaluated.get(&root) {
-        // 既に evaluate 済みの module（同じ `src` の再指定等）は二度実行せず、最初の結果を返す
-        // （例外は再提示し、保留は成功と見なさない）。
-        return match state {
-            EvalState::Succeeded => ScriptOutcome::Succeeded,
-            EvalState::Pending => ScriptOutcome::ModulePending,
-            EvalState::Rejected => rejected_outcome(),
-        };
+        // 既に evaluate 済みの module（同じ `src` の再指定等）は二度実行せず、確定した結果を返す
+        // （例外は再提示する）。保留は確定結果ではない（後続の classic が TLA の待ちを解く等）ため、
+        // 再参照ではエンジン側の現在の評価状態を取り直し、確定したらキャッシュを更新する
+        // （`JS-4`。エンジンは evaluate 済みの root に対し現在の Promise の状態を返す）。
+        match state {
+            EvalState::Succeeded => return ScriptOutcome::Succeeded,
+            EvalState::Rejected => return rejected_outcome(),
+            EvalState::Pending => {}
+        }
     }
     evaluate_root(rt, ctx, graph, root, index, abort)
 }
