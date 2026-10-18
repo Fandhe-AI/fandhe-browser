@@ -2756,12 +2756,21 @@ impl V8ProcessEngine {
         payload: &[u8],
         on_ok: impl FnOnce(&mut WorkerHandle, Vec<u8>) -> (Result<T, JsEngineError>, bool),
     ) -> Result<T, JsEngineError> {
+        // 期限が表現できない予算は子を起動する前に拒否する（起動しない）。
+        if Instant::now().checked_add(config.budget).is_none() {
+            return Err(JsEngineError::EvaluationFailed(
+                "the module operation timeout is too large to schedule".to_string(),
+            ));
+        }
+        let mut worker = self.take_live_worker()?;
+        // 期限は子の起動完了後に計算する。遅延起動のハンドシェイク・関数再登録が
+        // 書き込み・応答待ちの予算を消費しないようにする（`evaluate_script` と同じ並び）。
         let Some(deadline) = Instant::now().checked_add(config.budget) else {
+            self.worker = Some(worker);
             return Err(JsEngineError::EvaluationFailed(
                 "the module operation timeout is too large to schedule".to_string(),
             ));
         };
-        let mut worker = self.take_live_worker()?;
         if config.needs_module_slot && worker.modules.is_full() {
             self.worker = Some(worker);
             return Err(JsEngineError::ResourceLimitExceeded(format!(
@@ -3616,6 +3625,29 @@ mod tests {
 
     fn entry(func: ParentNativeFn) -> NativeEntry {
         NativeEntry::Threaded(Arc::new(Mutex::new(func)))
+    }
+
+    /// `JS-4`・Issue #1110（codex P1）: モジュール操作の期限は、遅延起動を含む
+    /// `take_live_worker()` の完了後に計算すること。起動（最大 5 秒のハンドシェイク・
+    /// 関数再登録）が書き込み・応答待ちの予算を食うと、正常な子を Timeout で
+    /// 破棄してしまう。起動遅延を注入する経路が無いため、実装上の並びを固定する。
+    #[test]
+    fn js_4_module_roundtrip_computes_the_deadline_after_the_worker_is_ready() {
+        let src = include_str!("process_engine.rs");
+        let start = src
+            .find("fn module_roundtrip<T>(")
+            .expect("module_roundtrip must exist");
+        let body = &src[start..];
+        let take = body
+            .find("self.take_live_worker()?")
+            .expect("module_roundtrip must take a live worker");
+        let deadline = body
+            .find("let Some(deadline) = Instant::now()")
+            .expect("module_roundtrip must compute the deadline");
+        assert!(
+            take < deadline,
+            "the deadline must be computed after take_live_worker()"
+        );
     }
 
     /// `TASK-29`・Issue #526: 登録件数の上限が具体値どおりであること
