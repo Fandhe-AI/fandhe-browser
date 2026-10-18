@@ -1862,6 +1862,59 @@ fn resolve_module_callback<'s>(
     found
 }
 
+/// ソースに `import.meta` の使用らしきものがあるか（保守的な検出。`JS-4`・`REPAIR-3`）。
+///
+/// `import.meta` の初期化 callback は未実装（#1112）で、そのまま評価すると
+/// `import.meta.url` が `undefined` のまま成功してしまう。対応するまで
+/// [`V8Engine::compile_module`] はこれを `NotYetImplemented` で拒否する。
+/// トークン `import` の後に空白・コメント（非 ASCII 文字も飛ばす）を挟んで `.` と
+/// `meta` が続くものを探す。文字列・コメント中の `import.meta` も拒否する誤検出は
+/// fail-closed 側として許容する。**#1112 で `import.meta.url` を実装したらこの検出を外す。**
+/// 入力は上限検証済みのソースで、添字アクセスは `get` のみ。
+fn uses_import_meta(source: &str) -> bool {
+    let bytes = source.as_bytes();
+    source.match_indices("import").any(|(index, word)| {
+        let after_import = skip_trivia(bytes, index.saturating_add(word.len()));
+        if bytes.get(after_import) != Some(&b'.') {
+            return false;
+        }
+        let after_dot = skip_trivia(bytes, after_import.saturating_add(1));
+        bytes.get(after_dot..after_dot.saturating_add(4)) == Some(b"meta".as_slice())
+    })
+}
+
+/// 空白・コメント（`//`・`/* */`）・非 ASCII バイトを読み飛ばした位置を返す。
+fn skip_trivia(bytes: &[u8], mut index: usize) -> usize {
+    loop {
+        match bytes.get(index) {
+            Some(byte) if byte.is_ascii_whitespace() || !byte.is_ascii() => index += 1,
+            Some(b'/') => match bytes.get(index.saturating_add(1)) {
+                Some(b'/') => {
+                    index += 2;
+                    while bytes.get(index).is_some_and(|byte| *byte != b'\n') {
+                        index += 1;
+                    }
+                }
+                Some(b'*') => {
+                    index += 2;
+                    loop {
+                        match bytes.get(index) {
+                            None => return index,
+                            Some(b'*') if bytes.get(index.saturating_add(1)) == Some(&b'/') => {
+                                index += 2;
+                                break;
+                            }
+                            Some(_) => index += 1,
+                        }
+                    }
+                }
+                _ => return index,
+            },
+            _ => return index,
+        }
+    }
+}
+
 /// 重複込みの import 宣言数の上限（走査・確保コストの上限。`MAX_MODULE_REQUESTS` は一意な件数）。
 const MAX_RAW_MODULE_REQUESTS: usize = 65_536;
 
@@ -1915,6 +1968,11 @@ impl V8Engine {
             return Err(JsEngineError::EvaluationFailed(format!(
                 "module source exceeds the maximum supported length of {MAX_SCRIPT_SOURCE_BYTES} bytes"
             )));
+        }
+        if uses_import_meta(source) {
+            return Err(JsEngineError::NotYetImplemented(
+                "compile_module: import.meta is not supported yet".to_string(),
+            ));
         }
         self.ensure_no_native_call_fatal()?;
         let (next_id, following_id) = {
@@ -4108,5 +4166,34 @@ mod tests {
             .evaluate_module(root.id(), &EvaluateOptions::default())
             .expect("module must evaluate");
         assert_eq!(eval_str(&mut engine, "got"), JsValue::Number(1.0));
+    }
+
+    /// JS-4・REPAIR-3・Issue #1111: `import.meta` は未実装のため compile が
+    /// `NotYetImplemented`。`import.meta` を含まない通常のモジュール（`import(` や
+    /// `important` など）は影響を受けない。
+    #[test]
+    fn js_4_v8_module_import_meta_is_not_yet_implemented() {
+        let mut engine = module_engine();
+        for source in [
+            "globalThis.u = import.meta.url; export {};",
+            "globalThis.u = import . meta . url; export {};",
+            "globalThis.u = import/* c */.\n// c\nmeta.url; export {};",
+        ] {
+            match engine.compile_module("https://example.test/m.js", source, MODULE_TIMEOUT) {
+                Err(JsEngineError::NotYetImplemented(msg)) => assert!(msg.contains("import.meta")),
+                other => panic!("expected NotYetImplemented for {source:?}, got: {other:?}"),
+            }
+        }
+        // 拒否した compile は id を消費せず、通常のモジュールは評価できる。
+        let ok = compile_ok(
+            &mut engine,
+            "https://example.test/ok.js",
+            "const important = 1; globalThis.p = import('./x.js'); globalThis.m = important; export {};",
+        );
+        assert_eq!(ok.id(), ModuleId::from_raw(1));
+        engine
+            .evaluate_module(ok.id(), &EvaluateOptions::default())
+            .expect("module must evaluate");
+        assert_eq!(eval_str(&mut engine, "m"), JsValue::Number(1.0));
     }
 }
