@@ -1059,6 +1059,20 @@ pub(super) async fn pump_one_dynamic_import(
             return Ok(false);
         }
         (_, Err(GraphError::Abort(kind, _))) => {
+            // 評価中の予算超過など、エンジンが reject して打ち切ったものは reject として数える。
+            // ページの実時間切れは JS を走らせず reject もしないため数えない。
+            if !matches!(
+                &kind,
+                AbortKind::WallTime {
+                    scope: WallTimeScope::Page,
+                    ..
+                }
+            ) {
+                report.rejected = report.rejected.saturating_add(1);
+                report
+                    .failures
+                    .push(DynamicImportFailureKind::Limit(kind.clone()));
+            }
             *abort = Some(PageAbort { kind, index: None });
             return Ok(false);
         }

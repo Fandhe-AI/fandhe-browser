@@ -2448,7 +2448,7 @@ impl V8Engine {
     /// - そのあと microtask checkpoint を行い（利用者の `then`・`catch` が走る）、監視は
     ///   `options.timeout()`（呼び出し側がページの残り時間を渡す。`JS-6`・Issue #1117）。超過は
     ///   `Timeout`（エントリは完了済みとして扱い、未確定の Promise は reject する。親は `Timeout`
-    ///   応答でも台帳から外す）。0 は V8 を呼ばず状態も変えずに `Timeout`
+    ///   応答でも台帳から外す）。0 は id の検証と除去のあと V8 を動かさず reject して `Timeout`
     /// - 戻り値は checkpoint 後の `import()` の Promise の状態（Fulfilled・Rejected・Pending）
     pub(crate) fn finish_dynamic_import(
         &mut self,
@@ -2458,13 +2458,6 @@ impl V8Engine {
     ) -> Result<ModuleEvaluation, JsEngineError> {
         self.ensure_no_native_call_fatal()?;
         let timeout = options.timeout();
-        if timeout.is_zero() {
-            return Err(V8Failure::Terminated {
-                stage: "execution",
-                timeout,
-            }
-            .into());
-        }
         let unknown = || {
             JsEngineError::ModuleResolutionFailed(
                 "unknown or finished dynamic import id".to_string(),
@@ -2489,6 +2482,16 @@ impl V8Engine {
         let mut tc = tc.init();
 
         let resolver = v8::Local::new(&tc, &resolver_global);
+        if timeout.is_zero() {
+            // 残り時間 0 でも id の検証と完了待ちからの除去は済ませてある（親は `Timeout` で
+            // 台帳から外すため、親子で完了の有無をそろえる）。V8 は動かさず reject だけする。
+            reject_with_message(&tc, resolver, "dynamic import timed out");
+            return Err(V8Failure::Terminated {
+                stage: "execution",
+                timeout,
+            }
+            .into());
+        }
         let watchdog = Watchdog::start(isolate_handle, timeout);
         Self::settle_dynamic_import(&mut tc, id.raw(), resolver, result);
         run_microtask_checkpoint(&mut tc);

@@ -106,6 +106,8 @@ fn main() -> ExitCode {
     js_4_dynamic_import_roundtrips_through_the_v8_worker();
     eprintln!("case: js_4_dynamic_import_reports_settlement_of_the_import_promise");
     js_4_dynamic_import_reports_settlement_of_the_import_promise();
+    eprintln!("case: js_4_dynamic_import_ledgers_stay_in_sync_after_consumed_failures");
+    js_4_dynamic_import_ledgers_stay_in_sync_after_consumed_failures();
     eprintln!("case: js_6_dynamic_import_timeout_keeps_parent_and_child_ledgers_in_sync");
     js_6_dynamic_import_timeout_keeps_parent_and_child_ledgers_in_sync();
     eprintln!("case: js_4_module_import_meta_url_and_promise_states_through_the_v8_worker");
@@ -780,6 +782,45 @@ fn js_4_dynamic_import_roundtrips_through_the_v8_worker() {
         pid,
         "the child must survive dynamic import completion"
     );
+}
+
+/// JS-4・JS-6・Issue #1117: 子が完了待ちから id を消費した失敗（残り時間 0 の `Timeout`・結果
+/// サイズ超過の `EvaluationFailed`）のあとも親の台帳が一致し、後続の take が上限違反にならない。
+/// 未知 id は残り時間 0 でも `ModuleResolutionFailed`。
+fn js_4_dynamic_import_ledgers_stay_in_sync_after_consumed_failures() {
+    let options = EvaluateOptions::default();
+    let mut engine = V8ProcessEngine::new();
+    let root = engine
+        .compile_module(
+            "https://example.test/app/main.js",
+            "import('./a.js').catch(() => {}); export {};",
+        )
+        .expect("compile root");
+    engine.evaluate_module(root.id(), &options).expect("eval");
+    let pid = engine.worker_pid_for_test();
+    let requests = engine.take_dynamic_import_requests().expect("take");
+    let id = requests[0].id();
+    let zero = EvaluateOptions::default().with_timeout(Duration::ZERO);
+    match engine.finish_dynamic_import(DynamicImportId::from_raw(99), Err("x".to_string()), &zero) {
+        Err(JsEngineError::ModuleResolutionFailed(_)) => {}
+        other => panic!("expected ModuleResolutionFailed for an unknown id, got: {other:?}"),
+    }
+    match engine.finish_dynamic_import(id, Err("x".to_string()), &zero) {
+        Err(JsEngineError::Timeout(_)) => {}
+        other => panic!("expected Timeout, got: {other:?}"),
+    }
+    // 子も親も id を消費済み。再完了は未知 id になり、後続の take は成功する。
+    match engine.finish_dynamic_import(id, Err("x".to_string()), &options) {
+        Err(JsEngineError::ModuleResolutionFailed(_)) => {}
+        other => panic!("expected ModuleResolutionFailed after consumption, got: {other:?}"),
+    }
+    assert!(
+        engine
+            .take_dynamic_import_requests()
+            .expect("take")
+            .is_empty()
+    );
+    assert_eq!(engine.worker_pid_for_test(), pid);
 }
 
 /// JS-4・Issue #1117: 完了の戻り値が `import()` の Promise の確定結果を表すこと。対象が throw
