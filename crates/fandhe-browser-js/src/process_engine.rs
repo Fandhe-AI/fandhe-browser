@@ -133,7 +133,8 @@
 //!   モジュールは compile が `NotYetImplemented`。Issue #1114）。V8 も静的 import の
 //!   compile・link・評価に加え、`import.meta.url`・top-level await・Promise の
 //!   `Fulfilled` / `Pending` / `Rejected`・評価後の microtask checkpoint を実装済み
-//!   （Issue #1111・#1112）。両エンジンの動的 import は後続 issue で、`NotYetImplemented`
+//!   （Issue #1111・#1112）。V8 は動的 `import()` の保留キューと完了も実装済み
+//!   （Issue #1113）。boa の動的 import は後続 issue で、`NotYetImplemented`
 //!   （設計 `es-module-design.md` §9 の 4〜5）。
 //! - 子 → 親へ `ObjectHandle` を渡す経路（オブジェクト参照の往復・親の handle
 //!   照合）は未実装で、現状は fail-closed で拒否する（`TASK-29.5b` の
@@ -2714,7 +2715,7 @@ impl JsEngine for V8ProcessEngine {
             .map_err(module_request_rejected)?;
         let budget =
             worker_protocol::wire_timeout(&module_default_options()).saturating_add(EVALUATE_GRACE);
-        self.module_roundtrip(
+        let outcome = self.module_roundtrip(
             ModuleRoundtrip {
                 frame_tag: tag::FINISH_DYNAMIC_IMPORT,
                 budget,
@@ -2732,7 +2733,15 @@ impl JsEngine for V8ProcessEngine {
                 }
                 (outcome, keep)
             },
-        )
+        );
+        // 子は実行前に完了待ちから id を外すため、Timeout 応答でも子の保留は残らない。
+        // 親の台帳も外し、後続の take で上限超過（プロトコル違反）にならないようにする。
+        if matches!(outcome, Err(JsEngineError::Timeout(_)))
+            && let Some(worker) = self.worker.as_mut()
+        {
+            worker.modules.complete_dynamic_import(id);
+        }
+        outcome
     }
 }
 

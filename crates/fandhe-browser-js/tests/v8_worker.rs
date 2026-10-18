@@ -29,8 +29,8 @@ use std::time::{Duration, Instant};
 use fandhe_browser_js::process_engine::{DomLikeMemberFn, ParentNativeFn};
 use fandhe_browser_js::process_engine::{V8ProcessEngine, WorkerSpawnConfigForTest};
 use fandhe_browser_js::{
-    DynamicImportId, EvaluateOptions, JsEngine, JsEngineError, JsValue, ModuleEvaluation, ModuleId,
-    ModuleResolution, NativeCallContext,
+    DynamicImportId, DynamicImportRequest, EvaluateOptions, JsEngine, JsEngineError, JsValue,
+    ModuleEvaluation, ModuleId, ModuleResolution, NativeCallContext,
 };
 
 /// `super::v8_engine::SCRIPT_EXECUTION_TIMEOUT`（子の watchdog。`pub(crate)`
@@ -97,11 +97,15 @@ fn main() -> ExitCode {
     eprintln!("case: js_4_handshake_with_protocol_generation_5_fails");
     js_4_handshake_with_protocol_generation_5_fails();
     eprintln!(
-        "case: js_4_module_frames_dispatch_to_v8_worker_and_dynamic_import_is_not_yet_implemented"
+        "case: js_4_module_frames_dispatch_to_v8_worker_and_dynamic_import_edge_cases_are_specific"
     );
-    js_4_module_frames_dispatch_to_v8_worker_and_dynamic_import_is_not_yet_implemented();
+    js_4_module_frames_dispatch_to_v8_worker_and_dynamic_import_edge_cases_are_specific();
     eprintln!("case: js_4_module_graph_roundtrips_through_the_v8_worker");
     js_4_module_graph_roundtrips_through_the_v8_worker();
+    eprintln!("case: js_4_dynamic_import_roundtrips_through_the_v8_worker");
+    js_4_dynamic_import_roundtrips_through_the_v8_worker();
+    eprintln!("case: js_6_dynamic_import_timeout_keeps_parent_and_child_ledgers_in_sync");
+    js_6_dynamic_import_timeout_keeps_parent_and_child_ledgers_in_sync();
     eprintln!("case: js_4_module_import_meta_url_and_promise_states_through_the_v8_worker");
     js_4_module_import_meta_url_and_promise_states_through_the_v8_worker();
     eprintln!("case: js_1_handshake_rejects_hello_naming_a_different_engine");
@@ -483,10 +487,11 @@ fn js_4_handshake_with_protocol_generation_5_fails() {
 }
 
 /// JS-4・REPAIR-3・Issue #1110・#1111: モジュール API の新フレームは現行の子に届いて検証され、
-/// 静的 import の 3 操作は成功し、動的 import の 2 操作は成功を装わず `NotYetImplemented` が返ること。子は生き続け
+/// 静的 import の 3 操作は成功し、動的 import は保留なしの take が空、未知 id の finish が
+/// `ModuleResolutionFailed` になること。子は生き続け
 /// （pid が変わらない）、classic 評価は引き続き動く。また compile の事前検査
 /// （source の上限）は子を起動せずに `EvaluationFailed` にする。
-fn js_4_module_frames_dispatch_to_v8_worker_and_dynamic_import_is_not_yet_implemented() {
+fn js_4_module_frames_dispatch_to_v8_worker_and_dynamic_import_edge_cases_are_specific() {
     let options = EvaluateOptions::default();
 
     // 事前検査: 子の起動前に弾く。
@@ -520,7 +525,7 @@ fn js_4_module_frames_dispatch_to_v8_worker_and_dynamic_import_is_not_yet_implem
         "the child must be running after an evaluation"
     );
 
-    // 静的 import の 3 操作は V8 で実装済み（Issue #1111）。動的 import の 2 操作は未対応のまま。
+    // 静的 import の 3 操作と動的 import の 2 操作は V8 で実装済み（Issue #1111・#1113）。
     let record = engine
         .compile_module("https://example.test/a.js", "export const a = 1;")
         .expect("compile_module must succeed");
@@ -533,20 +538,18 @@ fn js_4_module_frames_dispatch_to_v8_worker_and_dynamic_import_is_not_yet_implem
             .expect("evaluate_module must succeed"),
         ModuleEvaluation::Fulfilled
     );
-    let results = [
-        engine.take_dynamic_import_requests().map(|_| ()),
-        engine.finish_dynamic_import(DynamicImportId::from_raw(1), Err("failed".to_string())),
-    ];
-    for (index, result) in results.iter().enumerate() {
-        match result {
-            Err(JsEngineError::NotYetImplemented(msg)) => {
-                assert!(
-                    !msg.is_empty(),
-                    "operation {index} returned an empty message"
-                )
-            }
-            other => panic!("operation {index}: expected NotYetImplemented, got: {other:?}"),
+    assert_eq!(
+        engine
+            .take_dynamic_import_requests()
+            .expect("take must succeed"),
+        Vec::new(),
+        "no dynamic import is pending yet"
+    );
+    match engine.finish_dynamic_import(DynamicImportId::from_raw(1), Err("failed".to_string())) {
+        Err(JsEngineError::ModuleResolutionFailed(msg)) => {
+            assert_eq!(msg, "unknown or finished dynamic import id")
         }
+        other => panic!("expected ModuleResolutionFailed for an unknown id, got: {other:?}"),
     }
 
     assert_eq!(
@@ -556,7 +559,7 @@ fn js_4_module_frames_dispatch_to_v8_worker_and_dynamic_import_is_not_yet_implem
     assert_eq!(
         engine.worker_pid_for_test(),
         pid,
-        "the child must survive NotYetImplemented responses"
+        "the child must survive the dynamic import errors"
     );
 }
 
@@ -702,6 +705,114 @@ fn js_4_module_graph_roundtrips_through_the_v8_worker() {
         pid,
         "the child must survive module failures"
     );
+}
+
+/// JS-4・JS-6・Issue #1113: 実際の V8 子プロセスで、動的 `import()` が保留要求として取り出され
+/// （id・referrer・specifier が具体値）、`finish(Ok)` で `then`、`finish(Err)` で `catch` が
+/// 走ること。未知の id は `ModuleResolutionFailed` で、子（pid）は変わらない。
+fn js_4_dynamic_import_roundtrips_through_the_v8_worker() {
+    let options = EvaluateOptions::default();
+    let mut engine = V8ProcessEngine::new();
+    let root = engine
+        .compile_module(
+            "https://example.test/app/main.js",
+            "import('./lazy.js').then(ns => { globalThis.got = ns.v; }); \
+             import('./bad.js').catch(e => { globalThis.err = e.message; }); export {};",
+        )
+        .expect("compile root");
+    assert_eq!(
+        engine.evaluate_module(root.id(), &options).expect("eval"),
+        ModuleEvaluation::Fulfilled
+    );
+    let pid = engine.worker_pid_for_test();
+    let requests = engine.take_dynamic_import_requests().expect("take");
+    assert_eq!(
+        requests,
+        vec![
+            DynamicImportRequest::new(
+                DynamicImportId::from_raw(1),
+                Some(root.id()),
+                "./lazy.js".to_string()
+            ),
+            DynamicImportRequest::new(
+                DynamicImportId::from_raw(2),
+                Some(root.id()),
+                "./bad.js".to_string()
+            ),
+        ]
+    );
+    let lazy = engine
+        .compile_module("https://example.test/app/lazy.js", "export const v = 42;")
+        .expect("compile lazy");
+    engine.link_module(lazy.id(), &[]).expect("link lazy");
+    engine
+        .finish_dynamic_import(requests[0].id(), Ok(lazy.id()))
+        .expect("finish ok");
+    engine
+        .finish_dynamic_import(requests[1].id(), Err("fetch failed".to_string()))
+        .expect("finish err");
+    assert_eq!(
+        JsEngine::evaluate_script(&mut engine, "got + '|' + err", &options).expect("eval"),
+        JsValue::String("42|fetch failed".to_string())
+    );
+    match engine.finish_dynamic_import(DynamicImportId::from_raw(99), Err("x".to_string())) {
+        Err(JsEngineError::ModuleResolutionFailed(_)) => {}
+        other => panic!("expected ModuleResolutionFailed for an unknown id, got: {other:?}"),
+    }
+    assert_eq!(
+        engine.worker_pid_for_test(),
+        pid,
+        "the child must survive dynamic import completion"
+    );
+}
+
+/// JS-6・JS-4・Issue #1113: 動的 import の完了が `Timeout` になっても、親子の台帳が揃い
+/// （直後に 256 件を取り出してもプロトコル違反にならず子は同じ pid）、`import()` の Promise は
+/// reject されて `catch` に届くこと。
+fn js_6_dynamic_import_timeout_keeps_parent_and_child_ledgers_in_sync() {
+    let options = EvaluateOptions::default();
+    let mut engine = V8ProcessEngine::new();
+    let root = engine
+        .compile_module(
+            "https://example.test/app/main.js",
+            "globalThis.caught = 'no'; \
+             import('./spin.js').catch(() => { globalThis.caught = 'yes'; }); export {};",
+        )
+        .expect("compile root");
+    assert_eq!(
+        engine.evaluate_module(root.id(), &options).expect("eval"),
+        ModuleEvaluation::Fulfilled
+    );
+    let pid = engine.worker_pid_for_test();
+    let requests = engine.take_dynamic_import_requests().expect("take");
+    assert_eq!(requests.len(), 1);
+    let spin = engine
+        .compile_module("https://example.test/app/spin.js", "for (;;) {} export {};")
+        .expect("compile spin");
+    engine.link_module(spin.id(), &[]).expect("link spin");
+    match engine.finish_dynamic_import(requests[0].id(), Ok(spin.id())) {
+        Err(JsEngineError::Timeout(_)) => {}
+        other => panic!("expected Timeout, got: {other:?}"),
+    }
+    assert_eq!(
+        JsEngine::evaluate_script(&mut engine, "caught", &options).expect("eval"),
+        JsValue::String("yes".to_string())
+    );
+    let batch = engine
+        .compile_module(
+            "https://example.test/app/batch.js",
+            "for (let i = 0; i < 256; i++) { import('./m' + i + '.js').catch(() => {}); } export {};",
+        )
+        .expect("compile batch");
+    assert_eq!(
+        engine.evaluate_module(batch.id(), &options).expect("eval"),
+        ModuleEvaluation::Fulfilled
+    );
+    assert_eq!(
+        engine.take_dynamic_import_requests().expect("take").len(),
+        256
+    );
+    assert_eq!(engine.worker_pid_for_test(), pid);
 }
 
 /// JS-4・REPAIR-3・Issue #1112: 実際の V8 子プロセスで、静的 import 先を含む
