@@ -1691,7 +1691,12 @@ async fn run_event_loop(
             // 下で abort し、要求を数える（取りこぼして idle の成功終了にしない）。
             if take_dynamic && dynamic_queue.is_empty() {
                 match rt.take_dynamic_import_requests() {
-                    Ok(requests) => dynamic_queue.extend(requests),
+                    Ok(requests) => {
+                        // 取り出した時点で全件を計上する（打ち切りで残っても requested が過小にならない）。
+                        dynamic_imports.requested =
+                            dynamic_imports.requested.saturating_add(requests.len());
+                        dynamic_queue.extend(requests);
+                    }
                     // boa 等の未対応エンジンは「要求なし」。以降このページでは呼ばない。
                     Err(Error::JsEvaluation(JsEngineError::NotYetImplemented(_))) => {
                         take_dynamic = false;
@@ -1715,7 +1720,6 @@ async fn run_event_loop(
                     // 数えて reject 扱いにし、ページを打ち切る（成功終了にしない）。
                     let abort_kind = page_wall_abort(ctx.options, None);
                     let dropped = dynamic_queue.len().saturating_add(1);
-                    dynamic_imports.requested = dynamic_imports.requested.saturating_add(dropped);
                     dynamic_imports.rejected = dynamic_imports.rejected.saturating_add(dropped);
                     for _ in 0..dropped {
                         dynamic_imports
@@ -1736,6 +1740,16 @@ async fn run_event_loop(
                 )
                 .await?
                 {
+                    // どの打ち切り経路でも、取り出し済みで未処理の要求を reject として計上する。
+                    if let Some(tripped) = abort.as_ref() {
+                        let kind = tripped.kind.clone();
+                        for _ in dynamic_queue.drain(..) {
+                            dynamic_imports.rejected = dynamic_imports.rejected.saturating_add(1);
+                            dynamic_imports
+                                .failures
+                                .push(DynamicImportFailureKind::Limit(kind.clone()));
+                        }
+                    }
                     break;
                 }
                 continue;

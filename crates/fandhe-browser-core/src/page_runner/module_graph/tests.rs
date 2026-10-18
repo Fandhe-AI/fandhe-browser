@@ -1233,6 +1233,26 @@ fn js_6_dynamic_import_counts_toward_max_modules() {
     assert_eq!(out.dynamic_imports().rejected(), 1);
 }
 
+/// `JS-6`・Issue #1117: 打ち切りで取り出し済みの未処理要求が残っても、全件を requested と rejected に計上する。
+#[test]
+fn js_6_dynamic_import_abort_counts_remaining_queue() {
+    let (port, hits) = leaf_server();
+    let html = "<script type=module>dynamic \"/d1.js\";dynamic \"/d2.js\"</script>";
+    // inline のみで枠が埋まり、最初の動的 import で max_modules 超過になる。
+    let (out, _) = run(html, port, &module_options().with_max_modules(1));
+    assert_eq!(hit_count(&hits, "/d1.js"), 0);
+    assert_eq!(hit_count(&hits, "/d2.js"), 0);
+    let r = out.dynamic_imports();
+    assert_eq!((r.requested(), r.fulfilled(), r.rejected()), (2, 0, 2));
+    assert_eq!(
+        r.failures(),
+        &[
+            DynamicImportFailureKind::Limit(AbortKind::ScriptCount { limit: 1 }),
+            DynamicImportFailureKind::Limit(AbortKind::ScriptCount { limit: 1 }),
+        ]
+    );
+}
+
 /// `JS-6`: キャッシュに当たる繰り返しでも、要求数の上限を超えたら打ち切る。
 #[test]
 fn js_6_dynamic_import_request_limit() {

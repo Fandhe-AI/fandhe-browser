@@ -2028,11 +2028,18 @@ fn admit_dynamic_import(
     let referrer = match referrer_url {
         None => None,
         Some(url) => {
-            // 同じ URL が複数登録されていると特定できない。親の重複排除を信頼せず拒否する。
-            let mut matches = map.entries.iter().filter(|(_, e)| e.url == url);
-            match (matches.next(), matches.next()) {
-                (Some((id, _)), None) => Some(*id),
-                _ => return Err("referrer module cannot be identified"),
+            // inline module は文書の URL を共有するため、同じ URL の entry が複数あり得る
+            // （`<script type=module>` が複数）。親は referrer を URL の解決にしか使わず、同じ URL
+            // なら解決結果も同じなので、最小 id を決定的に採る。URL が未登録なら特定不能で拒否する。
+            match map
+                .entries
+                .iter()
+                .filter(|(_, e)| e.url == url)
+                .map(|(id, _)| *id)
+                .min()
+            {
+                Some(id) => Some(id),
+                None => return Err("referrer module cannot be identified"),
             }
         }
     };
@@ -4771,19 +4778,21 @@ mod tests {
         assert_eq!(engine.take_dynamic_import_requests().expect("take"), vec![]);
     }
 
-    /// JS-6・Issue #1113: 同じ URL のモジュールが 2 つ登録されていると referrer を特定できず、
-    /// 成功を装わず即時 reject する。
+    /// JS-6・Issue #1113: 同じ URL のモジュールが複数登録されていても（複数の inline module）、
+    /// 最小 id を referrer として動的 import を積む。
     #[test]
-    fn js_6_v8_dynamic_import_rejects_when_referrer_url_is_ambiguous() {
+    fn js_6_v8_dynamic_import_with_shared_referrer_url_uses_smallest_id() {
         let mut engine = module_engine();
-        compile_ok(&mut engine, "https://example.test/dup.js", "export {};");
+        let first = compile_ok(&mut engine, "https://example.test/dup.js", "export {};");
         eval_module_source(
             &mut engine,
             "https://example.test/dup.js",
-            "globalThis.r = 0; import('./x.js').catch(() => { globalThis.r = 1; }); export {};",
+            "import('./x.js'); export {};",
         );
-        assert_eq!(eval_str(&mut engine, "r"), JsValue::Number(1.0));
-        assert_eq!(engine.take_dynamic_import_requests().expect("take"), vec![]);
+        let requests = engine.take_dynamic_import_requests().expect("take");
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].referrer(), Some(first.id()));
+        assert_eq!(requests[0].specifier(), "./x.js");
     }
 
     /// JS-6・Issue #1113: 完了後の `then` が microtask を無限に積むと `Timeout`。

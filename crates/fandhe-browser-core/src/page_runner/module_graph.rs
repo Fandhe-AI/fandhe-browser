@@ -995,7 +995,7 @@ pub(super) async fn pump_one_dynamic_import(
     report: &mut DynamicImportReport,
     abort: &mut Option<PageAbort>,
 ) -> crate::Result<bool> {
-    report.requested = report.requested.saturating_add(1);
+    // `requested` は取り出し時に計上済み（イベントループ側）。
     let id = request.id();
     // 失敗の種別と、打ち切りの理由（打ち切るときだけ）。
     let verdict: Result<ModuleId, (DynamicImportFailureKind, Option<AbortKind>)> =
