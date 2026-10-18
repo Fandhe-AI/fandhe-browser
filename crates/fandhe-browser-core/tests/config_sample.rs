@@ -62,3 +62,42 @@ fn task_112_sample_execute_page_scripts_toggle() {
         assert!(result.expect("受理").js().execute_page_scripts());
     }
 }
+
+/// `JS-4`（Issue #1118）: サンプルの `execute_modules` は `false` で読め、両キーを `true` にすると
+/// エンジンありでは有効、`execute_modules` だけ `true` なら受理されるが無効、エンジンなしは拒否。
+#[test]
+fn js4_sample_execute_modules_toggle() {
+    let config = Config::load(&sample_path()).expect("サンプルは読み込める");
+    assert!(!config.js().execute_modules());
+
+    let text = std::fs::read_to_string(sample_path()).expect("サンプルを読める");
+    let only = text.replace("execute_modules = false", "execute_modules = true");
+    assert_ne!(text, only);
+    let both = only.replace(
+        "execute_page_scripts = false",
+        "execute_page_scripts = true",
+    );
+    if fandhe_browser_core::bundled_engines().is_empty() {
+        assert!(matches!(
+            Config::from_toml_str(&both).expect_err("エンジンなしは拒否"),
+            Error::Config(ConfigError::PageScriptsRequireJsEngine)
+        ));
+        assert!(matches!(
+            Config::from_toml_str(&only).expect_err("エンジンなしは拒否"),
+            Error::Config(ConfigError::ModulesRequireJsEngine)
+        ));
+    } else {
+        assert!(
+            Config::from_toml_str(&both)
+                .expect("受理")
+                .js()
+                .execute_modules()
+        );
+        assert!(
+            !Config::from_toml_str(&only)
+                .expect("受理")
+                .js()
+                .execute_modules()
+        );
+    }
+}

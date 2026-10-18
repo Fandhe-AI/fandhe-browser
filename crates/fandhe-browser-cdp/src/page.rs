@@ -34,6 +34,8 @@
 //!   スクリプト実行（打ち切り含む）の完了後に送出される。追い越された遷移の分は送出しない。
 //!
 //! スタブ・差異（`REPAIR-3`）: 有効化は設定のみ（`Page.navigate` のオプションは未対応）。
+//! ES module も同様で、`[js] execute_page_scripts` と `[js] execute_modules` が共に真のときだけ
+//! 実行される（`JS-4`・Issue #1118。ゲートの適用は core の `PageScriptHandle::with_options`）。
 //! `Page.frameStoppedLoading` は未送出（`CDP-2`・TASK-43）。`Page.lifecycleEvent` は `Page.enable` と
 //! `Page.setLifecycleEventsEnabled` の両方が有効なセッションに `init`・`load` だけ送る（43.3k・#1039。
 //! 送らない名前は [`lifecycle_event`] を参照）。

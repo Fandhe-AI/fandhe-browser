@@ -200,6 +200,25 @@ fn limit_handle(engine: &str, allow_loopback: bool) -> PageScriptHandle {
     )
 }
 
+/// 任意の `[js]` 設定（TOML 断片）から作るハンドル。`execute_modules` の設定 gate を、
+/// 実行オプションで上書きせず設定だけで検証するために使う（`JS-4`・Issue #1118）。
+fn handle_from_toml(js_toml: &str, allow_loopback: bool) -> PageScriptHandle {
+    let cfg = Config::from_toml_str(&format!("[js]\n{js_toml}")).expect("config");
+    let mut options = PageScriptActorOptions::default();
+    if allow_loopback {
+        options = options.with_fetch_options(
+            page_script_fetch_options().with_allow_private_network_access(true),
+        );
+    }
+    PageScriptHandle::with_options(cfg.js(), Arc::new(TokioExecutor), options)
+}
+
+/// import を持たない inline module 1 件と対照の classic script 1 件。
+const MODULE_GATE_HTML: &str = "<html><body>\
+    <script>document.body.setAttribute('data-c','ran')</script>\
+    <script type=\"module\">document.body.setAttribute('data-m','ran')</script>\
+    </body></html>";
+
 fn actor_run(
     rt: &tokio::runtime::Runtime,
     h: &PageScriptHandle,
@@ -799,6 +818,85 @@ mod cdp_layer {
         own + children
     }
 
+    /// `[js] execute_modules` の設定 gate（`JS-4`・Issue #1118）を CDP 層とアクター層で検証する。
+    pub fn module_gate(engine: &str) {
+        let rt = rt();
+        let on_toml =
+            format!("engine = \"{engine}\"\nexecute_page_scripts = true\nexecute_modules = true\n");
+        let off_toml = format!("engine = \"{engine}\"\nexecute_page_scripts = true\n");
+        let no_scripts_toml = format!("engine = \"{engine}\"\nexecute_modules = true\n");
+        rt.block_on(async {
+            eprintln!("case: JS-4 module gate (CDP layer)");
+            let (port, _hits) = serve_routes(vec![("/m", "html", MODULE_GATE_HTML.to_owned())]);
+            let url = format!("http://127.0.0.1:{port}/m");
+
+            let mut on = Cdp::new(Some(handle_from_toml(&on_toml, true)));
+            on.navigate(&url).await;
+            let html = on.html();
+            assert!(html.contains("data-m=\"ran\""), "{html}");
+            assert!(html.contains("data-c=\"ran\""), "{html}");
+
+            let mut off = Cdp::new(Some(handle_from_toml(&off_toml, true)));
+            off.navigate(&url).await;
+            let html = off.html();
+            assert!(!html.contains("data-m="), "{html}");
+            assert!(html.contains("data-c=\"ran\""), "{html}");
+
+            let mut disabled = Cdp::new(Some(handle_from_toml(&no_scripts_toml, true)));
+            assert!(!disabled.st.app_state().page_scripts().is_enabled());
+            disabled.navigate(&url).await;
+            let html = disabled.html();
+            assert!(
+                !html.contains("data-m=") && !html.contains("data-c="),
+                "{html}"
+            );
+        });
+
+        eprintln!("case: JS-4 module gate (actor layer)");
+        let url = "http://127.0.0.1:1/m";
+        let out = executed(actor_run(
+            &rt,
+            &handle_from_toml(&on_toml, true),
+            MODULE_GATE_HTML,
+            url,
+        ));
+        let results = outcomes(&out);
+        assert_eq!(results.len(), 2, "{results:?}");
+        assert!(
+            results
+                .iter()
+                .all(|o| matches!(o, ScriptOutcome::Succeeded)),
+            "{results:?}"
+        );
+        let out = executed(actor_run(
+            &rt,
+            &handle_from_toml(&off_toml, true),
+            MODULE_GATE_HTML,
+            url,
+        ));
+        let results = outcomes(&out);
+        assert!(
+            matches!(
+                results.get(1),
+                Some(ScriptOutcome::Skipped {
+                    kind: ScriptDiagnosticKind::SkippedModule,
+                    ..
+                })
+            ),
+            "{results:?}"
+        );
+        let skipped = actor_run(
+            &rt,
+            &handle_from_toml(&no_scripts_toml, true),
+            MODULE_GATE_HTML,
+            url,
+        );
+        assert!(matches!(
+            skipped,
+            Ok(PageScriptOutcome::Skipped(PageScriptSkipReason::Disabled))
+        ));
+    }
+
     pub fn run(engine: &str) {
         let rt = rt();
         rt.block_on(async {
@@ -1040,6 +1138,12 @@ mod cdp_layer {
 pub fn run(engine: &str) {
     actor_cases(engine);
     cdp_layer::run(engine);
+}
+
+/// `[js] execute_modules` の設定 gate の結合テスト（V8 のみが呼ぶ。`JS-4`・Issue #1118）。
+#[allow(dead_code)]
+pub fn run_module_gate(engine: &str) {
+    cdp_layer::module_gate(engine);
 }
 
 /// macOS では boa のランタイム生成が失敗し、アクターは `Err(Run(_))` を返す（成功を装わない）。

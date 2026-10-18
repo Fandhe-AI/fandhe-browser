@@ -1,6 +1,7 @@
 //! ページスクリプト実行アクターの構築（TASK-112・MS-6・Issue #784・ビヘイビア `JS-1`・`JS-4`）。
 //!
-//! `main::run_main` が設定 `[js] execute_page_scripts` から [`PageScriptHandle`] を作り、
+//! `main::run_main` が設定 `[js] execute_page_scripts`（module は `[js] execute_modules` も真のとき。
+//! `JS-4`・Issue #1118。ゲートは core が `JsConfig` から適用するため cli に追加の配線はない）から [`PageScriptHandle`] を作り、
 //! `server::run` が `AppState`（→ `CdpState::app_state()`）へ渡す。アクター本体は core の
 //! `page_actor` で、core は tokio を通常依存に持たないため、専用スレッド上で `!Send` な future を
 //! 駆動する実行器（[`TokioPageScriptExecutor`]）だけを cli が供給する。

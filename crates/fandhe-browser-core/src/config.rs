@@ -58,6 +58,20 @@
 //! 3. `true` かつエンジンなし（エンジンなしビルド）: [`ConfigError::PageScriptsRequireJsEngine`]
 //! 4. 真偽値以外（文字列・数値）: [`ConfigError::Syntax`]
 //!
+//! # `[js] execute_modules` の解決規則（JS-4・Issue #1118）
+//!
+//! ページ内 `<script type=module>` の実行（core の `page_runner` の module グラフ取得・評価）を
+//! 有効にするか。`execute_page_scripts` が真のときだけ効く（REPAIR-3: 単独では何も実行しない）。
+//!
+//! 1. 省略・`false`: 無効（既定。module は `SkippedModule` 診断のまま）
+//! 2. `true` かつエンジンなし: [`ConfigError::ModulesRequireJsEngine`]
+//! 3. `true` かつエンジンあり・`execute_page_scripts = false`: 受理するが実効値は `false`
+//! 4. `true` かつエンジンあり・`execute_page_scripts = true`: 有効
+//! 5. 真偽値以外（文字列・数値）: [`ConfigError::Syntax`]
+//!
+//! module の取得は同一オリジンのみ・件数 / 深さ / バイト数 / 実時間に上限あり（超過は fail-closed）。
+//! 設計は `docs/design/es-module-design.md` §8・§9。
+//!
 //! # serde/toml を公開 API に漏らさない方針
 //!
 //! `error.rs` が `reqwest`/`html5ever` の具象型を公開 API に漏らさない方針と
@@ -191,6 +205,15 @@ impl Config {
                 raw_js.execute_page_scripts,
                 engine,
             )?,
+            execute_modules: false,
+        };
+        let js = JsConfig {
+            execute_modules: resolve_execute_modules(
+                raw_js.execute_modules,
+                engine,
+                js.execute_page_scripts,
+            )?,
+            ..js
         };
 
         let rendering = resolve_rendering(raw.rendering, RENDERING_COMPILED)?;
@@ -389,6 +412,7 @@ fn resolve_rendering(raw: Option<RawRendering>, compiled: bool) -> Result<Render
 pub struct JsConfig {
     engine: Option<EngineKind>,
     execute_page_scripts: bool,
+    execute_modules: bool,
 }
 
 impl JsConfig {
@@ -404,6 +428,12 @@ impl JsConfig {
     pub fn execute_page_scripts(&self) -> bool {
         self.execute_page_scripts
     }
+
+    /// ページ内 ES module を実行するか（`[js] execute_modules`。既定 `false`。`JS-4`・Issue #1118）。
+    /// 実効値で、`execute_page_scripts` が真のときだけ真になる。
+    pub fn execute_modules(&self) -> bool {
+        self.execute_modules
+    }
 }
 
 impl Default for JsConfig {
@@ -415,6 +445,7 @@ impl Default for JsConfig {
             engine: select_default_engine(bundled_engines()),
             // 実行は明示的な opt-in（`true` を既定にしない。`JS-1`）。
             execute_page_scripts: false,
+            execute_modules: false,
         }
     }
 }
@@ -436,6 +467,20 @@ fn resolve_execute_page_scripts(raw: Option<bool>, engine: Option<EngineKind>) -
         (false, _) => Ok(false),
         (true, Some(_)) => Ok(true),
         (true, None) => Err(Error::from(ConfigError::PageScriptsRequireJsEngine)),
+    }
+}
+
+/// `[js] execute_modules` の実効値を確定する（モジュール doc「`[js] execute_modules` の解決規則」）。
+/// エンジンなしの `true` は fail-closed、`execute_page_scripts` が偽なら受理して無効にする（`JS-4`）。
+fn resolve_execute_modules(
+    raw: Option<bool>,
+    engine: Option<EngineKind>,
+    execute_page_scripts: bool,
+) -> Result<bool> {
+    match (raw.unwrap_or(false), engine) {
+        (false, _) => Ok(false),
+        (true, None) => Err(Error::from(ConfigError::ModulesRequireJsEngine)),
+        (true, Some(_)) => Ok(execute_page_scripts),
     }
 }
 
@@ -824,6 +869,7 @@ struct RawRendering {
 struct RawJs {
     engine: Option<String>,
     execute_page_scripts: Option<bool>,
+    execute_modules: Option<bool>,
 }
 
 /// `[profile]` セクションの生 TOML 構造（非公開）。
@@ -896,6 +942,9 @@ pub enum ConfigError {
     /// `[js] execute_page_scripts = true` だが、JS エンジンが 1 つも同梱されていない
     /// （無視して成功させない。TASK-112・Issue #784・`JS-1`）。
     PageScriptsRequireJsEngine,
+    /// `[js] execute_modules = true` だが、JS エンジンが 1 つも同梱されていない
+    /// （無視して成功させない。`JS-4`・Issue #1118）。
+    ModulesRequireJsEngine,
 }
 
 impl ConfigError {
@@ -988,6 +1037,12 @@ impl std::fmt::Display for ConfigError {
                 "js.execute_page_scripts = true but no js engine is compiled into this binary; \
                  rebuild with --features js-v8 or --features js-boa, or set \
                  js.execute_page_scripts = false"
+            ),
+            ConfigError::ModulesRequireJsEngine => write!(
+                f,
+                "js.execute_modules = true but no js engine is compiled into this binary; \
+                 rebuild with --features js-v8 or --features js-boa, or set \
+                 js.execute_modules = false"
             ),
             ConfigError::UnknownJsEngine { value, compiled } => write!(
                 f,
@@ -1450,6 +1505,77 @@ mod tests {
         for bad in [
             "[js]\nexecute_page_scripts = \"true\"\n",
             "[js]\nexecute_page_scripts = 1\n",
+        ] {
+            let err = Config::from_toml_str(bad).expect_err("型不正");
+            assert!(
+                matches!(err, Error::Config(ConfigError::Syntax { .. })),
+                "{bad}"
+            );
+        }
+    }
+
+    /// `JS-4`・Issue #1118: `execute_modules` の省略・`false` は `false`。
+    #[test]
+    fn js4_execute_modules_defaults_to_false() {
+        for input in ["", "[js]\n", "[js]\nexecute_modules = false\n"] {
+            let config = Config::from_toml_str(input).expect("読める");
+            assert!(!config.js().execute_modules(), "{input:?}");
+        }
+        assert!(!JsConfig::default().execute_modules());
+    }
+
+    /// `JS-4`・Issue #1118: 解決規則の全分岐をビルドに依らず検査する。
+    #[test]
+    fn js4_resolve_execute_modules_branches() {
+        assert!(matches!(
+            resolve_execute_modules(Some(true), Some(EngineKind::V8), true),
+            Ok(true)
+        ));
+        assert!(matches!(
+            resolve_execute_modules(Some(true), Some(EngineKind::V8), false),
+            Ok(false)
+        ));
+        assert!(matches!(
+            resolve_execute_modules(None, None, false),
+            Ok(false)
+        ));
+        let err = resolve_execute_modules(Some(true), None, false).expect_err("エンジンなしは拒否");
+        assert!(matches!(
+            err,
+            Error::Config(ConfigError::ModulesRequireJsEngine)
+        ));
+        let msg = err.to_string();
+        assert!(msg.contains("execute_modules"), "{msg}");
+        assert!(msg.contains("--features js-boa"), "{msg}");
+    }
+
+    /// `JS-4`・Issue #1118: `from_toml_str` 経由の有効化・無効化・エンジンなし拒否。
+    #[test]
+    fn js4_execute_modules_from_toml() {
+        let both =
+            Config::from_toml_str("[js]\nexecute_page_scripts = true\nexecute_modules = true\n");
+        let only_modules = Config::from_toml_str("[js]\nexecute_modules = true\n");
+        if bundled_engines().is_empty() {
+            assert!(matches!(
+                both,
+                Err(Error::Config(ConfigError::PageScriptsRequireJsEngine))
+            ));
+            assert!(matches!(
+                only_modules,
+                Err(Error::Config(ConfigError::ModulesRequireJsEngine))
+            ));
+        } else {
+            assert!(both.expect("受理").js().execute_modules());
+            assert!(!only_modules.expect("受理").js().execute_modules());
+        }
+    }
+
+    /// `JS-4`・Issue #1118: 真偽値以外は構文エラーで、`true` に倒れない。
+    #[test]
+    fn js4_execute_modules_wrong_type_is_syntax_error() {
+        for bad in [
+            "[js]\nexecute_modules = \"true\"\n",
+            "[js]\nexecute_modules = 1\n",
         ] {
             let err = Config::from_toml_str(bad).expect_err("型不正");
             assert!(
