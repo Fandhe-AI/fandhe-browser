@@ -188,6 +188,11 @@ pub(crate) mod tag {
 
 /// ES module 用フレームのコーデック・上限定数・id 台帳（`JS-4`・`JS-6`・
 /// Issue #1110）。
+///
+/// エンジン feature（`js-v8`・`js-boa`）もテストも無い構成では利用者が
+/// 存在しないため、モジュールごとコンパイルしない（広範な `allow` で
+/// 未使用検出を抑止しない）。
+#[cfg(any(test, feature = "js-v8", feature = "js-boa"))]
 pub(crate) mod module_frames;
 
 /// 注入するグローバル関数名の最大バイト数（`JS-1`・`TASK-29.4`・

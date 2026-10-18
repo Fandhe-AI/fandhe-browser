@@ -32,11 +32,6 @@
 //! プロトコル違反として扱い、相手側プロセスを終了させる。specifier・URL は
 //! untrusted で、エラーの `Display` には件数・長さ・種別だけを入れる。
 
-#![cfg_attr(
-    not(any(test, feature = "js-v8", feature = "js-boa")),
-    allow(dead_code)
-)]
-
 use std::collections::HashSet;
 use std::time::Duration;
 
