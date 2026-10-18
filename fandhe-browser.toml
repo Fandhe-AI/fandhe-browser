@@ -19,6 +19,14 @@ isolation = "data-directory"
 # ページ内の <script> を実行するか（既定 false。TASK-112・JS-1・JS-4）。
 # true にはエンジンの同梱が必要で、エンジンなしのビルドでは設定エラーになる。
 execute_page_scripts = false
+# ページ内の <script type="module"> も実行するか（既定 false。JS-4・Issue #1118）。
+# execute_page_scripts = true のときだけ効く（単独では何も実行しない）。
+# エンジンなしのビルドで true にすると設定エラーになる。
+# 制約: module の取得は同一オリジンのみ（別オリジンは拒否）。件数は最大 64、
+# グラフ深さは最大 32、バイト数・実時間にも上限があり、超過は fail-closed。
+# 応答は JavaScript の MIME type が必須。実行順は文書順の近似（defer 相当ではない）。
+# boa は動的 import() と top-level await に未対応。動的 import() は #1117 の完了まで未対応。
+execute_modules = false
 
 [rendering]
 # レンダリング層（Servo）の有効化。既定は false。
