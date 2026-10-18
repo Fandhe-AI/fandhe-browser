@@ -1867,50 +1867,60 @@ fn resolve_module_callback<'s>(
 /// `import.meta` の初期化 callback は未実装（#1112）で、そのまま評価すると
 /// `import.meta.url` が `undefined` のまま成功してしまう。対応するまで
 /// [`V8Engine::compile_module`] はこれを `NotYetImplemented` で拒否する。
-/// トークン `import` の後に空白・コメント（非 ASCII 文字も飛ばす）を挟んで `.` と
-/// `meta` が続くものを探す。文字列・コメント中の `import.meta` も拒否する誤検出は
-/// fail-closed 側として許容する。**#1112 で `import.meta.url` を実装したらこの検出を外す。**
+///
+/// トークン `import` の後に trivia を挟んで `.`、さらに trivia を挟んで `meta` または
+/// `\`（識別子の Unicode エスケープの開始。fail-closed で拒否）が続くものを探す。
+/// 不変条件: [`skip_trivia`] が読み飛ばす集合は JS の WhiteSpace・LineTerminator・
+/// Comment の上位集合で、余分に読み飛ばすのは誤検出（拒否側）にしかならない。文字列・
+/// コメント中の `import.meta` を拒否する誤検出も fail-closed 側として許容する。
+/// **#1112 で `import.meta.url` を実装したらこの検出を外す。**
 /// 入力は上限検証済みのソースで、添字アクセスは `get` のみ。
 fn uses_import_meta(source: &str) -> bool {
-    let bytes = source.as_bytes();
     source.match_indices("import").any(|(index, word)| {
-        let after_import = skip_trivia(bytes, index.saturating_add(word.len()));
-        if bytes.get(after_import) != Some(&b'.') {
+        let after_import = skip_trivia(source, index.saturating_add(word.len()));
+        if source
+            .get(after_import..)
+            .and_then(|rest| rest.chars().next())
+            != Some('.')
+        {
             return false;
         }
-        let after_dot = skip_trivia(bytes, after_import.saturating_add(1));
-        bytes.get(after_dot..after_dot.saturating_add(4)) == Some(b"meta".as_slice())
+        let after_dot = skip_trivia(source, after_import.saturating_add(1));
+        source
+            .get(after_dot..)
+            .is_some_and(|rest| rest.starts_with("meta") || rest.starts_with('\\'))
     })
 }
 
-/// 空白・コメント（`//`・`/* */`）・非 ASCII バイトを読み飛ばした位置を返す。
-fn skip_trivia(bytes: &[u8], mut index: usize) -> usize {
+/// 行末記号（LF・CR・U+2028・U+2029）か。
+fn is_line_terminator(c: char) -> bool {
+    matches!(c, '\n' | '\r' | '\u{2028}' | '\u{2029}')
+}
+
+/// 空白（Unicode White_Space に U+FEFF を加えたもの。VT・FF・NBSP・LS・PS を含む）・
+/// 行コメント（任意の行末記号で終わる）・ブロックコメント（`*/` まで。閉じ忘れは末尾まで）を
+/// 読み飛ばした位置（バイト位置）を返す。
+fn skip_trivia(source: &str, start: usize) -> usize {
+    let mut index = start;
     loop {
-        match bytes.get(index) {
-            Some(byte) if byte.is_ascii_whitespace() || !byte.is_ascii() => index += 1,
-            Some(b'/') => match bytes.get(index.saturating_add(1)) {
-                Some(b'/') => {
-                    index += 2;
-                    while bytes.get(index).is_some_and(|byte| *byte != b'\n') {
-                        index += 1;
-                    }
-                }
-                Some(b'*') => {
-                    index += 2;
-                    loop {
-                        match bytes.get(index) {
-                            None => return index,
-                            Some(b'*') if bytes.get(index.saturating_add(1)) == Some(&b'/') => {
-                                index += 2;
-                                break;
-                            }
-                            Some(_) => index += 1,
-                        }
-                    }
-                }
-                _ => return index,
-            },
-            _ => return index,
+        let Some(rest) = source.get(index..) else {
+            return index;
+        };
+        let Some(c) = rest.chars().next() else {
+            return index;
+        };
+        if c.is_whitespace() || c == '\u{feff}' {
+            index = index.saturating_add(c.len_utf8());
+        } else if rest.starts_with("//") {
+            let line_len = rest.find(is_line_terminator).unwrap_or(rest.len());
+            index = index.saturating_add(line_len);
+        } else if let Some(body) = rest.strip_prefix("/*") {
+            let consumed = body
+                .find("*/")
+                .map_or(rest.len(), |end| end.saturating_add(4));
+            index = index.saturating_add(consumed);
+        } else {
+            return index;
         }
     }
 }
@@ -4178,6 +4188,12 @@ mod tests {
             "globalThis.u = import.meta.url; export {};",
             "globalThis.u = import . meta . url; export {};",
             "globalThis.u = import/* c */.\n// c\nmeta.url; export {};",
+            "globalThis.u = import//c\r.meta.url; export {};",
+            "globalThis.u = import//c\u{2028}.meta.url; export {};",
+            "globalThis.u = import//c\u{2029}.meta.url; export {};",
+            "globalThis.u = import\u{b}.\u{c}meta.url; export {};",
+            "globalThis.u = import\u{a0}.\u{feff}meta.url; export {};",
+            "globalThis.u = import.\\u006deta.url; export {};",
         ] {
             match engine.compile_module("https://example.test/m.js", source, MODULE_TIMEOUT) {
                 Err(JsEngineError::NotYetImplemented(msg)) => assert!(msg.contains("import.meta")),
