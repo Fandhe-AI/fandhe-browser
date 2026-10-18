@@ -1774,6 +1774,13 @@ impl ModuleMap {
             if !entry.requests.iter().any(|r| r == resolution.specifier()) {
                 return Err(unresolved("specifier is not a dependency of the module"));
             }
+            // 別の id への付け替えは拒否する（instantiate 済みの束縛とずれるため）。
+            // 同じ対応の再 link は冪等に許す。
+            if let Some(existing) = entry.links.get(resolution.specifier())
+                && *existing != resolution.target().raw()
+            {
+                return Err(unresolved("specifier is already linked to another module"));
+            }
             accepted.push((
                 resolution.specifier().to_string(),
                 resolution.target().raw(),
@@ -1854,6 +1861,9 @@ fn resolve_module_callback<'s>(
     }
     found
 }
+
+/// 重複込みの import 宣言数の上限（走査・確保コストの上限。`MAX_MODULE_REQUESTS` は一意な件数）。
+const MAX_RAW_MODULE_REQUESTS: usize = 65_536;
 
 /// モジュール compile の結果（スコープの外へ持ち出す部分）。
 struct CompiledModule {
@@ -2032,12 +2042,16 @@ impl V8Engine {
             ));
         }
         let raw_requests = module.get_module_requests();
-        if raw_requests.length() > MAX_MODULE_REQUESTS {
+        // V8 の一覧は import 宣言ごと（同じ specifier が重複しうる）。重複を除いた
+        // 一意な件数で `MAX_MODULE_REQUESTS` を判定し、重複込みの生の件数にも走査・確保の
+        // ための上限を設ける（ソースは 1 MiB 以下なので正常な入力では超えない）。
+        if raw_requests.length() > MAX_RAW_MODULE_REQUESTS {
             return Err(JsEngineError::ResourceLimitExceeded(format!(
-                "module has more than {MAX_MODULE_REQUESTS} dependencies"
+                "module has more than {MAX_RAW_MODULE_REQUESTS} import declarations"
             )));
         }
-        let mut requests: Vec<String> = Vec::with_capacity(raw_requests.length());
+        let mut requests: Vec<String> =
+            Vec::with_capacity(MAX_MODULE_REQUESTS.min(raw_requests.length()));
         let mut seen: HashSet<String> = HashSet::new();
         for index in 0..raw_requests.length() {
             let request = raw_requests
@@ -2060,10 +2074,15 @@ impl V8Engine {
                 )));
             }
             let specifier = specifier.to_rust_string_lossy(&tc);
-            if !seen.insert(specifier.clone()) {
-                return Err(invalid("duplicate module specifier"));
+            // 同じ specifier は出現順で最初の 1 件に畳む（boa と同じ。親の契約は一意な一覧）。
+            if seen.insert(specifier.clone()) {
+                if requests.len() >= MAX_MODULE_REQUESTS {
+                    return Err(JsEngineError::ResourceLimitExceeded(format!(
+                        "module has more than {MAX_MODULE_REQUESTS} dependencies"
+                    )));
+                }
+                requests.push(specifier);
             }
-            requests.push(specifier);
         }
         Ok(CompiledModule {
             module: v8::Global::new(&tc, module),
@@ -4021,5 +4040,73 @@ mod tests {
             JsValue::Bool(true)
         );
         assert_eq!(eval_str(&mut engine, "1 + 1"), JsValue::Number(2.0));
+    }
+
+    /// JS-4・Issue #1111: 同じ specifier の import 宣言が複数あっても、依存は出現順の
+    /// 一意な一覧になる（名前付き import の分割・副作用 import との併用・`export from`）。
+    #[test]
+    fn js_4_v8_module_duplicate_import_declarations_collapse_to_unique_requests() {
+        let mut engine = module_engine();
+        let dep = compile_ok(
+            &mut engine,
+            "https://example.test/d.js",
+            "export const x = 1; export const y = 2;",
+        );
+        let root = compile_ok(
+            &mut engine,
+            "https://example.test/r.js",
+            "import { x } from './d.js'; import './o.js'; import { y } from './d.js'; \
+             export { x as x2 } from './d.js'; globalThis.sum = x + y;",
+        );
+        let specifiers: Vec<&str> = root.requests().iter().map(|r| r.specifier()).collect();
+        assert_eq!(specifiers, vec!["./d.js", "./o.js"]);
+        let other = compile_ok(&mut engine, "https://example.test/o.js", "export {};");
+        link_ok(&mut engine, &root, &[("./d.js", &dep), ("./o.js", &other)]);
+        assert_eq!(
+            engine
+                .evaluate_module(root.id(), &EvaluateOptions::default())
+                .expect("module must evaluate"),
+            ModuleEvaluation::Fulfilled
+        );
+        assert_eq!(eval_str(&mut engine, "sum"), JsValue::Number(3.0));
+        // 一意な件数が上限ちょうどなら、重複を足しても成功する。
+        let mut many: String = (0..MAX_MODULE_REQUESTS)
+            .map(|i| format!("import './m{i}.js';\n"))
+            .collect();
+        many.push_str("import './m0.js';\n");
+        let record = compile_ok(&mut engine, "https://example.test/many.js", &many);
+        assert_eq!(record.requests().len(), MAX_MODULE_REQUESTS);
+    }
+
+    /// JS-4・Issue #1111: 別の id への付け替えは拒否し、同じ対応の再 link は許す。
+    #[test]
+    fn js_4_v8_module_relink_to_another_module_is_rejected() {
+        let mut engine = module_engine();
+        let first = compile_ok(
+            &mut engine,
+            "https://example.test/a.js",
+            "export const v = 1;",
+        );
+        let second = compile_ok(
+            &mut engine,
+            "https://example.test/b.js",
+            "export const v = 2;",
+        );
+        let root = compile_ok(
+            &mut engine,
+            "https://example.test/r.js",
+            "import { v } from './x.js'; globalThis.got = v;",
+        );
+        link_ok(&mut engine, &root, &[("./x.js", &first)]);
+        link_ok(&mut engine, &root, &[("./x.js", &first)]);
+        let moved = ModuleResolution::new("./x.js".to_string(), second.id());
+        assert!(matches!(
+            engine.link_module(root.id(), &[moved]),
+            Err(JsEngineError::ModuleResolutionFailed(_))
+        ));
+        engine
+            .evaluate_module(root.id(), &EvaluateOptions::default())
+            .expect("module must evaluate");
+        assert_eq!(eval_str(&mut engine, "got"), JsValue::Number(1.0));
     }
 }
