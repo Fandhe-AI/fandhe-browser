@@ -534,6 +534,18 @@ impl fmt::Debug for PageScriptHandle {
     }
 }
 
+/// 設定の `execute_modules` が真なら収集オプションの module gate を真にした実行オプションを返す。
+/// 偽なら渡されたオプションをそのまま使う（テスト用に options で gate を渡す経路を壊さない）。
+/// `with_options` から呼ばれる（`JS-4`・Issue #1118）。
+fn run_options_for(js: &JsConfig, run: &PageRunOptions) -> PageRunOptions {
+    if js.execute_modules() {
+        run.clone()
+            .with_collection(run.collection().clone().with_execute_modules(true))
+    } else {
+        run.clone()
+    }
+}
+
 impl PageScriptHandle {
     /// 常に [`PageScriptSkipReason::Disabled`] を返す無効なハンドル。実行器もスレッドも持たない。
     pub fn disabled() -> Self {
@@ -567,7 +579,7 @@ impl PageScriptHandle {
         }
         let driver = Arc::new(RunnerDriver {
             js: *js,
-            run: options.run.clone(),
+            run: run_options_for(js, &options.run),
         });
         Self::with_driver(executor, options, driver)
     }
@@ -954,6 +966,43 @@ fn contains_script_start_tag(html: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Config;
+    use crate::page_script::ScriptCollectionOptions;
+
+    /// `JS-4`・Issue #1118: 設定が module 実行を有効にしているときだけ gate を真にする。
+    #[test]
+    fn js4_run_options_for_applies_execute_modules_gate() {
+        let base = PageRunOptions::default();
+        let off = JsConfig::default();
+        assert!(!run_options_for(&off, &base).collection().execute_modules());
+        let on =
+            Config::from_toml_str("[js]\nexecute_page_scripts = true\nexecute_modules = true\n");
+        if let Ok(on) = on {
+            assert!(
+                run_options_for(on.js(), &base)
+                    .collection()
+                    .execute_modules()
+            );
+        }
+        // 設定 off でも、テスト用に options で on にした値は保たれる。
+        let forced = PageRunOptions::default()
+            .with_collection(ScriptCollectionOptions::default().with_execute_modules(true));
+        assert!(
+            run_options_for(&off, &forced)
+                .collection()
+                .execute_modules()
+        );
+    }
+
+    /// `JS-4`・Issue #1118: `execute_page_scripts = false` ではハンドルは無効のまま。
+    #[test]
+    fn js4_modules_without_page_scripts_is_disabled() {
+        if let Ok(c) = Config::from_toml_str("[js]\nexecute_modules = true\n") {
+            let h = PageScriptHandle::new(c.js(), TestExecutor::new());
+            assert!(!h.is_enabled());
+        }
+    }
+
     use crate::state::NavigationState;
     use std::sync::atomic::AtomicUsize;
     use std::time::{Duration, Instant};
