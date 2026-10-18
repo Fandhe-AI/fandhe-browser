@@ -55,6 +55,8 @@
 //! | 応答（Result/Error）受信直後の同期確認で RSS 超過が判明した | [`JsEngineError::ResourceLimitExceeded`] | 破棄（せっかく得られた応答を握りつぶす。同上） |
 //! | 子から不正な `NativeCall` フレームを受け取った（デコード失敗・未登録 id） | [`JsEngineError::EngineUnavailable`] | 破棄（`dispatch_native_call`・`TASK-29`・Issue #526） |
 //! | `NativeFn` の実行終了後、評価開始時の期限を過ぎていた | [`JsEngineError::Timeout`] | 破棄（`NativeReturn` を送らずに `kill` する。`TASK-29`・Issue #526） |
+//! | 子が ES module 用フレームに `Error{kind=NotYetImplemented}` / `Error{kind=ModuleResolution}` を返した（プロトコル v6。`JS-4`・Issue #1110） | [`JsEngineError::NotYetImplemented`] / [`JsEngineError::ModuleResolutionFailed`] | 残る |
+//! | 子から不正な ES module 応答を受け取った（id の重複・未知の referrer・上限超過・不正な ack 等） | [`JsEngineError::EngineUnavailable`] | 破棄（`module_protocol_violation`） |
 //! | それ以外の異常終了・プロトコル違反・起動失敗 | [`JsEngineError::EngineUnavailable`] | 破棄 |
 //!
 //! Context が破棄される場合、メッセージに "context was discarded" を
@@ -106,8 +108,29 @@
 //! であれば、返信を受けた子の watchdog が
 //! 先に発火し `Error{kind=Timeout}` を返す）。
 //!
+//! # ES module 用フレーム（プロトコル v6。`JS-4`・`JS-6`・Issue #1110）
+//!
+//! `JsEngine` のモジュール評価 API 5 メソッド（`compile_module`・`link_module`・
+//! `evaluate_module`・`take_dynamic_import_requests`・`finish_dynamic_import`）は
+//! 新フレーム（`worker_protocol::module_frames`）の送受信に対応づけ、応答待ちは
+//! `evaluate_script` と共通の `await_response` で行う。期限は次のとおり。
+//!
+//! | 操作 | 期限（書き込み＋応答待ちの合計） | `NATIVE_CALL` |
+//! |---|---|---|
+//! | `compile_module` | 既定タイムアウト（2 秒。ワイヤにも載せる）+ `EVALUATE_GRACE` | 違反 |
+//! | `link_module`・`take_dynamic_import_requests` | `MODULE_CONTROL_TIMEOUT`（5 秒） | 違反 |
+//! | `evaluate_module` | `options.timeout()` + `EVALUATE_GRACE` | 許可 |
+//! | `finish_dynamic_import` | 既定タイムアウト + `EVALUATE_GRACE`（ワイヤのヘッダなし） | 許可 |
+//!
+//! 子が通知する module id・動的 import id は untrusted で、`WorkerHandle` が持つ
+//! `ModuleIdRegistry` で照合する（子の破棄で台帳も消える）。呼び出し側が渡す
+//! id は親では照合せず、未知の id は子が `ModuleResolution` で返す契約。
+//!
 //! # 既知の制限（実装済みを装わない。REPAIR-3）
 //!
+//! - 子は ES module 用フレームを検証したうえで全操作に `NotYetImplemented` を
+//!   返す（V8・boa での compile・link・評価・動的 import は後続 issue。設計
+//!   `es-module-design.md` §9 の 3〜6）。
 //! - 子 → 親へ `ObjectHandle` を渡す経路（オブジェクト参照の往復・親の handle
 //!   照合）は未実装で、現状は fail-closed で拒否する（`TASK-29.5b` の
 //!   後続作業。REPAIR-3）。setter（書き込み可能プロパティ）も未対応。
@@ -182,10 +205,12 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use super::engine_trait::{
-    EngineKind, EvaluateOptions, JsEngine, JsEngineError, JsValue, NativeCallContext, NativeFn,
-    ObjectHandle,
+    DynamicImportId, DynamicImportRequest, EngineKind, EvaluateOptions, JsEngine, JsEngineError,
+    JsValue, ModuleEvaluation, ModuleId, ModuleRecord, ModuleResolution, NativeCallContext,
+    NativeFn, ObjectHandle,
 };
-use super::worker_protocol::{self, ErrorKind, NativeReturn, tag};
+use super::worker_protocol::module_frames::{self, ModuleIdRegistry};
+use super::worker_protocol::{self, ErrorKind, NativeReturn, ProtocolError, tag};
 
 /// 親側の `NativeCall` dispatch が実行するネイティブ関数の型
 /// （`TASK-29`・Issue #526）。
@@ -221,6 +246,23 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 /// 再登録は全件で 1 回だけ計算する）の上限時間（`TASK-29.4`・Issue #155）。
 /// ハンドシェイクと同じ値を使う。
 const REGISTER_ACK_TIMEOUT: Duration = HANDSHAKE_TIMEOUT;
+
+/// ES module の link・動的 import の取り出しのように JS が走らない操作が、
+/// ack を待つ固定の期限（書き込み＋応答待ちの合計。`JS-4`・`JS-6`・
+/// Issue #1110）。登録系と同じ値を使う。compile・evaluate・finish は
+/// [`EVALUATE_GRACE`] を足した期限（[`module_default_options`] と各メソッドの
+/// ドキュメント参照）。
+const MODULE_CONTROL_TIMEOUT: Duration = REGISTER_ACK_TIMEOUT;
+
+/// `JsEngine::compile_module`・`finish_dynamic_import` が使うタイムアウトの
+/// 元になる options（トレイトのシグネチャに [`EvaluateOptions`] が無いため
+/// 既定値の 2 秒を使う。`JS-4`・`JS-6`・Issue #1110）。compile のワイヤには
+/// この値を載せ（子の watchdog 用。実際に使うのは後続の V8 issue）、親の期限は
+/// これに [`EVALUATE_GRACE`] を足す。finish はワイヤにヘッダを持たず、将来
+/// microtask が走りうるため親の期限だけ同じ値にする。
+fn module_default_options() -> EvaluateOptions {
+    EvaluateOptions::default()
+}
 
 /// 1 回の評価（書き込み＋応答待ちの合計）の親側の期限は、
 /// 呼び出し側の `options.timeout()`（ワイヤ上の丸め済み値。
@@ -653,6 +695,10 @@ struct WorkerHandle {
     /// （feature `test-support`）だけが差し替えられる（`JS-6`・`PERF-7`・
     /// Issue #905。macOS の往復遅延の帰属計測用）。
     memory_probe: MemoryProbeFn,
+    /// 子から通知された module id・動的 import id の台帳（`JS-4`・Issue #1110）。
+    /// 子と同じ寿命で、子の破棄・再起動で消える（古い id を新しい子に対して
+    /// 「既知」として通さない。設計 §3）。
+    modules: ModuleIdRegistry,
 }
 
 impl WorkerHandle {
@@ -809,6 +855,7 @@ impl WorkerHandle {
             memory_monitor,
             rss_threshold_bytes,
             memory_probe,
+            modules: ModuleIdRegistry::new(),
         })
     }
 
@@ -2072,248 +2119,282 @@ impl V8ProcessEngine {
             return (Err(err), false);
         }
 
-        loop {
-            let recv_wait = deadline.saturating_duration_since(Instant::now());
-            // codex レビュー指摘（P1）対応: `recv_timeout(Duration::ZERO)` は
-            // キューに残っているフレームを返せるため、期限後に届いていた
-            // `RESULT` を成功として返したり `NATIVE_CALL` の `NativeFn` を
-            // 新たに実行したりしてしまう。受信結果の種類を問わず、フレームを
-            // 処理する前に期限を判定し、期限切れなら子を破棄して `Timeout`
-            // を返す（`Timeout` 分岐と同じ扱い）。
-            let received = match worker.frame_rx.recv_timeout(recv_wait) {
-                Ok(_) if Instant::now() >= deadline => Err(mpsc::RecvTimeoutError::Timeout),
-                other => other,
-            };
-            match received {
-                Ok(ReaderEvent::Frame(frame_tag, payload)) if frame_tag == tag::RESULT => {
-                    let (outcome, keep) = match worker_protocol::decode_js_value(&payload) {
-                        // codex レビュー指摘 #503 P1「decode_js_value が返す
-                        // 消費バイト数を捨てている」対応: `Result` フレームの
-                        // ペイロードは常にちょうど 1 つの `JsValue` でなければ
-                        // ならない契約であり（`decode_js_value` 自体は複数値の
-                        // 連結読み取りにも使える汎用関数のため、単体では
-                        // 「1 つだけ」を強制しない）、消費バイト数が
-                        // ペイロード全体の長さと一致しなければ、末尾に余分な
-                        // バイトが付いたプロトコル違反として扱う。
-                        // codex レビュー指摘 #593 P1: 子が送る `ObjectHandle` は
-                        // untrusted で、親の登録簿と照合する契約
-                        // （`ObjectHandle` のドキュメント）。登録簿の照合（handle の往復）は
-                        // `TASK-29.5b` の後続作業で導入するため、それまでは子 → 親の
-                        // `ObjectHandle` を拒否する（fail-closed。未登録 ID が
-                        // 親側で bind 済みオブジェクトとして流通しない）。
-                        Ok((JsValue::ObjectHandle(handle), _)) => {
-                            worker.terminate_now();
-                            let tail = worker.reap_and_collect_stderr();
-                            let converted = discard_context_error(worker, &tail, || {
-                                JsEngineError::EngineUnavailable(format!(
-                                    "JS worker process sent an unregistered object handle \
-                                     {} in a Result frame; stderr: {tail}",
-                                    handle.raw()
-                                ))
-                            });
-                            (Err(converted), false)
-                        }
-                        // 多層防御（`JS-6`）: 子は untrusted。結果文字列が
-                        // 上限を超えていれば、子の検査をすり抜けたものとして
-                        // 切り詰めずに失敗にする（子は生かす）。
-                        Ok((JsValue::String(s), consumed))
-                            if consumed == payload.len()
-                                && s.len() > options.max_result_bytes() =>
-                        {
-                            (
-                                Err(JsEngineError::EvaluationFailed(format!(
-                                    "string result of {} bytes exceeds the result size limit of \
-                                     {} bytes",
-                                    s.len(),
-                                    options.max_result_bytes()
-                                ))),
-                                true,
-                            )
-                        }
-                        Ok((value, consumed)) if consumed == payload.len() => (Ok(value), true),
-                        Ok((_value, consumed)) => {
-                            worker.terminate_now();
-                            let tail = worker.reap_and_collect_stderr();
-                            let converted = discard_context_error(worker, &tail, || {
-                                JsEngineError::EngineUnavailable(format!(
-                                    "JS worker process sent a Result frame with {} trailing \
-                                     bytes after the decoded value ({consumed} of {} bytes \
-                                     consumed); stderr: {tail}",
-                                    payload.len() - consumed,
-                                    payload.len()
-                                ))
-                            });
-                            (Err(converted), false)
-                        }
-                        Err(err) => {
-                            worker.terminate_now();
-                            let tail = worker.reap_and_collect_stderr();
-                            let converted = discard_context_error(worker, &tail, || {
-                                JsEngineError::EngineUnavailable(format!(
-                                    "JS worker process sent a malformed Result frame: {err}; \
-                                     stderr: {tail}"
-                                ))
-                            });
-                            (Err(converted), false)
-                        }
-                    };
-                    return apply_post_response_rss_check(worker, outcome, keep);
-                }
-                Ok(ReaderEvent::Frame(frame_tag, payload)) if frame_tag == tag::ERROR => {
-                    let (outcome, keep) = match worker_protocol::decode_error(&payload) {
-                        // 子の watchdog による打ち切り。子プロセスは生き続け、
-                        // Context も残る（設計書 §3.3 の表の 1 行目）。
-                        // Timeout / Evaluation / Binding はいずれも子を維持する
-                        // （`keep = true`）。変換は
-                        // [`error_frame_to_js_engine_error`] に集約している。
-                        Ok((kind, message)) => {
-                            (Err(error_frame_to_js_engine_error(kind, message)), true)
-                        }
-                        Err(err) => {
-                            worker.terminate_now();
-                            let tail = worker.reap_and_collect_stderr();
-                            let converted = discard_context_error(worker, &tail, || {
-                                JsEngineError::EngineUnavailable(format!(
-                                    "JS worker process sent a malformed Error frame: {err}; \
-                                     stderr: {tail}"
-                                ))
-                            });
-                            (Err(converted), false)
-                        }
-                    };
-                    return apply_post_response_rss_check(worker, outcome, keep);
-                }
-                Ok(ReaderEvent::Frame(frame_tag, payload)) if frame_tag == tag::NATIVE_CALL => {
-                    // `JS-1`・`TASK-29`・Issue #526: 子側のプロキシ関数
-                    // （`v8_engine::native_proxy_callback`）が呼ばれた。
-                    // `NativeFn` を実行し、結果を `NATIVE_RETURN` として
-                    // 返信してから次のフレームを待つ（一問一答。
-                    // `worker::StdioTransport::call` の契約と対になる）。
-                    let native_return_payload =
-                        match dispatch_native_call(native_fns, &payload, deadline) {
-                            Ok(bytes) => bytes,
-                            Err(NativeDispatchViolation::DeadlineExceeded) => {
-                                // 戻らない `NativeFn` でも、ここで待機を打ち切り
-                                // 子を kill して制御を回復する（`NativeFn` を
-                                // 実行しているスレッドは強制終了できず放置される
-                                // が、評価は期限内に `Timeout` で終わる）。
-                                worker.terminate_now();
-                                let tail = worker.reap_and_collect_stderr();
-                                let err = discard_context_error(worker, &tail, || {
-                                    JsEngineError::Timeout(format!(
-                                        "a native function invoked by the JS worker process did \
-                                         not return before the evaluation deadline; stderr: \
-                                         {tail}"
-                                    ))
-                                });
-                                return (Err(err), false);
-                            }
-                            Err(violation) => {
-                                worker.terminate_now();
-                                let tail = worker.reap_and_collect_stderr();
-                                let err = discard_context_error(worker, &tail, || {
-                                    JsEngineError::EngineUnavailable(format!(
-                                        "JS worker process sent an invalid NativeCall frame \
-                                     ({violation}); stderr: {tail}"
-                                    ))
-                                });
-                                return (Err(err), false);
-                            }
-                        };
-                    // 受け入れ条件 2: `NativeFn` の実行時間もこの評価全体の
-                    // 期限に含める。`NativeFn` から戻った直後、期限を
-                    // 過ぎていれば `NATIVE_RETURN` を送らずに kill する
-                    // （実行に 2 秒以上 3 秒未満かかった場合は、返信を
-                    // 受けた子の watchdog が先に発火し `Error{Timeout}` を
-                    // 返す。3 秒以上ならここで先に打ち切る）。
-                    if Instant::now() >= deadline {
+        await_response(
+            worker,
+            deadline,
+            native_fns,
+            true,
+            tag::RESULT,
+            "script evaluation",
+            |worker, payload| {
+                match worker_protocol::decode_js_value(&payload) {
+                    // codex レビュー指摘 #503 P1「decode_js_value が返す
+                    // 消費バイト数を捨てている」対応: `Result` フレームの
+                    // ペイロードは常にちょうど 1 つの `JsValue` でなければ
+                    // ならない契約であり（`decode_js_value` 自体は複数値の
+                    // 連結読み取りにも使える汎用関数のため、単体では
+                    // 「1 つだけ」を強制しない）、消費バイト数が
+                    // ペイロード全体の長さと一致しなければ、末尾に余分な
+                    // バイトが付いたプロトコル違反として扱う。
+                    // codex レビュー指摘 #593 P1: 子が送る `ObjectHandle` は
+                    // untrusted で、親の登録簿と照合する契約
+                    // （`ObjectHandle` のドキュメント）。登録簿の照合（handle の往復）は
+                    // `TASK-29.5b` の後続作業で導入するため、それまでは子 → 親の
+                    // `ObjectHandle` を拒否する（fail-closed。未登録 ID が
+                    // 親側で bind 済みオブジェクトとして流通しない）。
+                    Ok((JsValue::ObjectHandle(handle), _)) => {
                         worker.terminate_now();
                         let tail = worker.reap_and_collect_stderr();
-                        let err = discard_context_error(worker, &tail, || {
-                            JsEngineError::Timeout(format!(
-                                "a native function invoked by the JS worker process exceeded \
-                                 the evaluation deadline; stderr: {tail}"
+                        let converted = discard_context_error(worker, &tail, || {
+                            JsEngineError::EngineUnavailable(format!(
+                                "JS worker process sent an unregistered object handle \
+                                     {} in a Result frame; stderr: {tail}",
+                                handle.raw()
                             ))
                         });
-                        return (Err(err), false);
+                        (Err(converted), false)
                     }
-                    if let Err(err) = write_frame_with_deadline(
-                        worker,
-                        tag::NATIVE_RETURN,
-                        &native_return_payload,
-                        deadline,
-                        "the native call result",
-                    ) {
-                        return (Err(err), false);
+                    // 多層防御（`JS-6`）: 子は untrusted。結果文字列が
+                    // 上限を超えていれば、子の検査をすり抜けたものとして
+                    // 切り詰めずに失敗にする（子は生かす）。
+                    Ok((JsValue::String(s), consumed))
+                        if consumed == payload.len() && s.len() > options.max_result_bytes() =>
+                    {
+                        (
+                            Err(JsEngineError::EvaluationFailed(format!(
+                                "string result of {} bytes exceeds the result size limit of \
+                                     {} bytes",
+                                s.len(),
+                                options.max_result_bytes()
+                            ))),
+                            true,
+                        )
                     }
-                    continue;
+                    Ok((value, consumed)) if consumed == payload.len() => (Ok(value), true),
+                    Ok((_value, consumed)) => {
+                        worker.terminate_now();
+                        let tail = worker.reap_and_collect_stderr();
+                        let converted = discard_context_error(worker, &tail, || {
+                            JsEngineError::EngineUnavailable(format!(
+                                "JS worker process sent a Result frame with {} trailing \
+                                     bytes after the decoded value ({consumed} of {} bytes \
+                                     consumed); stderr: {tail}",
+                                payload.len() - consumed,
+                                payload.len()
+                            ))
+                        });
+                        (Err(converted), false)
+                    }
+                    Err(err) => {
+                        worker.terminate_now();
+                        let tail = worker.reap_and_collect_stderr();
+                        let converted = discard_context_error(worker, &tail, || {
+                            JsEngineError::EngineUnavailable(format!(
+                                "JS worker process sent a malformed Result frame: {err}; \
+                                     stderr: {tail}"
+                            ))
+                        });
+                        (Err(converted), false)
+                    }
                 }
-                Ok(ReaderEvent::Frame(other_tag, _)) => {
-                    // 親が受け取るはずのないタグ（`HELLO`・`EVALUATE`・
-                    // `SHUTDOWN` 等）。`RESULT`・`ERROR`・`NATIVE_CALL` は
-                    // 上の分岐で扱い済みのため、ここに来るのは純粋な
-                    // プロトコル違反である。fail-closed に子を kill する。
-                    worker.terminate_now();
-                    let tail = worker.reap_and_collect_stderr();
-                    let err = discard_context_error(worker, &tail, || {
-                        JsEngineError::EngineUnavailable(format!(
-                            "JS worker process sent an unexpected frame (tag {other_tag}); \
-                             stderr: {tail}"
-                        ))
-                    });
-                    return (Err(err), false);
-                }
-                Ok(ReaderEvent::Eof) => {
-                    // 子は既にストリームを閉じている（終了済みか、まもなく
-                    // 終了する）ため、kill を挟まずに直接 reap する。
-                    //
-                    // `discard_context_error` が「監視スレッドの RSS 超過
-                    // kill」「stderr の V8 fatal OOM メッセージ」の両方を
-                    // `fallback` より先に判定する（同関数のドキュメントコメント
-                    // 参照。codex・Bugbot レビュー指摘 #503 対応）ため、この
-                    // `fallback` は「どちらの証拠も無かった場合」にだけ使われる。
-                    let tail = worker.reap_and_collect_stderr();
-                    let err = discard_context_error(worker, &tail, || {
-                        JsEngineError::EngineUnavailable(format!(
-                            "JS worker process terminated unexpectedly before responding; \
-                             stderr: {tail}"
-                        ))
-                    });
-                    return (Err(err), false);
-                }
-                Ok(ReaderEvent::Invalid(desc)) => {
-                    worker.terminate_now();
-                    let tail = worker.reap_and_collect_stderr();
-                    let err = discard_context_error(worker, &tail, || {
-                        JsEngineError::EngineUnavailable(format!(
-                            "JS worker process sent a malformed frame: {desc}; stderr: {tail}"
-                        ))
-                    });
-                    return (Err(err), false);
-                }
-                Err(mpsc::RecvTimeoutError::Timeout) => {
+            },
+        )
+    }
+}
+
+/// 子の応答を期限まで待つ共通ループ（`evaluate_script` と ES module 用の
+/// 5 操作が共有する。`JS-4`・`JS-6`・Issue #1110）。
+///
+/// 戻り値の 2 つ目は「この `worker` を保持し続けてよいか」。`ok_tag` の
+/// フレームは `on_ok` が解釈する（`on_ok` が子を破棄する場合は `false` を
+/// 返す）。`ERROR` は [`error_frame_to_js_engine_error`] で変換して子を保つ。
+/// `NATIVE_CALL` は `allow_native_calls` が真のとき（JS が走りうる評価・動的
+/// import の完了）だけ dispatch し、偽ならプロトコル違反として子を破棄する。
+/// それ以外の予期しない tag・EOF・不正フレーム・期限切れ・切断は子を破棄する。
+/// `timeout_what` は期限切れメッセージの主語（例: "script evaluation"）。
+/// 応答直後の RSS 確認（[`apply_post_response_rss_check`]）もここで行う。
+fn await_response<T>(
+    worker: &mut WorkerHandle,
+    deadline: Instant,
+    native_fns: &[NativeEntry],
+    allow_native_calls: bool,
+    ok_tag: u8,
+    timeout_what: &str,
+    on_ok: impl FnOnce(&mut WorkerHandle, Vec<u8>) -> (Result<T, JsEngineError>, bool),
+) -> (Result<T, JsEngineError>, bool) {
+    loop {
+        let recv_wait = deadline.saturating_duration_since(Instant::now());
+        // codex レビュー指摘（P1）対応: `recv_timeout(Duration::ZERO)` は
+        // キューに残っているフレームを返せるため、期限後に届いていた
+        // `RESULT` を成功として返したり `NATIVE_CALL` の `NativeFn` を
+        // 新たに実行したりしてしまう。受信結果の種類を問わず、フレームを
+        // 処理する前に期限を判定し、期限切れなら子を破棄して `Timeout`
+        // を返す（`Timeout` 分岐と同じ扱い）。
+        let received = match worker.frame_rx.recv_timeout(recv_wait) {
+            Ok(_) if Instant::now() >= deadline => Err(mpsc::RecvTimeoutError::Timeout),
+            other => other,
+        };
+        match received {
+            Ok(ReaderEvent::Frame(frame_tag, payload)) if frame_tag == ok_tag => {
+                let (outcome, keep) = on_ok(worker, payload);
+                return apply_post_response_rss_check(worker, outcome, keep);
+            }
+            Ok(ReaderEvent::Frame(frame_tag, payload)) if frame_tag == tag::ERROR => {
+                let (outcome, keep) = match worker_protocol::decode_error(&payload) {
+                    // 子の watchdog による打ち切り。子プロセスは生き続け、
+                    // Context も残る（設計書 §3.3 の表の 1 行目）。
+                    // Timeout / Evaluation / Binding はいずれも子を維持する
+                    // （`keep = true`）。変換は
+                    // [`error_frame_to_js_engine_error`] に集約している。
+                    Ok((kind, message)) => {
+                        (Err(error_frame_to_js_engine_error(kind, message)), true)
+                    }
+                    Err(err) => {
+                        worker.terminate_now();
+                        let tail = worker.reap_and_collect_stderr();
+                        let converted = discard_context_error(worker, &tail, || {
+                            JsEngineError::EngineUnavailable(format!(
+                                "JS worker process sent a malformed Error frame: {err}; \
+                                 stderr: {tail}"
+                            ))
+                        });
+                        (Err(converted), false)
+                    }
+                };
+                return apply_post_response_rss_check(worker, outcome, keep);
+            }
+            Ok(ReaderEvent::Frame(frame_tag, payload))
+                if frame_tag == tag::NATIVE_CALL && allow_native_calls =>
+            {
+                // `JS-1`・`TASK-29`・Issue #526: 子側のプロキシ関数
+                // （`v8_engine::native_proxy_callback`）が呼ばれた。
+                // `NativeFn` を実行し、結果を `NATIVE_RETURN` として
+                // 返信してから次のフレームを待つ（一問一答。
+                // `worker::StdioTransport::call` の契約と対になる）。
+                let native_return_payload =
+                    match dispatch_native_call(native_fns, &payload, deadline) {
+                        Ok(bytes) => bytes,
+                        Err(NativeDispatchViolation::DeadlineExceeded) => {
+                            // 戻らない `NativeFn` でも、ここで待機を打ち切り
+                            // 子を kill して制御を回復する（`NativeFn` を
+                            // 実行しているスレッドは強制終了できず放置される
+                            // が、評価は期限内に `Timeout` で終わる）。
+                            worker.terminate_now();
+                            let tail = worker.reap_and_collect_stderr();
+                            let err = discard_context_error(worker, &tail, || {
+                                JsEngineError::Timeout(format!(
+                                    "a native function invoked by the JS worker process did \
+                                     not return before the evaluation deadline; stderr: \
+                                     {tail}"
+                                ))
+                            });
+                            return (Err(err), false);
+                        }
+                        Err(violation) => {
+                            worker.terminate_now();
+                            let tail = worker.reap_and_collect_stderr();
+                            let err = discard_context_error(worker, &tail, || {
+                                JsEngineError::EngineUnavailable(format!(
+                                    "JS worker process sent an invalid NativeCall frame \
+                                 ({violation}); stderr: {tail}"
+                                ))
+                            });
+                            return (Err(err), false);
+                        }
+                    };
+                // 受け入れ条件 2: `NativeFn` の実行時間もこの評価全体の
+                // 期限に含める。`NativeFn` から戻った直後、期限を
+                // 過ぎていれば `NATIVE_RETURN` を送らずに kill する
+                // （実行に 2 秒以上 3 秒未満かかった場合は、返信を
+                // 受けた子の watchdog が先に発火し `Error{Timeout}` を
+                // 返す。3 秒以上ならここで先に打ち切る）。
+                if Instant::now() >= deadline {
                     worker.terminate_now();
                     let tail = worker.reap_and_collect_stderr();
                     let err = discard_context_error(worker, &tail, || {
                         JsEngineError::Timeout(format!(
-                            "script evaluation exceeded the JS worker deadline and the process \
-                             was killed; the next evaluation runs in a fresh context; stderr: \
-                             {tail}"
+                            "a native function invoked by the JS worker process exceeded \
+                             the evaluation deadline; stderr: {tail}"
                         ))
                     });
                     return (Err(err), false);
                 }
-                Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    worker.terminate_now();
-                    let tail = worker.reap_and_collect_stderr();
-                    let err = discard_context_error(worker, &tail, || {
-                        JsEngineError::EngineUnavailable(format!(
-                            "JS worker process communication channel disconnected \
-                             unexpectedly; stderr: {tail}"
-                        ))
-                    });
+                if let Err(err) = write_frame_with_deadline(
+                    worker,
+                    tag::NATIVE_RETURN,
+                    &native_return_payload,
+                    deadline,
+                    "the native call result",
+                ) {
                     return (Err(err), false);
                 }
+                continue;
+            }
+            Ok(ReaderEvent::Frame(other_tag, _)) => {
+                // 親が受け取るはずのないタグ（`HELLO`・`EVALUATE`・
+                // `SHUTDOWN` 等）。`RESULT`・`ERROR`・`NATIVE_CALL` は
+                // 上の分岐で扱い済みのため、ここに来るのは純粋な
+                // プロトコル違反である。fail-closed に子を kill する。
+                worker.terminate_now();
+                let tail = worker.reap_and_collect_stderr();
+                let err = discard_context_error(worker, &tail, || {
+                    JsEngineError::EngineUnavailable(format!(
+                        "JS worker process sent an unexpected frame (tag {other_tag}); \
+                         stderr: {tail}"
+                    ))
+                });
+                return (Err(err), false);
+            }
+            Ok(ReaderEvent::Eof) => {
+                // 子は既にストリームを閉じている（終了済みか、まもなく
+                // 終了する）ため、kill を挟まずに直接 reap する。
+                //
+                // `discard_context_error` が「監視スレッドの RSS 超過
+                // kill」「stderr の V8 fatal OOM メッセージ」の両方を
+                // `fallback` より先に判定する（同関数のドキュメントコメント
+                // 参照。codex・Bugbot レビュー指摘 #503 対応）ため、この
+                // `fallback` は「どちらの証拠も無かった場合」にだけ使われる。
+                let tail = worker.reap_and_collect_stderr();
+                let err = discard_context_error(worker, &tail, || {
+                    JsEngineError::EngineUnavailable(format!(
+                        "JS worker process terminated unexpectedly before responding; \
+                         stderr: {tail}"
+                    ))
+                });
+                return (Err(err), false);
+            }
+            Ok(ReaderEvent::Invalid(desc)) => {
+                worker.terminate_now();
+                let tail = worker.reap_and_collect_stderr();
+                let err = discard_context_error(worker, &tail, || {
+                    JsEngineError::EngineUnavailable(format!(
+                        "JS worker process sent a malformed frame: {desc}; stderr: {tail}"
+                    ))
+                });
+                return (Err(err), false);
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                worker.terminate_now();
+                let tail = worker.reap_and_collect_stderr();
+                let err = discard_context_error(worker, &tail, || {
+                    JsEngineError::Timeout(format!(
+                        "{timeout_what} exceeded the JS worker deadline and the process \
+                         was killed; the next evaluation runs in a fresh context; stderr: \
+                         {tail}"
+                    ))
+                });
+                return (Err(err), false);
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                worker.terminate_now();
+                let tail = worker.reap_and_collect_stderr();
+                let err = discard_context_error(worker, &tail, || {
+                    JsEngineError::EngineUnavailable(format!(
+                        "JS worker process communication channel disconnected \
+                         unexpectedly; stderr: {tail}"
+                    ))
+                });
+                return (Err(err), false);
             }
         }
     }
@@ -2487,6 +2568,299 @@ impl JsEngine for V8ProcessEngine {
         // 返る `ObjectHandle` はトレイトの契約に無いため捨てる
         // （handle の往復は未対応。モジュール doc 参照）。
         self.bind_dom_like_entries(name, members).map(|_| ())
+    }
+
+    /// ES module の compile（`JS-4`・Issue #1110）。入力は子を起動する前に検査し、
+    /// 応答の id・specifier は子が untrusted なため台帳で照合する。子は現状
+    /// `NotYetImplemented` を返す（モジュール doc「既知の制限」）。
+    fn compile_module(&mut self, url: &str, source: &str) -> Result<ModuleRecord, JsEngineError> {
+        if source.len() > super::shared::MAX_SCRIPT_SOURCE_BYTES {
+            return Err(JsEngineError::EvaluationFailed(format!(
+                "module source exceeds the maximum supported length of {} bytes",
+                super::shared::MAX_SCRIPT_SOURCE_BYTES
+            )));
+        }
+        let options = module_default_options();
+        let payload = module_frames::encode_compile_module(url, source, &options)
+            .map_err(module_request_rejected)?;
+        let budget = worker_protocol::wire_timeout(&options).saturating_add(EVALUATE_GRACE);
+        self.module_roundtrip(
+            ModuleRoundtrip {
+                frame_tag: tag::COMPILE_MODULE,
+                budget,
+                allow_native_calls: false,
+                needs_module_slot: true,
+                ok_tag: tag::MODULE_COMPILED,
+                write_what: "the module source",
+                timeout_what: "module compilation",
+            },
+            &payload,
+            |worker, payload| match interpret_module_compiled(&mut worker.modules, &payload) {
+                Ok(record) => (Ok(record), true),
+                Err(err) => module_protocol_violation(
+                    worker,
+                    format!("JS worker process sent an invalid ModuleCompiled frame: {err}"),
+                ),
+            },
+        )
+    }
+
+    /// 依存の対応表による link（`JS-4`・Issue #1110）。件数・長さ・重複は
+    /// 送信前に検査し、未知の id は子が `ModuleResolutionFailed` で返す契約。
+    fn link_module(
+        &mut self,
+        referrer: ModuleId,
+        resolutions: &[ModuleResolution],
+    ) -> Result<(), JsEngineError> {
+        let payload = module_frames::encode_link_module(referrer, resolutions)
+            .map_err(module_request_rejected)?;
+        self.module_roundtrip(
+            ModuleRoundtrip {
+                frame_tag: tag::LINK_MODULE,
+                budget: MODULE_CONTROL_TIMEOUT,
+                allow_native_calls: false,
+                needs_module_slot: false,
+                ok_tag: tag::RESULT,
+                write_what: "the module link table",
+                timeout_what: "module link",
+            },
+            &payload,
+            interpret_unit_ack_response,
+        )
+    }
+
+    /// link 済みモジュールの評価（`JS-4`・Issue #1110）。期限は
+    /// `options.timeout()` + [`EVALUATE_GRACE`]（`EVALUATE` と同じ）。JS が走る
+    /// ため `NATIVE_CALL` の往復を許す。
+    fn evaluate_module(
+        &mut self,
+        root: ModuleId,
+        options: &EvaluateOptions,
+    ) -> Result<ModuleEvaluation, JsEngineError> {
+        let payload = module_frames::encode_evaluate_module(root, options);
+        let budget = worker_protocol::wire_timeout(options).saturating_add(EVALUATE_GRACE);
+        let max_result_bytes = options.max_result_bytes();
+        self.module_roundtrip(
+            ModuleRoundtrip {
+                frame_tag: tag::EVALUATE_MODULE,
+                budget,
+                allow_native_calls: true,
+                needs_module_slot: false,
+                ok_tag: tag::MODULE_RESULT,
+                write_what: "the module evaluation request",
+                timeout_what: "module evaluation",
+            },
+            &payload,
+            move |worker, payload| match module_frames::decode_module_result(&payload) {
+                // 多層防御（`JS-6`）: 子は untrusted。Rejected のメッセージが
+                // 上限を超えていれば切り詰めずに失敗にする（子は生かす）。
+                Ok(ModuleEvaluation::Rejected { message }) if message.len() > max_result_bytes => (
+                    Err(JsEngineError::EvaluationFailed(format!(
+                        "module rejection message of {} bytes exceeds the result size limit of \
+                         {max_result_bytes} bytes",
+                        message.len()
+                    ))),
+                    true,
+                ),
+                Ok(evaluation) => (Ok(evaluation), true),
+                Err(err) => module_protocol_violation(
+                    worker,
+                    format!("JS worker process sent an invalid ModuleResult frame: {err}"),
+                ),
+            },
+        )
+    }
+
+    /// 保留中の動的 `import()` の取り出し（`JS-4`・Issue #1110）。子から届いた
+    /// id・referrer は台帳で照合する。
+    fn take_dynamic_import_requests(&mut self) -> Result<Vec<DynamicImportRequest>, JsEngineError> {
+        let payload = module_frames::encode_take_dynamic_imports();
+        self.module_roundtrip(
+            ModuleRoundtrip {
+                frame_tag: tag::TAKE_DYNAMIC_IMPORTS,
+                budget: MODULE_CONTROL_TIMEOUT,
+                allow_native_calls: false,
+                needs_module_slot: false,
+                ok_tag: tag::DYNAMIC_IMPORTS,
+                write_what: "the dynamic import request",
+                timeout_what: "dynamic import retrieval",
+            },
+            &payload,
+            |worker, payload| match interpret_dynamic_imports(&mut worker.modules, &payload) {
+                Ok(requests) => (Ok(requests), true),
+                Err(err) => module_protocol_violation(
+                    worker,
+                    format!("JS worker process sent an invalid DynamicImports frame: {err}"),
+                ),
+            },
+        )
+    }
+
+    /// 動的 `import()` の完了通知（`JS-4`・Issue #1110）。失敗メッセージは
+    /// [`worker_protocol::truncate_for_wire`] で切り詰めてから送る。期限は
+    /// 既定タイムアウト + [`EVALUATE_GRACE`]（将来 microtask が走りうるため。
+    /// トレイトに options が無くワイヤのヘッダは持たない）。
+    fn finish_dynamic_import(
+        &mut self,
+        id: DynamicImportId,
+        result: Result<ModuleId, String>,
+    ) -> Result<(), JsEngineError> {
+        let wire_result = result.map_err(|message| worker_protocol::truncate_for_wire(&message));
+        let payload = module_frames::encode_finish_dynamic_import(id, &wire_result)
+            .map_err(module_request_rejected)?;
+        let budget =
+            worker_protocol::wire_timeout(&module_default_options()).saturating_add(EVALUATE_GRACE);
+        self.module_roundtrip(
+            ModuleRoundtrip {
+                frame_tag: tag::FINISH_DYNAMIC_IMPORT,
+                budget,
+                allow_native_calls: true,
+                needs_module_slot: false,
+                ok_tag: tag::RESULT,
+                write_what: "the dynamic import completion",
+                timeout_what: "dynamic import completion",
+            },
+            &payload,
+            move |worker, payload| {
+                let (outcome, keep) = interpret_unit_ack_response(worker, payload);
+                if outcome.is_ok() {
+                    worker.modules.complete_dynamic_import(id);
+                }
+                (outcome, keep)
+            },
+        )
+    }
+}
+
+/// ES module 用の 1 往復の設定（[`V8ProcessEngine::module_roundtrip`] の引数）。
+struct ModuleRoundtrip {
+    frame_tag: u8,
+    /// 書き込み＋応答待ちの合計の期限。
+    budget: Duration,
+    /// 応答待ちの間に `NATIVE_CALL` を dispatch するか（JS が走りうる操作のみ）。
+    allow_native_calls: bool,
+    /// compile のように台帳へ新しいモジュールを足す操作か（満杯なら送らない）。
+    needs_module_slot: bool,
+    ok_tag: u8,
+    write_what: &'static str,
+    timeout_what: &'static str,
+}
+
+impl V8ProcessEngine {
+    /// ES module 用フレームを 1 つ送って応答を待つ共通処理（`JS-4`・Issue #1110）。
+    /// 生きた子の取得・送信・[`await_response`]・子の返却の順で、`evaluate_script`
+    /// と同じ規約（`keep = false` なら子を破棄して次回に起動し直す）に従う。
+    fn module_roundtrip<T>(
+        &mut self,
+        config: ModuleRoundtrip,
+        payload: &[u8],
+        on_ok: impl FnOnce(&mut WorkerHandle, Vec<u8>) -> (Result<T, JsEngineError>, bool),
+    ) -> Result<T, JsEngineError> {
+        // 期限が表現できない予算は子を起動する前に拒否する（起動しない）。
+        if Instant::now().checked_add(config.budget).is_none() {
+            return Err(JsEngineError::EvaluationFailed(
+                "the module operation timeout is too large to schedule".to_string(),
+            ));
+        }
+        let mut worker = self.take_live_worker()?;
+        // 期限は子の起動完了後に計算する。遅延起動のハンドシェイク・関数再登録が
+        // 書き込み・応答待ちの予算を消費しないようにする（`evaluate_script` と同じ並び）。
+        let Some(deadline) = Instant::now().checked_add(config.budget) else {
+            self.worker = Some(worker);
+            return Err(JsEngineError::EvaluationFailed(
+                "the module operation timeout is too large to schedule".to_string(),
+            ));
+        };
+        if config.needs_module_slot && worker.modules.is_full() {
+            self.worker = Some(worker);
+            return Err(JsEngineError::ResourceLimitExceeded(format!(
+                "the JS worker already holds the maximum of {} modules",
+                module_frames::MAX_MODULES_PER_WORKER
+            )));
+        }
+        write_frame_with_deadline(
+            &mut worker,
+            config.frame_tag,
+            payload,
+            deadline,
+            config.write_what,
+        )?;
+        let (outcome, keep_worker) = await_response(
+            &mut worker,
+            deadline,
+            &self.native_fns,
+            config.allow_native_calls,
+            config.ok_tag,
+            config.timeout_what,
+            on_ok,
+        );
+        if keep_worker {
+            self.worker = Some(worker);
+        }
+        outcome
+    }
+}
+
+/// 親が送る前に弾いた ES module 要求（件数・長さ・重複・URL）を
+/// [`JsEngineError::EvaluationFailed`] にする。`Display` は specifier・URL を
+/// 含まない（`JS-6`）。
+fn module_request_rejected(err: ProtocolError) -> JsEngineError {
+    JsEngineError::EvaluationFailed(format!("module request rejected: {err}"))
+}
+
+/// 子から届いた ES module の応答がプロトコル違反だったとき、子を破棄して
+/// `EngineUnavailable`（"context was discarded"）にする。
+fn module_protocol_violation<T>(
+    worker: &mut WorkerHandle,
+    description: String,
+) -> (Result<T, JsEngineError>, bool) {
+    worker.terminate_now();
+    let tail = worker.reap_and_collect_stderr();
+    let err = discard_context_error(worker, &tail, || {
+        JsEngineError::EngineUnavailable(format!("{description}; stderr: {tail}"))
+    });
+    (Err(err), false)
+}
+
+/// `MODULE_COMPILED` を decode し、台帳に登録して [`ModuleRecord`] にする
+/// （純粋関数。違反は [`ProtocolError`]）。
+fn interpret_module_compiled(
+    registry: &mut ModuleIdRegistry,
+    payload: &[u8],
+) -> Result<ModuleRecord, ProtocolError> {
+    let record = module_frames::decode_module_compiled(payload)?;
+    registry.register_compiled(record.id())?;
+    Ok(record)
+}
+
+/// `DYNAMIC_IMPORTS` を decode し、台帳で照合して保留集合へ登録する
+/// （純粋関数。違反は [`ProtocolError`]。失敗時は何も登録しない）。
+fn interpret_dynamic_imports(
+    registry: &mut ModuleIdRegistry,
+    payload: &[u8],
+) -> Result<Vec<DynamicImportRequest>, ProtocolError> {
+    let requests = module_frames::decode_dynamic_imports(payload)?;
+    registry.accept_dynamic_imports(&requests)?;
+    Ok(requests)
+}
+
+/// link・finish の応答（`RESULT(Undefined)` の ack）を検証する。それ以外の値や
+/// 末尾バイトはプロトコル違反として子を破棄する。
+fn interpret_unit_ack_response(
+    worker: &mut WorkerHandle,
+    payload: Vec<u8>,
+) -> (Result<(), JsEngineError>, bool) {
+    match worker_protocol::decode_js_value(&payload) {
+        Ok((JsValue::Undefined, consumed)) if consumed == payload.len() => (Ok(()), true),
+        Ok(_) => module_protocol_violation(
+            worker,
+            "JS worker process sent a module acknowledgement that is not exactly undefined"
+                .to_string(),
+        ),
+        Err(err) => module_protocol_violation(
+            worker,
+            format!("JS worker process sent a malformed module acknowledgement: {err}"),
+        ),
     }
 }
 
@@ -2806,6 +3180,8 @@ pub(crate) fn error_frame_to_js_engine_error(kind: ErrorKind, message: String) -
         ErrorKind::Evaluation => JsEngineError::EvaluationFailed(message),
         ErrorKind::Binding => JsEngineError::BindingFailed(message),
         ErrorKind::ResourceLimit => JsEngineError::ResourceLimitExceeded(message),
+        ErrorKind::NotYetImplemented => JsEngineError::NotYetImplemented(message),
+        ErrorKind::ModuleResolution => JsEngineError::ModuleResolutionFailed(message),
     }
 }
 
@@ -3179,11 +3555,11 @@ fn ensure_discarded_phrase(err: JsEngineError) -> JsEngineError {
 /// `keep_worker == false` の場合（既にプロトコル違反等で `kill` 済み）は
 /// 何もしない（二重に `kill` を試みても副作用は無いが、意味のある
 /// チェックにならないため早期に返す）。
-fn apply_post_response_rss_check(
+fn apply_post_response_rss_check<T>(
     worker: &mut WorkerHandle,
-    outcome: Result<JsValue, JsEngineError>,
+    outcome: Result<T, JsEngineError>,
     keep_worker: bool,
-) -> (Result<JsValue, JsEngineError>, bool) {
+) -> (Result<T, JsEngineError>, bool) {
     if !keep_worker {
         return (outcome, keep_worker);
     }
@@ -3249,6 +3625,29 @@ mod tests {
 
     fn entry(func: ParentNativeFn) -> NativeEntry {
         NativeEntry::Threaded(Arc::new(Mutex::new(func)))
+    }
+
+    /// `JS-4`・Issue #1110（codex P1）: モジュール操作の期限は、遅延起動を含む
+    /// `take_live_worker()` の完了後に計算すること。起動（最大 5 秒のハンドシェイク・
+    /// 関数再登録）が書き込み・応答待ちの予算を食うと、正常な子を Timeout で
+    /// 破棄してしまう。起動遅延を注入する経路が無いため、実装上の並びを固定する。
+    #[test]
+    fn js_4_module_roundtrip_computes_the_deadline_after_the_worker_is_ready() {
+        let src = include_str!("process_engine.rs");
+        let start = src
+            .find("fn module_roundtrip<T>(")
+            .expect("module_roundtrip must exist");
+        let body = &src[start..];
+        let take = body
+            .find("self.take_live_worker()?")
+            .expect("module_roundtrip must take a live worker");
+        let deadline = body
+            .find("let Some(deadline) = Instant::now()")
+            .expect("module_roundtrip must compute the deadline");
+        assert!(
+            take < deadline,
+            "the deadline must be computed after take_live_worker()"
+        );
     }
 
     /// `TASK-29`・Issue #526: 登録件数の上限が具体値どおりであること
@@ -4213,9 +4612,9 @@ mod tests {
             .expect("kill_reason mutex must not be poisoned") =
             Some(MonitorKillReason::ResourceLimitExceeded(123_456));
 
-        let keep_alive_error_outcome = Err(JsEngineError::EvaluationFailed(
-            "ReferenceError: x is not defined".to_string(),
-        ));
+        let keep_alive_error_outcome: Result<JsValue, JsEngineError> = Err(
+            JsEngineError::EvaluationFailed("ReferenceError: x is not defined".to_string()),
+        );
         let (outcome, keep) =
             apply_post_response_rss_check(&mut worker, keep_alive_error_outcome, true);
 
@@ -4463,5 +4862,86 @@ mod tests {
             interpret_register_ack(200, &[]),
             Err(RegisterAckViolation::UnexpectedFrame(200))
         );
+    }
+
+    // ---- JS-4・JS-6・Issue #1110: ES module 用フレームの親側処理 ----
+
+    /// JS-4: モジュール系の `ERROR` kind は対応する `JsEngineError` に戻る。
+    #[test]
+    fn js_4_error_frame_maps_module_kinds_to_engine_errors() {
+        assert!(matches!(
+            error_frame_to_js_engine_error(ErrorKind::NotYetImplemented, "m".to_string()),
+            JsEngineError::NotYetImplemented(msg) if msg == "m"
+        ));
+        assert!(matches!(
+            error_frame_to_js_engine_error(ErrorKind::ModuleResolution, "r".to_string()),
+            JsEngineError::ModuleResolutionFailed(msg) if msg == "r"
+        ));
+    }
+
+    /// JS-6: `MODULE_COMPILED` の応答検証。正常な応答は台帳に登録され、
+    /// 既知 id の重複・不正なフレームはプロトコル違反になる。
+    #[test]
+    fn js_6_interpret_module_compiled_registers_and_rejects_violations() {
+        let mut registry = ModuleIdRegistry::new();
+        let payload = module_frames::encode_module_compiled(
+            ModuleId::from_raw(3),
+            &[super::super::engine_trait::ModuleRequest::new(
+                "./a.js".to_string(),
+            )],
+        )
+        .expect("encode");
+        let record = interpret_module_compiled(&mut registry, &payload).expect("first");
+        assert_eq!(record.id(), ModuleId::from_raw(3));
+        assert_eq!(record.requests().len(), 1);
+        assert!(matches!(
+            interpret_module_compiled(&mut registry, &payload),
+            Err(ProtocolError::DuplicateModuleId)
+        ));
+        assert!(matches!(
+            interpret_module_compiled(&mut registry, &[1, 2]),
+            Err(ProtocolError::Truncated)
+        ));
+    }
+
+    /// JS-6: `DYNAMIC_IMPORTS` の応答検証。未知の referrer は違反で、
+    /// 失敗した回の id は台帳に残らない。
+    #[test]
+    fn js_6_interpret_dynamic_imports_checks_referrers_against_the_registry() {
+        let mut registry = ModuleIdRegistry::new();
+        let request = |referrer: Option<u32>| {
+            DynamicImportRequest::new(
+                DynamicImportId::from_raw(1),
+                referrer.map(ModuleId::from_raw),
+                "./x.js".to_string(),
+            )
+        };
+        let unknown = module_frames::encode_dynamic_imports(&[request(Some(9))]).expect("encode");
+        assert!(matches!(
+            interpret_dynamic_imports(&mut registry, &unknown),
+            Err(ProtocolError::UnknownModuleId)
+        ));
+        let document = module_frames::encode_dynamic_imports(&[request(None)]).expect("encode");
+        let accepted = interpret_dynamic_imports(&mut registry, &document).expect("accepted");
+        assert_eq!(accepted, vec![request(None)]);
+    }
+
+    /// JS-6: 親の送信前検査は `EvaluationFailed` にし、`Display` に URL・specifier を
+    /// 含めない。
+    #[test]
+    fn js_6_module_request_rejected_does_not_leak_the_input() {
+        let err = module_frames::encode_compile_module(
+            &"secret-token-".repeat(400),
+            "",
+            &EvaluateOptions::default(),
+        )
+        .expect_err("url too long");
+        match module_request_rejected(err) {
+            JsEngineError::EvaluationFailed(msg) => {
+                assert!(msg.contains("exceeds the 4096-byte limit"), "{msg}");
+                assert!(!msg.contains("secret-token"), "{msg}");
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
     }
 }

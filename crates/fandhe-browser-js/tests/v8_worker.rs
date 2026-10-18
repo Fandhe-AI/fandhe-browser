@@ -28,7 +28,10 @@ use std::time::{Duration, Instant};
 
 use fandhe_browser_js::process_engine::{DomLikeMemberFn, ParentNativeFn};
 use fandhe_browser_js::process_engine::{V8ProcessEngine, WorkerSpawnConfigForTest};
-use fandhe_browser_js::{EvaluateOptions, JsEngineError, JsValue, NativeCallContext};
+use fandhe_browser_js::{
+    DynamicImportId, EvaluateOptions, JsEngine, JsEngineError, JsValue, ModuleId, ModuleResolution,
+    NativeCallContext,
+};
 
 /// `super::v8_engine::SCRIPT_EXECUTION_TIMEOUT`（子の watchdog。`pub(crate)`
 /// で本クレート外からは参照できない）の値を、本結合テストの目的
@@ -91,6 +94,10 @@ fn main() -> ExitCode {
     js_1_oom_returns_resource_limit_exceeded_and_next_eval_uses_fresh_context();
     eprintln!("case: js_1_handshake_failure_is_engine_unavailable");
     js_1_handshake_failure_is_engine_unavailable();
+    eprintln!("case: js_4_handshake_with_protocol_generation_5_fails");
+    js_4_handshake_with_protocol_generation_5_fails();
+    eprintln!("case: js_4_module_frames_return_not_yet_implemented_from_current_worker");
+    js_4_module_frames_return_not_yet_implemented_from_current_worker();
     eprintln!("case: js_1_handshake_rejects_hello_naming_a_different_engine");
     js_1_handshake_rejects_hello_naming_a_different_engine();
     eprintln!("case: js_1_handshake_rejects_hello_with_wrong_length");
@@ -448,6 +455,97 @@ fn js_1_handshake_failure_is_engine_unavailable() {
             panic!("expected EngineUnavailable for an unsupported protocol version, got: {other:?}")
         }
     }
+}
+
+/// JS-4・REPAIR-3・Issue #1110「プロトコル v6」: 親が新しい世代（v5）の子と
+/// ハンドシェイクすると、世代の不一致として `EngineUnavailable` で失敗すること。
+fn js_4_handshake_with_protocol_generation_5_fails() {
+    let mut engine = V8ProcessEngine::new_for_test(WorkerSpawnConfigForTest {
+        heap_limit_bytes: None,
+        protocol_version_override: Some(5),
+        hello_wrong_engine_for_test: false,
+        hello_extra_byte_for_test: false,
+        rss_threshold_bytes_override: None,
+        native_proxies_for_test: Vec::new(),
+        windows_process_memory_limit_bytes_override: None,
+    });
+
+    match engine.evaluate_script("1 + 1", &EvaluateOptions::default()) {
+        Err(JsEngineError::EngineUnavailable(_)) => {}
+        other => panic!("expected EngineUnavailable for protocol generation 5, got: {other:?}"),
+    }
+}
+
+/// JS-4・REPAIR-3・Issue #1110: モジュール API 5 メソッドの新フレームは現行の子に
+/// 届いて検証され、成功を装わず `NotYetImplemented` が返ること。子は生き続け
+/// （pid が変わらない）、classic 評価は引き続き動く。また compile の事前検査
+/// （source の上限）は子を起動せずに `EvaluationFailed` にする。
+fn js_4_module_frames_return_not_yet_implemented_from_current_worker() {
+    let options = EvaluateOptions::default();
+
+    // 事前検査: 子の起動前に弾く。
+    let mut fresh = V8ProcessEngine::new();
+    let too_big = "x".repeat(V8ProcessEngine::max_script_source_bytes_for_test() + 1);
+    match fresh.compile_module("https://example.test/a.js", &too_big) {
+        Err(JsEngineError::EvaluationFailed(_)) => {}
+        other => panic!("expected EvaluationFailed for an oversized module, got: {other:?}"),
+    }
+    let rows: Vec<ModuleResolution> = (0..257)
+        .map(|i| ModuleResolution::new(format!("./m{i}.js"), ModuleId::from_raw(1)))
+        .collect();
+    match fresh.link_module(ModuleId::from_raw(1), &rows) {
+        Err(JsEngineError::EvaluationFailed(_)) => {}
+        other => panic!("expected EvaluationFailed for 257 link rows, got: {other:?}"),
+    }
+    assert_eq!(
+        fresh.worker_pid_for_test(),
+        None,
+        "rejected module requests must not spawn a child process"
+    );
+
+    let mut engine = V8ProcessEngine::new();
+    assert_eq!(
+        JsEngine::evaluate_script(&mut engine, "1 + 1", &options).expect("eval"),
+        JsValue::Number(2.0)
+    );
+    let pid = engine.worker_pid_for_test();
+    assert!(
+        pid.is_some(),
+        "the child must be running after an evaluation"
+    );
+
+    let results = [
+        engine
+            .compile_module("https://example.test/a.js", "export const a = 1;")
+            .map(|_| ()),
+        engine.link_module(ModuleId::from_raw(1), &[]),
+        engine
+            .evaluate_module(ModuleId::from_raw(1), &options)
+            .map(|_| ()),
+        engine.take_dynamic_import_requests().map(|_| ()),
+        engine.finish_dynamic_import(DynamicImportId::from_raw(1), Err("failed".to_string())),
+    ];
+    for (index, result) in results.iter().enumerate() {
+        match result {
+            Err(JsEngineError::NotYetImplemented(msg)) => {
+                assert!(
+                    !msg.is_empty(),
+                    "operation {index} returned an empty message"
+                )
+            }
+            other => panic!("operation {index}: expected NotYetImplemented, got: {other:?}"),
+        }
+    }
+
+    assert_eq!(
+        JsEngine::evaluate_script(&mut engine, "1 + 2", &options).expect("eval"),
+        JsValue::Number(3.0)
+    );
+    assert_eq!(
+        engine.worker_pid_for_test(),
+        pid,
+        "the child must survive NotYetImplemented responses"
+    );
 }
 
 /// codex レビュー指摘 #503 P1「Hello のエンジン種別を無視している」の

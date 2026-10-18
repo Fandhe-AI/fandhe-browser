@@ -757,7 +757,7 @@ pub trait JsEngine {
 }
 
 /// モジュール API の既定実装が返す「未対応」エラー（`REPAIR-3`）。
-fn module_api_not_yet_implemented(operation: &'static str) -> JsEngineError {
+pub(crate) fn module_api_not_yet_implemented(operation: &'static str) -> JsEngineError {
     JsEngineError::NotYetImplemented(format!(
         "{operation}: ES module evaluation is not supported by this engine yet"
     ))
