@@ -1892,7 +1892,9 @@ impl V8Engine {
     /// - 監視は compile の前に起動し、`timeout` を過ぎると `Timeout`
     ///
     /// 動的 `import()` は compile 時には検出しない。実行時は host callback が無いため
-    /// Promise が reject される（`TAKE_DYNAMIC_IMPORTS` の対応は別 issue）。
+    /// `import()` の Promise が reject され、評価は成功扱いのまま続く（挙動は
+    /// `js_4_v8_module_dynamic_import_call_is_not_resolved` が固定する。
+    /// `TAKE_DYNAMIC_IMPORTS` の対応は別 issue）。
     pub(crate) fn compile_module(
         &mut self,
         url: &str,
@@ -1905,17 +1907,17 @@ impl V8Engine {
             )));
         }
         self.ensure_no_native_call_fatal()?;
-        let next_id = {
+        let (next_id, following_id) = {
             let map = self.module_map()?;
             if map.entries.len() >= MAX_MODULES_PER_WORKER {
                 return Err(JsEngineError::ResourceLimitExceeded(format!(
                     "too many modules (maximum {MAX_MODULES_PER_WORKER})"
                 )));
             }
-            map.next_id.checked_add(1).ok_or_else(|| {
+            let following = map.next_id.checked_add(1).ok_or_else(|| {
                 JsEngineError::ResourceLimitExceeded("module id space is exhausted".to_string())
             })?;
-            map.next_id
+            (map.next_id, following)
         };
         if timeout.is_zero() {
             return Err(V8Failure::Terminated {
@@ -1943,7 +1945,7 @@ impl V8Engine {
                 .collect(),
         );
         let map = self.module_map()?;
-        map.next_id = next_id + 1;
+        map.next_id = following_id;
         map.entries.insert(
             next_id,
             ModuleEntry {
@@ -2195,8 +2197,9 @@ enum ModuleOutcome {
 }
 
 /// 投げられた値（`Module::get_exception`・Promise の拒否理由）から、ユーザーコードを
-/// 実行せずにメッセージを作る。`Exception::create_message` の `Message::get` は
-/// 副作用なしの文字列化（`NoSideEffectsToString`）でテンプレートを組み立てる。
+/// 実行せずにメッセージを作る。`Exception::create_message` と `Message::get` で
+/// 組み立てる（`toString` が無限ループするオブジェクトを投げてもハングしないことは
+/// `js_6_v8_module_thrown_object_with_hanging_tostring_does_not_hang` で確認している）。
 fn exception_message(scope: &v8::PinScope<'_, '_>, exception: v8::Local<v8::Value>) -> String {
     let message = v8::Exception::create_message(scope, exception);
     failure_message(scope, Some(message), Some(exception))
@@ -3996,5 +3999,27 @@ mod tests {
             ModuleEvaluation::Fulfilled
         );
         assert_eq!(eval_str(&mut engine, "fromModule"), JsValue::Number(6.0));
+    }
+
+    /// JS-4・REPAIR-3・Issue #1111: 動的 `import()` は host callback が無く解決されない。
+    /// 呼び出しは評価を止めず（`Fulfilled`）、`import()` の Promise は reject される。
+    /// 後続でエンジンは使い続けられる。動的 import の本対応は別 issue。
+    #[test]
+    fn js_4_v8_module_dynamic_import_call_is_not_resolved() {
+        let mut engine = module_engine();
+        let record = compile_ok(
+            &mut engine,
+            "https://example.test/d.js",
+            "globalThis.p = import('./nope.js'); export {};",
+        );
+        let result = engine
+            .evaluate_module(record.id(), &EvaluateOptions::default())
+            .expect("module must evaluate");
+        assert_eq!(result, ModuleEvaluation::Fulfilled);
+        assert_eq!(
+            eval_str(&mut engine, "p instanceof Promise"),
+            JsValue::Bool(true)
+        );
+        assert_eq!(eval_str(&mut engine, "1 + 1"), JsValue::Number(2.0));
     }
 }

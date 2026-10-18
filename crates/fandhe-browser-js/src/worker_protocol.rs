@@ -46,8 +46,8 @@
 //!   [`tag::EVALUATE_MODULE`]・[`tag::MODULE_RESULT`]・
 //!   [`tag::TAKE_DYNAMIC_IMPORTS`]・[`tag::DYNAMIC_IMPORTS`]・
 //!   [`tag::FINISH_DYNAMIC_IMPORT`]: ES module 用（プロトコル v6。
-//!   [`module_frames`]。`JS-4`・Issue #1110）。子はまだ全操作に
-//!   `ERROR{NotYetImplemented}` を返す（`REPAIR-3`）
+//!   [`module_frames`]。`JS-4`・Issue #1110）。子は静的 import の 3 操作を実装し（boa・
+//!   V8。Issue #1114・#1111）、動的 import の 2 操作には `ERROR{NotYetImplemented}` を返す（`REPAIR-3`）
 //!
 //! # 検証方針（外部入力として扱う。coding-rust.md「外部入力」節）
 //!
