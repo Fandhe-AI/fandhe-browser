@@ -21,11 +21,13 @@
 //! 返信。`super::process_engine::dispatch_native_call`・`TASK-29`・
 //! Issue #526）と、ES module の静的 import グラフの compile・link・evaluate
 //! （[`V8Engine::compile_module`]・[`V8Engine::link_module`]・
-//! [`V8Engine::evaluate_module`]。`JS-4`・Issue #1111）を実装済みである。以下は
-//! 未実装（実装済みを装わない。REPAIR-3）。
+//! [`V8Engine::evaluate_module`]。`JS-4`・Issue #1111）と、動的 `import()` の保留
+//! キューと完了（[`V8Engine::take_dynamic_import_requests`]・
+//! [`V8Engine::finish_dynamic_import`]。`JS-4`・`JS-6`・`JS-8`・Issue #1113。
+//! 取得は親が行い、子はネットワークに出ない。子を再起動すると保留は失われ、再登録しない）
+//! を実装済みである。以下は未実装（実装済みを装わない。REPAIR-3）。
 //!
-//! - ES module の動的 `import()`（`TAKE_DYNAMIC_IMPORTS` 等。host callback が無いため
-//!   `import()` の Promise は reject される）。後続 issue で対応する
+//! - ES module の import attributes（動的 `import()` の第 2 引数を含む。即時 reject する）
 //!
 //! なお ES module の `import.meta.url`・top-level await・Promise の
 //! `Fulfilled` / `Pending` / `Rejected` の分類・評価後の microtask checkpoint は
@@ -95,7 +97,9 @@
 //!   将来の複数回利用（cli の再起動なしの再初期化等）と相性が悪い
 //!
 //! `dispose` に関する `unsafe` は本モジュールでは使わない。本モジュールの
-//! `unsafe` は、次の 2 か所の `v8::callback_scope!(unsafe ...)` だけである。
+//! `unsafe` は、次の 2 か所の `v8::callback_scope!(unsafe ...)` だけである
+//! （動的 `import()` の host callback〔`dynamic_import_callback`。Issue #1113〕は、
+//! v8 crate が scope を渡す安全な `fn` 形式を使うため `unsafe` を足さない）。
 //!
 //! 1. ES module の resolve callback（`resolve_module_callback`。`JS-4`・Issue #1111。
 //!    リポジトリオーナー承認 2026-10-18。
@@ -139,20 +143,21 @@
 //! メッセージを含む）エラーを返す。
 
 use std::cell::Cell;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::OnceLock;
 use std::sync::mpsc;
 use std::time::Duration;
 
 use super::engine_trait::{
-    EvaluateOptions, JsEngineError, JsValue, ModuleEvaluation, ModuleId, ModuleRecord,
-    ModuleRequest, ModuleResolution,
+    DynamicImportId, DynamicImportRequest, EvaluateOptions, JsEngineError, JsValue,
+    ModuleEvaluation, ModuleId, ModuleRecord, ModuleRequest, ModuleResolution,
 };
 // 逆方向 RPC の窓口は boa 子プロセスとも共有するため `shared` へ置いた
 // （Issue #166）。既存の参照パスを保つため再エクスポートする。
 pub(crate) use super::shared::{NativeCallFailure, NativeCallTransport};
 use super::worker_protocol::module_frames::{
-    MAX_MODULE_REQUESTS, MAX_MODULE_SPECIFIER_BYTES, MAX_MODULES_PER_WORKER,
+    MAX_MODULE_REQUESTS, MAX_MODULE_SPECIFIER_BYTES, MAX_MODULE_URL_BYTES, MAX_MODULES_PER_WORKER,
+    MAX_PENDING_DYNAMIC_IMPORTS,
 };
 use super::worker_protocol::{self, NativeReturn};
 
@@ -673,6 +678,8 @@ impl V8Engine {
         isolate.set_slot(ModuleMap::new());
         // `import.meta.url` の初期化（`JS-4`・Issue #1112）。
         isolate.set_host_initialize_import_meta_object_callback(import_meta_callback);
+        // 動的 `import()` の保留キュー（`JS-4`・`JS-6`・Issue #1113）。
+        isolate.set_host_import_module_dynamically_callback(dynamic_import_callback);
         Ok(Self { context, isolate })
     }
 
@@ -1759,6 +1766,22 @@ struct ModuleMap {
     /// 次に払い出す id（1 始まり）。
     next_id: u32,
     entries: HashMap<u32, ModuleEntry>,
+    /// 次に払い出す動的 import の id（1 始まり。`JS-4`・Issue #1113）。
+    next_dynamic_id: u32,
+    /// まだ親へ取り出されていない動的 import（挿入順）。
+    queued_dynamic: VecDeque<QueuedDynamicImport>,
+    /// 取り出し済みで、`finish_dynamic_import` を待っている動的 import の resolver。
+    /// 子を再起動すると Isolate ごとこのキューも失われ、再登録はしない（設計 §3）。
+    awaiting_dynamic: HashMap<u32, v8::Global<v8::PromiseResolver>>,
+}
+
+/// 動的 `import()` 1 件の保留エントリ（未取得）。
+struct QueuedDynamicImport {
+    id: u32,
+    /// import を書いたモジュールの id。classic スクリプト起点は `None`（document 起点）。
+    referrer: Option<u32>,
+    specifier: String,
+    resolver: v8::Global<v8::PromiseResolver>,
 }
 
 impl ModuleMap {
@@ -1766,6 +1789,9 @@ impl ModuleMap {
         Self {
             next_id: 1,
             entries: HashMap::new(),
+            next_dynamic_id: 1,
+            queued_dynamic: VecDeque::new(),
+            awaiting_dynamic: HashMap::new(),
         }
     }
 
@@ -1913,6 +1939,122 @@ extern "C" fn import_meta_callback(
     let _ = meta.create_data_property(scope, key.into(), value.into());
 }
 
+/// 動的 `import()` を即時 reject するときの固定文言の拒否理由。
+/// 文言に specifier・URL は含めない（`JS-6`）。
+type DynamicImportRejection = &'static str;
+
+/// 動的 `import()` の host callback（`JS-4`・`JS-6`・`JS-8`・Issue #1113）。
+///
+/// 子は取得しない。要求を [`ModuleMap`] の保留キューに積み、保留中の Promise を返す。
+/// 親（core の `execute_modules`）が `TAKE_DYNAMIC_IMPORTS` で取り出し、取得・compile・
+/// link したうえで `FINISH_DYNAMIC_IMPORT` で完了させる。受け付けられない要求
+/// （import attributes・長すぎる specifier / URL・保留件数の上限超過・id 空間の枯渇・
+/// referrer を一意に特定できない）は、成功を装わず即時 reject する（fail-closed）。
+///
+/// 値を捕捉しない通常の `fn` で、`unsafe` を使わない。callback の中で JS は実行しない
+/// （reject の反応は microtask に積まれるだけ）。
+fn dynamic_import_callback<'s, 'i>(
+    scope: &mut v8::PinScope<'s, 'i>,
+    _host_defined_options: v8::Local<'s, v8::Data>,
+    resource_name: v8::Local<'s, v8::Value>,
+    specifier: v8::Local<'s, v8::String>,
+    import_attributes: v8::Local<'s, v8::FixedArray>,
+) -> Option<v8::Local<'s, v8::Promise>> {
+    let resolver = v8::PromiseResolver::new(scope)?;
+    let promise = resolver.get_promise(scope);
+    match admit_dynamic_import(scope, resource_name, specifier, import_attributes) {
+        Ok((referrer, specifier)) => {
+            let global = v8::Global::new(scope, resolver);
+            let Some(map) = scope.get_slot_mut::<ModuleMap>() else {
+                reject_with_message(scope, resolver, "module map is unavailable");
+                return Some(promise);
+            };
+            // `admit_dynamic_import` が id 空間の余裕を確かめている。
+            let id = map.next_dynamic_id;
+            map.next_dynamic_id = id.saturating_add(1);
+            map.queued_dynamic.push_back(QueuedDynamicImport {
+                id,
+                referrer,
+                specifier,
+                resolver: global,
+            });
+        }
+        Err(reason) => reject_with_message(scope, resolver, reason),
+    }
+    Some(promise)
+}
+
+/// 動的 `import()` の要求を検査し、referrer と specifier を取り出す。
+/// すべて確保の前（長さ・件数）に判定する。
+fn admit_dynamic_import(
+    scope: &mut v8::PinScope<'_, '_>,
+    resource_name: v8::Local<'_, v8::Value>,
+    specifier: v8::Local<'_, v8::String>,
+    import_attributes: v8::Local<'_, v8::FixedArray>,
+) -> Result<(Option<u32>, String), DynamicImportRejection> {
+    if import_attributes.length() > 0 {
+        return Err("import attributes are not supported");
+    }
+    if specifier.utf8_length(scope) > MAX_MODULE_SPECIFIER_BYTES {
+        return Err("module specifier is too long");
+    }
+    // referrer の URL（モジュール起点のときだけ文字列。classic は origin を持たない）。
+    let referrer_url = match v8::Local::<v8::String>::try_from(resource_name) {
+        Ok(name) => {
+            if name.utf8_length(scope) > MAX_MODULE_URL_BYTES {
+                return Err("referrer url is too long");
+            }
+            Some(name.to_rust_string_lossy(scope))
+        }
+        Err(_) => None,
+    };
+    let specifier = specifier.to_rust_string_lossy(scope);
+    let Some(map) = scope.get_slot::<ModuleMap>() else {
+        return Err("module map is unavailable");
+    };
+    // 未取得と完了待ちの合計で数える（親の台帳の数え方と揃える）。
+    if map.queued_dynamic.len() + map.awaiting_dynamic.len() >= MAX_PENDING_DYNAMIC_IMPORTS {
+        return Err("too many pending dynamic imports");
+    }
+    if map.next_dynamic_id.checked_add(1).is_none() {
+        return Err("dynamic import id space is exhausted");
+    }
+    let referrer = match referrer_url {
+        None => None,
+        Some(url) => {
+            // 同じ URL が複数登録されていると特定できない。親の重複排除を信頼せず拒否する。
+            let mut matches = map.entries.iter().filter(|(_, e)| e.url == url);
+            match (matches.next(), matches.next()) {
+                (Some((id, _)), None) => Some(*id),
+                _ => return Err("referrer module cannot be identified"),
+            }
+        }
+    };
+    Ok((referrer, specifier))
+}
+
+/// resolver を固定文言の `Error` で reject する（生成に失敗したら何もしない）。
+fn reject_with_message(
+    scope: &v8::PinScope<'_, '_>,
+    resolver: v8::Local<'_, v8::PromiseResolver>,
+    message: &str,
+) {
+    if let Some(message) = v8::String::new(scope, message) {
+        let error = v8::Exception::error(scope, message);
+        let _ = resolver.reject(scope, error);
+    }
+}
+
+/// `data` に束ねた値（モジュール名前空間）をそのまま返す関数の本体。評価 Promise の
+/// `then` に渡し、解決値を名前空間に差し替える（`finish_dynamic_import`）。
+fn return_bound_data(
+    _scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    rv.set(args.data());
+}
+
 /// 重複込みの import 宣言数の上限（走査・確保コストの上限。`MAX_MODULE_REQUESTS` は一意な件数）。
 const MAX_RAW_MODULE_REQUESTS: usize = 65_536;
 
@@ -1953,10 +2095,10 @@ impl V8Engine {
     /// - 重複した specifier は出現順で最初の 1 件に畳む
     /// - 監視は compile の前に起動し、`timeout` を過ぎると `Timeout`
     ///
-    /// 動的 `import()` は compile 時には検出しない。実行時は host callback が無いため
-    /// `import()` の Promise が reject され、評価は成功扱いのまま続く（挙動は
-    /// `js_4_v8_module_dynamic_import_call_is_not_resolved` が固定する。
-    /// `TAKE_DYNAMIC_IMPORTS` の対応は別 issue）。
+    /// 動的 `import()` は compile 時には検出しない。実行時は host callback
+    /// ([`dynamic_import_callback`]) が保留キューに積み、評価は成功扱いのまま続く
+    /// （取り出しと完了は [`V8Engine::take_dynamic_import_requests`]・
+    /// [`V8Engine::finish_dynamic_import`]。Issue #1113）。
     pub(crate) fn compile_module(
         &mut self,
         url: &str,
@@ -2228,6 +2370,135 @@ impl V8Engine {
         }
     }
 
+    /// 保留中の動的 `import()` を挿入順に取り出す（`TAKE_DYNAMIC_IMPORTS`。`JS-4`・
+    /// `JS-6`・Issue #1113）。取り出した要求は完了待ちへ移り、V8 は呼ばない。
+    /// 件数は callback 側の上限（[`MAX_PENDING_DYNAMIC_IMPORTS`]）で抑えられている。
+    pub(crate) fn take_dynamic_import_requests(
+        &mut self,
+    ) -> Result<Vec<DynamicImportRequest>, JsEngineError> {
+        self.ensure_no_native_call_fatal()?;
+        let map = self.module_map()?;
+        let mut requests = Vec::with_capacity(map.queued_dynamic.len());
+        while let Some(queued) = map.queued_dynamic.pop_front() {
+            requests.push(DynamicImportRequest::new(
+                DynamicImportId::from_raw(queued.id),
+                queued.referrer.map(ModuleId::from_raw),
+                queued.specifier,
+            ));
+            map.awaiting_dynamic.insert(queued.id, queued.resolver);
+        }
+        Ok(requests)
+    }
+
+    /// 動的 `import()` を完了させる（`FINISH_DYNAMIC_IMPORT`。`JS-4`・`JS-6`・Issue #1113）。
+    ///
+    /// - 完了待ちに無い id（未知・二重完了・未取り出し）と、未 link の対象は V8 を呼ぶ前に
+    ///   `ModuleResolutionFailed`（固定文言）。このとき状態は変えず、親は `Err` で完了し直せる
+    /// - `Err(message)` は保留中の Promise を `Error(message)` で reject する
+    /// - `Ok(target)` は instantiate・evaluate し、評価 Promise の `then` で名前空間へ解決する
+    ///   （評価が reject・top-level await で保留でも仕様どおりに伝播する）
+    /// - そのあと microtask checkpoint を行い（利用者の `then`・`catch` が走る）、監視は
+    ///   [`SCRIPT_EXECUTION_TIMEOUT`]。超過は `Timeout`（エントリは完了済みとして扱う）
+    pub(crate) fn finish_dynamic_import(
+        &mut self,
+        id: DynamicImportId,
+        result: Result<ModuleId, String>,
+    ) -> Result<(), JsEngineError> {
+        self.ensure_no_native_call_fatal()?;
+        let unknown = || {
+            JsEngineError::ModuleResolutionFailed(
+                "unknown or finished dynamic import id".to_string(),
+            )
+        };
+        let resolver_global = {
+            let map = self.module_map()?;
+            if !map.awaiting_dynamic.contains_key(&id.raw()) {
+                return Err(unknown());
+            }
+            if let Ok(target) = &result {
+                map.ensure_fully_linked(*target)?;
+            }
+            map.awaiting_dynamic.remove(&id.raw()).ok_or_else(unknown)?
+        };
+        let isolate_handle = self.isolate.thread_safe_handle();
+        let scope = std::pin::pin!(v8::HandleScope::new(&mut self.isolate));
+        let mut scope = scope.init();
+        let context = v8::Local::new(&scope, &self.context);
+        let scope = &mut v8::ContextScope::new(&mut scope, context);
+        let tc = std::pin::pin!(v8::TryCatch::new(scope));
+        let mut tc = tc.init();
+
+        let resolver = v8::Local::new(&tc, &resolver_global);
+        let watchdog = Watchdog::start(isolate_handle, SCRIPT_EXECUTION_TIMEOUT);
+        Self::settle_dynamic_import(&mut tc, resolver, result);
+        run_microtask_checkpoint(&mut tc);
+        watchdog.stop();
+        let was_terminated = tc.has_terminated();
+        tc.cancel_terminate_execution();
+        if was_terminated {
+            return Err(V8Failure::Terminated {
+                stage: "execution",
+                timeout: SCRIPT_EXECUTION_TIMEOUT,
+            }
+            .into());
+        }
+        Ok(())
+    }
+
+    /// 保留中の Promise を reject または名前空間で解決する（監視スレッドが生きている間に呼ぶ）。
+    fn settle_dynamic_import(
+        tc: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
+        resolver: v8::Local<v8::PromiseResolver>,
+        result: Result<ModuleId, String>,
+    ) {
+        let target = match result {
+            Ok(target) => target,
+            Err(message) => {
+                // 親の失敗理由は値として渡す（評価文字列へは連結しない）。
+                reject_with_message(tc, resolver, &message);
+                return;
+            }
+        };
+        let module = tc
+            .get_slot::<ModuleMap>()
+            .and_then(|map| map.entries.get(&target.raw()))
+            .map(|entry| entry.module.clone());
+        let Some(module) = module else {
+            reject_with_message(tc, resolver, "unknown module id");
+            return;
+        };
+        let module = v8::Local::new(tc, &module);
+        if module.get_status() == v8::ModuleStatus::Errored {
+            let exception = module.get_exception();
+            let _ = resolver.reject(tc, exception);
+            return;
+        }
+        if module.instantiate_module(tc, resolve_module_callback) != Some(true) {
+            reject_caught(tc, resolver, "module instantiation failed");
+            return;
+        }
+        let Some(value) = module.evaluate(tc) else {
+            if !tc.has_terminated() {
+                reject_caught(tc, resolver, "module evaluation failed");
+            }
+            return;
+        };
+        let namespace = module.get_module_namespace();
+        let promise = v8::Local::<v8::Promise>::try_from(value).ok();
+        let handler = v8::Function::builder(return_bound_data)
+            .data(namespace)
+            .build(tc);
+        let chained = promise
+            .zip(handler)
+            .and_then(|(promise, handler)| promise.then(tc, handler));
+        match chained {
+            Some(chained) => {
+                let _ = resolver.resolve(tc, chained.into());
+            }
+            None => reject_with_message(tc, resolver, "module evaluation did not return a promise"),
+        }
+    }
+
     /// instantiate・evaluate・microtask checkpoint を行い、結果を分類する（監視スレッドが
     /// 生きている間に呼ぶ。メッセージの取り出しもユーザーコードを実行しない経路だけを使う）。
     ///
@@ -2245,8 +2516,7 @@ impl V8Engine {
         };
         // 評価中に積まれた microtask（`Promise.resolve().then(...)`・TLA の継続）を
         // 流し切る。例外は microtask 内で処理され、ここへは伝わらない。
-        tc.perform_microtask_checkpoint();
-        if tc.has_terminated() {
+        if run_microtask_checkpoint(tc) {
             // 呼び出し側が Timeout にする。
             return ModuleOutcome::Pending;
         }
@@ -2289,6 +2559,30 @@ enum ModuleOutcome {
 fn exception_message(scope: &v8::PinScope<'_, '_>, exception: v8::Local<v8::Value>) -> String {
     let message = v8::Exception::create_message(scope, exception);
     failure_message(scope, Some(message), Some(exception))
+}
+
+/// 捕捉済みの例外（無ければ固定文言の `Error`）で resolver を reject する。
+fn reject_caught(
+    tc: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
+    resolver: v8::Local<v8::PromiseResolver>,
+    fallback: &str,
+) {
+    match tc.exception() {
+        Some(exception) => {
+            tc.reset();
+            let _ = resolver.reject(tc, exception);
+        }
+        None => reject_with_message(tc, resolver, fallback),
+    }
+}
+
+/// microtask checkpoint を流し切る（`run_module` と動的 import の完了が共用する。
+/// 呼び出し側の監視スレッドが生きている間に呼ぶ）。終了要求があれば `true`。
+fn run_microtask_checkpoint(
+    tc: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
+) -> bool {
+    tc.perform_microtask_checkpoint();
+    tc.has_terminated()
 }
 
 impl Drop for V8Engine {
@@ -4079,26 +4373,296 @@ mod tests {
         assert_eq!(eval_str(&mut engine, "fromModule"), JsValue::Number(6.0));
     }
 
-    /// JS-4・REPAIR-3・Issue #1111: 動的 `import()` は host callback が無く解決されない。
-    /// 呼び出しは評価を止めず（`Fulfilled`）、`import()` の Promise は reject される。
-    /// 後続でエンジンは使い続けられる。動的 import の本対応は別 issue。
+    /// モジュールを評価して動的 import を積ませ、保留要求を取り出す補助。
+    fn eval_module_source(engine: &mut V8Engine, url: &str, source: &str) -> ModuleRecord {
+        let record = compile_ok(engine, url, source);
+        assert_eq!(
+            engine
+                .evaluate_module(record.id(), &EvaluateOptions::default())
+                .expect("module must evaluate"),
+            ModuleEvaluation::Fulfilled
+        );
+        record
+    }
+
+    fn assert_unknown_dynamic_id(result: Result<(), JsEngineError>) {
+        match result {
+            Err(JsEngineError::ModuleResolutionFailed(msg)) => {
+                assert_eq!(msg, "unknown or finished dynamic import id")
+            }
+            other => panic!("expected ModuleResolutionFailed, got: {other:?}"),
+        }
+    }
+
+    /// JS-4・Issue #1113 受け入れ条件 a: モジュール内の `import()` は保留要求として
+    /// 取り出され、id・referrer・specifier が具体値で一致する。評価は成功扱いで続く。
     #[test]
-    fn js_4_v8_module_dynamic_import_call_is_not_resolved() {
+    fn js_4_v8_dynamic_import_in_module_is_queued_with_referrer_and_specifier() {
         let mut engine = module_engine();
-        let record = compile_ok(
+        let root = eval_module_source(
             &mut engine,
             "https://example.test/d.js",
-            "globalThis.p = import('./nope.js'); export {};",
+            "globalThis.p = import('./x.js'); export {};",
         );
-        let result = engine
-            .evaluate_module(record.id(), &EvaluateOptions::default())
-            .expect("module must evaluate");
-        assert_eq!(result, ModuleEvaluation::Fulfilled);
         assert_eq!(
             eval_str(&mut engine, "p instanceof Promise"),
             JsValue::Bool(true)
         );
+        let requests = engine.take_dynamic_import_requests().expect("take");
+        assert_eq!(
+            requests,
+            vec![DynamicImportRequest::new(
+                DynamicImportId::from_raw(1),
+                Some(root.id()),
+                "./x.js".to_string()
+            )]
+        );
+        assert_eq!(engine.take_dynamic_import_requests().expect("take"), vec![]);
         assert_eq!(eval_str(&mut engine, "1 + 1"), JsValue::Number(2.0));
+    }
+
+    /// JS-4・Issue #1113: classic スクリプトの `import()` は referrer なし（document 起点）で積まれる。
+    #[test]
+    fn js_4_v8_dynamic_import_from_classic_script_has_no_referrer() {
+        let mut engine = module_engine();
+        eval_str(&mut engine, "globalThis.q = import('./y.js'); 0");
+        let requests = engine.take_dynamic_import_requests().expect("take");
+        assert_eq!(
+            requests,
+            vec![DynamicImportRequest::new(
+                DynamicImportId::from_raw(1),
+                None,
+                "./y.js".to_string()
+            )]
+        );
+    }
+
+    /// JS-4・Issue #1113 受け入れ条件 b: `finish(Ok)` のあと `then` が名前空間を受け取る。
+    #[test]
+    fn js_4_v8_finish_dynamic_import_ok_resolves_namespace_and_runs_then() {
+        let mut engine = module_engine();
+        eval_module_source(
+            &mut engine,
+            "https://example.test/d.js",
+            "import('./x.js').then(ns => { globalThis.got = ns.v; }); export {};",
+        );
+        let requests = engine.take_dynamic_import_requests().expect("take");
+        let target = compile_ok(
+            &mut engine,
+            "https://example.test/x.js",
+            "export const v = 42;",
+        );
+        engine
+            .finish_dynamic_import(requests[0].id(), Ok(target.id()))
+            .expect("finish");
+        assert_eq!(eval_str(&mut engine, "got"), JsValue::Number(42.0));
+    }
+
+    /// JS-4・Issue #1113 受け入れ条件 c: `finish(Err)` のあと `catch` が親のメッセージを受け取る。
+    #[test]
+    fn js_4_v8_finish_dynamic_import_err_rejects_and_runs_catch() {
+        let mut engine = module_engine();
+        eval_module_source(
+            &mut engine,
+            "https://example.test/d.js",
+            "import('./x.js').catch(e => { globalThis.err = e.message; }); export {};",
+        );
+        let requests = engine.take_dynamic_import_requests().expect("take");
+        engine
+            .finish_dynamic_import(requests[0].id(), Err("fetch failed".to_string()))
+            .expect("finish");
+        assert_eq!(
+            eval_str(&mut engine, "err"),
+            JsValue::String("fetch failed".to_string())
+        );
+    }
+
+    /// JS-4・Issue #1113: 対象モジュールが評価時に throw すると、`catch` に元の例外が届く。
+    #[test]
+    fn js_4_v8_finish_dynamic_import_rejects_when_target_throws() {
+        let mut engine = module_engine();
+        eval_module_source(
+            &mut engine,
+            "https://example.test/d.js",
+            "import('./x.js').catch(e => { globalThis.err = e.message; }); export {};",
+        );
+        let requests = engine.take_dynamic_import_requests().expect("take");
+        let target = compile_ok(
+            &mut engine,
+            "https://example.test/x.js",
+            "throw new Error('boom'); export {};",
+        );
+        engine
+            .finish_dynamic_import(requests[0].id(), Ok(target.id()))
+            .expect("finish");
+        assert_eq!(
+            eval_str(&mut engine, "err"),
+            JsValue::String("boom".to_string())
+        );
+    }
+
+    /// JS-4・Issue #1113: top-level await を含む対象でも、完了後に `then` が発火する。
+    #[test]
+    fn js_4_v8_finish_dynamic_import_of_tla_module_settles_after_checkpoint() {
+        let mut engine = module_engine();
+        eval_module_source(
+            &mut engine,
+            "https://example.test/d.js",
+            "import('./x.js').then(ns => { globalThis.got = ns.v; }); export {};",
+        );
+        let requests = engine.take_dynamic_import_requests().expect("take");
+        let target = compile_ok(
+            &mut engine,
+            "https://example.test/x.js",
+            "await Promise.resolve(); export const v = 7;",
+        );
+        engine
+            .finish_dynamic_import(requests[0].id(), Ok(target.id()))
+            .expect("finish");
+        assert_eq!(eval_str(&mut engine, "got"), JsValue::Number(7.0));
+    }
+
+    /// JS-6・Issue #1113 受け入れ条件 d: 未知の id・二重完了・未取り出しの id は具体的な
+    /// `ModuleResolutionFailed` で、そのあとも classic 評価が動く。
+    #[test]
+    fn js_6_v8_finish_dynamic_import_unknown_double_and_untaken_ids_fail() {
+        let mut engine = module_engine();
+        eval_module_source(
+            &mut engine,
+            "https://example.test/d.js",
+            "import('./x.js').catch(() => {}); import('./y.js').catch(() => {}); export {};",
+        );
+        assert_unknown_dynamic_id(
+            engine.finish_dynamic_import(DynamicImportId::from_raw(99), Err("e".to_string())),
+        );
+        // まだ取り出していない id（1 件目）。
+        assert_unknown_dynamic_id(
+            engine.finish_dynamic_import(DynamicImportId::from_raw(1), Err("e".to_string())),
+        );
+        let requests = engine.take_dynamic_import_requests().expect("take");
+        assert_eq!(requests.len(), 2);
+        engine
+            .finish_dynamic_import(requests[0].id(), Err("e".to_string()))
+            .expect("first finish");
+        assert_unknown_dynamic_id(
+            engine.finish_dynamic_import(requests[0].id(), Err("e".to_string())),
+        );
+        assert_eq!(eval_str(&mut engine, "1 + 1"), JsValue::Number(2.0));
+    }
+
+    /// JS-6・Issue #1113: 未 link の対象での `Ok` は状態を変えず失敗し、同じ id を `Err` で
+    /// 完了し直せる。
+    #[test]
+    fn js_6_v8_finish_dynamic_import_with_unlinked_target_keeps_the_entry() {
+        let mut engine = module_engine();
+        eval_module_source(
+            &mut engine,
+            "https://example.test/d.js",
+            "import('./x.js').catch(e => { globalThis.err = e.message; }); export {};",
+        );
+        let requests = engine.take_dynamic_import_requests().expect("take");
+        let unlinked = compile_ok(&mut engine, "https://example.test/u.js", "import './z.js';");
+        match engine.finish_dynamic_import(requests[0].id(), Ok(unlinked.id())) {
+            Err(JsEngineError::ModuleResolutionFailed(_)) => {}
+            other => panic!("expected ModuleResolutionFailed, got: {other:?}"),
+        }
+        engine
+            .finish_dynamic_import(requests[0].id(), Err("retry".to_string()))
+            .expect("finish again with Err");
+        assert_eq!(
+            eval_str(&mut engine, "err"),
+            JsValue::String("retry".to_string())
+        );
+    }
+
+    /// JS-6・Issue #1113 受け入れ条件 d: 保留（未取得 + 完了待ち）が上限を超えた分は
+    /// 即時 reject され、キューは上限ちょうどで止まる。
+    #[test]
+    fn js_6_v8_dynamic_import_queue_limit_rejects_overflow_immediately() {
+        let mut engine = module_engine();
+        let source = format!(
+            "globalThis.failed = 0; \
+             for (let i = 0; i < {}; i++) {{ import('./m.js').catch(() => {{ globalThis.failed++; }}); }} \
+             export {{}};",
+            MAX_PENDING_DYNAMIC_IMPORTS + 1
+        );
+        eval_module_source(&mut engine, "https://example.test/d.js", &source);
+        // `catch` は microtask。評価直後の checkpoint で流れ済み。
+        assert_eq!(eval_str(&mut engine, "failed"), JsValue::Number(1.0));
+        let requests = engine.take_dynamic_import_requests().expect("take");
+        assert_eq!(requests.len(), MAX_PENDING_DYNAMIC_IMPORTS);
+        // 取り出し済み（完了待ち）も上限に数える。
+        eval_str(
+            &mut engine,
+            "import('./late.js').catch(() => { globalThis.failed++; }); 0",
+        );
+        assert_eq!(engine.take_dynamic_import_requests().expect("take"), vec![]);
+        // checkpoint は classic 評価の終わりでは走らないため、次の評価で観測する。
+        assert_eq!(eval_str(&mut engine, "failed"), JsValue::Number(2.0));
+    }
+
+    /// JS-6・Issue #1113: import attributes と上限超過の specifier は保留に積まれず即時 reject。
+    #[test]
+    fn js_6_v8_dynamic_import_rejects_attributes_and_oversized_specifier() {
+        let mut engine = module_engine();
+        let long = "a".repeat(MAX_MODULE_SPECIFIER_BYTES + 1);
+        let source = format!(
+            "globalThis.rejected = 0; \
+             import('./a.js', {{ with: {{ type: 'json' }} }}).catch(() => {{ globalThis.rejected++; }}); \
+             import('{long}').catch(() => {{ globalThis.rejected++; }}); export {{}};"
+        );
+        eval_module_source(&mut engine, "https://example.test/d.js", &source);
+        assert_eq!(eval_str(&mut engine, "rejected"), JsValue::Number(2.0));
+        assert_eq!(engine.take_dynamic_import_requests().expect("take"), vec![]);
+    }
+
+    /// JS-6・Issue #1113: 同じ URL のモジュールが 2 つ登録されていると referrer を特定できず、
+    /// 成功を装わず即時 reject する。
+    #[test]
+    fn js_6_v8_dynamic_import_rejects_when_referrer_url_is_ambiguous() {
+        let mut engine = module_engine();
+        compile_ok(&mut engine, "https://example.test/dup.js", "export {};");
+        eval_module_source(
+            &mut engine,
+            "https://example.test/dup.js",
+            "globalThis.r = 0; import('./x.js').catch(() => { globalThis.r = 1; }); export {};",
+        );
+        assert_eq!(eval_str(&mut engine, "r"), JsValue::Number(1.0));
+        assert_eq!(engine.take_dynamic_import_requests().expect("take"), vec![]);
+    }
+
+    /// JS-6・Issue #1113: 完了後の `then` が microtask を無限に積むと `Timeout`。
+    #[test]
+    fn js_6_v8_finish_dynamic_import_infinite_microtask_loop_times_out() {
+        let mut engine = module_engine();
+        eval_module_source(
+            &mut engine,
+            "https://example.test/d.js",
+            "import('./x.js').then(function loop() { Promise.resolve().then(loop); }); export {};",
+        );
+        let requests = engine.take_dynamic_import_requests().expect("take");
+        let target = compile_ok(&mut engine, "https://example.test/x.js", "export {};");
+        match engine.finish_dynamic_import(requests[0].id(), Ok(target.id())) {
+            Err(JsEngineError::Timeout(_)) => {}
+            other => panic!("expected Timeout, got: {other:?}"),
+        }
+        assert_eq!(eval_str(&mut engine, "1 + 1"), JsValue::Number(2.0));
+    }
+
+    /// JS-4・Issue #1113: 保留を残したままエンジンを drop しても落ちず、作り直せる。
+    #[test]
+    fn js_4_v8_engine_drop_with_pending_dynamic_imports_does_not_crash() {
+        let mut engine = module_engine();
+        eval_module_source(
+            &mut engine,
+            "https://example.test/d.js",
+            "import('./a.js'); import('./b.js'); export {};",
+        );
+        engine.take_dynamic_import_requests().expect("take");
+        eval_str(&mut engine, "import('./c.js'); 0");
+        drop(engine);
+        let mut again = module_engine();
+        assert_eq!(eval_str(&mut again, "1 + 1"), JsValue::Number(2.0));
     }
 
     /// JS-4・Issue #1111: 同じ specifier の import 宣言が複数あっても、依存は出現順の

@@ -127,9 +127,8 @@ pub(crate) trait ChildEngine {
 
     // ---- ES module（`JS-4`・`REPAIR-3`・Issue #1114。設計 `es-module-design.md` §3）----
     //
-    // 既定実装はすべて「未対応」を返す。モジュール評価を実装したエンジン
-    // （boa・V8 の静的 import）が compile・link・evaluate を上書きする。動的
-    // `import()` の 2 操作は両エンジンとも未対応のままで、成功を装わない。
+    // 既定実装はすべて「未対応」を返す。モジュール評価を実装したエンジンが上書きする。
+    // 動的 `import()` の 2 操作は V8 が実装済み、boa は未対応のままで成功を装わない。
 
     /// ES module を compile し、依存の一覧を返す。
     fn compile_module(
@@ -220,6 +219,18 @@ impl ChildEngine for V8Engine {
         options: &EvaluateOptions,
     ) -> Result<ModuleEvaluation, JsEngineError> {
         V8Engine::evaluate_module(self, root, options)
+    }
+
+    fn take_dynamic_import_requests(&mut self) -> Result<Vec<DynamicImportRequest>, JsEngineError> {
+        V8Engine::take_dynamic_import_requests(self)
+    }
+
+    fn finish_dynamic_import(
+        &mut self,
+        id: DynamicImportId,
+        result: Result<ModuleId, String>,
+    ) -> Result<(), JsEngineError> {
+        V8Engine::finish_dynamic_import(self, id, result)
     }
 }
 
@@ -1099,7 +1110,8 @@ fn classify_evaluation_error(err: &JsEngineError) -> (ErrorKind, String) {
 /// - `COMPILE_MODULE` → `MODULE_COMPILED`
 /// - `LINK_MODULE`・`FINISH_DYNAMIC_IMPORT` → `RESULT(Undefined)`（ack）
 /// - `EVALUATE_MODULE` → `MODULE_RESULT`（評価の直後・応答の前に逆方向 RPC の
-///   fatal を確認する。fatal なら応答せず [`RespondOutcome::NativeCallProtocolViolation`]）
+///   fatal を確認する。fatal なら応答せず [`RespondOutcome::NativeCallProtocolViolation`]。
+///   `FINISH_DYNAMIC_IMPORT` も利用者の継続を走らせるため同じ確認をする）
 /// - `TAKE_DYNAMIC_IMPORTS` → `DYNAMIC_IMPORTS`
 ///
 /// エンジンの失敗は [`classify_evaluation_error`] で `ERROR{kind}` にする
@@ -1165,9 +1177,12 @@ fn handle_module_frame(
         }
         tag::FINISH_DYNAMIC_IMPORT => {
             let (id, result) = frames::decode_finish_dynamic_import(payload)?;
-            engine
-                .finish_dynamic_import(id, result)
-                .and_then(|()| ack_response())
+            let finished = engine.finish_dynamic_import(id, result);
+            // 完了では利用者の `then` が走り、逆方向 RPC の fatal も起きうる。
+            if let Some(fatal) = engine.take_native_call_fatal() {
+                return Ok(RespondOutcome::NativeCallProtocolViolation(fatal));
+            }
+            finished.and_then(|()| ack_response())
         }
         other => return Err(ProtocolError::UnknownTag(other)),
     };
