@@ -43,6 +43,21 @@
 //!   検査する（`JS-6`）
 //! - [`NativeFn`] は本型を動かすプロセスの中で同期実行する。子プロセスでは
 //!   親へ転送するプロキシ関数（`boa_worker`）で、期限は親が掛ける
+//!
+//! # ES module（`JS-4`・`JS-6`・`REPAIR-3`・Issue #1114）
+//!
+//! `compile_module`・`link_module`・`evaluate_module` は静的 import のグラフ
+//! （循環を含む）を評価する。部品・既知の制限は [`module`] のドキュメント参照。
+//! 要点: 動的 `import()`・TLA を含むモジュールは compile が `NotYetImplemented`、
+//! link 時の SyntaxError（存在しない export の import 等）は JS が走っていないため
+//! `EvaluationFailed`（`Rejected` にしない）、評価中に投げた例外は `Rejected`。
+//! モジュール本体が再帰・スタックの上限に当たった場合は `Rejected` に畳まれず
+//! `ResourceLimitExceeded` で返る（実測。classic と同じ。Context は残る）。
+//! トップレベルの `for await` は boa 自身の TLA 判定が見落とすため、compile 時に
+//! 自前の走査で拒否する。`Pending` は TLA を compile 時に拒否しているため通常は
+//! 返らず、`Fulfilled` へ読み替えない。モジュール表は `Context` と同じ寿命（子の再起動で失われる）。
+
+mod module;
 
 use std::cell::RefCell;
 use std::collections::HashSet;
@@ -58,7 +73,15 @@ use boa_engine::{
     Source, js_string,
 };
 
-use crate::engine_trait::{EvaluateOptions, JsEngine, JsEngineError, JsValue, NativeFn};
+use self::module::{
+    BoaModuleLoader, GraphOutcome, ModuleAwareJobExecutor, analyze_module_source,
+    load_link_evaluate,
+};
+use crate::engine_trait::{
+    EvaluateOptions, JsEngine, JsEngineError, JsValue, ModuleEvaluation, ModuleId, ModuleRecord,
+    ModuleRequest, ModuleResolution, NativeFn,
+};
+use crate::worker_protocol::module_frames::MAX_MODULES_PER_WORKER;
 use crate::worker_protocol::{
     MAX_DOM_LIKE_MEMBER_NAME_BYTES, MAX_DOM_LIKE_OBJECT_MEMBERS, MAX_GLOBAL_FUNCTION_NAME_BYTES,
     MAX_NATIVE_CALL_ARGS, MAX_REGISTERED_GLOBAL_FUNCTIONS,
@@ -133,6 +156,13 @@ pub(crate) struct BoaEngine {
     /// モジュールドキュメント参照）。`RuntimeLimitError::LoopIteration` の
     /// 変換経路をテストするためだけに `Some` を指定できる。
     loop_iteration_limit: Option<u64>,
+    /// ES module のローダー（`Context` と共有。ファイル・ネットワークに触れない。
+    /// Issue #1114）。`Context` 生成前から保持し、生成時に必ず設定する。
+    module_loader: Rc<BoaModuleLoader>,
+    /// モジュールのグラフロード用 job だけを捕まえる job 実行器（Issue #1114）。
+    job_executor: Rc<ModuleAwareJobExecutor>,
+    /// 次に払い出す [`ModuleId`] の生値（1 から。`0` は払い出さない）。
+    next_module_id: u32,
 }
 
 impl BoaEngine {
@@ -143,6 +173,9 @@ impl BoaEngine {
             defined_names: HashSet::new(),
             global_function_count: 0,
             loop_iteration_limit: None,
+            module_loader: Rc::new(BoaModuleLoader::new()),
+            job_executor: Rc::new(ModuleAwareJobExecutor::new()),
+            next_module_id: 1,
         }
     }
 
@@ -160,8 +193,13 @@ impl BoaEngine {
     fn context_mut(&mut self) -> Result<&mut Context, JsEngineError> {
         if self.context.is_none() {
             // `Context::default()` は内部で `expect` するため使わない。
+            // 既定のモジュールローダー（`SimpleModuleLoader::new(".")`。cwd 起点の
+            // ファイル読み込み）に落ちないよう、ローダーと job 実行器は必ず設定する
+            // （Issue #1114。`JS-8` の取得は core の `Fetcher` に限る）。
             let mut context = Context::builder()
                 .host_hooks(Rc::new(BoundedBufferHooks))
+                .module_loader(Rc::clone(&self.module_loader))
+                .job_executor(Rc::clone(&self.job_executor))
                 .build()
                 .map_err(|err| {
                     JsEngineError::EngineUnavailable(truncate_message(&format!(
@@ -307,6 +345,103 @@ impl JsEngine for BoaEngine {
         self.defined_names.insert(name.to_string());
         self.global_function_count += 1;
         Ok(())
+    }
+
+    /// 静的 import のモジュールを compile する（`JS-4`・Issue #1114）。
+    ///
+    /// 動的 `import()`・TLA を含むモジュールは `NotYetImplemented`（登録せず id も
+    /// 払い出さない）。ソースは検出用と本体用に 2 回パースする（入力は 1 MiB 以下）。
+    /// `url` は将来の `import.meta.url` 用で、現状は使わずエラーにも含めない。
+    fn compile_module(&mut self, _url: &str, source: &str) -> Result<ModuleRecord, JsEngineError> {
+        if source.len() > MAX_SCRIPT_SOURCE_BYTES {
+            return Err(JsEngineError::EvaluationFailed(format!(
+                "module source exceeds the maximum supported size of {MAX_SCRIPT_SOURCE_BYTES} bytes"
+            )));
+        }
+        if self.module_loader.len() >= MAX_MODULES_PER_WORKER {
+            return Err(JsEngineError::ResourceLimitExceeded(format!(
+                "too many modules (maximum {MAX_MODULES_PER_WORKER})"
+            )));
+        }
+        let requests = analyze_module_source(source)?;
+        let raw_id = self.next_module_id;
+        let next = raw_id.checked_add(1).ok_or_else(|| {
+            JsEngineError::ResourceLimitExceeded("module id space is exhausted".to_string())
+        })?;
+        let context = self.context_mut()?;
+        let module = boa_engine::Module::parse(Source::from_bytes(source), None, context).map_err(
+            |err| {
+                JsEngineError::EvaluationFailed(truncate_message(&format!(
+                    "module syntax error: {}",
+                    error_message(&err, context)
+                )))
+            },
+        )?;
+        self.next_module_id = next;
+        let id = ModuleId::from_raw(raw_id);
+        let record = ModuleRecord::new(
+            id,
+            requests.iter().cloned().map(ModuleRequest::new).collect(),
+        );
+        self.module_loader.insert(id, module, requests);
+        Ok(record)
+    }
+
+    /// `referrer` の依存を link する。不整合は `ModuleResolutionFailed`（固定文言）。
+    fn link_module(
+        &mut self,
+        referrer: ModuleId,
+        resolutions: &[ModuleResolution],
+    ) -> Result<(), JsEngineError> {
+        self.module_loader.link(referrer, resolutions)
+    }
+
+    /// link 済みの `root` をグラフごとロード・link・評価する（`JS-4`・`JS-6`）。
+    ///
+    /// - `timeout` が 0 なら評価せずに `Timeout`、評価後に経過時間が `timeout` 以上なら
+    ///   結果を捨てて `Timeout`（classic と同じ。中断は親の kill）
+    /// - `Rejected` のメッセージが `max_result_bytes` を超えたら `EvaluationFailed`
+    /// - 未 link の依存・未知の `root` は `ModuleResolutionFailed`
+    fn evaluate_module(
+        &mut self,
+        root: ModuleId,
+        options: &EvaluateOptions,
+    ) -> Result<ModuleEvaluation, JsEngineError> {
+        let root_module = self.module_loader.root_module_if_fully_linked(root)?;
+        if options.timeout().is_zero() {
+            return Err(JsEngineError::Timeout(timeout_message(
+                "execution",
+                options.timeout(),
+            )));
+        }
+        let loader = Rc::clone(&self.module_loader);
+        let executor = Rc::clone(&self.job_executor);
+        let context = self.context_mut()?;
+        let started = Instant::now();
+        let outcome = load_link_evaluate(context, &loader, &executor, &root_module);
+        if exceeded_timeout(started.elapsed(), options.timeout()) {
+            return Err(JsEngineError::Timeout(timeout_message(
+                "execution",
+                options.timeout(),
+            )));
+        }
+        match outcome? {
+            GraphOutcome::Fulfilled => Ok(ModuleEvaluation::Fulfilled),
+            GraphOutcome::Pending => Ok(ModuleEvaluation::Pending),
+            GraphOutcome::Rejected(JsEngineError::EvaluationFailed(message)) => {
+                if message.len() > options.max_result_bytes() {
+                    Err(JsEngineError::EvaluationFailed(format!(
+                        "module rejection message of {} bytes exceeds the result size limit \
+                         of {} bytes",
+                        message.len(),
+                        options.max_result_bytes()
+                    )))
+                } else {
+                    Ok(ModuleEvaluation::rejected(message))
+                }
+            }
+            GraphOutcome::Rejected(other) => Err(other),
+        }
     }
 }
 
@@ -974,5 +1109,315 @@ mod tests {
         let e = BoaEngine::new();
         assert!(e.context.is_none());
         drop(e);
+    }
+
+    // ---- ES module（`JS-4`・`JS-6`・`REPAIR-3`・Issue #1114）----
+
+    fn compile(e: &mut BoaEngine, source: &str) -> ModuleId {
+        e.compile_module("https://example.test/m.js", source)
+            .expect("compiles")
+            .id()
+    }
+
+    fn link(e: &mut BoaEngine, from: ModuleId, specifier: &str, to: ModuleId) {
+        e.link_module(from, &[ModuleResolution::new(specifier.to_string(), to)])
+            .expect("links");
+    }
+
+    fn run(e: &mut BoaEngine, root: ModuleId) -> Result<ModuleEvaluation, JsEngineError> {
+        e.evaluate_module(root, &EvaluateOptions::default())
+    }
+
+    fn global_string(e: &mut BoaEngine, name: &str) -> JsValue {
+        eval(e, &format!("String(globalThis.{name})")).unwrap()
+    }
+
+    /// JS-4: 末尾に `export {...}` を持つ単一モジュールが評価され、副作用が
+    /// グローバルに反映される。
+    #[test]
+    fn js_4_boa_evaluates_a_single_module_with_exports() {
+        let mut e = BoaEngine::new();
+        let id = compile(
+            &mut e,
+            "const answer = 42; globalThis.answer = answer; export { answer };",
+        );
+        assert_eq!(id, ModuleId::from_raw(1));
+        assert_eq!(run(&mut e, id).unwrap(), ModuleEvaluation::Fulfilled);
+        assert_eq!(
+            eval(&mut e, "globalThis.answer").unwrap(),
+            JsValue::Number(42.0)
+        );
+    }
+
+    /// JS-4: 3 段の静的グラフ（a -> b -> c）は依存が先に評価される。
+    #[test]
+    fn js_4_boa_evaluates_a_three_level_static_graph_in_dependency_order() {
+        let mut e = BoaEngine::new();
+        let c = compile(
+            &mut e,
+            "globalThis.log = (globalThis.log || '') + 'c'; export const c = 3;",
+        );
+        let b = compile(
+            &mut e,
+            "import { c } from './c.js'; globalThis.log += ',b'; export const b = c + 20;",
+        );
+        let a = compile(
+            &mut e,
+            "import { b } from './b.js'; globalThis.log += ',a'; globalThis.sum = b + 100;",
+        );
+        link(&mut e, b, "./c.js", c);
+        link(&mut e, a, "./b.js", b);
+        assert_eq!(run(&mut e, a).unwrap(), ModuleEvaluation::Fulfilled);
+        assert_eq!(
+            global_string(&mut e, "log"),
+            JsValue::String("c,b,a".into())
+        );
+        assert_eq!(
+            eval(&mut e, "globalThis.sum").unwrap(),
+            JsValue::Number(123.0)
+        );
+    }
+
+    /// JS-4: 循環 import（a <-> b）も評価できる。
+    #[test]
+    fn js_4_boa_evaluates_a_cyclic_graph() {
+        let mut e = BoaEngine::new();
+        let a = compile(
+            &mut e,
+            "import { fromB } from './b.js'; export function fromA() { return 'A'; } \
+             globalThis.cycle = fromB();",
+        );
+        let b = compile(
+            &mut e,
+            "import { fromA } from './a.js'; export function fromB() { return 'B' + fromA(); }",
+        );
+        link(&mut e, a, "./b.js", b);
+        link(&mut e, b, "./a.js", a);
+        assert_eq!(run(&mut e, a).unwrap(), ModuleEvaluation::Fulfilled);
+        assert_eq!(global_string(&mut e, "cycle"), JsValue::String("BA".into()));
+    }
+
+    /// JS-4: トップレベルの `this` は `undefined`、strict mode で動く。
+    #[test]
+    fn js_4_boa_module_top_level_this_is_undefined_and_strict() {
+        let mut e = BoaEngine::new();
+        let id = compile(
+            &mut e,
+            "globalThis.topThis = typeof this; \
+             globalThis.fnThis = (function () { return typeof this; })(); export {};",
+        );
+        assert_eq!(run(&mut e, id).unwrap(), ModuleEvaluation::Fulfilled);
+        assert_eq!(
+            global_string(&mut e, "topThis"),
+            JsValue::String("undefined".into())
+        );
+        assert_eq!(
+            global_string(&mut e, "fnThis"),
+            JsValue::String("undefined".into())
+        );
+
+        let sloppy = compile(&mut e, "undeclaredVariable = 1; export {};");
+        match run(&mut e, sloppy).unwrap() {
+            ModuleEvaluation::Rejected { message } => {
+                assert!(message.contains("undeclaredVariable"), "{message}");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        // `with` 文は strict では構文エラー（compile 時）。
+        assert!(matches!(
+            e.compile_module("https://example.test/w.js", "with ({}) {} export {};"),
+            Err(JsEngineError::EvaluationFailed(_))
+        ));
+    }
+
+    /// JS-4・REPAIR-3: TLA と動的 `import()` は具体的な未対応エラーで、モジュールは
+    /// 登録されず、後続の compile は続けられる（id は消費しない）。
+    #[test]
+    fn js_4_boa_rejects_tla_and_dynamic_import_at_compile_time() {
+        let mut e = BoaEngine::new();
+        for (source, needle) in [
+            ("await 1; export {};", "top-level await"),
+            ("for await (const x of []) {} export {};", "top-level await"),
+            ("import('./x.js'); export {};", "dynamic import()"),
+            (
+                "export function f() { return import('./x.js'); }",
+                "dynamic import()",
+            ),
+        ] {
+            match e.compile_module("https://example.test/m.js", source) {
+                Err(JsEngineError::NotYetImplemented(message)) => {
+                    assert!(message.contains(needle), "{source}: {message}");
+                }
+                other => panic!("{source}: unexpected {other:?}"),
+            }
+        }
+        // async 関数の内側の await は TLA ではない。
+        let ok = compile(&mut e, "export async function f() { await 1; }");
+        assert_eq!(ok, ModuleId::from_raw(1));
+    }
+
+    /// JS-4: 未 link の依存・未知の id・不整合な link は `ModuleResolutionFailed`。
+    #[test]
+    fn js_4_boa_reports_unresolved_and_unknown_modules_as_resolution_failures() {
+        let mut e = BoaEngine::new();
+        let dep = compile(&mut e, "export const v = 1;");
+        let root = compile(&mut e, "import { v } from './dep.js'; globalThis.v = v;");
+        // 未 link のまま評価する。
+        match run(&mut e, root) {
+            Err(JsEngineError::ModuleResolutionFailed(message)) => {
+                assert_eq!(message, "module graph has an unresolved specifier");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        // 未知の root。
+        assert!(matches!(
+            run(&mut e, ModuleId::from_raw(99)),
+            Err(JsEngineError::ModuleResolutionFailed(_))
+        ));
+        // 未知の referrer / target / requests に無い specifier。
+        let resolution = ModuleResolution::new("./dep.js".to_string(), dep);
+        assert!(matches!(
+            e.link_module(ModuleId::from_raw(99), std::slice::from_ref(&resolution)),
+            Err(JsEngineError::ModuleResolutionFailed(_))
+        ));
+        assert!(matches!(
+            e.link_module(
+                root,
+                &[ModuleResolution::new(
+                    "./dep.js".to_string(),
+                    ModuleId::from_raw(99)
+                )]
+            ),
+            Err(JsEngineError::ModuleResolutionFailed(_))
+        ));
+        assert!(matches!(
+            e.link_module(
+                root,
+                &[ModuleResolution::new("./other.js".to_string(), dep)]
+            ),
+            Err(JsEngineError::ModuleResolutionFailed(_))
+        ));
+        // 正しく link し、同じ対象での再 link は冪等、別の対象への張り替えは拒否。
+        e.link_module(root, std::slice::from_ref(&resolution))
+            .unwrap();
+        e.link_module(root, std::slice::from_ref(&resolution))
+            .unwrap();
+        let other = compile(&mut e, "export const v = 2;");
+        match e.link_module(
+            root,
+            &[ModuleResolution::new("./dep.js".to_string(), other)],
+        ) {
+            Err(JsEngineError::ModuleResolutionFailed(message)) => {
+                assert_eq!(message, "specifier is already linked to a different module");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        assert_eq!(run(&mut e, root).unwrap(), ModuleEvaluation::Fulfilled);
+        assert_eq!(eval(&mut e, "globalThis.v").unwrap(), JsValue::Number(1.0));
+    }
+
+    /// JS-4: link 時の SyntaxError（存在しない export の import）は JS が走って
+    /// いないため `EvaluationFailed`。評価中の throw は `Rejected`。
+    #[test]
+    fn js_4_boa_distinguishes_link_errors_from_evaluation_rejections() {
+        let mut e = BoaEngine::new();
+        let dep = compile(&mut e, "export const present = 1;");
+        let bad = compile(
+            &mut e,
+            "import { missing } from './dep.js'; export { missing };",
+        );
+        link(&mut e, bad, "./dep.js", dep);
+        assert!(matches!(
+            run(&mut e, bad),
+            Err(JsEngineError::EvaluationFailed(_))
+        ));
+
+        let thrower = compile(&mut e, "throw new Error('module boom');");
+        match run(&mut e, thrower).unwrap() {
+            ModuleEvaluation::Rejected { message } => assert_eq!(message, "module boom"),
+            other => panic!("unexpected {other:?}"),
+        }
+        // 評価後も classic 評価は使える。
+        assert_eq!(eval(&mut e, "1 + 1").unwrap(), JsValue::Number(2.0));
+    }
+
+    /// JS-6: 上限（timeout 0・依存数・ソースサイズ・モジュール数）は fail-closed。
+    #[test]
+    fn js_6_boa_module_limits_are_enforced() {
+        let mut e = BoaEngine::new();
+        let id = compile(&mut e, "globalThis.ran = true; export {};");
+        let zero = EvaluateOptions::default().with_timeout(Duration::ZERO);
+        assert!(matches!(
+            e.evaluate_module(id, &zero),
+            Err(JsEngineError::Timeout(_))
+        ));
+        assert_eq!(
+            eval(&mut e, "typeof globalThis.ran").unwrap(),
+            JsValue::String("undefined".into())
+        );
+
+        let many: String = (0..=256)
+            .map(|i| format!("import './m{i}.js';\n"))
+            .collect();
+        assert!(matches!(
+            e.compile_module("https://example.test/m.js", &many),
+            Err(JsEngineError::ResourceLimitExceeded(_))
+        ));
+        let huge = " ".repeat(MAX_SCRIPT_SOURCE_BYTES + 1);
+        assert!(matches!(
+            e.compile_module("https://example.test/m.js", &huge),
+            Err(JsEngineError::EvaluationFailed(_))
+        ));
+        for _ in 1..MAX_MODULES_PER_WORKER {
+            e.compile_module("https://example.test/m.js", "export {};")
+                .unwrap();
+        }
+        assert!(matches!(
+            e.compile_module("https://example.test/m.js", "export {};"),
+            Err(JsEngineError::ResourceLimitExceeded(_))
+        ));
+    }
+
+    /// REPAIR-3: job はモジュールロード用だけを走らせる。モジュール本体が積んだ
+    /// PromiseJob は走らない（ページ全体の drain は未対応）。
+    #[test]
+    fn js_4_boa_module_promise_jobs_are_not_drained() {
+        let mut e = BoaEngine::new();
+        let id = compile(
+            &mut e,
+            "globalThis.after = 'no'; \
+             Promise.resolve().then(() => { globalThis.after = 'yes'; }); export {};",
+        );
+        assert_eq!(run(&mut e, id).unwrap(), ModuleEvaluation::Fulfilled);
+        assert_eq!(global_string(&mut e, "after"), JsValue::String("no".into()));
+    }
+
+    /// REPAIR-3: `import.meta.url` は未設定（空オブジェクト）。
+    #[test]
+    fn js_4_boa_import_meta_url_is_not_provided() {
+        let mut e = BoaEngine::new();
+        let id = compile(
+            &mut e,
+            "globalThis.metaUrl = String(import.meta.url); export {};",
+        );
+        assert_eq!(run(&mut e, id).unwrap(), ModuleEvaluation::Fulfilled);
+        assert_eq!(
+            global_string(&mut e, "metaUrl"),
+            JsValue::String("undefined".into())
+        );
+    }
+
+    /// JS-1: 再帰の上限に達するモジュールの結果種別を固定する。
+    #[test]
+    fn js_1_boa_module_recursion_limit_result_is_pinned() {
+        let mut e = BoaEngine::new();
+        let id = compile(&mut e, "function f() { return f(); } f(); export {};");
+        let result = run(&mut e, id);
+        assert!(
+            matches!(result, Err(JsEngineError::ResourceLimitExceeded(_))),
+            "{result:?}"
+        );
+        // 上限に達した後もエンジンは使える。
+        assert_eq!(eval(&mut e, "1 + 1").unwrap(), JsValue::Number(2.0));
     }
 }

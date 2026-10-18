@@ -22,9 +22,12 @@ use std::process::ExitCode;
 #[cfg(not(target_os = "macos"))]
 use std::time::{Duration, Instant};
 
-use fandhe_browser_js::{EngineKind, create_engine};
 #[cfg(not(target_os = "macos"))]
-use fandhe_browser_js::{EvaluateOptions, JsEngine, JsEngineError, JsValue};
+use fandhe_browser_js::{
+    DynamicImportId, EvaluateOptions, JsEngine, JsEngineError, JsValue, ModuleEvaluation, ModuleId,
+    ModuleResolution,
+};
+use fandhe_browser_js::{EngineKind, create_engine};
 
 /// 親の評価期限（既定 options では `timeout` 2 秒 + 猶予 1 秒 = 3 秒）に猶予を足した
 /// 上限。これ以内に呼び出しが戻らなければ実時間の上限が効いていない。
@@ -290,44 +293,176 @@ fn js_1_boa_is_disabled_on_macos() {
     }
 }
 
-/// JS-4・REPAIR-3・Issue #1110: boa の子でもモジュール API 5 メソッドの新フレームが
-/// 検証され、成功を装わず `NotYetImplemented` が返ること（子の未対応応答は
-/// V8 と共通のフレームループにある）。classic 評価と Context は子と共に残る。
+/// 3 モジュール（循環を含む）をコンパイル・link して返す。
 #[cfg(not(target_os = "macos"))]
-fn js_4_boa_module_frames_return_not_yet_implemented() {
-    use fandhe_browser_js::{DynamicImportId, ModuleId};
+fn compile_cyclic_graph(engine: &mut dyn JsEngine) -> ModuleId {
+    let root = engine
+        .compile_module(
+            "https://example.test/root.js",
+            "import { fromA } from './a.js'; globalThis.moduleLog = fromA(); export {};",
+        )
+        .expect("root compiles");
+    let a = engine
+        .compile_module(
+            "https://example.test/a.js",
+            "import { fromB } from './b.js'; export function fromA() { return 'a>' + fromB(); }",
+        )
+        .expect("a compiles");
+    let b = engine
+        .compile_module(
+            "https://example.test/b.js",
+            "import { fromA } from './a.js'; export function fromB() { return typeof fromA; }",
+        )
+        .expect("b compiles");
+    assert_eq!(root.requests()[0].specifier(), "./a.js");
+    engine
+        .link_module(
+            root.id(),
+            &[ModuleResolution::new("./a.js".to_string(), a.id())],
+        )
+        .expect("root links");
+    engine
+        .link_module(
+            a.id(),
+            &[ModuleResolution::new("./b.js".to_string(), b.id())],
+        )
+        .expect("a links");
+    engine
+        .link_module(
+            b.id(),
+            &[ModuleResolution::new("./a.js".to_string(), a.id())],
+        )
+        .expect("b links");
+    root.id()
+}
 
+/// JS-4・Issue #1114: 静的 import のグラフ（循環を含む）が子プロセス境界を越えて
+/// 評価され、副作用が classic 評価から具体値で読める。
+#[cfg(not(target_os = "macos"))]
+fn js_4_boa_static_module_graph_crosses_the_process_boundary() {
     let mut engine = boa_engine();
-    let options = EvaluateOptions::default();
+    let root = compile_cyclic_graph(&mut *engine);
+    assert_eq!(
+        engine
+            .evaluate_module(root, &EvaluateOptions::default())
+            .expect("evaluates"),
+        ModuleEvaluation::Fulfilled
+    );
+    assert_eq!(
+        eval(&mut *engine, "globalThis.moduleLog").expect("eval"),
+        JsValue::String("a>function".to_string())
+    );
+}
+
+/// JS-4・Issue #1114: トップレベルの `this` は `undefined`、strict mode で動き、
+/// 評価中の throw は `Rejected` として往復する。
+#[cfg(not(target_os = "macos"))]
+fn js_4_boa_module_this_is_undefined_and_strict() {
+    let mut engine = boa_engine();
+    let record = engine
+        .compile_module(
+            "https://example.test/this.js",
+            "globalThis.topThis = typeof this; export {};",
+        )
+        .expect("compiles");
+    assert_eq!(
+        engine
+            .evaluate_module(record.id(), &EvaluateOptions::default())
+            .expect("evaluates"),
+        ModuleEvaluation::Fulfilled
+    );
+    assert_eq!(
+        eval(&mut *engine, "globalThis.topThis").expect("eval"),
+        JsValue::String("undefined".to_string())
+    );
+
+    let sloppy = engine
+        .compile_module("https://example.test/s.js", "undeclared = 1; export {};")
+        .expect("compiles");
+    match engine
+        .evaluate_module(sloppy.id(), &EvaluateOptions::default())
+        .expect("evaluates")
+    {
+        ModuleEvaluation::Rejected { message, .. } => {
+            assert!(message.contains("undeclared"), "{message}");
+        }
+        other => panic!("expected Rejected, got {other:?}"),
+    }
+}
+
+/// JS-4・REPAIR-3・Issue #1114: 動的 `import()`・TLA は compile が
+/// `NotYetImplemented`、動的 import 用の 2 操作も未対応のままで、子は生き続ける。
+#[cfg(not(target_os = "macos"))]
+fn js_4_boa_dynamic_import_and_tla_return_not_yet_implemented() {
+    let mut engine = boa_engine();
     eval(&mut *engine, "globalThis.kept = 7").expect("eval");
 
-    let results = [
-        engine
-            .compile_module("https://example.test/a.js", "export const a = 1;")
-            .map(|_| ()),
-        engine.link_module(ModuleId::from_raw(1), &[]),
-        engine
-            .evaluate_module(ModuleId::from_raw(1), &options)
-            .map(|_| ()),
-        engine.take_dynamic_import_requests().map(|_| ()),
-        engine.finish_dynamic_import(DynamicImportId::from_raw(1), Err("failed".to_string())),
-    ];
-    for (index, result) in results.iter().enumerate() {
-        match result {
+    for (source, needle) in [
+        ("await Promise.resolve(1); export {};", "top-level await"),
+        ("import('./x.js'); export {};", "dynamic import()"),
+    ] {
+        match engine.compile_module("https://example.test/a.js", source) {
             Err(JsEngineError::NotYetImplemented(msg)) => {
-                assert!(
-                    !msg.is_empty(),
-                    "operation {index} returned an empty message"
-                )
+                assert!(msg.contains(needle), "{source}: {msg}");
             }
-            other => panic!("operation {index}: expected NotYetImplemented, got: {other:?}"),
+            other => panic!("{source}: expected NotYetImplemented, got {other:?}"),
         }
+    }
+    match engine.take_dynamic_import_requests() {
+        Err(JsEngineError::NotYetImplemented(msg)) => {
+            assert!(msg.starts_with("take_dynamic_import_requests:"), "{msg}");
+        }
+        other => panic!("expected NotYetImplemented, got {other:?}"),
+    }
+    match engine.finish_dynamic_import(DynamicImportId::from_raw(1), Err("failed".to_string())) {
+        Err(JsEngineError::NotYetImplemented(msg)) => {
+            assert!(msg.starts_with("finish_dynamic_import:"), "{msg}");
+        }
+        other => panic!("expected NotYetImplemented, got {other:?}"),
     }
 
     // 子は破棄されていない（永続 Context の変数が残っている）。
     assert_eq!(
         eval(&mut *engine, "kept").expect("eval"),
         JsValue::Number(7.0)
+    );
+}
+
+/// JS-4・Issue #1114: 未 link の specifier や存在しない `ModuleId` は
+/// `ModuleResolutionFailed` で、子は生き続ける。
+#[cfg(not(target_os = "macos"))]
+fn js_4_boa_unlinked_specifier_and_unknown_module_id_are_errors() {
+    let mut engine = boa_engine();
+    eval(&mut *engine, "globalThis.kept = 9").expect("eval");
+    let options = EvaluateOptions::default();
+    let root = engine
+        .compile_module(
+            "https://example.test/root.js",
+            "import './dep.js'; globalThis.ran = true;",
+        )
+        .expect("compiles");
+
+    match engine.evaluate_module(root.id(), &options) {
+        Err(JsEngineError::ModuleResolutionFailed(msg)) => {
+            assert_eq!(msg, "module graph has an unresolved specifier");
+        }
+        other => panic!("expected ModuleResolutionFailed, got {other:?}"),
+    }
+    assert!(matches!(
+        engine.evaluate_module(ModuleId::from_raw(999), &options),
+        Err(JsEngineError::ModuleResolutionFailed(_))
+    ));
+    assert!(matches!(
+        engine.link_module(ModuleId::from_raw(999), &[]),
+        Err(JsEngineError::ModuleResolutionFailed(_))
+    ));
+    assert_eq!(
+        eval(&mut *engine, "typeof globalThis.ran").expect("eval"),
+        JsValue::String("undefined".to_string())
+    );
+    assert_eq!(
+        eval(&mut *engine, "kept").expect("eval"),
+        JsValue::Number(9.0)
     );
 }
 
@@ -347,8 +482,14 @@ fn main() -> ExitCode {
     {
         eprintln!("case: js_1_boa_evaluates_in_a_child_process");
         js_1_boa_evaluates_in_a_child_process();
-        eprintln!("case: js_4_boa_module_frames_return_not_yet_implemented");
-        js_4_boa_module_frames_return_not_yet_implemented();
+        eprintln!("case: js_4_boa_static_module_graph_crosses_the_process_boundary");
+        js_4_boa_static_module_graph_crosses_the_process_boundary();
+        eprintln!("case: js_4_boa_module_this_is_undefined_and_strict");
+        js_4_boa_module_this_is_undefined_and_strict();
+        eprintln!("case: js_4_boa_dynamic_import_and_tla_return_not_yet_implemented");
+        js_4_boa_dynamic_import_and_tla_return_not_yet_implemented();
+        eprintln!("case: js_4_boa_unlinked_specifier_and_unknown_module_id_are_errors");
+        js_4_boa_unlinked_specifier_and_unknown_module_id_are_errors();
         eprintln!("case: js_1_boa_native_calls_cross_the_process_boundary");
         js_1_boa_native_calls_cross_the_process_boundary();
         eprintln!("case: js_1_boa_wall_clock_limit_kills_the_child_and_recovers");

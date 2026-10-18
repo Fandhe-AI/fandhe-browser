@@ -4,8 +4,9 @@
 //!
 //! 呼び出し元: 親側の [`super::super::process_engine`]（`JsEngine` のモジュール
 //! 評価 API 5 メソッドを新フレームの送受信へ対応づける）と、子側の
-//! [`super::super::worker`]（新 tag を検証してから「未対応」の `ERROR` を返す。
-//! 評価そのものは後続 issue）。`v8` crate には依存しない（テストも feature
+//! [`super::super::worker`]（新 tag を検証して `ChildEngine` へ dispatch する。
+//! boa は静的 import のグラフを評価し、V8・動的 import・TLA は「未対応」の
+//! `ERROR` を返す）。`v8` crate には依存しない（テストも feature
 //! なしで動く）。
 //!
 //! # ワイヤ形式（プロトコル v6。整数はすべて LE）
@@ -326,13 +327,6 @@ pub(crate) fn decode_compile_module(payload: &[u8]) -> Result<CompileModuleReque
 // ---- MODULE_COMPILED ----
 
 /// `MODULE_COMPILED` のペイロードを組み立てる（子 → 親）。
-#[cfg_attr(
-    not(test),
-    allow(
-        dead_code,
-        reason = "子側の応答生成は後続 issue（設計 §9 の 3〜6）で配線する（REPAIR-3）"
-    )
-)]
 pub(crate) fn encode_module_compiled(
     id: ModuleId,
     requests: &[ModuleRequest],
@@ -425,13 +419,6 @@ pub(crate) fn decode_evaluate_module(
 // ---- MODULE_RESULT ----
 
 /// `MODULE_RESULT` のペイロードを組み立てる（子 → 親）。
-#[cfg_attr(
-    not(test),
-    allow(
-        dead_code,
-        reason = "子側の応答生成は後続 issue（設計 §9 の 3〜6）で配線する（REPAIR-3）"
-    )
-)]
 pub(crate) fn encode_module_result(
     evaluation: &ModuleEvaluation,
 ) -> Result<Vec<u8>, ProtocolError> {
@@ -492,13 +479,6 @@ pub(crate) fn decode_take_dynamic_imports(payload: &[u8]) -> Result<(), Protocol
 // ---- DYNAMIC_IMPORTS ----
 
 /// `DYNAMIC_IMPORTS` のペイロードを組み立てる（子 → 親）。
-#[cfg_attr(
-    not(test),
-    allow(
-        dead_code,
-        reason = "子側の応答生成は後続 issue（設計 §9 の 3〜6）で配線する（REPAIR-3）"
-    )
-)]
 pub(crate) fn encode_dynamic_imports(
     requests: &[DynamicImportRequest],
 ) -> Result<Vec<u8>, ProtocolError> {

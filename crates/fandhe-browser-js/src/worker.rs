@@ -66,7 +66,10 @@ use std::io::Read;
 use std::io::{self, Write};
 use std::process::ExitCode;
 
-use super::engine_trait::{EngineKind, EvaluateOptions, JsEngineError, JsValue};
+use super::engine_trait::{
+    DynamicImportId, DynamicImportRequest, EngineKind, EvaluateOptions, JsEngineError, JsValue,
+    ModuleEvaluation, ModuleId, ModuleRecord, ModuleResolution, module_api_not_yet_implemented,
+};
 #[cfg(any(feature = "js-v8", all(feature = "js-boa", not(target_os = "macos"))))]
 use super::shared::{NativeCallFailure, NativeCallTransport};
 #[cfg(feature = "js-v8")]
@@ -121,6 +124,54 @@ pub(crate) trait ChildEngine {
         &mut self,
         binding: &worker_protocol::DomLikeObjectBinding,
     ) -> Result<(), JsEngineError>;
+
+    // ---- ES module（`JS-4`・`REPAIR-3`・Issue #1114。設計 `es-module-design.md` §3）----
+    //
+    // 既定実装はすべて「未対応」を返す。モジュール評価を実装したエンジン
+    // （現状は boa の静的 import のみ）だけが上書きする。V8 は後続 issue
+    // （設計 §9 の 3〜5）まで既定実装のままで、成功を装わない。
+
+    /// ES module を compile し、依存の一覧を返す。
+    fn compile_module(
+        &mut self,
+        _request: &worker_protocol::module_frames::CompileModuleRequest,
+    ) -> Result<ModuleRecord, JsEngineError> {
+        Err(module_api_not_yet_implemented("compile_module"))
+    }
+
+    /// `referrer` の依存を対応表どおりに link する。
+    fn link_module(
+        &mut self,
+        _referrer: ModuleId,
+        _resolutions: &[ModuleResolution],
+    ) -> Result<(), JsEngineError> {
+        Err(module_api_not_yet_implemented("link_module"))
+    }
+
+    /// link 済みの `root` を評価する。
+    fn evaluate_module(
+        &mut self,
+        _root: ModuleId,
+        _options: &EvaluateOptions,
+    ) -> Result<ModuleEvaluation, JsEngineError> {
+        Err(module_api_not_yet_implemented("evaluate_module"))
+    }
+
+    /// 保留中の動的 `import()` を取り出す。
+    fn take_dynamic_import_requests(&mut self) -> Result<Vec<DynamicImportRequest>, JsEngineError> {
+        Err(module_api_not_yet_implemented(
+            "take_dynamic_import_requests",
+        ))
+    }
+
+    /// 動的 `import()` を完了させる。
+    fn finish_dynamic_import(
+        &mut self,
+        _id: DynamicImportId,
+        _result: Result<ModuleId, String>,
+    ) -> Result<(), JsEngineError> {
+        Err(module_api_not_yet_implemented("finish_dynamic_import"))
+    }
 }
 
 #[cfg(feature = "js-v8")]
@@ -681,18 +732,31 @@ pub(crate) fn worker_main(marker_value: &str) -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             }
-            // JS-4・REPAIR-3・Issue #1110: ES module 用フレーム。ペイロードは
-            // 検証するが評価は後続 issue で実装するため、成功を装わず
-            // `ERROR{NotYetImplemented}` を返す（V8・boa 共通）。デコード失敗
+            // JS-4・REPAIR-3・Issue #1110・#1114: ES module 用フレーム。ペイロードを
+            // 検証してエンジンへ dispatch する。エンジンが未対応（V8・動的 import・
+            // TLA）なら成功を装わず `ERROR{NotYetImplemented}` を返す。デコード失敗
             // （プロトコル違反）は他の登録系と同じく終了する。
             tag::COMPILE_MODULE
             | tag::LINK_MODULE
             | tag::EVALUATE_MODULE
             | tag::TAKE_DYNAMIC_IMPORTS
             | tag::FINISH_DYNAMIC_IMPORT => {
-                if let Err(err) = handle_module_frame(frame_tag, &payload, &mut stdout) {
-                    eprintln!("fandhe-browser-js worker: failed to handle a module frame: {err}");
-                    return ExitCode::FAILURE;
+                match handle_module_frame(engine.as_mut(), frame_tag, &payload, &mut stdout) {
+                    Ok(RespondOutcome::Responded) => {}
+                    Ok(RespondOutcome::NativeCallProtocolViolation(message)) => {
+                        // モジュール本体から呼んだ逆方向 RPC が fatal で終わった。
+                        // `EVALUATE` と同じく応答を送らず終了する。
+                        eprintln!(
+                            "fandhe-browser-js worker: native call protocol violation: {message}"
+                        );
+                        return ExitCode::FAILURE;
+                    }
+                    Err(err) => {
+                        eprintln!(
+                            "fandhe-browser-js worker: failed to handle a module frame: {err}"
+                        );
+                        return ExitCode::FAILURE;
+                    }
                 }
             }
             tag::SHUTDOWN => return ExitCode::SUCCESS,
@@ -1004,36 +1068,104 @@ fn classify_evaluation_error(err: &JsEngineError) -> (ErrorKind, String) {
     }
 }
 
-/// 親 → 子の ES module 用フレーム 1 件を検証し、「未対応」の `ERROR` を返す
-/// （`JS-4`・`REPAIR-3`・Issue #1110）。
+/// 親 → 子の ES module 用フレーム 1 件を検証し、エンジンへ dispatch して
+/// 応答を書き返す（`JS-4`・`REPAIR-3`・Issue #1110・#1114）。
 ///
-/// 呼び出し元: [`worker_main`] のフレームループ。モジュールの compile・link・
-/// 評価・動的 import は後続 issue（設計 §9 の 3〜6）で `ChildEngine` に足すまで
-/// 未実装のため、ペイロードの検証（上限・UTF-8・重複）だけ行い成功を装わない。
-/// `Err` はデコード失敗（プロトコル違反）または応答送信の I/O 失敗で、
+/// 呼び出し元: [`worker_main`] のフレームループ。応答は次のとおり。
+///
+/// - `COMPILE_MODULE` → `MODULE_COMPILED`
+/// - `LINK_MODULE`・`FINISH_DYNAMIC_IMPORT` → `RESULT(Undefined)`（ack）
+/// - `EVALUATE_MODULE` → `MODULE_RESULT`（評価の直後・応答の前に逆方向 RPC の
+///   fatal を確認する。fatal なら応答せず [`RespondOutcome::NativeCallProtocolViolation`]）
+/// - `TAKE_DYNAMIC_IMPORTS` → `DYNAMIC_IMPORTS`
+///
+/// エンジンの失敗は [`classify_evaluation_error`] で `ERROR{kind}` にする
+/// （未対応は `NotYetImplemented`）。子は生き続ける。応答のエンコードが
+/// 失敗した場合（エンジン側の検査漏れ）も `ERROR` を返し、プロトコル違反としては
+/// 扱わない。`Err` はデコード失敗（プロトコル違反）または応答送信の I/O 失敗で、
 /// 呼び出し元が子を終了する。
 fn handle_module_frame(
+    engine: &mut dyn ChildEngine,
     frame_tag: u8,
     payload: &[u8],
     stdout: &mut impl Write,
-) -> Result<(), ProtocolError> {
+) -> Result<RespondOutcome, ProtocolError> {
     use worker_protocol::module_frames as frames;
-    let operation = match frame_tag {
-        tag::COMPILE_MODULE => frames::decode_compile_module(payload).map(|_| "compile_module"),
-        tag::LINK_MODULE => frames::decode_link_module(payload).map(|_| "link_module"),
-        tag::EVALUATE_MODULE => frames::decode_evaluate_module(payload).map(|_| "evaluate_module"),
+    // 応答ペイロードの組み立てまでを `Result<(u8, Vec<u8>), JsEngineError>` に
+    // 揃え、失敗の送信を 1 か所にまとめる。
+    let response: Result<(u8, Vec<u8>), JsEngineError> = match frame_tag {
+        tag::COMPILE_MODULE => {
+            let request = frames::decode_compile_module(payload)?;
+            engine.compile_module(&request).and_then(|record| {
+                frames::encode_module_compiled(record.id(), record.requests())
+                    .map(|body| (tag::MODULE_COMPILED, body))
+                    .map_err(|err| {
+                        JsEngineError::EvaluationFailed(format!(
+                            "compile_module: the compiled module cannot be sent: {err}"
+                        ))
+                    })
+            })
+        }
+        tag::LINK_MODULE => {
+            let (referrer, resolutions) = frames::decode_link_module(payload)?;
+            engine
+                .link_module(referrer, &resolutions)
+                .and_then(|()| ack_response())
+        }
+        tag::EVALUATE_MODULE => {
+            let (root, options) = frames::decode_evaluate_module(payload)?;
+            let evaluation = engine.evaluate_module(root, &options);
+            if let Some(fatal) = engine.take_native_call_fatal() {
+                return Ok(RespondOutcome::NativeCallProtocolViolation(fatal));
+            }
+            evaluation.and_then(|evaluation| {
+                frames::encode_module_result(&evaluation)
+                    .map(|body| (tag::MODULE_RESULT, body))
+                    .map_err(|err| {
+                        JsEngineError::EvaluationFailed(format!(
+                            "evaluate_module: the result cannot be sent: {err}"
+                        ))
+                    })
+            })
+        }
         tag::TAKE_DYNAMIC_IMPORTS => {
-            frames::decode_take_dynamic_imports(payload).map(|()| "take_dynamic_import_requests")
+            frames::decode_take_dynamic_imports(payload)?;
+            engine.take_dynamic_import_requests().and_then(|requests| {
+                frames::encode_dynamic_imports(&requests)
+                    .map(|body| (tag::DYNAMIC_IMPORTS, body))
+                    .map_err(|err| {
+                        JsEngineError::EvaluationFailed(format!(
+                            "take_dynamic_import_requests: the requests cannot be sent: {err}"
+                        ))
+                    })
+            })
         }
         tag::FINISH_DYNAMIC_IMPORT => {
-            frames::decode_finish_dynamic_import(payload).map(|_| "finish_dynamic_import")
+            let (id, result) = frames::decode_finish_dynamic_import(payload)?;
+            engine
+                .finish_dynamic_import(id, result)
+                .and_then(|()| ack_response())
         }
-        other => Err(ProtocolError::UnknownTag(other)),
-    }?;
-    let err = super::engine_trait::module_api_not_yet_implemented(operation);
-    let (kind, message) = classify_evaluation_error(&err);
-    let body = worker_protocol::encode_error(kind, &message);
-    send_frame(stdout, tag::ERROR, &body)
+        other => return Err(ProtocolError::UnknownTag(other)),
+    };
+    match response {
+        Ok((response_tag, body)) => send_frame(stdout, response_tag, &body)?,
+        Err(err) => {
+            let (kind, message) = classify_evaluation_error(&err);
+            let body = worker_protocol::encode_error(kind, &message);
+            send_frame(stdout, tag::ERROR, &body)?;
+        }
+    }
+    Ok(RespondOutcome::Responded)
+}
+
+/// `RESULT(Undefined)` の ack 応答（登録系フレームと同じ表現）を組み立てる。
+fn ack_response() -> Result<(u8, Vec<u8>), JsEngineError> {
+    let mut body = Vec::new();
+    worker_protocol::encode_js_value(&JsValue::Undefined, &mut body).map_err(|err| {
+        JsEngineError::EvaluationFailed(format!("the acknowledgement cannot be encoded: {err}"))
+    })?;
+    Ok((tag::RESULT, body))
 }
 
 /// フレームを書き込んで即座に `flush` する。子・親どちらも stdio は
@@ -1230,10 +1362,106 @@ mod tests {
             .expect("one frame must have been written")
     }
 
-    /// JS-4・REPAIR-3・Issue #1110: 子は新 tag を検証したうえで
+    /// モジュール API を一切実装しない偽エンジン（`ChildEngine` の既定実装 =
+    /// 「未対応」の確認用）。`fatal` を立てると EVALUATE 後の fatal 経路になる。
+    struct DefaultModuleEngine {
+        fatal: Option<String>,
+    }
+
+    impl ChildEngine for DefaultModuleEngine {
+        fn evaluate_script(
+            &mut self,
+            _script: &str,
+            _options: &EvaluateOptions,
+        ) -> Result<JsValue, JsEngineError> {
+            Ok(JsValue::Undefined)
+        }
+        fn take_native_call_fatal(&mut self) -> Option<String> {
+            self.fatal.take()
+        }
+        fn install_native_proxy_global(
+            &mut self,
+            _name: &str,
+            _id: u32,
+        ) -> Result<(), JsEngineError> {
+            Ok(())
+        }
+        fn install_dom_like_object(
+            &mut self,
+            _binding: &worker_protocol::DomLikeObjectBinding,
+        ) -> Result<(), JsEngineError> {
+            Ok(())
+        }
+    }
+
+    /// モジュール API を具体値で実装する偽エンジン（成功応答の確認用）。
+    struct SupportedModuleEngine;
+
+    impl ChildEngine for SupportedModuleEngine {
+        fn evaluate_script(
+            &mut self,
+            _script: &str,
+            _options: &EvaluateOptions,
+        ) -> Result<JsValue, JsEngineError> {
+            Ok(JsValue::Undefined)
+        }
+        fn take_native_call_fatal(&mut self) -> Option<String> {
+            None
+        }
+        fn install_native_proxy_global(
+            &mut self,
+            _name: &str,
+            _id: u32,
+        ) -> Result<(), JsEngineError> {
+            Ok(())
+        }
+        fn install_dom_like_object(
+            &mut self,
+            _binding: &worker_protocol::DomLikeObjectBinding,
+        ) -> Result<(), JsEngineError> {
+            Ok(())
+        }
+        fn compile_module(
+            &mut self,
+            request: &worker_protocol::module_frames::CompileModuleRequest,
+        ) -> Result<ModuleRecord, JsEngineError> {
+            assert_eq!(request.url, "https://example.test/a.js");
+            Ok(ModuleRecord::new(
+                ModuleId::from_raw(7),
+                vec![super::super::engine_trait::ModuleRequest::new(
+                    "./b.js".to_string(),
+                )],
+            ))
+        }
+        fn link_module(
+            &mut self,
+            referrer: ModuleId,
+            resolutions: &[ModuleResolution],
+        ) -> Result<(), JsEngineError> {
+            assert_eq!(referrer, ModuleId::from_raw(7));
+            assert_eq!(resolutions.len(), 1);
+            Ok(())
+        }
+        fn evaluate_module(
+            &mut self,
+            root: ModuleId,
+            _options: &EvaluateOptions,
+        ) -> Result<ModuleEvaluation, JsEngineError> {
+            if root == ModuleId::from_raw(7) {
+                Ok(ModuleEvaluation::rejected("boom".to_string()))
+            } else {
+                Err(JsEngineError::ModuleResolutionFailed(
+                    "module is not registered".to_string(),
+                ))
+            }
+        }
+    }
+
+    /// JS-4・REPAIR-3・Issue #1110: 既定のエンジンでは新 tag を検証したうえで
     /// `ERROR{NotYetImplemented}` を返し、不正なペイロードはデコードエラーにする。
     #[test]
     fn js_4_handle_module_frame_responds_not_yet_implemented_after_validation() {
+        let mut engine = DefaultModuleEngine { fatal: None };
         let compile = worker_protocol::module_frames::encode_compile_module(
             "https://example.test/a.js",
             "export {};",
@@ -1241,7 +1469,7 @@ mod tests {
         )
         .expect("encode");
         let mut out = Vec::new();
-        handle_module_frame(tag::COMPILE_MODULE, &compile, &mut out).expect("handled");
+        handle_module_frame(&mut engine, tag::COMPILE_MODULE, &compile, &mut out).expect("handled");
         let (frame_tag, payload) = read_frame_for_module_test(out);
         assert_eq!(frame_tag, tag::ERROR);
         let (kind, message) = worker_protocol::decode_error(&payload).expect("error frame");
@@ -1249,7 +1477,8 @@ mod tests {
         assert!(message.starts_with("compile_module:"), "{message}");
 
         let mut out = Vec::new();
-        handle_module_frame(tag::TAKE_DYNAMIC_IMPORTS, &[], &mut out).expect("handled");
+        handle_module_frame(&mut engine, tag::TAKE_DYNAMIC_IMPORTS, &[], &mut out)
+            .expect("handled");
         let (_, payload) = read_frame_for_module_test(out);
         let (kind, message) = worker_protocol::decode_error(&payload).expect("error frame");
         assert_eq!(kind, ErrorKind::NotYetImplemented);
@@ -1260,7 +1489,7 @@ mod tests {
 
         let mut out = Vec::new();
         assert!(matches!(
-            handle_module_frame(tag::TAKE_DYNAMIC_IMPORTS, &[0], &mut out),
+            handle_module_frame(&mut engine, tag::TAKE_DYNAMIC_IMPORTS, &[0], &mut out),
             Err(ProtocolError::TrailingBytes { .. })
         ));
         assert!(
@@ -1268,9 +1497,97 @@ mod tests {
             "no response is sent for a protocol violation"
         );
         assert!(matches!(
-            handle_module_frame(tag::COMPILE_MODULE, &[1, 2, 3], &mut out),
+            handle_module_frame(&mut engine, tag::COMPILE_MODULE, &[1, 2, 3], &mut out),
             Err(ProtocolError::Truncated)
         ));
+    }
+
+    /// JS-4・Issue #1114: エンジンが実装していれば compile / link / evaluate は
+    /// 専用の成功フレームで応答し、エンジンのエラーは `ERROR{kind}` になる。
+    #[test]
+    fn js_4_handle_module_frame_dispatches_to_the_engine_and_encodes_responses() {
+        use worker_protocol::module_frames as frames;
+        let mut engine = SupportedModuleEngine;
+
+        let compile = frames::encode_compile_module(
+            "https://example.test/a.js",
+            "import './b.js';",
+            &EvaluateOptions::default(),
+        )
+        .expect("encode");
+        let mut out = Vec::new();
+        let outcome = handle_module_frame(&mut engine, tag::COMPILE_MODULE, &compile, &mut out)
+            .expect("handled");
+        assert!(matches!(outcome, RespondOutcome::Responded));
+        let (frame_tag, payload) = read_frame_for_module_test(out);
+        assert_eq!(frame_tag, tag::MODULE_COMPILED);
+        let record = frames::decode_module_compiled(&payload).expect("record");
+        assert_eq!(record.id(), ModuleId::from_raw(7));
+        assert_eq!(record.requests().len(), 1);
+        assert_eq!(record.requests()[0].specifier(), "./b.js");
+
+        let link = frames::encode_link_module(
+            ModuleId::from_raw(7),
+            &[ModuleResolution::new(
+                "./b.js".to_string(),
+                ModuleId::from_raw(8),
+            )],
+        )
+        .expect("encode");
+        let mut out = Vec::new();
+        handle_module_frame(&mut engine, tag::LINK_MODULE, &link, &mut out).expect("handled");
+        let (frame_tag, payload) = read_frame_for_module_test(out);
+        assert_eq!(frame_tag, tag::RESULT);
+        assert_eq!(
+            worker_protocol::decode_js_value(&payload).expect("ack").0,
+            JsValue::Undefined
+        );
+
+        let evaluate =
+            frames::encode_evaluate_module(ModuleId::from_raw(7), &EvaluateOptions::default());
+        let mut out = Vec::new();
+        handle_module_frame(&mut engine, tag::EVALUATE_MODULE, &evaluate, &mut out)
+            .expect("handled");
+        let (frame_tag, payload) = read_frame_for_module_test(out);
+        assert_eq!(frame_tag, tag::MODULE_RESULT);
+        assert_eq!(
+            frames::decode_module_result(&payload).expect("result"),
+            ModuleEvaluation::rejected("boom".to_string())
+        );
+
+        let unknown =
+            frames::encode_evaluate_module(ModuleId::from_raw(99), &EvaluateOptions::default());
+        let mut out = Vec::new();
+        handle_module_frame(&mut engine, tag::EVALUATE_MODULE, &unknown, &mut out)
+            .expect("handled");
+        let (frame_tag, payload) = read_frame_for_module_test(out);
+        assert_eq!(frame_tag, tag::ERROR);
+        let (kind, message) = worker_protocol::decode_error(&payload).expect("error frame");
+        assert_eq!(kind, ErrorKind::ModuleResolution);
+        assert_eq!(message, "module is not registered");
+    }
+
+    /// JS-4・Issue #1114: モジュール評価の直後に逆方向 RPC の fatal があれば、
+    /// 応答を送らず違反として返す（`EVALUATE` と同じ）。
+    #[test]
+    fn js_4_handle_module_frame_reports_native_call_fatal_without_responding() {
+        let mut engine = DefaultModuleEngine {
+            fatal: Some("transport failed".to_string()),
+        };
+        let evaluate = worker_protocol::module_frames::encode_evaluate_module(
+            ModuleId::from_raw(1),
+            &EvaluateOptions::default(),
+        );
+        let mut out = Vec::new();
+        let outcome = handle_module_frame(&mut engine, tag::EVALUATE_MODULE, &evaluate, &mut out)
+            .expect("handled");
+        match outcome {
+            RespondOutcome::NativeCallProtocolViolation(message) => {
+                assert_eq!(message, "transport failed");
+            }
+            RespondOutcome::Responded => panic!("a fatal must not produce a response"),
+        }
+        assert!(out.is_empty());
     }
 
     /// JS-1・Issue #503: 未知のプロトコルバージョン文字列は Hello を

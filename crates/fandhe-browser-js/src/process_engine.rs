@@ -128,9 +128,11 @@
 //!
 //! # 既知の制限（実装済みを装わない。REPAIR-3）
 //!
-//! - 子は ES module 用フレームを検証したうえで全操作に `NotYetImplemented` を
-//!   返す（V8・boa での compile・link・評価・動的 import は後続 issue。設計
-//!   `es-module-design.md` §9 の 3〜6）。
+//! - 子は ES module 用フレームを検証したうえでエンジンへ dispatch する。boa は
+//!   静的 import のグラフを評価する（動的 `import()`・top-level await を含む
+//!   モジュールは compile が `NotYetImplemented`。Issue #1114）。V8 の
+//!   compile・link・評価と動的 import は後続 issue で、現状は全操作が
+//!   `NotYetImplemented`（設計 `es-module-design.md` §9 の 3〜5）。
 //! - 子 → 親へ `ObjectHandle` を渡す経路（オブジェクト参照の往復・親の handle
 //!   照合）は未実装で、現状は fail-closed で拒否する（`TASK-29.5b` の
 //!   後続作業。REPAIR-3）。setter（書き込み可能プロパティ）も未対応。
@@ -2571,8 +2573,8 @@ impl JsEngine for V8ProcessEngine {
     }
 
     /// ES module の compile（`JS-4`・Issue #1110）。入力は子を起動する前に検査し、
-    /// 応答の id・specifier は子が untrusted なため台帳で照合する。子は現状
-    /// `NotYetImplemented` を返す（モジュール doc「既知の制限」）。
+    /// 応答の id・specifier は子が untrusted なため台帳で照合する。子が V8 の
+    /// ときは現状 `NotYetImplemented` を返す（モジュール doc「既知の制限」）。
     fn compile_module(&mut self, url: &str, source: &str) -> Result<ModuleRecord, JsEngineError> {
         if source.len() > super::shared::MAX_SCRIPT_SOURCE_BYTES {
             return Err(JsEngineError::EvaluationFailed(format!(
