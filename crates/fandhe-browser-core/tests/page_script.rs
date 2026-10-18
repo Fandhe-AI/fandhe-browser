@@ -3,7 +3,7 @@
 
 use fandhe_browser_core::page_script::CollectedScripts;
 use fandhe_browser_core::{
-    ParseOptions, ScriptCollectionOptions, ScriptDiagnosticKind, ScriptSource,
+    ParseOptions, ScriptCollectionOptions, ScriptDiagnosticKind, ScriptKind, ScriptSource,
     collect_page_scripts, parse_document,
 };
 
@@ -49,4 +49,80 @@ fn js_6_limit_65() {
         ScriptDiagnosticKind::ScriptLimitExceeded
     );
     assert_eq!(r.diagnostics()[0].count(), Some(1));
+}
+
+const GATE_HTML: &str = concat!(
+    "<script>a()</script>",
+    "<script type=\"module\" src=\"m.js?token=dummy\"></script>",
+    "<script nomodule src=\"legacy.js?token=dummy\"></script>",
+    "<script type=\"module\">import 'x';</script>",
+);
+
+/// JS-4・#1115: gate 有効時は module を文書順に集め、nomodule classic を skip する。
+#[test]
+fn js_4_gate_on_collects_modules_and_skips_nomodule() {
+    let parsed = parse_document(GATE_HTML, &ParseOptions::default()).expect("parse");
+    let opts = ScriptCollectionOptions::default().with_execute_modules(true);
+    let r = collect_page_scripts(&parsed.document, &opts);
+    let got: Vec<_> = r
+        .entries()
+        .iter()
+        .map(|e| (e.index(), e.kind(), e.source().clone()))
+        .collect();
+    assert_eq!(
+        got,
+        vec![
+            (
+                0,
+                ScriptKind::Classic,
+                ScriptSource::Inline("a()".to_string())
+            ),
+            (
+                1,
+                ScriptKind::Module,
+                ScriptSource::External("m.js?token=dummy".to_string())
+            ),
+            (
+                3,
+                ScriptKind::Module,
+                ScriptSource::Inline("import 'x';".to_string())
+            ),
+        ]
+    );
+    assert_eq!(r.diagnostics().len(), 1);
+    let d = &r.diagnostics()[0];
+    assert_eq!(d.kind(), ScriptDiagnosticKind::SkippedNomodule);
+    assert_eq!(d.index(), Some(2));
+    assert!(!d.message().contains("token"));
+    assert!(!d.message().contains("legacy.js"));
+}
+
+/// JS-4・#1115: 同じ HTML を既定（gate off）で収集すると従来結果になる。
+#[test]
+fn js_4_gate_off_keeps_legacy_behavior() {
+    let r = run(GATE_HTML);
+    let got: Vec<_> = r
+        .entries()
+        .iter()
+        .map(|e| (e.index(), e.kind(), e.is_nomodule()))
+        .collect();
+    assert_eq!(
+        got,
+        vec![
+            (0, ScriptKind::Classic, false),
+            (2, ScriptKind::Classic, true)
+        ]
+    );
+    let kinds: Vec<_> = r
+        .diagnostics()
+        .iter()
+        .map(|d| (d.kind(), d.index()))
+        .collect();
+    assert_eq!(
+        kinds,
+        vec![
+            (ScriptDiagnosticKind::SkippedModule, Some(1)),
+            (ScriptDiagnosticKind::SkippedModule, Some(3)),
+        ]
+    );
 }
