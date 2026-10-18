@@ -19,8 +19,14 @@
 //! 生成・呼び出し・fatal 時の打ち切り。`TASK-29`・Issue #511）に加え、
 //! 親側の `NativeCall` dispatch（`NativeFn` の実行・`NativeReturn` の
 //! 返信。`super::process_engine::dispatch_native_call`・`TASK-29`・
-//! Issue #526）を実装済みである。以下は未実装（実装済みを装わない。
-//! REPAIR-3）。
+//! Issue #526）と、ES module の静的 import グラフの compile・link・evaluate
+//! （[`V8Engine::compile_module`]・[`V8Engine::link_module`]・
+//! [`V8Engine::evaluate_module`]。`JS-4`・Issue #1111）を実装済みである。以下は
+//! 未実装（実装済みを装わない。REPAIR-3）。
+//!
+//! - ES module の top-level await・Promise の `Pending`・microtask checkpoint・
+//!   `import.meta.url`・動的 `import()`（`TAKE_DYNAMIC_IMPORTS` 等）。TLA は compile が、
+//!   `Pending` は evaluate が `NotYetImplemented` を返す（#1112 以降）
 //!
 //! - [`super::engine_trait::JsEngine`] トレイトへの集約（`TASK-29.6.2`・Issue #548）。
 //!   本モジュールは同トレイトと同じシグネチャの inherent メソッドとして
@@ -68,7 +74,7 @@
 //! | `NativeCallFatal` | `EngineUnavailable` | `Evaluation`（畳まれる） | `EvaluationFailed` |
 //! | （boa のループ・再帰・スタック上限。V8 では発生しない） | `ResourceLimitExceeded` | `ResourceLimit` | `ResourceLimitExceeded`（Context は残る） |
 //! | （ES module 用フレームへの未対応応答。プロトコル v6。`JS-4`・Issue #1110） | `NotYetImplemented` | `NotYetImplemented`（4） | `NotYetImplemented`（Context は残る） |
-//! | （モジュールの解決・link の失敗。後続 issue が返す。同上） | `ModuleResolutionFailed` | `ModuleResolution`（5） | `ModuleResolutionFailed`（Context は残る） |
+//! | モジュールの未 link・未知の id・不正な link 表（`link_module`・`evaluate_module` が V8 を呼ぶ前に返す。`JS-4`・Issue #1111） | `ModuleResolutionFailed` | `ModuleResolution`（5） | `ModuleResolutionFailed`（Context は残る） |
 //!
 //! ワイヤ変換は `super::worker` の `classify_evaluation_error`、親側の逆変換は
 //! `super::process_engine::error_frame_to_js_engine_error`。
@@ -85,10 +91,18 @@
 //! - dispose 後は再初期化できない（v8 152.2.0 の制約）ため、テストや
 //!   将来の複数回利用（cli の再起動なしの再初期化等）と相性が悪い
 //!
-//! `dispose` に関する `unsafe` は本モジュールでは使わない。本モジュールは
-//! `unsafe` を一切使わない（TASK-29・Issue #503・JS プロセス分離の設計書
+//! `dispose` に関する `unsafe` は本モジュールでは使わない。本モジュールの
+//! `unsafe` は、ES module の resolve callback（`resolve_module_callback`）の
+//! `v8::callback_scope!(unsafe ...)` 1 か所だけである（`JS-4`・Issue #1111。
+//! リポジトリオーナー承認 2026-10-18。
+//! <https://github.com/Fandhe-AI/fandhe-browser/issues/1111#issuecomment-6248402182>）。
+//! v8 152.2.0 の `instantiate_module` に渡せる callback は値を捕捉できない `fn`
+//! で、依存先の `Local<Module>` を返すには callback の中で scope を作る必要があり、
+//! それを安全に行う API が無いため。`// SAFETY:` に不変条件（呼び出し中のみ・
+//! scope と `Local` を持ち出さない・JS を実行しない）を明記している。それ以外では
+//! `unsafe` を使わない（TASK-29・Issue #503・JS プロセス分離の設計書
 //! §5「案 X」。以前存在した `near_heap_limit_callback`〔Issue #507 で承認
-//! した唯一の `unsafe`〕は、ヒープ上限到達時の挙動を「V8 の既定の fatal
+//! した `unsafe`〕は、ヒープ上限到達時の挙動を「V8 の既定の fatal
 //! OOM で Isolate を含むプロセスが終了する」ことに一本化したため削除した。
 //! この Isolate は子プロセス（`super::worker`）の中でだけ生成されるため、
 //! fatal OOM で終了してもホストプロセスは道連れにならない。新たに
@@ -113,14 +127,21 @@
 //! メッセージを含む）エラーを返す。
 
 use std::cell::Cell;
+use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 use std::sync::mpsc;
 use std::time::Duration;
 
-use super::engine_trait::{EvaluateOptions, JsEngineError, JsValue};
+use super::engine_trait::{
+    EvaluateOptions, JsEngineError, JsValue, ModuleEvaluation, ModuleId, ModuleRecord,
+    ModuleRequest, ModuleResolution,
+};
 // 逆方向 RPC の窓口は boa 子プロセスとも共有するため `shared` へ置いた
 // （Issue #166）。既存の参照パスを保つため再エクスポートする。
 pub(crate) use super::shared::{NativeCallFailure, NativeCallTransport};
+use super::worker_protocol::module_frames::{
+    MAX_MODULE_REQUESTS, MAX_MODULE_SPECIFIER_BYTES, MAX_MODULES_PER_WORKER,
+};
 use super::worker_protocol::{self, NativeReturn};
 
 /// [`install_native_proxy_global`](V8Engine::install_native_proxy_global) が
@@ -636,6 +657,8 @@ impl V8Engine {
             transport: None,
             fatal: None,
         });
+        // ES module のモジュールマップ（`JS-4`・Issue #1111）。resolve callback が読む。
+        isolate.set_slot(ModuleMap::new());
         Ok(Self { context, isolate })
     }
 
@@ -1131,36 +1154,7 @@ impl V8Engine {
         // 本 PR の時点で実際に到達可能な脆弱性を塞いだことを示す再現
         // テストは書けていない（回帰テストは「ハングしない」ことを
         // 確認するに留まる。詳細は同テストのドキュメントコメント参照）
-        let extract_message = || -> String {
-            let raw = if let Some(message) = tc.message() {
-                let text =
-                    v8_string_prefix_lossy(&tc, message.get(&tc), MAX_ERROR_MESSAGE_EXTRACT_BYTES);
-                match message.get_line_number(&tc) {
-                    Some(line) => format!("{text} (line {line})"),
-                    None => text,
-                }
-            } else if let Some(exception) = tc.exception() {
-                if exception.is_object() {
-                    // オブジェクトの文字列表現は計算しない（上記のとおり
-                    // ユーザーコードの実行を避けるため）。型名だけを
-                    // 報告する（文字列化に成功したかのように装わない。
-                    // security.md「偽装・回避機能の禁止」）。
-                    let type_name = exception.type_of(&tc).to_rust_string_lossy(&tc);
-                    format!(
-                        "an object of type '{type_name}' was thrown; its string \
-                         representation was not computed to avoid executing user-defined code"
-                    )
-                } else {
-                    match exception.to_string(&tc) {
-                        Some(s) => v8_string_prefix_lossy(&tc, s, MAX_ERROR_MESSAGE_EXTRACT_BYTES),
-                        None => "unknown script error".to_string(),
-                    }
-                }
-            } else {
-                "unknown script error".to_string()
-            };
-            truncate_error_message(raw)
-        };
+        let extract_message = || -> String { failure_message(&tc, tc.message(), tc.exception()) };
 
         // PR #503 レビュー指摘 P1: 監視スレッドをコンパイル開始「前」に
         // 起動する。以前は `compiled.run` の直前に起動していたため、
@@ -1170,12 +1164,7 @@ impl V8Engine {
         // [`SCRIPT_EXECUTION_TIMEOUT`] を超えても `terminate_execution` が
         // 発火する（同定数のドキュメントコメント「コンパイル自体は打ち
         // 切られない場合がある」も参照）。
-        let (done_tx, done_rx) = mpsc::channel::<()>();
-        let watchdog = std::thread::spawn(move || {
-            if done_rx.recv_timeout(timeout).is_err() {
-                isolate_handle.terminate_execution();
-            }
-        });
+        let watchdog = Watchdog::start(isolate_handle, timeout);
         // 監視スレッドへ完了を伝えて join し、`terminate_execution` が
         // 発火していたかどうかを読み取ってから解除する。コンパイル失敗・
         // 実行失敗のどちらの打ち切りでも同じ手順（送信 → join →
@@ -1198,19 +1187,17 @@ impl V8Engine {
         // 実行しない設計にしている（同クロージャのコメント参照）が、
         // 万一その前提が崩れていても、監視スレッドがまだ生きていれば
         // `terminate_execution` で打ち切れるようにする多重の安全策。
-        let finish_watchdog =
-            |done_tx: mpsc::Sender<()>, watchdog: std::thread::JoinHandle<()>| -> bool {
-                let _ = done_tx.send(());
-                let _ = watchdog.join();
-                let was_terminated = tc.has_terminated();
-                tc.cancel_terminate_execution();
-                was_terminated
-            };
+        let finish_watchdog = |watchdog: Watchdog| -> bool {
+            watchdog.stop();
+            let was_terminated = tc.has_terminated();
+            tc.cancel_terminate_execution();
+            was_terminated
+        };
 
         let source = match v8::String::new(&tc, script) {
             Some(source) => source,
             None => {
-                finish_watchdog(done_tx, watchdog);
+                finish_watchdog(watchdog);
                 return Err(V8Failure::Allocation(
                     "failed to allocate script source string".to_string(),
                 )
@@ -1236,7 +1223,7 @@ impl V8Engine {
                 // 検出する「子の watchdog による打ち切り」に対応）、
                 // メッセージに "context was discarded" は含めない。
                 let message = extract_message();
-                let was_terminated = finish_watchdog(done_tx, watchdog);
+                let was_terminated = finish_watchdog(watchdog);
                 if was_terminated {
                     return Err(V8Failure::Terminated {
                         stage: "compilation",
@@ -1256,7 +1243,7 @@ impl V8Engine {
             Some(_) => None,
             None => Some(extract_message()),
         };
-        let was_terminated = finish_watchdog(done_tx, watchdog);
+        let was_terminated = finish_watchdog(watchdog);
 
         let result = match run_result {
             Some(result) => result,
@@ -1277,6 +1264,83 @@ impl V8Engine {
         };
 
         value_to_js_value(&tc, result, options.max_result_bytes())
+    }
+}
+
+/// `TryCatch` が捕捉した失敗から、切り詰め済みのエラーメッセージを作る
+/// （classic 評価・モジュールの compile・evaluate が共有する。`JS-1`・`JS-6`）。
+///
+/// ユーザー定義コードを一切実行しない経路だけを使う（根拠は
+/// [`V8Engine::evaluate_in_isolate`] の呼び出し側コメントと回帰テスト
+/// `js_1_v8_thrown_object_with_hanging_*`）。`message` が優先で、無ければ
+/// `exception` がオブジェクトのとき型名だけを報告し（ToString を呼ばない）、
+/// オブジェクトでなければ組み込みの ToString を使う。
+///
+/// - `message`: `v8::Message::Get` はスクリプト実行を許さないスコープで動く
+///   （v8 152.2.0 の `src/api/api.cc` で確認済み）ため、`toString`・getter・
+///   `Symbol.toPrimitive` を呼ばない
+/// - `exception` がオブジェクト: ToPrimitive 経由のユーザーコード実行を避けるため
+///   文字列表現を計算しない（実装済みを装わない。security.md）
+fn failure_message(
+    scope: &v8::PinScope<'_, '_>,
+    message: Option<v8::Local<v8::Message>>,
+    exception: Option<v8::Local<v8::Value>>,
+) -> String {
+    let raw = if let Some(message) = message {
+        let text =
+            v8_string_prefix_lossy(scope, message.get(scope), MAX_ERROR_MESSAGE_EXTRACT_BYTES);
+        match message.get_line_number(scope) {
+            Some(line) => format!("{text} (line {line})"),
+            None => text,
+        }
+    } else if let Some(exception) = exception {
+        if exception.is_object() {
+            let type_name = exception.type_of(scope).to_rust_string_lossy(scope);
+            format!(
+                "an object of type '{type_name}' was thrown; its string \
+                 representation was not computed to avoid executing user-defined code"
+            )
+        } else {
+            match exception.to_string(scope) {
+                Some(s) => v8_string_prefix_lossy(scope, s, MAX_ERROR_MESSAGE_EXTRACT_BYTES),
+                None => "unknown script error".to_string(),
+            }
+        }
+    } else {
+        "unknown script error".to_string()
+    };
+    truncate_error_message(raw)
+}
+
+/// 実行時間の監視スレッド（`JS-6`・`TASK-29`）。classic 評価とモジュールの
+/// compile・evaluate が共有する。
+///
+/// 起動から `timeout` が経過しても [`Watchdog::stop`] されなければ
+/// `terminate_execution` を呼ぶ。不変条件: 監視は compile の**前**に起動し、
+/// ユーザーコードに触れうる処理（メッセージ取り出しを含む）が終わるまで
+/// `stop` しない。`stop` の後に `has_terminated` を読んでから
+/// `cancel_terminate_execution` する手順は呼び出し側が踏む。
+struct Watchdog {
+    done_tx: mpsc::Sender<()>,
+    thread: std::thread::JoinHandle<()>,
+}
+
+impl Watchdog {
+    /// 監視スレッドを起動する。
+    fn start(isolate_handle: v8::IsolateHandle, timeout: Duration) -> Self {
+        let (done_tx, done_rx) = mpsc::channel::<()>();
+        let thread = std::thread::spawn(move || {
+            if done_rx.recv_timeout(timeout).is_err() {
+                isolate_handle.terminate_execution();
+            }
+        });
+        Self { done_tx, thread }
+    }
+
+    /// 完了を伝えて監視スレッドを join する。
+    fn stop(self) {
+        let _ = self.done_tx.send(());
+        let _ = self.thread.join();
     }
 }
 
@@ -1658,10 +1722,583 @@ fn native_proxy_callback(
     }
 }
 
+// ---- ES module（静的 import のグラフ。`JS-4`・`JS-6`・`REPAIR-3`・Issue #1111）----
+
+/// モジュールマップが保持する compile 済みモジュール 1 件。
+struct ModuleEntry {
+    /// compile 済みの V8 モジュール。
+    module: v8::Global<v8::Module>,
+    /// ソースに書かれた依存の specifier（出現順・重複なし・検証済み）。
+    requests: Vec<String>,
+    /// link 済みの specifier から対象 id への対応表。
+    links: HashMap<String, u32>,
+}
+
+/// 子プロセスのモジュールマップ（Isolate スロット。`JS-4`・Issue #1111）。
+///
+/// resolve callback は値を捕捉できない `fn` のため、`NativeCallBridge` と同じく
+/// Isolate スロット経由で届ける。`V8Engine::drop` が Isolate より先に取り外して
+/// `Global` を Isolate の生存中に解放する。
+struct ModuleMap {
+    /// 次に払い出す id（1 始まり）。
+    next_id: u32,
+    entries: HashMap<u32, ModuleEntry>,
+}
+
+impl ModuleMap {
+    fn new() -> Self {
+        Self {
+            next_id: 1,
+            entries: HashMap::new(),
+        }
+    }
+
+    /// `referrer` の依存を記録する。未知の referrer・未知の target・referrer の依存に
+    /// 無い specifier は `ModuleResolutionFailed`（固定文言。specifier・URL は含めない）。
+    /// 検証を全行終えてから書き込むため、失敗時は何も変わらない。
+    fn link(
+        &mut self,
+        referrer: ModuleId,
+        resolutions: &[ModuleResolution],
+    ) -> Result<(), JsEngineError> {
+        let unresolved = |msg: &str| JsEngineError::ModuleResolutionFailed(msg.to_string());
+        let entry = self
+            .entries
+            .get(&referrer.raw())
+            .ok_or_else(|| unresolved("unknown module id"))?;
+        let mut accepted = Vec::with_capacity(resolutions.len());
+        for resolution in resolutions {
+            if !self.entries.contains_key(&resolution.target().raw()) {
+                return Err(unresolved("unknown link target module id"));
+            }
+            if !entry.requests.iter().any(|r| r == resolution.specifier()) {
+                return Err(unresolved("specifier is not a dependency of the module"));
+            }
+            // 別の id への付け替えは拒否する（instantiate 済みの束縛とずれるため）。
+            // 同じ対応の再 link は冪等に許す。
+            if let Some(existing) = entry.links.get(resolution.specifier())
+                && *existing != resolution.target().raw()
+            {
+                return Err(unresolved("specifier is already linked to another module"));
+            }
+            accepted.push((
+                resolution.specifier().to_string(),
+                resolution.target().raw(),
+            ));
+        }
+        if let Some(entry) = self.entries.get_mut(&referrer.raw()) {
+            entry.links.extend(accepted);
+        }
+        Ok(())
+    }
+
+    /// `root` から到達できる全モジュールの全依存が link 済みであることを確かめる
+    /// （V8 を呼ぶ前の検査。循環は visited で止める）。未知の id・未 link の依存は
+    /// `ModuleResolutionFailed`。
+    fn ensure_fully_linked(&self, root: ModuleId) -> Result<(), JsEngineError> {
+        let unresolved = |msg: &str| JsEngineError::ModuleResolutionFailed(msg.to_string());
+        if !self.entries.contains_key(&root.raw()) {
+            return Err(unresolved("unknown module id"));
+        }
+        let mut visited: HashSet<u32> = HashSet::new();
+        let mut stack = vec![root.raw()];
+        while let Some(id) = stack.pop() {
+            if !visited.insert(id) {
+                continue;
+            }
+            // 件数の上限はマップの上限（`MAX_MODULES_PER_WORKER`）で抑えられている。
+            let entry = self
+                .entries
+                .get(&id)
+                .ok_or_else(|| unresolved("unknown module id"))?;
+            for specifier in &entry.requests {
+                let target = entry
+                    .links
+                    .get(specifier)
+                    .ok_or_else(|| unresolved("unresolved module specifier"))?;
+                stack.push(*target);
+            }
+        }
+        Ok(())
+    }
+}
+
+/// `instantiate_module` に渡す resolve callback（`JS-4`・Issue #1111）。
+///
+/// モジュールマップを同期に引くだけで、JS は実行しない。見つからない場合（事前検査
+/// [`ModuleMap::ensure_fully_linked`] を通っていれば起きない防御経路）は固定文言の
+/// 例外を投げて `None` を返す。
+///
+/// 本モジュールで唯一の `unsafe` の使用箇所（リポジトリオーナー承認 2026-10-18。
+/// Issue #1111 のコメント
+/// <https://github.com/Fandhe-AI/fandhe-browser/issues/1111#issuecomment-6248402182>）。
+fn resolve_module_callback<'s>(
+    context: v8::Local<'s, v8::Context>,
+    specifier: v8::Local<'s, v8::String>,
+    _import_attributes: v8::Local<'s, v8::FixedArray>,
+    referrer: v8::Local<'s, v8::Module>,
+) -> Option<v8::Local<'s, v8::Module>> {
+    // SAFETY: この callback は、同じスレッドが `Module::instantiate_module` を
+    // 呼び出している間にだけ V8 から呼ばれ、`context` はその時点の current context
+    // で生きている。作る scope と、そこから得る `Local` は callback の外へ持ち出さず
+    // （戻り値の `Local<'s, Module>` の寿命は V8 が渡した `'s` に従う）、callback の
+    // 中で JS を実行しない（モジュールマップを読むだけ。例外を投げる経路を除く）。
+    v8::callback_scope!(unsafe scope, context);
+
+    let found = (|| {
+        let map = scope.get_slot::<ModuleMap>()?;
+        let specifier = specifier.to_rust_string_lossy(scope);
+        let referrer_entry = map.entries.values().find(|e| referrer == e.module)?;
+        let target = map.entries.get(referrer_entry.links.get(&specifier)?)?;
+        Some(v8::Local::new(scope, &target.module))
+    })();
+    if found.is_none() {
+        let handle_scope = std::pin::pin!(v8::HandleScope::new(scope));
+        let handle_scope = handle_scope.init();
+        if let Some(message) = v8::String::new(&handle_scope, "unresolved module specifier") {
+            handle_scope.throw_exception(message.into());
+        }
+    }
+    found
+}
+
+/// ソースに `import.meta` の使用らしきものがあるか（保守的な検出。`JS-4`・`REPAIR-3`）。
+///
+/// `import.meta` の初期化 callback は未実装（#1112）で、そのまま評価すると
+/// `import.meta.url` が `undefined` のまま成功してしまう。対応するまで
+/// [`V8Engine::compile_module`] はこれを `NotYetImplemented` で拒否する。
+///
+/// トークン `import` の後に trivia を挟んで `.`、さらに trivia を挟んで `meta` または
+/// `\`（識別子の Unicode エスケープの開始。fail-closed で拒否）が続くものを探す。
+/// 不変条件: [`skip_trivia`] が読み飛ばす集合は JS の WhiteSpace・LineTerminator・
+/// Comment の上位集合で、余分に読み飛ばすのは誤検出（拒否側）にしかならない。文字列・
+/// コメント中の `import.meta` を拒否する誤検出も fail-closed 側として許容する。
+/// **#1112 で `import.meta.url` を実装したらこの検出を外す。**
+/// 入力は上限検証済みのソースで、添字アクセスは `get` のみ。
+fn uses_import_meta(source: &str) -> bool {
+    source.match_indices("import").any(|(index, word)| {
+        let after_import = skip_trivia(source, index.saturating_add(word.len()));
+        if source
+            .get(after_import..)
+            .and_then(|rest| rest.chars().next())
+            != Some('.')
+        {
+            return false;
+        }
+        let after_dot = skip_trivia(source, after_import.saturating_add(1));
+        source
+            .get(after_dot..)
+            .is_some_and(|rest| rest.starts_with("meta") || rest.starts_with('\\'))
+    })
+}
+
+/// 行末記号（LF・CR・U+2028・U+2029）か。
+fn is_line_terminator(c: char) -> bool {
+    matches!(c, '\n' | '\r' | '\u{2028}' | '\u{2029}')
+}
+
+/// 空白（Unicode White_Space に U+FEFF を加えたもの。VT・FF・NBSP・LS・PS を含む）・
+/// 行コメント（任意の行末記号で終わる）・ブロックコメント（`*/` まで。閉じ忘れは末尾まで）を
+/// 読み飛ばした位置（バイト位置）を返す。
+fn skip_trivia(source: &str, start: usize) -> usize {
+    let mut index = start;
+    loop {
+        let Some(rest) = source.get(index..) else {
+            return index;
+        };
+        let Some(c) = rest.chars().next() else {
+            return index;
+        };
+        if c.is_whitespace() || c == '\u{feff}' {
+            index = index.saturating_add(c.len_utf8());
+        } else if rest.starts_with("//") {
+            let line_len = rest.find(is_line_terminator).unwrap_or(rest.len());
+            index = index.saturating_add(line_len);
+        } else if let Some(body) = rest.strip_prefix("/*") {
+            let consumed = body
+                .find("*/")
+                .map_or(rest.len(), |end| end.saturating_add(4));
+            index = index.saturating_add(consumed);
+        } else {
+            return index;
+        }
+    }
+}
+
+/// 重複込みの import 宣言数の上限（走査・確保コストの上限。`MAX_MODULE_REQUESTS` は一意な件数）。
+const MAX_RAW_MODULE_REQUESTS: usize = 65_536;
+
+/// モジュール compile の結果（スコープの外へ持ち出す部分）。
+struct CompiledModule {
+    module: v8::Global<v8::Module>,
+    requests: Vec<String>,
+}
+
+impl V8Engine {
+    /// Isolate スロットのモジュールマップ（[`V8Engine::new_with_heap_limit`] が必ず設定する）。
+    fn module_map(&mut self) -> Result<&mut ModuleMap, JsEngineError> {
+        self.isolate
+            .get_slot_mut::<ModuleMap>()
+            .ok_or_else(|| JsEngineError::EngineUnavailable("module map is unavailable".into()))
+    }
+
+    /// 逆方向 RPC の fatal が記録済みなら `Err`（classic 評価と同じ fail-closed）。
+    fn ensure_no_native_call_fatal(&self) -> Result<(), JsEngineError> {
+        match self
+            .isolate
+            .get_slot::<NativeCallBridge>()
+            .and_then(|bridge| bridge.fatal.clone())
+        {
+            Some(message) => Err(V8Failure::NativeCallFatal(message).into()),
+            None => Ok(()),
+        }
+    }
+
+    /// ES module を compile し、モジュールマップへ登録して依存の一覧を返す
+    /// （`COMPILE_MODULE`。`JS-4`・`JS-6`・Issue #1111）。
+    ///
+    /// - ソース長・登録数（[`MAX_MODULES_PER_WORKER`]）・依存の件数・specifier の長さを
+    ///   確保の前に上限と比べる（超過は `ResourceLimitExceeded` / `EvaluationFailed`。
+    ///   エラー文言に specifier・URL は含めない）
+    /// - import attributes 付きの import・`import defer` / source phase・重複した
+    ///   specifier・top-level await は compile 失敗にする（成功を装わない。REPAIR-3）
+    /// - 監視は compile の前に起動し、`timeout` を過ぎると `Timeout`
+    ///
+    /// 動的 `import()` は compile 時には検出しない。実行時は host callback が無いため
+    /// `import()` の Promise が reject され、評価は成功扱いのまま続く（挙動は
+    /// `js_4_v8_module_dynamic_import_call_is_not_resolved` が固定する。
+    /// `TAKE_DYNAMIC_IMPORTS` の対応は別 issue）。
+    pub(crate) fn compile_module(
+        &mut self,
+        url: &str,
+        source: &str,
+        timeout: Duration,
+    ) -> Result<ModuleRecord, JsEngineError> {
+        if source.len() > MAX_SCRIPT_SOURCE_BYTES {
+            return Err(JsEngineError::EvaluationFailed(format!(
+                "module source exceeds the maximum supported length of {MAX_SCRIPT_SOURCE_BYTES} bytes"
+            )));
+        }
+        if uses_import_meta(source) {
+            return Err(JsEngineError::NotYetImplemented(
+                "compile_module: import.meta is not supported yet".to_string(),
+            ));
+        }
+        self.ensure_no_native_call_fatal()?;
+        let (next_id, following_id) = {
+            let map = self.module_map()?;
+            if map.entries.len() >= MAX_MODULES_PER_WORKER {
+                return Err(JsEngineError::ResourceLimitExceeded(format!(
+                    "too many modules (maximum {MAX_MODULES_PER_WORKER})"
+                )));
+            }
+            let following = map.next_id.checked_add(1).ok_or_else(|| {
+                JsEngineError::ResourceLimitExceeded("module id space is exhausted".to_string())
+            })?;
+            (map.next_id, following)
+        };
+        if timeout.is_zero() {
+            return Err(V8Failure::Terminated {
+                stage: "compilation",
+                timeout,
+            }
+            .into());
+        }
+
+        let compiled = Self::compile_module_in_isolate(
+            &mut self.isolate,
+            &self.context,
+            url,
+            source,
+            timeout,
+        )?;
+
+        let record = ModuleRecord::new(
+            ModuleId::from_raw(next_id),
+            compiled
+                .requests
+                .iter()
+                .cloned()
+                .map(ModuleRequest::new)
+                .collect(),
+        );
+        let map = self.module_map()?;
+        map.next_id = following_id;
+        map.entries.insert(
+            next_id,
+            ModuleEntry {
+                module: compiled.module,
+                requests: compiled.requests,
+                links: HashMap::new(),
+            },
+        );
+        Ok(record)
+    }
+
+    /// [`V8Engine::compile_module`] の V8 を呼ぶ部分（スコープを閉じて `Global` を返す）。
+    fn compile_module_in_isolate(
+        isolate: &mut v8::OwnedIsolate,
+        context: &v8::Global<v8::Context>,
+        url: &str,
+        source: &str,
+        timeout: Duration,
+    ) -> Result<CompiledModule, JsEngineError> {
+        let isolate_handle = isolate.thread_safe_handle();
+        let scope = std::pin::pin!(v8::HandleScope::new(isolate));
+        let mut scope = scope.init();
+        let context = v8::Local::new(&scope, context);
+        let scope = &mut v8::ContextScope::new(&mut scope, context);
+        let tc = std::pin::pin!(v8::TryCatch::new(scope));
+        let tc = tc.init();
+
+        // 監視は compile の前に起動する（classic と同じ不変条件）。
+        let watchdog = Watchdog::start(isolate_handle, timeout);
+        let finish = |watchdog: Watchdog| -> bool {
+            watchdog.stop();
+            let was_terminated = tc.has_terminated();
+            tc.cancel_terminate_execution();
+            was_terminated
+        };
+
+        // URL とソースは評価文字列へ連結せず、origin と Source へ直接渡す。
+        let (Some(name), Some(source)) = (v8::String::new(&tc, url), v8::String::new(&tc, source))
+        else {
+            finish(watchdog);
+            return Err(V8Failure::Allocation(
+                "failed to allocate module source string".to_string(),
+            )
+            .into());
+        };
+        let origin = v8::ScriptOrigin::new(
+            &tc,
+            name.into(),
+            0,
+            0,
+            false,
+            -1,
+            None,
+            false,
+            false,
+            true,
+            None,
+        );
+        let mut source = v8::script_compiler::Source::new(source, Some(&origin));
+        let compiled = v8::script_compiler::compile_module(&tc, &mut source);
+        let message = match compiled {
+            Some(_) => None,
+            None => Some(failure_message(&tc, tc.message(), tc.exception())),
+        };
+        let was_terminated = finish(watchdog);
+        if was_terminated {
+            return Err(V8Failure::Terminated {
+                stage: "compilation",
+                timeout,
+            }
+            .into());
+        }
+        let Some(module) = compiled else {
+            return Err(V8Failure::Threw(
+                message.unwrap_or_else(|| "unknown script error".to_string()),
+            )
+            .into());
+        };
+
+        let invalid = |msg: &str| JsEngineError::EvaluationFailed(msg.to_string());
+        if module.has_top_level_await() {
+            return Err(JsEngineError::NotYetImplemented(
+                "compile_module: top-level await is not supported yet".to_string(),
+            ));
+        }
+        let raw_requests = module.get_module_requests();
+        // V8 の一覧は import 宣言ごと（同じ specifier が重複しうる）。重複を除いた
+        // 一意な件数で `MAX_MODULE_REQUESTS` を判定し、重複込みの生の件数にも走査・確保の
+        // ための上限を設ける（ソースは 1 MiB 以下なので正常な入力では超えない）。
+        if raw_requests.length() > MAX_RAW_MODULE_REQUESTS {
+            return Err(JsEngineError::ResourceLimitExceeded(format!(
+                "module has more than {MAX_RAW_MODULE_REQUESTS} import declarations"
+            )));
+        }
+        let mut requests: Vec<String> =
+            Vec::with_capacity(MAX_MODULE_REQUESTS.min(raw_requests.length()));
+        let mut seen: HashSet<String> = HashSet::new();
+        for index in 0..raw_requests.length() {
+            let request = raw_requests
+                .get(&tc, index)
+                .and_then(|data| v8::Local::<v8::ModuleRequest>::try_from(data).ok())
+                .ok_or_else(|| invalid("module request is not available"))?;
+            if request.get_phase() != v8::ModuleImportPhase::kEvaluation {
+                return Err(invalid(
+                    "import phases other than evaluation are not supported",
+                ));
+            }
+            if request.get_import_attributes().length() > 0 {
+                return Err(invalid("import attributes are not supported"));
+            }
+            let specifier = request.get_specifier();
+            // 変換前に長さを見る（無制限の確保を避ける。coding-rust.md）。
+            if specifier.utf8_length(&tc) > MAX_MODULE_SPECIFIER_BYTES {
+                return Err(JsEngineError::ResourceLimitExceeded(format!(
+                    "module specifier exceeds the maximum of {MAX_MODULE_SPECIFIER_BYTES} bytes"
+                )));
+            }
+            let specifier = specifier.to_rust_string_lossy(&tc);
+            // 同じ specifier は出現順で最初の 1 件に畳む（boa と同じ。親の契約は一意な一覧）。
+            if seen.insert(specifier.clone()) {
+                if requests.len() >= MAX_MODULE_REQUESTS {
+                    return Err(JsEngineError::ResourceLimitExceeded(format!(
+                        "module has more than {MAX_MODULE_REQUESTS} dependencies"
+                    )));
+                }
+                requests.push(specifier);
+            }
+        }
+        Ok(CompiledModule {
+            module: v8::Global::new(&tc, module),
+            requests,
+        })
+    }
+
+    /// `referrer` の依存を対応表どおりに記録する（`LINK_MODULE`。`JS-4`・Issue #1111）。
+    /// V8 は呼ばない（JS は走らない）。不整合は `ModuleResolutionFailed`。
+    pub(crate) fn link_module(
+        &mut self,
+        referrer: ModuleId,
+        resolutions: &[ModuleResolution],
+    ) -> Result<(), JsEngineError> {
+        self.module_map()?.link(referrer, resolutions)
+    }
+
+    /// link 済みの `root` を instantiate・evaluate する（`EVALUATE_MODULE`。`JS-4`・
+    /// `JS-6`・Issue #1111）。
+    ///
+    /// - 未知の `root`・到達先に未 link の依存が残る場合は、V8 を呼ぶ前に
+    ///   `ModuleResolutionFailed`
+    /// - 同期に完了したら `Fulfilled`、評価時（link 時の SyntaxError を含む）の例外は
+    ///   `Rejected(message)`（ユーザーコードを実行せずに取り出し、切り詰める）
+    /// - 監視は instantiate の前に起動し、`options.timeout()` を過ぎると `Timeout`
+    ///
+    /// 未実装（REPAIR-3）: top-level await・Promise の `Pending`・microtask checkpoint・
+    /// `import.meta.url` は別 issue（#1112）。これらは `NotYetImplemented` を返し、
+    /// 成功を装わない。
+    pub(crate) fn evaluate_module(
+        &mut self,
+        root: ModuleId,
+        options: &EvaluateOptions,
+    ) -> Result<ModuleEvaluation, JsEngineError> {
+        self.ensure_no_native_call_fatal()?;
+        self.module_map()?.ensure_fully_linked(root)?;
+        let timeout = options.timeout();
+        if timeout.is_zero() {
+            return Err(V8Failure::Terminated {
+                stage: "execution",
+                timeout,
+            }
+            .into());
+        }
+        let isolate_handle = self.isolate.thread_safe_handle();
+        let scope = std::pin::pin!(v8::HandleScope::new(&mut self.isolate));
+        let mut scope = scope.init();
+        let context = v8::Local::new(&scope, &self.context);
+        let scope = &mut v8::ContextScope::new(&mut scope, context);
+        let tc = std::pin::pin!(v8::TryCatch::new(scope));
+        let tc = tc.init();
+
+        let module = {
+            let entry = tc
+                .get_slot::<ModuleMap>()
+                .and_then(|map| map.entries.get(&root.raw()))
+                .ok_or_else(|| {
+                    JsEngineError::ModuleResolutionFailed("unknown module id".to_string())
+                })?;
+            v8::Local::new(&tc, &entry.module)
+        };
+
+        let watchdog = Watchdog::start(isolate_handle, timeout);
+        let outcome = Self::run_module(&tc, module);
+        watchdog.stop();
+        let was_terminated = tc.has_terminated();
+        tc.cancel_terminate_execution();
+        if was_terminated {
+            return Err(V8Failure::Terminated {
+                stage: "execution",
+                timeout,
+            }
+            .into());
+        }
+        match outcome {
+            ModuleOutcome::Fulfilled => Ok(ModuleEvaluation::Fulfilled),
+            ModuleOutcome::Unsupported(what) => Err(JsEngineError::NotYetImplemented(format!(
+                "evaluate_module: {what} is not supported yet"
+            ))),
+            ModuleOutcome::Rejected(message) => {
+                if message.len() > options.max_result_bytes() {
+                    return Err(JsEngineError::EvaluationFailed(format!(
+                        "module rejection message of {} bytes exceeds the result size limit of {} bytes",
+                        message.len(),
+                        options.max_result_bytes()
+                    )));
+                }
+                Ok(ModuleEvaluation::rejected(message))
+            }
+        }
+    }
+
+    /// instantiate・evaluate を行い、結果を分類する（監視スレッドが生きている間に呼ぶ。
+    /// メッセージの取り出しもユーザーコードを実行しない経路だけを使う）。
+    fn run_module(
+        tc: &v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
+        module: v8::Local<v8::Module>,
+    ) -> ModuleOutcome {
+        if module.instantiate_module(tc, resolve_module_callback) != Some(true) {
+            return ModuleOutcome::Rejected(failure_message(tc, tc.message(), tc.exception()));
+        }
+        if module.is_graph_async() {
+            return ModuleOutcome::Unsupported("top-level await");
+        }
+        let Some(value) = module.evaluate(tc) else {
+            return ModuleOutcome::Rejected(failure_message(tc, tc.message(), tc.exception()));
+        };
+        if module.get_status() == v8::ModuleStatus::Errored {
+            return ModuleOutcome::Rejected(exception_message(tc, module.get_exception()));
+        }
+        match v8::Local::<v8::Promise>::try_from(value) {
+            Ok(promise) => match promise.state() {
+                v8::PromiseState::Fulfilled => ModuleOutcome::Fulfilled,
+                v8::PromiseState::Rejected => {
+                    promise.mark_as_handled();
+                    ModuleOutcome::Rejected(exception_message(tc, promise.result(tc)))
+                }
+                v8::PromiseState::Pending => ModuleOutcome::Unsupported("a pending evaluation"),
+            },
+            Err(_) => ModuleOutcome::Unsupported("an evaluation result that is not a promise"),
+        }
+    }
+}
+
+/// [`V8Engine::run_module`] の分類結果。
+enum ModuleOutcome {
+    Fulfilled,
+    Rejected(String),
+    /// 本 issue の範囲外（`NotYetImplemented` にする）。
+    Unsupported(&'static str),
+}
+
+/// 投げられた値（`Module::get_exception`・Promise の拒否理由）から、ユーザーコードを
+/// 実行せずにメッセージを作る。`Exception::create_message` と `Message::get` で
+/// 組み立てる（`toString` が無限ループするオブジェクトを投げてもハングしないことは
+/// `js_6_v8_module_thrown_object_with_hanging_tostring_does_not_hang` で確認している）。
+fn exception_message(scope: &v8::PinScope<'_, '_>, exception: v8::Local<v8::Value>) -> String {
+    let message = v8::Exception::create_message(scope, exception);
+    failure_message(scope, Some(message), Some(exception))
+}
+
 impl Drop for V8Engine {
     /// このスレッドの [`V8_ISOLATE_ACTIVE`] フラグを解放し、以後
     /// このスレッドで新しい `V8Engine` を生成できるようにする。
     fn drop(&mut self) {
+        // モジュールマップの `Global` は Isolate が生きている間に解放する
+        // （Isolate のスロットは Isolate の破棄時に落ちるため、順序を明示する）。
+        drop(self.isolate.remove_slot::<ModuleMap>());
         V8_ISOLATE_ACTIVE.with(|active| active.set(false));
     }
 }
@@ -3029,5 +3666,550 @@ mod tests {
                     .to_string(),
             ),
         );
+    }
+    // ---- ES module（静的 import のグラフ。`JS-4`・`JS-6`・Issue #1111）----
+
+    const MODULE_TIMEOUT: Duration = Duration::from_secs(5);
+
+    fn module_engine() -> V8Engine {
+        V8Engine::new().expect("no other V8Engine is active on this thread")
+    }
+
+    fn compile_ok(engine: &mut V8Engine, url: &str, source: &str) -> ModuleRecord {
+        engine
+            .compile_module(url, source, MODULE_TIMEOUT)
+            .expect("module must compile")
+    }
+
+    fn link_ok(engine: &mut V8Engine, referrer: &ModuleRecord, pairs: &[(&str, &ModuleRecord)]) {
+        let resolutions: Vec<ModuleResolution> = pairs
+            .iter()
+            .map(|(specifier, target)| ModuleResolution::new((*specifier).to_string(), target.id()))
+            .collect();
+        engine
+            .link_module(referrer.id(), &resolutions)
+            .expect("link must succeed");
+    }
+
+    fn eval_str(engine: &mut V8Engine, script: &str) -> JsValue {
+        engine
+            .evaluate_script(script, &EvaluateOptions::default())
+            .expect("classic evaluation must succeed")
+    }
+
+    fn assert_resolution_failed(result: Result<ModuleEvaluation, JsEngineError>) {
+        match result {
+            Err(JsEngineError::ModuleResolutionFailed(_)) => {}
+            other => panic!("expected ModuleResolutionFailed, got: {other:?}"),
+        }
+    }
+
+    /// JS-4・Issue #1111 受け入れ条件 1: 末尾の `export {...}` を持つソースは
+    /// classic では SyntaxError、モジュールとしては成功する。
+    #[test]
+    fn js_4_v8_module_export_source_evaluates_only_as_module() {
+        let source = "const a = 1; globalThis.seen = a; export { a };";
+        let mut engine = module_engine();
+        match engine.evaluate_script(source, &EvaluateOptions::default()) {
+            Err(JsEngineError::EvaluationFailed(msg)) => {
+                assert!(msg.contains("SyntaxError"), "unexpected message: {msg}")
+            }
+            other => panic!("expected a SyntaxError, got: {other:?}"),
+        }
+        let record = compile_ok(&mut engine, "https://example.test/m.js", source);
+        assert_eq!(record.id(), ModuleId::from_raw(1));
+        assert!(record.requests().is_empty());
+        let result = engine.evaluate_module(record.id(), &EvaluateOptions::default());
+        assert_eq!(
+            result.expect("module must evaluate"),
+            ModuleEvaluation::Fulfilled
+        );
+        assert_eq!(
+            eval_str(&mut engine, "globalThis.seen"),
+            JsValue::Number(1.0)
+        );
+    }
+
+    /// JS-4・Issue #1111 受け入れ条件 2: トップレベルの `this` は `undefined`、
+    /// strict mode で評価される。
+    #[test]
+    fn js_4_v8_module_top_level_this_is_undefined_and_strict() {
+        let mut engine = module_engine();
+        let record = compile_ok(
+            &mut engine,
+            "https://example.test/s.js",
+            "globalThis.t = this === undefined;\n\
+             globalThis.s = (function () { return this === undefined; })();\n\
+             export {};",
+        );
+        assert_eq!(
+            engine
+                .evaluate_module(record.id(), &EvaluateOptions::default())
+                .expect("module must evaluate"),
+            ModuleEvaluation::Fulfilled
+        );
+        assert_eq!(eval_str(&mut engine, "t && s"), JsValue::Bool(true));
+    }
+
+    /// JS-4・Issue #1111 受け入れ条件 3: 3 段の静的 import を compile → link →
+    /// evaluate し、評価順と受け渡した値がグローバルに反映される。
+    #[test]
+    fn js_4_v8_module_three_level_graph_evaluates_in_dependency_order() {
+        let mut engine = module_engine();
+        let c = compile_ok(
+            &mut engine,
+            "https://example.test/c.js",
+            "globalThis.order = ['c']; export const c = 3;",
+        );
+        let b = compile_ok(
+            &mut engine,
+            "https://example.test/b.js",
+            "import { c } from './c.js'; order.push('b'); export const b = c * 10;",
+        );
+        let a = compile_ok(
+            &mut engine,
+            "https://example.test/a.js",
+            "import { b } from './b.js'; order.push('a'); globalThis.total = b + 1;",
+        );
+        assert_eq!(a.requests()[0].specifier(), "./b.js");
+        link_ok(&mut engine, &a, &[("./b.js", &b)]);
+        link_ok(&mut engine, &b, &[("./c.js", &c)]);
+        assert_eq!(
+            engine
+                .evaluate_module(a.id(), &EvaluateOptions::default())
+                .expect("module must evaluate"),
+            ModuleEvaluation::Fulfilled
+        );
+        assert_eq!(
+            eval_str(&mut engine, "order.join(',')"),
+            JsValue::String("c,b,a".to_string())
+        );
+        assert_eq!(eval_str(&mut engine, "total"), JsValue::Number(31.0));
+    }
+
+    /// JS-4・Issue #1111 受け入れ条件 3: 循環する静的 import も評価でき、各モジュールは
+    /// 1 回だけ評価される。
+    #[test]
+    fn js_4_v8_module_cyclic_graph_evaluates_each_module_once() {
+        let mut engine = module_engine();
+        let a = compile_ok(
+            &mut engine,
+            "https://example.test/a.js",
+            "import { fb } from './b.js'; \
+             globalThis.order = (globalThis.order || []).concat('a'); \
+             export const fa = 1; globalThis.r = fb();",
+        );
+        let b = compile_ok(
+            &mut engine,
+            "https://example.test/b.js",
+            "import { fa } from './a.js'; \
+             globalThis.order = (globalThis.order || []).concat('b'); \
+             export function fb() { return fa + 10; }",
+        );
+        link_ok(&mut engine, &a, &[("./b.js", &b)]);
+        link_ok(&mut engine, &b, &[("./a.js", &a)]);
+        assert_eq!(
+            engine
+                .evaluate_module(a.id(), &EvaluateOptions::default())
+                .expect("module must evaluate"),
+            ModuleEvaluation::Fulfilled
+        );
+        assert_eq!(
+            eval_str(&mut engine, "order.join(',')"),
+            JsValue::String("b,a".to_string())
+        );
+        assert_eq!(eval_str(&mut engine, "r"), JsValue::Number(11.0));
+    }
+
+    /// JS-4・Issue #1111 受け入れ条件 4: 未 link の依存・未知の id・不正な link 表は
+    /// `ModuleResolutionFailed`（V8 を呼ぶ前に失敗し、JS は走らない）。
+    #[test]
+    fn js_4_v8_module_unresolved_unknown_and_bad_links_fail() {
+        let mut engine = module_engine();
+        let dep = compile_ok(
+            &mut engine,
+            "https://example.test/d.js",
+            "export const d = 1;",
+        );
+        let root = compile_ok(
+            &mut engine,
+            "https://example.test/r.js",
+            "import { d } from './d.js'; globalThis.touched = d;",
+        );
+        let options = EvaluateOptions::default();
+        // 未 link のまま評価する。
+        assert_resolution_failed(engine.evaluate_module(root.id(), &options));
+        // 未知の root。
+        assert_resolution_failed(engine.evaluate_module(ModuleId::from_raw(999), &options));
+        // 未知の referrer・target・依存に無い specifier。
+        let ok_entry = ModuleResolution::new("./d.js".to_string(), dep.id());
+        assert!(matches!(
+            engine.link_module(ModuleId::from_raw(999), std::slice::from_ref(&ok_entry)),
+            Err(JsEngineError::ModuleResolutionFailed(_))
+        ));
+        let unknown_target = ModuleResolution::new("./d.js".to_string(), ModuleId::from_raw(999));
+        assert!(matches!(
+            engine.link_module(root.id(), &[unknown_target]),
+            Err(JsEngineError::ModuleResolutionFailed(_))
+        ));
+        let extra = ModuleResolution::new("./other.js".to_string(), dep.id());
+        assert!(matches!(
+            engine.link_module(root.id(), &[ok_entry.clone(), extra]),
+            Err(JsEngineError::ModuleResolutionFailed(_))
+        ));
+        // 失敗した link は何も記録しない（まだ評価できない）。
+        assert_resolution_failed(engine.evaluate_module(root.id(), &options));
+        assert_eq!(
+            eval_str(&mut engine, "typeof touched"),
+            JsValue::String("undefined".to_string())
+        );
+        // 正しく link すれば評価できる。
+        engine
+            .link_module(root.id(), &[ok_entry])
+            .expect("valid link");
+        assert_eq!(
+            engine
+                .evaluate_module(root.id(), &options)
+                .expect("module must evaluate"),
+            ModuleEvaluation::Fulfilled
+        );
+        assert_eq!(eval_str(&mut engine, "touched"), JsValue::Number(1.0));
+    }
+
+    /// JS-4・JS-6・Issue #1111 受け入れ条件 5: 評価時の例外は `Rejected(message)`、
+    /// 無限ループは watchdog で `Timeout`。どちらの後でもエンジンは使える。
+    #[test]
+    fn js_6_v8_module_throw_is_rejected_and_infinite_loop_times_out() {
+        let mut engine = module_engine();
+        let thrower = compile_ok(
+            &mut engine,
+            "https://example.test/t.js",
+            "throw new Error('boom'); export {};",
+        );
+        match engine.evaluate_module(thrower.id(), &EvaluateOptions::default()) {
+            Ok(ModuleEvaluation::Rejected { message }) => {
+                assert!(message.contains("boom"), "unexpected message: {message}")
+            }
+            other => panic!("expected Rejected, got: {other:?}"),
+        }
+        let looping = compile_ok(
+            &mut engine,
+            "https://example.test/l.js",
+            "while (true) {} export {};",
+        );
+        let options = EvaluateOptions::default().with_timeout(Duration::from_millis(200));
+        let started = std::time::Instant::now();
+        match engine.evaluate_module(looping.id(), &options) {
+            Err(JsEngineError::Timeout(msg)) => {
+                assert!(msg.contains("0.2 second"), "unexpected message: {msg}")
+            }
+            other => panic!("expected Timeout, got: {other:?}"),
+        }
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert_eq!(eval_str(&mut engine, "1 + 1"), JsValue::Number(2.0));
+    }
+
+    /// JS-6・Issue #1111: 投げられた値の `toString` が無限ループでも、メッセージの取り出しで
+    /// ユーザーコードを実行しないためハングしない。
+    #[test]
+    fn js_6_v8_module_thrown_object_with_hanging_tostring_does_not_hang() {
+        let mut engine = module_engine();
+        let record = compile_ok(
+            &mut engine,
+            "https://example.test/h.js",
+            "throw { toString() { while (true) {} } }; export {};",
+        );
+        let options = EvaluateOptions::default().with_timeout(Duration::from_secs(5));
+        let started = std::time::Instant::now();
+        match engine.evaluate_module(record.id(), &options) {
+            Ok(ModuleEvaluation::Rejected { .. }) => {}
+            other => panic!("expected Rejected, got: {other:?}"),
+        }
+        assert!(started.elapsed() < Duration::from_secs(3));
+    }
+
+    /// JS-4・Issue #1111: link 時の SyntaxError（存在しない export の import）も
+    /// `Rejected` になり、評価は走らない。
+    #[test]
+    fn js_4_v8_module_missing_export_is_rejected_at_instantiate() {
+        let mut engine = module_engine();
+        let dep = compile_ok(
+            &mut engine,
+            "https://example.test/d.js",
+            "export const d = 1;",
+        );
+        let root = compile_ok(
+            &mut engine,
+            "https://example.test/r.js",
+            "import { nope } from './d.js'; globalThis.ran = true;",
+        );
+        link_ok(&mut engine, &root, &[("./d.js", &dep)]);
+        match engine.evaluate_module(root.id(), &EvaluateOptions::default()) {
+            Ok(ModuleEvaluation::Rejected { message }) => {
+                assert!(message.contains("nope"), "unexpected message: {message}")
+            }
+            other => panic!("expected Rejected, got: {other:?}"),
+        }
+        assert_eq!(
+            eval_str(&mut engine, "typeof ran"),
+            JsValue::String("undefined".to_string())
+        );
+    }
+
+    /// JS-4・REPAIR-3・Issue #1111: 範囲外の構文（TLA・import attributes）と構文エラーは
+    /// compile の失敗になり、成功を装わない。失敗した compile は id を消費しない。
+    #[test]
+    fn js_4_v8_module_compile_rejects_unsupported_and_invalid_sources() {
+        let mut engine = module_engine();
+        assert!(matches!(
+            engine.compile_module(
+                "https://example.test/a.js",
+                "await 0; export {};",
+                MODULE_TIMEOUT
+            ),
+            Err(JsEngineError::NotYetImplemented(_))
+        ));
+        match engine.compile_module(
+            "https://example.test/j.js",
+            "import x from './a.json' with { type: 'json' }; export { x };",
+            MODULE_TIMEOUT,
+        ) {
+            Err(JsEngineError::EvaluationFailed(msg)) => {
+                assert_eq!(msg, "import attributes are not supported")
+            }
+            other => panic!("expected EvaluationFailed, got: {other:?}"),
+        }
+        match engine.compile_module(
+            "https://example.test/s.js",
+            "export const = ;",
+            MODULE_TIMEOUT,
+        ) {
+            Err(JsEngineError::EvaluationFailed(msg)) => {
+                assert!(msg.contains("SyntaxError"), "unexpected message: {msg}")
+            }
+            other => panic!("expected EvaluationFailed, got: {other:?}"),
+        }
+        let record = compile_ok(&mut engine, "https://example.test/ok.js", "export {};");
+        assert_eq!(record.id(), ModuleId::from_raw(1));
+    }
+
+    /// JS-6・Issue #1111: 依存の件数・specifier の長さ・ソース長・ゼロ timeout の上限は
+    /// 具体的な `Err` になり、エンジンは使い続けられる。
+    #[test]
+    fn js_6_v8_module_limits_are_enforced() {
+        let mut engine = module_engine();
+        let many: String = (0..=MAX_MODULE_REQUESTS)
+            .map(|i| format!("import './m{i}.js';\n"))
+            .collect();
+        assert!(matches!(
+            engine.compile_module("https://example.test/many.js", &many, MODULE_TIMEOUT),
+            Err(JsEngineError::ResourceLimitExceeded(_))
+        ));
+        let exactly: String = (0..MAX_MODULE_REQUESTS)
+            .map(|i| format!("import './m{i}.js';\n"))
+            .collect();
+        let record = compile_ok(&mut engine, "https://example.test/exact.js", &exactly);
+        assert_eq!(record.requests().len(), MAX_MODULE_REQUESTS);
+
+        let long = format!("import '{}';", "x".repeat(MAX_MODULE_SPECIFIER_BYTES + 1));
+        assert!(matches!(
+            engine.compile_module("https://example.test/long.js", &long, MODULE_TIMEOUT),
+            Err(JsEngineError::ResourceLimitExceeded(_))
+        ));
+        let oversized = " ".repeat(MAX_SCRIPT_SOURCE_BYTES + 1);
+        assert!(matches!(
+            engine.compile_module("https://example.test/big.js", &oversized, MODULE_TIMEOUT),
+            Err(JsEngineError::EvaluationFailed(_))
+        ));
+        match engine.compile_module("https://example.test/zero.js", "export {};", Duration::ZERO) {
+            Err(JsEngineError::Timeout(msg)) => assert_eq!(
+                msg,
+                "script compilation exceeded the 0 second timeout and was terminated"
+            ),
+            other => panic!("expected Timeout, got: {other:?}"),
+        }
+        assert_eq!(eval_str(&mut engine, "1 + 1"), JsValue::Number(2.0));
+    }
+
+    /// JS-6・Issue #1111: 登録できるモジュール数は `MAX_MODULES_PER_WORKER` まで。
+    /// 超過は `ResourceLimitExceeded`。登録済みのモジュールは残る。
+    #[test]
+    fn js_6_v8_module_count_limit_is_enforced() {
+        let mut engine = module_engine();
+        for _ in 0..MAX_MODULES_PER_WORKER {
+            compile_ok(&mut engine, "https://example.test/m.js", "export {};");
+        }
+        assert!(matches!(
+            engine.compile_module("https://example.test/m.js", "export {};", MODULE_TIMEOUT),
+            Err(JsEngineError::ResourceLimitExceeded(_))
+        ));
+        let last = ModuleId::from_raw(u32::try_from(MAX_MODULES_PER_WORKER).expect("fits in u32"));
+        assert_eq!(
+            engine
+                .evaluate_module(last, &EvaluateOptions::default())
+                .expect("module must evaluate"),
+            ModuleEvaluation::Fulfilled
+        );
+    }
+
+    /// JS-4・Issue #1111: モジュールを登録したままエンジンを drop しても落ちず、
+    /// 同じスレッドで作り直せる（スロットの `Global` が Isolate より先に解放される）。
+    #[test]
+    fn js_4_v8_module_engine_drop_with_registered_modules_does_not_crash() {
+        let mut engine = module_engine();
+        let a = compile_ok(
+            &mut engine,
+            "https://example.test/a.js",
+            "export const a = 1;",
+        );
+        let b = compile_ok(&mut engine, "https://example.test/b.js", "import './a.js';");
+        link_ok(&mut engine, &b, &[("./a.js", &a)]);
+        drop(engine);
+        let mut again = module_engine();
+        assert_eq!(eval_str(&mut again, "1 + 1"), JsValue::Number(2.0));
+    }
+
+    /// JS-4・Issue #1111 受け入れ条件 6: classic 評価とモジュール評価は同じグローバルを共有する。
+    #[test]
+    fn js_4_v8_module_and_classic_evaluation_share_the_global_context() {
+        let mut engine = module_engine();
+        eval_str(&mut engine, "var fromClassic = 5;");
+        let record = compile_ok(
+            &mut engine,
+            "https://example.test/g.js",
+            "globalThis.fromModule = fromClassic + 1; export {};",
+        );
+        assert_eq!(
+            engine
+                .evaluate_module(record.id(), &EvaluateOptions::default())
+                .expect("module must evaluate"),
+            ModuleEvaluation::Fulfilled
+        );
+        assert_eq!(eval_str(&mut engine, "fromModule"), JsValue::Number(6.0));
+    }
+
+    /// JS-4・REPAIR-3・Issue #1111: 動的 `import()` は host callback が無く解決されない。
+    /// 呼び出しは評価を止めず（`Fulfilled`）、`import()` の Promise は reject される。
+    /// 後続でエンジンは使い続けられる。動的 import の本対応は別 issue。
+    #[test]
+    fn js_4_v8_module_dynamic_import_call_is_not_resolved() {
+        let mut engine = module_engine();
+        let record = compile_ok(
+            &mut engine,
+            "https://example.test/d.js",
+            "globalThis.p = import('./nope.js'); export {};",
+        );
+        let result = engine
+            .evaluate_module(record.id(), &EvaluateOptions::default())
+            .expect("module must evaluate");
+        assert_eq!(result, ModuleEvaluation::Fulfilled);
+        assert_eq!(
+            eval_str(&mut engine, "p instanceof Promise"),
+            JsValue::Bool(true)
+        );
+        assert_eq!(eval_str(&mut engine, "1 + 1"), JsValue::Number(2.0));
+    }
+
+    /// JS-4・Issue #1111: 同じ specifier の import 宣言が複数あっても、依存は出現順の
+    /// 一意な一覧になる（名前付き import の分割・副作用 import との併用・`export from`）。
+    #[test]
+    fn js_4_v8_module_duplicate_import_declarations_collapse_to_unique_requests() {
+        let mut engine = module_engine();
+        let dep = compile_ok(
+            &mut engine,
+            "https://example.test/d.js",
+            "export const x = 1; export const y = 2;",
+        );
+        let root = compile_ok(
+            &mut engine,
+            "https://example.test/r.js",
+            "import { x } from './d.js'; import './o.js'; import { y } from './d.js'; \
+             export { x as x2 } from './d.js'; globalThis.sum = x + y;",
+        );
+        let specifiers: Vec<&str> = root.requests().iter().map(|r| r.specifier()).collect();
+        assert_eq!(specifiers, vec!["./d.js", "./o.js"]);
+        let other = compile_ok(&mut engine, "https://example.test/o.js", "export {};");
+        link_ok(&mut engine, &root, &[("./d.js", &dep), ("./o.js", &other)]);
+        assert_eq!(
+            engine
+                .evaluate_module(root.id(), &EvaluateOptions::default())
+                .expect("module must evaluate"),
+            ModuleEvaluation::Fulfilled
+        );
+        assert_eq!(eval_str(&mut engine, "sum"), JsValue::Number(3.0));
+        // 一意な件数が上限ちょうどなら、重複を足しても成功する。
+        let mut many: String = (0..MAX_MODULE_REQUESTS)
+            .map(|i| format!("import './m{i}.js';\n"))
+            .collect();
+        many.push_str("import './m0.js';\n");
+        let record = compile_ok(&mut engine, "https://example.test/many.js", &many);
+        assert_eq!(record.requests().len(), MAX_MODULE_REQUESTS);
+    }
+
+    /// JS-4・Issue #1111: 別の id への付け替えは拒否し、同じ対応の再 link は許す。
+    #[test]
+    fn js_4_v8_module_relink_to_another_module_is_rejected() {
+        let mut engine = module_engine();
+        let first = compile_ok(
+            &mut engine,
+            "https://example.test/a.js",
+            "export const v = 1;",
+        );
+        let second = compile_ok(
+            &mut engine,
+            "https://example.test/b.js",
+            "export const v = 2;",
+        );
+        let root = compile_ok(
+            &mut engine,
+            "https://example.test/r.js",
+            "import { v } from './x.js'; globalThis.got = v;",
+        );
+        link_ok(&mut engine, &root, &[("./x.js", &first)]);
+        link_ok(&mut engine, &root, &[("./x.js", &first)]);
+        let moved = ModuleResolution::new("./x.js".to_string(), second.id());
+        assert!(matches!(
+            engine.link_module(root.id(), &[moved]),
+            Err(JsEngineError::ModuleResolutionFailed(_))
+        ));
+        engine
+            .evaluate_module(root.id(), &EvaluateOptions::default())
+            .expect("module must evaluate");
+        assert_eq!(eval_str(&mut engine, "got"), JsValue::Number(1.0));
+    }
+
+    /// JS-4・REPAIR-3・Issue #1111: `import.meta` は未実装のため compile が
+    /// `NotYetImplemented`。`import.meta` を含まない通常のモジュール（`import(` や
+    /// `important` など）は影響を受けない。
+    #[test]
+    fn js_4_v8_module_import_meta_is_not_yet_implemented() {
+        let mut engine = module_engine();
+        for source in [
+            "globalThis.u = import.meta.url; export {};",
+            "globalThis.u = import . meta . url; export {};",
+            "globalThis.u = import/* c */.\n// c\nmeta.url; export {};",
+            "globalThis.u = import//c\r.meta.url; export {};",
+            "globalThis.u = import//c\u{2028}.meta.url; export {};",
+            "globalThis.u = import//c\u{2029}.meta.url; export {};",
+            "globalThis.u = import\u{b}.\u{c}meta.url; export {};",
+            "globalThis.u = import\u{a0}.\u{feff}meta.url; export {};",
+            "globalThis.u = import.\\u006deta.url; export {};",
+        ] {
+            match engine.compile_module("https://example.test/m.js", source, MODULE_TIMEOUT) {
+                Err(JsEngineError::NotYetImplemented(msg)) => assert!(msg.contains("import.meta")),
+                other => panic!("expected NotYetImplemented for {source:?}, got: {other:?}"),
+            }
+        }
+        // 拒否した compile は id を消費せず、通常のモジュールは評価できる。
+        let ok = compile_ok(
+            &mut engine,
+            "https://example.test/ok.js",
+            "const important = 1; globalThis.p = import('./x.js'); globalThis.m = important; export {};",
+        );
+        assert_eq!(ok.id(), ModuleId::from_raw(1));
+        engine
+            .evaluate_module(ok.id(), &EvaluateOptions::default())
+            .expect("module must evaluate");
+        assert_eq!(eval_str(&mut engine, "m"), JsValue::Number(1.0));
     }
 }

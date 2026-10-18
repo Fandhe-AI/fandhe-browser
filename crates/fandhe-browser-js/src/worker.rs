@@ -128,8 +128,8 @@ pub(crate) trait ChildEngine {
     // ---- ES module（`JS-4`・`REPAIR-3`・Issue #1114。設計 `es-module-design.md` §3）----
     //
     // 既定実装はすべて「未対応」を返す。モジュール評価を実装したエンジン
-    // （現状は boa の静的 import のみ）だけが上書きする。V8 は後続 issue
-    // （設計 §9 の 3〜5）まで既定実装のままで、成功を装わない。
+    // （boa・V8 の静的 import）が compile・link・evaluate を上書きする。動的
+    // `import()` の 2 操作は両エンジンとも未対応のままで、成功を装わない。
 
     /// ES module を compile し、依存の一覧を返す。
     fn compile_module(
@@ -197,6 +197,29 @@ impl ChildEngine for V8Engine {
         binding: &worker_protocol::DomLikeObjectBinding,
     ) -> Result<(), JsEngineError> {
         V8Engine::install_dom_like_object(self, binding)
+    }
+
+    fn compile_module(
+        &mut self,
+        request: &worker_protocol::module_frames::CompileModuleRequest,
+    ) -> Result<ModuleRecord, JsEngineError> {
+        V8Engine::compile_module(self, &request.url, &request.source, request.timeout)
+    }
+
+    fn link_module(
+        &mut self,
+        referrer: ModuleId,
+        resolutions: &[ModuleResolution],
+    ) -> Result<(), JsEngineError> {
+        V8Engine::link_module(self, referrer, resolutions)
+    }
+
+    fn evaluate_module(
+        &mut self,
+        root: ModuleId,
+        options: &EvaluateOptions,
+    ) -> Result<ModuleEvaluation, JsEngineError> {
+        V8Engine::evaluate_module(self, root, options)
     }
 }
 

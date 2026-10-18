@@ -29,8 +29,8 @@ use std::time::{Duration, Instant};
 use fandhe_browser_js::process_engine::{DomLikeMemberFn, ParentNativeFn};
 use fandhe_browser_js::process_engine::{V8ProcessEngine, WorkerSpawnConfigForTest};
 use fandhe_browser_js::{
-    DynamicImportId, EvaluateOptions, JsEngine, JsEngineError, JsValue, ModuleId, ModuleResolution,
-    NativeCallContext,
+    DynamicImportId, EvaluateOptions, JsEngine, JsEngineError, JsValue, ModuleEvaluation, ModuleId,
+    ModuleResolution, NativeCallContext,
 };
 
 /// `super::v8_engine::SCRIPT_EXECUTION_TIMEOUT`（子の watchdog。`pub(crate)`
@@ -96,8 +96,12 @@ fn main() -> ExitCode {
     js_1_handshake_failure_is_engine_unavailable();
     eprintln!("case: js_4_handshake_with_protocol_generation_5_fails");
     js_4_handshake_with_protocol_generation_5_fails();
-    eprintln!("case: js_4_module_frames_return_not_yet_implemented_from_current_worker");
-    js_4_module_frames_return_not_yet_implemented_from_current_worker();
+    eprintln!(
+        "case: js_4_module_frames_dispatch_to_v8_worker_and_dynamic_import_is_not_yet_implemented"
+    );
+    js_4_module_frames_dispatch_to_v8_worker_and_dynamic_import_is_not_yet_implemented();
+    eprintln!("case: js_4_module_graph_roundtrips_through_the_v8_worker");
+    js_4_module_graph_roundtrips_through_the_v8_worker();
     eprintln!("case: js_1_handshake_rejects_hello_naming_a_different_engine");
     js_1_handshake_rejects_hello_naming_a_different_engine();
     eprintln!("case: js_1_handshake_rejects_hello_with_wrong_length");
@@ -476,11 +480,11 @@ fn js_4_handshake_with_protocol_generation_5_fails() {
     }
 }
 
-/// JS-4・REPAIR-3・Issue #1110: モジュール API 5 メソッドの新フレームは現行の子に
-/// 届いて検証され、成功を装わず `NotYetImplemented` が返ること。子は生き続け
+/// JS-4・REPAIR-3・Issue #1110・#1111: モジュール API の新フレームは現行の子に届いて検証され、
+/// 静的 import の 3 操作は成功し、動的 import の 2 操作は成功を装わず `NotYetImplemented` が返ること。子は生き続け
 /// （pid が変わらない）、classic 評価は引き続き動く。また compile の事前検査
 /// （source の上限）は子を起動せずに `EvaluationFailed` にする。
-fn js_4_module_frames_return_not_yet_implemented_from_current_worker() {
+fn js_4_module_frames_dispatch_to_v8_worker_and_dynamic_import_is_not_yet_implemented() {
     let options = EvaluateOptions::default();
 
     // 事前検査: 子の起動前に弾く。
@@ -514,14 +518,20 @@ fn js_4_module_frames_return_not_yet_implemented_from_current_worker() {
         "the child must be running after an evaluation"
     );
 
+    // 静的 import の 3 操作は V8 で実装済み（Issue #1111）。動的 import の 2 操作は未対応のまま。
+    let record = engine
+        .compile_module("https://example.test/a.js", "export const a = 1;")
+        .expect("compile_module must succeed");
+    engine
+        .link_module(record.id(), &[])
+        .expect("link_module must succeed");
+    assert_eq!(
+        engine
+            .evaluate_module(record.id(), &options)
+            .expect("evaluate_module must succeed"),
+        ModuleEvaluation::Fulfilled
+    );
     let results = [
-        engine
-            .compile_module("https://example.test/a.js", "export const a = 1;")
-            .map(|_| ()),
-        engine.link_module(ModuleId::from_raw(1), &[]),
-        engine
-            .evaluate_module(ModuleId::from_raw(1), &options)
-            .map(|_| ()),
         engine.take_dynamic_import_requests().map(|_| ()),
         engine.finish_dynamic_import(DynamicImportId::from_raw(1), Err("failed".to_string())),
     ];
@@ -545,6 +555,150 @@ fn js_4_module_frames_return_not_yet_implemented_from_current_worker() {
         engine.worker_pid_for_test(),
         pid,
         "the child must survive NotYetImplemented responses"
+    );
+}
+
+/// JS-4・JS-6・Issue #1111 受け入れ条件 1〜6: 実際の V8 子プロセスで、静的 import のグラフ
+/// （循環を含む）を compile → link → evaluate し、評価結果がグローバルに反映されること。
+/// 未 link・未知 id は `ModuleResolutionFailed`、例外は `Rejected`、無限ループは `Timeout`。
+/// どの失敗でも子（pid）は変わらず、classic 評価と状態を共有する。
+fn js_4_module_graph_roundtrips_through_the_v8_worker() {
+    let options = EvaluateOptions::default();
+    let mut engine = V8ProcessEngine::new();
+    assert_eq!(
+        JsEngine::evaluate_script(&mut engine, "var base = 100;", &options).expect("eval"),
+        JsValue::Undefined
+    );
+    let pid = engine.worker_pid_for_test();
+
+    // 1: classic では SyntaxError になるソースが、モジュールとしては成功する。
+    let source = "const next = base + 1; globalThis.single = next; export { next as exported };";
+    match JsEngine::evaluate_script(&mut engine, source, &options) {
+        Err(JsEngineError::EvaluationFailed(_)) => {}
+        other => panic!("expected a classic SyntaxError, got: {other:?}"),
+    }
+    let single = engine
+        .compile_module("https://example.test/single.js", source)
+        .expect("compile");
+    assert_eq!(
+        engine.evaluate_module(single.id(), &options).expect("eval"),
+        ModuleEvaluation::Fulfilled
+    );
+    assert_eq!(
+        JsEngine::evaluate_script(&mut engine, "single", &options).expect("eval"),
+        JsValue::Number(101.0)
+    );
+
+    // 2: トップレベルの this は undefined。
+    let strict = engine
+        .compile_module(
+            "https://example.test/strict.js",
+            "globalThis.t = this === undefined; export {};",
+        )
+        .expect("compile");
+    engine.evaluate_module(strict.id(), &options).expect("eval");
+    assert_eq!(
+        JsEngine::evaluate_script(&mut engine, "t", &options).expect("eval"),
+        JsValue::Bool(true)
+    );
+
+    // 3: 3 段のグラフ。b と c の間は循環。
+    let c = engine
+        .compile_module(
+            "https://example.test/c.js",
+            "import { fb } from './b.js'; order.push('c'); export const c = 3; \
+             export const viaB = () => fb();",
+        )
+        .expect("compile c");
+    let b = engine
+        .compile_module(
+            "https://example.test/b.js",
+            "import { c } from './c.js'; globalThis.order = ['b']; export const fb = () => c * 10;",
+        )
+        .expect("compile b");
+    let a = engine
+        .compile_module(
+            "https://example.test/a.js",
+            "import { viaB } from './c.js'; order.push('a'); globalThis.total = viaB() + 1;",
+        )
+        .expect("compile a");
+    assert_eq!(a.requests().len(), 1);
+    assert_eq!(a.requests()[0].specifier(), "./c.js");
+
+    // 4: 未 link のまま・未知の id は ModuleResolutionFailed。
+    match engine.evaluate_module(a.id(), &options) {
+        Err(JsEngineError::ModuleResolutionFailed(_)) => {}
+        other => panic!("expected ModuleResolutionFailed for an unlinked graph, got: {other:?}"),
+    }
+    match engine.link_module(
+        a.id(),
+        &[ModuleResolution::new(
+            "./c.js".to_string(),
+            ModuleId::from_raw(9999),
+        )],
+    ) {
+        Err(JsEngineError::ModuleResolutionFailed(_)) => {}
+        other => panic!("expected ModuleResolutionFailed for an unknown target, got: {other:?}"),
+    }
+    engine
+        .link_module(
+            a.id(),
+            &[ModuleResolution::new("./c.js".to_string(), c.id())],
+        )
+        .expect("link a");
+    engine
+        .link_module(
+            c.id(),
+            &[ModuleResolution::new("./b.js".to_string(), b.id())],
+        )
+        .expect("link c");
+    engine
+        .link_module(
+            b.id(),
+            &[ModuleResolution::new("./c.js".to_string(), c.id())],
+        )
+        .expect("link b");
+    assert_eq!(
+        engine.evaluate_module(a.id(), &options).expect("eval"),
+        ModuleEvaluation::Fulfilled
+    );
+    assert_eq!(
+        JsEngine::evaluate_script(&mut engine, "order.join(',') + ':' + total", &options)
+            .expect("eval"),
+        JsValue::String("b,c,a:31".to_string())
+    );
+
+    // 5: 評価時の例外は Rejected、無限ループは Timeout。
+    let thrower = engine
+        .compile_module(
+            "https://example.test/t.js",
+            "throw new Error('boom'); export {};",
+        )
+        .expect("compile");
+    match engine.evaluate_module(thrower.id(), &options) {
+        Ok(ModuleEvaluation::Rejected { message, .. }) => {
+            assert!(message.contains("boom"), "unexpected message: {message}")
+        }
+        other => panic!("expected Rejected, got: {other:?}"),
+    }
+    let looping = engine
+        .compile_module("https://example.test/l.js", "while (true) {} export {};")
+        .expect("compile");
+    let short = EvaluateOptions::default().with_timeout(Duration::from_millis(300));
+    match engine.evaluate_module(looping.id(), &short) {
+        Err(JsEngineError::Timeout(_)) => {}
+        other => panic!("expected Timeout, got: {other:?}"),
+    }
+
+    // 6: 子は生き続け、classic 評価も動く。
+    assert_eq!(
+        JsEngine::evaluate_script(&mut engine, "base + 1", &options).expect("eval"),
+        JsValue::Number(101.0)
+    );
+    assert_eq!(
+        engine.worker_pid_for_test(),
+        pid,
+        "the child must survive module failures"
     );
 }
 

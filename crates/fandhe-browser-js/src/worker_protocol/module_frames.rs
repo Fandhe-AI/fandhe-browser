@@ -5,7 +5,7 @@
 //! 呼び出し元: 親側の [`super::super::process_engine`]（`JsEngine` のモジュール
 //! 評価 API 5 メソッドを新フレームの送受信へ対応づける）と、子側の
 //! [`super::super::worker`]（新 tag を検証して `ChildEngine` へ dispatch する。
-//! boa は静的 import のグラフを評価し、V8・動的 import・TLA は「未対応」の
+//! boa・V8 は静的 import のグラフを評価し、動的 import・TLA は「未対応」の
 //! `ERROR` を返す）。`v8` crate には依存しない（テストも feature
 //! なしで動く）。
 //!
