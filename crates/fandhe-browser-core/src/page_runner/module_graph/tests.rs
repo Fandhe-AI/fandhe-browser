@@ -223,6 +223,11 @@ impl JsEngine for FakeModuleEngine {
         let (line, settlement) = match result {
             Ok(target) => {
                 let src = log.sources.get(&target.raw()).cloned().unwrap_or_default();
+                if src.contains("settle-timeout") {
+                    // 評価に入った後の時間切れ（エンジンが reject 済みで打ち切る）の模擬。
+                    log.events.push(format!("finish:{}:timeout", id.raw()));
+                    return Err(JsEngineError::Timeout("finish timeout".to_string()));
+                }
                 let settlement = if src.contains("settle-throw") {
                     ModuleEvaluation::rejected("boom".to_string())
                 } else if src.contains("settle-pending") {
@@ -1430,4 +1435,25 @@ fn js_6_dynamic_import_requests_left_when_clock_expired_are_counted_and_aborted(
             limit
         })]
     );
+}
+
+/// `JS-6`・Issue #1117: 残りのページ時間がスクリプト上限を下回る状態で、完了の評価が実際に
+/// タイムアウトした場合は reject 済みのため、`rejected` と `Limit(WallTime)` に計上して打ち切る。
+#[test]
+fn js_6_dynamic_import_page_scope_eval_timeout_is_counted_rejected() {
+    let (port, _hits) = spawn_server(|_| js("settle-timeout"));
+    let html = "<script type=module>dynamic \"/c.js\"</script>";
+    let limit = Duration::from_secs(3);
+    let opts = module_options()
+        .with_script_wall_time(Duration::from_secs(60))
+        .with_page_wall_time(limit);
+    let (out, _log) = run(html, port, &opts);
+    let kind = AbortKind::WallTime {
+        scope: WallTimeScope::Page,
+        limit,
+    };
+    assert_eq!(out.abort().map(|a| a.kind().clone()), Some(kind.clone()));
+    let r = out.dynamic_imports();
+    assert_eq!((r.requested(), r.fulfilled(), r.rejected()), (1, 0, 1));
+    assert_eq!(r.failures(), &[DynamicImportFailureKind::Limit(kind)]);
 }

@@ -1042,6 +1042,15 @@ pub(super) async fn pump_one_dynamic_import(
         ))
     );
     // ページの実時間が尽きたときは JS を走らせない。それ以外は reject してから打ち切る。
+    // 評価に入る前にページ時間が尽きていたか（JS 未実行）。実際に評価して Page 側の時間切れに
+    // なった場合は reject 済みのため、この判定には含めない。
+    let js_skipped = page_wall
+        || script_budget(
+            ctx.options.script_wall_time,
+            ctx.options.page_wall_time,
+            ctx.page_start.elapsed(),
+        )
+        .is_none();
     let finished = if page_wall {
         Err(page_clock_abort(ctx))
     } else {
@@ -1060,14 +1069,8 @@ pub(super) async fn pump_one_dynamic_import(
         }
         (_, Err(GraphError::Abort(kind, _))) => {
             // 評価中の予算超過など、エンジンが reject して打ち切ったものは reject として数える。
-            // ページの実時間切れは JS を走らせず reject もしないため数えない。
-            if !matches!(
-                &kind,
-                AbortKind::WallTime {
-                    scope: WallTimeScope::Page,
-                    ..
-                }
-            ) {
+            // 評価に入る前にページの実時間が尽きた場合だけは JS を走らせず reject もしないため数えない。
+            if !js_skipped {
                 report.rejected = report.rejected.saturating_add(1);
                 report
                     .failures
