@@ -2715,7 +2715,7 @@ impl JsEngine for V8ProcessEngine {
             .map_err(module_request_rejected)?;
         let budget =
             worker_protocol::wire_timeout(&module_default_options()).saturating_add(EVALUATE_GRACE);
-        self.module_roundtrip(
+        let outcome = self.module_roundtrip(
             ModuleRoundtrip {
                 frame_tag: tag::FINISH_DYNAMIC_IMPORT,
                 budget,
@@ -2733,7 +2733,15 @@ impl JsEngine for V8ProcessEngine {
                 }
                 (outcome, keep)
             },
-        )
+        );
+        // 子は実行前に完了待ちから id を外すため、Timeout 応答でも子の保留は残らない。
+        // 親の台帳も外し、後続の take で上限超過（プロトコル違反）にならないようにする。
+        if matches!(outcome, Err(JsEngineError::Timeout(_)))
+            && let Some(worker) = self.worker.as_mut()
+        {
+            worker.modules.complete_dynamic_import(id);
+        }
+        outcome
     }
 }
 

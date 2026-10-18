@@ -104,6 +104,8 @@ fn main() -> ExitCode {
     js_4_module_graph_roundtrips_through_the_v8_worker();
     eprintln!("case: js_4_dynamic_import_roundtrips_through_the_v8_worker");
     js_4_dynamic_import_roundtrips_through_the_v8_worker();
+    eprintln!("case: js_6_dynamic_import_timeout_keeps_parent_and_child_ledgers_in_sync");
+    js_6_dynamic_import_timeout_keeps_parent_and_child_ledgers_in_sync();
     eprintln!("case: js_4_module_import_meta_url_and_promise_states_through_the_v8_worker");
     js_4_module_import_meta_url_and_promise_states_through_the_v8_worker();
     eprintln!("case: js_1_handshake_rejects_hello_naming_a_different_engine");
@@ -762,6 +764,55 @@ fn js_4_dynamic_import_roundtrips_through_the_v8_worker() {
         pid,
         "the child must survive dynamic import completion"
     );
+}
+
+/// JS-6・JS-4・Issue #1113: 動的 import の完了が `Timeout` になっても、親子の台帳が揃い
+/// （直後に 256 件を取り出してもプロトコル違反にならず子は同じ pid）、`import()` の Promise は
+/// reject されて `catch` に届くこと。
+fn js_6_dynamic_import_timeout_keeps_parent_and_child_ledgers_in_sync() {
+    let options = EvaluateOptions::default();
+    let mut engine = V8ProcessEngine::new();
+    let root = engine
+        .compile_module(
+            "https://example.test/app/main.js",
+            "globalThis.caught = 'no'; \
+             import('./spin.js').catch(() => { globalThis.caught = 'yes'; }); export {};",
+        )
+        .expect("compile root");
+    assert_eq!(
+        engine.evaluate_module(root.id(), &options).expect("eval"),
+        ModuleEvaluation::Fulfilled
+    );
+    let pid = engine.worker_pid_for_test();
+    let requests = engine.take_dynamic_import_requests().expect("take");
+    assert_eq!(requests.len(), 1);
+    let spin = engine
+        .compile_module("https://example.test/app/spin.js", "for (;;) {} export {};")
+        .expect("compile spin");
+    engine.link_module(spin.id(), &[]).expect("link spin");
+    match engine.finish_dynamic_import(requests[0].id(), Ok(spin.id())) {
+        Err(JsEngineError::Timeout(_)) => {}
+        other => panic!("expected Timeout, got: {other:?}"),
+    }
+    assert_eq!(
+        JsEngine::evaluate_script(&mut engine, "caught", &options).expect("eval"),
+        JsValue::String("yes".to_string())
+    );
+    let batch = engine
+        .compile_module(
+            "https://example.test/app/batch.js",
+            "for (let i = 0; i < 256; i++) { import('./m' + i + '.js').catch(() => {}); } export {};",
+        )
+        .expect("compile batch");
+    assert_eq!(
+        engine.evaluate_module(batch.id(), &options).expect("eval"),
+        ModuleEvaluation::Fulfilled
+    );
+    assert_eq!(
+        engine.take_dynamic_import_requests().expect("take").len(),
+        256
+    );
+    assert_eq!(engine.worker_pid_for_test(), pid);
 }
 
 /// JS-4・REPAIR-3・Issue #1112: 実際の V8 子プロセスで、静的 import 先を含む

@@ -2398,7 +2398,8 @@ impl V8Engine {
     /// - `Ok(target)` は instantiate・evaluate し、評価 Promise の `then` で名前空間へ解決する
     ///   （評価が reject・top-level await で保留でも仕様どおりに伝播する）
     /// - そのあと microtask checkpoint を行い（利用者の `then`・`catch` が走る）、監視は
-    ///   [`SCRIPT_EXECUTION_TIMEOUT`]。超過は `Timeout`（エントリは完了済みとして扱う）
+    ///   [`SCRIPT_EXECUTION_TIMEOUT`]。超過は `Timeout`（エントリは完了済みとして扱い、
+    ///   未確定の Promise は reject する。親は `Timeout` 応答でも台帳から外す）
     pub(crate) fn finish_dynamic_import(
         &mut self,
         id: DynamicImportId,
@@ -2436,6 +2437,10 @@ impl V8Engine {
         let was_terminated = tc.has_terminated();
         tc.cancel_terminate_execution();
         if was_terminated {
+            // 実行を打ち切られた場合、resolver が未確定のままだと `import()` の Promise が
+            // 永久に pending になる（エントリは取り出し済みで再 finish もできない）。
+            // 終了要求を解除したあとで reject する（確定済みなら no-op）。
+            reject_with_message(&tc, resolver, "dynamic import timed out");
             return Err(V8Failure::Terminated {
                 stage: "execution",
                 timeout: SCRIPT_EXECUTION_TIMEOUT,
@@ -4647,6 +4652,32 @@ mod tests {
             other => panic!("expected Timeout, got: {other:?}"),
         }
         assert_eq!(eval_str(&mut engine, "1 + 1"), JsValue::Number(2.0));
+    }
+
+    /// JS-6・Issue #1113: 完了中にウォッチドッグが発火しても `import()` の Promise は
+    /// reject され、`catch` に届く（pending のまま残らない）。
+    #[test]
+    fn js_6_v8_finish_dynamic_import_timeout_rejects_the_promise() {
+        let mut engine = module_engine();
+        eval_module_source(
+            &mut engine,
+            "https://example.test/d.js",
+            "globalThis.c = 'no'; import('./x.js').catch(() => { globalThis.c = 'yes'; }); export {};",
+        );
+        let requests = engine.take_dynamic_import_requests().expect("take");
+        let target = compile_ok(
+            &mut engine,
+            "https://example.test/x.js",
+            "for (;;) {} export {};",
+        );
+        match engine.finish_dynamic_import(requests[0].id(), Ok(target.id())) {
+            Err(JsEngineError::Timeout(_)) => {}
+            other => panic!("expected Timeout, got: {other:?}"),
+        }
+        assert_eq!(
+            eval_str(&mut engine, "c"),
+            JsValue::String("yes".to_string())
+        );
     }
 
     /// JS-4・Issue #1113: 保留を残したままエンジンを drop しても落ちず、作り直せる。
