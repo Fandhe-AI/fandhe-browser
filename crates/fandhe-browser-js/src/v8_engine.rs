@@ -1773,6 +1773,9 @@ struct ModuleMap {
     /// 取り出し済みで、`finish_dynamic_import` を待っている動的 import の resolver。
     /// 子を再起動すると Isolate ごとこのキューも失われ、再登録はしない（設計 §3）。
     awaiting_dynamic: HashMap<u32, v8::Global<v8::PromiseResolver>>,
+    /// 評価を始め、評価 Promise の成否ハンドラーによる確定を待つ resolver。タイムアウト時は
+    /// `finish_dynamic_import` が取り出して reject する。
+    settling_dynamic: HashMap<u32, v8::Global<v8::PromiseResolver>>,
 }
 
 /// 動的 `import()` 1 件の保留エントリ（未取得）。
@@ -1792,6 +1795,7 @@ impl ModuleMap {
             next_dynamic_id: 1,
             queued_dynamic: VecDeque::new(),
             awaiting_dynamic: HashMap::new(),
+            settling_dynamic: HashMap::new(),
         }
     }
 
@@ -2013,7 +2017,9 @@ fn admit_dynamic_import(
         return Err("module map is unavailable");
     };
     // 未取得と完了待ちの合計で数える（親の台帳の数え方と揃える）。
-    if map.queued_dynamic.len() + map.awaiting_dynamic.len() >= MAX_PENDING_DYNAMIC_IMPORTS {
+    if map.queued_dynamic.len() + map.awaiting_dynamic.len() + map.settling_dynamic.len()
+        >= MAX_PENDING_DYNAMIC_IMPORTS
+    {
         return Err("too many pending dynamic imports");
     }
     if map.next_dynamic_id.checked_add(1).is_none() {
@@ -2045,14 +2051,56 @@ fn reject_with_message(
     }
 }
 
-/// `data` に束ねた値（モジュール名前空間）をそのまま返す関数の本体。評価 Promise の
-/// `then` に渡し、解決値を名前空間に差し替える（`finish_dynamic_import`）。
-fn return_bound_data(
-    _scope: &mut v8::PinScope<'_, '_>,
+/// 評価 Promise の fulfilled ハンドラー。`data` は `[id, namespace]` で、`settling_dynamic`
+/// から resolver を取り出し、`import()` の Promise を名前空間で解決する
+/// （`finish_dynamic_import`・JS-4）。
+fn dynamic_import_fulfilled(
+    scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,
-    mut rv: v8::ReturnValue<'_, v8::Value>,
+    _rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    rv.set(args.data());
+    let Ok(data) = v8::Local::<v8::Array>::try_from(args.data()) else {
+        return;
+    };
+    let (Some(id), Some(namespace)) = (data.get_index(scope, 0), data.get_index(scope, 1)) else {
+        return;
+    };
+    let Some(global) = take_settling_resolver(scope, id) else {
+        return;
+    };
+    let resolver = v8::Local::new(scope, &global);
+    let _ = resolver.resolve(scope, namespace);
+}
+
+/// 評価 Promise の rejected ハンドラー。`import()` の Promise を同じ理由で reject する。
+fn dynamic_import_rejected(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    _rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let Ok(data) = v8::Local::<v8::Array>::try_from(args.data()) else {
+        return;
+    };
+    let Some(id) = data.get_index(scope, 0) else {
+        return;
+    };
+    let Some(global) = take_settling_resolver(scope, id) else {
+        return;
+    };
+    let resolver = v8::Local::new(scope, &global);
+    let _ = resolver.reject(scope, args.get(0));
+}
+
+/// `id`（数値）に対応する確定待ち resolver を `settling_dynamic` から取り出す。
+fn take_settling_resolver(
+    scope: &mut v8::PinScope<'_, '_>,
+    id: v8::Local<'_, v8::Value>,
+) -> Option<v8::Global<v8::PromiseResolver>> {
+    let id = id.uint32_value(scope)?;
+    scope
+        .get_slot_mut::<ModuleMap>()?
+        .settling_dynamic
+        .remove(&id)
 }
 
 /// 重複込みの import 宣言数の上限（走査・確保コストの上限。`MAX_MODULE_REQUESTS` は一意な件数）。
@@ -2431,7 +2479,7 @@ impl V8Engine {
 
         let resolver = v8::Local::new(&tc, &resolver_global);
         let watchdog = Watchdog::start(isolate_handle, SCRIPT_EXECUTION_TIMEOUT);
-        Self::settle_dynamic_import(&mut tc, resolver, result);
+        Self::settle_dynamic_import(&mut tc, id.raw(), resolver, result);
         run_microtask_checkpoint(&mut tc);
         watchdog.stop();
         let was_terminated = tc.has_terminated();
@@ -2440,6 +2488,9 @@ impl V8Engine {
             // 実行を打ち切られた場合、resolver が未確定のままだと `import()` の Promise が
             // 永久に pending になる（エントリは取り出し済みで再 finish もできない）。
             // 終了要求を解除したあとで reject する（確定済みなら no-op）。
+            if let Some(map) = tc.get_slot_mut::<ModuleMap>() {
+                map.settling_dynamic.remove(&id.raw());
+            }
             reject_with_message(&tc, resolver, "dynamic import timed out");
             return Err(V8Failure::Terminated {
                 stage: "execution",
@@ -2453,6 +2504,7 @@ impl V8Engine {
     /// 保留中の Promise を reject または名前空間で解決する（監視スレッドが生きている間に呼ぶ）。
     fn settle_dynamic_import(
         tc: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
+        id: u32,
         resolver: v8::Local<v8::PromiseResolver>,
         result: Result<ModuleId, String>,
     ) {
@@ -2489,18 +2541,31 @@ impl V8Engine {
             return;
         };
         let namespace = module.get_module_namespace();
+        // resolver は評価 Promise の成否ハンドラーからだけ確定する。checkpoint 前に
+        // `resolver.resolve(promise)` で Promise を採用させると、タイムアウトで評価の継続が
+        // 失われたとき `import()` の Promise を reject できなくなるため。
         let promise = v8::Local::<v8::Promise>::try_from(value).ok();
-        let handler = v8::Function::builder(return_bound_data)
-            .data(namespace)
+        let id_value: v8::Local<v8::Value> = v8::Number::new(tc, f64::from(id)).into();
+        let data = v8::Array::new_with_elements(tc, &[id_value, namespace]);
+        let global = v8::Global::new(tc, resolver);
+        if let Some(map) = tc.get_slot_mut::<ModuleMap>() {
+            map.settling_dynamic.insert(id, global);
+        }
+        let on_fulfilled = v8::Function::builder(dynamic_import_fulfilled)
+            .data(data.into())
             .build(tc);
-        let chained = promise
-            .zip(handler)
-            .and_then(|(promise, handler)| promise.then(tc, handler));
-        match chained {
-            Some(chained) => {
-                let _ = resolver.resolve(tc, chained.into());
+        let on_rejected = v8::Function::builder(dynamic_import_rejected)
+            .data(data.into())
+            .build(tc);
+        let attached = promise
+            .zip(on_fulfilled)
+            .zip(on_rejected)
+            .and_then(|((promise, f), r)| promise.then2(tc, f, r));
+        if attached.is_none() {
+            if let Some(map) = tc.get_slot_mut::<ModuleMap>() {
+                map.settling_dynamic.remove(&id);
             }
-            None => reject_with_message(tc, resolver, "module evaluation did not return a promise"),
+            reject_with_message(tc, resolver, "module evaluation did not return a promise");
         }
     }
 
@@ -4669,6 +4734,32 @@ mod tests {
             &mut engine,
             "https://example.test/x.js",
             "for (;;) {} export {};",
+        );
+        match engine.finish_dynamic_import(requests[0].id(), Ok(target.id())) {
+            Err(JsEngineError::Timeout(_)) => {}
+            other => panic!("expected Timeout, got: {other:?}"),
+        }
+        assert_eq!(
+            eval_str(&mut engine, "c"),
+            JsValue::String("yes".to_string())
+        );
+    }
+
+    /// JS-6・Issue #1113: top-level await の後に無限ループする対象でも、タイムアウト後に
+    /// `import()` の Promise は reject され `catch` に届く。
+    #[test]
+    fn js_6_v8_finish_dynamic_import_timeout_after_tla_rejects_the_promise() {
+        let mut engine = module_engine();
+        eval_module_source(
+            &mut engine,
+            "https://example.test/d.js",
+            "globalThis.c = 'no'; import('./x.js').catch(() => { globalThis.c = 'yes'; }); export {};",
+        );
+        let requests = engine.take_dynamic_import_requests().expect("take");
+        let target = compile_ok(
+            &mut engine,
+            "https://example.test/x.js",
+            "await Promise.resolve(); for (;;) {} export {};",
         );
         match engine.finish_dynamic_import(requests[0].id(), Ok(target.id())) {
             Err(JsEngineError::Timeout(_)) => {}
