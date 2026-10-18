@@ -14,8 +14,12 @@
 //!   `<script>` は、パーサーが noscript を閉じて head の子にするため除外できない
 //!   （既知の制約。`scripting_enabled` を切り替えたパースは本タスクの範囲外）。
 //! - `type` は WHATWG の JavaScript MIME type essence 一覧（`text/javascript` 等）、
-//!   未指定、空のとき classic として収集する。`module` は収集せず
-//!   [`ScriptDiagnosticKind::SkippedModule`]、その他は
+//!   未指定、空のとき classic として収集する。`module` は、module 実行の gate
+//!   （[`ScriptCollectionOptions::execute_modules`]。既定 off）が無効なら収集せず
+//!   [`ScriptDiagnosticKind::SkippedModule`] を残し、有効なら [`ScriptKind::Module`] として
+//!   classic と同じ文書順に収集する（#1115・設計 `es-module-design.md` §8）。gate 有効時は
+//!   `nomodule` 付き classic を [`ScriptDiagnosticKind::SkippedNomodule`] で skip する
+//!   （`type=module nomodule` は仕様どおり module として収集する）。その他の型は
 //!   [`ScriptDiagnosticKind::SkippedUnsupportedType`] を診断に残す（`JS-4`。未知の型は
 //!   実行しない側に倒す）。
 //! - `src` は inline 本文より優先し、値は未検証の生の文字列として保持する。
@@ -27,7 +31,10 @@
 //!
 //! - スクリプトの評価、`src` の URL 検証・取得（`Fetcher` 経由のみ。`JS-8`）、総バイト上限、
 //!   DOMContentLoaded / load の発火（いずれも [`crate::page_runner`] の担当。#780・#781 で実装済み）。
-//! - SVG の `<script>`、`language` 属性、`type=module`・import map の実行、
+//! - `type=module` の評価は [`crate::page_runner`] の担当（#1116 以降）。設定ファイル・
+//!   `Page.navigate` への gate の配線は #1118。module の実行順は初版では文書順のまま
+//!   （仕様は defer 相当。差分は REPAIR-3 として許容）。
+//! - SVG の `<script>`、`language` 属性、import map、
 //!   `crossorigin`・`integrity`・`referrerpolicy`、`charset`、`document.write` で
 //!   挿入されるスクリプト。
 //! - 設定ファイルからの上限値の読み込み（TASK-112）と、可観測性（`OperationRecorder`）
@@ -69,6 +76,7 @@ const JS_MIME_ESSENCES: &[&str] = &[
 pub struct ScriptCollectionOptions {
     max_scripts: usize,
     max_inline_bytes: usize,
+    execute_modules: bool,
 }
 
 impl Default for ScriptCollectionOptions {
@@ -76,6 +84,7 @@ impl Default for ScriptCollectionOptions {
         Self {
             max_scripts: DEFAULT_MAX_PAGE_SCRIPTS,
             max_inline_bytes: DEFAULT_MAX_INLINE_SCRIPT_BYTES,
+            execute_modules: false,
         }
     }
 }
@@ -91,6 +100,26 @@ impl ScriptCollectionOptions {
     pub fn with_max_inline_bytes(mut self, max_inline_bytes: usize) -> Self {
         self.max_inline_bytes = max_inline_bytes;
         self
+    }
+
+    /// module 実行の gate を切り替える（既定 off。`JS-4`・#1115）。
+    ///
+    /// 有効時は `type=module` を [`ScriptKind::Module`] として収集し、`nomodule` 付き
+    /// classic を skip する。収集した module は classic と同じ `max_scripts` 枠・
+    /// `max_inline_bytes` の対象で、専用の件数上限は設けない（設計 §7 は #1116 で再検討）。
+    ///
+    /// 注意（REPAIR-3）: [`crate::page_runner`] は #1116 までは [`ScriptEntry::kind`] を見ず
+    /// 全エントリを classic として評価するため、有効化した options をランナーへ渡すと
+    /// module が構文エラーになる。設定ファイル・`Page.navigate` には未配線（#1118）で、
+    /// 既定 off のため既存の挙動と `AISNAP-1`・`PLUG-4` の測定は変わらない。
+    pub fn with_execute_modules(mut self, execute_modules: bool) -> Self {
+        self.execute_modules = execute_modules;
+        self
+    }
+
+    /// module 実行の gate。
+    pub fn execute_modules(&self) -> bool {
+        self.execute_modules
     }
 
     /// 収集件数の上限。
@@ -115,6 +144,28 @@ pub enum ScriptSource {
     External(String),
 }
 
+/// 収集した `<script>` の種別（#1115）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ScriptKind {
+    /// classic script。
+    Classic,
+    /// `type=module`。gate（[`ScriptCollectionOptions::execute_modules`]）有効時のみ収集される。
+    /// 並びは文書順のまま（仕様は defer 相当。REPAIR-3）。inline module の referrer
+    /// （文書の base URL）の解決は URL を持たない収集器では行わず、#1116 の担当。
+    Module,
+}
+
+impl ScriptKind {
+    /// ログ・診断で使う安定した表記。
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Classic => "classic",
+            Self::Module => "module",
+        }
+    }
+}
+
 /// 収集した実行対象の `<script>` 1 件。
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
@@ -125,6 +176,7 @@ pub struct ScriptEntry {
     is_async: bool,
     is_defer: bool,
     is_nomodule: bool,
+    kind: ScriptKind,
     type_attr: Option<String>,
 }
 
@@ -155,7 +207,13 @@ impl ScriptEntry {
         self.is_defer
     }
 
-    /// `nomodule` 属性の有無。module を実行しない本実装では収集対象に含める。
+    /// 種別。gate 無効時は常に [`ScriptKind::Classic`]。
+    pub fn kind(&self) -> ScriptKind {
+        self.kind
+    }
+
+    /// `nomodule` 属性の有無。gate 無効時は `nomodule` 付き classic も収集対象に含め、
+    /// 有効時は classic 側を skip する（`type=module nomodule` は module として残る）。
     pub fn is_nomodule(&self) -> bool {
         self.is_nomodule
     }
@@ -170,8 +228,10 @@ impl ScriptEntry {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ScriptDiagnosticKind {
-    /// `type=module` をスキップした。
+    /// module 実行の gate が無効のため `type=module` をスキップした。
     SkippedModule,
+    /// module 実行の gate が有効のため `nomodule` 付き classic をスキップした。
+    SkippedNomodule,
     /// JavaScript 以外の `type` をスキップした。
     SkippedUnsupportedType,
     /// 件数上限を超えた分を収集しなかった。
@@ -187,6 +247,7 @@ impl ScriptDiagnosticKind {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::SkippedModule => "skipped_module",
+            Self::SkippedNomodule => "skipped_nomodule",
             Self::SkippedUnsupportedType => "skipped_unsupported_type",
             Self::ScriptLimitExceeded => "script_limit_exceeded",
             Self::InlineScriptTooLarge => "inline_script_too_large",
@@ -380,7 +441,8 @@ pub fn collect_page_scripts(
         out.seen_scripts = out.seen_scripts.saturating_add(1);
 
         let type_attr = document.attribute(id, "type");
-        match classify_type(type_attr) {
+        let kind = match classify_type(type_attr) {
+            ScriptType::Module if options.execute_modules => ScriptKind::Module,
             ScriptType::Module => {
                 out.push_diagnostic(diagnostic(
                     ScriptDiagnosticKind::SkippedModule,
@@ -401,8 +463,20 @@ pub fn collect_page_scripts(
                 ));
                 continue;
             }
-            ScriptType::Classic => {}
-        }
+            ScriptType::Classic
+                if options.execute_modules && document.attribute(id, "nomodule").is_some() =>
+            {
+                out.push_diagnostic(diagnostic(
+                    ScriptDiagnosticKind::SkippedNomodule,
+                    Some(index),
+                    Some(id),
+                    None,
+                    "nomodule script skipped because module execution is enabled".to_string(),
+                ));
+                continue;
+            }
+            ScriptType::Classic => ScriptKind::Classic,
+        };
 
         // 本文の確保より前に件数上限を判定する。
         if out.entries.len() >= options.max_scripts {
@@ -451,6 +525,7 @@ pub fn collect_page_scripts(
             is_async: document.attribute(id, "async").is_some(),
             is_defer: document.attribute(id, "defer").is_some(),
             is_nomodule: document.attribute(id, "nomodule").is_some(),
+            kind,
             type_attr: type_attr.map(str::to_string),
         });
     }
@@ -696,6 +771,124 @@ mod tests {
         let r = collect_with(&n_scripts(5), &opts);
         assert_eq!(r.entries().len(), 2);
         assert_eq!(r.diagnostics()[0].count(), Some(3));
+    }
+
+    fn gated() -> ScriptCollectionOptions {
+        ScriptCollectionOptions::default().with_execute_modules(true)
+    }
+
+    /// JS-4: gate 有効時は module を文書順に Module として収集する。
+    #[test]
+    fn js_4_gate_on_collects_modules_in_document_order() {
+        let r = collect_with(
+            "<script>a</script><script type=module src=\"m.js\"></script><script type=module>b</script>",
+            &gated(),
+        );
+        let got: Vec<_> = r
+            .entries()
+            .iter()
+            .map(|e| (e.index(), e.kind(), e.source().clone()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (0, ScriptKind::Classic, ScriptSource::Inline("a".into())),
+                (1, ScriptKind::Module, ScriptSource::External("m.js".into())),
+                (2, ScriptKind::Module, ScriptSource::Inline("b".into())),
+            ]
+        );
+        assert!(r.diagnostics().is_empty());
+    }
+
+    /// JS-4: gate 有効時は nomodule 付き classic を skip する。
+    #[test]
+    fn js_4_gate_on_skips_nomodule_classic() {
+        let r = collect_with("<script>a</script><script nomodule>b</script>", &gated());
+        assert_eq!(r.entries().len(), 1);
+        assert_eq!(r.diagnostics().len(), 1);
+        let d = &r.diagnostics()[0];
+        assert_eq!(d.kind(), ScriptDiagnosticKind::SkippedNomodule);
+        assert_eq!(d.kind().as_str(), "skipped_nomodule");
+        assert_eq!(d.index(), Some(1));
+        assert_eq!(
+            d.message(),
+            "nomodule script skipped because module execution is enabled"
+        );
+    }
+
+    /// JS-4: type の大文字小文字・空白の揺れは classify_type と同じ規則。
+    #[test]
+    fn js_4_gate_on_module_type_variants() {
+        let r = collect_with(
+            "<script type=\"Module\">a</script><script type=\" module \">b</script><script type=\"MODULE\">c</script>",
+            &gated(),
+        );
+        assert_eq!(r.entries().len(), 3);
+        assert!(r.entries().iter().all(|e| e.kind() == ScriptKind::Module));
+    }
+
+    /// JS-4: type=module nomodule は module として収集する（nomodule は classic のみ抑止）。
+    #[test]
+    fn js_4_gate_on_module_with_nomodule_is_collected() {
+        let r = collect_with("<script type=module nomodule>a</script>", &gated());
+        assert_eq!(r.entries().len(), 1);
+        assert_eq!(r.entries()[0].kind(), ScriptKind::Module);
+        assert!(r.entries()[0].is_nomodule());
+    }
+
+    /// JS-6: gate 有効時、skip された nomodule は枠を消費しない。
+    #[test]
+    fn js_6_gate_on_nomodule_does_not_consume_limit() {
+        let html = format!(
+            "{}<script>x</script>",
+            "<script nomodule>n</script>".repeat(5)
+        );
+        let r = collect_with(&html, &gated().with_max_scripts(1));
+        assert_eq!(r.entries().len(), 1);
+        assert_eq!(r.diagnostics().len(), 5);
+    }
+
+    /// JS-6: gate 有効時、収集される module は枠を消費する。
+    #[test]
+    fn js_6_gate_on_modules_consume_limit() {
+        let r = collect_with(
+            "<script type=module>a</script><script type=module>b</script>",
+            &gated().with_max_scripts(1),
+        );
+        assert_eq!(r.entries().len(), 1);
+        assert_eq!(
+            r.diagnostics()[0].kind(),
+            ScriptDiagnosticKind::ScriptLimitExceeded
+        );
+        assert_eq!(r.diagnostics()[0].count(), Some(1));
+    }
+
+    /// JS-6: inline module もバイト上限の対象。module の src="" は EmptySrc。
+    #[test]
+    fn js_6_gate_on_inline_module_limit_and_empty_src() {
+        let r = collect_with(
+            "<script type=module>abcd</script><script type=module src=\"\"></script>",
+            &gated().with_max_inline_bytes(3),
+        );
+        assert!(r.entries().is_empty());
+        assert_eq!(
+            r.diagnostics()[0].kind(),
+            ScriptDiagnosticKind::InlineScriptTooLarge
+        );
+        assert_eq!(r.diagnostics()[1].kind(), ScriptDiagnosticKind::EmptySrc);
+    }
+
+    /// JS-4: 既定（gate off）では挙動不変で全件 Classic。
+    #[test]
+    fn js_4_gate_off_default_is_unchanged() {
+        assert!(!ScriptCollectionOptions::default().execute_modules());
+        let r = collect("<script nomodule>a</script><script type=module>b</script>");
+        assert_eq!(r.entries().len(), 1);
+        assert_eq!(r.entries()[0].kind(), ScriptKind::Classic);
+        assert_eq!(
+            r.diagnostics()[0].kind(),
+            ScriptDiagnosticKind::SkippedModule
+        );
     }
 
     /// JS-6: 非 JS は件数上限の枠を消費しない。
