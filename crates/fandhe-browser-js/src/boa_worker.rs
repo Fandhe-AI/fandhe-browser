@@ -50,6 +50,10 @@
 //!
 //! # 既知の制限（実装済みを装わない。REPAIR-3）
 //!
+//! - ES module は静的 import のグラフだけを評価する（`JS-4`・Issue #1114）。
+//!   動的 `import()`・top-level await を含むモジュールは compile が
+//!   `NotYetImplemented`、`TAKE_DYNAMIC_IMPORTS`・`FINISH_DYNAMIC_IMPORT` も未対応
+//!   （詳細は `boa_engine::module`）
 //! - 読み取り専用プロパティ（`DomLikeMemberKind::Property`）の bind は未対応で、
 //!   `BindingFailed` を返す（メソッドのみ。V8 版との差。将来仕様は `JS-1`
 //!   「DOM 風オブジェクト」の getter 対応）
@@ -62,7 +66,10 @@
 use std::sync::{Arc, Mutex};
 
 use super::boa_engine::BoaEngine;
-use super::engine_trait::{EvaluateOptions, JsEngine, JsEngineError, JsValue, NativeFn};
+use super::engine_trait::{
+    EvaluateOptions, JsEngine, JsEngineError, JsValue, ModuleEvaluation, ModuleId, ModuleRecord,
+    ModuleResolution, NativeFn,
+};
 use super::shared::{NativeCallFailure, NativeCallTransport};
 use super::worker::ChildEngine;
 use super::worker_protocol::{self, DomLikeMemberKind, DomLikeObjectBinding, NativeReturn};
@@ -169,6 +176,33 @@ impl ChildEngine for BoaChildEngine {
         }
         self.engine.bind_dom_like_object(&binding.name, methods)
     }
+
+    fn compile_module(
+        &mut self,
+        request: &worker_protocol::module_frames::CompileModuleRequest,
+    ) -> Result<ModuleRecord, JsEngineError> {
+        JsEngine::compile_module(&mut self.engine, &request.url, &request.source)
+    }
+
+    fn link_module(
+        &mut self,
+        referrer: ModuleId,
+        resolutions: &[ModuleResolution],
+    ) -> Result<(), JsEngineError> {
+        JsEngine::link_module(&mut self.engine, referrer, resolutions)
+    }
+
+    fn evaluate_module(
+        &mut self,
+        root: ModuleId,
+        options: &EvaluateOptions,
+    ) -> Result<ModuleEvaluation, JsEngineError> {
+        JsEngine::evaluate_module(&mut self.engine, root, options)
+    }
+
+    // `take_dynamic_import_requests`・`finish_dynamic_import` は実装しない
+    // （`ChildEngine` の既定実装が `NotYetImplemented` を返す。動的 `import()` は
+    // compile 時に拒否するため保留中の要求は発生しない。`REPAIR-3`・Issue #1114）。
 }
 
 #[cfg(test)]
