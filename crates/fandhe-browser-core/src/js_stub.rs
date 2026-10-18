@@ -291,18 +291,20 @@ impl JsRuntime {
     }
 
     /// 動的 `import()` を完了させる（`JS-4`・Issue #1117）。`Ok` は compile・link 済みの対象、
-    /// `Err` は URL を含めない失敗の種別。契約は [`JsEngine::finish_dynamic_import`] に同じ。
+    /// `Err` は URL を含めない失敗の種別。`options` の timeout で評価・checkpoint を打ち切り、戻り値は
+    /// `import()` の Promise の確定結果。契約は [`JsEngine::finish_dynamic_import`] に同じ。
     pub fn finish_dynamic_import(
         &mut self,
         id: DynamicImportId,
         result: Result<ModuleId, String>,
-    ) -> crate::Result<()> {
+        options: &EvaluateOptions,
+    ) -> crate::Result<ModuleEvaluation> {
         match &mut self.state {
             RuntimeState::Disabled => Err(crate::Error::JsExecutionUnavailable {
                 message: DISABLED_MESSAGE.to_string(),
             }),
             RuntimeState::Enabled { engine, .. } => engine
-                .finish_dynamic_import(id, result)
+                .finish_dynamic_import(id, result, options)
                 .map_err(crate::Error::JsEvaluation),
         }
     }
@@ -830,7 +832,11 @@ mod tests {
         let err = rt.take_dynamic_import_requests().expect_err("常に失敗する");
         assert!(matches!(err, Error::JsExecutionUnavailable { .. }));
         let err = rt
-            .finish_dynamic_import(DynamicImportId::from_raw(1), Err("x".to_string()))
+            .finish_dynamic_import(
+                DynamicImportId::from_raw(1),
+                Err("x".to_string()),
+                &EvaluateOptions::default(),
+            )
             .expect_err("常に失敗する");
         assert!(matches!(err, Error::JsExecutionUnavailable { .. }));
 
@@ -843,7 +849,11 @@ mod tests {
             Error::JsEvaluation(JsEngineError::NotYetImplemented(_))
         ));
         let err = rt
-            .finish_dynamic_import(DynamicImportId::from_raw(1), Err("x".to_string()))
+            .finish_dynamic_import(
+                DynamicImportId::from_raw(1),
+                Err("x".to_string()),
+                &EvaluateOptions::default(),
+            )
             .expect_err("FakeEngine は未対応");
         assert!(matches!(
             err,

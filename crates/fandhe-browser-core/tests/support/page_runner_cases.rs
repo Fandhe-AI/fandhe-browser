@@ -1225,6 +1225,58 @@ pub fn run_dynamic_imports(engine: &str) {
     );
     assert!(out.abort().is_none());
 
+    eprintln!("case: JS-4 throwing / top-level-await targets are not counted as fulfilled");
+    let (port, _hits) = spawn_recording_server(|path| match path {
+        "/throws.js" => js_response("throw new Error('x'); export {};"),
+        "/tla.js" => js_response("await new Promise(() => {}); export {};"),
+        _ => ("404 Not Found", String::new(), "nope".to_string()),
+    });
+    let base = format!("http://127.0.0.1:{port}/");
+    let html = "<body><script type=module>\
+        import('./throws.js').catch(() => document.body.setAttribute('data-t', '1'));\
+        import('./tla.js').then(() => document.body.setAttribute('data-p', '1'));\
+        </script></body>";
+    let out = run_page_at(engine, html, &base, &opts, &loopback_fetcher());
+    assert!(out.html().contains("data-t=\"1\""), "{}", out.html());
+    assert!(!out.html().contains("data-p=\"1\""), "{}", out.html());
+    let report = out.dynamic_imports();
+    assert_eq!(
+        (
+            report.requested(),
+            report.fulfilled(),
+            report.rejected(),
+            report.pending()
+        ),
+        (2, 0, 1, 1)
+    );
+    assert_eq!(report.failures().len(), 1);
+    assert_eq!(report.failures()[0].as_str(), "module_evaluation_failed");
+    assert!(out.abort().is_none());
+
+    eprintln!("case: JS-6 a dynamic module loop is stopped by the remaining script wall time");
+    let (port, _hits) = spawn_recording_server(|path| match path {
+        "/spin.js" => js_response("for (;;) {} export {};"),
+        _ => ("404 Not Found", String::new(), "nope".to_string()),
+    });
+    let base = format!("http://127.0.0.1:{port}/");
+    let limit = Duration::from_millis(500);
+    let started = std::time::Instant::now();
+    let out = run_page_at(
+        engine,
+        "<body><script type=module>import('./spin.js').catch(() => {});</script></body>",
+        &base,
+        &module_options().with_script_wall_time(limit),
+        &loopback_fetcher(),
+    );
+    assert_eq!(
+        out.abort().map(|a| a.kind().clone()),
+        Some(AbortKind::WallTime {
+            scope: WallTimeScope::Script,
+            limit
+        })
+    );
+    assert!(started.elapsed() < Duration::from_millis(1800));
+
     eprintln!("case: JS-8/SEC-2 non-JS MIME / cross-origin / bare reject with a kind only");
     let (other, other_hits) = spawn_recording_server(|_| js_response("export {};"));
     let (port, _hits) = spawn_recording_server(|path| match path {

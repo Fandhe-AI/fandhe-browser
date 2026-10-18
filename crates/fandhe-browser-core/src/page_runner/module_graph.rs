@@ -29,7 +29,8 @@
 //!
 //! イベントループ段が [`pump_one_dynamic_import`] を 1 件ずつ呼ぶ。specifier を referrer の URL に
 //! 対して解決し、静的 import と同じ経路（`Fetcher`・MIME・同一オリジン・重複排除・上限）で対象を
-//! 取得・compile・link して `finish_dynamic_import` で resolve する。失敗は `Err` で reject し、
+//! 取得・compile・link して `finish_dynamic_import` で完了させる。完了にはページの残り時間を渡し、
+//! 戻り値の `import()` の Promise の確定結果（resolve・reject・未確定）で件数を数える。失敗は `Err` で reject し、
 //! メッセージは固定文字列 `dynamic import failed: <種別>` だけ（URL・specifier を含めない）。
 //! 件数・総バイト・深さ・実時間の超過は reject したうえで `AbortKind` に写してページを打ち切る。
 //!
@@ -44,7 +45,7 @@
 //!   なく文書の base URL を基準に解決する近似。動的 import の対象は新しい root（深さ 0）として扱い、
 //!   連鎖は `max_modules` と [`super::MAX_PAGE_DYNAMIC_IMPORTS`] で抑える。V8 の
 //!   `finish_dynamic_import` は内部で microtask checkpoint を回すため、上限で打ち切る場合も
-//!   `catch` ハンドラが 1 回だけ走り得る。評価済み entry の `ScriptOutcome::ModulePending` は
+//!   `catch` ハンドラが 1 回だけ走り得る（実行時間は残り時間で打ち切る）。評価済み entry の `ScriptOutcome::ModulePending` は
 //!   動的 import の完了後に遡って更新しない。
 //! - module の評価中は `document.currentScript` を設定しない（WHATWG では module は null）。
 //!   実行順は classic と同じ文書順（`async` / `defer` の順序近似は行わない）。
@@ -907,27 +908,38 @@ enum DynamicImportError {
     UnknownReferrer,
 }
 
-/// `finish_dynamic_import` を、残り時間の確認つきで呼ぶ。
+/// `import()` の Promise の確定結果と、対象をエンジンが受け付けたか（[`call_finish`] の戻り値）。
+struct Finished {
+    /// microtask checkpoint 後の `import()` の Promise の状態。
+    settlement: ModuleEvaluation,
+    /// `Ok` の対象をエンジンが受け付けたか（受け付けなかったときは `Err` で完了し直している）。
+    delivered: bool,
+}
+
+/// `finish_dynamic_import` を、ページの残り時間を課して呼ぶ（`JS-6`・Issue #1117）。
 ///
-/// `finish` は期限を引数に取れないため、呼ぶ前に残りを確認し、呼んだ後にページ時計を確認する。
-/// `Ok` の対象を engine が受け付けない（`ModuleResolutionFailed`）ときは 1 回だけ `Err` で完了し直し、
-/// そのとき `Ok(false)` を返す（呼び出し側は reject として数える）。
+/// 残り時間（`script_budget`）を `EvaluateOptions` の timeout としてエンジンへ渡し、動的 module の
+/// 評価と `then` / `catch` の checkpoint 全体をその予算で停止させる。`Ok` の対象を engine が
+/// 受け付けない（`ModuleResolutionFailed`）ときは同じ予算で 1 回だけ `Err` で完了し直し、
+/// `delivered = false` を返す（呼び出し側は reject として数える）。戻り値の `settlement` は
+/// `import()` の Promise の実際の確定結果で、通知を受理しただけでは成功と見なさない。
 fn call_finish(
     rt: &mut JsRuntime,
     ctx: &RunContext<'_>,
     id: fandhe_browser_js::DynamicImportId,
     result: Result<ModuleId, String>,
-) -> Result<bool, GraphError> {
-    let Some((_, scope)) = script_budget(
+) -> Result<Finished, GraphError> {
+    let Some((timeout, scope)) = script_budget(
         ctx.options.script_wall_time,
         ctx.options.page_wall_time,
         ctx.page_start.elapsed(),
     ) else {
         return Err(page_clock_abort(ctx));
     };
+    let eval_options = EvaluateOptions::default().with_timeout(timeout);
     let was_ok = result.is_ok();
     let mut delivered = true;
-    let mut outcome = rt.finish_dynamic_import(id, result);
+    let mut outcome = rt.finish_dynamic_import(id, result, &eval_options);
     if was_ok
         && matches!(
             outcome,
@@ -938,12 +950,27 @@ fn call_finish(
     {
         delivered = false;
         let kind = DynamicImportFailureKind::Fetch(SrcFetchErrorKind::Other);
-        outcome = rt.finish_dynamic_import(id, Err(failure_message(&kind)));
+        // 1 回目で予算を使った可能性があるため、残りを取り直す（尽きていれば打ち切り）。
+        let Some((timeout, _)) = script_budget(
+            ctx.options.script_wall_time,
+            ctx.options.page_wall_time,
+            ctx.page_start.elapsed(),
+        ) else {
+            return Err(page_clock_abort(ctx));
+        };
+        outcome = rt.finish_dynamic_import(
+            id,
+            Err(failure_message(&kind)),
+            &EvaluateOptions::default().with_timeout(timeout),
+        );
     }
     let page_expired = ctx.page_start.elapsed() > ctx.options.page_wall_time;
     match outcome {
-        Ok(()) if page_expired => Err(page_clock_abort(ctx)),
-        Ok(()) => Ok(delivered),
+        Ok(_) if page_expired => Err(page_clock_abort(ctx)),
+        Ok(settlement) => Ok(Finished {
+            settlement,
+            delivered,
+        }),
         Err(Error::JsEvaluation(JsEngineError::NotYetImplemented(_))) => {
             Err(GraphError::Unsupported)
         }
@@ -1042,13 +1069,24 @@ pub(super) async fn pump_one_dynamic_import(
             });
             return Ok(false);
         }
-        (Ok(_), Ok(true)) => report.fulfilled = report.fulfilled.saturating_add(1),
-        (Ok(_), Ok(false)) => {
+        (Ok(_), Ok(finished)) if !finished.delivered => {
             report.rejected = report.rejected.saturating_add(1);
             report
                 .failures
                 .push(DynamicImportFailureKind::Fetch(SrcFetchErrorKind::Other));
         }
+        // 実際の Promise の確定結果で数える（通知を受理しただけでは成功にしない）。
+        (Ok(_), Ok(finished)) => match finished.settlement {
+            ModuleEvaluation::Fulfilled => report.fulfilled = report.fulfilled.saturating_add(1),
+            ModuleEvaluation::Pending => report.pending = report.pending.saturating_add(1),
+            // 評価の例外（Rejected）と未知の確定結果は fail-closed で reject として数える。
+            _ => {
+                report.rejected = report.rejected.saturating_add(1);
+                report
+                    .failures
+                    .push(DynamicImportFailureKind::EvaluationFailed);
+            }
+        },
         (Err((kind, None)), Ok(_)) => {
             report.rejected = report.rejected.saturating_add(1);
             report.failures.push(kind.clone());

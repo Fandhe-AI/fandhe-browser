@@ -687,6 +687,8 @@ pub enum DynamicImportFailureKind {
     Fetch(SrcFetchErrorKind),
     /// 構文エラー等で compile できなかった。
     CompileFailed,
+    /// 取得・link は成功したが、対象の評価が例外で終わり `import()` が reject された。
+    EvaluationFailed,
     /// エンジンが module に未対応。
     Unsupported,
     /// 呼び出し元 module を特定できなかった（子の再起動後等。fail-closed）。
@@ -701,6 +703,7 @@ impl DynamicImportFailureKind {
         match self {
             Self::Fetch(kind) => kind.as_str(),
             Self::CompileFailed => "module_compile_failed",
+            Self::EvaluationFailed => "module_evaluation_failed",
             Self::Unsupported => "module_unsupported",
             Self::UnknownReferrer => "unknown_referrer",
             Self::Limit(kind) => kind.as_str(),
@@ -717,6 +720,7 @@ pub struct DynamicImportReport {
     pub(crate) requested: usize,
     pub(crate) fulfilled: usize,
     pub(crate) rejected: usize,
+    pub(crate) pending: usize,
     pub(crate) failures: Vec<DynamicImportFailureKind>,
 }
 
@@ -726,7 +730,7 @@ impl DynamicImportReport {
         self.requested
     }
 
-    /// 取得・評価に成功して resolve した件数。
+    /// 取得・評価に成功し、`import()` の Promise が実際に resolve した件数。
     pub fn fulfilled(&self) -> usize {
         self.fulfilled
     }
@@ -734,6 +738,12 @@ impl DynamicImportReport {
     /// reject した件数（打ち切りで reject したものを含む）。
     pub fn rejected(&self) -> usize {
         self.rejected
+    }
+
+    /// 完了を通知したが Promise が未確定のままの件数（top-level await が待ち続けている等）。
+    /// resolve にも reject にも数えない。
+    pub fn pending(&self) -> usize {
+        self.pending
     }
 
     /// reject の理由（種別のみ。処理順）。
@@ -1677,15 +1687,9 @@ async fn run_event_loop(
             }
             // 動的 `import()` の保留を取り出し、1 件ずつ取得して完了させる（Issue #1117）。
             // ネット要求・タイマーより先に処理する（応答は仮想時間 0 の近似）。
-            if take_dynamic
-                && dynamic_queue.is_empty()
-                && script_budget(
-                    ctx.options.script_wall_time,
-                    ctx.options.page_wall_time,
-                    ctx.page_start.elapsed(),
-                )
-                .is_some()
-            {
+            // 取り出し自体は JS を走らせないため、ページの残り時間が尽きていても行う。残っていれば
+            // 下で abort し、要求を数える（取りこぼして idle の成功終了にしない）。
+            if take_dynamic && dynamic_queue.is_empty() {
                 match rt.take_dynamic_import_requests() {
                     Ok(requests) => dynamic_queue.extend(requests),
                     // boa 等の未対応エンジンは「要求なし」。以降このページでは呼ばない。
@@ -1707,7 +1711,19 @@ async fn run_event_loop(
                 )
                 .is_none()
                 {
-                    *abort = Some(page_wall_abort(ctx.options, None));
+                    // JS を走らせる予算が無い。エンジンに残る要求（取り出し済みの未処理分を含む）を
+                    // 数えて reject 扱いにし、ページを打ち切る（成功終了にしない）。
+                    let abort_kind = page_wall_abort(ctx.options, None);
+                    let dropped = dynamic_queue.len().saturating_add(1);
+                    dynamic_imports.requested = dynamic_imports.requested.saturating_add(dropped);
+                    dynamic_imports.rejected = dynamic_imports.rejected.saturating_add(dropped);
+                    for _ in 0..dropped {
+                        dynamic_imports
+                            .failures
+                            .push(DynamicImportFailureKind::Limit(abort_kind.kind.clone()));
+                    }
+                    dynamic_queue.clear();
+                    *abort = Some(abort_kind);
                     break;
                 }
                 if !module_graph::pump_one_dynamic_import(

@@ -744,14 +744,22 @@ pub trait JsEngine {
         ))
     }
 
-    /// 動的 `import()` を完了させる（`JS-4`・Issue #1109）。`Ok` は compile・
-    /// link 済みの対象、`Err(String)` は親が付ける失敗の種別（URL を含めない）。
+    /// 動的 `import()` を完了させ、`import()` の Promise の確定結果を返す
+    /// （`JS-4`・`JS-6`・Issue #1109・#1117）。`Ok` は compile・link 済みの対象、
+    /// `Err(String)` は親が付ける失敗の種別（URL を含めない）。
+    ///
+    /// 評価と microtask checkpoint（利用者の `then`・`catch`）の実行時間は
+    /// `options.timeout()` で打ち切る（呼び出し側はページの残り時間を渡す）。戻り値の
+    /// [`ModuleEvaluation`] は checkpoint 後の `import()` の Promise の状態で、
+    /// `Fulfilled` は名前空間で resolve、`Rejected` は reject（評価の例外を含む）、
+    /// `Pending` は top-level await 等で未確定。`Ok` は通知を受理しただけでは成功を意味しない。
     /// 既定は [`JsEngineError::NotYetImplemented`]。
     fn finish_dynamic_import(
         &mut self,
         _id: DynamicImportId,
         _result: Result<ModuleId, String>,
-    ) -> Result<(), JsEngineError> {
+        _options: &EvaluateOptions,
+    ) -> Result<ModuleEvaluation, JsEngineError> {
         Err(module_api_not_yet_implemented("finish_dynamic_import"))
     }
 }
@@ -969,7 +977,11 @@ mod tests {
             "take_dynamic_import_requests",
         );
         expect_not_yet(
-            engine.finish_dynamic_import(DynamicImportId::from_raw(2), Ok(id)),
+            engine.finish_dynamic_import(
+                DynamicImportId::from_raw(2),
+                Ok(id),
+                &EvaluateOptions::default(),
+            ),
             "finish_dynamic_import",
         );
     }

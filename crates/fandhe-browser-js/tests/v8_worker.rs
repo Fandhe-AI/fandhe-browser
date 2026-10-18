@@ -104,6 +104,8 @@ fn main() -> ExitCode {
     js_4_module_graph_roundtrips_through_the_v8_worker();
     eprintln!("case: js_4_dynamic_import_roundtrips_through_the_v8_worker");
     js_4_dynamic_import_roundtrips_through_the_v8_worker();
+    eprintln!("case: js_4_dynamic_import_reports_settlement_of_the_import_promise");
+    js_4_dynamic_import_reports_settlement_of_the_import_promise();
     eprintln!("case: js_6_dynamic_import_timeout_keeps_parent_and_child_ledgers_in_sync");
     js_6_dynamic_import_timeout_keeps_parent_and_child_ledgers_in_sync();
     eprintln!("case: js_4_module_import_meta_url_and_promise_states_through_the_v8_worker");
@@ -545,7 +547,11 @@ fn js_4_module_frames_dispatch_to_v8_worker_and_dynamic_import_edge_cases_are_sp
         Vec::new(),
         "no dynamic import is pending yet"
     );
-    match engine.finish_dynamic_import(DynamicImportId::from_raw(1), Err("failed".to_string())) {
+    match engine.finish_dynamic_import(
+        DynamicImportId::from_raw(1),
+        Err("failed".to_string()),
+        &EvaluateOptions::default(),
+    ) {
         Err(JsEngineError::ModuleResolutionFailed(msg)) => {
             assert_eq!(msg, "unknown or finished dynamic import id")
         }
@@ -745,17 +751,27 @@ fn js_4_dynamic_import_roundtrips_through_the_v8_worker() {
         .compile_module("https://example.test/app/lazy.js", "export const v = 42;")
         .expect("compile lazy");
     engine.link_module(lazy.id(), &[]).expect("link lazy");
-    engine
-        .finish_dynamic_import(requests[0].id(), Ok(lazy.id()))
-        .expect("finish ok");
-    engine
-        .finish_dynamic_import(requests[1].id(), Err("fetch failed".to_string()))
-        .expect("finish err");
+    assert_eq!(
+        engine
+            .finish_dynamic_import(requests[0].id(), Ok(lazy.id()), &options)
+            .expect("finish ok"),
+        ModuleEvaluation::Fulfilled
+    );
+    assert_eq!(
+        engine
+            .finish_dynamic_import(requests[1].id(), Err("fetch failed".to_string()), &options)
+            .expect("finish err"),
+        ModuleEvaluation::rejected("Uncaught Error: fetch failed (line 0)".to_string())
+    );
     assert_eq!(
         JsEngine::evaluate_script(&mut engine, "got + '|' + err", &options).expect("eval"),
         JsValue::String("42|fetch failed".to_string())
     );
-    match engine.finish_dynamic_import(DynamicImportId::from_raw(99), Err("x".to_string())) {
+    match engine.finish_dynamic_import(
+        DynamicImportId::from_raw(99),
+        Err("x".to_string()),
+        &options,
+    ) {
         Err(JsEngineError::ModuleResolutionFailed(_)) => {}
         other => panic!("expected ModuleResolutionFailed for an unknown id, got: {other:?}"),
     }
@@ -763,6 +779,58 @@ fn js_4_dynamic_import_roundtrips_through_the_v8_worker() {
         engine.worker_pid_for_test(),
         pid,
         "the child must survive dynamic import completion"
+    );
+}
+
+/// JS-4・Issue #1117: 完了の戻り値が `import()` の Promise の確定結果を表すこと。対象が throw
+/// すれば `Rejected`（通知を受理しただけの成功にならない）、top-level await で未確定なら
+/// `Pending`、正常なら `Fulfilled`。
+fn js_4_dynamic_import_reports_settlement_of_the_import_promise() {
+    let options = EvaluateOptions::default();
+    let mut engine = V8ProcessEngine::new();
+    let root = engine
+        .compile_module(
+            "https://example.test/app/main.js",
+            "import('./ok.js').catch(() => {}); import('./throws.js').catch(() => {}); \
+             import('./tla.js').catch(() => {}); export {};",
+        )
+        .expect("compile root");
+    assert_eq!(
+        engine.evaluate_module(root.id(), &options).expect("eval"),
+        ModuleEvaluation::Fulfilled
+    );
+    let requests = engine.take_dynamic_import_requests().expect("take");
+    assert_eq!(requests.len(), 3);
+    let mut compile = |name: &str, source: &str| {
+        let record = engine
+            .compile_module(&format!("https://example.test/app/{name}"), source)
+            .expect("compile");
+        engine.link_module(record.id(), &[]).expect("link");
+        record.id()
+    };
+    let ok = compile("ok.js", "export const v = 1;");
+    let throws = compile("throws.js", "throw new Error('boom'); export {};");
+    let tla = compile("tla.js", "await new Promise(() => {}); export {};");
+    assert_eq!(
+        engine
+            .finish_dynamic_import(requests[0].id(), Ok(ok), &options)
+            .expect("ok"),
+        ModuleEvaluation::Fulfilled
+    );
+    match engine
+        .finish_dynamic_import(requests[1].id(), Ok(throws), &options)
+        .expect("throws")
+    {
+        ModuleEvaluation::Rejected { message, .. } => {
+            assert!(message.contains("Error: boom"), "{message}");
+        }
+        other => panic!("expected Rejected for a throwing target, got: {other:?}"),
+    }
+    assert_eq!(
+        engine
+            .finish_dynamic_import(requests[2].id(), Ok(tla), &options)
+            .expect("tla"),
+        ModuleEvaluation::Pending
     );
 }
 
@@ -790,8 +858,17 @@ fn js_6_dynamic_import_timeout_keeps_parent_and_child_ledgers_in_sync() {
         .compile_module("https://example.test/app/spin.js", "for (;;) {} export {};")
         .expect("compile spin");
     engine.link_module(spin.id(), &[]).expect("link spin");
-    match engine.finish_dynamic_import(requests[0].id(), Ok(spin.id())) {
-        Err(JsEngineError::Timeout(_)) => {}
+    // 呼び出し側が渡した短い残り時間で打ち切られる（固定の既定値ではない。Issue #1117）。
+    let short = EvaluateOptions::default().with_timeout(Duration::from_millis(300));
+    let started = Instant::now();
+    match engine.finish_dynamic_import(requests[0].id(), Ok(spin.id()), &short) {
+        Err(JsEngineError::Timeout(_)) => {
+            assert!(
+                started.elapsed() < Duration::from_millis(1500),
+                "the supplied budget must bound the evaluation: {:?}",
+                started.elapsed()
+            );
+        }
         other => panic!("expected Timeout, got: {other:?}"),
     }
     assert_eq!(

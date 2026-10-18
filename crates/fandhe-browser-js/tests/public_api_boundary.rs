@@ -85,8 +85,11 @@ fn js_1_public_signatures_are_pinned_without_v8_types() {
             engine.evaluate_module(ModuleId::from_raw(0), options);
         let _: Result<Vec<DynamicImportRequest>, JsEngineError> =
             engine.take_dynamic_import_requests();
-        let _: Result<(), JsEngineError> =
-            engine.finish_dynamic_import(DynamicImportId::from_raw(0), Err(String::new()));
+        let _: Result<ModuleEvaluation, JsEngineError> = engine.finish_dynamic_import(
+            DynamicImportId::from_raw(0),
+            Err(String::new()),
+            &EvaluateOptions::default(),
+        );
     }
 
     // 具体値の検査（テストとして実体を持たせる）。
