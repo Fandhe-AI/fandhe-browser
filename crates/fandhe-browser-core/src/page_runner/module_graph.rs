@@ -47,7 +47,7 @@ use reqwest::Url;
 use super::{
     AbortKind, MAX_MODULE_GRAPH_DEPTH, PageAbort, RunContext, ScriptBytesScope, ScriptOutcome,
     SrcFailure, SrcFetchErrorKind, WallTimeScope, check_src_response, classify_fetch_error,
-    engine_error_abort, lossy_len_exceeds, page_wall_abort, script_budget, truncated_message,
+    engine_error_abort, lossy_len_exceeds, page_wall_abort, script_budget,
 };
 use crate::error::Error;
 use crate::fetch::Fetcher;
@@ -56,6 +56,13 @@ use crate::page_script::ScriptSource;
 
 /// 深さ超過の打ち切りに付ける固定メッセージ（URL を含めない）。
 const DEPTH_EXCEEDED_MESSAGE: &str = "module graph depth limit exceeded";
+
+/// module の構文・リンク・評価の失敗に付ける固定メッセージ（`JS-8`・`SEC-2`）。
+///
+/// エンジンの生メッセージは specifier・URL・クエリを含み得る（V8 の instantiate エラー等）ため
+/// 診断には保存せず、失敗の種別だけを残す。
+const MODULE_COMPILE_FAILED_MESSAGE: &str = "module compile failed";
+const MODULE_EVALUATION_FAILED_MESSAGE: &str = "module evaluation failed";
 
 /// WHATWG MIME Sniffing の JavaScript MIME type（essence の完全一致で比べる）。
 const JAVASCRIPT_MIME_ESSENCES: &[&str] = &[
@@ -189,10 +196,8 @@ enum EvalState {
     Succeeded,
     /// 保留（top-level await 等）。再参照でも成功とは見なさない。
     Pending,
-    Rejected {
-        message: String,
-        truncated: bool,
-    },
+    /// 評価の失敗。内容は固定メッセージで返す（生メッセージは保持しない）。
+    Rejected,
 }
 
 impl ModuleGraph {
@@ -361,12 +366,15 @@ fn compile_source(
     let record = match result {
         Ok(_) if page_expired => return Err(page_clock_abort(ctx)),
         Ok(record) => record,
-        Err(Error::JsEvaluation(JsEngineError::EvaluationFailed(m))) => {
+        Err(Error::JsEvaluation(JsEngineError::EvaluationFailed(_))) => {
             if page_expired {
                 return Err(page_clock_abort(ctx));
             }
-            let (message, truncated) = truncated_message(&m);
-            return Err(ModuleFailure::Exception { message, truncated }.into());
+            return Err(ModuleFailure::Exception {
+                message: MODULE_COMPILE_FAILED_MESSAGE.to_string(),
+                truncated: false,
+            }
+            .into());
         }
         Err(Error::JsEvaluation(JsEngineError::NotYetImplemented(_))) => {
             return Err(GraphError::Unsupported);
@@ -521,6 +529,19 @@ async fn load_graph(
         }
     }
 
+    // 取得の重複排除（最短距離での判定）とは別に、依存経路の最長の深さで上限を検査する。
+    let starts: Vec<(String, usize)> = match (&inline_root, &root_key) {
+        (Some((_, deps)), _) => deps.iter().map(|d| (d.key.clone(), 1)).collect(),
+        (None, Some(k)) => vec![(k.clone(), 0)],
+        _ => Vec::new(),
+    };
+    if longest_depth(graph, &starts) > MAX_MODULE_GRAPH_DEPTH {
+        return Err(GraphError::Abort(
+            AbortKind::ResourceLimit,
+            Some(DEPTH_EXCEEDED_MESSAGE.to_string()),
+        ));
+    }
+
     // 全員が compile 済みなので、循環していても link できる。
     for key in &to_link {
         let Some(ModuleSlot::Ready(ready)) = graph.map.get(key) else {
@@ -541,6 +562,61 @@ async fn load_graph(
         Some(ModuleSlot::Failed(f)) => Err(GraphError::Failed(f.clone())),
         None => Err(GraphError::Abort(AbortKind::EngineError, None)),
     }
+}
+
+/// `starts`（キーと基準の深さ）から辿れる依存経路の最長の深さを返す。
+///
+/// 反復 DFS で各モジュールの高さ（葉まで）を 1 回ずつ求める。探索中の祖先への辺（循環）は
+/// 辿らないので、循環は深さを伸ばさない。取得はキーごとに 1 回のまま、近道の経路に隠れた
+/// 深い経路も検出する（`JS-6`）。
+fn longest_depth(graph: &ModuleGraph, starts: &[(String, usize)]) -> usize {
+    let mut height: HashMap<&str, usize> = HashMap::new();
+    let mut on_stack: HashSet<&str> = HashSet::new();
+    let mut deepest = 0usize;
+    for (start, base) in starts {
+        let Some(ModuleSlot::Ready(_)) = graph.map.get(start) else {
+            continue;
+        };
+        let mut stack: Vec<(&str, usize)> = vec![(start.as_str(), 0)];
+        on_stack.insert(start.as_str());
+        height.entry(start.as_str()).or_insert(0);
+        while let Some(&(key, idx)) = stack.last() {
+            let deps: &[Dep] = match graph.map.get(key) {
+                Some(ModuleSlot::Ready(r)) => &r.deps,
+                _ => &[],
+            };
+            if let Some(dep) = deps.get(idx) {
+                if let Some(top) = stack.last_mut() {
+                    top.1 += 1;
+                }
+                let child = dep.key.as_str();
+                if on_stack.contains(child)
+                    || !matches!(graph.map.get(child), Some(ModuleSlot::Ready(_)))
+                {
+                    continue;
+                }
+                if let Some(&h) = height.get(child) {
+                    let cur = height.entry(key).or_insert(0);
+                    *cur = (*cur).max(h.saturating_add(1));
+                } else {
+                    height.insert(child, 0);
+                    on_stack.insert(child);
+                    stack.push((child, 0));
+                }
+            } else {
+                stack.pop();
+                on_stack.remove(key);
+                let h = height.get(key).copied().unwrap_or(0);
+                if let Some(&(parent, _)) = stack.last() {
+                    let cur = height.entry(parent).or_insert(0);
+                    *cur = (*cur).max(h.saturating_add(1));
+                }
+            }
+        }
+        deepest =
+            deepest.max(base.saturating_add(height.get(start.as_str()).copied().unwrap_or(0)));
+    }
+    deepest
 }
 
 /// `id` の依存を対応表（specifier → 解決先の id）で link する。
@@ -588,6 +664,14 @@ fn aborted(
     ScriptOutcome::Aborted { kind, message }
 }
 
+/// 評価失敗の結果（URL を含まない固定メッセージ）。
+fn rejected_outcome() -> ScriptOutcome {
+    ScriptOutcome::Exception {
+        message: MODULE_EVALUATION_FAILED_MESSAGE.to_string(),
+        truncated: false,
+    }
+}
+
 /// link 済みの root を evaluate して結果を写す。
 fn evaluate_root(
     rt: &mut JsRuntime,
@@ -618,16 +702,9 @@ fn evaluate_root(
             graph.evaluated.insert(root, EvalState::Pending);
             ScriptOutcome::ModulePending
         }
-        Ok(ModuleEvaluation::Rejected { message, .. }) => {
-            let (message, truncated) = truncated_message(&message);
-            graph.evaluated.insert(
-                root,
-                EvalState::Rejected {
-                    message: message.clone(),
-                    truncated,
-                },
-            );
-            ScriptOutcome::Exception { message, truncated }
+        Ok(ModuleEvaluation::Rejected { .. }) => {
+            graph.evaluated.insert(root, EvalState::Rejected);
+            rejected_outcome()
         }
         // 未知の結果は成功と見なさない（fail-closed）。
         Ok(_) => aborted(AbortKind::EngineError, None, index, abort),
@@ -671,10 +748,7 @@ pub(super) async fn run_module_entry(
         return match state {
             EvalState::Succeeded => ScriptOutcome::Succeeded,
             EvalState::Pending => ScriptOutcome::ModulePending,
-            EvalState::Rejected { message, truncated } => ScriptOutcome::Exception {
-                message: message.clone(),
-                truncated: *truncated,
-            },
+            EvalState::Rejected => rejected_outcome(),
         };
     }
     evaluate_root(rt, ctx, graph, root, index, abort)

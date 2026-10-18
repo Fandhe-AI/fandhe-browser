@@ -371,7 +371,7 @@ fn js_4_repeated_src_reports_first_result() {
                 <script type=module src=\"/p.js\"></script>";
     let (out, _) = run(html, port, &module_options());
     let exception = ScriptOutcome::Exception {
-        message: "boom".to_string(),
+        message: "module evaluation failed".to_string(),
         truncated: false,
     };
     assert_eq!(
@@ -533,7 +533,7 @@ fn js_8_status_and_syntax_errors_continue() {
         vec![
             failed(SrcFetchErrorKind::HttpStatus { status: 404 }),
             ScriptOutcome::Exception {
-                message: "SyntaxError".to_string(),
+                message: "module compile failed".to_string(),
                 truncated: false
             },
             ScriptOutcome::Succeeded,
@@ -630,6 +630,42 @@ fn js_6_module_graph_depth_boundary() {
     );
     assert_eq!(hit_count(&hits, "/d32.js"), 1);
     assert_eq!(hit_count(&hits, "/d33.js"), 0);
+}
+
+/// `JS-6`: 近道の経路があっても、最長の依存経路で深さの上限を検査する。
+/// entry が d1 と d2 を import し、d1→d2→…→d33 と続く（d2 への最短は深さ 1）。
+#[test]
+fn js_6_module_graph_depth_not_bypassed_by_shortcut() {
+    let (port, _hits) = chain_server(33);
+    let html = "<script type=module>import \"./d1.js\";import \"./d2.js\";</script>";
+    let (out, _) = run(html, port, &module_options());
+    assert_eq!(
+        outcomes(&out),
+        vec![ScriptOutcome::Aborted {
+            kind: AbortKind::ResourceLimit,
+            message: Some("module graph depth limit exceeded".to_string())
+        }]
+    );
+    // 深さ 32 まで（d1..d32 が chain、d2 への近道あり）は成功する。
+    let (port, _hits) = chain_server(32);
+    let (out, _) = run(html, port, &module_options());
+    assert_eq!(outcomes(&out), vec![ScriptOutcome::Succeeded]);
+}
+
+/// `JS-8`・`SEC-2`: 失敗の診断にエンジンの生メッセージ（specifier・クエリ）を残さない。
+#[test]
+fn js_8_module_failure_messages_do_not_leak_engine_text() {
+    let (port, _hits) = spawn_server(|p| match p {
+        "/bad.js" => js("syntax-error ./dep.js?token=secret"),
+        _ => js("export {};"),
+    });
+    let html = "<script type=module>reject:SyntaxError ./dep.js?token=secret</script>\
+                <script type=module>import \"/bad.js?token=secret\";</script>";
+    let (out, _) = run(html, port, &module_options());
+    let dump = format!("{:?}", out.scripts());
+    assert!(!dump.contains("secret"), "{dump}");
+    assert!(!dump.contains("token"), "{dump}");
+    assert_eq!(outcomes(&out).len(), 2);
 }
 
 /// `JS-6`: `src` 1 件のバイト上限の境界（16 B は成功、17 B は打ち切り）。
@@ -755,7 +791,7 @@ fn js_4_module_evaluation_outcomes() {
         Some(
             &[
                 ScriptOutcome::Exception {
-                    message: "boom".to_string(),
+                    message: "module evaluation failed".to_string(),
                     truncated: false
                 },
                 ScriptOutcome::ModulePending,
@@ -766,8 +802,8 @@ fn js_4_module_evaluation_outcomes() {
     );
     match got.get(4) {
         Some(ScriptOutcome::Exception { message, truncated }) => {
-            assert_eq!(message.len(), 4096);
-            assert!(truncated);
+            assert_eq!(message, "module evaluation failed");
+            assert!(!truncated);
         }
         other => panic!("unexpected: {other:?}"),
     }
