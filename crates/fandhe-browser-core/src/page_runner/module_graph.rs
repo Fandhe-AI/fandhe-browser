@@ -566,89 +566,107 @@ async fn load_graph(
 
 /// `starts`（キーと基準の深さ）から辿れる依存経路の最長の深さを返す。
 ///
-/// 反復 DFS。探索中の祖先への辺（循環）は辿らないので、循環は深さを伸ばさない。
-/// 高さ（葉まで）のメモ化は、祖先への辺の切断に依存しない結果だけに限る。祖先を除いて
-/// 求めた高さは探索経路依存で、別経路へ再利用すると最長経路を過小評価するため
-/// （切断が自身より上の祖先に及んだノードはメモ化せず、辿るたびに再計算する）。
-/// 深さが上限を超えた時点で打ち切る（`JS-6`）。
+/// 循環（強連結成分）は 1 つの塊に縮約し、塊の深さへの寄与は所属 module 数とする
+/// （循環内の単純経路の長さの上界。過小評価しない側＝fail-closed）。縮約後は DAG なので、
+/// 反復版 Tarjan の 1 回の走査で成分ごとの高さを O(V+E) で求める。単純経路の列挙は
+/// 完全相互 import で階乗規模になり、ホストスレッドを占有できるため行わない（`JS-6`）。
 fn longest_depth(graph: &ModuleGraph, starts: &[(String, usize)]) -> usize {
-    /// DFS の 1 フレーム。`low` は切断した祖先の最小のスタック位置（無ければ `usize::MAX`）。
     struct Frame<'a> {
         key: &'a str,
         idx: usize,
-        height: usize,
-        low: usize,
     }
-    let mut memo: HashMap<&str, usize> = HashMap::new();
+    fn ready_deps<'a>(graph: &'a ModuleGraph, key: &str) -> &'a [Dep] {
+        match graph.map.get(key) {
+            Some(ModuleSlot::Ready(r)) => &r.deps,
+            _ => &[],
+        }
+    }
+    let mut index_of: HashMap<&str, usize> = HashMap::new();
+    let mut low: HashMap<&str, usize> = HashMap::new();
+    // 成分に確定したノードの成分の高さ（module 数で数える）。
+    let mut comp_height: HashMap<&str, usize> = HashMap::new();
+    let mut scc_stack: Vec<&str> = Vec::new();
+    let mut on_stack: HashSet<&str> = HashSet::new();
+    let mut next_index = 0usize;
     let mut deepest = 0usize;
     for (start, base) in starts {
-        let Some(ModuleSlot::Ready(_)) = graph.map.get(start) else {
-            continue;
-        };
-        if let Some(&h) = memo.get(start.as_str()) {
-            deepest = deepest.max(base.saturating_add(h));
+        if !matches!(graph.map.get(start.as_str()), Some(ModuleSlot::Ready(_))) {
             continue;
         }
-        let mut pos: HashMap<&str, usize> = HashMap::new();
-        let mut stack: Vec<Frame<'_>> = vec![Frame {
-            key: start.as_str(),
-            idx: 0,
-            height: 0,
-            low: usize::MAX,
-        }];
-        pos.insert(start.as_str(), 0);
-        let mut start_height = 0usize;
-        while let Some(top) = stack.last() {
-            let (key, idx) = (top.key, top.idx);
-            let deps: &[Dep] = match graph.map.get(key) {
-                Some(ModuleSlot::Ready(r)) => &r.deps,
-                _ => &[],
-            };
-            if let Some(dep) = deps.get(idx) {
-                if let Some(top) = stack.last_mut() {
-                    top.idx += 1;
-                }
-                let child = dep.key.as_str();
-                if let Some(&p) = pos.get(child) {
-                    if let Some(top) = stack.last_mut() {
-                        top.low = top.low.min(p);
+        if !index_of.contains_key(start.as_str()) {
+            let mut calls: Vec<Frame<'_>> = vec![Frame {
+                key: start.as_str(),
+                idx: 0,
+            }];
+            index_of.insert(start.as_str(), next_index);
+            low.insert(start.as_str(), next_index);
+            next_index += 1;
+            scc_stack.push(start.as_str());
+            on_stack.insert(start.as_str());
+            while let Some(top) = calls.last_mut() {
+                let key = top.key;
+                let idx = top.idx;
+                top.idx += 1;
+                if let Some(dep) = ready_deps(graph, key).get(idx) {
+                    let child = dep.key.as_str();
+                    if !matches!(graph.map.get(child), Some(ModuleSlot::Ready(_))) {
+                        continue;
+                    }
+                    if let Some(&ci) = index_of.get(child) {
+                        if on_stack.contains(child) {
+                            let l = low.get(key).copied().unwrap_or(usize::MAX).min(ci);
+                            low.insert(key, l);
+                        }
+                    } else {
+                        index_of.insert(child, next_index);
+                        low.insert(child, next_index);
+                        next_index += 1;
+                        scc_stack.push(child);
+                        on_stack.insert(child);
+                        calls.push(Frame { key: child, idx: 0 });
                     }
                     continue;
                 }
-                if !matches!(graph.map.get(child), Some(ModuleSlot::Ready(_))) {
-                    continue;
+                // 全ての辺を見終えた。
+                calls.pop();
+                let key_low = low.get(key).copied().unwrap_or(usize::MAX);
+                if let Some(parent) = calls.last() {
+                    let l = low
+                        .get(parent.key)
+                        .copied()
+                        .unwrap_or(usize::MAX)
+                        .min(key_low);
+                    low.insert(parent.key, l);
                 }
-                if let Some(&h) = memo.get(child) {
-                    if let Some(top) = stack.last_mut() {
-                        top.height = top.height.max(h.saturating_add(1));
+                if key_low == index_of.get(key).copied().unwrap_or(usize::MAX) {
+                    let mut members: Vec<&str> = Vec::new();
+                    while let Some(m) = scc_stack.pop() {
+                        on_stack.remove(m);
+                        members.push(m);
+                        if m == key {
+                            break;
+                        }
                     }
-                    continue;
-                }
-                if base.saturating_add(stack.len()) > MAX_MODULE_GRAPH_DEPTH {
-                    return base.saturating_add(stack.len());
-                }
-                pos.insert(child, stack.len());
-                stack.push(Frame {
-                    key: child,
-                    idx: 0,
-                    height: 0,
-                    low: usize::MAX,
-                });
-            } else if let Some(done) = stack.pop() {
-                let p = stack.len();
-                pos.remove(done.key);
-                if done.low >= p {
-                    memo.insert(done.key, done.height);
-                }
-                if let Some(parent) = stack.last_mut() {
-                    parent.height = parent.height.max(done.height.saturating_add(1));
-                    parent.low = parent.low.min(done.low);
-                } else {
-                    start_height = done.height;
+                    let mut child_max = 0usize;
+                    for m in &members {
+                        for d in ready_deps(graph, m) {
+                            if let Some(&h) = comp_height.get(d.key.as_str())
+                                && !members.contains(&d.key.as_str())
+                            {
+                                child_max = child_max.max(h);
+                            }
+                        }
+                    }
+                    let height = members.len().saturating_add(child_max);
+                    for m in members {
+                        comp_height.insert(m, height);
+                    }
                 }
             }
         }
-        deepest = deepest.max(base.saturating_add(start_height));
+        // 高さは module 数。深さは辺の数なので 1 引く。
+        let h = comp_height.get(start.as_str()).copied().unwrap_or(1);
+        deepest = deepest.max(base.saturating_add(h.saturating_sub(1)));
     }
     deepest
 }

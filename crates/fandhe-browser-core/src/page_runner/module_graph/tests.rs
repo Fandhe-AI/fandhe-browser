@@ -919,3 +919,18 @@ fn js_4_module_evaluation_failed_continues() {
     );
     assert!(out.abort().is_none());
 }
+
+/// `JS-6`: 20 module の完全相互 import でも深さ検査は多項式時間で終わり、成功する
+/// （循環は 1 つの塊として扱い、単純経路を列挙しない）。
+#[test]
+fn js_6_module_graph_complete_mutual_imports_terminate() {
+    let (port, _hits) = spawn_server(|_| {
+        let body: String = (0..20).map(|i| format!("import \"./c{i}.js\";")).collect();
+        js(&body)
+    });
+    let html = "<script type=module>import \"./c0.js\";</script>";
+    let started = std::time::Instant::now();
+    let (out, _) = run(html, port, &module_options().with_max_modules(64));
+    assert_eq!(outcomes(&out), vec![ScriptOutcome::Succeeded]);
+    assert!(started.elapsed() < std::time::Duration::from_secs(4));
+}
