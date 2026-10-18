@@ -172,8 +172,8 @@ pub use page_runner::{
 };
 pub use page_script::{
     CollectedScripts, DEFAULT_MAX_INLINE_SCRIPT_BYTES, DEFAULT_MAX_PAGE_SCRIPTS,
-    ScriptCollectionOptions, ScriptDiagnostic, ScriptDiagnosticKind, ScriptEntry, ScriptSource,
-    collect_page_scripts,
+    ScriptCollectionOptions, ScriptDiagnostic, ScriptDiagnosticKind, ScriptEntry, ScriptKind,
+    ScriptSource, collect_page_scripts,
 };
 pub use parse::{
     ParseDiagnostics, ParseErrorPolicy, ParseOptions, ParsedDocument, parse_document,
