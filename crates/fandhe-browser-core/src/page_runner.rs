@@ -20,7 +20,9 @@
 //! 1. **prepare（同期）**: パースと収集、base URL の検証。
 //! 2. **load（async）**: 文書順に `src` を [`Fetcher`] で取得しつつ、スクリプト総バイトを
 //!    評価する。この段の `.await` は [`JsRuntime`] / [`DomBridge`] の生成より前にある。
-//! 3. **execute（async）**: 取得済みのソースを文書順に実行し、打ち切られていなければ
+//! 3. **execute（async）**: 取得済みのソースを文書順に実行し（`type=module` のエントリは
+//!    `module_graph` がここでグラフを Fetcher 経由で取得して compile・link・evaluate する。
+//!    Issue #1116）、打ち切られていなければ
 //!    DOMContentLoaded → load を発火する。各 `<script>` とライフサイクルイベントの後に
 //!    microtask checkpoint（`__fandheRunMicrotasks()`）を評価する。
 //! 4. **event loop（async。`JS-7`・`JS-8`）**: load の後に、保留中のネットワーク要求（ページ内
@@ -50,7 +52,13 @@
 //!   fail-closed で以降の実行を打ち切り、残りを [`ScriptOutcome::NotExecuted`] にする。
 //!   打ち切り後は DOMContentLoaded / load を発火せず、その時点の DOM を確定して返す。
 //! - 実行可能なソース（inline、または取得に成功した `src`）が 1 件も無いページでは
-//!   ランタイムを作らない（子プロセスを起動しない。`PERF-7`）。
+//!   ランタイムを作らない（子プロセスを起動しない。`PERF-7`）。module のエントリは、取得が
+//!   execute 段まで分からないため実行可能とみなす（module gate 有効時に限った `PERF-7` からの
+//!   逸脱。REPAIR-3）。
+//! - ES module（gate 有効時のみ。[`ScriptCollectionOptions::with_execute_modules`]）: 静的 `import` の
+//!   グラフを [`Fetcher`] 経由で取得し、件数（[`PageRunOptions::max_modules`]）・深さ
+//!   （[`MAX_MODULE_GRAPH_DEPTH`]）・バイト数・実時間・MIME・オリジン（初版は同一オリジンのみ）を
+//!   fail-closed で検査する。詳細と差異は `module_graph` の doc を参照。
 //! - `src` の取得は呼び出し側が所有する [`Fetcher`] 経由のみ。scheme・内部アドレス・
 //!   リダイレクト先の検査は Fetcher に一元化されており（SSRF 対策。`SEC-2`）、拒否された
 //!   スクリプトは [`ScriptOutcome::SrcFetchFailed`] として後続の実行を続ける。診断には
@@ -59,8 +67,8 @@
 //! # スタブ・簡易実装の残り（REPAIR-3）
 //!
 //! - `<base href>` による `src` の解決（ページの base URL に対する相対解決のみ）。
-//! - `src` 応答の Content-Type / nosniff 検査と charset 判定（`CORE-5` (7)。UTF-8 の
-//!   非可逆変換のみ）。
+//! - classic の `src` 応答の Content-Type / nosniff 検査と charset 判定（`CORE-5` (7)。UTF-8 の
+//!   非可逆変換のみ）。module の応答は JavaScript MIME type を必須とする点が非対称（#1116）。
 //! - `src` 取得全体の時間予算（現状は Fetcher のタイムアウト × 件数。`page_wall_time` は
 //!   JS 実行だけを対象とする）。
 //! - 要素レベルの EventTarget・`onload` / `onreadystatechange` プロパティ・
@@ -101,13 +109,15 @@ use crate::fetch::{FetchOptions, Fetcher};
 use crate::js_stub::JsRuntime;
 use crate::page_net::{NetOutcome, NetRejectKind, NetReport, PageNetLimits};
 use crate::page_script::{
-    CollectedScripts, ScriptCollectionOptions, ScriptDiagnosticKind, ScriptSource,
+    CollectedScripts, ScriptCollectionOptions, ScriptDiagnosticKind, ScriptKind, ScriptSource,
     collect_page_scripts,
 };
 use crate::parse::{ParseOptions, parse_document};
 use crate::{NodeId, dom_bridge::truncate_utf8};
 
 pub use crate::dom_bridge::LifecycleEvent;
+
+mod module_graph;
 
 /// スクリプト 1 件あたりの実時間上限の既定（`EvaluateOptions` の既定と同じ 2 秒）。
 pub const DEFAULT_SCRIPT_WALL_TIME: Duration = EvaluateOptions::DEFAULT_TIMEOUT;
@@ -119,6 +129,12 @@ pub const MAX_SCRIPT_ERROR_MESSAGE_BYTES: usize = 4096;
 pub const DEFAULT_MAX_TOTAL_SCRIPT_BYTES: usize = 4 * 1024 * 1024;
 /// `src` スクリプト 1 件の本文バイト数の既定上限（1 MiB。`JS-6`）。
 pub const DEFAULT_MAX_SRC_SCRIPT_BYTES: usize = 1024 * 1024;
+/// ページあたりの ES module の件数の既定上限（64。inline の module と取得した依存の合計。
+/// `JS-6`・Issue #1116）。
+pub const DEFAULT_MAX_PAGE_MODULES: usize = 64;
+/// module グラフの深さの上限（32。entry を 0 とし、33 段目のモジュールは取得しない。
+/// `JS-6`・Issue #1116）。
+pub const MAX_MODULE_GRAPH_DEPTH: usize = 32;
 
 /// `src` 取得用の [`FetchOptions`]（本文上限を [`DEFAULT_MAX_SRC_SCRIPT_BYTES`] にしたもの）。
 ///
@@ -170,6 +186,7 @@ pub struct PageRunOptions {
     page_wall_time: Duration,
     max_total_script_bytes: usize,
     max_src_script_bytes: usize,
+    max_modules: usize,
     event_loop: EventLoopLimits,
     net_limits: PageNetLimits,
 }
@@ -184,6 +201,7 @@ impl Default for PageRunOptions {
             page_wall_time: DEFAULT_PAGE_WALL_TIME,
             max_total_script_bytes: DEFAULT_MAX_TOTAL_SCRIPT_BYTES,
             max_src_script_bytes: DEFAULT_MAX_SRC_SCRIPT_BYTES,
+            max_modules: DEFAULT_MAX_PAGE_MODULES,
             event_loop: EventLoopLimits::default(),
             net_limits: PageNetLimits::default(),
         }
@@ -240,6 +258,14 @@ impl PageRunOptions {
         self
     }
 
+    /// ページあたりの ES module の件数の上限を設定する（`JS-6`。既定は
+    /// [`DEFAULT_MAX_PAGE_MODULES`]。`with_execute_modules(true)` のときだけ意味を持つ）。
+    #[must_use]
+    pub fn with_max_modules(mut self, limit: usize) -> Self {
+        self.max_modules = limit;
+        self
+    }
+
     /// イベントループ（タイマー）の上限を差し替える（`JS-6`・`JS-7`）。
     #[must_use]
     pub fn with_event_loop_limits(mut self, limits: EventLoopLimits) -> Self {
@@ -252,6 +278,11 @@ impl PageRunOptions {
     pub fn with_net_limits(mut self, limits: PageNetLimits) -> Self {
         self.net_limits = limits;
         self
+    }
+
+    /// ページあたりの ES module の件数の上限。
+    pub fn max_modules(&self) -> usize {
+        self.max_modules
     }
 
     /// ページ内 `fetch` / `XMLHttpRequest` の上限。
@@ -357,7 +388,8 @@ pub enum AbortKind {
     EngineUnavailable,
     /// 上記以外のエンジン側の失敗（未知の種別を含む。fail-closed）。
     EngineError,
-    /// スクリプト件数の上限を超えた（上限は収集時の `max_scripts`）。
+    /// スクリプト件数の上限を超えた（classic は収集時の `max_scripts`、ES module は
+    /// [`PageRunOptions::max_modules`]）。
     ScriptCount {
         /// 超過した上限の値。
         limit: usize,
@@ -425,6 +457,13 @@ pub enum SrcFetchErrorKind {
         /// 受信したステータスコード。
         status: u16,
     },
+    /// module の specifier が bare（`/`・`./`・`../` で始まらず、絶対 URL でもない）。
+    BareSpecifier,
+    /// ページと別オリジンの module（リダイレクト先を含む。初版は同一オリジンのみ許可。
+    /// 設計 `es-module-design.md` §6）。
+    CrossOrigin,
+    /// module の応答の MIME が JavaScript MIME type でない（Content-Type が無い場合を含む）。
+    UnsupportedMimeType,
     /// 上記以外（未知のエラー。fail-closed で実行しない）。
     Other,
 }
@@ -440,6 +479,9 @@ impl SrcFetchErrorKind {
             Self::Timeout => "timeout",
             Self::Network => "network",
             Self::HttpStatus { .. } => "http_status",
+            Self::BareSpecifier => "bare_specifier",
+            Self::CrossOrigin => "cross_origin",
+            Self::UnsupportedMimeType => "unsupported_mime_type",
             Self::Other => "other",
         }
     }
@@ -482,6 +524,11 @@ pub enum ScriptOutcome {
         /// 打ち切りの理由。
         kind: AbortKind,
     },
+    /// ES module の評価が完了せず保留のままになった（top-level await・未完了の動的 `import()`）。
+    /// 成功を装わない（`REPAIR-3`）。後続の実行は続ける。
+    ModulePending,
+    /// エンジンが ES module の評価に未対応だった（`NotYetImplemented`）。後続の実行は続ける。
+    ModuleUnsupported,
 }
 
 impl ScriptOutcome {
@@ -494,6 +541,8 @@ impl ScriptOutcome {
             Self::SrcFetchFailed { .. } => "src_fetch_failed",
             Self::Aborted { .. } => "aborted",
             Self::NotExecuted { .. } => "not_executed",
+            Self::ModulePending => "module_pending",
+            Self::ModuleUnsupported => "module_unsupported",
         }
     }
 }
@@ -743,6 +792,9 @@ enum ScriptLoad {
     Failed(SrcFetchErrorKind),
     /// バイト上限超過により取得しなかった。
     Unfetched,
+    /// ES module（inline / `src`）。取得と compile は execute 段で `module_graph` が行う
+    /// （依存は compile の後でないと分からず、ページ時計の下で取得するため。Issue #1116）。
+    Module,
 }
 
 /// load 段の結果。
@@ -770,6 +822,7 @@ fn classify_fetch_error(e: &Error) -> SrcFailure {
         Error::DisallowedScheme { .. } => SrcFetchErrorKind::DisallowedScheme,
         Error::DisallowedAddress { .. } => SrcFetchErrorKind::DisallowedAddress,
         Error::TooManyRedirects { .. } => SrcFetchErrorKind::TooManyRedirects,
+        Error::CrossOriginRedirect => SrcFetchErrorKind::CrossOrigin,
         Error::Timeout { .. } => SrcFetchErrorKind::Timeout,
         Error::Network { .. } | Error::TooManyConcurrentDnsResolutions { .. } => {
             SrcFetchErrorKind::Network
@@ -869,6 +922,11 @@ async fn load_sources(
     for entry in collected.entries() {
         if byte_abort.is_some() {
             loads.push(ScriptLoad::Unfetched);
+            continue;
+        }
+        // module は取得も計上もせず execute 段へ回す（Issue #1116）。
+        if entry.kind() == ScriptKind::Module {
+            loads.push(ScriptLoad::Module);
             continue;
         }
         match entry.source() {
@@ -977,7 +1035,7 @@ async fn execute(
     let PreparedPage {
         document: doc,
         collected,
-        ..
+        base,
     } = prepared;
     let LoadedScripts { loads, byte_abort } = loaded;
 
@@ -998,7 +1056,12 @@ async fn execute(
         .iter()
         .zip(loads.iter())
         .take_while(|(e, _)| abort_index.is_none_or(|a| e.index() < a))
-        .any(|(_, l)| matches!(l, ScriptLoad::Inline | ScriptLoad::Ready(_)));
+        .any(|(_, l)| {
+            matches!(
+                l,
+                ScriptLoad::Inline | ScriptLoad::Ready(_) | ScriptLoad::Module
+            )
+        });
     let page_start = Instant::now();
 
     let mut records: Vec<ScriptRunRecord> = Vec::new();
@@ -1060,7 +1123,11 @@ async fn execute(
         bridge: &bridge,
         options,
         page_start,
+        fetcher,
+        base: &base,
     };
+    // ページで 1 つの module グラフ（モジュールマップ・件数・総バイトの計上。Issue #1116）。
+    let mut graph = module_graph::ModuleGraph::new();
     for (entry, load) in collected.entries().iter().zip(loads.iter()) {
         let outcome = if let Some(a) = &abort {
             ScriptOutcome::NotExecuted {
@@ -1076,14 +1143,62 @@ async fn execute(
                 message: None,
             }
         } else {
+            // classic の本文は実行時点で総量へ加算する（文書順の会計。後続の classic の分で
+            // 先行の module を打ち切らない。`JS-6`・Issue #1116）。
+            let classic_len = match (load, entry.source()) {
+                (ScriptLoad::Ready(src), _) | (ScriptLoad::Inline, ScriptSource::Inline(src)) => {
+                    Some(src.len())
+                }
+                _ => None,
+            };
+            if let Some(len) = classic_len
+                && !graph.account_classic(len, options.max_total_script_bytes)
+            {
+                let kind = AbortKind::ScriptBytes {
+                    scope: ScriptBytesScope::Total,
+                    limit: options.max_total_script_bytes,
+                };
+                abort = Some(PageAbort {
+                    kind: kind.clone(),
+                    index: Some(entry.index()),
+                });
+                records.push(ScriptRunRecord {
+                    index: Some(entry.index()),
+                    node: Some(entry.node()),
+                    outcome: ScriptOutcome::Aborted {
+                        kind,
+                        message: None,
+                    },
+                });
+                continue;
+            }
             match (entry.source(), load) {
                 (_, ScriptLoad::Failed(kind)) => ScriptOutcome::SrcFetchFailed { kind: *kind },
-                (ScriptSource::Inline(src), _)
-                | (ScriptSource::External(_), ScriptLoad::Ready(src)) => {
+                (
+                    source,
+                    load @ (ScriptLoad::Inline | ScriptLoad::Ready(_) | ScriptLoad::Module),
+                ) => {
                     match runtime.as_mut() {
                         Some(rt) => {
-                            let mut o =
-                                run_one(rt, &ctx, entry.node(), entry.index(), src, &mut abort)?;
+                            let mut o = match (load, source) {
+                                (ScriptLoad::Module, _) => {
+                                    module_graph::run_module_entry(
+                                        rt,
+                                        &ctx,
+                                        &mut graph,
+                                        source,
+                                        entry.index(),
+                                        &mut abort,
+                                    )
+                                    .await
+                                }
+                                (ScriptLoad::Ready(src), _) | (_, ScriptSource::Inline(src)) => {
+                                    run_one(rt, &ctx, entry.node(), entry.index(), src, &mut abort)?
+                                }
+                                _ => ScriptOutcome::NotExecuted {
+                                    kind: AbortKind::EngineError,
+                                },
+                            };
                             // microtask checkpoint（スクリプト末尾の `queueMicrotask` を実行する。`JS-7`）。
                             // 上限超過済みなら checkpoint を回さない（超過後に callback が DOM を
                             // 変更しないよう、下の上限判定で打ち切る。`JS-6`）。
@@ -1204,6 +1319,10 @@ struct RunContext<'a> {
     options: &'a PageRunOptions,
     /// ページ実行の開始時刻（ページ時計。`JS-6`）。
     page_start: Instant,
+    /// module グラフの取得に使う Fetcher（`JS-8`。呼び出し側が所有する唯一の取得経路）。
+    fetcher: &'a Fetcher,
+    /// 検証済みの文書の base URL（inline module の referrer・同一オリジン判定の基準）。
+    base: &'a Url,
 }
 
 /// [`evaluate_with_budget`] の結果。
@@ -1219,6 +1338,37 @@ enum Evaluated {
     },
     /// ページの残り時間が無く、評価しなかった。
     BudgetExhausted(AbortKind),
+}
+
+/// 評価の失敗（例外以外）を打ち切りの種別とメッセージに写す。
+///
+/// 呼び出し元: classic の [`evaluate_with_budget`] と、module の compile・link・evaluate
+/// （`module_graph`。Issue #1116）。`scope` は `Timeout` のときに超過した上限の適用範囲。
+/// 未知の種別は fail-closed で `EngineError`（メッセージなし）。
+fn engine_error_abort(
+    err: &Error,
+    scope: WallTimeScope,
+    options: &PageRunOptions,
+) -> (AbortKind, Option<String>) {
+    match err {
+        Error::JsEvaluation(JsEngineError::Timeout(m)) => {
+            let limit = match scope {
+                WallTimeScope::Script => options.script_wall_time,
+                WallTimeScope::Page => options.page_wall_time,
+            };
+            (
+                AbortKind::WallTime { scope, limit },
+                Some(truncated_message(m).0),
+            )
+        }
+        Error::JsEvaluation(JsEngineError::ResourceLimitExceeded(m)) => {
+            (AbortKind::ResourceLimit, Some(truncated_message(m).0))
+        }
+        Error::JsEvaluation(JsEngineError::EngineUnavailable(m)) => {
+            (AbortKind::EngineUnavailable, Some(truncated_message(m).0))
+        }
+        _ => (AbortKind::EngineError, None),
+    }
 }
 
 /// ページ時計の残り予算を課して `src` を評価し、エンジンの結果を [`Evaluated`] に写す。
@@ -1253,23 +1403,7 @@ fn evaluate_with_budget(rt: &mut JsRuntime, ctx: &RunContext<'_>, src: &str) -> 
                 return Evaluated::Exception { message, truncated };
             }
         }
-        Err(Error::JsEvaluation(JsEngineError::Timeout(m))) => {
-            let limit = match scope {
-                WallTimeScope::Script => options.script_wall_time,
-                WallTimeScope::Page => options.page_wall_time,
-            };
-            (
-                AbortKind::WallTime { scope, limit },
-                Some(truncated_message(&m).0),
-            )
-        }
-        Err(Error::JsEvaluation(JsEngineError::ResourceLimitExceeded(m))) => {
-            (AbortKind::ResourceLimit, Some(truncated_message(&m).0))
-        }
-        Err(Error::JsEvaluation(JsEngineError::EngineUnavailable(m))) => {
-            (AbortKind::EngineUnavailable, Some(truncated_message(&m).0))
-        }
-        Err(Error::JsEvaluation(_)) | Err(_) => (AbortKind::EngineError, None),
+        Err(e) => engine_error_abort(&e, scope, options),
     };
     Evaluated::Aborted { kind, message }
 }
@@ -2387,6 +2521,11 @@ mod tests {
         assert_eq!(o.max_src_script_bytes(), 1024 * 1024);
         assert_eq!(DEFAULT_MAX_TOTAL_SCRIPT_BYTES, 4_194_304);
         assert_eq!(DEFAULT_MAX_SRC_SCRIPT_BYTES, 1_048_576);
+        // module の既定（Issue #1116）。
+        assert_eq!(o.max_modules(), 64);
+        assert_eq!(DEFAULT_MAX_PAGE_MODULES, 64);
+        assert_eq!(MAX_MODULE_GRAPH_DEPTH, 32);
+        assert_eq!(o.with_max_modules(3).max_modules(), 3);
     }
 
     /// JS-6: 件数の境界。上限ちょうどは打ち切らず、+1 で script_count。
@@ -2662,6 +2801,10 @@ mod tests {
             (
                 Error::TooManyRedirects { limit: 5 },
                 f(SrcFetchErrorKind::TooManyRedirects),
+            ),
+            (
+                Error::CrossOriginRedirect,
+                f(SrcFetchErrorKind::CrossOrigin),
             ),
             (
                 Error::Timeout {

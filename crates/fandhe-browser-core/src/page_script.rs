@@ -31,7 +31,8 @@
 //!
 //! - スクリプトの評価、`src` の URL 検証・取得（`Fetcher` 経由のみ。`JS-8`）、総バイト上限、
 //!   DOMContentLoaded / load の発火（いずれも [`crate::page_runner`] の担当。#780・#781 で実装済み）。
-//! - `type=module` の評価は [`crate::page_runner`] の担当（#1116 以降）。設定ファイル・
+//! - `type=module` の評価（グラフの取得・compile・link・evaluate）は [`crate::page_runner`] の担当
+//!   （#1116 で実装済み。動的 `import()` の取得は #1117）。設定ファイル・
 //!   `Page.navigate` への gate の配線は #1118。module の実行順は初版では文書順のまま
 //!   （仕様は defer 相当。差分は REPAIR-3 として許容）。
 //! - SVG の `<script>`、`language` 属性、import map、
@@ -106,12 +107,11 @@ impl ScriptCollectionOptions {
     ///
     /// 有効時は `type=module` を [`ScriptKind::Module`] として収集し、`nomodule` 付き
     /// classic を skip する。収集した module は classic と同じ `max_scripts` 枠・
-    /// `max_inline_bytes` の対象で、専用の件数上限は設けない（設計 §7 は #1116 で再検討）。
+    /// `max_inline_bytes` の対象で、収集時に専用の件数上限は設けない（取得する module の件数上限はランナー側）。
     ///
-    /// 注意（REPAIR-3）: [`crate::page_runner`] は #1116 までは [`ScriptEntry::kind`] を見ず
-    /// 全エントリを classic として評価するため、有効化した options をランナーへ渡すと
-    /// module が構文エラーになる。設定ファイル・`Page.navigate` には未配線（#1118）で、
-    /// 既定 off のため既存の挙動と `AISNAP-1`・`PLUG-4` の測定は変わらない。
+    /// [`crate::page_runner`] は module のエントリを #1116 から module として評価する
+    /// （件数は `PageRunOptions::max_modules`）。設定ファイル・`Page.navigate` には未配線
+    /// （#1118）で、既定 off のため既存の挙動と `AISNAP-1`・`PLUG-4` の測定は変わらない。
     pub fn with_execute_modules(mut self, execute_modules: bool) -> Self {
         self.execute_modules = execute_modules;
         self
