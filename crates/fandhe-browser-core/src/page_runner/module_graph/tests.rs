@@ -109,6 +109,9 @@ impl JsEngine for FakeModuleEngine {
         if src.contains("unsupported") {
             return Err(JsEngineError::NotYetImplemented("module".to_string()));
         }
+        if src.contains("eval-too-large") {
+            return Err(JsEngineError::EvaluationFailed("x".repeat(16)));
+        }
         if src.contains("tla-pending") {
             return Ok(ModuleEvaluation::Pending);
         }
@@ -861,4 +864,58 @@ fn js_4_gate_off_keeps_classic_behavior() {
     );
     assert_eq!(total_hits(&hits), 0);
     assert!(events(&log).is_empty());
+}
+
+/// `JS-6`: 循環の祖先を除いて求めた高さを別経路へ再利用せず、最長経路で深さを検査する。
+/// entry→X→A、entry→Y→B、A→B、A→E1→…→E30、B→A。
+/// entry→Y→B→A→E1→…→E30 は深さ 34 で上限（32）を超える。
+#[test]
+fn js_6_module_graph_depth_not_underestimated_by_cycle_memo() {
+    let (port, _hits) = spawn_server(|p| match p {
+        "/x.js" => js("import \"./a.js\";"),
+        "/y.js" => js("import \"./b.js\";"),
+        "/a.js" => js("import \"./b.js\";import \"./e1.js\";"),
+        "/b.js" => js("import \"./a.js\";"),
+        _ => {
+            let n: usize = p
+                .trim_start_matches("/e")
+                .trim_end_matches(".js")
+                .parse()
+                .unwrap_or(0);
+            if n >= 30 {
+                js("export {};")
+            } else {
+                js(&format!("import \"./e{}.js\";", n + 1))
+            }
+        }
+    });
+    let html = "<script type=module>import \"./x.js\";import \"./y.js\";</script>";
+    let (out, _) = run(html, port, &module_options());
+    assert_eq!(
+        outcomes(&out),
+        vec![ScriptOutcome::Aborted {
+            kind: AbortKind::ResourceLimit,
+            message: Some("module graph depth limit exceeded".to_string())
+        }]
+    );
+}
+
+/// 評価の `EvaluationFailed`（拒否メッセージの上限超過等）はページを打ち切らず、
+/// 固定メッセージの例外として後続を続ける。
+#[test]
+fn js_4_module_evaluation_failed_continues() {
+    let (port, _hits) = leaf_server();
+    let html = "<script type=module>eval-too-large</script><script>1</script>";
+    let (out, _) = run(html, port, &module_options());
+    assert_eq!(
+        outcomes(&out),
+        vec![
+            ScriptOutcome::Exception {
+                message: "module evaluation failed".to_string(),
+                truncated: false
+            },
+            ScriptOutcome::Succeeded
+        ]
+    );
+    assert!(out.abort().is_none());
 }

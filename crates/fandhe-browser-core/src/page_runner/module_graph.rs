@@ -566,55 +566,89 @@ async fn load_graph(
 
 /// `starts`（キーと基準の深さ）から辿れる依存経路の最長の深さを返す。
 ///
-/// 反復 DFS で各モジュールの高さ（葉まで）を 1 回ずつ求める。探索中の祖先への辺（循環）は
-/// 辿らないので、循環は深さを伸ばさない。取得はキーごとに 1 回のまま、近道の経路に隠れた
-/// 深い経路も検出する（`JS-6`）。
+/// 反復 DFS。探索中の祖先への辺（循環）は辿らないので、循環は深さを伸ばさない。
+/// 高さ（葉まで）のメモ化は、祖先への辺の切断に依存しない結果だけに限る。祖先を除いて
+/// 求めた高さは探索経路依存で、別経路へ再利用すると最長経路を過小評価するため
+/// （切断が自身より上の祖先に及んだノードはメモ化せず、辿るたびに再計算する）。
+/// 深さが上限を超えた時点で打ち切る（`JS-6`）。
 fn longest_depth(graph: &ModuleGraph, starts: &[(String, usize)]) -> usize {
-    let mut height: HashMap<&str, usize> = HashMap::new();
-    let mut on_stack: HashSet<&str> = HashSet::new();
+    /// DFS の 1 フレーム。`low` は切断した祖先の最小のスタック位置（無ければ `usize::MAX`）。
+    struct Frame<'a> {
+        key: &'a str,
+        idx: usize,
+        height: usize,
+        low: usize,
+    }
+    let mut memo: HashMap<&str, usize> = HashMap::new();
     let mut deepest = 0usize;
     for (start, base) in starts {
         let Some(ModuleSlot::Ready(_)) = graph.map.get(start) else {
             continue;
         };
-        let mut stack: Vec<(&str, usize)> = vec![(start.as_str(), 0)];
-        on_stack.insert(start.as_str());
-        height.entry(start.as_str()).or_insert(0);
-        while let Some(&(key, idx)) = stack.last() {
+        if let Some(&h) = memo.get(start.as_str()) {
+            deepest = deepest.max(base.saturating_add(h));
+            continue;
+        }
+        let mut pos: HashMap<&str, usize> = HashMap::new();
+        let mut stack: Vec<Frame<'_>> = vec![Frame {
+            key: start.as_str(),
+            idx: 0,
+            height: 0,
+            low: usize::MAX,
+        }];
+        pos.insert(start.as_str(), 0);
+        let mut start_height = 0usize;
+        while let Some(top) = stack.last() {
+            let (key, idx) = (top.key, top.idx);
             let deps: &[Dep] = match graph.map.get(key) {
                 Some(ModuleSlot::Ready(r)) => &r.deps,
                 _ => &[],
             };
             if let Some(dep) = deps.get(idx) {
                 if let Some(top) = stack.last_mut() {
-                    top.1 += 1;
+                    top.idx += 1;
                 }
                 let child = dep.key.as_str();
-                if on_stack.contains(child)
-                    || !matches!(graph.map.get(child), Some(ModuleSlot::Ready(_)))
-                {
+                if let Some(&p) = pos.get(child) {
+                    if let Some(top) = stack.last_mut() {
+                        top.low = top.low.min(p);
+                    }
                     continue;
                 }
-                if let Some(&h) = height.get(child) {
-                    let cur = height.entry(key).or_insert(0);
-                    *cur = (*cur).max(h.saturating_add(1));
-                } else {
-                    height.insert(child, 0);
-                    on_stack.insert(child);
-                    stack.push((child, 0));
+                if !matches!(graph.map.get(child), Some(ModuleSlot::Ready(_))) {
+                    continue;
                 }
-            } else {
-                stack.pop();
-                on_stack.remove(key);
-                let h = height.get(key).copied().unwrap_or(0);
-                if let Some(&(parent, _)) = stack.last() {
-                    let cur = height.entry(parent).or_insert(0);
-                    *cur = (*cur).max(h.saturating_add(1));
+                if let Some(&h) = memo.get(child) {
+                    if let Some(top) = stack.last_mut() {
+                        top.height = top.height.max(h.saturating_add(1));
+                    }
+                    continue;
+                }
+                if base.saturating_add(stack.len()) > MAX_MODULE_GRAPH_DEPTH {
+                    return base.saturating_add(stack.len());
+                }
+                pos.insert(child, stack.len());
+                stack.push(Frame {
+                    key: child,
+                    idx: 0,
+                    height: 0,
+                    low: usize::MAX,
+                });
+            } else if let Some(done) = stack.pop() {
+                let p = stack.len();
+                pos.remove(done.key);
+                if done.low >= p {
+                    memo.insert(done.key, done.height);
+                }
+                if let Some(parent) = stack.last_mut() {
+                    parent.height = parent.height.max(done.height.saturating_add(1));
+                    parent.low = parent.low.min(done.low);
+                } else {
+                    start_height = done.height;
                 }
             }
         }
-        deepest =
-            deepest.max(base.saturating_add(height.get(start.as_str()).copied().unwrap_or(0)));
+        deepest = deepest.max(base.saturating_add(start_height));
     }
     deepest
 }
@@ -710,6 +744,16 @@ fn evaluate_root(
         Ok(_) => aborted(AbortKind::EngineError, None, index, abort),
         Err(Error::JsEvaluation(JsEngineError::NotYetImplemented(_))) => {
             ScriptOutcome::ModuleUnsupported
+        }
+        // 拒否メッセージの上限超過等。classic の `evaluate_with_budget` と同様に
+        // 固定メッセージの例外として記録し、後続を続ける（ページ時計が尽きていれば打ち切り）。
+        Err(Error::JsEvaluation(JsEngineError::EvaluationFailed(_))) => {
+            if page_expired {
+                aborted(page_wall_abort(options, None).kind, None, index, abort)
+            } else {
+                graph.evaluated.insert(root, EvalState::Rejected);
+                rejected_outcome()
+            }
         }
         Err(e) => {
             let (kind, message) = engine_error_abort(&e, scope, options);
