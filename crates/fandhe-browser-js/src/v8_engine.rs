@@ -2028,11 +2028,18 @@ fn admit_dynamic_import(
     let referrer = match referrer_url {
         None => None,
         Some(url) => {
-            // 同じ URL が複数登録されていると特定できない。親の重複排除を信頼せず拒否する。
-            let mut matches = map.entries.iter().filter(|(_, e)| e.url == url);
-            match (matches.next(), matches.next()) {
-                (Some((id, _)), None) => Some(*id),
-                _ => return Err("referrer module cannot be identified"),
+            // inline module は文書の URL を共有するため、同じ URL の entry が複数あり得る
+            // （`<script type=module>` が複数）。親は referrer を URL の解決にしか使わず、同じ URL
+            // なら解決結果も同じなので、最小 id を決定的に採る。URL が未登録なら特定不能で拒否する。
+            match map
+                .entries
+                .iter()
+                .filter(|(_, e)| e.url == url)
+                .map(|(id, _)| *id)
+                .min()
+            {
+                Some(id) => Some(id),
+                None => return Err("referrer module cannot be identified"),
             }
         }
     };
@@ -2446,14 +2453,18 @@ impl V8Engine {
     /// - `Ok(target)` は instantiate・evaluate し、評価 Promise の `then` で名前空間へ解決する
     ///   （評価が reject・top-level await で保留でも仕様どおりに伝播する）
     /// - そのあと microtask checkpoint を行い（利用者の `then`・`catch` が走る）、監視は
-    ///   [`SCRIPT_EXECUTION_TIMEOUT`]。超過は `Timeout`（エントリは完了済みとして扱い、
-    ///   未確定の Promise は reject する。親は `Timeout` 応答でも台帳から外す）
+    ///   `options.timeout()`（呼び出し側がページの残り時間を渡す。`JS-6`・Issue #1117）。超過は
+    ///   `Timeout`（エントリは完了済みとして扱い、未確定の Promise は reject する。親は `Timeout`
+    ///   応答でも台帳から外す）。0 は id の検証と除去のあと V8 を動かさず reject して `Timeout`
+    /// - 戻り値は checkpoint 後の `import()` の Promise の状態（Fulfilled・Rejected・Pending）
     pub(crate) fn finish_dynamic_import(
         &mut self,
         id: DynamicImportId,
         result: Result<ModuleId, String>,
-    ) -> Result<(), JsEngineError> {
+        options: &EvaluateOptions,
+    ) -> Result<ModuleEvaluation, JsEngineError> {
         self.ensure_no_native_call_fatal()?;
+        let timeout = options.timeout();
         let unknown = || {
             JsEngineError::ModuleResolutionFailed(
                 "unknown or finished dynamic import id".to_string(),
@@ -2478,9 +2489,26 @@ impl V8Engine {
         let mut tc = tc.init();
 
         let resolver = v8::Local::new(&tc, &resolver_global);
-        let watchdog = Watchdog::start(isolate_handle, SCRIPT_EXECUTION_TIMEOUT);
+        if timeout.is_zero() {
+            // 残り時間 0 でも id の検証と完了待ちからの除去は済ませてある（親は `Timeout` で
+            // 台帳から外すため、親子で完了の有無をそろえる）。V8 は動かさず reject だけする。
+            reject_with_message(&tc, resolver, "dynamic import timed out");
+            return Err(V8Failure::Terminated {
+                stage: "execution",
+                timeout,
+            }
+            .into());
+        }
+        let watchdog = Watchdog::start(isolate_handle, timeout);
         Self::settle_dynamic_import(&mut tc, id.raw(), resolver, result);
         run_microtask_checkpoint(&mut tc);
+        // 打ち切られていなければ `import()` の Promise の状態を読む（ユーザーコードを実行しない
+        // 経路だけを使うため、監視スレッドが生きている間に行う）。
+        let settlement = if tc.has_terminated() {
+            None
+        } else {
+            Some(Self::classify_import_promise(&mut tc, resolver))
+        };
         watchdog.stop();
         let was_terminated = tc.has_terminated();
         tc.cancel_terminate_execution();
@@ -2494,11 +2522,41 @@ impl V8Engine {
             reject_with_message(&tc, resolver, "dynamic import timed out");
             return Err(V8Failure::Terminated {
                 stage: "execution",
-                timeout: SCRIPT_EXECUTION_TIMEOUT,
+                timeout,
             }
             .into());
         }
-        Ok(())
+        match settlement {
+            Some(ModuleOutcome::Fulfilled) => Ok(ModuleEvaluation::Fulfilled),
+            Some(ModuleOutcome::Rejected(message)) => {
+                if message.len() > options.max_result_bytes() {
+                    return Err(JsEngineError::EvaluationFailed(format!(
+                        "dynamic import rejection message of {} bytes exceeds the result size limit of {} bytes",
+                        message.len(),
+                        options.max_result_bytes()
+                    )));
+                }
+                Ok(ModuleEvaluation::rejected(message))
+            }
+            Some(ModuleOutcome::Pending) | None => Ok(ModuleEvaluation::Pending),
+        }
+    }
+
+    /// `import()` の Promise（resolver が持つ）の確定結果を分類する。reject は処理済みにして
+    /// unhandled rejection の報告を避ける。
+    fn classify_import_promise(
+        tc: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
+        resolver: v8::Local<v8::PromiseResolver>,
+    ) -> ModuleOutcome {
+        let promise = resolver.get_promise(tc);
+        match promise.state() {
+            v8::PromiseState::Fulfilled => ModuleOutcome::Fulfilled,
+            v8::PromiseState::Rejected => {
+                promise.mark_as_handled();
+                ModuleOutcome::Rejected(exception_message(tc, promise.result(tc)))
+            }
+            v8::PromiseState::Pending => ModuleOutcome::Pending,
+        }
     }
 
     /// 保留中の Promise を reject または名前空間で解決する（監視スレッドが生きている間に呼ぶ）。
@@ -4455,7 +4513,7 @@ mod tests {
         record
     }
 
-    fn assert_unknown_dynamic_id(result: Result<(), JsEngineError>) {
+    fn assert_unknown_dynamic_id(result: Result<ModuleEvaluation, JsEngineError>) {
         match result {
             Err(JsEngineError::ModuleResolutionFailed(msg)) => {
                 assert_eq!(msg, "unknown or finished dynamic import id")
@@ -4523,7 +4581,11 @@ mod tests {
             "export const v = 42;",
         );
         engine
-            .finish_dynamic_import(requests[0].id(), Ok(target.id()))
+            .finish_dynamic_import(
+                requests[0].id(),
+                Ok(target.id()),
+                &EvaluateOptions::default(),
+            )
             .expect("finish");
         assert_eq!(eval_str(&mut engine, "got"), JsValue::Number(42.0));
     }
@@ -4539,7 +4601,11 @@ mod tests {
         );
         let requests = engine.take_dynamic_import_requests().expect("take");
         engine
-            .finish_dynamic_import(requests[0].id(), Err("fetch failed".to_string()))
+            .finish_dynamic_import(
+                requests[0].id(),
+                Err("fetch failed".to_string()),
+                &EvaluateOptions::default(),
+            )
             .expect("finish");
         assert_eq!(
             eval_str(&mut engine, "err"),
@@ -4563,7 +4629,11 @@ mod tests {
             "throw new Error('boom'); export {};",
         );
         engine
-            .finish_dynamic_import(requests[0].id(), Ok(target.id()))
+            .finish_dynamic_import(
+                requests[0].id(),
+                Ok(target.id()),
+                &EvaluateOptions::default(),
+            )
             .expect("finish");
         assert_eq!(
             eval_str(&mut engine, "err"),
@@ -4587,7 +4657,11 @@ mod tests {
             "await Promise.resolve(); export const v = 7;",
         );
         engine
-            .finish_dynamic_import(requests[0].id(), Ok(target.id()))
+            .finish_dynamic_import(
+                requests[0].id(),
+                Ok(target.id()),
+                &EvaluateOptions::default(),
+            )
             .expect("finish");
         assert_eq!(eval_str(&mut engine, "got"), JsValue::Number(7.0));
     }
@@ -4602,21 +4676,31 @@ mod tests {
             "https://example.test/d.js",
             "import('./x.js').catch(() => {}); import('./y.js').catch(() => {}); export {};",
         );
-        assert_unknown_dynamic_id(
-            engine.finish_dynamic_import(DynamicImportId::from_raw(99), Err("e".to_string())),
-        );
+        assert_unknown_dynamic_id(engine.finish_dynamic_import(
+            DynamicImportId::from_raw(99),
+            Err("e".to_string()),
+            &EvaluateOptions::default(),
+        ));
         // まだ取り出していない id（1 件目）。
-        assert_unknown_dynamic_id(
-            engine.finish_dynamic_import(DynamicImportId::from_raw(1), Err("e".to_string())),
-        );
+        assert_unknown_dynamic_id(engine.finish_dynamic_import(
+            DynamicImportId::from_raw(1),
+            Err("e".to_string()),
+            &EvaluateOptions::default(),
+        ));
         let requests = engine.take_dynamic_import_requests().expect("take");
         assert_eq!(requests.len(), 2);
         engine
-            .finish_dynamic_import(requests[0].id(), Err("e".to_string()))
+            .finish_dynamic_import(
+                requests[0].id(),
+                Err("e".to_string()),
+                &EvaluateOptions::default(),
+            )
             .expect("first finish");
-        assert_unknown_dynamic_id(
-            engine.finish_dynamic_import(requests[0].id(), Err("e".to_string())),
-        );
+        assert_unknown_dynamic_id(engine.finish_dynamic_import(
+            requests[0].id(),
+            Err("e".to_string()),
+            &EvaluateOptions::default(),
+        ));
         assert_eq!(eval_str(&mut engine, "1 + 1"), JsValue::Number(2.0));
     }
 
@@ -4632,12 +4716,20 @@ mod tests {
         );
         let requests = engine.take_dynamic_import_requests().expect("take");
         let unlinked = compile_ok(&mut engine, "https://example.test/u.js", "import './z.js';");
-        match engine.finish_dynamic_import(requests[0].id(), Ok(unlinked.id())) {
+        match engine.finish_dynamic_import(
+            requests[0].id(),
+            Ok(unlinked.id()),
+            &EvaluateOptions::default(),
+        ) {
             Err(JsEngineError::ModuleResolutionFailed(_)) => {}
             other => panic!("expected ModuleResolutionFailed, got: {other:?}"),
         }
         engine
-            .finish_dynamic_import(requests[0].id(), Err("retry".to_string()))
+            .finish_dynamic_import(
+                requests[0].id(),
+                Err("retry".to_string()),
+                &EvaluateOptions::default(),
+            )
             .expect("finish again with Err");
         assert_eq!(
             eval_str(&mut engine, "err"),
@@ -4686,19 +4778,21 @@ mod tests {
         assert_eq!(engine.take_dynamic_import_requests().expect("take"), vec![]);
     }
 
-    /// JS-6・Issue #1113: 同じ URL のモジュールが 2 つ登録されていると referrer を特定できず、
-    /// 成功を装わず即時 reject する。
+    /// JS-6・Issue #1113: 同じ URL のモジュールが複数登録されていても（複数の inline module）、
+    /// 最小 id を referrer として動的 import を積む。
     #[test]
-    fn js_6_v8_dynamic_import_rejects_when_referrer_url_is_ambiguous() {
+    fn js_6_v8_dynamic_import_with_shared_referrer_url_uses_smallest_id() {
         let mut engine = module_engine();
-        compile_ok(&mut engine, "https://example.test/dup.js", "export {};");
+        let first = compile_ok(&mut engine, "https://example.test/dup.js", "export {};");
         eval_module_source(
             &mut engine,
             "https://example.test/dup.js",
-            "globalThis.r = 0; import('./x.js').catch(() => { globalThis.r = 1; }); export {};",
+            "import('./x.js'); export {};",
         );
-        assert_eq!(eval_str(&mut engine, "r"), JsValue::Number(1.0));
-        assert_eq!(engine.take_dynamic_import_requests().expect("take"), vec![]);
+        let requests = engine.take_dynamic_import_requests().expect("take");
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].referrer(), Some(first.id()));
+        assert_eq!(requests[0].specifier(), "./x.js");
     }
 
     /// JS-6・Issue #1113: 完了後の `then` が microtask を無限に積むと `Timeout`。
@@ -4712,7 +4806,11 @@ mod tests {
         );
         let requests = engine.take_dynamic_import_requests().expect("take");
         let target = compile_ok(&mut engine, "https://example.test/x.js", "export {};");
-        match engine.finish_dynamic_import(requests[0].id(), Ok(target.id())) {
+        match engine.finish_dynamic_import(
+            requests[0].id(),
+            Ok(target.id()),
+            &EvaluateOptions::default(),
+        ) {
             Err(JsEngineError::Timeout(_)) => {}
             other => panic!("expected Timeout, got: {other:?}"),
         }
@@ -4735,7 +4833,11 @@ mod tests {
             "https://example.test/x.js",
             "for (;;) {} export {};",
         );
-        match engine.finish_dynamic_import(requests[0].id(), Ok(target.id())) {
+        match engine.finish_dynamic_import(
+            requests[0].id(),
+            Ok(target.id()),
+            &EvaluateOptions::default(),
+        ) {
             Err(JsEngineError::Timeout(_)) => {}
             other => panic!("expected Timeout, got: {other:?}"),
         }
@@ -4761,7 +4863,11 @@ mod tests {
             "https://example.test/x.js",
             "await Promise.resolve(); for (;;) {} export {};",
         );
-        match engine.finish_dynamic_import(requests[0].id(), Ok(target.id())) {
+        match engine.finish_dynamic_import(
+            requests[0].id(),
+            Ok(target.id()),
+            &EvaluateOptions::default(),
+        ) {
             Err(JsEngineError::Timeout(_)) => {}
             other => panic!("expected Timeout, got: {other:?}"),
         }

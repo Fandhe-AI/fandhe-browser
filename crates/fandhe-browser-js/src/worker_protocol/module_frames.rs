@@ -22,9 +22,10 @@
 //! | `MODULE_RESULT` | 子 → 親 | `u8 status`（0 Fulfilled・1 Pending・2 Rejected）。Rejected のみ message（残り全部） |
 //! | `TAKE_DYNAMIC_IMPORTS` | 親 → 子 | 空 |
 //! | `DYNAMIC_IMPORTS` | 子 → 親 | `u16 count` ＋ count × (`u32 id` ＋ `u8 has_referrer` ＋ [`u32 referrer`] ＋ specifier) |
-//! | `FINISH_DYNAMIC_IMPORT` | 親 → 子 | `u32 id` ＋ `u8 status`（0 Ok・1 Err）＋ Ok は `u32 module_id`、Err は message（残り全部） |
+//! | `FINISH_DYNAMIC_IMPORT` | 親 → 子 | `EVALUATE` と同じ 16 バイトのヘッダ ＋ `u32 id` ＋ `u8 status`（0 Ok・1 Err）＋ Ok は `u32 module_id`、Err は message（残り全部） |
 //!
-//! link・finish の応答は登録系と同じ `RESULT(Undefined)` の ack を流用する。
+//! link の応答は登録系と同じ `RESULT(Undefined)` の ack を流用する。finish の応答は
+//! `import()` の Promise の確定結果を `MODULE_RESULT` で返す（Issue #1117）。
 //!
 //! # 検証方針（`JS-6`・coding-rust.md「外部入力」）
 //!
@@ -546,8 +547,10 @@ fn reject_duplicate_ids(ids: impl Iterator<Item = u32>) -> Result<(), ProtocolEr
 pub(crate) fn encode_finish_dynamic_import(
     id: DynamicImportId,
     result: &Result<ModuleId, String>,
+    options: &EvaluateOptions,
 ) -> Result<Vec<u8>, ProtocolError> {
     let mut out = Vec::new();
+    out.extend_from_slice(&encode_evaluate_header(options));
     out.extend_from_slice(&id.raw().to_le_bytes());
     match result {
         Ok(module) => {
@@ -571,14 +574,15 @@ pub(crate) fn encode_finish_dynamic_import(
 /// [`encode_finish_dynamic_import`] の逆変換（子側）。
 pub(crate) fn decode_finish_dynamic_import(
     payload: &[u8],
-) -> Result<(DynamicImportId, Result<ModuleId, String>), ProtocolError> {
-    let mut r = Reader::new(payload);
+) -> Result<(DynamicImportId, Result<ModuleId, String>, EvaluateOptions), ProtocolError> {
+    let (options, body) = decode_evaluate_header(payload)?;
+    let mut r = Reader::new(body);
     let id = DynamicImportId::from_raw(r.u32()?);
     match r.u8()? {
         FINISH_OK => {
             let module = ModuleId::from_raw(r.u32()?);
             r.finish()?;
-            Ok((id, Ok(module)))
+            Ok((id, Ok(module), options))
         }
         FINISH_ERR => {
             let bytes = r.rest();
@@ -591,7 +595,7 @@ pub(crate) fn decode_finish_dynamic_import(
             let message = std::str::from_utf8(bytes)
                 .map(str::to_string)
                 .map_err(|_| ProtocolError::InvalidUtf8)?;
-            Ok((id, Err(message)))
+            Ok((id, Err(message), options))
         }
         other => Err(ProtocolError::InvalidFinishStatus(other)),
     }
@@ -877,21 +881,28 @@ mod tests {
         ));
     }
 
-    /// JS-4: FINISH_DYNAMIC_IMPORT の Ok・Err の往復。
+    /// JS-4: FINISH_DYNAMIC_IMPORT の Ok・Err の往復（残り時間のヘッダを含む）。
     #[test]
     fn js_4_finish_dynamic_import_round_trips_ok_and_err() {
         let id = DynamicImportId::from_raw(4);
-        let ok = encode_finish_dynamic_import(id, &Ok(ModuleId::from_raw(8))).expect("encode");
-        assert_eq!(
-            decode_finish_dynamic_import(&ok).expect("decode"),
-            (id, Ok(ModuleId::from_raw(8)))
-        );
-        let err =
-            encode_finish_dynamic_import(id, &Err("fetch failed".to_string())).expect("encode");
-        assert_eq!(
-            decode_finish_dynamic_import(&err).expect("decode"),
-            (id, Err("fetch failed".to_string()))
-        );
+        let options = EvaluateOptions::default().with_timeout(Duration::from_millis(1234));
+        let ok =
+            encode_finish_dynamic_import(id, &Ok(ModuleId::from_raw(8)), &options).expect("encode");
+        let (got_id, got_result, got_options) = decode_finish_dynamic_import(&ok).expect("decode");
+        assert_eq!((got_id, got_result), (id, Ok(ModuleId::from_raw(8))));
+        assert_eq!(got_options.timeout(), Duration::from_millis(1234));
+        let err = encode_finish_dynamic_import(id, &Err("fetch failed".to_string()), &options)
+            .expect("encode");
+        let (got_id, got_result, got_options) = decode_finish_dynamic_import(&err).expect("decode");
+        assert_eq!((got_id, got_result), (id, Err("fetch failed".to_string())));
+        assert_eq!(got_options.timeout(), Duration::from_millis(1234));
+    }
+
+    /// 先頭に `EVALUATE` 共通ヘッダ（既定値）を付けたペイロードを作る。
+    fn with_header(body: &[u8]) -> Vec<u8> {
+        let mut out = encode_evaluate_header(&EvaluateOptions::default()).to_vec();
+        out.extend_from_slice(body);
+        out
     }
 
     /// JS-4: FINISH_DYNAMIC_IMPORT の不正入力。
@@ -900,7 +911,7 @@ mod tests {
         let mut payload = 1u32.to_le_bytes().to_vec();
         payload.push(2);
         assert!(matches!(
-            decode_finish_dynamic_import(&payload),
+            decode_finish_dynamic_import(&with_header(&payload)),
             Err(ProtocolError::InvalidFinishStatus(2))
         ));
         let mut trailing = 1u32.to_le_bytes().to_vec();
@@ -908,30 +919,36 @@ mod tests {
         trailing.extend_from_slice(&3u32.to_le_bytes());
         trailing.push(0);
         assert!(matches!(
-            decode_finish_dynamic_import(&trailing),
+            decode_finish_dynamic_import(&with_header(&trailing)),
             Err(ProtocolError::TrailingBytes { .. })
         ));
         let mut utf8 = 1u32.to_le_bytes().to_vec();
         utf8.push(1);
         utf8.push(0xff);
         assert!(matches!(
-            decode_finish_dynamic_import(&utf8),
+            decode_finish_dynamic_import(&with_header(&utf8)),
             Err(ProtocolError::InvalidUtf8)
         ));
         let mut long = 1u32.to_le_bytes().to_vec();
         long.push(1);
         long.extend_from_slice(&vec![b'x'; MAX_ERROR_MESSAGE_BYTES + 1]);
         assert!(matches!(
-            decode_finish_dynamic_import(&long),
+            decode_finish_dynamic_import(&with_header(&long)),
             Err(ProtocolError::ErrorMessageTooLong { .. })
         ));
         assert!(matches!(
             encode_finish_dynamic_import(
                 DynamicImportId::from_raw(1),
-                &Err("x".repeat(MAX_ERROR_MESSAGE_BYTES + 1))
+                &Err("x".repeat(MAX_ERROR_MESSAGE_BYTES + 1)),
+                &EvaluateOptions::default(),
             ),
             Err(ProtocolError::ErrorMessageTooLong { .. })
         ));
+        assert!(matches!(
+            decode_finish_dynamic_import(&with_header(&[1, 0, 0])),
+            Err(ProtocolError::Truncated)
+        ));
+        // ヘッダ自体が足りない。
         assert!(matches!(
             decode_finish_dynamic_import(&[1, 0, 0]),
             Err(ProtocolError::Truncated)

@@ -118,7 +118,11 @@ pub(crate) const MARKER_ENV_VAR: &str = "FANDHE_BROWSER_JS_WORKER";
 /// 4・5）を追加（`JS-4`・Issue #1110・設計 `es-module-design.md` §4）。旧世代の
 /// 子は新 tag をプロトコル違反として終了し、旧世代の親は新しいエラー種別を
 /// 解釈できないため、世代差をハンドシェイクで検出できるよう上げた。
-pub(crate) const PROTOCOL_VERSION: u16 = 6;
+///
+/// 7: [`tag::FINISH_DYNAMIC_IMPORT`] のペイロード先頭に [`tag::EVALUATE`] と同じ 16 バイトの
+/// ヘッダ（残り時間）を追加し、応答を ack（`RESULT`）から `import()` の Promise の確定結果
+/// （[`tag::MODULE_RESULT`]）へ変更（`JS-4`・`JS-6`・Issue #1117）。
+pub(crate) const PROTOCOL_VERSION: u16 = 7;
 
 /// フレームの `tag` バイトの値。
 ///
@@ -2518,7 +2522,7 @@ mod tests {
     #[test]
     fn js_1_marker_env_var_and_protocol_version_have_the_documented_values() {
         assert_eq!(MARKER_ENV_VAR, "FANDHE_BROWSER_JS_WORKER");
-        assert_eq!(PROTOCOL_VERSION, 6);
+        assert_eq!(PROTOCOL_VERSION, 7);
     }
 
     /// JS-1: 想定される tag 値が予約分も含め重複しないこと（プロトコル

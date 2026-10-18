@@ -1193,6 +1193,197 @@ pub fn run_module_graph(engine: &str) {
     assert_eq!(outcome_of(&out, 0).as_str(), "skipped");
     assert_eq!(hit_count(&hits), 0);
 }
+/// 動的 `import()` をイベントループ段で取得して完了させるケース（`JS-4`・`JS-6`・`JS-8`・`SEC-2`・
+/// Issue #1117）。V8 のみ（boa は動的 `import()` を compile 時に拒否する）。
+#[allow(dead_code)]
+pub fn run_dynamic_imports(engine: &str) {
+    let opts = module_options();
+
+    eprintln!("case: JS-4 dynamic import is fetched, linked with its static import, and applied");
+    let (port, hits) = spawn_recording_server(|path| match path {
+        "/chunk.js" => js_response("import {k} from './dep.js'; export const v = k + 5;"),
+        "/dep.js" => js_response("export const k = 2;"),
+        _ => ("404 Not Found", String::new(), "nope".to_string()),
+    });
+    let base = format!("http://127.0.0.1:{port}/");
+    let html = "<body><script type=module>import('./chunk.js').then(m => { \
+        document.body.setAttribute('data-d', String(m.v)); globalThis.__d = m.v; });</script></body>";
+    let out = run_page_at(engine, html, &base, &opts, &loopback_fetcher());
+    assert_eq!(
+        outcome_of(&out, 0),
+        ScriptOutcome::Succeeded,
+        "{}",
+        out.html()
+    );
+    assert!(out.html().contains("data-d=\"7\""), "{}", out.html());
+    assert_eq!(path_hits(&hits, "/chunk.js"), 1);
+    assert_eq!(path_hits(&hits, "/dep.js"), 1);
+    let report = out.dynamic_imports();
+    assert_eq!(
+        (report.requested(), report.fulfilled(), report.rejected()),
+        (1, 1, 0)
+    );
+    assert!(out.abort().is_none());
+
+    eprintln!("case: JS-4 throwing / top-level-await targets are not counted as fulfilled");
+    let (port, _hits) = spawn_recording_server(|path| match path {
+        "/throws.js" => js_response("throw new Error('x'); export {};"),
+        "/tla.js" => js_response("await new Promise(() => {}); export {};"),
+        _ => ("404 Not Found", String::new(), "nope".to_string()),
+    });
+    let base = format!("http://127.0.0.1:{port}/");
+    let html = "<body><script type=module>\
+        import('./throws.js').catch(() => document.body.setAttribute('data-t', '1'));\
+        import('./tla.js').then(() => document.body.setAttribute('data-p', '1'));\
+        </script></body>";
+    let out = run_page_at(engine, html, &base, &opts, &loopback_fetcher());
+    assert!(out.html().contains("data-t=\"1\""), "{}", out.html());
+    assert!(!out.html().contains("data-p=\"1\""), "{}", out.html());
+    let report = out.dynamic_imports();
+    assert_eq!(
+        (
+            report.requested(),
+            report.fulfilled(),
+            report.rejected(),
+            report.pending()
+        ),
+        (2, 0, 1, 1)
+    );
+    assert_eq!(report.failures().len(), 1);
+    assert_eq!(report.failures()[0].as_str(), "module_evaluation_failed");
+    assert!(out.abort().is_none());
+
+    eprintln!("case: JS-6 a dynamic module loop is stopped by the remaining script wall time");
+    let (port, _hits) = spawn_recording_server(|path| match path {
+        "/spin.js" => js_response("for (;;) {} export {};"),
+        _ => ("404 Not Found", String::new(), "nope".to_string()),
+    });
+    let base = format!("http://127.0.0.1:{port}/");
+    let limit = Duration::from_millis(500);
+    let started = std::time::Instant::now();
+    let out = run_page_at(
+        engine,
+        "<body><script type=module>import('./spin.js').catch(() => {});</script></body>",
+        &base,
+        &module_options().with_script_wall_time(limit),
+        &loopback_fetcher(),
+    );
+    assert_eq!(
+        out.abort().map(|a| a.kind().clone()),
+        Some(AbortKind::WallTime {
+            scope: WallTimeScope::Script,
+            limit
+        })
+    );
+    assert!(started.elapsed() < Duration::from_millis(1800));
+
+    eprintln!("case: JS-8/SEC-2 non-JS MIME / cross-origin / bare reject with a kind only");
+    let (other, other_hits) = spawn_recording_server(|_| js_response("export {};"));
+    let (port, _hits) = spawn_recording_server(|path| match path {
+        "/text.js" => (
+            "200 OK",
+            "Content-Type: text/plain\r\n".to_string(),
+            "export {};".to_string(),
+        ),
+        _ => js_response("export {};"),
+    });
+    let base = format!("http://127.0.0.1:{port}/");
+    let html = format!(
+        "<body><script type=module>\
+         import('./text.js').catch(e => document.body.setAttribute('data-e0', e.message));\
+         import('http://127.0.0.1:{other}/x.js').catch(e => document.body.setAttribute('data-e1', e.message));\
+         import('foo').catch(e => document.body.setAttribute('data-e2', e.message));\
+         </script></body>"
+    );
+    let out = run_page_at(engine, &html, &base, &opts, &loopback_fetcher());
+    for (i, kind) in ["unsupported_mime_type", "cross_origin", "bare_specifier"]
+        .iter()
+        .enumerate()
+    {
+        let expected = format!("data-e{i}=\"dynamic import failed: {kind}\"");
+        assert!(out.html().contains(&expected), "{expected}: {}", out.html());
+    }
+    assert_eq!(hit_count(&other_hits), 0);
+    let kinds: Vec<&str> = out
+        .dynamic_imports()
+        .failures()
+        .iter()
+        .map(|f| f.as_str())
+        .collect();
+    assert_eq!(
+        kinds,
+        vec!["unsupported_mime_type", "cross_origin", "bare_specifier"]
+    );
+    assert!(out.abort().is_none());
+
+    eprintln!(
+        "case: JS-6 dynamic import counts toward max_modules (62 static + dyn ok, 63 aborts)"
+    );
+    let (port, hits) = spawn_recording_server(|_| js_response("export const v = 1;"));
+    let base = format!("http://127.0.0.1:{port}/");
+    let html = |n: usize| {
+        let imports: String = (0..n).map(|i| format!("import './m{i}.js';")).collect();
+        format!(
+            "<body><script type=module>{imports}import('./dyn.js').then(m => \
+             document.body.setAttribute('data-d', String(m.v)));</script></body>"
+        )
+    };
+    let out = run_page_at(engine, &html(62), &base, &opts, &loopback_fetcher());
+    assert!(out.html().contains("data-d=\"1\""), "{}", out.html());
+    assert!(out.abort().is_none());
+    let before = hit_count(&hits);
+    let out = run_page_at(engine, &html(63), &base, &opts, &loopback_fetcher());
+    assert_eq!(
+        out.abort().map(|a| a.kind().clone()),
+        Some(AbortKind::ScriptCount { limit: 64 })
+    );
+    // 2 回目のページは静的 63 件を取得した後、動的 import の取得に進まない。
+    assert_eq!(path_hits(&hits, "/dyn.js"), 1);
+    assert_eq!(hit_count(&hits) - before, 63);
+
+    eprintln!("case: JS-6 dynamic import fetch is bounded by the page wall time");
+    let (port, _hits) = spawn_recording_server(|path| {
+        if path == "/hang.js" {
+            std::thread::sleep(Duration::from_secs(4));
+        }
+        js_response("export const v = 1;")
+    });
+    let base = format!("http://127.0.0.1:{port}/");
+    let limit = Duration::from_millis(1500);
+    let started = std::time::Instant::now();
+    let out = run_page_at(
+        engine,
+        "<body><script type=module>import('./hang.js').then(m => \
+         document.body.setAttribute('data-d', '1'));</script></body>",
+        &base,
+        &module_options().with_page_wall_time(limit),
+        &loopback_fetcher(),
+    );
+    assert_eq!(
+        out.abort().map(|a| a.kind().clone()),
+        Some(AbortKind::WallTime {
+            scope: WallTimeScope::Page,
+            limit
+        })
+    );
+    assert!(!out.html().contains("data-d=\"1\""), "{}", out.html());
+    assert!(started.elapsed() < Duration::from_secs(4));
+
+    eprintln!("case: JS-4 gate off never fetches a dynamic import");
+    let (port, hits) = spawn_recording_server(|_| js_response("export {};"));
+    let base = format!("http://127.0.0.1:{port}/");
+    let out = run_page_at(
+        engine,
+        "<body><script type=module>import('./c.js');</script></body>",
+        &base,
+        &PageRunOptions::default(),
+        &loopback_fetcher(),
+    );
+    assert_eq!(outcome_of(&out, 0).as_str(), "skipped");
+    assert_eq!(hit_count(&hits), 0);
+    assert_eq!(out.dynamic_imports().requested(), 0);
+}
+
 pub fn run(engine: &str) {
     let opts = PageRunOptions::default();
     timer_cases(engine);

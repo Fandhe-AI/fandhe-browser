@@ -59,8 +59,8 @@ use std::time::Instant;
 // 注入関数の型を core 経由で使えるよう再公開する（js crate へ直接依存してよいのは
 // core のみという crate 間の許可依存を、harness 等の利用側に守らせるため）。
 use fandhe_browser_js::{
-    CreateEngineError, EngineKind, EvaluateOptions, JsEngine, JsValue, ModuleEvaluation, ModuleId,
-    ModuleRecord, ModuleResolution, create_engine,
+    CreateEngineError, DynamicImportId, DynamicImportRequest, EngineKind, EvaluateOptions,
+    JsEngine, JsValue, ModuleEvaluation, ModuleId, ModuleRecord, ModuleResolution, create_engine,
 };
 pub use fandhe_browser_js::{JsEngineError, NativeFn};
 
@@ -269,6 +269,42 @@ impl JsRuntime {
             }),
             RuntimeState::Enabled { engine, .. } => engine
                 .evaluate_module(root, options)
+                .map_err(crate::Error::JsEvaluation),
+        }
+    }
+
+    /// 保留中の動的 `import()` を取り出す（`JS-4`・Issue #1117）。
+    ///
+    /// 呼び出し元: `page_runner` のイベントループ段。JS 無効のランタイムは成功を装わず
+    /// `JsExecutionUnavailable`、エンジンの失敗は [`crate::Error::JsEvaluation`] に包む
+    /// （未対応エンジンは `NotYetImplemented` のまま）。契約は
+    /// [`JsEngine::take_dynamic_import_requests`] に同じ。
+    pub fn take_dynamic_import_requests(&mut self) -> crate::Result<Vec<DynamicImportRequest>> {
+        match &mut self.state {
+            RuntimeState::Disabled => Err(crate::Error::JsExecutionUnavailable {
+                message: DISABLED_MESSAGE.to_string(),
+            }),
+            RuntimeState::Enabled { engine, .. } => engine
+                .take_dynamic_import_requests()
+                .map_err(crate::Error::JsEvaluation),
+        }
+    }
+
+    /// 動的 `import()` を完了させる（`JS-4`・Issue #1117）。`Ok` は compile・link 済みの対象、
+    /// `Err` は URL を含めない失敗の種別。`options` の timeout で評価・checkpoint を打ち切り、戻り値は
+    /// `import()` の Promise の確定結果。契約は [`JsEngine::finish_dynamic_import`] に同じ。
+    pub fn finish_dynamic_import(
+        &mut self,
+        id: DynamicImportId,
+        result: Result<ModuleId, String>,
+        options: &EvaluateOptions,
+    ) -> crate::Result<ModuleEvaluation> {
+        match &mut self.state {
+            RuntimeState::Disabled => Err(crate::Error::JsExecutionUnavailable {
+                message: DISABLED_MESSAGE.to_string(),
+            }),
+            RuntimeState::Enabled { engine, .. } => engine
+                .finish_dynamic_import(id, result, options)
                 .map_err(crate::Error::JsEvaluation),
         }
     }
@@ -786,6 +822,43 @@ mod tests {
             ),
             "{err}"
         );
+    }
+
+    /// JS-4（Issue #1117）: 動的 import API も無効ランタイムで成功を装わず、
+    /// 未対応エンジンの失敗は種別を保って包まれる。
+    #[test]
+    fn js_4_dynamic_import_api_disabled_and_default_engine() {
+        let mut rt = JsRuntime::disabled();
+        let err = rt.take_dynamic_import_requests().expect_err("常に失敗する");
+        assert!(matches!(err, Error::JsExecutionUnavailable { .. }));
+        let err = rt
+            .finish_dynamic_import(
+                DynamicImportId::from_raw(1),
+                Err("x".to_string()),
+                &EvaluateOptions::default(),
+            )
+            .expect_err("常に失敗する");
+        assert!(matches!(err, Error::JsExecutionUnavailable { .. }));
+
+        let (mut rt, _scripts, _binds) = fake_runtime(Ok(JsValue::Undefined));
+        let err = rt
+            .take_dynamic_import_requests()
+            .expect_err("FakeEngine は未対応");
+        assert!(matches!(
+            err,
+            Error::JsEvaluation(JsEngineError::NotYetImplemented(_))
+        ));
+        let err = rt
+            .finish_dynamic_import(
+                DynamicImportId::from_raw(1),
+                Err("x".to_string()),
+                &EvaluateOptions::default(),
+            )
+            .expect_err("FakeEngine は未対応");
+        assert!(matches!(
+            err,
+            Error::JsEvaluation(JsEngineError::NotYetImplemented(_))
+        ));
     }
 
     /// REPAIR-9: recorder 付きの失敗呼び出しは `JsStub` / `Failure` を 1 件記録する。

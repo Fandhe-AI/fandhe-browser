@@ -414,7 +414,11 @@ fn js_4_boa_dynamic_import_and_tla_return_not_yet_implemented() {
         }
         other => panic!("expected NotYetImplemented, got {other:?}"),
     }
-    match engine.finish_dynamic_import(DynamicImportId::from_raw(1), Err("failed".to_string())) {
+    match engine.finish_dynamic_import(
+        DynamicImportId::from_raw(1),
+        Err("failed".to_string()),
+        &EvaluateOptions::default(),
+    ) {
         Err(JsEngineError::NotYetImplemented(msg)) => {
             assert!(msg.starts_with("finish_dynamic_import:"), "{msg}");
         }

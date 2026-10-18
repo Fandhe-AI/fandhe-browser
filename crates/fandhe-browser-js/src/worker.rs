@@ -168,7 +168,8 @@ pub(crate) trait ChildEngine {
         &mut self,
         _id: DynamicImportId,
         _result: Result<ModuleId, String>,
-    ) -> Result<(), JsEngineError> {
+        _options: &EvaluateOptions,
+    ) -> Result<ModuleEvaluation, JsEngineError> {
         Err(module_api_not_yet_implemented("finish_dynamic_import"))
     }
 }
@@ -229,8 +230,9 @@ impl ChildEngine for V8Engine {
         &mut self,
         id: DynamicImportId,
         result: Result<ModuleId, String>,
-    ) -> Result<(), JsEngineError> {
-        V8Engine::finish_dynamic_import(self, id, result)
+        options: &EvaluateOptions,
+    ) -> Result<ModuleEvaluation, JsEngineError> {
+        V8Engine::finish_dynamic_import(self, id, result, options)
     }
 }
 
@@ -1108,7 +1110,8 @@ fn classify_evaluation_error(err: &JsEngineError) -> (ErrorKind, String) {
 /// 呼び出し元: [`worker_main`] のフレームループ。応答は次のとおり。
 ///
 /// - `COMPILE_MODULE` → `MODULE_COMPILED`
-/// - `LINK_MODULE`・`FINISH_DYNAMIC_IMPORT` → `RESULT(Undefined)`（ack）
+/// - `LINK_MODULE` → `RESULT(Undefined)`（ack）
+/// - `FINISH_DYNAMIC_IMPORT` → `MODULE_RESULT`（`import()` の Promise の確定結果。Issue #1117）
 /// - `EVALUATE_MODULE` → `MODULE_RESULT`（評価の直後・応答の前に逆方向 RPC の
 ///   fatal を確認する。fatal なら応答せず [`RespondOutcome::NativeCallProtocolViolation`]。
 ///   `FINISH_DYNAMIC_IMPORT` も利用者の継続を走らせるため同じ確認をする）
@@ -1176,13 +1179,21 @@ fn handle_module_frame(
             })
         }
         tag::FINISH_DYNAMIC_IMPORT => {
-            let (id, result) = frames::decode_finish_dynamic_import(payload)?;
-            let finished = engine.finish_dynamic_import(id, result);
+            let (id, result, options) = frames::decode_finish_dynamic_import(payload)?;
+            let finished = engine.finish_dynamic_import(id, result, &options);
             // 完了では利用者の `then` が走り、逆方向 RPC の fatal も起きうる。
             if let Some(fatal) = engine.take_native_call_fatal() {
                 return Ok(RespondOutcome::NativeCallProtocolViolation(fatal));
             }
-            finished.and_then(|()| ack_response())
+            finished.and_then(|settlement| {
+                frames::encode_module_result(&settlement)
+                    .map(|body| (tag::MODULE_RESULT, body))
+                    .map_err(|err| {
+                        JsEngineError::EvaluationFailed(format!(
+                            "finish_dynamic_import: the result cannot be sent: {err}"
+                        ))
+                    })
+            })
         }
         other => return Err(ProtocolError::UnknownTag(other)),
     };

@@ -3,12 +3,16 @@
 //! 実エンジン（V8）での結合は `tests/support/page_runner_cases.rs` の `run_module_graph` が担う。
 
 use super::*;
+use crate::event_loop::EventLoopLimits;
 use crate::fetch::FetchOptions;
 use crate::page_runner::{
     PageRunInput, PageRunOptions, PageRunOutput, run_with_fetcher_and_factory,
 };
 use crate::page_script::ScriptCollectionOptions;
-use fandhe_browser_js::{EngineKind, JsEngine, JsValue, ModuleRecord, ModuleRequest, NativeFn};
+use fandhe_browser_js::{
+    DynamicImportId, DynamicImportRequest, EngineKind, JsEngine, JsValue, ModuleRecord,
+    ModuleRequest, NativeFn,
+};
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::sync::{Arc, Mutex};
@@ -20,22 +24,78 @@ struct EngineLog {
     /// `compile:<id>:<url>` / `link:<referrer>:<specifier>=<target>` / `eval:<id>`。
     events: Vec<String>,
     sources: HashMap<u32, String>,
+    /// `finish_dynamic_import` に渡された残り時間（`options.timeout()`。呼び出し順）。
+    finish_timeouts: Vec<Duration>,
 }
 
 /// module API を持つテスト用エンジン。`import "<spec>"` の文から依存を作り、ソース中の印
 /// （`syntax-error`・`tla-pending`・`reject:<msg>`・`unsupported`・`compile-unsupported`）で
 /// 結果を分岐する。classic の評価はすべて成功させる。
+///
+/// 動的 `import()` の模擬（Issue #1117）: module の本文の `dynamic "<spec>"` 文は evaluate 時に
+/// 保留へ積む（referrer はその module）。`dynamic-unknown "<spec>"` は未知の referrer、classic の
+/// `dynamic-doc "<spec>"` は `referrer=None`。`no-dyn-support` を含む module を compile すると
+/// `take` が `NotYetImplemented` を返す。
 struct FakeModuleEngine {
     log: Arc<Mutex<EngineLog>>,
     next_id: u32,
+    pending: Vec<DynamicImportRequest>,
+    next_dyn: u32,
+    take_unsupported: bool,
+    /// `slow-take` を含む module を compile すると、要求を返す `take` がこの時間ブロックする。
+    take_sleep: Option<Duration>,
+    /// `__dom.op` の束縛（checkpoint でタイマーを登録して上限超過を再現する用）。
+    op: Option<NativeFn>,
+    /// `checkpoint-timers` を含む module を compile すると、checkpoint の評価でタイマーを複数登録する。
+    checkpoint_timers: bool,
+}
+
+impl FakeModuleEngine {
+    /// `tag "<spec>"` 形式の文から specifier を抜き出す。
+    fn scan(src: &str, tag: &str) -> Vec<String> {
+        src.split([';', '\n'])
+            .filter_map(|stmt| {
+                stmt.trim()
+                    .strip_prefix(tag)
+                    .and_then(|s| s.strip_prefix(" \""))
+                    .and_then(|s| s.strip_suffix('"'))
+                    .map(str::to_string)
+            })
+            .collect()
+    }
+
+    fn push_dynamic(&mut self, referrer: Option<ModuleId>, specs: Vec<String>) {
+        for spec in specs {
+            self.next_dyn += 1;
+            self.pending.push(DynamicImportRequest::new(
+                DynamicImportId::from_raw(self.next_dyn),
+                referrer,
+                spec,
+            ));
+        }
+    }
 }
 
 impl JsEngine for FakeModuleEngine {
     fn evaluate_script(
         &mut self,
-        _script: &str,
+        script: &str,
         _options: &EvaluateOptions,
     ) -> Result<JsValue, JsEngineError> {
+        if script == "__fandheRunMicrotasks()" && self.checkpoint_timers {
+            if let Some(op) = self.op.as_mut() {
+                for _ in 0..3 {
+                    let _ = op(&[
+                        JsValue::String("timerSet".to_string()),
+                        JsValue::Number(1.0),
+                        JsValue::Bool(false),
+                    ]);
+                }
+            }
+            return Ok(JsValue::Undefined);
+        }
+        let specs = Self::scan(script, "dynamic-doc");
+        self.push_dynamic(None, specs);
         Ok(JsValue::Undefined)
     }
 
@@ -50,8 +110,9 @@ impl JsEngine for FakeModuleEngine {
     fn bind_dom_like_object(
         &mut self,
         _name: &str,
-        _methods: Vec<(String, NativeFn)>,
+        methods: Vec<(String, NativeFn)>,
     ) -> Result<(), JsEngineError> {
+        self.op = methods.into_iter().find(|(n, _)| n == "op").map(|(_, f)| f);
         Ok(())
     }
 
@@ -61,6 +122,15 @@ impl JsEngine for FakeModuleEngine {
         }
         if source.contains("compile-unsupported") {
             return Err(JsEngineError::NotYetImplemented("module".to_string()));
+        }
+        if source.contains("no-dyn-support") {
+            self.take_unsupported = true;
+        }
+        if source.contains("checkpoint-timers") {
+            self.checkpoint_timers = true;
+        }
+        if source.contains("slow-take") {
+            self.take_sleep = Some(Duration::from_millis(400));
         }
         self.next_id += 1;
         let id = self.next_id;
@@ -75,6 +145,9 @@ impl JsEngine for FakeModuleEngine {
                 requests.push(ModuleRequest::new(spec.to_string()));
             }
         }
+        // `dynamic-on-compile`: 評価に入れない module（依存解決失敗）でも referrer として引けるかの検査用。
+        let early = Self::scan(source, "dynamic-on-compile");
+        self.push_dynamic(Some(ModuleId::from_raw(id)), early);
         let mut log = self.log.lock().expect("log");
         log.events.push(format!("compile:{id}:{url}"));
         log.sources.insert(id, source.to_string());
@@ -87,6 +160,14 @@ impl JsEngine for FakeModuleEngine {
         resolutions: &[ModuleResolution],
     ) -> Result<(), JsEngineError> {
         let mut log = self.log.lock().expect("log");
+        // `slow-link`: link で時間を使い、取得・compile の後でページ時計を尽きさせる。
+        if log
+            .sources
+            .get(&referrer.raw())
+            .is_some_and(|src| src.contains("slow-link"))
+        {
+            std::thread::sleep(Duration::from_millis(500));
+        }
         for r in resolutions {
             log.events.push(format!(
                 "link:{}:{}={}",
@@ -106,6 +187,13 @@ impl JsEngine for FakeModuleEngine {
         let mut log = self.log.lock().expect("log");
         log.events.push(format!("eval:{}", root.raw()));
         let src = log.sources.get(&root.raw()).cloned().unwrap_or_default();
+        drop(log);
+        self.push_dynamic(Some(root), Self::scan(&src, "dynamic"));
+        self.push_dynamic(
+            Some(ModuleId::from_raw(9999)),
+            Self::scan(&src, "dynamic-unknown"),
+        );
+        let log = self.log.lock().expect("log");
         if src.contains("unsupported") {
             return Err(JsEngineError::NotYetImplemented("module".to_string()));
         }
@@ -137,13 +225,82 @@ impl JsEngine for FakeModuleEngine {
         }
         Ok(ModuleEvaluation::Fulfilled)
     }
+
+    fn take_dynamic_import_requests(&mut self) -> Result<Vec<DynamicImportRequest>, JsEngineError> {
+        self.log
+            .lock()
+            .expect("log")
+            .events
+            .push("take".to_string());
+        if self.take_unsupported {
+            return Err(JsEngineError::NotYetImplemented("take".to_string()));
+        }
+        if let Some(sleep) = self.take_sleep
+            && !self.pending.is_empty()
+        {
+            std::thread::sleep(sleep);
+        }
+        Ok(std::mem::take(&mut self.pending))
+    }
+
+    fn finish_dynamic_import(
+        &mut self,
+        id: DynamicImportId,
+        result: Result<ModuleId, String>,
+        options: &EvaluateOptions,
+    ) -> Result<ModuleEvaluation, JsEngineError> {
+        let mut log = self.log.lock().expect("log");
+        log.finish_timeouts.push(options.timeout());
+        // 対象の本文の印で `import()` の Promise の確定結果を分岐する（V8 の挙動の模擬）。
+        let (line, settlement) = match result {
+            Ok(target) => {
+                let src = log.sources.get(&target.raw()).cloned().unwrap_or_default();
+                if src.contains("settle-timeout") {
+                    // 評価に入った後の時間切れ（エンジンが reject 済みで打ち切る）の模擬。
+                    log.events.push(format!("finish:{}:timeout", id.raw()));
+                    return Err(JsEngineError::Timeout("finish timeout".to_string()));
+                }
+                if src.contains("finish-too-large") {
+                    // 拒否メッセージが結果サイズ上限を超えたエンジン側の失敗（Promise は reject 済み）。
+                    log.events.push(format!("finish:{}:too-large", id.raw()));
+                    return Err(JsEngineError::EvaluationFailed("x".repeat(16)));
+                }
+                let settlement = if src.contains("settle-throw") {
+                    ModuleEvaluation::rejected("boom".to_string())
+                } else if src.contains("settle-pending") {
+                    ModuleEvaluation::Pending
+                } else {
+                    ModuleEvaluation::Fulfilled
+                };
+                (
+                    format!("finish:{}:ok:{}", id.raw(), target.raw()),
+                    settlement,
+                )
+            }
+            Err(msg) => (
+                format!("finish:{}:err:{msg}", id.raw()),
+                ModuleEvaluation::rejected(msg),
+            ),
+        };
+        log.events.push(line);
+        Ok(settlement)
+    }
 }
 
 fn fake_factory(log: Arc<Mutex<EngineLog>>) -> impl FnOnce() -> crate::Result<JsRuntime> {
     move || {
         Ok(JsRuntime::from_engine_for_test(
             EngineKind::V8,
-            Box::new(FakeModuleEngine { log, next_id: 0 }),
+            Box::new(FakeModuleEngine {
+                log,
+                next_id: 0,
+                pending: Vec::new(),
+                next_dyn: 0,
+                take_unsupported: false,
+                take_sleep: None,
+                op: None,
+                checkpoint_timers: false,
+            }),
         ))
     }
 }
@@ -982,4 +1139,474 @@ fn js_6_module_graph_complete_mutual_imports_terminate() {
     let (out, _) = run(html, port, &module_options().with_max_modules(64));
     assert_eq!(outcomes(&out), vec![ScriptOutcome::Succeeded]);
     assert!(started.elapsed() < std::time::Duration::from_secs(4));
+}
+
+// ---- 動的 import（Issue #1117） ----
+
+fn finishes(log: &Arc<Mutex<EngineLog>>) -> Vec<String> {
+    events(log)
+        .into_iter()
+        .filter(|e| e.starts_with("finish:"))
+        .collect()
+}
+
+/// `JS-4`: gate 無効（既定）では `take` を呼ばず、サーバーにも到達しない。
+#[test]
+fn js_4_dynamic_import_gate_off_never_takes() {
+    let (port, hits) = leaf_server();
+    let html = "<script>1</script><script type=module>dynamic \"/c.js\"</script>";
+    let (out, log) = run(html, port, &PageRunOptions::default());
+    assert!(!events(&log).contains(&"take".to_string()));
+    assert_eq!(total_hits(&hits), 0);
+    assert_eq!(out.dynamic_imports().requested(), 0);
+    assert_eq!(out.dynamic_imports().fulfilled(), 0);
+    assert!(out.dynamic_imports().failures().is_empty());
+}
+
+/// `JS-4`・`JS-8`: 動的 import の対象を 1 回だけ取得し、compile して `ok` で完了させる。
+#[test]
+fn js_4_dynamic_import_fetches_and_finishes_ok() {
+    let (port, hits) = leaf_server();
+    let html = "<script type=module>dynamic \"/c.js\"</script>";
+    let (out, log) = run(html, port, &module_options());
+    assert_eq!(outcomes(&out), vec![ScriptOutcome::Succeeded]);
+    assert_eq!(hit_count(&hits, "/c.js"), 1);
+    // inline の root が id 1、動的に取得した対象が id 2。
+    assert_eq!(finishes(&log), vec!["finish:1:ok:2".to_string()]);
+    let r = out.dynamic_imports();
+    assert_eq!((r.requested(), r.fulfilled(), r.rejected()), (1, 1, 0));
+    assert!(out.abort().is_none());
+}
+
+/// `JS-4`: classic スクリプトからの `import()`（`referrer=None`）は文書の base URL で解決する。
+#[test]
+fn js_4_dynamic_import_from_classic_uses_document_base() {
+    let (port, hits) = leaf_server();
+    let html = "<script>dynamic-doc \"./c.js\"</script>";
+    let (out, log) = run(html, port, &module_options());
+    assert_eq!(hit_count(&hits, "/c.js"), 1);
+    assert_eq!(finishes(&log), vec!["finish:1:ok:1".to_string()]);
+    assert_eq!(out.dynamic_imports().fulfilled(), 1);
+}
+
+/// `JS-8`・`SEC-2`: 拒否は種別だけを `Err` と診断に残す（URL・ポート・パスを含めない）。
+#[test]
+fn js_8_dynamic_import_rejections_have_kind_only() {
+    let (other_port, other_hits) = leaf_server();
+    let (port, _hits) = spawn_server(|p| match p {
+        "/text.js" => response("200 OK", "Content-Type: text/plain\r\n", "export {};"),
+        "/bad.js" => js("syntax-error"),
+        _ => response("404 Not Found", "", ""),
+    });
+    let html = format!(
+        "<script type=module>dynamic \"foo\";dynamic \"http://127.0.0.1:{other_port}/secret.js?t=1\";\
+         dynamic \"/text.js\";dynamic \"/missing.js\";dynamic \"/bad.js\"</script>"
+    );
+    let (out, log) = run(&html, port, &module_options());
+    assert_eq!(
+        finishes(&log),
+        vec![
+            "finish:1:err:dynamic import failed: bare_specifier",
+            "finish:2:err:dynamic import failed: cross_origin",
+            "finish:3:err:dynamic import failed: unsupported_mime_type",
+            "finish:4:err:dynamic import failed: http_status",
+            "finish:5:err:dynamic import failed: module_compile_failed",
+        ]
+    );
+    for line in finishes(&log) {
+        assert!(
+            !line.contains("127.0.0.1") && !line.contains("secret"),
+            "{line}"
+        );
+    }
+    assert_eq!(total_hits(&other_hits), 0);
+    let r = out.dynamic_imports();
+    assert_eq!((r.requested(), r.fulfilled(), r.rejected()), (5, 0, 5));
+    assert_eq!(
+        r.failures(),
+        &[
+            DynamicImportFailureKind::Fetch(SrcFetchErrorKind::BareSpecifier),
+            DynamicImportFailureKind::Fetch(SrcFetchErrorKind::CrossOrigin),
+            DynamicImportFailureKind::Fetch(SrcFetchErrorKind::UnsupportedMimeType),
+            DynamicImportFailureKind::Fetch(SrcFetchErrorKind::HttpStatus { status: 404 }),
+            DynamicImportFailureKind::CompileFailed,
+        ]
+    );
+    assert!(out.abort().is_none());
+}
+
+/// `JS-8`: 静的 import 済みの URL は再取得せず、その id で完了させる。
+#[test]
+fn js_8_dynamic_import_reuses_static_module() {
+    let (port, hits) = leaf_server();
+    let html = "<script type=module>import \"/s.js\";dynamic \"/s.js\"</script>";
+    let (out, log) = run(html, port, &module_options());
+    assert_eq!(hit_count(&hits, "/s.js"), 1);
+    assert_eq!(finishes(&log), vec!["finish:1:ok:2".to_string()]);
+    assert_eq!(out.dynamic_imports().fulfilled(), 1);
+}
+
+/// `JS-6`: 動的 import も `max_modules` の枠を使う。静的との合計が上限以内なら成功、超えたら打ち切り。
+#[test]
+fn js_6_dynamic_import_counts_toward_max_modules() {
+    let (port, hits) = leaf_server();
+    let html = "<script type=module>import \"/a.js\";dynamic \"/d.js\"</script>";
+    // inline + a.js + d.js = 3 件。
+    let (out, _) = run(html, port, &module_options().with_max_modules(3));
+    assert_eq!(hit_count(&hits, "/d.js"), 1);
+    assert_eq!(out.dynamic_imports().fulfilled(), 1);
+    assert!(out.abort().is_none());
+
+    let (port, hits) = leaf_server();
+    let (out, log) = run(html, port, &module_options().with_max_modules(2));
+    assert_eq!(hit_count(&hits, "/d.js"), 0);
+    assert_eq!(
+        out.abort().map(|a| a.kind().clone()),
+        Some(AbortKind::ScriptCount { limit: 2 })
+    );
+    // reject してから打ち切る。
+    assert_eq!(
+        finishes(&log),
+        vec!["finish:1:err:dynamic import failed: script_count".to_string()]
+    );
+    assert_eq!(out.dynamic_imports().rejected(), 1);
+}
+
+/// `JS-6`・Issue #1117: 打ち切りで取り出し済みの未処理要求が残っても、全件を requested と rejected に計上する。
+#[test]
+fn js_6_dynamic_import_abort_counts_remaining_queue() {
+    let (port, hits) = leaf_server();
+    let html = "<script type=module>dynamic \"/d1.js\";dynamic \"/d2.js\"</script>";
+    // inline のみで枠が埋まり、最初の動的 import で max_modules 超過になる。
+    let (out, _) = run(html, port, &module_options().with_max_modules(1));
+    assert_eq!(hit_count(&hits, "/d1.js"), 0);
+    assert_eq!(hit_count(&hits, "/d2.js"), 0);
+    let r = out.dynamic_imports();
+    assert_eq!((r.requested(), r.fulfilled(), r.rejected()), (2, 0, 2));
+    assert_eq!(
+        r.failures(),
+        &[
+            DynamicImportFailureKind::Limit(AbortKind::ScriptCount { limit: 1 }),
+            DynamicImportFailureKind::Limit(AbortKind::ScriptCount { limit: 1 }),
+        ]
+    );
+}
+
+/// `JS-6`: キャッシュに当たる繰り返しでも、要求数の上限を超えたら打ち切る。
+#[test]
+fn js_6_dynamic_import_request_limit() {
+    let (port, hits) = leaf_server();
+    let body = "dynamic \"/s.js\";".repeat(MAX_PAGE_DYNAMIC_IMPORTS + 1);
+    let html = format!("<script type=module>{body}</script>");
+    let (out, _) = run(&html, port, &module_options());
+    assert_eq!(hit_count(&hits, "/s.js"), 1);
+    assert_eq!(
+        out.abort().map(|a| a.kind().clone()),
+        Some(AbortKind::ResourceLimit)
+    );
+    let r = out.dynamic_imports();
+    assert_eq!(r.requested(), MAX_PAGE_DYNAMIC_IMPORTS + 1);
+    assert_eq!(r.fulfilled(), MAX_PAGE_DYNAMIC_IMPORTS);
+    assert_eq!(r.rejected(), 1);
+}
+
+/// `JS-6`: 動的に取得する本文も総バイト数の枠に含める（境界は「ちょうどなら成功」）。
+#[test]
+fn js_6_dynamic_import_total_bytes() {
+    let inline = "dynamic \"/d.js\"";
+    let (port, _hits) = spawn_server(|_| js(&"a".repeat(10)));
+    let html = format!("<script type=module>{inline}</script>");
+    let exact = inline.len() + 10;
+    let (out, _) = run(
+        &html,
+        port,
+        &module_options().with_max_total_script_bytes(exact),
+    );
+    assert!(out.abort().is_none());
+    assert_eq!(out.dynamic_imports().fulfilled(), 1);
+
+    let (out, log) = run(
+        &html,
+        port,
+        &module_options().with_max_total_script_bytes(exact - 1),
+    );
+    assert_eq!(
+        out.abort().map(|a| a.kind().clone()),
+        Some(AbortKind::ScriptBytes {
+            scope: ScriptBytesScope::Total,
+            limit: exact - 1
+        })
+    );
+    assert_eq!(
+        finishes(&log),
+        vec!["finish:1:err:dynamic import failed: script_bytes".to_string()]
+    );
+}
+
+/// `JS-6`: 動的 import の取得待ちもページの実時間で打ち切る（reject せず打ち切る）。
+#[test]
+fn js_6_dynamic_import_fetch_bounded_by_page_wall_time() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    let held: Arc<Mutex<Vec<std::net::TcpStream>>> = Arc::new(Mutex::new(Vec::new()));
+    let held_for_thread = held.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            if let Ok(mut h) = held_for_thread.lock() {
+                h.push(stream);
+            }
+        }
+    });
+    let limit = Duration::from_millis(400);
+    let opts = module_options().with_page_wall_time(limit);
+    let started = std::time::Instant::now();
+    let (out, log) = run(
+        "<script type=module>dynamic \"/hang.js\"</script>",
+        port,
+        &opts,
+    );
+    assert_eq!(
+        out.abort().map(|a| a.kind().clone()),
+        Some(AbortKind::WallTime {
+            scope: WallTimeScope::Page,
+            limit
+        })
+    );
+    assert!(finishes(&log).is_empty());
+    assert!(started.elapsed() < Duration::from_secs(4));
+}
+
+/// `JS-4`: 依存解決に失敗した module も referrer として登録される（後続 module の動的 import に影響しない）。
+#[test]
+fn js_4_dynamic_import_referrer_registered_even_if_deps_fail() {
+    let (port, _hits) = spawn_server(|p| match p {
+        "/ok.js" => js("export {};"),
+        _ => response("404 Not Found", "", ""),
+    });
+    let html = "<script type=module>import \"bare\";dynamic-on-compile \"/ok.js\"</script>\
+                <script type=module>dynamic \"/ok.js\"</script>";
+    let (out, log) = run(html, port, &module_options());
+    assert!(
+        !finishes(&log)
+            .iter()
+            .any(|l| l.contains("unknown_referrer")),
+        "{:?}",
+        finishes(&log)
+    );
+    assert!(
+        !out.dynamic_imports()
+            .failures()
+            .contains(&DynamicImportFailureKind::UnknownReferrer)
+    );
+    assert!(out.dynamic_imports().fulfilled() >= 1);
+}
+
+/// `JS-4`: 未知の referrer は fail-closed で reject する（取得しない）。
+#[test]
+fn js_4_dynamic_import_unknown_referrer_rejected() {
+    let (port, hits) = leaf_server();
+    let html = "<script type=module>dynamic-unknown \"/c.js\"</script>";
+    let (out, log) = run(html, port, &module_options());
+    assert_eq!(total_hits(&hits), 0);
+    assert_eq!(
+        finishes(&log),
+        vec!["finish:1:err:dynamic import failed: unknown_referrer".to_string()]
+    );
+    assert_eq!(
+        out.dynamic_imports().failures(),
+        &[DynamicImportFailureKind::UnknownReferrer]
+    );
+    assert!(out.abort().is_none());
+}
+
+/// `JS-4`: `take` が未対応のエンジン（boa 等）は「要求なし」とし、以降は呼ばない。
+#[test]
+fn js_4_dynamic_import_take_not_yet_implemented_is_noop() {
+    let (port, hits) = leaf_server();
+    let html = "<script type=module>no-dyn-support;dynamic \"/c.js\"</script>";
+    let (out, log) = run(html, port, &module_options());
+    let takes = events(&log).iter().filter(|e| *e == "take").count();
+    assert_eq!(takes, 1);
+    assert_eq!(total_hits(&hits), 0);
+    assert_eq!(out.dynamic_imports().requested(), 0);
+    assert!(out.abort().is_none());
+}
+
+/// `JS-4`・Issue #1117: 対象が評価で throw して `import()` が reject された場合は、完了の通知が
+/// 受理されても resolve として数えず、`EvaluationFailed` として記録する。
+#[test]
+fn js_4_dynamic_import_rejected_by_evaluation_is_not_counted_fulfilled() {
+    let (port, _hits) = spawn_server(|_| js("settle-throw"));
+    let html = "<script type=module>dynamic \"/t.js\"</script>";
+    let (out, _) = run(html, port, &module_options());
+    let r = out.dynamic_imports();
+    assert_eq!(
+        (r.requested(), r.fulfilled(), r.rejected(), r.pending()),
+        (1, 0, 1, 0)
+    );
+    assert_eq!(r.failures(), &[DynamicImportFailureKind::EvaluationFailed]);
+    assert!(out.abort().is_none());
+}
+
+/// `JS-4`・Issue #1117: top-level await 等で未確定のままの `import()` は resolve にも reject にも
+/// 数えず、`pending` に数える。
+#[test]
+fn js_4_dynamic_import_pending_target_is_counted_pending() {
+    let (port, _hits) = spawn_server(|_| js("settle-pending"));
+    let html = "<script type=module>dynamic \"/p.js\"</script>";
+    let (out, _) = run(html, port, &module_options());
+    let r = out.dynamic_imports();
+    assert_eq!(
+        (r.requested(), r.fulfilled(), r.rejected(), r.pending()),
+        (1, 0, 0, 1)
+    );
+    assert!(r.failures().is_empty());
+    assert!(out.abort().is_none());
+}
+
+/// `JS-6`・Issue #1117: 完了の評価・checkpoint には、固定値ではなくページの残り時間
+/// （スクリプト単位の上限とページの残りの小さい方）を渡す。
+#[test]
+fn js_6_dynamic_import_finish_receives_remaining_budget() {
+    let (port, _hits) = leaf_server();
+    let html = "<script type=module>dynamic \"/c.js\"</script>";
+    let script_limit = Duration::from_millis(1500);
+    let opts = module_options()
+        .with_script_wall_time(script_limit)
+        .with_page_wall_time(Duration::from_secs(60));
+    let (_, log) = run(html, port, &opts);
+    let timeouts = log.lock().expect("log").finish_timeouts.clone();
+    assert_eq!(timeouts, vec![script_limit]);
+
+    // ページの残りの方が小さければ、その残りで丸める。
+    let (port, _hits) = leaf_server();
+    let page_limit = Duration::from_secs(3);
+    let opts = module_options()
+        .with_script_wall_time(Duration::from_secs(60))
+        .with_page_wall_time(page_limit);
+    let (_, log) = run(html, port, &opts);
+    let timeouts = log.lock().expect("log").finish_timeouts.clone();
+    assert_eq!(timeouts.len(), 1);
+    assert!(
+        timeouts.iter().all(|t| *t <= page_limit && !t.is_zero()),
+        "{timeouts:?}"
+    );
+}
+
+/// `JS-6`・Issue #1117: 取り出した時点でページの実時間が尽きていても、残った `import()` を数えて
+/// reject 扱いにし、ページを打ち切る（成功終了にしない）。
+#[test]
+fn js_6_dynamic_import_requests_left_when_clock_expired_are_counted_and_aborted() {
+    let (port, hits) = leaf_server();
+    let limit = Duration::from_millis(200);
+    let html = "<script type=module>slow-take;dynamic \"/c.js\"</script>";
+    let (out, log) = run(html, port, &module_options().with_page_wall_time(limit));
+    assert_eq!(
+        out.abort().map(|a| a.kind().clone()),
+        Some(AbortKind::WallTime {
+            scope: WallTimeScope::Page,
+            limit
+        })
+    );
+    assert_eq!(total_hits(&hits), 0);
+    assert!(finishes(&log).is_empty());
+    let r = out.dynamic_imports();
+    assert_eq!((r.requested(), r.fulfilled(), r.rejected()), (1, 0, 1));
+    assert_eq!(
+        r.failures(),
+        &[DynamicImportFailureKind::Limit(AbortKind::WallTime {
+            scope: WallTimeScope::Page,
+            limit
+        })]
+    );
+}
+
+/// `JS-6`・Issue #1117: 残りのページ時間がスクリプト上限を下回る状態で、完了の評価が実際に
+/// タイムアウトした場合は reject 済みのため、`rejected` と `Limit(WallTime)` に計上して打ち切る。
+#[test]
+fn js_6_dynamic_import_page_scope_eval_timeout_is_counted_rejected() {
+    let (port, _hits) = spawn_server(|_| js("settle-timeout"));
+    let html = "<script type=module>dynamic \"/c.js\"</script>";
+    let limit = Duration::from_secs(3);
+    let opts = module_options()
+        .with_script_wall_time(Duration::from_secs(60))
+        .with_page_wall_time(limit);
+    let (out, _log) = run(html, port, &opts);
+    let kind = AbortKind::WallTime {
+        scope: WallTimeScope::Page,
+        limit,
+    };
+    assert_eq!(out.abort().map(|a| a.kind().clone()), Some(kind.clone()));
+    let r = out.dynamic_imports();
+    assert_eq!((r.requested(), r.fulfilled(), r.rejected()), (1, 0, 1));
+    assert_eq!(r.failures(), &[DynamicImportFailureKind::Limit(kind)]);
+}
+
+/// `JS-6`・Issue #1117: 取得・link の後でページ時計が尽きて完了を呼べなくても、要求は rejected に計上する
+/// （requested = fulfilled + rejected + pending）。
+#[test]
+fn js_6_dynamic_import_clock_expired_before_finish_is_counted_rejected() {
+    let (port, _hits) = spawn_server(|_| js("slow-link"));
+    let html = "<script type=module>dynamic \"/s.js\"</script>";
+    let limit = Duration::from_millis(300);
+    let opts = module_options().with_page_wall_time(limit);
+    let (out, _) = run(html, port, &opts);
+    let kind = AbortKind::WallTime {
+        scope: WallTimeScope::Page,
+        limit,
+    };
+    assert_eq!(out.abort().map(|a| a.kind().clone()), Some(kind.clone()));
+    let r = out.dynamic_imports();
+    assert_eq!(
+        (r.requested(), r.fulfilled(), r.rejected(), r.pending()),
+        (1, 0, 1, 0)
+    );
+    assert_eq!(r.failures(), &[DynamicImportFailureKind::Limit(kind)]);
+}
+
+/// `JS-6`・Issue #1117: 結果サイズ上限を超える拒否は、その要求だけの reject として数え、ページは継続する
+/// （静的 evaluate_root・classic 評価と同じ扱い）。
+#[test]
+fn js_6_dynamic_import_oversized_rejection_continues_page() {
+    let (port, _hits) = spawn_server(|path| {
+        if path == "/big.js" {
+            js("finish-too-large")
+        } else {
+            js("1")
+        }
+    });
+    let html = "<script type=module>dynamic \"/big.js\";dynamic \"/ok.js\"</script>";
+    let (out, _) = run(html, port, &module_options());
+    assert!(out.abort().is_none());
+    let r = out.dynamic_imports();
+    assert_eq!(
+        (r.requested(), r.fulfilled(), r.rejected(), r.pending()),
+        (2, 1, 1, 0)
+    );
+    assert_eq!(r.failures(), &[DynamicImportFailureKind::EvaluationFailed]);
+}
+
+/// `JS-6`・Issue #1117: checkpoint で資源上限に達して打ち切るとき、取り出し済みの残り要求を rejected に
+/// 計上する（requested = fulfilled + rejected + pending）。
+#[test]
+fn js_6_dynamic_import_checkpoint_limit_counts_remaining_queue() {
+    let (port, _hits) = spawn_server(|path| {
+        if path == "/a.js" {
+            js("checkpoint-timers")
+        } else {
+            js("1")
+        }
+    });
+    let html = "<script type=module>dynamic \"/a.js\";dynamic \"/b.js\"</script>";
+    let opts = module_options()
+        .with_event_loop_limits(EventLoopLimits::default().with_max_registered_timers(1));
+    let (out, _) = run(html, port, &opts);
+    let kind = AbortKind::RegisteredTimers { limit: 1 };
+    assert_eq!(out.abort().map(|a| a.kind().clone()), Some(kind.clone()));
+    let r = out.dynamic_imports();
+    assert_eq!(
+        (r.requested(), r.fulfilled(), r.rejected(), r.pending()),
+        (2, 1, 1, 0)
+    );
+    assert_eq!(r.failures(), &[DynamicImportFailureKind::Limit(kind)]);
 }

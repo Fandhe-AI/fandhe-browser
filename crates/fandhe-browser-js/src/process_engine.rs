@@ -108,7 +108,7 @@
 //! であれば、返信を受けた子の watchdog が
 //! 先に発火し `Error{kind=Timeout}` を返す）。
 //!
-//! # ES module 用フレーム（プロトコル v6。`JS-4`・`JS-6`・Issue #1110）
+//! # ES module 用フレーム（プロトコル v7。`JS-4`・`JS-6`・Issue #1110・#1117）
 //!
 //! `JsEngine` のモジュール評価 API 5 メソッド（`compile_module`・`link_module`・
 //! `evaluate_module`・`take_dynamic_import_requests`・`finish_dynamic_import`）は
@@ -120,7 +120,7 @@
 //! | `compile_module` | 既定タイムアウト（2 秒。ワイヤにも載せる）+ `EVALUATE_GRACE` | 違反 |
 //! | `link_module`・`take_dynamic_import_requests` | `MODULE_CONTROL_TIMEOUT`（5 秒） | 違反 |
 //! | `evaluate_module` | `options.timeout()` + `EVALUATE_GRACE` | 許可 |
-//! | `finish_dynamic_import` | 既定タイムアウト + `EVALUATE_GRACE`（ワイヤのヘッダなし） | 許可 |
+//! | `finish_dynamic_import` | `options.timeout()` + `EVALUATE_GRACE`（`EVALUATE` と同じヘッダ） | 許可 |
 //!
 //! 子が通知する module id・動的 import id は untrusted で、`WorkerHandle` が持つ
 //! `ModuleIdRegistry` で照合する（子の破棄で台帳も消える）。呼び出し側が渡す
@@ -259,12 +259,11 @@ const REGISTER_ACK_TIMEOUT: Duration = HANDSHAKE_TIMEOUT;
 /// ドキュメント参照）。
 const MODULE_CONTROL_TIMEOUT: Duration = REGISTER_ACK_TIMEOUT;
 
-/// `JsEngine::compile_module`・`finish_dynamic_import` が使うタイムアウトの
+/// `JsEngine::compile_module` が使うタイムアウトの
 /// 元になる options（トレイトのシグネチャに [`EvaluateOptions`] が無いため
 /// 既定値の 2 秒を使う。`JS-4`・`JS-6`・Issue #1110）。compile のワイヤには
 /// この値を載せ（子の watchdog 用。実際に使うのは後続の V8 issue）、親の期限は
-/// これに [`EVALUATE_GRACE`] を足す。finish はワイヤにヘッダを持たず、将来
-/// microtask が走りうるため親の期限だけ同じ値にする。
+/// これに [`EVALUATE_GRACE`] を足す。
 fn module_default_options() -> EvaluateOptions {
     EvaluateOptions::default()
 }
@@ -2701,43 +2700,64 @@ impl JsEngine for V8ProcessEngine {
         )
     }
 
-    /// 動的 `import()` の完了通知（`JS-4`・Issue #1110）。失敗メッセージは
+    /// 動的 `import()` の完了通知（`JS-4`・`JS-6`・Issue #1110・#1117）。失敗メッセージは
     /// [`worker_protocol::truncate_for_wire`] で切り詰めてから送る。期限は
-    /// 既定タイムアウト + [`EVALUATE_GRACE`]（将来 microtask が走りうるため。
-    /// トレイトに options が無くワイヤのヘッダは持たない）。
+    /// `options.timeout()` + [`EVALUATE_GRACE`]（`EVALUATE` と同じ。評価と利用者の
+    /// microtask が走るため）。応答は `import()` の Promise の確定結果（`MODULE_RESULT`）。
     fn finish_dynamic_import(
         &mut self,
         id: DynamicImportId,
         result: Result<ModuleId, String>,
-    ) -> Result<(), JsEngineError> {
+        options: &EvaluateOptions,
+    ) -> Result<ModuleEvaluation, JsEngineError> {
         let wire_result = result.map_err(|message| worker_protocol::truncate_for_wire(&message));
-        let payload = module_frames::encode_finish_dynamic_import(id, &wire_result)
+        let payload = module_frames::encode_finish_dynamic_import(id, &wire_result, options)
             .map_err(module_request_rejected)?;
-        let budget =
-            worker_protocol::wire_timeout(&module_default_options()).saturating_add(EVALUATE_GRACE);
+        let budget = worker_protocol::wire_timeout(options).saturating_add(EVALUATE_GRACE);
+        let max_result_bytes = options.max_result_bytes();
         let outcome = self.module_roundtrip(
             ModuleRoundtrip {
                 frame_tag: tag::FINISH_DYNAMIC_IMPORT,
                 budget,
                 allow_native_calls: true,
                 needs_module_slot: false,
-                ok_tag: tag::RESULT,
+                ok_tag: tag::MODULE_RESULT,
                 write_what: "the dynamic import completion",
                 timeout_what: "dynamic import completion",
             },
             &payload,
-            move |worker, payload| {
-                let (outcome, keep) = interpret_unit_ack_response(worker, payload);
-                if outcome.is_ok() {
+            move |worker, payload| match module_frames::decode_module_result(&payload) {
+                // 多層防御（`JS-6`）: 子は untrusted。Rejected のメッセージが上限を超えていれば
+                // 切り詰めずに失敗にする（子は生かす。通知自体は受理済みなので台帳は外す）。
+                Ok(ModuleEvaluation::Rejected { message }) if message.len() > max_result_bytes => {
                     worker.modules.complete_dynamic_import(id);
+                    (
+                        Err(JsEngineError::EvaluationFailed(format!(
+                            "dynamic import rejection message of {} bytes exceeds the result \
+                             size limit of {max_result_bytes} bytes",
+                            message.len()
+                        ))),
+                        true,
+                    )
                 }
-                (outcome, keep)
+                Ok(settlement) => {
+                    worker.modules.complete_dynamic_import(id);
+                    (Ok(settlement), true)
+                }
+                Err(err) => module_protocol_violation(
+                    worker,
+                    format!("JS worker process sent an invalid ModuleResult frame: {err}"),
+                ),
             },
         );
-        // 子は実行前に完了待ちから id を外すため、Timeout 応答でも子の保留は残らない。
-        // 親の台帳も外し、後続の take で上限超過（プロトコル違反）にならないようにする。
-        if matches!(outcome, Err(JsEngineError::Timeout(_)))
-            && let Some(worker) = self.worker.as_mut()
+        // 子は実行前に完了待ちから id を外すため、Timeout 応答でも結果サイズ超過などの
+        // EvaluationFailed（ERROR 応答）でも子の保留は残らない。親の台帳も外し、後続の take で
+        // 上限超過（プロトコル違反）にならないようにする。id 未知・未 link の
+        // ModuleResolutionFailed は子が消費しないので外さない（Err での再試行を許す）。
+        if matches!(
+            outcome,
+            Err(JsEngineError::Timeout(_) | JsEngineError::EvaluationFailed(_))
+        ) && let Some(worker) = self.worker.as_mut()
         {
             worker.modules.complete_dynamic_import(id);
         }
