@@ -756,8 +756,8 @@ pub(crate) fn worker_main(marker_value: &str) -> ExitCode {
                 }
             }
             // JS-4・REPAIR-3・Issue #1110・#1114: ES module 用フレーム。ペイロードを
-            // 検証してエンジンへ dispatch する。エンジンが未対応（V8・動的 import・
-            // TLA）なら成功を装わず `ERROR{NotYetImplemented}` を返す。デコード失敗
+            // 検証してエンジンへ dispatch する。エンジンが未対応（動的 import・
+            // boa の TLA）なら成功を装わず `ERROR{NotYetImplemented}` を返す。デコード失敗
             // （プロトコル違反）は他の登録系と同じく終了する。
             tag::COMPILE_MODULE
             | tag::LINK_MODULE
