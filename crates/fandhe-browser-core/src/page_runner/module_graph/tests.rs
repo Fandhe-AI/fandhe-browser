@@ -124,6 +124,9 @@ impl JsEngine for FakeModuleEngine {
                 requests.push(ModuleRequest::new(spec.to_string()));
             }
         }
+        // `dynamic-on-compile`: 評価に入れない module（依存解決失敗）でも referrer として引けるかの検査用。
+        let early = Self::scan(source, "dynamic-on-compile");
+        self.push_dynamic(Some(ModuleId::from_raw(id)), early);
         let mut log = self.log.lock().expect("log");
         log.events.push(format!("compile:{id}:{url}"));
         log.sources.insert(id, source.to_string());
@@ -1335,6 +1338,31 @@ fn js_6_dynamic_import_fetch_bounded_by_page_wall_time() {
     );
     assert!(finishes(&log).is_empty());
     assert!(started.elapsed() < Duration::from_secs(4));
+}
+
+/// `JS-4`: 依存解決に失敗した module も referrer として登録される（後続 module の動的 import に影響しない）。
+#[test]
+fn js_4_dynamic_import_referrer_registered_even_if_deps_fail() {
+    let (port, _hits) = spawn_server(|p| match p {
+        "/ok.js" => js("export {};"),
+        _ => response("404 Not Found", "", ""),
+    });
+    let html = "<script type=module>import \"bare\";dynamic-on-compile \"/ok.js\"</script>\
+                <script type=module>dynamic \"/ok.js\"</script>";
+    let (out, log) = run(html, port, &module_options());
+    assert!(
+        !finishes(&log)
+            .iter()
+            .any(|l| l.contains("unknown_referrer")),
+        "{:?}",
+        finishes(&log)
+    );
+    assert!(
+        !out.dynamic_imports()
+            .failures()
+            .contains(&DynamicImportFailureKind::UnknownReferrer)
+    );
+    assert!(out.dynamic_imports().fulfilled() >= 1);
 }
 
 /// `JS-4`: 未知の referrer は fail-closed で reject する（取得しない）。

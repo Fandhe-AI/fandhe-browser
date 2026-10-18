@@ -372,6 +372,7 @@ async fn fetch_module(
 fn compile_source(
     rt: &mut JsRuntime,
     ctx: &RunContext<'_>,
+    graph: &mut ModuleGraph,
     referrer: &Url,
     source: &str,
 ) -> Result<(ModuleId, Vec<Dep>), GraphError> {
@@ -406,6 +407,8 @@ fn compile_source(
             return Err(GraphError::Abort(kind, message));
         }
     };
+    // 依存解決に失敗しても、動的 `import()` の referrer として id を引けるよう先に登録する。
+    graph.referrers.insert(record.id(), referrer.clone());
     let mut deps = Vec::with_capacity(record.requests().len());
     for request in record.requests() {
         let resolved = resolve_specifier(referrer, request.specifier())
@@ -456,8 +459,7 @@ async fn fetch_and_compile(
     add_module_bytes(ctx, graph, text.len())?;
     // `import.meta.url` とモジュール同一性のため、要求のフラグメントを戻す。
     final_url.set_fragment(url.fragment());
-    let (id, deps) = compile_source(rt, ctx, &final_url, &text)?;
-    graph.referrers.insert(id, final_url);
+    let (id, deps) = compile_source(rt, ctx, graph, &final_url, &text)?;
     Ok(ReadyModule {
         id,
         deps,
@@ -511,8 +513,7 @@ async fn load_graph_root(
         GraphRoot::Inline(text) => {
             reserve_module_slot(ctx, graph)?;
             add_module_bytes(ctx, graph, text.len())?;
-            let (id, deps) = compile_source(rt, ctx, ctx.base, text)?;
-            graph.referrers.insert(id, ctx.base.clone());
+            let (id, deps) = compile_source(rt, ctx, graph, ctx.base, text)?;
             for dep in &deps {
                 queue.push_back((dep.clone(), 1));
             }
