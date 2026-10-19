@@ -1166,8 +1166,8 @@ fn style_cases(engine: &str) {
     );
     check(
         &mut p,
-        "try { e.getAttribute('a b'); 'no' } catch (err) { 'threw' }",
-        "threw",
+        "try { String(e.getAttribute('a b')) + '|' + e.hasAttribute('a b') } catch (err) { 'threw' }",
+        "null|false",
     );
 
     eprintln!("case: REPAIR-3 / SEC-2 no computed style stub and no vendor-prefixed names");
