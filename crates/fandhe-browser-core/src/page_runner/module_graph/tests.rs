@@ -1550,6 +1550,41 @@ fn js_5_module_evaluation_failure_carries_exception_summary() {
     assert!(!dbg.contains("SECRET") && !dbg.contains("https"));
 }
 
+/// `JS-5`・`REPAIR-4`・Issue #1140: `in` 演算子の TypeError は分類とプロパティ名が
+/// `exception_summary()` まで届き、`identifier`（不足 API 名）には入らない。
+#[test]
+fn js_5_in_operator_type_error_carries_property() {
+    let (port, _hits) = spawn_server(|path| match path {
+        "/i.js" => js(
+            "reject:Uncaught TypeError: Cannot use 'in' operator to search for 'WebkitAnimation' in undefined (line 1)",
+        ),
+        _ => js("1"),
+    });
+    let html = "<script type=module src=\"/i.js\"></script>";
+    let (out, _) = run(html, port, &module_options());
+    let sum = out
+        .scripts()
+        .first()
+        .and_then(|r| r.exception_summary())
+        .map(|e| {
+            (
+                e.kind().as_str(),
+                e.message_class().as_str(),
+                e.identifier(),
+                e.property(),
+            )
+        });
+    assert_eq!(
+        sum,
+        Some((
+            "TypeError",
+            "cannot_use_in_operator",
+            None,
+            Some("WebkitAnimation")
+        ))
+    );
+}
+
 /// `JS-4`・Issue #1117: top-level await 等で未確定のままの `import()` は resolve にも reject にも
 /// 数えず、`pending` に数える。
 #[test]

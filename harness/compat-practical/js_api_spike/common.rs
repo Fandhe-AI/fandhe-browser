@@ -109,6 +109,8 @@ pub struct Classification {
     pub error_kind: Option<String>,
     pub message_class: &'static str,
     pub missing_api: Option<String>,
+    /// 検証済みのプロパティ名（読み取り・設定・`in` 検索の対象。不足 API 名ではない。#1140）。
+    pub property: Option<String>,
     /// 失敗ではない結果（スカラーに表現できない評価値）。
     pub non_scalar_result: bool,
 }
@@ -171,7 +173,12 @@ pub fn classify(msg: &str) -> Classification {
         error_kind: k.map(str::to_string),
         message_class: class,
         missing_api: missing,
+        property: None,
         non_scalar_result: false,
+    };
+    let with_prop = |mut c: Classification, tail: &str| {
+        c.property = tail.split_once('\'').and_then(|(n, _)| api(n));
+        c
     };
     if body.starts_with("evaluation result of type")
         && body.ends_with("is not representable as JsValue")
@@ -180,6 +187,7 @@ pub fn classify(msg: &str) -> Classification {
             error_kind: None,
             message_class: "non_scalar_result",
             missing_api: None,
+            property: None,
             non_scalar_result: true,
         };
     }
@@ -193,7 +201,25 @@ pub fn classify(msg: &str) -> Classification {
         return mk(kind, "not_a_constructor", api(name));
     }
     if body.starts_with("Cannot read properties of") {
-        return mk(kind, "read_property", None);
+        let c = mk(kind, "read_property", None);
+        return match body.split_once("(reading '") {
+            Some((_, tail)) => with_prop(c, tail),
+            None => c,
+        };
+    }
+    if let Some(tail) = body.strip_prefix("Cannot use 'in' operator to search for '") {
+        return with_prop(mk(kind, "cannot_use_in_operator", None), tail);
+    }
+    if body.starts_with("right-hand side of 'in' should be an object") {
+        // boa は種類の接頭辞を付けないため TypeError と推定する（core と同じ規則）。
+        return mk(kind.or(Some("TypeError")), "cannot_use_in_operator", None);
+    }
+    if body.starts_with("Cannot set properties of") {
+        let c = mk(kind, "cannot_set_properties", None);
+        return match body.split_once("(setting '") {
+            Some((_, tail)) => with_prop(c, tail),
+            None => c,
+        };
     }
     mk(kind, "other", None)
 }

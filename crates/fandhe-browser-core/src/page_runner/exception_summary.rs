@@ -4,6 +4,13 @@
 //! 診断に出してよいのは固定語彙の enum と、文字種・段数・長さを検証した識別子だけで、
 //! メッセージ本文・URL・クエリ・specifier は残さない。V8（`Uncaught Kind: ...`）と
 //! boa（接頭辞なし）の両方の形式を受ける。classic の例外は現状対象外（`REPAIR-3`）。
+//!
+//! `TypeError` の `other` を減らすため、`Cannot use 'in' operator ...`（V8）・
+//! `right-hand side of 'in' should be an object ...`（boa）と `Cannot set properties of ...`（V8）を
+//! 分類する（Issue #1140）。調べられた・設定されたキー名は [`ExceptionSummary::property`] に
+//! 検証済みの場合だけ入れる。boa には「set properties」に当たる文言が無く、`in` の
+//! キー名もメッセージに含まれないため、boa ではそれぞれ `other`／名前なしになる（`REPAIR-3`）。
+//! `Cannot convert undefined or null to object` は将来の分類候補で、現状は `other` のまま。
 
 /// 識別子 1 段あたりの最大バイト数。
 const MAX_IDENTIFIER_SEGMENT_BYTES: usize = 64;
@@ -83,6 +90,11 @@ pub enum ExceptionMessageClass {
     ReadProperty,
     /// `The requested module ... does not provide an export named 'X'`。
     MissingExport,
+    /// `Cannot use 'in' operator to search for 'K' in undefined`（V8）／
+    /// `right-hand side of 'in' should be an object`（boa）。右辺の値は残さない。
+    CannotUseInOperator,
+    /// `Cannot set properties of undefined (setting 'K')`（V8）。
+    CannotSetProperties,
     /// 上記以外。
     Other,
 }
@@ -96,6 +108,8 @@ impl ExceptionMessageClass {
             Self::NotAConstructor => "not_a_constructor",
             Self::ReadProperty => "read_property",
             Self::MissingExport => "missing_export",
+            Self::CannotUseInOperator => "cannot_use_in_operator",
+            Self::CannotSetProperties => "cannot_set_properties",
             Self::Other => "other",
         }
     }
@@ -110,6 +124,7 @@ pub struct ExceptionSummary {
     kind: ExceptionKind,
     class: ExceptionMessageClass,
     identifier: Option<String>,
+    property: Option<String>,
 }
 
 impl ExceptionSummary {
@@ -119,6 +134,7 @@ impl ExceptionSummary {
             kind: ExceptionKind::Other,
             class: ExceptionMessageClass::Other,
             identifier: None,
+            property: None,
         }
     }
 
@@ -144,6 +160,18 @@ impl ExceptionSummary {
     pub fn identifier(&self) -> Option<&str> {
         self.identifier.as_deref()
     }
+
+    /// 例外メッセージ中の、読み取り・設定・`in` 検索の対象になったプロパティ名（検証済み）。
+    /// 不足 API 名ではない（`identifier` とは別物）。特定・検証できなければ `None`。
+    pub fn property(&self) -> Option<&str> {
+        self.property.as_deref()
+    }
+}
+
+/// `'` で囲まれた最初の区間を取り出して検証する（閉じ `'` が無ければ `None`）。
+fn quoted_property(tail: &str) -> Option<String> {
+    let (name, _) = tail.split_once('\'')?;
+    identifier_of(name)
 }
 
 /// 識別子の検証（段ごとに `[A-Za-z_$][A-Za-z0-9_$]{0,63}`、最大 8 段・128 バイト）。
@@ -203,6 +231,7 @@ pub(crate) fn summarize_exception_message(msg: &str) -> ExceptionSummary {
         Some(pos) if body.ends_with(')') => body.get(..pos).unwrap_or(body),
         _ => body,
     };
+    let mut property = None;
     let (class, ident) = if let Some(x) = body.strip_suffix(" is not defined") {
         (ExceptionMessageClass::NotDefined, identifier_of(x))
     } else if let Some(x) = body.strip_suffix(" is not a function") {
@@ -210,22 +239,39 @@ pub(crate) fn summarize_exception_message(msg: &str) -> ExceptionSummary {
     } else if let Some(x) = body.strip_suffix(" is not a constructor") {
         (ExceptionMessageClass::NotAConstructor, identifier_of(x))
     } else if body.starts_with("Cannot read properties of") {
+        if let Some((_, tail)) = body.split_once("(reading '") {
+            property = quoted_property(tail);
+        }
         (ExceptionMessageClass::ReadProperty, None)
+    } else if let Some(tail) = body.strip_prefix("Cannot use 'in' operator to search for '") {
+        property = quoted_property(tail);
+        (ExceptionMessageClass::CannotUseInOperator, None)
+    } else if body.starts_with("right-hand side of 'in' should be an object") {
+        (ExceptionMessageClass::CannotUseInOperator, None)
+    } else if body.starts_with("Cannot set properties of") {
+        if let Some((_, tail)) = body.split_once("(setting '") {
+            property = quoted_property(tail);
+        }
+        (ExceptionMessageClass::CannotSetProperties, None)
     } else if let Some((_, tail)) = body.split_once("does not provide an export named '") {
         let name = tail.split('\'').next().unwrap_or("");
         (ExceptionMessageClass::MissingExport, identifier_of(name))
     } else {
         (ExceptionMessageClass::Other, None)
     };
-    let kind = if kind == ExceptionKind::Other && class == ExceptionMessageClass::NotDefined {
-        ExceptionKind::ReferenceError
-    } else {
-        kind
+    // boa は種類の接頭辞を付けないため、固有の文言から推定する。
+    let kind = match (kind, class) {
+        (ExceptionKind::Other, ExceptionMessageClass::NotDefined) => ExceptionKind::ReferenceError,
+        (ExceptionKind::Other, ExceptionMessageClass::CannotUseInOperator) => {
+            ExceptionKind::TypeError
+        }
+        _ => kind,
     };
     ExceptionSummary {
         kind,
         class,
         identifier: ident,
+        property,
     }
 }
 
@@ -360,6 +406,148 @@ mod tests {
         assert!(r.identifier().is_none_or(|i| i.len() <= 128));
         let multibyte = "あ".repeat(5000);
         let _ = summarize_exception_message(&multibyte);
+    }
+
+    fn sp(
+        m: &str,
+    ) -> (
+        ExceptionKind,
+        ExceptionMessageClass,
+        Option<String>,
+        Option<String>,
+    ) {
+        let r = summarize_exception_message(m);
+        (r.kind, r.class, r.identifier, r.property)
+    }
+
+    /// V8 の `in` 演算子の右辺が undefined / null（`JS-5`・`REPAIR-4`）。
+    #[test]
+    fn v8_in_operator_extracts_property() {
+        for rhs in ["undefined", "null"] {
+            assert_eq!(
+                sp(&format!(
+                    "Uncaught TypeError: Cannot use 'in' operator to search for 'WebkitAnimation' in {rhs} (line 1)"
+                )),
+                (
+                    ExceptionKind::TypeError,
+                    ExceptionMessageClass::CannotUseInOperator,
+                    None,
+                    Some("WebkitAnimation".into())
+                )
+            );
+        }
+    }
+
+    /// boa の `in` は名前なしで TypeError と推定する（`JS-5`・`REPAIR-4`・`REPAIR-3`）。
+    #[test]
+    fn boa_in_operator_infers_type_error() {
+        assert_eq!(
+            sp("right-hand side of 'in' should be an object, got `undefined`"),
+            (
+                ExceptionKind::TypeError,
+                ExceptionMessageClass::CannotUseInOperator,
+                None,
+                None
+            )
+        );
+    }
+
+    /// V8 のプロパティ設定失敗（`JS-5`・`REPAIR-4`）。
+    #[test]
+    fn v8_set_properties_extracts_property() {
+        assert_eq!(
+            sp("Uncaught TypeError: Cannot set properties of undefined (setting 'x') (line 4)"),
+            (
+                ExceptionKind::TypeError,
+                ExceptionMessageClass::CannotSetProperties,
+                None,
+                Some("x".into())
+            )
+        );
+    }
+
+    /// read_property でも property を取り、identifier は None のまま（`JS-5`・`REPAIR-4`）。
+    #[test]
+    fn read_property_has_property_only() {
+        assert_eq!(
+            sp("Uncaught TypeError: Cannot read properties of undefined (reading 'x') (line 2)"),
+            (
+                ExceptionKind::TypeError,
+                ExceptionMessageClass::ReadProperty,
+                None,
+                Some("x".into())
+            )
+        );
+    }
+
+    /// 検証外のキーは分類を保ったまま property が None（`JS-5`・`REPAIR-4`）。
+    #[test]
+    fn invalid_property_keys_become_none() {
+        let long_seg = "a".repeat(65);
+        let nine = ["a"; 9].join(".");
+        for bad in [
+            "-webkit-animation",
+            long_seg.as_str(),
+            nine.as_str(),
+            "",
+            "a b",
+            "https://h.example/p?token=SECRET",
+        ] {
+            let r = summarize_exception_message(&format!(
+                "Uncaught TypeError: Cannot use 'in' operator to search for '{bad}' in undefined"
+            ));
+            assert_eq!(
+                r.message_class(),
+                ExceptionMessageClass::CannotUseInOperator,
+                "{bad}"
+            );
+            assert_eq!(r.property(), None, "{bad}");
+            let dbg = format!("{r:?}");
+            assert!(!dbg.contains("SECRET") && !dbg.contains("https"), "{bad}");
+        }
+    }
+
+    /// 閉じ引用符なし・巨大・マルチバイトでも panic せず上限内（`JS-5`・`REPAIR-4`）。
+    #[test]
+    fn property_is_bounded_and_panic_free() {
+        let r = summarize_exception_message("Cannot use 'in' operator to search for 'abc");
+        assert_eq!(
+            r.message_class(),
+            ExceptionMessageClass::CannotUseInOperator
+        );
+        assert_eq!(r.property(), None);
+        let big = format!(
+            "Uncaught TypeError: Cannot set properties of undefined (setting '{}')",
+            "a".repeat(1 << 20)
+        );
+        assert_eq!(summarize_exception_message(&big).property(), None);
+        let ok = summarize_exception_message(&format!(
+            "Cannot set properties of undefined (setting '{}')",
+            "あ".repeat(5000)
+        ));
+        assert!(ok.property().is_none_or(|p| p.len() <= 128));
+    }
+
+    /// 語彙外の boa 文言は other のまま固定し、新旧語彙を確認する（`JS-5`・`REPAIR-4`・`REPAIR-3`）。
+    #[test]
+    fn convert_to_object_stays_other_and_vocabulary_extended() {
+        assert_eq!(
+            sp("cannot convert 'null' or 'undefined' to object").1,
+            ExceptionMessageClass::Other
+        );
+        assert_eq!(
+            ExceptionMessageClass::CannotUseInOperator.as_str(),
+            "cannot_use_in_operator"
+        );
+        assert_eq!(
+            ExceptionMessageClass::CannotSetProperties.as_str(),
+            "cannot_set_properties"
+        );
+        assert_eq!(ExceptionMessageClass::NotDefined.as_str(), "not_defined");
+        assert_eq!(
+            ExceptionMessageClass::NotAFunction.as_str(),
+            "not_a_function"
+        );
     }
 
     /// as_str の語彙が固定である（`JS-5`・`REPAIR-4`）。
