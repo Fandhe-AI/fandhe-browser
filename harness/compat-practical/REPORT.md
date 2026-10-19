@@ -140,7 +140,7 @@ spec 対応: TASK-71 / MS-6 / `COMPAT-1`・`JS-4`・`JS-5`・`MEAS-4`・`REPAIR-
 
 ### 次の対応
 
-1. `MutationObserver` の shim 追加（`JS-5`）を別 issue で扱う。追加後に d2・d3 を再測定し、次に不足する API を同じ手順で洗い出す。既存の #777・#778・#779 との差分整理が要る。起票は本 PR では行わない
+1. （済み: #1138 で対応。下の節を参照）`MutationObserver` の shim 追加（`JS-5`）を別 issue で扱う。追加後に d2・d3 を再測定し、次に不足する API を同じ手順で洗い出す。既存の #777・#778・#779 との差分整理が要る。起票は本 PR では行わない
 2. #919（回帰ゲート）の条件（d2・d3 の解消）は、今回も満たしていない。#919 はオーナー判断の issue のため、本件は事実の報告に留める
 3. 分類で扱えない例外（`other`・`TypeError` の `read_property`）が出たときは、分類語彙の拡張を先に検討する
 
@@ -149,6 +149,53 @@ spec 対応: TASK-71 / MS-6 / `COMPAT-1`・`JS-4`・`JS-5`・`MEAS-4`・`REPAIR-
 - 単一環境（Linux）・単一時点。URL のクエリ・ページ本文・script 本文・生の例外メッセージは記録していない
 - link / instantiate の失敗（`missing_export` を含む）は評価失敗ではなく compile 失敗の固定文で扱われ、要約は付かない（範囲外。V8 の実エンジンでの確認済み）
 - boa は例外メッセージに種類の接頭辞を付けないため、`not_defined` 以外は `error_kind` が `null`（`other`）になる。本測定は V8
+
+### 再現手順
+
+```bash
+cargo build --release -p fandhe-browser-core --features js-v8 --example compat_page_script_probe
+target/release/examples/compat_page_script_probe --target d2=https://www.saucedemo.com --modules --selector form --out /abs/path/d2.jsonl
+target/release/examples/compat_page_script_probe --target d3=https://demoqa.com/automation-practice-form --modules --selector form --out /abs/path/d3.jsonl
+jq -c 'select(.type=="script")' /abs/path/d2.jsonl /abs/path/d3.jsonl
+```
+
+## MutationObserver shim 追加後の再測定（#1138）
+
+spec 対応: TASK-71・TASK-108 / MS-6 / `COMPAT-1`・`JS-5`・`JS-6`・`JS-7`・`MEAS-4`・`REPAIR-3`。
+前節（#1133）の「次の対応 1」を実装し、d2・d3 を `page_script_probe --modules` で再測定した。出力はコミットしていない。
+
+### 測定条件
+
+| 項目 | 値 |
+| ---- | -- |
+| 実施日時（UTC） | 2026-10-19T03:14Z 前後 |
+| OS | Linux |
+| ベース | main `f1a71f9b` に、`MutationObserver` の shim を追加する変更（本 PR の `ced51f19`）を加えたもの |
+| バイナリ | `cargo build --release -p fandhe-browser-core --features js-v8 --example compat_page_script_probe` |
+| 設定 | `--modules`（`[js] execute_modules = true` 相当）・V8・`--selector form`。実行上限は既定のまま |
+
+### 結果
+
+| id | サイト | script | outcome | `error_kind` | `message_class` | `missing_api` | `form`（実行後） | 判定 |
+| -- | ------ | ------ | ------- | ------------ | --------------- | ------------- | ---------------- | ---- |
+| d2 | Saucedemo | index 1（module・同一オリジン `src`） | exception | `TypeError` | `other` | なし | 0 件 | 未解消（例外が前進した） |
+| d3 | DemoQA | index 0（module・同一オリジン `src`） | exception | `TypeError` | `other` | なし | 0 件 | 未解消（例外が前進した） |
+
+- 前回の `ReferenceError` / `not_defined` / `MutationObserver` は 2 件とも出なくなった。`MutationObserver` の不足は解消し、評価は次の例外まで進んだ。ただし `form` は実行後も 0 件で、**d2・d3 とも解消していない**
+- 次の例外は 2 件とも同じ種類（`TypeError`・`other`）で、現在の分類語彙（`not_defined`・`not_a_function`・`not_a_constructor`・`read_property`・`missing_export`）に当てはまらず、`missing_api` は付かない。動的 import は 0 件（`requested=0`）、`evaluation_errors` は空、abort は無し
+- 例外メッセージの形をローカルで確認した（記録はしていない）。`in` 演算子の右辺が `undefined` で、CSS のベンダー接頭辞付きプロパティ名（アニメーション系）を調べている。**推測（未検証）**: 要素の `style`（`CSSStyleDeclaration`）が未提供で、CSS 機能検出が `undefined` を引いている。script 本文は読んでおらず、原因の所在は未確認（`REPAIR-3`）
+- 同じ例外が別サイト 2 件で出ており、フレームワーク由来の共通依存である可能性がある。これも script 本文を読んでいないため未確認
+
+### 次の対応
+
+1. 要素の `style`（最小の `CSSStyleDeclaration` 相当）の shim が要るかを調べる。`JS-5` の別 issue として扱い、追加後に d2・d3 を同じ手順で再測定して、その次の不足 API を洗い出す。起票は本 PR では行わない
+2. 分類語彙の拡張を先に検討する: `TypeError` の `other` のうち「`in` 演算子の右辺が `undefined`」「`undefined` への代入」のように、不足 API の手掛かりになる形を `message_class` に足す（`REPAIR-4`）。今回はこの分類が無いため `missing_api` が付かなかった
+3. #919（回帰ゲート）の条件（d2・d3 の解消）は、今回も満たしていない。#919 には解消していないためコメントしていない
+
+### 制約
+
+- 単一環境（Linux）・単一時点。URL のクエリ・ページ本文・script 本文・生の例外メッセージは記録していない
+- 判定は最初の例外で止まる測定に基づく。後続の不足 API は未確認
 
 ### 再現手順
 
