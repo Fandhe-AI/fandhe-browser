@@ -592,6 +592,28 @@ mod tests {
         assert_eq!((e.len(), over), (2, 1));
     }
 
+    /// `JS-5`・`REPAIR-4`・Issue #1145: Minified React error は番号だけを取り、検証外は None。
+    /// boa 形式（接頭辞なし）は Error と推定する。
+    #[test]
+    fn classify_minified_react_error_code() {
+        let v8 = classify(
+            "Uncaught Error: Minified React error #299; visit https://h.example/e?token=SECRET (line 9)",
+        );
+        assert_eq!(v8.error_kind.as_deref(), Some("Error"));
+        assert_eq!(v8.message_class, "minified_react_error");
+        assert_eq!(v8.code.as_deref(), Some("299"));
+        let boa = classify("Minified React error #12; visit https://h.example/e");
+        assert_eq!(boa.error_kind.as_deref(), Some("Error"));
+        assert_eq!(boa.code.as_deref(), Some("12"));
+        for bad in ["", "1234567", "12a", "https://h.example/?token=SECRET"] {
+            let c = classify(&format!(
+                "Uncaught Error: Minified React error #{bad}; visit x"
+            ));
+            assert_eq!(c.message_class, "minified_react_error", "{bad}");
+            assert_eq!(c.code, None, "{bad}");
+        }
+    }
+
     /// `JS-1`・`JS-5`・TASK-106: V8 / boa 双方の例外形式を未定義 API・構文エラー等の分類へ正しく写す契約を検証する。
     #[test]
     fn classify_handles_v8_and_boa_forms() {
