@@ -298,11 +298,17 @@
     // 依存シグナル（any）への伝播は明示的なスタックによる反復で行い、依存の連鎖が深くてもスタックを消費しない。
     // 全依存の状態を先に更新してから、中止した順に abort イベントを配る。
     function signalAbort(signal, reason) {
-        var pending = [signal];
-        var fired = [];
+        // 実行時の Array メソッドはページに差し替えられうるため、プロトタイプなしのコンテナと件数で持つ（JS-4）。
+        var pending = createObject(null);
+        var pendingCount = 1;
+        pending[0] = signal;
+        var fired = createObject(null);
+        var firedCount = 0;
         var rootReason = reason;
-        while (pending.length > 0) {
-            var cur = pending.pop();
+        while (pendingCount > 0) {
+            pendingCount -= 1;
+            var cur = pending[pendingCount];
+            delete pending[pendingCount];
             var st = wmGet(signalStates, cur);
             if (st === undefined || st.aborted) {
                 continue;
@@ -316,7 +322,8 @@
             if (cur === signal) {
                 rootReason = st.reason;
             }
-            fired.push(cur);
+            fired[firedCount] = cur;
+            firedCount += 1;
             var algs = st.algs;
             var n = algs.count;
             var snapshot = createObject(null);
@@ -331,7 +338,8 @@
                 var link = wmGet(links, snapshot[i]);
                 if (link !== undefined) {
                     link.detach();
-                    pending.push(link.target);
+                    pending[pendingCount] = link.target;
+                    pendingCount += 1;
                     continue;
                 }
                 try {
@@ -341,7 +349,7 @@
                 }
             }
         }
-        for (var f = 0; f < fired.length; f++) {
+        for (var f = 0; f < firedCount; f++) {
             fireAbort(fired[f], wmGet(signalStates, fired[f]));
         }
     }
@@ -443,13 +451,15 @@
             if (step.done) {
                 break;
             }
+            // getter で値が変わりうるため value は 1 度だけ読み、検証にも保存にも同じ値を使う。
+            var value = step.value;
             if (count >= MAX_ENTRIES) {
                 throw new NativeTypeError("Failed to execute 'any' on 'AbortSignal': Too many signals");
             }
-            if (wmGet(signalStates, step.value) === undefined) {
+            if (wmGet(signalStates, value) === undefined) {
                 throw new NativeTypeError("Failed to execute 'any' on 'AbortSignal': Element is not an AbortSignal");
             }
-            inputs[count] = step.value;
+            inputs[count] = value;
             count += 1;
         }
         var result = createSignal();

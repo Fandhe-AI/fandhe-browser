@@ -1877,4 +1877,29 @@ fn abort_cases(engine: &str) {
          [tail.aborted, tail.reason, fired8].join('|')",
         "true|deep|1",
     );
+
+    eprintln!("case: JS-4 tampered Array.prototype push/pop does not break abort() or any");
+    check(
+        &mut p,
+        "var tp = Array.prototype.push, tq = Array.prototype.pop; \
+         Array.prototype.push = function () { throw new Error('tampered'); }; \
+         Array.prototype.pop = function () { throw new Error('tampered'); }; \
+         var c9 = new AbortController(); var any9 = AbortSignal.any([c9.signal]); \
+         var log9 = []; any9.addEventListener('abort', function () { log9[log9.length] = 'any'; }); \
+         c9.abort('t'); \
+         Array.prototype.push = tp; Array.prototype.pop = tq; \
+         [c9.signal.aborted, any9.aborted, any9.reason, log9.join(',')].join('|')",
+        "true|true|t|any",
+    );
+
+    eprintln!("case: JS-4 AbortSignal.any reads iterator value once");
+    check(
+        &mut p,
+        "var c10 = new AbortController(); var reads10 = 0; \
+         var calls10 = 0; \
+         var iter10 = {}; iter10[Symbol.iterator] = function () { return { next: function () { \
+           calls10++; return calls10 === 1 ? { done: false, get value() { reads10++; return reads10 === 1 ? c10.signal : {}; } } : { done: true }; } }; }; \
+         var r10 = AbortSignal.any(iter10); c10.abort('v'); [reads10, r10.aborted, r10.reason].join('|')",
+        "1|true|v",
+    );
 }
