@@ -599,7 +599,7 @@ spec 対応: TASK-71・TASK-108 / MS-6 / `COMPAT-1`・`JS-5`・`MEAS-4`・`REPAI
 
 ### 次の対応
 
-1. d2: `localStorage` / `sessionStorage` の不足の確認。保存を持ち越さない最小の in-memory 実装にするか、識別面にならない形で足せるかを `SEC-2` の観点で判断し、別 issue で追跡する
+1. d2: `localStorage` / `sessionStorage` の不足の確認。保存を持ち越さない最小の in-memory 実装にするか、識別面にならない形で足せるかを `SEC-2` の観点で判断し、別 issue で追跡する。追跡: #1167（済み: #1167。下の節を参照）
 2. d3: `instanceof` の右辺の特定（前節 #1156 の次の対応 1 のまま）
 3. Backtrace SDK は `history.pushState` を包む処理も持つ。`history` が shim に無いため、`localStorage` の後に出る可能性がある（静的に読んだ推測で、未測定）
 
@@ -608,6 +608,62 @@ spec 対応: TASK-71・TASK-108 / MS-6 / `COMPAT-1`・`JS-5`・`MEAS-4`・`REPAI
 - 単一環境（Linux）・単一時点。URL のクエリ・ページ本文・script 本文は記録していない。生メッセージはエンジンの固定文だけを転記した
 - 判定は最初の例外で止まる測定に基づく。後続の不足 API は未確認
 - 未実装（`REPAIR-3`）: `location` 代入による実際の遷移、`[LegacyUnforgeable]` との差異（`document.location` は `Document.prototype` に置いている）、navigator の追加プロパティ（フィンガープリント面を作らないため意図的に入れていない）
+
+### 再現手順
+
+```bash
+cargo build --release -p fandhe-browser-core --features js-v8 --example compat_page_script_probe
+target/release/examples/compat_page_script_probe --target d2=https://www.saucedemo.com --modules --selector form --debug-raw-exception --out /abs/path/d2.jsonl
+target/release/examples/compat_page_script_probe --target d3=https://demoqa.com/automation-practice-form --modules --selector form --debug-raw-exception --out /abs/path/d3.jsonl
+jq -c 'select(.type=="script")' /abs/path/d2.jsonl /abs/path/d3.jsonl
+jq -c 'select(.type=="run") | .bridge.timer_errors' /abs/path/d2.jsonl /abs/path/d3.jsonl
+```
+
+## localStorage / sessionStorage の追加と d2・d3 の再測定（#1167）
+
+spec 対応: TASK-71・TASK-108 / MS-6 / `COMPAT-1`・`JS-5`・`JS-6`・`MEAS-4`・`REPAIR-3`・`SEC-2`。
+前節（#1158）の「次の対応 1」を調べ、`localStorage` / `sessionStorage` の in-memory 最小実装を足して、d2・d3 を `page_script_probe --modules --debug-raw-exception` で再測定した。出力はコミットしていない。
+
+### 実装の要点
+
+- 原因（確認済みの範囲）: 修正前の `getItem` の TypeError は、shim に `localStorage` / `sessionStorage` が無いことで説明できる。追加後に同じ TypeError が消えた。bundle の静的な調査はしていないため、読み取り先がどちらの名前かは区別していない（未確認）
+- `storage.js`（新規）で `Storage` と、独立した 2 つのインスタンス `localStorage` / `sessionStorage` を足した。`getItem`・`setItem`・`removeItem`・`clear`・`key`・`length` を持ち、キーと値は文字列にする
+- 保存は shim を install した 1 回のページ実行の中だけ（in-memory）。プロファイルへの永続化や実行間の共有はしない（`PROF` 系の境界。永続化の設計は別 issue）
+- 上限（`JS-6`）: 1 ストアあたり、全キー長と全値長の合計 5 MiB（UTF-16 code unit）、件数 65536。超えたら `QuotaExceededError`（DOMException・code 22）を投げ、状態は変えない
+- 識別面（`SEC-2`）: 残量・クォータを示すプロパティ、`navigator.storage`、`StorageEvent` は定義しない
+- Rust の変更（`JS_SHIM_SOURCES` への追加のみ）・新しい op・依存の追加は無い。V8・boa の共通ケース（`js_shim_cases.rs` の `storage_cases`）で検証した
+
+### 測定条件
+
+| 項目 | 値 |
+| ---- | -- |
+| 実施日時（UTC） | 2026-10-19 |
+| OS | Linux |
+| ベース | main `d39d65be` に、本変更を加えたもの |
+| バイナリ | `cargo build --release -p fandhe-browser-core --features js-v8 --example compat_page_script_probe` |
+| 設定 | `--modules`・V8・`--selector form`・`--debug-raw-exception`。実行上限は既定のまま |
+
+### 結果
+
+| id | サイト | script | outcome | 最初の例外 | `form`（実行後） | 判定 |
+| -- | ------ | ------ | ------- | ---------- | ---------------- | ---- |
+| d2 | Saucedemo | index 1（module・同一オリジン `src`） | exception | `ReferenceError`・`not_defined`・`missing_api=history`（`module_evaluation`） | 0 件 | 未解消（`getItem` は越えた） |
+| d3 | DemoQA | index 0（module・同一オリジン `src`） | succeeded | なし（`timer_errors` は `timeout:TypeError:other`） | 0 件 | 変化なし |
+
+- d2 は `getItem` の TypeError を越え、次に `ReferenceError: history is not defined` で止まる。#1158 の節で静的に読んだ推測（Backtrace SDK の `history.pushState`）と一致する方向だが、読み取り元の特定まではしていない
+- d3 は #1156 の節と同じ（`instanceof` の右辺が object ではない TypeError）
+- **d2・d3 とも `form` は 0 件のため #919 にはコメントしていない**
+
+### 次の対応
+
+1. d2: `history`（`pushState` / `replaceState` 等）の不足。`location` と履歴の整合を含めて別 issue で追跡する（切り出し候補）
+2. d3: `instanceof` の右辺の特定（#1156 の次の対応 1 のまま。#1168 で扱う）
+
+### 制約
+
+- 単一環境（Linux）・単一時点。URL のクエリ・ページ本文・script 本文は記録していない。生メッセージはエンジンの固定文だけを転記した
+- 判定は最初の例外で止まる測定に基づく。後続の不足 API は未確認
+- 未実装（`REPAIR-3`）: `storage` イベントと `StorageEvent`、プロパティ形式のアクセス（`localStorage.foo`）、永続化とオリジンごとの分離、opaque origin での `SecurityError`。書き込みを試せば上限が推測できる点は残る（緩和は上限を公開しないことまで）
 
 ### 再現手順
 
