@@ -497,7 +497,7 @@ spec 対応: TASK-71・TASK-108・TASK-111 / MS-6 / `COMPAT-1`・`JS-5`・`JS-6`
 
 ### 次の対応
 
-1. d2: `port` を読む対象の特定（`--debug-raw-exception` で端末のみに出して確かめる）。`location.port` なら `window.js` の `location` の構成要素の不足の可能性がある。追跡: #1158
+1. d2: `port` を読む対象の特定（`--debug-raw-exception` で端末のみに出して確かめる）。`location.port` なら `window.js` の `location` の構成要素の不足の可能性がある。追跡: #1158（済み: #1158。下の節を参照）
 2. d3: タイマー callback の例外の分類（#1156）（済み: #1156。下の節を参照）
 
 ### 制約
@@ -563,6 +563,60 @@ spec 対応: TASK-71・TASK-108 / MS-6 / `COMPAT-1`・`JS-5`・`JS-6`・`JS-7`�
 cargo build --release -p fandhe-browser-core --features js-v8 --example compat_page_script_probe
 target/release/examples/compat_page_script_probe --target d3=https://demoqa.com/automation-practice-form --modules --selector form --debug-raw-exception --out /abs/path/d3.jsonl
 jq -c 'select(.type=="run") | .bridge.timer_errors' /abs/path/d3.jsonl
+```
+
+## document.location / document.URL の追加と d2・d3 の再測定（#1158）
+
+spec 対応: TASK-71・TASK-108 / MS-6 / `COMPAT-1`・`JS-5`・`MEAS-4`・`REPAIR-3`・`SEC-2`。
+前節（#1150）の「次の対応 1」を調べ、d2 の `port` の読み取りで止まる原因を確認して `document.location`・`document.URL` を足し、d2・d3 を `page_script_probe --modules --debug-raw-exception` で再測定した。出力はコミットしていない。
+
+### 実装の要点
+
+- 原因（確認済み）: 修正前の端末出力は `Uncaught TypeError: Cannot read properties of undefined (reading 'port')`。ページの bundle 内で `.port` を読む箇所は Backtrace SDK の属性収集の `document.location.port` の 1 箇所で、`document.location` が未定義だった。`window.location.port` は実装済みで、`Location` の構成要素の不足は原因ではない
+- `window.js` で `Document.prototype` に `location`（`window.location` と同一のオブジェクトを返す accessor）と `URL`（`location.href` と同じ値の読み取り専用 getter）を足した。`document.location` への代入は遷移せず、`window.location` への代入と同じ `assignLocation` 診断に記録する（長さのみ。区別しない簡略化）。`document.URL` は代入しても変わらない
+- Rust の変更・新しい op・依存の追加は無い。V8・boa の共通ケース（`js_shim_cases.rs` の `window_cases`）で検証した
+
+### 測定条件
+
+| 項目 | 値 |
+| ---- | -- |
+| 実施日時（UTC） | 2026-10-19 |
+| OS | Linux |
+| ベース | main `0efc2c7d` に、本変更を加えたもの |
+| バイナリ | `cargo build --release -p fandhe-browser-core --features js-v8 --example compat_page_script_probe` |
+| 設定 | `--modules`・V8・`--selector form`・`--debug-raw-exception`。実行上限は既定のまま |
+
+### 結果
+
+| id | サイト | script | outcome | 最初の例外 | `form`（実行後） | 判定 |
+| -- | ------ | ------ | ------- | ---------- | ---------------- | ---- |
+| d2 | Saucedemo | index 1（module・同一オリジン `src`） | exception | `TypeError`・`read_property`・`property=getItem`（`module_evaluation`） | 0 件 | 未解消（`port` は越えた） |
+| d3 | DemoQA | index 0（module・同一オリジン `src`） | succeeded | なし（`timer_errors` は `timeout:TypeError:other`） | 0 件 | 変化なし |
+
+- d2 は `port` の TypeError を越え、次に `Cannot read properties of undefined (reading 'getItem')` で止まる。読み取り先の名前はメッセージに含まれないが、`getItem` は Web Storage の API で、`localStorage`（または `sessionStorage`）が shim に無いことが有力な候補（未確認）
+- d3 は #1156 の節と同じ（`instanceof` の右辺が object ではない TypeError）
+- **d2・d3 とも `form` は 0 件のため #919 にはコメントしていない**
+
+### 次の対応
+
+1. d2: `localStorage` / `sessionStorage` の不足の確認。保存を持ち越さない最小の in-memory 実装にするか、識別面にならない形で足せるかを `SEC-2` の観点で判断し、別 issue で追跡する
+2. d3: `instanceof` の右辺の特定（前節 #1156 の次の対応 1 のまま）
+3. Backtrace SDK は `history.pushState` を包む処理も持つ。`history` が shim に無いため、`localStorage` の後に出る可能性がある（静的に読んだ推測で、未測定）
+
+### 制約
+
+- 単一環境（Linux）・単一時点。URL のクエリ・ページ本文・script 本文は記録していない。生メッセージはエンジンの固定文だけを転記した
+- 判定は最初の例外で止まる測定に基づく。後続の不足 API は未確認
+- 未実装（`REPAIR-3`）: `location` 代入による実際の遷移、`[LegacyUnforgeable]` との差異（`document.location` は `Document.prototype` に置いている）、navigator の追加プロパティ（フィンガープリント面を作らないため意図的に入れていない）
+
+### 再現手順
+
+```bash
+cargo build --release -p fandhe-browser-core --features js-v8 --example compat_page_script_probe
+target/release/examples/compat_page_script_probe --target d2=https://www.saucedemo.com --modules --selector form --debug-raw-exception --out /abs/path/d2.jsonl
+target/release/examples/compat_page_script_probe --target d3=https://demoqa.com/automation-practice-form --modules --selector form --debug-raw-exception --out /abs/path/d3.jsonl
+jq -c 'select(.type=="script")' /abs/path/d2.jsonl /abs/path/d3.jsonl
+jq -c 'select(.type=="run") | .bridge.timer_errors' /abs/path/d2.jsonl /abs/path/d3.jsonl
 ```
 
 ## b5（Trello）の原因特定（#964）
