@@ -787,6 +787,15 @@ fn string_response(s: String, limits: &DomBridgeLimits) -> Result<JsValue, DomBr
     Ok(JsValue::String(s))
 }
 
+/// `Document::set_attribute` が保存する属性名（HTML 要素は ASCII 小文字、それ以外は原文）。
+fn normalized_attribute_name(doc: &Document, element: NodeId, name: &str) -> String {
+    if doc.namespace_url(element) == Some(crate::dom::HTML_NAMESPACE_URI) {
+        name.to_ascii_lowercase()
+    } else {
+        name.to_string()
+    }
+}
+
 /// 検証済みの `op` を実行する。各操作は引数の検証を終えてから `Document` を変更する。
 fn execute(
     op: DomOp,
@@ -1184,14 +1193,29 @@ fn execute(
             let name = string_arg(op, args, 2, limits)?;
             let value = string_arg(op, args, 3, limits)?;
             page.document.set_attribute(element, name, value)?;
-            Ok(JsValue::Undefined)
+            // 実際に保存された（HTML 要素では ASCII 小文字化後の）属性名を返す。
+            // shim が MutationObserver の attributeName・attributeFilter 照合に使う（JS-5・JS-7）。
+            Ok(JsValue::String(normalized_attribute_name(
+                &page.document,
+                element,
+                name,
+            )))
         }
         DomOp::RemoveAttribute => {
             let element = page.node_arg(op, args, 1)?;
             let name = string_arg(op, args, 2, limits)?;
-            // 実際に属性を削除した場合だけ true（shim が MutationObserver の通知要否に使う。JS-5・JS-7）。
+            // 実際に属性を削除した場合だけ、その正規化後の属性名を返し、削除しなかったときは null
+            // （shim が MutationObserver の通知要否と属性名に使う。JS-5・JS-7）。
             let removed = page.document.remove_attribute(element, name)?;
-            Ok(JsValue::Bool(removed.is_some()))
+            if removed.is_some() {
+                Ok(JsValue::String(normalized_attribute_name(
+                    &page.document,
+                    element,
+                    name,
+                )))
+            } else {
+                Ok(JsValue::Null)
+            }
         }
         DomOp::GetTextContent => {
             let node = page.node_arg(op, args, 1)?;

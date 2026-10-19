@@ -178,8 +178,9 @@
         writable: true,
         value: function setAttribute(name, value) {
             var attr = String(name);
-            op('setAttribute', idOf(this, 'setAttribute'), attr, String(value));
-            notifyMutation('attributes', this, { attributeName: attr });
+            // bridge は実際に保存された（正規化後の）属性名を返す。通知にはその名前を使う。
+            var stored = op('setAttribute', idOf(this, 'setAttribute'), attr, String(value));
+            notifyMutation('attributes', this, { attributeName: typeof stored === 'string' ? stored : attr });
         }
     });
     define(Element.prototype, 'removeAttribute', {
@@ -187,8 +188,9 @@
         value: function removeAttribute(name) {
             var attr = String(name);
             // 属性が無いときは DOM 仕様どおり変更なし（レコードを作らない）。bridge が削除有無を返す。
-            if (op('removeAttribute', idOf(this, 'removeAttribute'), attr) === true) {
-                notifyMutation('attributes', this, { attributeName: attr });
+            var removedName = op('removeAttribute', idOf(this, 'removeAttribute'), attr);
+            if (typeof removedName === 'string') {
+                notifyMutation('attributes', this, { attributeName: removedName });
             }
         }
     });

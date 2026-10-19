@@ -653,6 +653,29 @@ fn observer_cases(engine: &str) {
         "data-x",
     );
 
+    eprintln!("case: JS-5 attribute names are normalized for HTML elements");
+    let mut p = setup(engine, None);
+    check(
+        &mut p,
+        "var got = []; var el = document.getElementById('a'); \
+         var mo = new MutationObserver(function (r) { for (var i = 0; i < r.length; i++) got.push(r[i].attributeName); }); \
+         mo.observe(el, { attributeFilter: ['data-x'] }); \
+         el.setAttribute('DATA-X', '1'); el.removeAttribute('Data-X'); __fandheRunMicrotasks(); got.join('|')",
+        "data-x|data-x",
+    );
+
+    eprintln!("case: JS-6 disconnect and takeRecords leave nothing queued for delivery");
+    let mut p = setup(engine, None);
+    check(
+        &mut p,
+        "var calls = 0; var el = document.getElementById('a'); \
+         var mo = new MutationObserver(function () { calls++; }); \
+         mo.observe(el, { attributes: true }); el.setAttribute('data-x', '1'); mo.disconnect(); \
+         mo.observe(el, { attributes: true }); el.setAttribute('data-y', '1'); mo.takeRecords(); \
+         __fandheRunMicrotasks(); calls",
+        "0",
+    );
+
     eprintln!("case: JS-5 characterData / textContent / innerHTML");
     let mut p = setup(engine, None);
     check(

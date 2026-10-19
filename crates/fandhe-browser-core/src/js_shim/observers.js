@@ -182,6 +182,24 @@
         }
     }
 
+    // 配信待ちリストから state を除く。disconnect / takeRecords でレコードが空になった state を
+    // 残すと、登録・変更・disconnect の繰り返しで observer と callback が解放されない（JS-6）。
+    // これにより notifyList の長さは常に「レコードを持つ state 数」以下（<= pendingTotal 上限）に抑えられる。
+    function unqueue(state) {
+        if (!state.queued) {
+            return;
+        }
+        state.queued = false;
+        var kept = 0;
+        for (var i = 0; i < notifyList.length; i++) {
+            if (notifyList[i] !== state) {
+                notifyList[kept] = notifyList[i];
+                kept += 1;
+            }
+        }
+        notifyList.length = kept;
+    }
+
     function enqueue(state, record) {
         if (pendingTotal >= MAX_PENDING_MUTATION_RECORDS) {
             notifyLimit();
@@ -402,12 +420,14 @@
         removeRegistrations(state);
         pendingTotal -= state.records.length;
         state.records = [];
+        unqueue(state);
     });
     define(MutationObserver.prototype, 'takeRecords', function takeRecords() {
         var state = stateOf(this, 'takeRecords');
         var recs = state.records;
         pendingTotal -= recs.length;
         state.records = [];
+        unqueue(state);
         return recs;
     });
 
