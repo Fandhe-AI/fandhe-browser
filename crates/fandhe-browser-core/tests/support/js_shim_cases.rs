@@ -1432,6 +1432,35 @@ fn url_cases(engine: &str) {
         "try { new URLSearchParams().append('x'); 'no' } catch (e) { e instanceof TypeError }",
         "true",
     );
+    // JS-6: 終端のない iterable の pair は 3 個目で拒否し、確保を続けない。
+    check(
+        &mut p,
+        "var cnt = 0; var inf = { [Symbol.iterator]() { return { next() { cnt++; if (cnt > 1000) { throw new Error('runaway'); } return { done: false, value: 'x' }; } }; } }; \
+         try { new URLSearchParams([inf]); 'no' } catch (e) { (e instanceof TypeError) + '|' + cnt }",
+        "true|3",
+    );
+    // JS-6: 外側の iterable が件数上限を越えたら TypeError。
+    check(
+        &mut p,
+        "var oc = 0; var outer = { [Symbol.iterator]() { return { next() { oc++; return { done: oc > 70000, value: ['a', 'b'] }; } }; } }; \
+         try { new URLSearchParams(outer); 'no' } catch (e) { (e instanceof TypeError) + '|' + (oc < 70000) }",
+        "true|true",
+    );
+    // JS-6: 文字列・append の文字数上限。
+    check(
+        &mut p,
+        "var big = 'a'.repeat(1048577); var q = new URLSearchParams(); \
+         var r1 = 0; try { new URLSearchParams(big) } catch (e) { r1 = e instanceof TypeError } \
+         var r2 = 0; try { q.append('k', big) } catch (e) { r2 = e instanceof TypeError } \
+         r1 + '|' + r2 + '|' + q.toString()",
+        "true|true|",
+    );
+    // append の引数変換中に一覧が変わっても、変換後の最新の一覧に追加する。
+    check(
+        &mut p,
+        "var pa = new URLSearchParams(); pa.append('a', { toString() { pa.append('b', '2'); return '1' } }); pa.toString()",
+        "b=2&a=1",
+    );
     check(
         &mut p,
         "try { new URLSearchParams().get(); 'no' } catch (e) { e instanceof TypeError }",

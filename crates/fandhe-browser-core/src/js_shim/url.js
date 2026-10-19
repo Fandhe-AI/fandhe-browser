@@ -23,8 +23,9 @@
 // - form-urlencoded は `decodeURIComponent` / `encodeURIComponent` / `TextDecoder` を使わず、UTF-8 を
 //   手書きで符号化・復号する（不正な `%` はそのまま残し、不正な UTF-8 と孤立サロゲートは U+FFFD にする）。
 //   解析は線形走査で正規表現のバックトラッキングも eval も使わない。
-// - 上限（JS-6）: URLSearchParams は純 JS で、入力文字列長に比例するだけで増幅しない（op を通らないため
-//   新しい上限は設けない）。`URL` 経由の入力は op の文字列上限（既定 64 KiB）と応答上限で止まる。
+// - 上限（JS-6）: URLSearchParams は純 JS だが、構築・append・set は確保の前に件数（65536）と
+//   文字数（1 MiB）の共通予算で検査して TypeError で拒否する。pair は 3 個目で拒否する。
+//   `URL` 経由の入力は op の文字列上限（既定 64 KiB）と応答上限で止まる。
 // - ES2015 の範囲に留める（V8 と boa で同一のソース。class / Proxy は使わない）。
 //
 // 未実装（REPAIR-3。黙って成功扱いにはしない）:
@@ -261,7 +262,47 @@
 
     // USVString への変換（孤立サロゲートを U+FFFD に置き換える）。名前・値の保存と検索の前に必ず通す。
     function usv(value) {
+        return usvStr(toStr(value));
+    }
+
+    // 確保前の件数・文字数の共通予算（JS-6）。URLSearchParams の構築・append・set は、確保の前に
+    // この予算で検査し、超えたら TypeError で拒否する（終端のない iterable でも確保を続けない）。
+    var MAX_ENTRIES = 65536;
+    var MAX_CHARS = 1048576;
+
+    function newBudget(list) {
+        var b = { n: 0, c: 0 };
+        if (list) {
+            for (var i = 0; i < list.length; i++) {
+                b.n++;
+                b.c += list[i].n.length + list[i].v.length;
+            }
+        }
+        return b;
+    }
+
+    function chargeEntry(b) {
+        b.n++;
+        if (b.n > MAX_ENTRIES) {
+            throw new TypeError('URLSearchParams input exceeds the entry limit');
+        }
+    }
+
+    function chargeChars(b, len) {
+        b.c += len;
+        if (b.c > MAX_CHARS) {
+            throw new TypeError('URLSearchParams input exceeds the size limit');
+        }
+    }
+
+    // 文字列化してから長さを予算で検査し、通れば USVString に変換する（変換前に確保を止める）。
+    function usvCharged(value, b) {
         var s = toStr(value);
+        chargeChars(b, s.length);
+        return usvStr(s);
+    }
+
+    function usvStr(s) {
         var out = '';
         var n = s.length;
         var i = 0;
@@ -472,6 +513,7 @@
             throw new TypeError("Failed to construct 'URLSearchParams': Please use the 'new' operator");
         }
         var list = [];
+        var budget = newBudget(null);
         if (init === undefined || init === null) {
             // 空。
         } else if (isObjectLike(init)) {
@@ -480,9 +522,14 @@
                     if (!isObjectLike(item) || typeof item[symIter] !== 'function') {
                         throw new TypeError('Each URLSearchParams pair must be iterable');
                     }
+                    chargeEntry(budget);
                     var pair = [];
                     iterate(item, function (x) {
-                        arrPush(pair, usv(x));
+                        // 3 個目を検出した時点で拒否する（終端のない iterable で確保を続けない）。
+                        if (pair.length >= 2) {
+                            throw new TypeError('Each URLSearchParams pair must have exactly two elements');
+                        }
+                        arrPush(pair, usvCharged(x, budget));
                     });
                     if (pair.length !== 2) {
                         throw new TypeError('Each URLSearchParams pair must have exactly two elements');
@@ -491,12 +538,18 @@
                 });
             } else {
                 var keys = objectKeys(init);
+                if (keys.length > MAX_ENTRIES) {
+                    throw new TypeError('URLSearchParams input exceeds the entry limit');
+                }
                 for (var i = 0; i < keys.length; i++) {
-                    arrPush(list, { n: usv(keys[i]), v: usv(init[keys[i]]) });
+                    chargeEntry(budget);
+                    arrPush(list, { n: usvCharged(keys[i], budget), v: usvCharged(init[keys[i]], budget) });
                 }
             }
         } else {
-            list = parseForm(stripFirst(usv(init), '?'));
+            var text = toStr(init);
+            chargeChars(budget, text.length);
+            list = parseForm(stripFirst(usvStr(text), '?'));
         }
         wmSet(spStates, this, { list: list, url: null });
     }
@@ -529,8 +582,14 @@
     defMethod(SP, 'append', function (name, value) {
         requireArgs(arguments.length, 2);
         var sp = requireSp(this);
+        // 引数の変換（利用者コードが走りうる）を一覧の複製より先に済ませ、最新の一覧を複製する。
+        var n = toStr(name);
+        var v = toStr(value);
+        var b = newBudget(sp.list);
+        chargeEntry(b);
+        chargeChars(b, n.length + v.length);
         var next = copyList(sp.list);
-        arrPush(next, { n: usv(name), v: usv(value) });
+        arrPush(next, { n: usvStr(n), v: usvStr(v) });
         commit(sp, next);
     });
     defMethod(SP, 'delete', function (name) {
@@ -582,8 +641,13 @@
     defMethod(SP, 'set', function (name, value) {
         requireArgs(arguments.length, 2);
         var sp = requireSp(this);
-        var key = usv(name);
-        var val = usv(value);
+        var key = toStr(name);
+        var val = toStr(value);
+        var b = newBudget(sp.list);
+        chargeEntry(b);
+        chargeChars(b, key.length + val.length);
+        key = usvStr(key);
+        val = usvStr(val);
         var next = [];
         var done = false;
         for (var i = 0; i < sp.list.length; i++) {
