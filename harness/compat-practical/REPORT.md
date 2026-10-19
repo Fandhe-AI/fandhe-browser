@@ -287,7 +287,7 @@ spec 対応: TASK-71・TASK-108 / MS-6 / `COMPAT-1`・`JS-5`・`JS-6`・`MEAS-4`
 - 単一環境（Linux）・単一時点。URL のクエリ・ページ本文・script 本文・生の例外メッセージは記録していない
 - 判定は最初の例外で止まる測定に基づく。後続の不足 API は未確認
 - `style` の shim は `profiles/`（`PLUG-8`）を使わない。ブラウザ別の CSS 機能データを JS の面に反映すると、選んだプロファイルで `in` 判定が変わり識別面に近づくため（`SEC-2`）。ベンダー接頭辞付きのプロパティは定義せず、`getComputedStyle` も定義しない
-- HTML パーサー・`innerHTML` で作られた要素の元の `style` 属性は読む op が無く、shim から最初に書くと `style` 属性全体を置き換える（`REPAIR-3`。`getAttribute` 相当の op で解消できる）
+- HTML パーサー・`innerHTML` で作られた要素の元の `style` 属性は読む op が無く、shim から最初に書くと `style` 属性全体を置き換える（`REPAIR-3`。解消済み: #1146。`getAttribute` op を足し、style の shim が最初のアクセスで元の属性を読んで初期化する。属性の列挙は未対応）
 
 ### 再現手順
 

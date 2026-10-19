@@ -53,7 +53,7 @@
 //!
 //! - `hashchange` / `popstate` イベントの発火、`document.location` / `document.URL`、
 //!   `location` 代入による実際の遷移は未実装（後続 issue）。
-//! - #771 のスパイクで判明する追加操作（`getAttribute`・`parentNode` 等）は後続 issue で足す。
+//! - #771 のスパイクで判明する追加操作（`parentNode` 等）は後続 issue で足す。
 
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
@@ -332,6 +332,7 @@ enum DomOp {
     RemoveChild,
     SetAttribute,
     RemoveAttribute,
+    GetAttribute,
     GetTextContent,
     SetTextContent,
     GetInnerHtml,
@@ -381,6 +382,7 @@ impl DomOp {
             "removeChild" => Self::RemoveChild,
             "setAttribute" => Self::SetAttribute,
             "removeAttribute" => Self::RemoveAttribute,
+            "getAttribute" => Self::GetAttribute,
             "getTextContent" => Self::GetTextContent,
             "setTextContent" => Self::SetTextContent,
             "getInnerHTML" => Self::GetInnerHtml,
@@ -431,6 +433,7 @@ impl DomOp {
             Self::RemoveChild => "removeChild",
             Self::SetAttribute => "setAttribute",
             Self::RemoveAttribute => "removeAttribute",
+            Self::GetAttribute => "getAttribute",
             Self::GetTextContent => "getTextContent",
             Self::SetTextContent => "setTextContent",
             Self::GetInnerHtml => "getInnerHTML",
@@ -500,6 +503,7 @@ impl DomOp {
             | Self::AppendChild
             | Self::RemoveChild
             | Self::RemoveAttribute
+            | Self::GetAttribute
             | Self::SetTextContent
             | Self::SetInnerHtml
             | Self::IgnoreLocationChange
@@ -1215,6 +1219,19 @@ fn execute(
                 )))
             } else {
                 Ok(JsValue::Null)
+            }
+        }
+        DomOp::GetAttribute => {
+            let element = page.node_arg(op, args, 1)?;
+            let name = string_arg(op, args, 2, limits)?;
+            // 読み取り専用（JS-5）。名前は Document 側で検証し、値は文字列を確保する前に
+            // 応答上限（JS-6）を検査する。属性が無ければ null。
+            match page.document.attribute_checked(element, name)? {
+                Some(v) => {
+                    check_response_len(v.len(), limits)?;
+                    Ok(JsValue::String(v.to_owned()))
+                }
+                None => Ok(JsValue::Null),
             }
         }
         DomOp::GetTextContent => {
@@ -1962,6 +1979,73 @@ mod tests {
         let e = call(&b, &[s("setTextContent"), n(a), s(&multibyte)]).expect_err("超過");
         assert!(matches!(e, DomBridgeError::StringTooLong { index: 2, .. }));
         assert_eq!(snapshot(&b), after_ok);
+    }
+
+    #[test]
+    fn js_5_get_attribute_returns_value_or_null() {
+        let b = bridge();
+        let a = num(call(&b, &[s("getElementById"), s("a")]));
+        let before = snapshot(&b);
+        assert_eq!(
+            call(&b, &[s("getAttribute"), n(a), s("id")]).expect("ok"),
+            s("a")
+        );
+        assert_eq!(
+            call(&b, &[s("getAttribute"), n(a), s("ID")]).expect("ok"),
+            s("a")
+        );
+        assert_eq!(
+            call(&b, &[s("getAttribute"), n(a), s("nope")]).expect("ok"),
+            JsValue::Null
+        );
+        assert_eq!(snapshot(&b), before);
+        call(&b, &[s("setAttribute"), n(a), s("title"), s("t")]).expect("set");
+        assert_eq!(
+            call(&b, &[s("getAttribute"), n(a), s("title")]).expect("ok"),
+            s("t")
+        );
+    }
+
+    #[test]
+    fn js_5_get_attribute_rejects_invalid_name() {
+        let b = bridge();
+        let a = num(call(&b, &[s("getElementById"), s("a")]));
+        let before = snapshot(&b);
+        for name in ["", "1x", "a b"] {
+            let e = call(&b, &[s("getAttribute"), n(a), s(name)]).expect_err("不正");
+            assert!(matches!(
+                e,
+                DomBridgeError::Core(Error::Dom(DomError::InvalidName { .. }))
+            ));
+        }
+        let long = "x".repeat(DEFAULT_MAX_STRING_ARG_BYTES + 1);
+        let e = call(&b, &[s("getAttribute"), n(a), s(&long)]).expect_err("超過");
+        assert!(matches!(e, DomBridgeError::StringTooLong { index: 2, .. }));
+        let e = call(&b, &[s("getAttribute"), n(a)]).expect_err("不足");
+        assert!(matches!(
+            e,
+            DomBridgeError::ArityMismatch { expected: 2, .. }
+        ));
+        let e = call(&b, &[s("getAttribute"), n(a), n(1.0)]).expect_err("型");
+        assert!(matches!(e, DomBridgeError::TypeMismatch { index: 2, .. }));
+        assert_eq!(snapshot(&b), before);
+    }
+
+    #[test]
+    fn js_6_get_attribute_response_limit() {
+        let b = bridge_with(DomBridgeLimits::default().with_max_response_bytes(4));
+        let a = num(call(&b, &[s("getElementById"), s("a")]));
+        call(&b, &[s("setAttribute"), n(a), s("title"), s("1234")]).expect("set");
+        assert_eq!(
+            call(&b, &[s("getAttribute"), n(a), s("title")]).expect("ok"),
+            s("1234")
+        );
+        call(&b, &[s("setAttribute"), n(a), s("title"), s("12345")]).expect("set");
+        let e = call(&b, &[s("getAttribute"), n(a), s("title")]).expect_err("超過");
+        assert!(matches!(
+            e,
+            DomBridgeError::ResponseTooLarge { len: 5, limit: 4 }
+        ));
     }
 
     #[test]

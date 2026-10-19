@@ -548,6 +548,20 @@ impl Document {
         }))
     }
 
+    /// 要素 `element` の属性 `name` の値を、要素種別と名前を検証したうえで読む（`JS-5`）。
+    ///
+    /// [`Document::attribute`] は照合だけで検証しない。本関数は DOM ブリッジの
+    /// `getAttribute` op から呼ばれ、`set_attribute` / `remove_attribute` と同じ順序で
+    /// 検査する（要素以外は [`DomError::InvalidNodeKind`]、名前の規則違反は
+    /// [`DomError::InvalidName`]）。属性が無ければ `Ok(None)`。照合規則は `attribute` と共通。
+    pub fn attribute_checked(&self, element: NodeId, name: &str) -> Result<Option<&str>> {
+        if !matches!(self.require_node(element)?.data, NodeData::Element { .. }) {
+            return Err(kind_err("attribute_checked", "node is not an element"));
+        }
+        validate_name(NameKind::Attribute, name, self.limits.max_name_bytes)?;
+        Ok(self.attribute(element, name))
+    }
+
     /// `node` のテキスト内容を `text` に置き換える（`JS-5`）。
     ///
     /// 要素・DocumentFragment は全ての子を外し、`text` が空でなければテキストノードを
@@ -680,6 +694,33 @@ mod tests {
             err.source().map(ToString::to_string).as_deref(),
             Some("node limit of 100000 exceeded")
         );
+    }
+
+    /// JS-5 (TASK-107): attribute_checked は値を返し、不正な名前・要素以外を拒否する。
+    #[test]
+    fn js_5_attribute_checked_reads_and_validates() {
+        let mut doc = parse("<body><div id=\"a\"></div></body>");
+        let a = query_selector_str(&doc, doc.root(), "#a")
+            .expect("selector ok")
+            .expect("exists");
+        assert_eq!(doc.attribute_checked(a, "id").expect("ok"), Some("a"));
+        assert_eq!(doc.attribute_checked(a, "ID").expect("ok"), Some("a"));
+        assert_eq!(doc.attribute_checked(a, "nope").expect("ok"), None);
+        for (name, reason) in [
+            ("", "name is empty"),
+            ("1x", "invalid leading character"),
+            ("a b", "name contains a disallowed character"),
+        ] {
+            match dom_err(doc.attribute_checked(a, name)) {
+                DomError::InvalidName { reason: r, .. } => assert_eq!(r, reason),
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+        let t = doc.create_text_node("x").expect("create");
+        assert!(matches!(
+            dom_err(doc.attribute_checked(t, "id")),
+            DomError::InvalidNodeKind { .. }
+        ));
     }
 
     /// JS-5 (TASK-107): append_child は末尾に追加し parent を設定する。

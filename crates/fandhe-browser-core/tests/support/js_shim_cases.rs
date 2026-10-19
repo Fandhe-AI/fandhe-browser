@@ -23,7 +23,12 @@ struct Page {
 }
 
 fn setup(engine: &str, limit_extra_nodes: Option<usize>) -> Page {
-    let mut doc = parse_document(FIXTURE, &ParseOptions::default())
+    setup_html(engine, FIXTURE, limit_extra_nodes)
+}
+
+/// 任意の HTML（`<script>` を 1 つ含むこと）で始める setup。パーサー由来の属性を検証する。
+fn setup_html(engine: &str, html: &str, limit_extra_nodes: Option<usize>) -> Page {
+    let mut doc = parse_document(html, &ParseOptions::default())
         .expect("fixture parses")
         .document;
     let list = parse_selector_list("script").expect("selector");
@@ -1088,24 +1093,81 @@ fn style_cases(engine: &str) {
         "attributes:style",
     );
 
-    eprintln!("case: REPAIR-3 style baseline of parser-created elements is unknown");
+    eprintln!("case: JS-5 style reads the original style attribute of innerHTML-created elements");
     let mut p = setup(engine, None);
     check(
         &mut p,
         "document.body.innerHTML = '<p id=\"sp\" style=\"margin: 0\">x</p>'; \
          var sp = document.getElementById('sp'); sp.style.margin + '|' + sp.style.length",
-        "|0",
+        "0|1",
     );
     check(
         &mut p,
         "sp.style.color = 'red'; sp.style.cssText",
-        "color: red;",
+        "margin: 0; color: red;",
     );
     assert!(
         p.html()
-            .contains("<p id=\"sp\" style=\"color: red;\">x</p>"),
+            .contains("<p id=\"sp\" style=\"margin: 0; color: red;\">x</p>"),
         "html: {}",
         p.html()
+    );
+
+    eprintln!("case: JS-5 style keeps declarations of a parser-created style attribute");
+    let mut p = setup_html(
+        engine,
+        "<html><head></head><body><div id=\"h\" style=\"color: red\"></div>\
+         <div id=\"n\"></div><script>x</script></body></html>",
+        None,
+    );
+    check(
+        &mut p,
+        "var h = document.getElementById('h'); h.style.color",
+        "red",
+    );
+    check(
+        &mut p,
+        "h.style.display = 'none'; h.getAttribute('style')",
+        "color: red; display: none;",
+    );
+    assert!(
+        p.html().contains("style=\"color: red; display: none;\""),
+        "html: {}",
+        p.html()
+    );
+    check(
+        &mut p,
+        "var nn = document.getElementById('n'); nn.style.length",
+        "0",
+    );
+    check(
+        &mut p,
+        "nn.style.top = '1px'; nn.getAttribute('style')",
+        "top: 1px;",
+    );
+
+    eprintln!("case: JS-5 element getAttribute / hasAttribute");
+    let mut p = setup(engine, None);
+    check(
+        &mut p,
+        "var e = document.getElementById('a'); e.getAttribute('id') + '|' + e.getAttribute('ID')",
+        "a|a",
+    );
+    check(&mut p, "String(e.getAttribute('nope') === null)", "true");
+    check(
+        &mut p,
+        "e.hasAttribute('id') + '|' + e.hasAttribute('nope')",
+        "true|false",
+    );
+    check(
+        &mut p,
+        "e.setAttribute('data-x', '1'); e.getAttribute('data-x')",
+        "1",
+    );
+    check(
+        &mut p,
+        "try { e.getAttribute('a b'); 'no' } catch (err) { 'threw' }",
+        "threw",
     );
 
     eprintln!("case: REPAIR-3 / SEC-2 no computed style stub and no vendor-prefixed names");

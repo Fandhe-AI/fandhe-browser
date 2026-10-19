@@ -8,7 +8,8 @@
 // `length` / `item` と、`style` 属性への同期を提供する。
 // 呼び出し元: core の `js_shim::install`（`JS_SHIM_SOURCES` の末尾。observers.js の後に評価）。
 // 属性の書き込みは dom.js の `setAttribute`（MutationObserver へ通知するラッパー）を install 時に
-// 捕捉して使う。新しい bridge op は足さない。
+// 捕捉して使う。元の `style` 属性は dom.js の `getAttribute`（`getAttribute` op）を install 時に捕捉して
+// 最初のアクセスで 1 回だけ読む（#1146）。
 //
 // 設計上の要点:
 // - 宣言は要素ごとの順序付きリスト（添字演算と null プロトタイプのコンテナ。配列メソッドは使わない）で持つ。
@@ -39,9 +40,10 @@
 // - 値の構文検証はしない（書いた値はそのまま読み戻せる。機能検出では「何でも対応」に見える）。
 // - 固定リストに無いプロパティ名の `el.style.foo = v` は own データプロパティになり属性へ同期しない
 //   （Proxy を使わない制約）。`setProperty` / `cssText` では扱える。添字アクセス（`style[0]`）は未対応。
-// - HTML パーサー・`innerHTML` で作られた要素の元の `style` 属性は読む op が無いため基準値が不明。
-//   その要素に shim から最初に書くと `style` 属性全体を shim の宣言で置き換える（元の宣言は
-//   失われ、読み取りにも出ない）。`getAttribute` 相当の op を足せば解消する。
+// - HTML パーサー・`innerHTML` で作られた要素の元の `style` 属性は最初のアクセスで読んで初期化する
+//   が、元の属性が合計 32768 UTF-16 単位の上限を超える場合は解析できず、最初の書き込みで
+//   `style` 属性全体を置き換える。shim が無効と判断した断片も最初の書き込みで直列化から落ち、
+//   直列化は `name: value;` の正規形になる（例: `color:red` は `color: red;`）。
 // - shorthand の展開（`margin` を `margin-top` 等へ）・相対 URL の解決・値の正規化はしない。
 (function (global) {
     'use strict';
@@ -77,6 +79,10 @@
         throw new TypeError('dom.js must be evaluated before style.js');
     }
     var origSetAttribute = Element.prototype.setAttribute;
+    var origGetAttribute = Element.prototype.getAttribute;
+    if (typeof origGetAttribute !== 'function') {
+        throw new TypeError('dom.js must be evaluated before style.js');
+    }
     var origRemoveAttribute = Element.prototype.removeAttribute;
     var origCreateElement = Document.prototype.createElement;
 
@@ -620,7 +626,14 @@
         if (decl === undefined) {
             decl = createObject(CSSStyleDeclaration.prototype);
             var base = wmGet(baselines, el);
-            wmSet(states, decl, { el: el, model: base === undefined ? newModel() : parseText(base) || newModel() });
+            if (base === undefined) {
+                // パーサー・innerHTML 由来の要素: 元の属性を 1 回だけ読む。読み取りの例外は伝播させ
+                // （空に倒すと最初の書き込みで元の宣言が消える）、宣言オブジェクトもキャッシュしない。
+                var raw = fnCall(origGetAttribute, el, 'style');
+                base = typeof raw === 'string' ? raw : '';
+                wmSet(baselines, el, base);
+            }
+            wmSet(states, decl, { el: el, model: parseText(base) || newModel() });
             wmSet(declarations, el, decl);
         }
         return decl;
