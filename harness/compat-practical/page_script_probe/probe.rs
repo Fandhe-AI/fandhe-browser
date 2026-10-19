@@ -9,12 +9,14 @@
 use std::path::PathBuf;
 
 use fandhe_browser_core::{
-    ExceptionKind, ExceptionSummary, LifecycleEvent, LifecycleOutcome, ScriptDiagnosticKind,
-    ScriptOutcome, SrcFetchErrorKind,
+    ExceptionKind, ExceptionSummary, LifecycleEvent, LifecycleOutcome, PageRunOptions,
+    ScriptCollectionOptions, ScriptDiagnosticKind, ScriptOutcome, SrcFetchErrorKind,
 };
 use reqwest::Url;
 
-use crate::common::{EngineChoice, Obj, UsageError, classify, is_valid_id, parse_https_url};
+use crate::common::{
+    EngineChoice, Obj, UsageError, classify, is_valid_id, parse_https_url, sanitize_debug,
+};
 
 /// 引数（対象は 1 件。実行上限は本番の既定のままで、引数から変えられない）。
 #[derive(Debug)]
@@ -23,7 +25,10 @@ pub struct ProbeArgs {
     pub url: Url,
     pub engine: EngineChoice,
     pub out: Option<PathBuf>,
-    pub debug_messages: bool,
+    /// 生の例外メッセージ（300 文字に切り詰め・制御文字除去済み）を stderr にだけ出す opt-in
+    /// （`--debug-raw-exception`。`--debug-messages` は同じ意味の別名。Issue #1152）。
+    /// JSONL・`--out` には出さない。
+    pub debug_raw_exception: bool,
     /// ES module 実行（`JS-2`・設定 gate `[js] execute_modules`）を有効にして収集・実行する。
     pub modules: bool,
     /// 件数を数える CSS セレクタ（既定 `h1`。d2・d3 の `form` 判定用。#1119）。
@@ -34,13 +39,13 @@ fn usage<T>(msg: &str) -> Result<T, UsageError> {
     Err(UsageError(msg.to_string()))
 }
 
-/// `--target <id>=<https url>`・`--engine v8|boa`（既定 v8）・`--out <path>`・`--debug-messages`・`--modules`・`--selector <css>`（既定 `h1`）。
+/// `--target <id>=<https url>`・`--engine v8|boa`（既定 v8）・`--out <path>`・`--debug-raw-exception`（別名 `--debug-messages`）・`--modules`・`--selector <css>`（既定 `h1`）。
 pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<ProbeArgs, UsageError> {
     let mut it = args.into_iter();
     let mut target: Option<(String, Url)> = None;
     let mut engine = EngineChoice::V8;
     let mut out = None;
-    let mut debug_messages = false;
+    let mut debug_raw_exception = false;
     let mut modules = false;
     let mut selector = "h1".to_string();
     while let Some(flag) = it.next() {
@@ -69,7 +74,7 @@ pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<ProbeArgs, U
                 Some(p) if !p.is_empty() => out = Some(PathBuf::from(p)),
                 _ => return usage("--out requires a path"),
             },
-            "--debug-messages" => debug_messages = true,
+            "--debug-raw-exception" | "--debug-messages" => debug_raw_exception = true,
             "--modules" => modules = true,
             "--selector" => match it.next() {
                 // 長さを上限検証する（セレクタは core のパーサーへ渡すだけで、連結・評価はしない）
@@ -87,10 +92,44 @@ pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<ProbeArgs, U
         url,
         engine,
         out,
-        debug_messages,
+        debug_raw_exception,
         modules,
         selector,
     })
+}
+
+/// 本番（core の `run_options_for`）と同じく、module 有効時は収集オプションの gate を真にする。
+/// 収集と実行の両方に同じオプションを渡す（片方だけだと module は `skipped_module` のままになる）。
+/// `--debug-raw-exception` のときだけ core の生メッセージ保持（既定 off）を有効にする（Issue #1152）。
+pub fn run_options(args: &ProbeArgs) -> PageRunOptions {
+    let base = if args.modules {
+        PageRunOptions::default()
+            .with_collection(ScriptCollectionOptions::default().with_execute_modules(true))
+    } else {
+        PageRunOptions::default()
+    };
+    base.with_retain_raw_exception_messages(args.debug_raw_exception)
+}
+
+/// bidi 制御文字（`char::is_control` では除かれない端末表示の並べ替え用）か。
+fn is_bidi_control(c: char) -> bool {
+    matches!(c, '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}')
+}
+
+/// 生メッセージを stderr に出す 1 行にする純関数（Issue #1152・`REPAIR-4`・`SEC-2`）。
+///
+/// `enabled`（`--debug-raw-exception`）が偽、または `raw` が無ければ `None`（既定では何も出さない）。
+/// 本文は 300 文字に切り詰め、制御文字・bidi 制御文字を除く。`label` は出どころ（固定語彙と番号だけ）。
+/// 戻り値は stderr 専用で、JSONL・`--out`・REPORT・fixture には書かない。
+pub fn debug_stderr_line(enabled: bool, label: &str, raw: Option<&str>) -> Option<String> {
+    if !enabled {
+        return None;
+    }
+    let body: String = sanitize_debug(raw?)
+        .chars()
+        .filter(|c| !is_bidi_control(*c))
+        .collect();
+    Some(format!("[{label}] {body}"))
 }
 
 /// 例外メッセージを「分類名[:API 名]」へ要約する（本文は残さない）。
@@ -224,11 +263,40 @@ mod tests {
         assert_eq!(a.id, "b5");
         assert_eq!(a.url.as_str(), "https://example.com/");
         assert_eq!(a.engine, EngineChoice::V8);
-        assert!(!a.debug_messages);
+        assert!(!a.debug_raw_exception);
         assert!(!a.modules);
         assert_eq!(a.selector, "h1");
         let b = args(&["--target", "b5=https://example.com/", "--engine", "boa"]).expect("ok");
         assert_eq!(b.engine, EngineChoice::Boa);
+    }
+
+    /// #1152: 生メッセージの stderr 出力は既定 off。`--debug-raw-exception` と別名 `--debug-messages` で
+    /// 有効になり、core の保持スイッチも連動する。
+    #[test]
+    fn raw_exception_opt_in_defaults_off_and_toggles_core_switch() {
+        let t = ["--target", "b5=https://example.com/"];
+        let off = args(&t).expect("ok");
+        assert!(!off.debug_raw_exception);
+        assert!(!run_options(&off).retains_raw_exception_messages());
+        for flag in ["--debug-raw-exception", "--debug-messages"] {
+            let on = args(&[t[0], t[1], flag, "--modules"]).expect("ok");
+            assert!(on.debug_raw_exception);
+            assert!(run_options(&on).retains_raw_exception_messages());
+        }
+    }
+
+    /// #1152: 無効時・生メッセージなしでは何も出さず、有効時は 300 文字・制御文字なしで出る。
+    #[test]
+    fn debug_stderr_line_is_gated_clipped_and_sanitized() {
+        assert_eq!(debug_stderr_line(false, "x", Some("SECRET")), None);
+        assert_eq!(debug_stderr_line(true, "x", None), None);
+        let raw = format!("a\u{1b}[31m\n\r\t\u{7f}\u{202E}b{}", "あ".repeat(400));
+        let line = debug_stderr_line(true, "d2#0 module_evaluation", Some(&raw)).expect("some");
+        assert!(line.starts_with("[d2#0 module_evaluation] a [31m"));
+        assert!(!line.chars().any(char::is_control));
+        assert!(!line.contains('\u{202E}'));
+        let body = line.trim_start_matches("[d2#0 module_evaluation] ");
+        assert_eq!(body.chars().count(), 300 - 1);
     }
 
     /// #1119: `--modules` と `--selector` を受け付ける。

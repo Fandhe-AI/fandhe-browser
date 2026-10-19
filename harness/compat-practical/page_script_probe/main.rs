@@ -12,7 +12,9 @@
 //! 手順は `harness/compat-practical/README.md` の「page_script_probe」節。
 //!
 //! 出力に載せるのは件数・分類名・種別だけで、HTML・script 本文・URL・例外メッセージの
-//! 本文は載せない（`--debug-messages` 指定時の stderr だけ切り詰めて出す）。
+//! 本文は載せない（`--debug-raw-exception`〔別名 `--debug-messages`〕指定時の stderr だけ、
+//! 切り詰め・制御文字除去したうえで classic・module 評価失敗・動的 import の評価失敗の生メッセージを出す。
+//! stderr は端末で読むだけにし、ファイルへ保存・REPORT へ転記しない。Issue #1152）。
 //!
 //! 終了コード: 0 = 記録完了（失敗はデータでありゲートではない）/ 1 = 書き込み失敗 /
 //! 2 = 入力・使用エラー（引数不正・エンジン未同梱・ランタイム構築失敗）。
@@ -29,14 +31,17 @@ use std::io::Write;
 use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use common::{Obj, map_fetch_error, same_origin, sanitize_debug};
+use common::{Obj, map_fetch_error, same_origin};
 use fandhe_browser_core::config::Config;
 use fandhe_browser_core::{
-    FetchOptions, Fetcher, PageRunInput, PageRunOptions, ParseOptions, ScriptCollectionOptions,
-    ScriptKind, ScriptOutcome, ScriptSource, collect_page_scripts, page_script_fetch_options,
-    parse_document, query_selector_all_str, run_page_scripts,
+    FetchOptions, Fetcher, PageRunInput, ParseOptions, ScriptKind, ScriptOutcome, ScriptSource,
+    collect_page_scripts, page_script_fetch_options, parse_document, query_selector_all_str,
+    run_page_scripts,
 };
-use probe::{Origin, ProbeArgs, class_label, exception_label, lifecycle_label, script_line};
+use probe::{
+    Origin, ProbeArgs, class_label, debug_stderr_line, exception_label, lifecycle_label,
+    run_options, script_line,
+};
 use reqwest::Url;
 
 fn main() -> ExitCode {
@@ -63,17 +68,6 @@ fn count_matches(html: &str, selector: &str) -> Option<u64> {
     let doc = parsed.document;
     let found = query_selector_all_str(&doc, doc.root(), selector).ok()?;
     Some(found.len() as u64)
-}
-
-/// 本番（core の `run_options_for`）と同じく、module 有効時は収集オプションの gate を真にする。
-/// 収集と実行の両方に同じオプションを渡す（片方だけだと module は `skipped_module` のままになる）。
-fn run_options(args: &ProbeArgs) -> PageRunOptions {
-    if args.modules {
-        PageRunOptions::default()
-            .with_collection(ScriptCollectionOptions::default().with_execute_modules(true))
-    } else {
-        PageRunOptions::default()
-    }
 }
 
 fn bool_s(b: bool) -> String {
@@ -307,15 +301,17 @@ async fn measure(
             },
             _ => Origin::Unknown,
         };
-        if args.debug_messages
-            && let ScriptOutcome::Exception { message, .. } = rec.outcome()
-        {
-            eprintln!(
-                "[{}#{:?}] {}",
-                args.id,
-                rec.index(),
-                sanitize_debug(message)
-            );
+        // 生メッセージは stderr だけへ（JSONL の `script_line` には渡さない。Issue #1152）。
+        // module の評価失敗は outcome が固定文のため、core が保持した生メッセージを使う。
+        if let ScriptOutcome::Exception { message, .. } = rec.outcome() {
+            let (source, raw) = match rec.raw_exception_message() {
+                Some(m) => ("module_evaluation", Some(m)),
+                None => ("classic", Some(message.as_str())),
+            };
+            let label = format!("{}#{:?} {source}", args.id, rec.index());
+            if let Some(line) = debug_stderr_line(args.debug_raw_exception, &label, raw) {
+                eprintln!("{line}");
+            }
         }
         lines.push(script_line(
             &args.id,
@@ -414,6 +410,13 @@ async fn measure(
         .map(exception_label)
         .collect();
     eval_errors.sort();
+    // 動的 import の評価失敗の生メッセージも stderr だけへ（JSONL の `evaluation_errors` は要約のまま）。
+    for (n, raw) in dyn_imp.raw_evaluation_messages().into_iter().enumerate() {
+        let label = format!("{} dynamic_import#{n}", args.id);
+        if let Some(line) = debug_stderr_line(args.debug_raw_exception, &label, raw) {
+            eprintln!("{line}");
+        }
+    }
     // 動的 import は件数と reject の種別名だけを出す（URL・specifier は出さない）
     let dyn_obj = Obj::new()
         .n("requested", dyn_imp.requested() as u64)
