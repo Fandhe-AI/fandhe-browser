@@ -656,7 +656,7 @@ spec 対応: TASK-71・TASK-108 / MS-6 / `COMPAT-1`・`JS-5`・`JS-6`・`MEAS-4`
 
 ### 次の対応
 
-1. d2: `history`（`pushState` / `replaceState` 等）の不足。`location` と履歴の整合を含めて別 issue で追跡する（切り出し候補）
+1. d2: `history`（`pushState` / `replaceState` 等）の不足。`location` と履歴の整合を含めて別 issue で追跡する（切り出し候補）。追跡: #1171（済み: #1171。下の節を参照）
 2. d3: `instanceof` の右辺の特定（#1156 の次の対応 1 のまま。済み: #1168。下の節を参照）
 
 ### 制約
@@ -720,7 +720,7 @@ spec 対応: TASK-71・TASK-108 / MS-6 / `COMPAT-1`・`JS-5`・`JS-7`・`MEAS-4`
 
 1. d3: 描画されない原因の調査（`document.activeElement`、`HTMLElement` の定義で出る擬似クラス selector の対応を含む。別 issue で追跡する切り出し候補）
 2. `listener_errors`・`net_callback_errors` を core の `ExceptionSummary` で分類する（#1156 の次の対応 2。本 issue では未対応）
-3. d2: `history` の不足（#1167 の節の次の対応 1 のまま）
+3. d2: `history` の不足（#1167 の節の次の対応 1 のまま。済み: #1171。下の節を参照）
 
 ### 制約
 
@@ -735,6 +735,64 @@ cargo build --release -p fandhe-browser-core --features js-v8 --example compat_p
 target/release/examples/compat_page_script_probe --target d3=https://demoqa.com/automation-practice-form --modules --selector form --debug-raw-exception --out /abs/path/d3.jsonl
 # stderr の "timer_error#N ... frame" 行の url:line:col を見て、人間が手動で該当列の前後を読む
 jq -c 'select(.type=="run") | .bridge.timer_errors' /abs/path/d3.jsonl
+```
+
+## window.history の追加と d2・d3 の再測定（#1171）
+
+spec 対応: TASK-71・TASK-108 / MS-6 / `COMPAT-1`・`JS-5`・`JS-6`・`MEAS-4`・`REPAIR-3`・`REPAIR-4`・`SEC-2`。
+前節群（#1167・#1168）の「次の対応」（d2 の `history` の不足）を扱い、`window.history` の最小実装を足して、d2・d3 を `page_script_probe --modules --debug-raw-exception` で再測定した。出力はコミットしていない。
+
+### 実装の要点
+
+- `history.js`（新規）で `History` と `history` を足した。`length`（1 から。`pushState` で増え、上限 50）・`state`・`scrollRestoration`（`auto` / `manual` のみ受理）、`pushState`・`replaceState`・`back`・`forward`・`go` を持つ。メソッドは包み直せる（Backtrace SDK の想定パターン）
+- URL の書き換えは新しい bridge op `historySetUrl`（Rust 側）で行う。現在の URL を基準に解決し、userinfo 付き・別オリジン（scheme・host・port）・`javascript:` / `file:` / `data:`・8192 バイト超・`about:blank` を拒否する。拒否は `SecurityError`（DOMException）で、状態は変えない。`__dom.op` を直接呼ばれても現在のオリジンの外へは書き換えられない。遷移も取得も行わない
+- `state` は構造化複製の代わりに JSON の往復で複製し、直列化後 2 MiB（UTF-16）を上限にする（`JS-6`）。超過・循環参照・関数は `DataCloneError`。保持するのは現在の 1 件だけ
+- **`back`・`forward`・`go` と `popstate` は未実装（`REPAIR-3`）を選んだ**。汎用の `EventTarget` / `dispatchEvent` が無く、URL だけを動かして `popstate` を配らないと、SPA のルーターの状態と URL が食い違うため。3 つは URL と state を変えず、`ignoreLocationChange` 診断（`HistoryBack`・`HistoryForward`・`HistoryGo`）に記録するだけ。`PopStateEvent`・`onpopstate` は定義しない
+- 識別面（`SEC-2`）: `navigation`・`PopStateEvent`・`onpopstate`・上限や残量を示すプロパティは定義しない。診断に URL 本文は残さない
+- 副作用: `pushState` 後は `page_net` の相対 URL の基準（`location`）が同一オリジン内の別パスに変わる（実ブラウザと同じ。オリジンは変わらず、クロスオリジン・SSRF 検査は従来どおり）
+- 依存の追加・`unsafe` の追加は無い。V8・boa の共通ケース（`js_shim_cases.rs` の `history_cases`）で検証した
+
+### 測定条件
+
+| 項目 | 値 |
+| ---- | -- |
+| 実施日時（UTC） | 2026-10-19 |
+| OS | Linux |
+| ベース | main `fa8fc20a` に、本変更を加えたもの |
+| バイナリ | `cargo build --release -p fandhe-browser-core --features js-v8 --example compat_page_script_probe` |
+| 設定 | `--modules`・V8・`--selector form`・`--debug-raw-exception`。実行上限は既定のまま |
+
+### 結果
+
+| id | サイト | script | outcome | 最初の例外 | `form`（実行後） | 判定 |
+| -- | ------ | ------ | ------- | ---------- | ---------------- | ---- |
+| d2 | Saucedemo | index 1（module・同一オリジン `src`） | succeeded | なし | 0 件 | `history` は解消、`form` は未解消 |
+| d3 | DemoQA | index 0（module・同一オリジン `src`） | succeeded | なし（`timer_errors` は 0 件） | 0 件 | 変化なし |
+
+- d2 は module 評価が成功した（`ReferenceError: history is not defined` は解消）。実行は `abort=virtual_time` で終わり、タイマーが 1 件発火・1 件未発火（`pending_at_end`）、`console.error` が 1 件ある。実行後の HTML は 1344 バイトで `form` は 0 件
+- d3 は #1168 の節と同じ（タイマー 1 件発火・module 成功・HTML 437 バイト）
+- **d2・d3 とも `form` は 0 件のため #919 にはコメントしていない**
+
+### 次の対応
+
+1. d2: 描画されない原因の調査。`virtual_time` で打ち切られ未発火のタイマーが 1 件残る点と、`console.error` 1 件の内容（本測定では記録していない）が手掛かり。別 issue で追跡する（切り出し候補）
+2. d3: 描画されない原因の調査（#1168 の次の対応 1 のまま。別 issue で追跡する切り出し候補）
+3. `back`・`forward`・`go` による実際のページ内履歴の移動と `popstate` の配送（汎用の `EventTarget` が前提。別 issue の切り出し候補）
+
+### 制約
+
+- 単一環境（Linux）・単一時点。URL のクエリ・script 本文は記録していない
+- 判定は最初の例外で止まる測定に基づく。d2 の `console.error` の内容と未発火タイマーの原因は未特定
+- 未実装（`REPAIR-3`）: `back`・`forward`・`go` の移動、`popstate`・`hashchange` の配送、構造化複製の完全な実装（`Date`・`Map`・`Blob` は保持されない）、`about:blank` での URL 付き `pushState`、履歴の永続化
+
+### 再現手順
+
+```bash
+cargo build --release -p fandhe-browser-core --features js-v8 --example compat_page_script_probe
+target/release/examples/compat_page_script_probe --target d2=https://www.saucedemo.com --modules --selector form --debug-raw-exception --out /abs/path/d2.jsonl
+target/release/examples/compat_page_script_probe --target d3=https://demoqa.com/automation-practice-form --modules --selector form --debug-raw-exception --out /abs/path/d3.jsonl
+jq -c 'select(.type=="script")' /abs/path/d2.jsonl /abs/path/d3.jsonl
+jq -c 'select(.type=="run")' /abs/path/d2.jsonl /abs/path/d3.jsonl
 ```
 
 ## b5（Trello）の原因特定（#964）

@@ -57,6 +57,7 @@ fn setup_html(engine: &str, html: &str, limit_extra_nodes: Option<usize>) -> Pag
             "style.js",
             "url.js",
             "storage.js",
+            "history.js",
         ]
     );
     Page { bridge, rt, script }
@@ -307,6 +308,7 @@ pub fn run(engine: &str) {
     node_cases(engine);
     abort_cases(engine);
     storage_cases(engine);
+    history_cases(engine);
 
     eprintln!("case: JS-5 disabled runtime does not pretend to install");
     let mut disabled = JsRuntime::disabled();
@@ -2166,4 +2168,205 @@ fn storage_cases(engine: &str) {
     );
     p.rt.install_dom_shim(&p.bridge).expect("reinstall");
     check(&mut p, "localStorage.length", "0");
+}
+
+/// `history.js`（#1171・`JS-5`・`JS-6`・`SEC-2`・`REPAIR-3`）の最小 `window.history`。
+fn history_cases(engine: &str) {
+    const BASE: &str = "https://example.com:8443/a/b?q=1#f";
+    eprintln!("case: JS-5 history globals and initial values");
+    let mut p = setup(engine, None);
+    p.bridge.set_location(BASE).expect("set_location");
+    check(
+        &mut p,
+        "[typeof History, typeof history, window.history === history, history instanceof History, \
+         Object.prototype.toString.call(history), history.length, history.state === null, \
+         history.scrollRestoration].join('|')",
+        "function|object|true|true|[object History]|1|true|auto",
+    );
+    check(
+        &mut p,
+        "var b = []; try { new History(); } catch (e) { b.push(e instanceof TypeError); } \
+         try { History.prototype.pushState.call({}, null, ''); } catch (e) { b.push(e instanceof TypeError); } b.join('|')",
+        "true|true",
+    );
+
+    eprintln!("case: JS-5 history same-origin URL rewrite updates location views");
+    let views = "[location.href, location.pathname, location.search, location.hash, document.URL, \
+                 document.location.href].join(' ')";
+    for (url, want) in [
+        (
+            "c?x=1",
+            "https://example.com:8443/a/c?x=1 /a/c ?x=1  https://example.com:8443/a/c?x=1 https://example.com:8443/a/c?x=1",
+        ),
+        (
+            "/p/q#h",
+            "https://example.com:8443/p/q#h /p/q  #h https://example.com:8443/p/q#h https://example.com:8443/p/q#h",
+        ),
+        (
+            "?z=2",
+            "https://example.com:8443/p/q?z=2 /p/q ?z=2  https://example.com:8443/p/q?z=2 https://example.com:8443/p/q?z=2",
+        ),
+        (
+            "#only",
+            "https://example.com:8443/p/q?z=2#only /p/q ?z=2 #only https://example.com:8443/p/q?z=2#only https://example.com:8443/p/q?z=2#only",
+        ),
+        (
+            "https://example.com:8443/abs",
+            "https://example.com:8443/abs /abs   https://example.com:8443/abs https://example.com:8443/abs",
+        ),
+    ] {
+        check(
+            &mut p,
+            &format!("history.pushState(null, '', '{url}'); {views}"),
+            want,
+        );
+    }
+
+    eprintln!("case: JS-5 history push grows length, replace does not, capped at 50");
+    check(
+        &mut p,
+        "var l0 = history.length; history.replaceState(null, '', '/r'); var l1 = history.length; \
+         history.pushState(null, '', '/s'); [l0, l1, history.length].join('|')",
+        "6|6|7",
+    );
+    check(
+        &mut p,
+        "for (var i = 0; i < 60; i++) { history.pushState(null, ''); } history.length",
+        "50",
+    );
+
+    eprintln!("case: JS-5 history rejects cross-origin URLs without changing state (SEC-2)");
+    check(
+        &mut p,
+        "history.pushState({k: 1}, '', '/keep'); history.length",
+        "50",
+    );
+    for bad in [
+        "https://evil.test/x",
+        "https://example.com:9000/",
+        "http://example.com:8443/",
+        "javascript:alert(1)",
+        "file:///etc/passwd",
+        "https://user:pw@example.com:8443/",
+    ] {
+        check(
+            &mut p,
+            &format!(
+                "var r; try {{ history.pushState({{k: 2}}, '', '{bad}'); r = 'no-throw'; }} catch (e) {{ \
+                 r = (e instanceof DOMException) + ',' + e.name + ',' + e.code; }} \
+                 [r, location.pathname, history.state.k, history.length].join('|')"
+            ),
+            "true,SecurityError,18|/keep|1|50",
+        );
+    }
+    let diag = p.bridge.take_diagnostics().expect("diagnostics");
+    assert!(
+        !format!("{diag:?}").contains("evil.test"),
+        "診断に URL 本文が残る"
+    );
+
+    eprintln!("case: JS-5 history omitted or null URL updates only state");
+    check(
+        &mut p,
+        "history.replaceState({n: 1}, '', null); history.replaceState({n: 2}, ''); [location.pathname, history.state.n].join('|')",
+        "/keep|2",
+    );
+
+    eprintln!("case: JS-6 history state clone, identity and limits");
+    check(
+        &mut p,
+        "var src = {a: [1, 2]}; history.replaceState(src, ''); src.a.push(3); \
+         [history.state === history.state, history.state !== src, history.state.a.length].join('|')",
+        "true|true|2",
+    );
+    check(
+        &mut p,
+        "history.replaceState(undefined, ''); var u = history.state === undefined; \
+         history.replaceState(null, ''); u + '|' + (history.state === null)",
+        "true|true",
+    );
+    check(
+        &mut p,
+        "history.replaceState({keep: 1}, ''); var out = []; var cyc = {}; cyc.self = cyc; \
+         var cases = [function () {}, cyc, 'x'.repeat(2 * 1024 * 1024 + 1)]; \
+         for (var i = 0; i < cases.length; i++) { try { history.pushState(cases[i], ''); out.push('no-throw'); } \
+         catch (e) { out.push(e instanceof DOMException && e.name); } } \
+         out.push(history.state.keep, history.length); out.join('|')",
+        "DataCloneError|DataCloneError|DataCloneError|1|50",
+    );
+    check(
+        &mut p,
+        "history.replaceState('x'.repeat(2 * 1024 * 1024 - 2), ''); history.state.length",
+        "2097150",
+    );
+
+    eprintln!("case: JS-5 history methods can be wrapped (Backtrace SDK pattern)");
+    check(
+        &mut p,
+        "var o = history.pushState; history.pushState = function () { return o.apply(this, arguments); }; \
+         history.pushState({a: 1}, '', '/w'); location.pathname",
+        "/w",
+    );
+    check(
+        &mut p,
+        "var t = []; try { history.replaceState({}); } catch (e) { t.push(e instanceof TypeError); } t.join('|')",
+        "true",
+    );
+
+    eprintln!("case: JS-5 history back/forward/go are recorded, not executed (REPAIR-3)");
+    let _ = p.bridge.take_diagnostics();
+    check(
+        &mut p,
+        "history.back(); history.forward(); history.go(-1); history.go(); \
+         var t = ''; try { history.go(1n); t = 'no-throw'; } catch (e) { t = e instanceof TypeError; } \
+         [location.pathname, t].join('|')",
+        "/w|true",
+    );
+    let diag = p.bridge.take_diagnostics().expect("diagnostics");
+    let got: Vec<_> = diag
+        .location_changes_ignored
+        .iter()
+        .map(|c| (c.kind, c.value_len))
+        .collect();
+    assert_eq!(
+        got,
+        vec![
+            (LocationChangeKind::HistoryBack, 0),
+            (LocationChangeKind::HistoryForward, 0),
+            (LocationChangeKind::HistoryGo, 2),
+            (LocationChangeKind::HistoryGo, 1),
+        ]
+    );
+
+    eprintln!("case: JS-5 history scrollRestoration accepts only auto/manual");
+    check(
+        &mut p,
+        "history.scrollRestoration = 'manual'; var a = history.scrollRestoration; \
+         history.scrollRestoration = 'bogus'; a + '|' + history.scrollRestoration",
+        "manual|manual",
+    );
+
+    eprintln!("case: SEC-2 history adds no identity surface");
+    check(
+        &mut p,
+        "[typeof PopStateEvent, 'onpopstate' in window, typeof navigation].join('|')",
+        "undefined|false|undefined",
+    );
+
+    eprintln!("case: JS-5 history resets on reinstall");
+    p.rt.install_dom_shim(&p.bridge).expect("reinstall");
+    check(
+        &mut p,
+        "[history.length, history.state === null].join('|')",
+        "1|true",
+    );
+
+    eprintln!("case: JS-5 history on about:blank rejects URLs but accepts state-only updates");
+    let mut b = setup(engine, None);
+    check(
+        &mut b,
+        "var r; try { history.pushState(null, '', '/x'); r = 'no-throw'; } catch (e) { r = e.name; } \
+         history.pushState({z: 1}, ''); [r, history.length, history.state.z, location.href].join('|')",
+        "SecurityError|2|1|about:blank",
+    );
 }
