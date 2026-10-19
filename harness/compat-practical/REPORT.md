@@ -8,6 +8,7 @@ spec 対応: TASK-71（71.4）/ MS-6 / `COMPAT-4`・`JS-2`・`MEAS-4`（関連 `
 
 ## 結論
 
+- ES module 有効（`[js] execute_modules = true`）での再測定（#1119）は **15/22 で、b5・d2・d3 は 3 件とも未解消**。結果は下の「ES module 有効での再測定（#1119）」を参照
 - ページ内 JS（V8）を有効にして 22 タスクを再実行した結果は **15/22（68.2%）で、JS 無効の同日対照（15/22）と成否が完全に一致した**
 - b5（Trello）・d2（Saucedemo）・d3（DemoQA）は **3 件とも未解消**（`no_match`）
 - PoC-9 の統合後推定 90.9%（20/22）に対して **-5 件（-22.7 ポイント）**。`COMPAT-4` の閾値 70%（16/22 以上）にも **1 件足りない**
@@ -45,6 +46,70 @@ spec 対応: TASK-71（71.4）/ MS-6 / `COMPAT-4`・`JS-2`・`MEAS-4`（関連 `
 - 実行上限による打ち切り: b5・d2・d3 を 1 件ずつ `--page-js v8 --log` で再実行し、固定診断行（`cdp: page scripts: status=... abort=...`）を回収した。**3 件とも診断行は出ず、上限による打ち切りはない**。ただし診断行が無いことは「実行されて打ち切りなし」と「実行対象なし」を区別しないため、実行の成否の確証にはならない。全 22 件の通し実行では 1 行だけ `status=aborted generation=22 abort=script_bytes` が出た（`generation` は 22 番目の遷移で、タスク順では e5 に当たる。本件の対象外）
 - スパイク（`js_api_spike`・`--engine v8`・DOM バインディング無しの素のエンジン）: b5 は 4 件が最初の未定義 API `window` で例外、2 件が module でスキップ、1 件が成功。d2 は inline 1 件が `window` で例外、module 1 件がスキップ。d3 は module 1 件のみでスキップ。素のエンジンの値であり、本番ランタイムの shim 導入後の不足を直接示すものではない。shim 導入後の b5 は「b5（Trello）の原因特定（#964）」で実測した（不足 API ではなく module が主因）
 - d2・d3 の解消には ES module の実行対応が前提になる可能性が高い。ただし未実装機能に基づく推測であり、実装後の検証が要る
+
+## ES module 有効での再測定（#1119）
+
+spec 対応: TASK-71 / MS-6 / `COMPAT-1`・`JS-2`・`JS-4`・`JS-5`・`JS-6`・`MEAS-4`・`REPAIR-3`（設計 `docs/design/es-module-design.md`）。
+数値は `results/core_results_modules.jsonl` から `jq` で導出した。script 単位の観測は `page_script_probe --modules`（出力はコミットしていない）。
+
+### 測定条件
+
+| 項目 | 値 |
+| ---- | -- |
+| 実施日時（UTC） | 通し実行: 2026-10-19T01:02:39Z（プローブは同日の直後） |
+| OS | Linux |
+| ベース | main `8d44877b`（動的 import・設定 gate `[js] execute_modules` を含む）に、`run_core.sh --page-modules` とプローブ拡張（本 PR の 1 件目のコミット）を加えたもの |
+| バイナリ | `target/release/fandhe-browser`（`cargo build --release -p fandhe-browser-cli`。既定 feature・V8 同梱）/ プローブは `--features js-v8` の example |
+| 設定 | `[js] engine = "v8"`・`execute_page_scripts = true`・`execute_modules = true`（`run_core.sh --page-js v8 --page-modules`） |
+| 実行上限 | 既定のまま（`JS-6`。変更していない） |
+| 比較の注意 | 対照は 2026-10-11 の `results/core_results.jsonl`（module 無効）。実サイトは時期で変わる |
+
+メタ行は `page_modules_executed` で module 有効での起動を記録する（意味は `page_js_executed` と同じで、ページごとの実行成否ではない）。
+
+### 結果
+
+22 件の成否は 2026-10-11 の module 無効の結果と **全 id で一致**した（15/22 = 68.2%。`COMPAT-4` の閾値 70% = 16/22 に 1 件足りない）。module 有効にしたことで他サイトが悪化した id はない。
+
+失敗の種別は次の固定の分類から選ぶ。(a) 取得 / (b) 上限 / (c) 評価（例外・`missing_api`・`module_compile_failed`・`module_evaluation_failed`・`module_unsupported`）/ (d) 評価は成功したが DOM に出ない。
+
+| id | サイト | module 無効（2026-10-11） | module 有効 | 判定 | 種別 | 根拠（プローブ） |
+| -- | ------ | ------------------------ | ----------- | ---- | ---- | ---------------- |
+| b5 | Trello（`h1`） | 失敗 `no_match` | 失敗 `no_match` | 未解消 | (a) 取得 | module 2 件は `src_fetch_failed`（`cross_origin`）。初期 HTML に `h1` が無く、実行後も 0 件 |
+| d2 | Saucedemo（`form`） | 失敗 `no_match` | 失敗 `no_match` | 未解消 | (c) 評価 | module 1 件（同一オリジンの `src`）は取得できたが `module evaluation failed`。inline 1 件は成功。実行後も `form` は 0 件 |
+| d3 | DemoQA（`form`） | 失敗 `no_match` | 失敗 `no_match` | 未解消 | (c) 評価 | script は module 1 件のみ（同一オリジンの `src`）。取得後に `module evaluation failed`。実行後も `form` は 0 件 |
+
+- b5: 設計 §2 の見込みのうち、実際に起きたのは **(a) の `cross_origin`** である。別オリジンの module は取得前に拒否されるため、`src` 1 MiB 上限（`JS-6`）には到達していない。上限は「別オリジン module を許可した場合に初めて顕在化する潜在要因」で、現時点では判断待ち（設計 §6 の案 (b)）。本件は失敗ではなく「未解消・理由あり」として扱う。ほかに classic の別オリジン `src` 1 件が `TypeError`（`read_property`。未定義の値のプロパティ読み取り）、inline 2 件が `non_scalar_result` で例外扱いだが、いずれも module とは別の経路
+- d2・d3: 取得・コンパイルまでは通り、**評価で失敗**する。エンジンの例外メッセージは固定文（`module evaluation failed`）で、例外の種類や不足 API は診断に出ない。このため **`JS-5`（DOM / Web API の shim 不足）の範囲か、module 側の未対応（import の解決・top-level await・`import.meta` 等）かは本測定では切り分けられていない**。動的 import は 3 件とも 0 件（`requested=0`）で、動的 import が原因ではない。推測を事実として書かない（`REPAIR-3`）
+- 実行上限: 3 件とも `abort` は無し。通し実行の固定診断行は 1 行（`status=aborted generation=22 abort=script_bytes`）で、前回と同じく 22 番目（e5）で、本件の対象外
+- 前回の推測「d2・d3 の解消には ES module の実行対応が前提になる」は、前提ではあるが十分ではなかった。module は実行対象になったが、評価失敗が次の壁である
+
+### 次の対応候補
+
+1. module 評価失敗の例外の分類名・不足 API 名を `ScriptOutcome` の診断へ出す（`ModuleEvaluationFailed` の理由を失わない。`REPAIR-4`・`JS-5`）。これで d2・d3 が `JS-5` の shim 不足か module 側の未対応かを切り分けられる
+2. 切り分け結果が shim 不足なら `JS-5` の shim 追加（対象 API は切り分け後に決める）
+3. b5 は別オリジン module の方針（設計 §6 の案 (b)）と `src` 上限の見直しが要る。いずれもオーナー判断を伴う（`SEC-2`・`JS-6`）
+4. d2・d3 の解消は #919（回帰ゲート）の条件。今回は満たしていない
+
+### 制約
+
+- 実施は単一環境（Linux）・単一時点。URL のクエリ・ページ本文・script 本文・生の例外メッセージは記録していない
+- `tasks.json`・セレクタ・UA・実行上限は変更していない。`matrix.json` はコミットしておらず、`core_results.jsonl` は上書きしていない
+
+### 再現手順（module 有効）
+
+```bash
+cargo build --release -p fandhe-browser-cli
+cargo build --release -p fandhe-browser-core --features js-v8 --example compat_page_script_probe
+# 22 タスク（--log は絶対パス・コミットしない）
+bash harness/compat-practical/run_core.sh --page-js v8 --page-modules --log /abs/path/run.log \
+  --out harness/compat-practical/results/core_results_modules.jsonl
+jq -s '[.[] | select(.type=="result" and .success==true)] | length' harness/compat-practical/results/core_results_modules.jsonl
+jq -c 'select(.type=="meta") | [.page_js_executed,.page_js_engine,.page_modules_executed]' harness/compat-practical/results/core_results_modules.jsonl
+# script 単位（d2・d3 は --selector form）
+target/release/examples/compat_page_script_probe --target b5=https://trello.com --modules --out /abs/path/b5.jsonl
+target/release/examples/compat_page_script_probe --target d2=https://www.saucedemo.com --modules --selector form --out /abs/path/d2.jsonl
+target/release/examples/compat_page_script_probe --target d3=https://demoqa.com/automation-practice-form --modules --selector form --out /abs/path/d3.jsonl
+```
 
 ## b5（Trello）の原因特定（#964）
 
