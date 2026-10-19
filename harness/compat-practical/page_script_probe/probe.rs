@@ -146,6 +146,7 @@ pub fn script_line(
                     .opt_s("error_kind", kind)
                     .s("message_class", e.message_class().as_str())
                     .opt_s("missing_api", e.identifier())
+                    .opt_s("property", e.property())
                     .s("exception_source", "module_evaluation")
                     .raw("truncated", truncated.to_string());
             }
@@ -156,6 +157,7 @@ pub fn script_line(
                 .opt_s("error_kind", c.error_kind.as_deref())
                 .s("message_class", c.message_class)
                 .opt_s("missing_api", c.missing_api.as_deref())
+                .opt_s("property", c.property.as_deref())
                 .raw("truncated", truncated.to_string());
         }
         ScriptOutcome::Skipped { kind, count } => {
@@ -386,6 +388,48 @@ mod tests {
             !line.contains("SECRET") && !line.contains("https"),
             "{line}"
         );
+    }
+
+    /// `JS-5`・`REPAIR-4`・Issue #1140: `property` は module 要約・classic の両経路で出し、
+    /// 検証外のキーは `null`、ラベルには入れず、URL・クエリは出さない。
+    #[test]
+    fn property_key_is_emitted_on_both_paths() {
+        let fixed = ScriptOutcome::Exception {
+            message: "module evaluation failed".to_string(),
+            truncated: false,
+        };
+        let sum = ExceptionSummary::from_engine_message(
+            "Uncaught TypeError: Cannot use 'in' operator to search for 'WebkitAnimation' in undefined (line 1)",
+        );
+        let line = script_line("d2", Some(1), Origin::Inline, &fixed, Some(&sum));
+        assert!(
+            line.contains(r#""message_class":"cannot_use_in_operator""#),
+            "{line}"
+        );
+        assert!(line.contains(r#""property":"WebkitAnimation""#), "{line}");
+        assert!(line.contains(r#""missing_api":null"#), "{line}");
+        assert_eq!(exception_label(&sum), "TypeError:cannot_use_in_operator");
+
+        let sum = ExceptionSummary::from_engine_message(
+            "Uncaught TypeError: Cannot use 'in' operator to search for 'https://h/p?token=SECRET' in undefined",
+        );
+        let line = script_line("d2", Some(2), Origin::Inline, &fixed, Some(&sum));
+        assert!(line.contains(r#""property":null"#), "{line}");
+        assert!(
+            !line.contains("SECRET") && !line.contains("https"),
+            "{line}"
+        );
+
+        let classic = ScriptOutcome::Exception {
+            message: "TypeError: Cannot set properties of undefined (setting 'x')".to_string(),
+            truncated: false,
+        };
+        let line = script_line("d3", Some(0), Origin::Inline, &classic, None);
+        assert!(
+            line.contains(r#""message_class":"cannot_set_properties""#),
+            "{line}"
+        );
+        assert!(line.contains(r#""property":"x""#), "{line}");
     }
 
     #[test]
