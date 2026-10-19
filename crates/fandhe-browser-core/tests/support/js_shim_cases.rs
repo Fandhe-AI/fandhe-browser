@@ -621,6 +621,38 @@ fn observer_cases(engine: &str) {
         "1,true,null",
     );
 
+    eprintln!("case: JS-5 removeAttribute of a missing attribute makes no record");
+    let mut p = setup(engine, None);
+    check(
+        &mut p,
+        "var n = 0; var el = document.getElementById('a'); \
+         var mo = new MutationObserver(function (r) { n += r.length; }); \
+         mo.observe(el, { attributes: true }); \
+         el.removeAttribute('data-none'); __fandheRunMicrotasks(); var none = n; \
+         el.setAttribute('data-x', '1'); el.removeAttribute('data-x'); __fandheRunMicrotasks(); \
+         none + ',' + n",
+        "0,2",
+    );
+
+    eprintln!("case: JS-5 false oldValue options and iterable attributeFilter");
+    let mut p = setup(engine, None);
+    check(
+        &mut p,
+        "var ok = true; var el = document.getElementById('a'); var mo = new MutationObserver(function () {}); \
+         try { mo.observe(el, { childList: true, attributes: false, attributeOldValue: false, characterData: false, characterDataOldValue: false }); } catch (e) { ok = false; } \
+         var thrown = false; \
+         try { mo.observe(el, { childList: true, attributes: false, attributeOldValue: true }); } catch (e) { thrown = e instanceof TypeError; } \
+         ok + ',' + thrown",
+        "true,true",
+    );
+    check(
+        &mut p,
+        "var got = []; var mo2 = new MutationObserver(function (r) { for (var i = 0; i < r.length; i++) got.push(r[i].attributeName); }); \
+         mo2.observe(el, { attributeFilter: new Set(['data-x']) }); \
+         el.setAttribute('data-y', '1'); el.setAttribute('data-x', '1'); __fandheRunMicrotasks(); got.join('|')",
+        "data-x",
+    );
+
     eprintln!("case: JS-5 characterData / textContent / innerHTML");
     let mut p = setup(engine, None);
     check(

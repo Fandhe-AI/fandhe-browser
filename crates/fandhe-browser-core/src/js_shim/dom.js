@@ -186,8 +186,10 @@
         writable: true,
         value: function removeAttribute(name) {
             var attr = String(name);
-            op('removeAttribute', idOf(this, 'removeAttribute'), attr);
-            notifyMutation('attributes', this, { attributeName: attr });
+            // 属性が無いときは DOM 仕様どおり変更なし（レコードを作らない）。bridge が削除有無を返す。
+            if (op('removeAttribute', idOf(this, 'removeAttribute'), attr) === true) {
+                notifyMutation('attributes', this, { attributeName: attr });
+            }
         }
     });
     define(Element.prototype, 'innerHTML', {

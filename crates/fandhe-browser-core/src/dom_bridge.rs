@@ -1189,8 +1189,9 @@ fn execute(
         DomOp::RemoveAttribute => {
             let element = page.node_arg(op, args, 1)?;
             let name = string_arg(op, args, 2, limits)?;
-            page.document.remove_attribute(element, name)?;
-            Ok(JsValue::Undefined)
+            // 実際に属性を削除した場合だけ true（shim が MutationObserver の通知要否に使う。JS-5・JS-7）。
+            let removed = page.document.remove_attribute(element, name)?;
+            Ok(JsValue::Bool(removed.is_some()))
         }
         DomOp::GetTextContent => {
             let node = page.node_arg(op, args, 1)?;

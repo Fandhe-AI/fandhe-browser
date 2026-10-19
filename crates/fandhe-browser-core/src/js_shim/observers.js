@@ -37,7 +37,7 @@
 // - shim を介さない変更（HTML パーサー・Rust 側の変更）の検出。
 // - NodeList 互換（addedNodes / removedNodes は素の Array）。
 // - 配信順序は「最初のレコードが積まれた順」で、DOM 仕様の observer 作成順ではない。
-// - `attributeFilter` は 64 要素までで、超過分は無視して診断に数える。名前の大文字小文字の正規化はしない。
+// - `attributeFilter` は配列・iterable（Set 等。iterator で読む）・array-like を受理し、64 要素までで、超過分は無視して診断に数える。名前の大文字小文字の正規化はしない。
 (function (global) {
     'use strict';
 
@@ -51,6 +51,7 @@
     var createObject = Object.create;
     var hasOwn = Function.prototype.call.bind(Object.prototype.hasOwnProperty);
     var toNumber = Number;
+    var symIterator = typeof Symbol === 'function' ? Symbol.iterator : undefined;
     var toStr = String;
     var wmGet = Function.prototype.call.bind(WeakMap.prototype.get);
     var wmSet = Function.prototype.call.bind(WeakMap.prototype.set);
@@ -274,27 +275,52 @@
         if (!opts.childList && !opts.attributes && !opts.characterData) {
             throw new TypeError("Failed to execute 'observe' on 'MutationObserver': The options object must set at least one of 'attributes', 'characterData', or 'childList' to true.");
         }
-        if (attributes !== undefined && !opts.attributes && (attributeOldValue !== undefined || filterArg !== undefined)) {
+        // 矛盾の判定は値の真偽で行う（`attributeOldValue: false` は有効な指定）。attributeFilter は存在で判定する。
+        if (attributes !== undefined && !opts.attributes && (attributeOldValue || filterArg !== undefined)) {
             throw new TypeError("Failed to execute 'observe' on 'MutationObserver': The options object may only set 'attributeOldValue' or 'attributeFilter' when 'attributes' is true or not present.");
         }
-        if (characterData !== undefined && !opts.characterData && characterDataOldValue !== undefined) {
+        if (characterData !== undefined && !opts.characterData && characterDataOldValue) {
             throw new TypeError("Failed to execute 'observe' on 'MutationObserver': The options object may only set 'characterDataOldValue' when 'characterData' is true or not present.");
         }
         if (filterArg !== undefined) {
             if (filterArg === null || typeof filterArg !== 'object') {
                 throw new TypeError("Failed to execute 'observe' on 'MutationObserver': The provided value cannot be converted to a sequence.");
             }
-            var len = toNumber(filterArg.length);
-            if (!(len >= 0)) {
-                len = 0;
-            }
-            var take = len < MAX_ATTRIBUTE_FILTER ? len : MAX_ATTRIBUTE_FILTER;
             var filter = createObject(null);
-            for (var i = 0; i < take; i++) {
-                filter[toStr(filterArg[i])] = true;
+            var overflow = false;
+            var iterFn = symIterator ? filterArg[symIterator] : undefined;
+            if (typeof iterFn === 'function') {
+                // Set 等の iterable は iterator で読む。上限 +1 件まで読んで超過を検出する（無限 iterator 対策）。
+                var it = fnCall(iterFn, filterArg);
+                var count = 0;
+                while (true) {
+                    var step = it.next();
+                    if (step.done) {
+                        break;
+                    }
+                    if (count >= MAX_ATTRIBUTE_FILTER) {
+                        overflow = true;
+                        if (typeof it['return'] === 'function') {
+                            it['return']();
+                        }
+                        break;
+                    }
+                    filter[toStr(step.value)] = true;
+                    count++;
+                }
+            } else {
+                var len = toNumber(filterArg.length);
+                if (!(len >= 0)) {
+                    len = 0;
+                }
+                var take = len < MAX_ATTRIBUTE_FILTER ? len : MAX_ATTRIBUTE_FILTER;
+                for (var i = 0; i < take; i++) {
+                    filter[toStr(filterArg[i])] = true;
+                }
+                overflow = len > MAX_ATTRIBUTE_FILTER;
             }
             opts.filter = filter;
-            if (len > MAX_ATTRIBUTE_FILTER) {
+            if (overflow) {
                 // 超過分はフィルターに入らない（通知対象外になる）ため、無視した件数として診断に出す。
                 ignored.count += 1;
             }
