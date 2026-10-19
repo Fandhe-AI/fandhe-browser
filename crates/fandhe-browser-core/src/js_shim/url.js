@@ -52,6 +52,8 @@
     var defineProperty = Object.defineProperty;
     var createObject = Object.create;
     var objectKeys = Object.keys;
+    var getOwnPropertySymbols = Object.getOwnPropertySymbols;
+    var propIsEnumerable = Function.prototype.call.bind(Object.prototype.propertyIsEnumerable);
     var strCtor = String;
     var fromCharCode = String.fromCharCode;
     var reTest = Function.prototype.call.bind(RegExp.prototype.test);
@@ -243,38 +245,35 @@
     // 区切りを逐次走査し、各項目を確保する前に件数・文字数の予算を検査する（JS-6）。
     function parseForm(s) {
         var list = [];
-        var b = { n: 0, c: 0 };
         var len = s.length;
-        var start = 0;
-        // 先に区切りだけを数え、件数・文字数が上限を超える入力は項目を確保する前に拒否する。
-        var pre = { n: 0, c: len };
-        var from = 0;
-        while (from <= len) {
-            var stop = sIndexOf(s, '&', from);
-            if (stop < 0) {
-                stop = len;
-            }
-            if (stop > from) {
-                chargeEntry(pre);
-            }
-            from = stop + 1;
-        }
         chargeChars({ n: 0, c: 0 }, len);
-        while (start <= len) {
-            var end = sIndexOf(s, '&', start);
-            if (end < 0) {
-                end = len;
+        // 項目を確保・復号する前に、charCodeAt の線形走査で空項目を除いた件数を数えて上限超過を拒否する。
+        // indexOf(…, 開始位置)・split・正規表現の全体走査は boa で入力長に対して二次時間になるため使わない。
+        var count = 0;
+        var inPiece = false;
+        for (var i = 0; i < len; i++) {
+            if (sCharCodeAt(s, i) === 38) {
+                inPiece = false;
+            } else if (!inPiece) {
+                inPiece = true;
+                count++;
+                if (count > MAX_ENTRIES) {
+                    throw new TypeError('URLSearchParams input exceeds the entry limit');
+                }
             }
-            if (end > start) {
-                chargeEntry(b);
-                chargeChars(b, end - start);
-                var piece = sSub(s, start, end);
-                var eq = sIndexOf(piece, '=');
-                var name = eq < 0 ? piece : sSub(piece, 0, eq);
-                var value = eq < 0 ? '' : sSub(piece, eq + 1);
-                arrPush(list, { n: formDecode(name), v: formDecode(value) });
+        }
+        var start = 0;
+        for (var j = 0; j <= len; j++) {
+            if (j === len || sCharCodeAt(s, j) === 38) {
+                if (j > start) {
+                    var piece = sSub(s, start, j);
+                    var eq = sIndexOf(piece, '=');
+                    var name = eq < 0 ? piece : sSub(piece, 0, eq);
+                    var value = eq < 0 ? '' : sSub(piece, eq + 1);
+                    arrPush(list, { n: formDecode(name), v: formDecode(value) });
+                }
+                start = j + 1;
             }
-            start = end + 1;
         }
         return list;
     }
@@ -641,6 +640,13 @@
                     arrPush(list, { n: pair[0], v: pair[1] });
                 });
             } else {
+                // 列挙可能な Symbol キーは Web IDL の record 変換で文字列化に失敗する（TypeError）。
+                var syms = getOwnPropertySymbols(init);
+                for (var si = 0; si < syms.length; si++) {
+                    if (propIsEnumerable(init, syms[si])) {
+                        throw new TypeError('Cannot convert a Symbol value to a string');
+                    }
+                }
                 var keys = objectKeys(init);
                 var seen = createObject(null);
                 if (keys.length > MAX_ENTRIES) {

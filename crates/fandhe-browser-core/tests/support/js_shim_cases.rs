@@ -1549,6 +1549,15 @@ fn url_cases(engine: &str) {
         "%EF%BF%BD=b&x=1",
     );
 
+    // JS-5: record 初期化の列挙可能な Symbol キーは TypeError、列挙不可の Symbol キーは無視する。
+    check(
+        &mut p,
+        "var sy = 'x'; try { new URLSearchParams({ [Symbol('key')]: 'v' }) } catch (e) { sy = e instanceof TypeError } \
+         var hid = {}; Object.defineProperty(hid, Symbol('h'), { value: 1, enumerable: false }); hid.a = 'b'; \
+         sy + '|' + new URLSearchParams(hid).toString()",
+        "true|a=b",
+    );
+
     eprintln!("case: REPAIR-3 unimplemented setters throw in strict mode and do not change state");
     check(
         &mut p,
