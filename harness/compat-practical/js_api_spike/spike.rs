@@ -624,6 +624,39 @@ mod tests {
             "read_property",
             None,
         );
+        // Issue #1140: `in` 演算子・プロパティ設定の分類と検証済みプロパティ名。
+        let c = classify(
+            "Uncaught TypeError: Cannot use 'in' operator to search for 'WebkitAnimation' in undefined (line 1)",
+        );
+        want(
+            Classification {
+                property: None,
+                ..c
+            },
+            Some("TypeError"),
+            "cannot_use_in_operator",
+            None,
+        );
+        assert_eq!(
+            classify("TypeError: Cannot use 'in' operator to search for 'WebkitAnimation' in null")
+                .property
+                .as_deref(),
+            Some("WebkitAnimation")
+        );
+        assert_eq!(
+            classify("TypeError: Cannot use 'in' operator to search for '-webkit-x' in null")
+                .property,
+            None
+        );
+        want(
+            classify("right-hand side of 'in' should be an object, got `undefined`"),
+            Some("TypeError"),
+            "cannot_use_in_operator",
+            None,
+        );
+        let c = classify("TypeError: Cannot set properties of undefined (setting 'x')");
+        assert_eq!(c.message_class, "cannot_set_properties");
+        assert_eq!(c.property.as_deref(), Some("x"));
         let ns = classify("evaluation result of type 'object' is not representable as JsValue");
         assert!(ns.non_scalar_result);
         for bad in [

@@ -189,7 +189,7 @@ spec 対応: TASK-71・TASK-108 / MS-6 / `COMPAT-1`・`JS-5`・`JS-6`・`JS-7`�
 ### 次の対応
 
 1. （済み: #1141。下の節を参照）要素の `style`（最小の `CSSStyleDeclaration` 相当）の shim が要るかを調べる。`JS-5` の別 issue として扱い、追加後に d2・d3 を同じ手順で再測定して、その次の不足 API を洗い出す。起票は本 PR では行わない
-2. 分類語彙の拡張を先に検討する: `TypeError` の `other` のうち「`in` 演算子の右辺が `undefined`」「`undefined` への代入」のように、不足 API の手掛かりになる形を `message_class` に足す（`REPAIR-4`）。今回はこの分類が無いため `missing_api` が付かなかった
+2. （済み: #1140 で対応。下の節を参照）分類語彙の拡張を先に検討する: `TypeError` の `other` のうち「`in` 演算子の右辺が `undefined`」「`undefined` への代入」のように、不足 API の手掛かりになる形を `message_class` に足す（`REPAIR-4`）。今回はこの分類が無いため `missing_api` が付かなかった
 3. #919（回帰ゲート）の条件（d2・d3 の解消）は、今回も満たしていない。#919 には解消していないためコメントしていない
 
 ### 制約
@@ -205,6 +205,44 @@ target/release/examples/compat_page_script_probe --target d2=https://www.saucede
 target/release/examples/compat_page_script_probe --target d3=https://demoqa.com/automation-practice-form --modules --selector form --out /abs/path/d3.jsonl
 jq -c 'select(.type=="script")' /abs/path/d2.jsonl /abs/path/d3.jsonl
 ```
+
+## TypeError の分類語彙の拡張後の再測定（#1140）
+
+spec 対応: TASK-71・TASK-108 / MS-6 / `COMPAT-1`・`JS-5`・`MEAS-4`・`REPAIR-3`・`REPAIR-4`。
+前節（#1138）の「次の対応 2」を実装した。`message_class` に `cannot_use_in_operator`・`cannot_set_properties` を足し、検証済みのプロパティ名を `property` として出す（`missing_api` とは別。不足 API 名ではない）。d2・d3 を `page_script_probe --modules` で再測定した。出力はコミットしていない。
+
+### 測定条件
+
+| 項目 | 値 |
+| ---- | -- |
+| 実施日時（UTC） | 2026-10-19T04:37Z 前後 |
+| OS | Linux |
+| ベース | main `a8c0ddce` に、分類語彙を拡張する変更（本 PR）を加えたもの |
+| バイナリ | `cargo build --release -p fandhe-browser-core --features js-v8 --example compat_page_script_probe` |
+| 設定 | `--modules`・V8・`--selector form`。実行上限は既定のまま |
+
+### 結果
+
+| id | サイト | script | outcome | `error_kind` | `message_class` | `missing_api` | `property` | `form`（実行後） | 判定 |
+| -- | ------ | ------ | ------- | ------------ | --------------- | ------------- | ---------- | ---------------- | ---- |
+| d2 | Saucedemo | index 1（module・同一オリジン `src`） | exception | `TypeError` | `cannot_use_in_operator` | なし | `WebkitAnimation` | 0 件 | 未解消（分類のみ） |
+| d3 | DemoQA | index 0（module・同一オリジン `src`） | exception | `TypeError` | `cannot_use_in_operator` | なし | `WebkitAnimation` | 0 件 | 未解消（分類のみ） |
+
+- 確認できた事実: 2 件とも `in` 演算子の右辺が `undefined` か `null` の `TypeError` で、調べられたキーは `WebkitAnimation`。動的 import は 0 件、`evaluation_errors` は空、abort は無し
+- 推測（未検証）: 要素の `style`（`CSSStyleDeclaration`）が未提供で、CSS のアニメーション機能検出が未定義値を引いている。script 本文は読んでおらず、右辺の値は診断に出さないため、右辺が `undefined` か `null` かも区別していない（`REPAIR-3`）
+- 今回は診断の拡張だけで、実行の挙動は変えていない。そのため d2・d3 は解消しておらず、#919 にはコメントしていない
+
+### 次の対応
+
+1. 要素の `style`（最小の `CSSStyleDeclaration` 相当）の shim を別 issue で扱う。追加後に d2・d3 を同じ手順で再測定し、その次の不足 API を洗い出す。起票は本 PR では行わない
+2. `Cannot convert undefined or null to object` は分類していない（`other` のまま）。よく出るようなら語彙に足す
+3. #919（回帰ゲート）の条件（d2・d3 の解消）は満たしていない
+
+### 制約
+
+- 単一環境（Linux）・単一時点。URL のクエリ・ページ本文・script 本文・生の例外メッセージは記録していない
+- boa は `in` の分類のみ取れ、キー名は取れない（メッセージに含まれない）。`cannot_set_properties` に当たる boa の文言は無く `other` のまま
+- 判定は最初の例外で止まる測定に基づく。後続の不足 API は未確認
 
 ## style shim 追加後の再測定（#1141）
 
