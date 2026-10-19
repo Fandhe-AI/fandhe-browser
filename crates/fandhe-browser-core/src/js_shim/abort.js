@@ -345,7 +345,7 @@
                     continue;
                 }
                 try {
-                    snapshot[i](st.reason);
+                    fnCall(snapshot[i], undefined, st.reason);
                 } catch (e) {
                     reportLater(e);
                 }

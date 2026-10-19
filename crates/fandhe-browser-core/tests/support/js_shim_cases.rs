@@ -1925,4 +1925,17 @@ fn abort_cases(engine: &str) {
          [bad12, closed12].join('|')",
         "true|1",
     );
+
+    eprintln!("case: JS-4 followed algorithm does not receive the internal container as this");
+    check(
+        &mut p,
+        "var c13 = new AbortController(); var seen13 = 'none'; \
+         __fandheAbortFollow(c13.signal, function () { \
+           seen13 = String(this !== null && this !== undefined && (Object.prototype.hasOwnProperty.call(this, 0) || Object.prototype.hasOwnProperty.call(this, 1))); \
+           try { delete this[1]; } catch (e) {} \
+         }); \
+         var s13 = AbortSignal.any([c13.signal]); c13.abort('z'); \
+         [seen13, s13.aborted, s13.reason].join('|')",
+        "false|true|z",
+    );
 }

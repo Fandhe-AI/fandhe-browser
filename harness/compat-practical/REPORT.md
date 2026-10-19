@@ -497,7 +497,7 @@ spec 対応: TASK-71・TASK-108・TASK-111 / MS-6 / `COMPAT-1`・`JS-5`・`JS-6`
 
 ### 次の対応
 
-1. d2: `port` を読む対象の特定（`--debug-raw-exception` で端末のみに出して確かめる）。`location.port` なら `window.js` の `location` の構成要素の不足の可能性がある。起票はしていない
+1. d2: `port` を読む対象の特定（`--debug-raw-exception` で端末のみに出して確かめる）。`location.port` なら `window.js` の `location` の構成要素の不足の可能性がある。追跡: #1158
 2. d3: タイマー callback の例外の分類（#1156）
 
 ### 制約
