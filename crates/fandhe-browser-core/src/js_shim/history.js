@@ -14,8 +14,9 @@
 // - pushState / replaceState: 失敗時に状態を変えない順序（直列化と上限検査 → URL op → 反映）。
 //   別オリジン等は SecurityError（DOMException）。URL の省略 / null は state（と length）だけ更新する。
 //   メソッドは writable・configurable で、`history.pushState = wrapper` の包み直しができる。
-// - state は構造化複製の代わりに JSON の往復で複製し、直列化後 2 MiB（UTF-16 code unit）を上限にする
-//   （JS-6。無制限確保の防止）。超過・直列化失敗は DataCloneError。保持するのは現在の 1 件だけで、
+// - state は構造化複製の代わりに予算付きの再帰複製で複製し、累計 2 MiB（UTF-16 code unit）・
+//   10 万ノード・深さ 100 を確保前に検査して上限にする（JS-6。共有参照による指数展開も打ち切る）。
+//   超過・複製不能は DataCloneError。保持するのは現在の 1 件だけで、
 //   `history.state` は毎回同じオブジェクトを返す。
 // - length は 1 から始まり pushState のたびに増える。上限 50（一般的な値で本実装に固有にしない）で止め、
 //   上限後の pushState も成功する。replaceState では増やさない。
@@ -26,8 +27,8 @@
 // - back / forward / go によるページ内履歴の移動と popstate の配送。URL と state は動かさず、
 //   `ignoreLocationChange` op で診断に記録するだけ（SPA のルーターの状態と URL を食い違わせないため）。
 //   将来仕様: 汎用の EventTarget / dispatchEvent を足したうえで履歴の範囲で移動する（JS-5）。
-// - 構造化複製の完全な実装。JSON の往復のため Date・Map・Blob 等は保持されず、undefined / 関数の
-//   プロパティは落ち、toJSON が呼ばれる。
+// - 構造化複製の完全な実装。Date・Map・Blob 等は保持されず（own enumerable プロパティだけの素の
+//   オブジェクトになる）、関数・symbol・bigint は DataCloneError。循環参照は深さ上限で DataCloneError。
 // - about:blank（opaque origin）での URL 付き pushState / replaceState は常に SecurityError。
 // - hashchange の配送、履歴のプロファイルへの永続化（実行ごとに空から始まる）。
 (function (global) {
@@ -45,13 +46,15 @@
     var NativeTypeError = TypeError;
     var defineProperty = Object.defineProperty;
     var strCtor = String;
-    var jsonStringify = JSON.stringify;
-    var jsonParse = JSON.parse;
+    var isArray = Array.isArray;
+    var objectKeys = Object.keys;
     var WeakMapCtor = WeakMap;
     var wmGet = Function.prototype.call.bind(WeakMap.prototype.get);
     var wmSet = Function.prototype.call.bind(WeakMap.prototype.set);
 
     var MAX_STATE_UNITS = 2 * 1024 * 1024;
+    var MAX_STATE_NODES = 100000;
+    var MAX_STATE_DEPTH = 100;
     var MAX_LENGTH = 50;
 
     var states = new WeakMapCtor();
@@ -84,24 +87,84 @@
         }
     }
 
-    // state を JSON の往復で複製する。undefined / null はそのまま保持する。失敗は DataCloneError。
+    // state を予算付きの再帰複製で複製する（独自の簡易な構造化複製）。
+    // 確保前に走査件数・深さ・累計サイズ（UTF-16 code unit。数値・真偽値は固定 8）を検査し、超えたら
+    // 即座に打ち切る。共有参照や循環による指数的な展開・無限再帰も、件数・深さの上限で止まる。
+    // 関数・symbol・bigint は複製できず、失敗はすべて DataCloneError。
     function cloneState(data, name) {
         if (data === undefined || data === null) {
             return data;
         }
-        var text;
+        var budget = { nodes: 0, units: 0 };
         try {
-            text = jsonStringify(data);
+            return cloneValue(data, 0, budget);
         } catch (e) {
-            text = undefined;
-        }
-        if (typeof text !== 'string' || text.length > MAX_STATE_UNITS) {
+            // 予算超過・複製不能・getter の例外・スタック枯渇はすべて固定文の DataCloneError にする。
             throw new NativeDOMException(
                 "Failed to execute '" + name + "' on 'History': the state could not be cloned.",
                 'DataCloneError'
             );
         }
-        return jsonParse(text);
+    }
+
+    function cloneValue(v, depth, budget) {
+        var t = typeof v;
+        if (v === null || t === 'undefined') {
+            return v;
+        }
+        if (t === 'string') {
+            budget.units += v.length;
+            if (budget.units > MAX_STATE_UNITS) {
+                throw 0;
+            }
+            return v;
+        }
+        if (t === 'number' || t === 'boolean') {
+            budget.units += 8;
+            if (budget.units > MAX_STATE_UNITS) {
+                throw 0;
+            }
+            return v;
+        }
+        if (t !== 'object' || depth >= MAX_STATE_DEPTH) {
+            throw 0;
+        }
+        budget.nodes++;
+        if (budget.nodes > MAX_STATE_NODES) {
+            throw 0;
+        }
+        var i;
+        var out;
+        if (isArray(v)) {
+            var n = v.length;
+            // 配列の長さは確保前に件数予算と照合する（疎な巨大配列で確保しない）。
+            if (n > MAX_STATE_NODES - budget.nodes) {
+                throw 0;
+            }
+            out = [];
+            for (i = 0; i < n; i++) {
+                out.push(cloneValue(v[i], depth + 1, budget));
+            }
+            return out;
+        }
+        var keys = objectKeys(v);
+        if (keys.length > MAX_STATE_NODES - budget.nodes) {
+            throw 0;
+        }
+        out = {};
+        for (i = 0; i < keys.length; i++) {
+            budget.units += keys[i].length;
+            if (budget.units > MAX_STATE_UNITS) {
+                throw 0;
+            }
+            defineProperty(out, keys[i], {
+                value: cloneValue(v[keys[i]], depth + 1, budget),
+                writable: true,
+                configurable: true,
+                enumerable: true
+            });
+        }
+        return out;
     }
 
     function update(self, args, name, isPush) {
@@ -113,7 +176,9 @@
             if (typeof url === 'symbol') {
                 throw new NativeTypeError('Cannot convert a Symbol value to a string');
             }
-            if (callOp('historySetUrl', strCtor(url)) !== true) {
+            var urlText = strCtor(url);
+            // 空文字列は現在の URL を保持する（解決するとフラグメントが落ちるため op を呼ばない）。
+            if (urlText !== '' && callOp('historySetUrl', urlText) !== true) {
                 throw new NativeDOMException(
                     "Failed to execute '" + name + "' on 'History': the URL cannot be used.",
                     'SecurityError'

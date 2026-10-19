@@ -2299,6 +2299,19 @@ fn history_cases(engine: &str) {
         "history.replaceState('x'.repeat(2 * 1024 * 1024 - 2), ''); history.state.length",
         "2097150",
     );
+    // 共有参照グラフ（27 段の [a, a]）は予算で拒否され、状態は変わらない。
+    check(
+        &mut p,
+        "history.replaceState({keep: 7}, ''); var a = 'x'; for (var i = 0; i < 27; i++) { a = [a, a]; } \
+         var r; try { history.pushState(a, ''); r = 'no-throw'; } catch (e) { r = e.name; } r + '|' + history.state.keep",
+        "DataCloneError|7",
+    );
+    // 空文字列の URL 引数は現在の URL（フラグメント含む）を保持する。
+    check(
+        &mut p,
+        "history.replaceState({}, '', '#route'); history.replaceState({}, '', ''); history.pushState({}, '', ''); location.hash",
+        "#route",
+    );
 
     eprintln!("case: JS-5 history methods can be wrapped (Backtrace SDK pattern)");
     check(
