@@ -19,7 +19,7 @@
 //   直列化が path・userinfo・query で `#` を、path・userinfo で `?` をエンコードするため。
 //   `search` の値に含まれる `#` は `%23` に置き換えてから再解析する（WHATWG の state override と同じ結果）。
 // - `searchParams` は URL ごとに同じオブジェクトを返し、変更系メソッドの後に URL の query を再解析で
-//   更新する（直列化結果が空なら `?` ごと消す）。逆に `href` / `search` の setter は中身を作り直す。
+//   更新する（直列化結果が空なら `?` ごと消す）。再解析に失敗したら一覧も URL も変えず TypeError で拒否する。逆に `href` / `search` の setter は中身を作り直す。
 // - form-urlencoded は `decodeURIComponent` / `encodeURIComponent` / `TextDecoder` を使わず、UTF-8 を
 //   手書きで符号化・復号する（不正な `%` はそのまま残し、不正な UTF-8 と孤立サロゲートは U+FFFD にする）。
 //   解析は線形走査で正規表現のバックトラッキングも eval も使わない。
@@ -259,6 +259,51 @@
         return sCharAt(s, 0) === ch ? sSub(s, 1) : s;
     }
 
+    // USVString への変換（孤立サロゲートを U+FFFD に置き換える）。名前・値の保存と検索の前に必ず通す。
+    function usv(value) {
+        var s = toStr(value);
+        var out = '';
+        var n = s.length;
+        var i = 0;
+        while (i < n) {
+            var cp = codePointAt(s, i);
+            if (cp > 0xFFFF) {
+                out += sSub(s, i, i + 2);
+                i += 2;
+            } else {
+                out += cp === 0xFFFD ? fromCharCode(0xFFFD) : sCharAt(s, i);
+                i++;
+            }
+        }
+        return out;
+    }
+
+    // search / hash の値を再解析用に符号化する。URL 全体の解析は先頭・末尾の空白と C0 制御文字を
+    // 削るため、値の末尾が失われないよう空白と C0 制御文字を先に `%XX` にする（tab・LF・CR は
+    // WHATWG の解析と同じく取り除く）。
+    function encodeTail(s) {
+        var out = '';
+        for (var i = 0; i < s.length; i++) {
+            var c = sCharCodeAt(s, i);
+            if (c === 9 || c === 10 || c === 13) {
+                continue;
+            }
+            if (c <= 0x20) {
+                out += '%' + sCharAt(HEX, c >> 4) + sCharAt(HEX, c & 15);
+            } else {
+                out += sCharAt(s, i);
+            }
+        }
+        return out;
+    }
+
+    function requireArgs(given, needed) {
+        if (given < needed) {
+            throw new TypeError(needed + ' argument' + (needed === 1 ? '' : 's') +
+                ' required, but only ' + given + ' present.');
+        }
+    }
+
     // --- urlParse op の呼び出し ---
     // 成功は 11 要素の配列、失敗（構文エラー・op の例外）は null。
     function parseComponents(input, base) {
@@ -360,19 +405,21 @@
         },
         search: function (value) {
             var st = requireUrl(this);
-            var v = stripFirst(toStr(value), '?');
+            var raw = toStr(value);
             var p = splitHref(st.c[IDX_HREF]);
-            var query = v === '' ? '' : '?' + arrJoin(sSplit(v, '#'), '%23');
+            // 空文字の代入だけが query の削除。'?' は空の query として残す。
+            var query = raw === '' ? '' : '?' + arrJoin(sSplit(encodeTail(stripFirst(raw, '?')), '#'), '%23');
             // 失敗したら変更しない（setter は投げない）。
             reparse(st, p.head + query + p.frag);
         },
         hash: function (value) {
             var st = requireUrl(this);
-            var v = stripFirst(toStr(value), '#');
+            var raw = toStr(value);
+            var v = encodeTail(stripFirst(raw, '#'));
             var href = st.c[IDX_HREF];
             var h = sIndexOf(href, '#');
             var head = h < 0 ? href : sSub(href, 0, h);
-            reparse(st, v === '' ? head : head + '#' + v);
+            reparse(st, raw === '' ? head : head + '#' + v);
         }
     };
     for (var ni = 0; ni < NAMES.length; ni++) {
@@ -425,7 +472,7 @@
             throw new TypeError("Failed to construct 'URLSearchParams': Please use the 'new' operator");
         }
         var list = [];
-        if (init === undefined) {
+        if (init === undefined || init === null) {
             // 空。
         } else if (isObjectLike(init)) {
             if (typeof init[symIter] === 'function') {
@@ -435,7 +482,7 @@
                     }
                     var pair = [];
                     iterate(item, function (x) {
-                        arrPush(pair, toStr(x));
+                        arrPush(pair, usv(x));
                     });
                     if (pair.length !== 2) {
                         throw new TypeError('Each URLSearchParams pair must have exactly two elements');
@@ -445,48 +492,63 @@
             } else {
                 var keys = objectKeys(init);
                 for (var i = 0; i < keys.length; i++) {
-                    arrPush(list, { n: keys[i], v: toStr(init[keys[i]]) });
+                    arrPush(list, { n: usv(keys[i]), v: usv(init[keys[i]]) });
                 }
             }
         } else {
-            list = parseForm(stripFirst(toStr(init), '?'));
+            list = parseForm(stripFirst(usv(init), '?'));
         }
         wmSet(spStates, this, { list: list, url: null });
     }
 
-    // 変更系メソッドの後で、紐づく URL の query を再解析で更新する（失敗したら URL を変えない）。
-    function syncUrl(sp) {
-        var st = sp.url;
-        if (!st) {
-            return;
+    function copyList(list) {
+        var out = [];
+        for (var i = 0; i < list.length; i++) {
+            arrPush(out, { n: list[i].n, v: list[i].v });
         }
-        var ser = serializeForm(sp.list);
-        var p = splitHref(st.c[IDX_HREF]);
-        var comps = parseComponents(p.head + (ser === '' ? '' : '?' + ser) + p.frag, undefined);
-        if (comps !== null) {
+        return out;
+    }
+
+    // 変更後の候補一覧を確定する。紐づく URL があれば先に href への反映を検証し、成功したときだけ
+    // 一覧と URL の両方を更新する。失敗（上限超過など）は一覧も URL も変えずに TypeError で拒否する。
+    function commit(sp, next) {
+        var st = sp.url;
+        if (st) {
+            var ser = serializeForm(next);
+            var p = splitHref(st.c[IDX_HREF]);
+            var comps = parseComponents(p.head + (ser === '' ? '' : '?' + ser) + p.frag, undefined);
+            if (comps === null) {
+                throw new TypeError('Invalid URL');
+            }
             st.c = comps;
         }
+        sp.list = next;
     }
 
     var SP = URLSearchParams.prototype;
     defMethod(SP, 'append', function (name, value) {
+        requireArgs(arguments.length, 2);
         var sp = requireSp(this);
-        arrPush(sp.list, { n: toStr(name), v: toStr(value) });
-        syncUrl(sp);
+        var next = copyList(sp.list);
+        arrPush(next, { n: usv(name), v: usv(value) });
+        commit(sp, next);
     });
     defMethod(SP, 'delete', function (name) {
+        requireArgs(arguments.length, 1);
         var sp = requireSp(this);
-        var key = toStr(name);
-        for (var i = sp.list.length - 1; i >= 0; i--) {
-            if (sp.list[i].n === key) {
-                arrSplice(sp.list, i, 1);
+        var key = usv(name);
+        var next = [];
+        for (var i = 0; i < sp.list.length; i++) {
+            if (sp.list[i].n !== key) {
+                arrPush(next, { n: sp.list[i].n, v: sp.list[i].v });
             }
         }
-        syncUrl(sp);
+        commit(sp, next);
     });
     defMethod(SP, 'get', function (name) {
+        requireArgs(arguments.length, 1);
         var sp = requireSp(this);
-        var key = toStr(name);
+        var key = usv(name);
         for (var i = 0; i < sp.list.length; i++) {
             if (sp.list[i].n === key) {
                 return sp.list[i].v;
@@ -495,8 +557,9 @@
         return null;
     });
     defMethod(SP, 'getAll', function (name) {
+        requireArgs(arguments.length, 1);
         var sp = requireSp(this);
-        var key = toStr(name);
+        var key = usv(name);
         var out = [];
         for (var i = 0; i < sp.list.length; i++) {
             if (sp.list[i].n === key) {
@@ -506,8 +569,9 @@
         return out;
     });
     defMethod(SP, 'has', function (name) {
+        requireArgs(arguments.length, 1);
         var sp = requireSp(this);
-        var key = toStr(name);
+        var key = usv(name);
         for (var i = 0; i < sp.list.length; i++) {
             if (sp.list[i].n === key) {
                 return true;
@@ -516,30 +580,25 @@
         return false;
     });
     defMethod(SP, 'set', function (name, value) {
+        requireArgs(arguments.length, 2);
         var sp = requireSp(this);
-        var key = toStr(name);
-        var val = toStr(value);
-        var first = -1;
+        var key = usv(name);
+        var val = usv(value);
+        var next = [];
+        var done = false;
         for (var i = 0; i < sp.list.length; i++) {
-            if (sp.list[i].n === key) {
-                first = i;
-                break;
+            var e = sp.list[i];
+            if (e.n !== key) {
+                arrPush(next, { n: e.n, v: e.v });
+            } else if (!done) {
+                arrPush(next, { n: key, v: val });
+                done = true;
             }
         }
-        if (first < 0) {
-            arrPush(sp.list, { n: key, v: val });
-        } else {
-            sp.list[first].v = val;
-            var j = first + 1;
-            while (j < sp.list.length) {
-                if (sp.list[j].n === key) {
-                    arrSplice(sp.list, j, 1);
-                } else {
-                    j++;
-                }
-            }
+        if (!done) {
+            arrPush(next, { n: key, v: val });
         }
-        syncUrl(sp);
+        commit(sp, next);
     });
     defMethod(SP, 'toString', function () {
         return serializeForm(requireSp(this).list);

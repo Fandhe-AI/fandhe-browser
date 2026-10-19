@@ -1408,6 +1408,43 @@ fn url_cases(engine: &str) {
         "http://a/?z=1",
     );
 
+    eprintln!(
+        "case: JS-5 review fixes (empty-vs-delimiter, trailing space, null, USVString, arity, sync failure)"
+    );
+    check(
+        &mut p,
+        "var r1 = new URL('https://a/p'); r1.search = '?'; r1.hash = '#'; r1.href",
+        "https://a/p?#",
+    );
+    check(
+        &mut p,
+        "var r2 = new URL('https://a/p'); r2.hash = 'a '; r2.search = 'b '; r2.href",
+        "https://a/p?b%20#a%20",
+    );
+    check(&mut p, "new URLSearchParams(null).toString()", "");
+    check(
+        &mut p,
+        "var r3 = new URLSearchParams(); r3.append('\\ud800', 'x'); r3.get('\\ufffd') + '|' + r3.has('\\ud800')",
+        "x|true",
+    );
+    check(
+        &mut p,
+        "try { new URLSearchParams().append('x'); 'no' } catch (e) { e instanceof TypeError }",
+        "true",
+    );
+    check(
+        &mut p,
+        "try { new URLSearchParams().get(); 'no' } catch (e) { e instanceof TypeError }",
+        "true",
+    );
+    check(
+        &mut p,
+        "var r4 = new URL('https://a/'); var big = new Array(70001).join('a'); \
+         var thrown = false; try { r4.searchParams.set('k', big); } catch (e) { thrown = e instanceof TypeError; } \
+         thrown + '|' + r4.searchParams.has('k') + '|' + r4.href",
+        "true|false|https://a/",
+    );
+
     eprintln!("case: REPAIR-3 unimplemented setters throw in strict mode and do not change state");
     check(
         &mut p,
