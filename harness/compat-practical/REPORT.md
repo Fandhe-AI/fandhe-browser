@@ -392,7 +392,7 @@ spec 対応: TASK-71・TASK-108 / MS-6 / `COMPAT-1`・`JS-5`・`JS-6`・`MEAS-4`
 
 - 単一環境（Linux）・単一時点。URL のクエリ・ページ本文・script 本文・生の例外メッセージは記録していない
 - 判定は最初の例外で止まる測定に基づく。後続の不足 API は未確認
-- 未実装: `protocol` / `username` / `password` / `host` / `hostname` / `port` / `pathname` の setter（getter だけ。strict モードの代入は `TypeError`）、`URL.createObjectURL` / `revokeObjectURL`・`URLPattern`（定義しない）、`URLSearchParams` の `sort` / `size` / 値指定の `has` / `delete`、op の文字列上限（64 KiB）を超える URL（失敗として扱う）（`REPAIR-3`）
+- 未実装: `protocol` / `username` / `password` / `host` / `hostname` / `port` / `pathname` の setter（getter だけ。strict モードの代入は `TypeError`）、`URL.createObjectURL` / `revokeObjectURL`・`URLPattern`（定義しない）、`URLSearchParams` の `sort` / `size`、op の文字列上限（64 KiB）を超える URL（失敗として扱う）（`REPAIR-3`）
 
 ### 再現手順
 
