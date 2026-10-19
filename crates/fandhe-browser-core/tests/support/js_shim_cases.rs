@@ -1015,6 +1015,79 @@ fn style_cases(engine: &str) {
     );
     check(&mut p, "names.length > 100", "true");
 
+    eprintln!("case: JS-5 style model is committed only after the attribute write succeeds");
+    let mut p = setup(engine, None);
+    check(
+        &mut p,
+        "var d = document.createElement('div'); document.body.appendChild(d); var s = d.style; var big = ''; \
+         for (var i = 0; i < 4096; i++) big += '\\u3042'; \
+         var thrown = 0; \
+         for (var k = 0; k < 6; k++) { try { s.setProperty('--v' + k, big); } catch (e) { thrown++; } } \
+         thrown + '|' + s.length + '|' + (s.getPropertyValue('--v5') === '')",
+        "1|5|true",
+    );
+    let html = p.html();
+    assert!(
+        html.contains("--v4:") && !html.contains("--v5:"),
+        "attribute must match model"
+    );
+    check(
+        &mut p,
+        "var before = s.cssText; var t2 = 0; \
+         try { s.cssText = '--a: ' + big + '; --b: ' + big + '; --c: ' + big + '; \
+                --d: ' + big + '; --e: ' + big + '; --f: ' + big; } catch (e) { t2++; } \
+         t2 + '|' + (s.cssText === before)",
+        "1|true",
+    );
+    check(&mut p, "s.removeProperty('--v0'); s.length", "4");
+    let html = p.html();
+    assert!(
+        !html.contains("--v0:") && html.contains("--v1:"),
+        "attribute must match model"
+    );
+
+    eprintln!("case: JS-5 style setAttribute / removeAttribute stringify arguments once");
+    let mut p = setup(engine, None);
+    check(
+        &mut p,
+        "var d = document.createElement('div'); document.body.appendChild(d); var n = 0; \
+         var v = { toString: function () { n++; return n === 1 ? 'color: red' : 'color: blue'; } }; \
+         d.setAttribute('style', v); d.style.color + '|' + n",
+        "red|1",
+    );
+    assert!(
+        p.html().contains("color: red"),
+        "attribute must hold the first stringification"
+    );
+    check(
+        &mut p,
+        "var m = 0; var nm = { toString: function () { m++; return m === 1 ? 'style' : 'x'; } }; \
+         d.removeAttribute(nm); d.style.length + '|' + m",
+        "0|1",
+    );
+
+    eprintln!(
+        "case: JS-5 style cssText keeps an earlier !important against a later normal declaration"
+    );
+    let mut p = setup(engine, None);
+    check(
+        &mut p,
+        "var d = document.createElement('div'); var s = d.style; \
+         s.cssText = 'color: red !important; color: blue'; \
+         s.color + '|' + s.getPropertyPriority('color') + '|' + s.cssText",
+        "red|important|color: red !important;",
+    );
+    check(
+        &mut p,
+        "s.cssText = 'color: red !important; color: blue !important'; s.color",
+        "blue",
+    );
+    check(
+        &mut p,
+        "s.cssText = 'color: red !important'; s.setProperty('color', 'green'); s.color + '|' + s.getPropertyPriority('color')",
+        "green|",
+    );
+
     eprintln!("case: JS-5 style survives shim re-install without double wrapping");
     let mut p = setup(engine, None);
     p.rt.install_dom_shim(&p.bridge).expect("reinstall shim");

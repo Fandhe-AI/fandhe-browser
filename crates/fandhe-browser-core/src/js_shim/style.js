@@ -14,6 +14,9 @@
 // - 宣言は要素ごとの順序付きリスト（添字演算と null プロトタイプのコンテナ。配列メソッドは使わない）で持つ。
 //   宣言が変わるたびに `style` 属性へ `name: value;`（important は `name: value !important;`）を
 //   空白 1 つで連結して書く。1 回の変更につき bridge op は 1 回（ページの op 上限に従う）。
+// - 変更は候補モデルを作り、`style` 属性への書き込みが成功してから確定する（DOM が書き込みを
+//   拒否して例外になっても、読み取りと実属性が食い違わない）。
+// - cssText の宣言リストでは、先の `!important` を後続の通常宣言で上書きしない（`setProperty` は明示更新）。
 // - cssText の解析は引用符・括弧の内側を追跡する線形走査で、正規表現のバックトラッキングも
 //   eval も使わない。不正な断片は捨てる。単一プロパティへの代入では、トップレベルに `;` `{` `}` を
 //   含む値を無視し、別の宣言を紛れ込ませない。
@@ -159,6 +162,20 @@
         return true;
     }
 
+    // 候補モデル用の複製（属性への書き込みが成功してから確定するため。上限により小さい）。
+    function cloneModel(model) {
+        var copy = newModel();
+        for (var i = 0; i < model.n; i++) {
+            var name = model.names[i];
+            copy.names[i] = name;
+            copy.values[name] = model.values[name];
+            copy.prios[name] = model.prios[name];
+        }
+        copy.n = model.n;
+        copy.size = model.size;
+        return copy;
+    }
+
     function serialize(model) {
         var out = '';
         for (var i = 0; i < model.n; i++) {
@@ -229,6 +246,10 @@
         if (split.value === '' || !valueIsSafe(split.value)) {
             return;
         }
+        // 宣言リスト内では、既存の important を後続の通常宣言で上書きしない（CSS のカスケード）。
+        if (!split.important && model.prios[name] === true) {
+            return;
+        }
         if (!modelPut(model, name, split.value, split.important)) {
             warnLimit();
         }
@@ -276,9 +297,11 @@
         return model;
     }
 
-    // 宣言の変更を `style` 属性へ書く（dom.js の setAttribute 経由。MutationObserver へも通知される）。
-    function sync(state) {
-        fnCall(origSetAttribute, state.el, 'style', serialize(state.model));
+    // 候補モデルを `style` 属性へ書き（dom.js の setAttribute 経由。MutationObserver へも通知される）、
+    // 成功してからだけ state.model に確定する。書き込みが例外で拒否されたら state は変えない。
+    function commit(state, candidate) {
+        fnCall(origSetAttribute, state.el, 'style', serialize(candidate));
+        state.model = candidate;
     }
 
     function stateOf(self) {
@@ -319,20 +342,21 @@
     }
 
     function writeValue(state, name, value, important) {
+        var next = cloneModel(state.model);
         if (value === '') {
-            if (modelRemove(state.model, name) !== null) {
-                sync(state);
+            if (modelRemove(next, name) !== null) {
+                commit(state, next);
             }
             return;
         }
         if (!valueIsSafe(value)) {
             return;
         }
-        if (!modelPut(state.model, name, value, important)) {
+        if (!modelPut(next, name, value, important)) {
             warnLimit();
             return;
         }
-        sync(state);
+        commit(state, next);
     }
 
     function valueArg(v) {
@@ -359,11 +383,12 @@
     });
     methodDefine('removeProperty', function removeProperty(name) {
         var state = stateOf(this);
-        var prev = modelRemove(state.model, normalizeName(name));
+        var next = cloneModel(state.model);
+        var prev = modelRemove(next, normalizeName(name));
         if (prev === null) {
             return '';
         }
-        sync(state);
+        commit(state, next);
         return prev;
     });
     methodDefine('item', function item(index) {
@@ -382,8 +407,7 @@
         return null;
     });
     function setCssText(state, value) {
-        state.model = parseText(valueArg(value));
-        sync(state);
+        commit(state, parseText(valueArg(value)));
     }
     getterDefine(
         'cssText',
@@ -512,9 +536,12 @@
 
     defineProperty(Element.prototype, 'setAttribute', {
         value: function setAttribute(name, value) {
-            fnCall(origSetAttribute, this, name, value);
-            if (sLower(sTrim(toStr(name))) === 'style') {
-                noteStyleAttribute(this, toStr(value));
+            // 引数は一度だけ文字列化し、元メソッドと同期処理へ同じ文字列を渡す。
+            var attrName = toStr(name);
+            var attrValue = toStr(value);
+            fnCall(origSetAttribute, this, attrName, attrValue);
+            if (sLower(sTrim(attrName)) === 'style') {
+                noteStyleAttribute(this, attrValue);
             }
         },
         writable: true,
@@ -523,8 +550,9 @@
     });
     defineProperty(Element.prototype, 'removeAttribute', {
         value: function removeAttribute(name) {
-            fnCall(origRemoveAttribute, this, name);
-            if (sLower(sTrim(toStr(name))) === 'style') {
+            var attrName = toStr(name);
+            fnCall(origRemoveAttribute, this, attrName);
+            if (sLower(sTrim(attrName)) === 'style') {
                 noteStyleAttribute(this, '');
             }
         },
