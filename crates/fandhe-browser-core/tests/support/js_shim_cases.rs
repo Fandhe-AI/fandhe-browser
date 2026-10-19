@@ -2118,6 +2118,17 @@ fn storage_cases(engine: &str) {
         "65536|QuotaExceededError|65536",
     );
 
+    eprintln!("case: JS-6 storage internal key array is unreachable from Array.prototype setters");
+    check(
+        &mut p,
+        "localStorage.clear(); var leaked = 0; \
+         Object.defineProperty(Array.prototype, '0', { configurable: true, set: function () { leaked++; this.length = 0; } }); \
+         var r; try { for (var i = 0; i < 5; i++) { localStorage.setItem('p' + i, 'v'); } \
+         localStorage.removeItem('p1'); r = leaked + '|' + localStorage.length + '|' + localStorage.key(0) + '|' + localStorage.key(3) + '|' + localStorage.getItem('p4'); } \
+         finally { delete Array.prototype[0]; } localStorage.clear(); r",
+        "0|4|p0|p4|v",
+    );
+
     eprintln!("case: JS-5 storage brand check and SEC-2 identity surface");
     check(
         &mut p,

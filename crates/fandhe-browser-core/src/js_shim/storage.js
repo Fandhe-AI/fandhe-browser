@@ -19,7 +19,7 @@
 // - 上限（JS-6。1 ストアごと。主要ブラウザで一般的な値で、本実装に固有の値にしない）: 全キー長と全値長の合計
 //   5 MiB（UTF-16 code unit）、件数 65536。検査は置き換え後の値で確保の前に行い、超えたら
 //   `QuotaExceededError`（DOMException・code 22）を投げて状態を変えない。
-// - `key(n)` は O(1)（キー配列を持つ）。削除時の詰め直しは O(n)。
+// - `key(n)` は O(1)（プロトタイプ null のキー配列を持つ。件数は Map.size を真実源にする）。削除時の詰め直しは O(n)。
 // - 識別面を増やさない（SEC-2）: 残量・クォータを示すプロパティ、`navigator.storage`、`StorageEvent` は定義しない。
 //   クォータは書き込みを試せば推測できる（緩和策は「明示的に公開しない」ことまで）。
 // - ES2015 の範囲に留める（V8 と boa で同一のソース。class / Proxy は使わない）。
@@ -51,9 +51,7 @@
     var mapHas = Function.prototype.call.bind(Map.prototype.has);
     var mapDelete = Function.prototype.call.bind(Map.prototype.delete);
     var mapClear = Function.prototype.call.bind(Map.prototype.clear);
-    var arrPush = Function.prototype.call.bind(Array.prototype.push);
-    var arrSplice = Function.prototype.call.bind(Array.prototype.splice);
-    var arrIndexOf = Function.prototype.call.bind(Array.prototype.indexOf);
+    var mapSize = Function.prototype.call.bind(Object.getOwnPropertyDescriptor(Map.prototype, 'size').get);
 
     var MAX_TOTAL = 5 * 1024 * 1024;
     var MAX_ENTRIES = 65536;
@@ -97,7 +95,10 @@
 
     function create() {
         var inst = createObject(Storage.prototype);
-        wmSet(states, inst, { keys: [], map: new MapCtor(), total: 0 });
+        // キー列は配列でなくプロトタイプ null のオブジェクト（添字 → キー）で持ち、件数は Map.size を真実源にする。
+        // Array.prototype の数値プロパティ setter や Symbol.species をページが差し込んでも、内部状態の取得・
+        // length 改ざんができない（件数上限の迂回を防ぐ。JS-6）。
+        wmSet(states, inst, { keys: createObject(null), map: new MapCtor(), total: 0 });
         return inst;
     }
 
@@ -120,14 +121,14 @@
         } else {
             next += k.length;
         }
-        if (next > MAX_TOTAL || (!exists && st.keys.length >= MAX_ENTRIES)) {
+        if (next > MAX_TOTAL || (!exists && mapSize(st.map) >= MAX_ENTRIES)) {
             throw new NativeDOMException(
                 "Failed to execute 'setItem' on 'Storage': the quota has been exceeded.",
                 'QuotaExceededError'
             );
         }
         if (!exists) {
-            arrPush(st.keys, k);
+            st.keys[mapSize(st.map)] = k;
         }
         mapSet(st.map, k, v);
         st.total = next;
@@ -140,14 +141,25 @@
         if (mapHas(st.map, k)) {
             st.total -= k.length + mapGet(st.map, k).length;
             mapDelete(st.map, k);
-            arrSplice(st.keys, arrIndexOf(st.keys, k), 1);
+            // 自前の詰め直し（splice はプロトタイプ・species に依存するため使わない）。
+            // Map からの削除前の件数が n（削除後は n - 1）。
+            var keys = st.keys;
+            var n = mapSize(st.map) + 1;
+            var at = 0;
+            while (at < n && keys[at] !== k) {
+                at++;
+            }
+            for (; at + 1 < n; at++) {
+                keys[at] = keys[at + 1];
+            }
+            delete keys[n - 1];
         }
     });
 
     defineMethod(Storage.prototype, 'clear', function clear() {
         var st = stateOf(this);
         mapClear(st.map);
-        st.keys.length = 0;
+        st.keys = createObject(null);
         st.total = 0;
     });
 
@@ -156,12 +168,12 @@
         need(arguments, 1, 'key');
         // 単項 + は ToNumber 相当で BigInt を TypeError にする（WebIDL unsigned long 変換）。グローバル Number の差し替えに依存しない。
         var i = +index >>> 0;
-        return i < st.keys.length ? st.keys[i] : null;
+        return i < mapSize(st.map) ? st.keys[i] : null;
     });
 
     defineProperty(Storage.prototype, 'length', {
         get: function () {
-            return stateOf(this).keys.length;
+            return mapSize(stateOf(this).map);
         },
         configurable: true,
         enumerable: false
