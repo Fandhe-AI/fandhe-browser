@@ -138,7 +138,7 @@
         return prev;
     }
 
-    // 追加（既存は削除して末尾へ）。上限超過は false（変更なし）。
+    // 追加（既存名は位置を保ったまま更新し、新規名だけ末尾へ）。上限超過は false（変更なし）。
     function modelPut(model, name, value, important) {
         if (value.length > MAX_VALUE_UNITS) {
             return false;
@@ -152,10 +152,11 @@
             return false;
         }
         if (at >= 0) {
-            modelRemove(model, name);
+            model.size -= prevSize;
+        } else {
+            model.names[model.n] = name;
+            model.n += 1;
         }
-        model.names[model.n] = name;
-        model.n += 1;
         model.values[name] = value;
         model.prios[name] = important;
         model.size += declSize(name, value, important);
@@ -262,13 +263,16 @@
                 quote = ch;
             } else if (ch === '/' && sCharAt(value, i + 1) === '*') {
                 return false;
-            } else if (ch === '(') {
+            } else if (ch === '{' || ch === '}') {
+                // core の parse_declarations は `{` も括弧深さに数えるため、引用符の外では常に無効にする。
+                return false;
+            } else if (ch === '(' || ch === '[') {
                 depth += 1;
-            } else if (ch === ')') {
+            } else if (ch === ')' || ch === ']') {
                 if (depth > 0) {
                     depth -= 1;
                 }
-            } else if (depth === 0 && (ch === ';' || ch === '{' || ch === '}')) {
+            } else if (depth === 0 && ch === ';') {
                 return false;
             } else if (depth === 0 && ch === '!' && sLower(sTrim(sSub(value, i + 1))) === 'important') {
                 // 値内のトップレベル `!important` は優先度指定。実属性だけ重要宣言になりモデルの優先度と
@@ -276,7 +280,7 @@
                 return false;
             }
         }
-        // 閉じていない括弧は、後続の宣言を未完の関数へ取り込み、モデルと実属性をずらすため無効にする。
+        // 閉じていない括弧（丸・角）は、後続の宣言を未完の関数へ取り込み、モデルと実属性をずらすため無効にする。
         return quote === '' && depth === 0;
     }
 
@@ -337,9 +341,10 @@
                 }
             } else if (ch === '"' || ch === "'") {
                 quote = ch;
-            } else if (ch === '(') {
+            } else if (ch === '(' || ch === '[' || ch === '{') {
+                // core の parse_declarations と同じく丸・角・波括弧を深さに数える。
                 depth += 1;
-            } else if (ch === ')') {
+            } else if (ch === ')' || ch === ']' || ch === '}') {
                 if (depth > 0) {
                     depth -= 1;
                 }

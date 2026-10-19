@@ -984,6 +984,25 @@ fn style_cases(engine: &str) {
         "important",
     );
 
+    let mut q = setup(engine, None);
+    // 角括弧も丸括弧と同様に追跡する。未閉鎖の `[` は拒否し、cssText の `[a;b]` は 1 値として扱う。
+    check(
+        &mut q,
+        "var s = document.createElement('div').style; s.setProperty('--x', '['); s.color = 'red'; s.cssText",
+        "color: red;",
+    );
+    check(
+        &mut q,
+        "s.cssText = '--x: [a;b]; color: red'; s.length + '|' + s.getPropertyValue('--x') + '|' + s.color",
+        "2|[a;b]|red",
+    );
+    // 既存名の更新は宣言の位置を保つ（新規名だけ末尾）。
+    check(
+        &mut q,
+        "s.cssText = 'color: red; display: block'; s.color = 'blue'; s.item(0) + '|' + s.cssText",
+        "color|color: blue; display: block;",
+    );
+
     eprintln!(
         "case: JS-5 style unbalanced paren / oversize cssText / removeProperty arg side effects"
     );
