@@ -435,11 +435,20 @@
                 return result;
             }
         }
+        // 結果が中止されたら、全入力に登録した follow を解除する（JS-6。長寿命の入力に残り続けて上限に達するのを防ぐ）。
+        var detach = function () {
+            for (var d = 0; d < count; d++) {
+                removeAlg(wmGet(signalStates, inputs[d]), follow);
+            }
+        };
         var follow = function (reason) {
+            detach();
             signalAbort(result, reason);
         };
         for (i = 0; i < count; i++) {
             if (!addAlg(wmGet(signalStates, inputs[i]), follow)) {
+                // 登録途中の失敗は、ここまでの登録を巻き戻してから投げる。
+                detach();
                 throw new NativeTypeError("Failed to execute 'any' on 'AbortSignal': Too many dependents");
             }
         }

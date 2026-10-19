@@ -1826,4 +1826,34 @@ fn abort_cases(engine: &str) {
         "1024",
     );
     assert!(p.bridge.listener_limit_exceeded().expect("flag"));
+
+    eprintln!(
+        "case: JS-6/JS-8 AbortSignal.any releases follow registrations from long-lived inputs"
+    );
+    let mut p = setup(engine, None);
+    check(
+        &mut p,
+        "var root = new AbortController(); var ok = 0; \
+         for (var k = 0; k < 1100; k++) { \
+           var req = new AbortController(); \
+           AbortSignal.any([root.signal, req.signal]); \
+           req.abort(); ok++; \
+         } \
+         var last = AbortSignal.any([root.signal]); root.abort('r'); \
+         [ok, last.aborted, last.reason].join('|')",
+        "1100|true|r",
+    );
+    eprintln!(
+        "case: JS-6 AbortSignal.any rolls back partial registrations when a dependent cap is hit"
+    );
+    check(
+        &mut p,
+        "var full = new AbortController(); var keep = []; \
+         for (var m = 0; m < 1024; m++) { keep.push(AbortSignal.any([full.signal])); } \
+         var other = new AbortController(); var thrown; \
+         try { AbortSignal.any([other.signal, full.signal]); } catch (e) { thrown = e instanceof TypeError; } \
+         var again = AbortSignal.any([other.signal]); other.abort('o'); \
+         [thrown, again.aborted].join('|')",
+        "true|true",
+    );
 }
