@@ -1523,6 +1523,32 @@ fn url_cases(engine: &str) {
         "600000|1|k=2",
     );
 
+    // JS-6: search・hash setter は上限超過（入力長・符号化後の長さ）を符号化の前後で拒否し、状態を変えない。
+    check(
+        &mut p,
+        "var lu = new URL('https://a/p?k=v#h'); \
+         lu.search = 'a'.repeat(65537); var r1 = lu.href; \
+         lu.search = ' '.repeat(30000); var r2 = lu.href; \
+         lu.hash = 'x'.repeat(65537); var r3 = lu.href; \
+         lu.hash = ' '.repeat(30000); var r4 = lu.href; \
+         lu.search = 'z'; \
+         [r1, r2, r3, r4, lu.href, lu.searchParams.get('z')].join('|')",
+        "https://a/p?k=v#h|https://a/p?k=v#h|https://a/p?k=v#h|https://a/p?k=v#h|https://a/p?z#h|",
+    );
+    // JS-6: 検索系メソッドの名前が予算を超えるなら変換の前に TypeError で拒否する。
+    check(
+        &mut p,
+        "var lk = 'x'; try { new URLSearchParams('a=1').get('x'.repeat(1048577)) } catch (e) { lk = e instanceof TypeError } \
+         lk + '|' + new URLSearchParams('a=1').get('a')",
+        "true|1",
+    );
+    // JS-5: record 初期化では、正規化後に同名になるキーを後の値で上書きし、最初の位置を保つ。
+    check(
+        &mut p,
+        "new URLSearchParams({'\\ud800': 'a', x: '1', '\\ud801': 'b'}).toString()",
+        "%EF%BF%BD=b&x=1",
+    );
+
     eprintln!("case: REPAIR-3 unimplemented setters throw in strict mode and do not change state");
     check(
         &mut p,

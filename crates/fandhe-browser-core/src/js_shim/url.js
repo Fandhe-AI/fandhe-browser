@@ -26,6 +26,8 @@
 // - 上限（JS-6）: URLSearchParams は純 JS だが、構築・append・set は確保の前に件数（65536）と
 //   文字数（1 MiB）の共通予算で検査して TypeError で拒否する。pair は 3 個目で拒否する。
 //   `URL` 経由の入力は op の文字列上限（既定 64 KiB）と応答上限で止まる。
+//   search・hash setter は入力長と符号化後の長さを 64 KiB で打ち切り（符号化の前後）、超えたら状態を変えない。
+//   record 初期化は正規化後に同名のキーを後の値で上書きする。
 // - ES2015 の範囲に留める（V8 と boa で同一のソース。class / Proxy は使わない）。
 //
 // 未実装（REPAIR-3。黙って成功扱いにはしない）:
@@ -290,14 +292,22 @@
     }
 
     // USVString への変換（孤立サロゲートを U+FFFD に置き換える）。名前・値の保存と検索の前に必ず通す。
+    // 検索系（get・has・delete 等）の引数は、予算を超える長さなら変換の前に TypeError で拒否する（JS-6）。
     function usv(value) {
-        return usvStr(toStr(value));
+        var s = toStr(value);
+        if (s.length > MAX_CHARS) {
+            throw new TypeError('URLSearchParams input exceeds the size limit');
+        }
+        return usvStr(s);
     }
 
     // 確保前の件数・文字数の共通予算（JS-6）。URLSearchParams の構築・append・set は、確保の前に
     // この予算で検査し、超えたら TypeError で拒否する（終端のない iterable でも確保を続けない）。
     var MAX_ENTRIES = 65536;
     var MAX_CHARS = 1048576;
+    // search / hash setter の入力・符号化後の上限。core の `urlParse` op の文字列上限（既定 64 KiB）に合わせ、
+    // 超える値は op に渡しても失敗するため、符号化・split の前に打ち切る。
+    var MAX_SETTER_CHARS = 65536;
 
     function newBudget(list) {
         var b = { n: 0, c: 0 };
@@ -355,9 +365,14 @@
     // search / hash の値を再解析用に符号化する。URL 全体の解析は先頭・末尾の空白と C0 制御文字を
     // 削るため、値の末尾が失われないよう空白と C0 制御文字を先に `%XX` にする（tab・LF・CR は
     // WHATWG の解析と同じく取り除く）。
+    // 入力は呼び出し側が MAX_SETTER_CHARS 以下に確認済みで、符号化の途中でも出力が予算を超えたら
+    // null を返して打ち切る（JS-6。1 文字が最大 3 倍に展開されるため出力側も検査する）。
     function encodeTail(s) {
         var out = '';
         for (var i = 0; i < s.length; i++) {
+            if (out.length > MAX_SETTER_CHARS) {
+                return null;
+            }
             var c = sCharCodeAt(s, i);
             if (c === 9 || c === 10 || c === 13) {
                 continue;
@@ -488,16 +503,32 @@
         search: function (value) {
             var st = requireUrl(this);
             var raw = toStr(value);
+            if (raw.length > MAX_SETTER_CHARS) {
+                return;
+            }
             var p = splitHref(st.c[IDX_HREF]);
+            var query = '';
             // 空文字の代入だけが query の削除。'?' は空の query として残す。
-            var query = raw === '' ? '' : '?' + arrJoin(sSplit(encodeTail(stripFirst(raw, '?')), '#'), '%23');
+            if (raw !== '') {
+                var enc = encodeTail(stripFirst(raw, '?'));
+                if (enc === null) {
+                    return;
+                }
+                query = '?' + arrJoin(sSplit(enc, '#'), '%23');
+            }
             // 失敗したら変更しない（setter は投げない）。
             reparse(st, p.head + query + p.frag);
         },
         hash: function (value) {
             var st = requireUrl(this);
             var raw = toStr(value);
+            if (raw.length > MAX_SETTER_CHARS) {
+                return;
+            }
             var v = encodeTail(stripFirst(raw, '#'));
+            if (v === null) {
+                return;
+            }
             var href = st.c[IDX_HREF];
             var h = sIndexOf(href, '#');
             var head = h < 0 ? href : sSub(href, 0, h);
@@ -611,12 +642,22 @@
                 });
             } else {
                 var keys = objectKeys(init);
+                var seen = createObject(null);
                 if (keys.length > MAX_ENTRIES) {
                     throw new TypeError('URLSearchParams input exceeds the entry limit');
                 }
                 for (var i = 0; i < keys.length; i++) {
                     chargeEntry(budget);
-                    arrPush(list, { n: usvCharged(keys[i], budget), v: usvCharged(init[keys[i]], budget) });
+                    var rn = usvCharged(keys[i], budget);
+                    var rv = usvCharged(init[keys[i]], budget);
+                    // 正規化後に同名になるキーは、最初の位置を保ち後の値で上書きする（WHATWG の record 変換）。
+                    var at = seen[rn];
+                    if (at !== undefined) {
+                        list[at].v = rv;
+                    } else {
+                        seen[rn] = list.length;
+                        arrPush(list, { n: rn, v: rv });
+                    }
                 }
             }
         } else {
