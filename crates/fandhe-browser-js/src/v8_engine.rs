@@ -121,7 +121,10 @@
 //! した `unsafe`〕は、ヒープ上限到達時の挙動を「V8 の既定の fatal
 //! OOM で Isolate を含むプロセスが終了する」ことに一本化したため削除した。
 //! この Isolate は子プロセス（`super::worker`）の中でだけ生成されるため、
-//! fatal OOM で終了してもホストプロセスは道連れにならない。新たに
+//! fatal OOM で終了してもホストプロセスは道連れにならない。
+//! 例外として、`Drop for V8Engine` だけが `unsafe` なしの near-heap-limit
+//! コールバックで破棄中に限り上限を一時的に引き上げる〔JS-6・Issue #1161。
+//! JS 実行中の契約は変えない〕。新たに
 //! `unsafe` が必要になった場合は実装を止めてユーザーへ報告する
 //! （security.md「`unsafe` の新規追加はユーザー承認を得る」）。
 //!
@@ -266,6 +269,46 @@ pub(crate) const MAX_SCRIPT_SOURCE_BYTES: usize = super::shared::MAX_SCRIPT_SOUR
 ///   子プロセスへの分離は「その超過分がホストへ波及しない」ことを保証
 ///   するものであり、「子プロセス自身の異常終了を防ぐ」ものではない
 pub(crate) const MAX_ISOLATE_HEAP_BYTES: usize = 128 * 1024 * 1024; // 128 MiB
+
+/// 破棄時（[`V8Engine`] の `Drop`）だけ許す一時的なヒープ上限の天井。
+///
+/// タイムアウトで止めた無限 microtask の鎖はヒープを上限近くまで埋める。
+/// その状態で Isolate を破棄すると、破棄中の GC が「効かない mark-compact」
+/// と判定されて `FatalProcessOutOfMemory` になり得る（JS-6・Issue #1161）。
+/// 破棄中は JS を実行しないため、この天井までの引き上げはページから見える
+/// 契約（実行中の上限 [`MAX_ISOLATE_HEAP_BYTES`]）を緩めない。値は
+/// `crate::resource_limits` の子プロセス RSS 監視しきい値より小さく保つ。
+pub(crate) const TEARDOWN_HEAP_LIMIT_CAP_BYTES: usize = MAX_ISOLATE_HEAP_BYTES * 2; // 256 MiB
+
+/// 破棄時の near-heap-limit コールバックが返す新しい上限を計算する純関数。
+///
+/// 戻り値は `current` より厳密に大きい（V8 は同値以下を「引き上げなし」
+/// とみなして fatal にするため）。ただし `current` が `usize::MAX` のときは
+/// `usize::MAX` で飽和する。通常は [`TEARDOWN_HEAP_LIMIT_CAP_BYTES`] で
+/// 頭打ちにし、すでに天井以上なら 1 バイトだけ上乗せする（オーバーフローしない）。
+pub(crate) fn teardown_heap_limit(current: usize, initial: usize) -> usize {
+    let raised = current
+        .saturating_add(initial.max(1))
+        .min(TEARDOWN_HEAP_LIMIT_CAP_BYTES);
+    if raised > current {
+        raised
+    } else {
+        current.saturating_add(1)
+    }
+}
+
+/// `Drop for V8Engine` だけが登録する near-heap-limit コールバック。
+///
+/// `data` には触れない safe な `extern "C" fn` で、`unsafe` を要さずに
+/// `NearHeapLimitCallback` へ暗黙変換される。上限の計算は
+/// [`teardown_heap_limit`]。
+extern "C" fn raise_heap_limit_for_teardown(
+    _data: *mut std::ffi::c_void,
+    current_heap_limit: usize,
+    initial_heap_limit: usize,
+) -> usize {
+    teardown_heap_limit(current_heap_limit, initial_heap_limit)
+}
 
 /// テスト専用のヒープ上限（[`super::worker::TEST_HEAP_LIMIT_ENV_VAR`]・
 /// `super::process_engine::WorkerSpawnConfigForTest::heap_limit_bytes`。
@@ -2724,6 +2767,11 @@ impl Drop for V8Engine {
         // モジュールマップの `Global` は Isolate が生きている間に解放する
         // （Isolate のスロットは Isolate の破棄時に落ちるため、順序を明示する）。
         drop(self.isolate.remove_slot::<ModuleMap>());
+        // 無限 microtask をタイムアウトで止めた後はヒープが上限近くに残り、
+        // 破棄中の GC が致命的 OOM になり得る（JS-6・Issue #1161）。JS を実行
+        // しないこの区間に限り上限を引き上げる（解除不要: Isolate ごと消える）。
+        self.isolate
+            .add_near_heap_limit_callback(raise_heap_limit_for_teardown, std::ptr::null_mut());
         V8_ISOLATE_ACTIVE.with(|active| active.set(false));
     }
 }
@@ -5116,6 +5164,41 @@ mod tests {
         ));
         assert!(started.elapsed() < Duration::from_secs(5));
         assert_eq!(eval_str(&mut engine, "1 + 1"), JsValue::Number(2.0));
+    }
+
+    /// JS-6・Issue #1161: 破棄時の上限引き上げは常に現在値より大きく、天井で頭打ち。
+    #[test]
+    fn js_6_teardown_heap_limit_always_raises_and_is_capped() {
+        let mib = 1024 * 1024;
+        assert_eq!(teardown_heap_limit(128 * mib, 128 * mib), 256 * mib);
+        assert_eq!(teardown_heap_limit(200 * mib, 128 * mib), 256 * mib);
+        assert_eq!(teardown_heap_limit(10, 0), 11);
+        assert_eq!(
+            teardown_heap_limit(TEARDOWN_HEAP_LIMIT_CAP_BYTES, 128 * mib),
+            TEARDOWN_HEAP_LIMIT_CAP_BYTES + 1
+        );
+        assert_eq!(teardown_heap_limit(usize::MAX - 1, usize::MAX), usize::MAX);
+        assert_eq!(teardown_heap_limit(usize::MAX, usize::MAX), usize::MAX);
+    }
+
+    /// JS-6・Issue #1161: 無限 microtask のタイムアウト後にエンジンを破棄しても
+    /// プロセスが落ちず、同じスレッドで新しいエンジンを作り直せる。
+    #[test]
+    fn js_6_v8_engine_drop_after_microtask_timeout_does_not_abort() {
+        let mut engine = module_engine();
+        let record = compile_ok(
+            &mut engine,
+            "https://example.test/loop-drop.js",
+            "const f = () => Promise.resolve().then(f); f(); export {};",
+        );
+        let opts = EvaluateOptions::default().with_timeout(Duration::from_millis(300));
+        assert!(matches!(
+            engine.evaluate_module(record.id(), &opts),
+            Err(JsEngineError::Timeout(_))
+        ));
+        drop(engine);
+        let mut again = module_engine();
+        assert_eq!(eval_str(&mut again, "1 + 1"), JsValue::Number(2.0));
     }
 
     /// JS-6・Issue #1112: `Rejected` のメッセージが `max_result_bytes` を超えると
