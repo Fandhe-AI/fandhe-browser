@@ -1474,6 +1474,22 @@ fn url_cases(engine: &str) {
         "true|false|https://a/",
     );
 
+    // JS-6: 文字列からの解析も確保前に件数上限を検査する。
+    check(
+        &mut p,
+        "var r5 = 0; try { new URLSearchParams('a&'.repeat(100000)) } catch (e) { r5 = e instanceof TypeError } \
+         r5 + '|' + new URLSearchParams('a&'.repeat(1000)).toString().length",
+        "true|3999",
+    );
+    // JS-6: set は置換で消える項目を差し引いた最終状態で予算を検査する。
+    check(
+        &mut p,
+        "var q6 = new URLSearchParams(); q6.set('k', 'a'.repeat(600000)); q6.set('k', 'b'.repeat(600000)); \
+         var q7 = new URLSearchParams('k=1&'.repeat(3000)); q7.set('k', '2'); \
+         q6.get('k').length + '|' + q6.getAll('k').length + '|' + q7.toString()",
+        "600000|1|k=2",
+    );
+
     eprintln!("case: REPAIR-3 unimplemented setters throw in strict mode and do not change state");
     check(
         &mut p,

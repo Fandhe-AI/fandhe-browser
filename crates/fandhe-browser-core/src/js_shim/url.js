@@ -232,18 +232,41 @@
     }
 
     // --- application/x-www-form-urlencoded の一覧 ---
+    // 区切りを逐次走査し、各項目を確保する前に件数・文字数の予算を検査する（JS-6）。
     function parseForm(s) {
         var list = [];
-        var pieces = sSplit(s, '&');
-        for (var i = 0; i < pieces.length; i++) {
-            var piece = pieces[i];
-            if (piece === '') {
-                continue;
+        var b = { n: 0, c: 0 };
+        var len = s.length;
+        var start = 0;
+        // 先に区切りだけを数え、件数・文字数が上限を超える入力は項目を確保する前に拒否する。
+        var pre = { n: 0, c: len };
+        var from = 0;
+        while (from <= len) {
+            var stop = sIndexOf(s, '&', from);
+            if (stop < 0) {
+                stop = len;
             }
-            var eq = sIndexOf(piece, '=');
-            var name = eq < 0 ? piece : sSub(piece, 0, eq);
-            var value = eq < 0 ? '' : sSub(piece, eq + 1);
-            arrPush(list, { n: formDecode(name), v: formDecode(value) });
+            if (stop > from) {
+                chargeEntry(pre);
+            }
+            from = stop + 1;
+        }
+        chargeChars({ n: 0, c: 0 }, len);
+        while (start <= len) {
+            var end = sIndexOf(s, '&', start);
+            if (end < 0) {
+                end = len;
+            }
+            if (end > start) {
+                chargeEntry(b);
+                chargeChars(b, end - start);
+                var piece = sSub(s, start, end);
+                var eq = sIndexOf(piece, '=');
+                var name = eq < 0 ? piece : sSub(piece, 0, eq);
+                var value = eq < 0 ? '' : sSub(piece, eq + 1);
+                arrPush(list, { n: formDecode(name), v: formDecode(value) });
+            }
+            start = end + 1;
         }
         return list;
     }
@@ -643,11 +666,20 @@
         var sp = requireSp(this);
         var key = toStr(name);
         var val = toStr(value);
-        var b = newBudget(sp.list);
-        chargeEntry(b);
-        chargeChars(b, key.length + val.length);
+        chargeChars({ n: 0, c: 0 }, key.length + val.length);
         key = usvStr(key);
         val = usvStr(val);
+        // 置換で消える同名の項目を予算から差し引き、更新後の最終状態で検査する。
+        var b = { n: 0, c: 0 };
+        for (var j = 0; j < sp.list.length; j++) {
+            var cur = sp.list[j];
+            if (cur.n !== key) {
+                b.n++;
+                b.c += cur.n.length + cur.v.length;
+            }
+        }
+        chargeEntry(b);
+        chargeChars(b, key.length + val.length);
         var next = [];
         var done = false;
         for (var i = 0; i < sp.list.length; i++) {
