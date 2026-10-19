@@ -85,7 +85,7 @@ spec 対応: TASK-71 / MS-6 / `COMPAT-1`・`JS-2`・`JS-4`・`JS-5`・`JS-6`・`
 
 ### 次の対応候補
 
-1. module 評価失敗の例外の分類名・不足 API 名を `ScriptOutcome` の診断へ出す（`ModuleEvaluationFailed` の理由を失わない。`REPAIR-4`・`JS-5`）。これで d2・d3 が `JS-5` の shim 不足か module 側の未対応かを切り分けられる
+1. （済み: #1133 で対応。下の節を参照）module 評価失敗の例外の分類名・不足 API 名を診断へ出す（`ModuleEvaluationFailed` の理由を失わない。`REPAIR-4`・`JS-5`）。これで d2・d3 が `JS-5` の shim 不足か module 側の未対応かを切り分けられる
 2. 切り分け結果が shim 不足なら `JS-5` の shim 追加（対象 API は切り分け後に決める）
 3. b5 は別オリジン module の方針（設計 §6 の案 (b)）と `src` 上限の見直しが要る。いずれもオーナー判断を伴う（`SEC-2`・`JS-6`）
 4. d2・d3 の解消は #919（回帰ゲート）の条件。今回は満たしていない
@@ -109,6 +109,54 @@ jq -c 'select(.type=="meta") | [.page_js_executed,.page_js_engine,.page_modules_
 target/release/examples/compat_page_script_probe --target b5=https://trello.com --modules --out /abs/path/b5.jsonl
 target/release/examples/compat_page_script_probe --target d2=https://www.saucedemo.com --modules --selector form --out /abs/path/d2.jsonl
 target/release/examples/compat_page_script_probe --target d3=https://demoqa.com/automation-practice-form --modules --selector form --out /abs/path/d3.jsonl
+```
+
+## module 評価失敗の分類（#1133）
+
+spec 対応: TASK-71 / MS-6 / `COMPAT-1`・`JS-4`・`JS-5`・`MEAS-4`・`REPAIR-3`・`REPAIR-4`（設計 `docs/design/es-module-design.md`）。
+上の「次の対応候補 1」を実装し、d2・d3 を `page_script_probe --modules` で再測定した。出力はコミットしていない。
+
+### 測定条件
+
+| 項目 | 値 |
+| ---- | -- |
+| 実施日時（UTC） | 2026-10-19T02:00Z 前後 |
+| OS | Linux |
+| ベース | main `ae6f2f63` に、例外の要約（`ExceptionSummary`）を診断へ出す変更（本 PR の `4baae368`）を加えたもの |
+| バイナリ | `cargo build --release -p fandhe-browser-core --features js-v8 --example compat_page_script_probe` |
+| 設定 | `--modules`（`[js] execute_modules = true` 相当）・V8・`--selector form`。実行上限は既定のまま |
+
+### 結果
+
+| id | サイト | script | outcome | `error_kind` | `message_class` | `missing_api` | 判定 |
+| -- | ------ | ------ | ------- | ------------ | --------------- | ------------- | ---- |
+| d2 | Saucedemo | index 1（module・同一オリジン `src`） | exception | `ReferenceError` | `not_defined` | `MutationObserver` | `JS-5` の shim 不足 |
+| d3 | DemoQA | index 0（module・同一オリジン `src`） | exception | `ReferenceError` | `not_defined` | `MutationObserver` | `JS-5` の shim 不足 |
+
+- 判定は測定前に固定した規則による: `ReferenceError` / `not_defined` で識別子が Web API 名なら `JS-5` の shim 不足。`SyntaxError`・`missing_export`・link 失敗なら module 側の未対応
+- 2 件とも、評価で止まる原因は module の仕組み（import の解決・export の不一致・top-level await・`import.meta`）ではなく、**`MutationObserver` が未定義**であること。動的 import は 0 件（`requested=0`）で、`evaluation_errors` も空
+- d2・d3 とも `form` は実行後も 0 件で、**解消していない**。`MutationObserver` の shim を足しても、その先で別の API が不足し得る（今回の測定は最初の例外で止まるため、後続は未確認）。推測を事実として書かない（`REPAIR-3`）
+- 同じ module を持つ 2 サイトが同一 API で止まることは、フレームワーク由来の共通依存である可能性を示す。ただし script 本文は読んでおらず、原因の所在は未確認
+
+### 次の対応
+
+1. `MutationObserver` の shim 追加（`JS-5`）を別 issue で扱う。追加後に d2・d3 を再測定し、次に不足する API を同じ手順で洗い出す。既存の #777・#778・#779 との差分整理が要る。起票は本 PR では行わない
+2. #919（回帰ゲート）の条件（d2・d3 の解消）は、今回も満たしていない。#919 はオーナー判断の issue のため、本件は事実の報告に留める
+3. 分類で扱えない例外（`other`・`TypeError` の `read_property`）が出たときは、分類語彙の拡張を先に検討する
+
+### 制約
+
+- 単一環境（Linux）・単一時点。URL のクエリ・ページ本文・script 本文・生の例外メッセージは記録していない
+- link / instantiate の失敗（`missing_export` を含む）は評価失敗ではなく compile 失敗の固定文で扱われ、要約は付かない（範囲外。V8 の実エンジンでの確認済み）
+- boa は例外メッセージに種類の接頭辞を付けないため、`not_defined` 以外は `error_kind` が `null`（`other`）になる。本測定は V8
+
+### 再現手順
+
+```bash
+cargo build --release -p fandhe-browser-core --features js-v8 --example compat_page_script_probe
+target/release/examples/compat_page_script_probe --target d2=https://www.saucedemo.com --modules --selector form --out /abs/path/d2.jsonl
+target/release/examples/compat_page_script_probe --target d3=https://demoqa.com/automation-practice-form --modules --selector form --out /abs/path/d3.jsonl
+jq -c 'select(.type=="script")' /abs/path/d2.jsonl /abs/path/d3.jsonl
 ```
 
 ## b5（Trello）の原因特定（#964）
