@@ -188,7 +188,7 @@ spec 対応: TASK-71・TASK-108 / MS-6 / `COMPAT-1`・`JS-5`・`JS-6`・`JS-7`�
 
 ### 次の対応
 
-1. 要素の `style`（最小の `CSSStyleDeclaration` 相当）の shim が要るかを調べる。`JS-5` の別 issue として扱い、追加後に d2・d3 を同じ手順で再測定して、その次の不足 API を洗い出す。起票は本 PR では行わない
+1. （済み: #1141。下の節を参照）要素の `style`（最小の `CSSStyleDeclaration` 相当）の shim が要るかを調べる。`JS-5` の別 issue として扱い、追加後に d2・d3 を同じ手順で再測定して、その次の不足 API を洗い出す。起票は本 PR では行わない
 2. 分類語彙の拡張を先に検討する: `TypeError` の `other` のうち「`in` 演算子の右辺が `undefined`」「`undefined` への代入」のように、不足 API の手掛かりになる形を `message_class` に足す（`REPAIR-4`）。今回はこの分類が無いため `missing_api` が付かなかった
 3. #919（回帰ゲート）の条件（d2・d3 の解消）は、今回も満たしていない。#919 には解消していないためコメントしていない
 
@@ -196,6 +196,60 @@ spec 対応: TASK-71・TASK-108 / MS-6 / `COMPAT-1`・`JS-5`・`JS-6`・`JS-7`�
 
 - 単一環境（Linux）・単一時点。URL のクエリ・ページ本文・script 本文・生の例外メッセージは記録していない
 - 判定は最初の例外で止まる測定に基づく。後続の不足 API は未確認
+
+### 再現手順
+
+```bash
+cargo build --release -p fandhe-browser-core --features js-v8 --example compat_page_script_probe
+target/release/examples/compat_page_script_probe --target d2=https://www.saucedemo.com --modules --selector form --out /abs/path/d2.jsonl
+target/release/examples/compat_page_script_probe --target d3=https://demoqa.com/automation-practice-form --modules --selector form --out /abs/path/d3.jsonl
+jq -c 'select(.type=="script")' /abs/path/d2.jsonl /abs/path/d3.jsonl
+```
+
+## style shim 追加後の再測定（#1141）
+
+spec 対応: TASK-71・TASK-108 / MS-6 / `COMPAT-1`・`JS-5`・`JS-6`・`MEAS-4`・`REPAIR-3`・`SEC-2`。
+前節（#1138）の「次の対応 1」を実装し、d2・d3 を `page_script_probe --modules` で再測定した。出力はコミットしていない。
+
+### 原因の確認結果
+
+- 前節の推測（要素の `style` が未提供で、CSS 機能検出が `undefined` を引く）は**正しかった**。`style` の shim を足すと、d2・d3 とも `TypeError`（`message_class=other`）が出なくなり、評価が次の例外まで進んだ
+- 確認は shim 追加の前後の `error_kind` / `message_class` の変化による。script 本文・生の例外メッセージは読んでいない（module 評価失敗の理由は `--debug-messages` でも stderr に出ない）
+
+### 測定条件
+
+| 項目 | 値 |
+| ---- | -- |
+| 実施日時（UTC） | 2026-10-19T04:40Z 前後 |
+| OS | Linux |
+| ベース | main `a8c0ddce` に、要素の `style` の shim を追加する変更（本 PR の `0bea5d9c`）を加えたもの |
+| バイナリ | `cargo build --release -p fandhe-browser-core --features js-v8 --example compat_page_script_probe` |
+| 設定 | `--modules`（`[js] execute_modules = true` 相当）・V8・`--selector form`。実行上限は既定のまま |
+
+### 結果
+
+| id | サイト | script | outcome | `error_kind` | `message_class` | `missing_api` | `form`（実行後） | 判定 |
+| -- | ------ | ------ | ------- | ------------ | --------------- | ------------- | ---------------- | ---- |
+| d2 | Saucedemo | index 1（module・同一オリジン `src`） | exception | `ReferenceError` | `not_defined` | `URL` | 0 件 | 未解消（例外が前進した） |
+| d3 | DemoQA | index 0（module・同一オリジン `src`） | exception | `Error` | `other` | なし | 0 件 | 未解消（例外が前進した） |
+
+- 前節の `TypeError` / `other` は 2 件とも出なくなった。**d2・d3 とも `form` は 0 件で、解消していない**。abort は無し
+- 次の不足 API
+  - d2: `URL`（グローバルのコンストラクタ）。URL の解析（WHATWG URL）は仕様が大きく、JS だけの小さな shim に収まらない。core の URL 解析を呼ぶ bridge op の追加を伴うため、本 PR では扱わず止めた（新しい op の設計が要る）
+  - d3: 種類は `Error`（`message_class=other`）で、不足 API は不明。script 本文と生メッセージを読んでいないため、原因の所在は未確認（`REPAIR-3`）。module 評価失敗の理由を安全に取り出す診断の拡張（`REPAIR-4`）が先に要る可能性がある
+- #919（回帰ゲート）の条件（d2・d3 の解消）は今回も満たしていない。#919 にはコメントしていない
+
+### 次の対応
+
+1. `URL` / `URLSearchParams` の shim（core の URL 解析を呼ぶ op の設計を含む）。`JS-5` の別 issue として扱う。起票は本 PR では行わない
+2. d3 の `Error` の原因特定。module 評価失敗の診断に、例外の分類名に加えて不足 API の手掛かりを出す拡張を検討する（`REPAIR-4`）
+
+### 制約
+
+- 単一環境（Linux）・単一時点。URL のクエリ・ページ本文・script 本文・生の例外メッセージは記録していない
+- 判定は最初の例外で止まる測定に基づく。後続の不足 API は未確認
+- `style` の shim は `profiles/`（`PLUG-8`）を使わない。ブラウザ別の CSS 機能データを JS の面に反映すると、選んだプロファイルで `in` 判定が変わり識別面に近づくため（`SEC-2`）。ベンダー接頭辞付きのプロパティは定義せず、`getComputedStyle` も定義しない
+- HTML パーサー・`innerHTML` で作られた要素の元の `style` 属性は読む op が無く、shim から最初に書くと `style` 属性全体を置き換える（`REPAIR-3`。`getAttribute` 相当の op で解消できる）
 
 ### 再現手順
 
