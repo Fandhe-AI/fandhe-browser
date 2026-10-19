@@ -8,11 +8,12 @@
 # 127.0.0.1:9333 に CDP サーバーを立てるだけのため、run_core.mjs が Page.navigate・DOM.* を送る。
 # ページ内 JS（JS-4〜JS-6）は既定オフ。--page-js <v8|boa> を付けると、固定文面の設定ファイル
 # （[js] engine=<..>, execute_page_scripts=true）を FANDHE_BROWSER_CONFIG で渡して起動する。
+# --page-modules を足すと同じ設定へ execute_modules=true も加える（ES module 実行。JS-2・#1119。--page-js が必須）。
 # 付けない起動では呼び出し元の FANDHE_BROWSER_CONFIG を外し、meta の page_js_executed=false を事実と一致させる（REPAIR-3）。
 # page_js_executed は「実行を有効にして起動した」意味で、ページごとの実行成否ではない。--no-spawn では確認できないため併用不可。
 #
 # 使い方: run_core.sh [--tasks P] [--out P] [--bin P] [--endpoint URL] [--no-spawn]
-#                     [--page-js v8|boa] [--log ABS_PATH] [--task-timeout SEC] [--total-timeout SEC] [--startup-timeout SEC] [--validate-only]
+#                     [--page-js v8|boa [--page-modules]] [--log ABS_PATH] [--task-timeout SEC] [--total-timeout SEC] [--startup-timeout SEC] [--validate-only]
 # --startup-timeout は起動モードでは起動待ち、--no-spawn では接続確認の予算（拒否・2xx 以外は即失敗し理由を出力）。
 # 終了コード: 0=記録完了（失敗タスクがあっても 0。成否は計測結果でありゲートではない）
 #            1=記録の書き込み失敗・結果件数/id 集合の不一致
@@ -30,6 +31,7 @@ ENDPOINT="http://127.0.0.1:9333"
 BIN_ARG=""
 NO_SPAWN=0
 PAGE_JS=""
+PAGE_MODULES=0
 LOG_OUT=""
 VALIDATE_ONLY=0
 TASK_TIMEOUT=45
@@ -51,6 +53,7 @@ while [ $# -gt 0 ]; do
     --total-timeout) [ $# -ge 2 ] || die "--total-timeout requires a value"; TOTAL_TIMEOUT="$2"; shift 2 ;;
     --startup-timeout) [ $# -ge 2 ] || die "--startup-timeout requires a value"; STARTUP_TIMEOUT="$2"; shift 2 ;;
     --page-js) [ $# -ge 2 ] || die "--page-js requires a value"; PAGE_JS="$2"; shift 2 ;;
+    --page-modules) PAGE_MODULES=1; shift ;;
     --log) [ $# -ge 2 ] || die "--log requires a value"; LOG_OUT="$2"; shift 2 ;;
     --no-spawn) NO_SPAWN=1; shift ;;
     --validate-only) VALIDATE_ONLY=1; shift ;;
@@ -74,6 +77,8 @@ case "$PAGE_JS" in
   *) die "--page-js must be v8 or boa" ;;
 esac
 [ -z "$PAGE_JS" ] || [ "$NO_SPAWN" -eq 0 ] || die "--page-js cannot be combined with --no-spawn (server configuration is not verifiable)"
+# --page-modules は真偽フラグで --page-js が前提（module は ES module 実行を有効にしたページ JS 実行の一部）
+[ "$PAGE_MODULES" -eq 0 ] || [ -n "$PAGE_JS" ] || die "--page-modules requires --page-js"
 if [ -n "$LOG_OUT" ]; then
   [ "$NO_SPAWN" -eq 0 ] || die "--log cannot be combined with --no-spawn"
   case "$LOG_OUT" in /*) ;; *) die "--log must be an absolute path" ;; esac
@@ -197,6 +202,8 @@ if [ "$NO_SPAWN" -eq 0 ]; then
     CONF_DIR="$(mktemp -d)" || die "cannot create config dir"
     # [profile] は書かない（cli は profile root を含む設定を拒否する）。エンジン未同梱のバイナリは起動前に非 0 終了する
     printf '[js]\nengine = "%s"\nexecute_page_scripts = true\n' "$PAGE_JS" >"$CONF_DIR/config.toml"
+    # execute_modules は真偽の固定行のみ追記する（引数文字列は連結しない）
+    if [ "$PAGE_MODULES" -eq 1 ]; then printf 'execute_modules = true\n' >>"$CONF_DIR/config.toml"; fi
     env XDG_DATA_HOME="$PROFILE_DIR" HOME="$PROFILE_DIR" FANDHE_BROWSER_CONFIG="$CONF_DIR/config.toml" "$BIN_RESOLVED" >"$LOG" 2>&1 &
   else
     env -u FANDHE_BROWSER_CONFIG XDG_DATA_HOME="$PROFILE_DIR" HOME="$PROFILE_DIR" "$BIN_RESOLVED" >"$LOG" 2>&1 &
@@ -244,8 +251,8 @@ CDP_BROWSER=$(jq -r 'select(.type=="browser") | .cdp_browser' "$RAW" | head -n 1
 
 MSYS2_ARG_CONV_EXCL='*' jq -cn --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg sha "$(sha256_of "$TASKS")" \
   --arg bin "$BIN_REC" --arg ep "$ENDPOINT" --arg cb "$CDP_BROWSER" --arg os "$(uname -s)" \
-  --arg pjs "$PAGE_JS" --argjson tt "$TASK_TIMEOUT" --argjson tot "$TOTAL_TIMEOUT" \
-  '{type:"meta",schema_version:1,measured_at:$at,tasks_sha256:$sha,bin:(if $bin=="" then null else $bin end),endpoint:$ep,cdp_browser:$cb,driver:"cdp",page_js_executed:($pjs!=""),page_js_engine:(if $pjs=="" then null else $pjs end),task_timeout_sec:$tt,total_timeout_sec:$tot,os:$os}' >"$TMP"
+  --arg pjs "$PAGE_JS" --argjson pm "$PAGE_MODULES" --argjson tt "$TASK_TIMEOUT" --argjson tot "$TOTAL_TIMEOUT" \
+  '{type:"meta",schema_version:1,measured_at:$at,tasks_sha256:$sha,bin:(if $bin=="" then null else $bin end),endpoint:$ep,cdp_browser:$cb,driver:"cdp",page_js_executed:($pjs!=""),page_js_engine:(if $pjs=="" then null else $pjs end),page_modules_executed:($pm==1),task_timeout_sec:$tt,total_timeout_sec:$tot,os:$os}' >"$TMP"
 jq -c 'select(.type=="result")' "$RAW" >>"$TMP"
 
 # 起動したバイナリの stdout / stderr を残す（固定診断行 `cdp: page scripts: ...` の回収用。非信頼データでコミットしない）

@@ -23,19 +23,25 @@ pub struct ProbeArgs {
     pub engine: EngineChoice,
     pub out: Option<PathBuf>,
     pub debug_messages: bool,
+    /// ES module 実行（`JS-2`・設定 gate `[js] execute_modules`）を有効にして収集・実行する。
+    pub modules: bool,
+    /// 件数を数える CSS セレクタ（既定 `h1`。d2・d3 の `form` 判定用。#1119）。
+    pub selector: String,
 }
 
 fn usage<T>(msg: &str) -> Result<T, UsageError> {
     Err(UsageError(msg.to_string()))
 }
 
-/// `--target <id>=<https url>`・`--engine v8|boa`（既定 v8）・`--out <path>`・`--debug-messages`。
+/// `--target <id>=<https url>`・`--engine v8|boa`（既定 v8）・`--out <path>`・`--debug-messages`・`--modules`・`--selector <css>`（既定 `h1`）。
 pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<ProbeArgs, UsageError> {
     let mut it = args.into_iter();
     let mut target: Option<(String, Url)> = None;
     let mut engine = EngineChoice::V8;
     let mut out = None;
     let mut debug_messages = false;
+    let mut modules = false;
+    let mut selector = "h1".to_string();
     while let Some(flag) = it.next() {
         match flag.as_str() {
             "--target" => {
@@ -63,6 +69,12 @@ pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<ProbeArgs, U
                 _ => return usage("--out requires a path"),
             },
             "--debug-messages" => debug_messages = true,
+            "--modules" => modules = true,
+            "--selector" => match it.next() {
+                // 長さを上限検証する（セレクタは core のパーサーへ渡すだけで、連結・評価はしない）
+                Some(v) if !v.is_empty() && v.len() <= 200 => selector = v,
+                _ => return usage("--selector requires a CSS selector (1..200 bytes)"),
+            },
             _ => return usage("unknown argument"),
         }
     }
@@ -75,6 +87,8 @@ pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<ProbeArgs, U
         engine,
         out,
         debug_messages,
+        modules,
+        selector,
     })
 }
 
@@ -181,8 +195,27 @@ mod tests {
         assert_eq!(a.url.as_str(), "https://example.com/");
         assert_eq!(a.engine, EngineChoice::V8);
         assert!(!a.debug_messages);
+        assert!(!a.modules);
+        assert_eq!(a.selector, "h1");
         let b = args(&["--target", "b5=https://example.com/", "--engine", "boa"]).expect("ok");
         assert_eq!(b.engine, EngineChoice::Boa);
+    }
+
+    /// #1119: `--modules` と `--selector` を受け付ける。
+    #[test]
+    fn accepts_modules_and_selector() {
+        let a = args(&[
+            "--target",
+            "d2=https://example.com/",
+            "--modules",
+            "--selector",
+            "form",
+        ])
+        .expect("ok");
+        assert!(a.modules);
+        assert_eq!(a.selector, "form");
+        assert!(args(&["--target", "d2=https://example.com/", "--selector"]).is_err());
+        assert!(args(&["--target", "d2=https://example.com/", "--selector", ""]).is_err());
     }
 
     /// SSRF 対策（security.md）: http・file・不正 id・重複・未知引数は使用エラー。
@@ -250,6 +283,25 @@ mod tests {
         let line = script_line("b5", Some(1), Origin::Src { same_origin: true }, &f);
         assert!(line.contains(r#""fetch_error":"http_status""#), "{line}");
         assert!(line.contains(r#""http_status":403"#), "{line}");
+    }
+
+    /// `JS-2`・#1119: module の保留・未対応と別オリジン拒否は種別名だけを出す。
+    #[test]
+    fn module_outcomes_carry_kinds_only() {
+        let line = script_line("b5", Some(0), Origin::Inline, &ScriptOutcome::ModulePending);
+        assert!(line.contains(r#""outcome":"module_pending""#), "{line}");
+        let line = script_line(
+            "b5",
+            Some(1),
+            Origin::Src { same_origin: false },
+            &ScriptOutcome::ModuleUnsupported,
+        );
+        assert!(line.contains(r#""outcome":"module_unsupported""#), "{line}");
+        let f = ScriptOutcome::SrcFetchFailed {
+            kind: SrcFetchErrorKind::CrossOrigin,
+        };
+        let line = script_line("b5", Some(2), Origin::Src { same_origin: false }, &f);
+        assert!(line.contains(r#""fetch_error":"cross_origin""#), "{line}");
     }
 
     #[test]
