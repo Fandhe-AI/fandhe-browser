@@ -215,6 +215,25 @@ fn timer_cases(engine: &str) {
     );
     assert_eq!(out.event_loop().pending_at_end(), 0);
 
+    eprintln!("case: JS-7 AbortSignal.timeout aborts with TimeoutError on the virtual clock");
+    let out = run_page(
+        engine,
+        &page(
+            "var s=AbortSignal.timeout(10);\
+             s.addEventListener('abort',function(){a(s.reason.name+':'+s.reason.code)});\
+             var bad='none';try{AbortSignal.timeout(-1)}catch(e){bad=e.name}a('neg:'+bad)",
+        ),
+        &opts,
+    );
+    assert!(
+        out.html()
+            .contains("<p>neg:TypeError</p><p>TimeoutError:23</p>"),
+        "{}",
+        out.html()
+    );
+    assert!(out.abort().is_none(), "{:?}", out.abort());
+    assert_eq!(out.event_loop().fired(), 1);
+
     eprintln!("case: JS-7 a 29s timer does not wait in real time");
     let out = run_page(
         engine,
@@ -1069,6 +1088,94 @@ pub fn run_fetch_promises(engine: &str) {
         out.html()
     );
     assert_eq!(hit_count(&hits), before);
+
+    // boa ではネイティブ Promise のジョブが drain されず `.catch` が走らない（net.js 冒頭・TASK-30）。
+    // reject の中身の確認は V8 だけで行い、要求数・診断は両エンジンで確かめる。
+    let promise_runs = engine == "v8";
+
+    eprintln!("case: JS-8 fetch with an already aborted signal never sends a request");
+    let (port, hits) = spawn_recording_server(|_| ("200 OK", String::new(), "{}".to_string()));
+    let base = format!("http://127.0.0.1:{port}/dir/page.html");
+    let helper = "function a(t){var p=document.createElement('p');p.textContent=t;\
+                  document.body.appendChild(p)}";
+    let page = |script: &str| format!("<body><script>{helper}{script}</script></body>");
+    let out = run_page_at(
+        engine,
+        &page(
+            "var c=new AbortController();c.abort();\
+             fetch('data.json',{signal:c.signal}).catch(function(e){a('rej:'+e.name)})",
+        ),
+        &base,
+        &opts,
+        &loopback_fetcher(),
+    );
+    assert_eq!(hit_count(&hits), 0);
+    assert_eq!(out.net().started(), 0);
+    assert_eq!(out.bridge_diagnostics().net_options_ignored, 0);
+    if promise_runs {
+        assert!(
+            out.html().contains("<p>rej:AbortError</p>"),
+            "{}",
+            out.html()
+        );
+    }
+
+    eprintln!("case: JS-8 aborting right after fetch cancels the queued request");
+    let out = run_page_at(
+        engine,
+        &page(
+            "var c=new AbortController();\
+             fetch('data.json',{signal:c.signal}).catch(function(e){a('rej:'+e)});\
+             c.abort('stop')",
+        ),
+        &base,
+        &opts,
+        &loopback_fetcher(),
+    );
+    assert_eq!(hit_count(&hits), 0);
+    assert_eq!(out.net().cancelled(), 1);
+    assert_eq!(out.net().completed(), 0);
+    if promise_runs {
+        assert!(out.html().contains("<p>rej:stop</p>"), "{}", out.html());
+    }
+
+    eprintln!("case: JS-8 fetch with a live signal succeeds and does not count it as ignored");
+    let out = run_page_at(
+        engine,
+        &page(
+            "var c=new AbortController();\
+             fetch('data.json',{signal:c.signal}).then(function(r){a('ok'+r.status)})",
+        ),
+        &base,
+        &opts,
+        &loopback_fetcher(),
+    );
+    assert_eq!(hit_count(&hits), 1);
+    assert_eq!(out.net().started(), 1);
+    assert_eq!(out.net().completed(), 1);
+    assert_eq!(out.bridge_diagnostics().net_options_ignored, 0);
+    if promise_runs {
+        assert!(out.html().contains("<p>ok200</p>"), "{}", out.html());
+    }
+
+    eprintln!("case: JS-8 a signal that is not an AbortSignal rejects without a request");
+    let before = hit_count(&hits);
+    let out = run_page_at(
+        engine,
+        &page("fetch('data.json',{signal:{}}).catch(function(e){a('rej:'+e.name)})"),
+        &base,
+        &opts,
+        &loopback_fetcher(),
+    );
+    assert_eq!(hit_count(&hits), before);
+    assert_eq!(out.net().started(), 0);
+    if promise_runs {
+        assert!(
+            out.html().contains("<p>rej:TypeError</p>"),
+            "{}",
+            out.html()
+        );
+    }
 }
 
 /// 指定パスへの要求回数（ヒットの先頭行の request target で数える）。

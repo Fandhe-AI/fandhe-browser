@@ -38,6 +38,10 @@
 //! bridge op `urlParse`（core の `reqwest::Url` に委譲）、form-urlencoded は JS で実装する
 //! （`protocol`・`host`・`port`・`pathname` 等の setter・`createObjectURL`・`URLPattern`・
 //! `URLSearchParams.sort` 等は未実装）。
+//! `abort.js`（#1150・`JS-5`・`JS-6`・`JS-7`・`JS-8`・`REPAIR-3`）は `DOMException` / `AbortSignal` /
+//! `AbortController` を提供し、timers.js の後・net.js の前に評価する（`AbortSignal.timeout` が
+//! `setTimeout` を、net.js の `fetch` が abort.js の窓口 `__fandheAbortFollow` を install 時に捕捉するため）。
+//! 汎用の `EventTarget` / `Event` / `dispatchEvent` は未実装（`typeof` は 'undefined' のまま）。
 
 use fandhe_browser_js::{EvaluateOptions, JsEngine, JsEngineError};
 
@@ -68,6 +72,10 @@ pub const JS_SHIM_SOURCES: &[JsShimSource] = &[
     JsShimSource {
         name: "timers.js",
         source: include_str!("timers.js"),
+    },
+    JsShimSource {
+        name: "abort.js",
+        source: include_str!("abort.js"),
     },
     JsShimSource {
         name: "net.js",

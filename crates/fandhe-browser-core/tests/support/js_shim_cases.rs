@@ -51,6 +51,7 @@ fn setup_html(engine: &str, html: &str, limit_extra_nodes: Option<usize>) -> Pag
             "window.js",
             "events.js",
             "timers.js",
+            "abort.js",
             "net.js",
             "observers.js",
             "style.js",
@@ -287,6 +288,7 @@ pub fn run(engine: &str) {
     style_cases(engine);
     url_cases(engine);
     node_cases(engine);
+    abort_cases(engine);
 
     eprintln!("case: JS-5 disabled runtime does not pretend to install");
     let mut disabled = JsRuntime::disabled();
@@ -1701,4 +1703,127 @@ fn node_cases(engine: &str) {
         "for (var i = 0; i < 1100; i++) { document.body.addEventListener('e' + i, function () {}); } 'ok'",
         "ok",
     );
+}
+
+/// `DOMException` / `AbortSignal` / `AbortController`（#1150・`JS-5`・`JS-6`・`REPAIR-3`・`SEC-2`）のケース。
+fn abort_cases(engine: &str) {
+    eprintln!("case: JS-5 abort globals exist and EventTarget stays undefined");
+    let mut p = setup(engine, None);
+    check(&mut p, "typeof AbortController", "function");
+    check(&mut p, "typeof AbortSignal", "function");
+    check(&mut p, "typeof DOMException", "function");
+    check(&mut p, "typeof EventTarget", "undefined");
+    check(&mut p, "typeof Event", "undefined");
+
+    eprintln!("case: JS-5 AbortController abort() state and reason");
+    check(
+        &mut p,
+        "var c = new AbortController(); \
+         var before = [c.signal.aborted, String(c.signal.reason), c.signal === c.signal].join('|'); \
+         c.abort(); \
+         var r = c.signal.reason; \
+         before + '/' + [c.signal.aborted, r instanceof DOMException, r instanceof Error, r.name, r.code, r.message].join('|')",
+        "false|undefined|true/true|true|true|AbortError|20|signal is aborted without reason",
+    );
+    check(
+        &mut p,
+        "var c2 = new AbortController(); c2.abort('x'); c2.abort('y'); c2.signal.reason",
+        "x",
+    );
+
+    eprintln!("case: JS-5 abort event via onabort and addEventListener");
+    check(
+        &mut p,
+        "var log = []; var c3 = new AbortController(); var s = c3.signal; \
+         s.onabort = function (e) { log.push('on:' + e.type + ':' + (e.target === s) + ':' + (e.currentTarget === s)); }; \
+         s.addEventListener('abort', function (e) { log.push('add'); }); \
+         var once = function () { log.push('once'); }; \
+         s.addEventListener('abort', once, { once: true }); \
+         s.addEventListener('abort', once, { once: true }); \
+         var removed = function () { log.push('removed'); }; \
+         s.addEventListener('abort', removed); s.removeEventListener('abort', removed); \
+         s.addEventListener('abort', { handleEvent: function (e) { log.push('obj'); } }); \
+         c3.abort(); c3.abort(); log.join(',')",
+        "on:abort:true:true,add,once,obj",
+    );
+
+    eprintln!("case: JS-5 throwIfAborted / illegal constructor / brand check");
+    check(
+        &mut p,
+        "var c4 = new AbortController(); c4.signal.throwIfAborted(); \
+         c4.abort('why'); var got; try { c4.signal.throwIfAborted(); } catch (e) { got = e; } String(got)",
+        "why",
+    );
+    check(
+        &mut p,
+        "var res = []; \
+         try { new AbortSignal(); } catch (e) { res.push(e instanceof TypeError); } \
+         try { Object.getOwnPropertyDescriptor(AbortSignal.prototype, 'aborted').get.call({}); } \
+         catch (e) { res.push(e instanceof TypeError); } \
+         try { AbortController(); } catch (e) { res.push(e instanceof TypeError); } \
+         res.join('|')",
+        "true|true|true",
+    );
+
+    eprintln!("case: JS-5 AbortSignal.abort / any");
+    check(
+        &mut p,
+        "[AbortSignal.abort().aborted, AbortSignal.abort('r').reason, AbortSignal.abort().reason.name].join('|')",
+        "true|r|AbortError",
+    );
+    check(
+        &mut p,
+        "var a = new AbortController(); var b = new AbortController(); \
+         var any = AbortSignal.any([a.signal, b.signal]); var pre = any.aborted; \
+         b.abort('z'); \
+         var pre2 = AbortSignal.any([a.signal, AbortSignal.abort('q')]); \
+         [pre, any.aborted, any.reason, pre2.aborted, pre2.reason].join('|')",
+        "false|true|z|true|q",
+    );
+    check(
+        &mut p,
+        "var bad; try { AbortSignal.any([{}]); } catch (e) { bad = e instanceof TypeError; } String(bad)",
+        "true",
+    );
+
+    eprintln!("case: JS-5 AbortSignal.timeout validates its delay");
+    check(
+        &mut p,
+        "var t = AbortSignal.timeout(10); var bads = []; \
+         [-1, NaN, Infinity].forEach(function (v) { \
+           try { AbortSignal.timeout(v); bads.push('no'); } catch (e) { bads.push(e instanceof TypeError); } \
+         }); [t.aborted, bads.join(',')].join('|')",
+        "false|true,true,true",
+    );
+
+    eprintln!("case: JS-5 DOMException basics");
+    check(
+        &mut p,
+        "var d = new DOMException('m', 'TimeoutError'); var e0 = new DOMException(); \
+         [d.code, d.name, d.message, e0.name, e0.code, e0.message === '', DOMException.ABORT_ERR, \
+          DOMException.prototype.TIMEOUT_ERR, String(d)].join('|')",
+        "23|TimeoutError|m|Error|0|true|20|23|TimeoutError: m",
+    );
+
+    eprintln!("case: JS-5 a throwing listener does not stop later listeners or abort() caller");
+    check(
+        &mut p,
+        "var seen = []; var c5 = new AbortController(); \
+         c5.signal.addEventListener('abort', function () { throw new Error('boom'); }); \
+         c5.signal.addEventListener('abort', function () { seen.push('second'); }); \
+         var threw = false; try { c5.abort(); } catch (e) { threw = true; } \
+         seen.join(',') + '|' + threw",
+        "second|false",
+    );
+
+    eprintln!("case: JS-6 abort listener count is capped and flagged");
+    let mut p = setup(engine, None);
+    check(
+        &mut p,
+        "var c6 = new AbortController(); var cnt = 0; \
+         for (var i = 0; i < 1025; i++) { c6.signal.addEventListener('abort', function () { cnt++; }); } \
+         c6.abort(); String(cnt)",
+        "1024",
+    );
+    assert!(p.bridge.listener_limit_exceeded().expect("flag"));
 }
