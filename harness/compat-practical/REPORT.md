@@ -746,7 +746,7 @@ spec 対応: TASK-71・TASK-108 / MS-6 / `COMPAT-1`・`JS-5`・`JS-6`・`MEAS-4`
 
 - `history.js`（新規）で `History` と `history` を足した。`length`（1 から。`pushState` で増え、上限 50）・`state`・`scrollRestoration`（`auto` / `manual` のみ受理）、`pushState`・`replaceState`・`back`・`forward`・`go` を持つ。メソッドは包み直せる（Backtrace SDK の想定パターン）
 - URL の書き換えは新しい bridge op `historySetUrl`（Rust 側）で行う。現在の URL を基準に解決し、userinfo 付き・別オリジン（scheme・host・port）・`javascript:` / `file:` / `data:`・8192 バイト超・`about:blank` を拒否する。拒否は `SecurityError`（DOMException）で、状態は変えない。`__dom.op` を直接呼ばれても現在のオリジンの外へは書き換えられない。遷移も取得も行わない
-- `state` は構造化複製の代わりに JSON の往復で複製し、直列化後 2 MiB（UTF-16）を上限にする（`JS-6`）。超過・循環参照・関数は `DataCloneError`。保持するのは現在の 1 件だけ
+- `state` は構造化複製の代わりに予算付きの再帰複製で複製し、累計 2 MiB（UTF-16）・10 万ノード・深さ 100 を確保前に検査して上限にする（`JS-6`。`undefined` は保持）。超過・循環参照・関数は `DataCloneError`。保持するのは現在の 1 件だけ
 - **`back`・`forward`・`go` と `popstate` は未実装（`REPAIR-3`）を選んだ**。汎用の `EventTarget` / `dispatchEvent` が無く、URL だけを動かして `popstate` を配らないと、SPA のルーターの状態と URL が食い違うため。3 つは URL と state を変えず、`ignoreLocationChange` 診断（`HistoryBack`・`HistoryForward`・`HistoryGo`）に記録するだけ。`PopStateEvent`・`onpopstate` は定義しない
 - 識別面（`SEC-2`）: `navigation`・`PopStateEvent`・`onpopstate`・上限や残量を示すプロパティは定義しない。診断に URL 本文は残さない
 - 副作用: `pushState` 後は `page_net` の相対 URL の基準（`location`）が同一オリジン内の別パスに変わる（実ブラウザと同じ。オリジンは変わらず、クロスオリジン・SSRF 検査は従来どおり）

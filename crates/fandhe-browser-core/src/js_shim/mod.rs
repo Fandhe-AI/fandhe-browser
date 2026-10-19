@@ -47,7 +47,7 @@
 //! abort.js の後に評価する。
 //! `history.js`（#1171・`JS-5`・`JS-6`・`SEC-2`・`REPAIR-3`）は `History` / `history` を提供する。
 //! `pushState` / `replaceState` は同一オリジンの URL だけを bridge op `historySetUrl` で受け付け
-//! （検査は core 側）、state は JSON の往復で上限付きで保持する。`back` / `forward` / `go` と
+//! （検査は core 側）、state は予算付きの再帰複製（ノード数・深さ・累計サイズの上限・undefined を保持）で保持する。`back` / `forward` / `go` と
 //! `popstate` は未実装（URL を動かさず診断に記録するだけ）。abort.js の `DOMException` を
 //! install 時に捕捉するため abort.js の後（storage.js の次）に評価する。
 //! 汎用の `EventTarget` / `Event` / `dispatchEvent` は未実装（`typeof` は 'undefined' のまま）。

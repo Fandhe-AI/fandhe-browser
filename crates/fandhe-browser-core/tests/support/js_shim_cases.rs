@@ -2318,10 +2318,22 @@ fn history_cases(engine: &str) {
         &mut p,
         "history.replaceState({keep: 9}, ''); var a = new Array(50000); var r; \
          try { history.pushState(new Array(40000).fill(a), ''); r = 'no-throw'; } catch (e) { r = e.name; } \
-         var b = new Array(60000).fill(null); var r2; \
+         var b = new Array(100001).fill(null); var r2; \
          try { history.pushState(b, ''); r2 = 'no-throw'; } catch (e) { r2 = e.name; } \
          [r, r2, history.state.keep].join('|')",
         "DataCloneError|DataCloneError|9",
+    );
+
+    eprintln!(
+        "case: JS-6 history clone ignores page-modified Array.prototype.push and budgets many keys"
+    );
+    check(
+        &mut p,
+        "var op = Array.prototype.push; Array.prototype.push = function () {}; \
+         history.replaceState([1, 2], ''); var l = history.state.length; Array.prototype.push = op; \
+         var big = {}; for (var i = 0; i < 100001; i++) { big['k' + i] = 1; } var r; \
+         try { history.replaceState(big, ''); r = 'no-throw'; } catch (e) { r = e.name; } l + '|' + r",
+        "2|DataCloneError",
     );
 
     eprintln!("case: JS-5 history methods can be wrapped (Backtrace SDK pattern)");

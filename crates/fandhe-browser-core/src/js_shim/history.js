@@ -14,7 +14,8 @@
 // - pushState / replaceState: 失敗時に状態を変えない順序（直列化と上限検査 → URL op → 反映）。
 //   別オリジン等は SecurityError（DOMException）。URL の省略 / null は state（と length）だけ更新する。
 //   メソッドは writable・configurable で、`history.pushState = wrapper` の包み直しができる。
-// - state は構造化複製の代わりに予算付きの再帰複製で複製し、累計 2 MiB（UTF-16 code unit）・
+// - state は構造化複製の代わりに予算付きの再帰複製（配列は添字で defineProperty、オブジェクトは for...in を
+//   逐次処理。ページが書き換え可能な Array.prototype.push・Object.keys は使わない）で複製し、累計 2 MiB（UTF-16 code unit）・
 //   10 万ノード・深さ 100 を確保前に検査して上限にする（JS-6。共有参照による指数展開も打ち切る）。
 //   超過・複製不能は DataCloneError。保持するのは現在の 1 件だけで、
 //   `history.state` は毎回同じオブジェクトを返す。
@@ -47,7 +48,7 @@
     var defineProperty = Object.defineProperty;
     var strCtor = String;
     var isArray = Array.isArray;
-    var objectKeys = Object.keys;
+    var hasOwn = Function.prototype.call.bind(Object.prototype.hasOwnProperty);
     var WeakMapCtor = WeakMap;
     var wmGet = Function.prototype.call.bind(WeakMap.prototype.get);
     var wmSet = Function.prototype.call.bind(WeakMap.prototype.set);
@@ -144,22 +145,33 @@
             }
             out = [];
             for (i = 0; i < n; i++) {
-                out.push(cloneValue(v[i], depth + 1, budget));
+                // ページが書き換え可能な Array.prototype.push・添字 setter を経由しないよう defineProperty で置く。
+                defineProperty(out, i, {
+                    value: cloneValue(v[i], depth + 1, budget),
+                    writable: true,
+                    configurable: true,
+                    enumerable: true
+                });
             }
             return out;
         }
-        var keys = objectKeys(v);
-        if (keys.length > MAX_STATE_NODES - budget.nodes) {
-            throw 0;
-        }
         out = {};
-        for (i = 0; i < keys.length; i++) {
-            budget.units += keys[i].length;
+        // 全キーの配列を作らず for...in で逐次処理し、列挙したキーごと（継承分を含む）に件数予算へ計上して
+        // 超えたら確保前に打ち切る（大量プロパティのオブジェクトで巨大な一覧を作らない）。
+        for (var key in v) {
+            budget.nodes++;
+            if (budget.nodes > MAX_STATE_NODES) {
+                throw 0;
+            }
+            if (!hasOwn(v, key)) {
+                continue;
+            }
+            budget.units += key.length;
             if (budget.units > MAX_STATE_UNITS) {
                 throw 0;
             }
-            defineProperty(out, keys[i], {
-                value: cloneValue(v[keys[i]], depth + 1, budget),
+            defineProperty(out, key, {
+                value: cloneValue(v[key], depth + 1, budget),
                 writable: true,
                 configurable: true,
                 enumerable: true
