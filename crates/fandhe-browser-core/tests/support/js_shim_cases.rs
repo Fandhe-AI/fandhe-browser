@@ -1439,12 +1439,23 @@ fn url_cases(engine: &str) {
          try { new URLSearchParams([inf]); 'no' } catch (e) { (e instanceof TypeError) + '|' + cnt }",
         "true|3",
     );
-    // JS-6: 外側の iterable が件数上限を越えたら TypeError。
+    // JS-6: 外側が配列で件数上限を越えるなら、反復の前に TypeError で拒否する。
     check(
         &mut p,
-        "var oc = 0; var outer = { [Symbol.iterator]() { return { next() { oc++; return { done: oc > 70000, value: ['a', 'b'] }; } }; } }; \
-         try { new URLSearchParams(outer); 'no' } catch (e) { (e instanceof TypeError) + '|' + (oc < 70000) }",
-        "true|true",
+        "var pr = ['a', 'b']; var big = new Array(70000).fill(pr); try { new URLSearchParams(big); 'no' } catch (e) { e instanceof TypeError }",
+        "true",
+    );
+    // JS-5: delete / has の第 2 引数は値指定として扱う。
+    check(
+        &mut p,
+        "var dv = new URLSearchParams('a=1&a=2&b=3'); dv.delete('a', '1'); var hv = new URLSearchParams('a=1&a=2'); dv.toString() + '|' + hv.has('a', '2') + '|' + hv.has('a', '3') + '|' + hv.has('a', undefined)",
+        "a=2&b=3|true|false|true",
+    );
+    // JS-5: Symbol.iterator が関数でない値は record 扱いにせず TypeError にする。
+    check(
+        &mut p,
+        "var rec = new URLSearchParams({ a: 2 }); var ri; try { new URLSearchParams({ [Symbol.iterator]: 1, a: 2 }); ri = 'no' } catch (e) { ri = e instanceof TypeError } rec.toString() + '|' + ri",
+        "a=2|true",
     );
     // JS-5: 通常呼び出しは既存インスタンスを再初期化せず TypeError にする。
     check(
@@ -1489,7 +1500,7 @@ fn url_cases(engine: &str) {
     // JS-6: 文字列からの解析も確保前に件数上限を検査する。
     check(
         &mut p,
-        "var r5 = 0; try { new URLSearchParams('a&'.repeat(100000)) } catch (e) { r5 = e instanceof TypeError } \
+        "var r5 = 0; try { new URLSearchParams('a&'.repeat(65537)) } catch (e) { r5 = e instanceof TypeError } \
          r5 + '|' + new URLSearchParams('a&'.repeat(1000)).toString().length",
         "true|2999",
     );

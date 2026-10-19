@@ -36,7 +36,7 @@
 // - `URL.createObjectURL` / `URL.revokeObjectURL` / `URLPattern` は定義しない（Blob が無いため。
 //   `typeof` は 'undefined' のまま。機能検出で対応を装わない。SEC-2）。将来仕様: Blob 導入後の
 //   `createObjectURL`（JS-5）。
-// - `URLSearchParams` の `sort`・`size`・`has(name, value)` / `delete(name, value)` の第 2 引数。
+// - `URLSearchParams` の `sort`・`size`。
 // - op の文字列上限（既定 64 KiB）を超える URL は失敗として扱う。
 (function (global) {
     'use strict';
@@ -582,7 +582,15 @@
         if (init === undefined || init === null) {
             // 空。
         } else if (isObjectLike(init)) {
-            if (typeof init[symIter] === 'function') {
+            var initIter = init[symIter];
+            if (initIter !== undefined && initIter !== null && typeof initIter !== 'function') {
+                throw new TypeError('URLSearchParams input Symbol.iterator is not a function');
+            }
+            if (initIter !== undefined && initIter !== null) {
+                // 配列は件数が上限を超えるなら反復の前に拒否する（要素ごとの処理に入らない）。
+                if (isArray(init) && init.length > MAX_ENTRIES) {
+                    throw new TypeError('URLSearchParams input exceeds the entry limit');
+                }
                 iterate(init, function (item) {
                     if (!isObjectLike(item) || typeof item[symIter] !== 'function') {
                         throw new TypeError('Each URLSearchParams pair must be iterable');
@@ -657,13 +665,16 @@
         arrPush(next, { n: usvStr(n), v: usvStr(v) });
         commit(sp, next);
     });
-    defMethod(SP, 'delete', function (name) {
+    defMethod(SP, 'delete', function (name, value) {
         requireArgs(arguments.length, 1);
         var sp = requireSp(this);
         var key = usv(name);
+        // 第 2 引数が undefined でなければ、名前と値の両方が一致する項目だけを消す。
+        var hasVal = value !== undefined;
+        var val = hasVal ? usv(value) : '';
         var next = [];
         for (var i = 0; i < sp.list.length; i++) {
-            if (sp.list[i].n !== key) {
+            if (sp.list[i].n !== key || (hasVal && sp.list[i].v !== val)) {
                 arrPush(next, { n: sp.list[i].n, v: sp.list[i].v });
             }
         }
@@ -692,12 +703,14 @@
         }
         return out;
     });
-    defMethod(SP, 'has', function (name) {
+    defMethod(SP, 'has', function (name, value) {
         requireArgs(arguments.length, 1);
         var sp = requireSp(this);
         var key = usv(name);
+        var hasVal = value !== undefined;
+        var val = hasVal ? usv(value) : '';
         for (var i = 0; i < sp.list.length; i++) {
-            if (sp.list[i].n === key) {
+            if (sp.list[i].n === key && (!hasVal || sp.list[i].v === val)) {
                 return true;
             }
         }
