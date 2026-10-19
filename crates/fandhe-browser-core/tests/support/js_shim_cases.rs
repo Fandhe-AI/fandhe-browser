@@ -1816,6 +1816,26 @@ fn abort_cases(engine: &str) {
         "second|false",
     );
 
+    eprintln!("case: JS-5 explicit undefined reason yields AbortError");
+    check(
+        &mut p,
+        "var cu = new AbortController(); cu.abort(undefined); \
+         [cu.signal.reason.name, AbortSignal.abort(undefined).reason.name].join('|')",
+        "AbortError|AbortError",
+    );
+
+    eprintln!("case: JS-5 listeners added during dispatch are not called in that dispatch");
+    check(
+        &mut p,
+        "var ld = []; var cd = new AbortController(); \
+         var late = function () { ld.push('late'); }; \
+         cd.signal.onabort = function () { ld.push('on'); cd.signal.addEventListener('abort', late); }; \
+         cd.signal.addEventListener('abort', function () { ld.push('first'); \
+           cd.signal.addEventListener('abort', function () { ld.push('late2'); }); }); \
+         cd.abort(); ld.join(',')",
+        "on,first",
+    );
+
     eprintln!("case: JS-6 abort listener count is capped and flagged");
     let mut p = setup(engine, None);
     check(
@@ -1891,15 +1911,15 @@ fn abort_cases(engine: &str) {
          r12.abort('x'); log12.join(',')",
         "root,a,b,c",
     );
-    eprintln!("case: JS-5 abort(undefined) keeps an explicit undefined reason");
+    eprintln!("case: JS-5 abort(undefined) and any() follow the default AbortError reason");
     check(
         &mut p,
         "var c13 = new AbortController(); c13.abort(undefined); \
          var c14 = new AbortController(); c14.abort(); \
          var d13 = AbortSignal.abort(undefined); var e13 = AbortSignal.any([d13]); \
-         [String(c13.signal.reason), c14.signal.reason.name, String(d13.reason), \
-          AbortSignal.abort().reason.name, String(e13.reason)].join('|')",
-        "undefined|AbortError|undefined|AbortError|undefined",
+         [c13.signal.reason.name, c14.signal.reason.name, d13.reason.name, \
+          AbortSignal.abort().reason.name, e13.reason.name].join('|')",
+        "AbortError|AbortError|AbortError|AbortError|AbortError",
     );
 
     eprintln!("case: JS-4 tampered Array.prototype push/pop does not break abort() or any");

@@ -247,6 +247,13 @@
         d.enumerable = true;
         d.configurable = false;
         defineProperty(event, 'currentTarget', d);
+        // 配送対象は onabort 実行前に確定する（onabort 内で追加されたリスナーはこの配送で呼ばない）。
+        var list = st.listeners;
+        var n = list.count;
+        var snapshot = createObject(null);
+        for (var k = 0; k < n; k++) {
+            snapshot[k] = list.items[k];
+        }
         try {
             var handler = st.onabort;
             if (typeof handler === 'function') {
@@ -255,12 +262,6 @@
                 } catch (e) {
                     reportLater(e);
                 }
-            }
-            var list = st.listeners;
-            var n = list.count;
-            var snapshot = createObject(null);
-            for (var k = 0; k < n; k++) {
-                snapshot[k] = list.items[k];
             }
             for (var i = 0; i < n; i++) {
                 if (flags.stopped) {
@@ -441,8 +442,8 @@
 
     defineMethod(AbortSignal, 'abort', function abort(reason) {
         var signal = createSignal();
-        // 引数省略のときだけ AbortError を作る（明示的な undefined はそのまま保持する）。
-        signalAbort(signal, reason, arguments.length > 0);
+        // reason が undefined のときは AbortError を作る（DOM 標準。明示的な undefined も同じ）。
+        signalAbort(signal, reason, reason !== undefined);
         return signal;
     });
 
@@ -541,7 +542,7 @@
         if (signal === undefined) {
             throw new NativeTypeError('Illegal invocation');
         }
-        signalAbort(signal, reason, arguments.length > 0);
+        signalAbort(signal, reason, reason !== undefined);
     });
     defineTag(AbortController.prototype, 'AbortController');
 
