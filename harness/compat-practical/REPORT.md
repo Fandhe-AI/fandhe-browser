@@ -385,7 +385,7 @@ spec 対応: TASK-71・TASK-108 / MS-6 / `COMPAT-1`・`JS-5`・`JS-6`・`MEAS-4`
 
 ### 次の対応
 
-1. d2: `AbortController` / `AbortSignal`。`EventTarget`（現状は document / window の最小実装のみ）、`DOMException`（`AbortError` の `reason`。DOMException への写像は未実装）、`AbortSignal.timeout`（timers 連携）が絡み、30 分・1 ファイル程度には収まらないと判断し、本 PR では続行せず止めた。`net.js` の `fetch` への `signal` 連携も含めて別 issue（`JS-5`・`JS-8`）。起票済み: #1150
+1. d2: `AbortController` / `AbortSignal`。`EventTarget`（現状は document / window の最小実装のみ）、`DOMException`（`AbortError` の `reason`。DOMException への写像は未実装）、`AbortSignal.timeout`（timers 連携）が絡み、30 分・1 ファイル程度には収まらないと判断し、本 PR では続行せず止めた。`net.js` の `fetch` への `signal` 連携も含めて別 issue（`JS-5`・`JS-8`）。起票済み: #1150（済み: #1150。下の節を参照）
 2. d3 の原因特定（前節 #1145 の次の対応 1 のまま。`REPAIR-4`）（済み: #1151。下の節を参照）
 
 ### 制約
@@ -445,13 +445,66 @@ spec 対応: TASK-71・TASK-108 / MS-6 / `COMPAT-1`・`JS-5`・`JS-6`・`MEAS-4`
 ### 次の対応
 
 1. d3: タイマー callback の例外の分類（`timer_errors` に `message_class` / `missing_api` を持たせる診断）。これで描画段階の次の不足 API を特定する。診断の拡張が先で、shim 単体では 30 分・1 ファイルに収まらないと判断し、本 PR では続行せず止めた。#1156 で追跡する
-2. d2: `AbortController`（#1150）
+2. d2: `AbortController`（#1150）（済み: #1150。下の節を参照）
 
 ### 制約
 
 - 単一環境（Linux）・単一時点。URL のクエリ・ページ本文・script 本文・生の例外メッセージは記録していない
 - 判定は最初の例外で止まる測定に基づく。タイマー callback 内の不足は未特定
 - 要素レベルのイベントは保持のみで、`click` 等は発火しない（`REPAIR-3`）
+
+### 再現手順
+
+```bash
+cargo build --release -p fandhe-browser-core --features js-v8 --example compat_page_script_probe
+target/release/examples/compat_page_script_probe --target d2=https://www.saucedemo.com --modules --selector form --out /abs/path/d2.jsonl
+target/release/examples/compat_page_script_probe --target d3=https://demoqa.com/automation-practice-form --modules --selector form --out /abs/path/d3.jsonl
+jq -c 'select(.type=="script")' /abs/path/d2.jsonl /abs/path/d3.jsonl
+```
+
+## AbortController / AbortSignal shim 追加後の再測定（#1150）
+
+spec 対応: TASK-71・TASK-108・TASK-111 / MS-6 / `COMPAT-1`・`JS-5`・`JS-6`・`JS-7`・`JS-8`・`MEAS-4`・`REPAIR-3`・`SEC-2`。
+前節（#1151）の「次の対応 2」を実装し、d2・d3 を `page_script_probe --modules` で再測定した。出力はコミットしていない。
+
+### 実装の要点
+
+- `js_shim/abort.js`（timers.js の後・net.js の前に評価）が `DOMException`（`AbortError` / `TimeoutError` の code を含む最小実装）、`AbortSignal`（`aborted` / `reason` / `onabort` / `throwIfAborted` / `addEventListener` / `removeEventListener`・静的 `abort` / `timeout` / `any`）、`AbortController` を提供する。`AbortSignal.timeout` は install 時に捕捉した `setTimeout` に載り、期限は core のイベントループの仮想時計で進む
+- 汎用の `EventTarget` / `Event` / `dispatchEvent` は定義しない（`typeof` は `'undefined'` のまま。`SEC-2`）。AbortSignal は `abort` イベントだけを自前のリスナー保持（1 シグナル 1024 件まで。超過は `lifecycleListenerLimit`）で配る
+- `net.js` の `fetch` が `init.signal` を扱う。中止済みなら要求を出さずに reason で reject し、要求後の中止は未着手の要求を `netCancel` で取り除いて reject する。AbortSignal でない値は `TypeError` で reject する。`signal` は `netOptionsIgnored` の集計から外した
+- Rust 側の変更は `JS_SHIM_SOURCES` への 1 件の追加のみ（新しい bridge op・依存・`unsafe` なし）
+
+### 測定条件
+
+| 項目 | 値 |
+| ---- | -- |
+| 実施日時（UTC） | 2026-10-19T11:57Z 前後 |
+| OS | Linux |
+| ベース | main `947e9cdd` に、abort.js の追加と fetch の signal 対応を加えたもの |
+| バイナリ | `cargo build --release -p fandhe-browser-core --features js-v8 --example compat_page_script_probe` |
+| 設定 | `--modules`（`[js] execute_modules = true` 相当）・V8・`--selector form`。実行上限は既定のまま |
+
+### 結果
+
+| id | サイト | script | outcome | `error_kind` | `message_class` | `missing_api` | `error_code` | `form`（実行後） | 判定 |
+| -- | ------ | ------ | ------- | ------------ | --------------- | ------------- | ------------ | ---------------- | ---- |
+| d2 | Saucedemo | index 1（module・同一オリジン `src`） | exception | `TypeError` | `read_property` | なし（`property=port`） | なし | 0 件 | 未解消（例外が前進した） |
+| d3 | DemoQA | index 0（module・同一オリジン `src`） | succeeded | なし | なし | なし | なし | 0 件 | 変化なし（module 評価は成功。`form` は未解消） |
+
+- d2 は `AbortController` の `ReferenceError` を越え、次に `port` プロパティの読み取り（`TypeError`・`read_property`）で止まった。未定義の値の `port` を読んでおり、`location.port` 周辺（`location` は `URL` 相当の構成要素を持つか）か URL 系の戻り値が候補だが、**生の例外メッセージは確認していない**ため推測にとどまる
+- d3 は変化なし（タイマー callback の `timer_errors` に `other` が 1 件。#1156 で追跡）。abort は両方とも無し
+- **d2・d3 とも `form` は 0 件のため #919 にはコメントしていない**
+
+### 次の対応
+
+1. d2: `port` を読む対象の特定（`--debug-raw-exception` で端末のみに出して確かめる）。`location.port` なら `window.js` の `location` の構成要素の不足の可能性がある。起票はしていない
+2. d3: タイマー callback の例外の分類（#1156）
+
+### 制約
+
+- 単一環境（Linux）・単一時点。URL のクエリ・ページ本文・script 本文・生の例外メッセージは記録していない
+- 判定は最初の例外で止まる測定に基づく。後続の不足 API は未確認
+- 未実装（`REPAIR-3`）: 汎用 `EventTarget` / `Event` / `dispatchEvent`、既存のブリッジエラーの DOMException への写像、XHR / `Request` の signal、着手済みの要求の取り消し（応答は届き、捨てられる。受理件数は戻らない）、`onabort` の呼び出し順の簡略化（リスナー一覧の設定位置ではなく最初に呼ぶ）、`addEventListener` の `signal` / `passive` / capture
 
 ### 再現手順
 
