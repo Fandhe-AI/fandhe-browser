@@ -121,7 +121,7 @@
 //! した `unsafe`〕は、ヒープ上限到達時の挙動を「V8 の既定の fatal
 //! OOM で Isolate を含むプロセスが終了する」ことに一本化したため削除した。
 //! この Isolate は子プロセス（`super::worker`）の中でだけ生成されるため、
-//! fatal OOM で終了してもホストプロセスは道連れにならない。新たに
+//! fatal OOM で終了してもホストプロセスは道連れにならない。
 //! 例外として、`Drop for V8Engine` だけが `unsafe` なしの near-heap-limit
 //! コールバックで破棄中に限り上限を一時的に引き上げる〔JS-6・Issue #1161。
 //! JS 実行中の契約は変えない〕。新たに
@@ -282,8 +282,9 @@ pub(crate) const TEARDOWN_HEAP_LIMIT_CAP_BYTES: usize = MAX_ISOLATE_HEAP_BYTES *
 
 /// 破棄時の near-heap-limit コールバックが返す新しい上限を計算する純関数。
 ///
-/// 戻り値は常に `current` より厳密に大きい（V8 は同値以下を「引き上げなし」
-/// とみなして fatal にするため）。通常は [`TEARDOWN_HEAP_LIMIT_CAP_BYTES`] で
+/// 戻り値は `current` より厳密に大きい（V8 は同値以下を「引き上げなし」
+/// とみなして fatal にするため）。ただし `current` が `usize::MAX` のときは
+/// `usize::MAX` で飽和する。通常は [`TEARDOWN_HEAP_LIMIT_CAP_BYTES`] で
 /// 頭打ちにし、すでに天井以上なら 1 バイトだけ上乗せする（オーバーフローしない）。
 pub(crate) fn teardown_heap_limit(current: usize, initial: usize) -> usize {
     let raised = current
