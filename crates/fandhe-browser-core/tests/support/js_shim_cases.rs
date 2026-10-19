@@ -1446,6 +1446,18 @@ fn url_cases(engine: &str) {
          try { new URLSearchParams(outer); 'no' } catch (e) { (e instanceof TypeError) + '|' + (oc < 70000) }",
         "true|true",
     );
+    // JS-5: 通常呼び出しは既存インスタンスを再初期化せず TypeError にする。
+    check(
+        &mut p,
+        "var cu = new URL('https://a/x'); var cs = new URLSearchParams('a=1'); var e1 = 0, e2 = 0; try { URL.call(cu, 'https://b/') } catch (e) { e1 = e instanceof TypeError } try { URLSearchParams.call(cs, 'b=2') } catch (e) { e2 = e instanceof TypeError } e1 + '|' + e2 + '|' + cu.href + '|' + cs.toString()",
+        "true|true|https://a/x|a=1",
+    );
+    // JS-5: iterator.next() の戻りがオブジェクトでなければ TypeError にする。
+    check(
+        &mut p,
+        "var bad = { [Symbol.iterator]() { return { next() { return 1 } } } }; try { new URLSearchParams(bad); 'no' } catch (e) { e instanceof TypeError }",
+        "true",
+    );
     // JS-6: 文字列・append の文字数上限。
     check(
         &mut p,

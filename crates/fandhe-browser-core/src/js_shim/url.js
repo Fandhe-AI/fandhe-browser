@@ -50,7 +50,6 @@
     var defineProperty = Object.defineProperty;
     var createObject = Object.create;
     var objectKeys = Object.keys;
-    var isProtoOf = Function.prototype.call.bind(Object.prototype.isPrototypeOf);
     var strCtor = String;
     var fromCharCode = String.fromCharCode;
     var reTest = Function.prototype.call.bind(RegExp.prototype.test);
@@ -65,6 +64,11 @@
     var sSplit = Function.prototype.call.bind(String.prototype.split);
     var arrPush = Function.prototype.call.bind(Array.prototype.push);
     var arrSplice = Function.prototype.call.bind(Array.prototype.splice);
+    var isArray = Array.isArray;
+    // 未改変の配列イテレータだけを添字ループで走査する高速経路の判定用（反復 1 件ごとの呼び出し費用を避ける）。
+    var arrValues = Array.prototype[Symbol.iterator];
+    var arrIterNext = Object.getPrototypeOf([][Symbol.iterator]()).next;
+    var arrIterProto = Object.getPrototypeOf([][Symbol.iterator]());
     var arrJoin = Function.prototype.call.bind(Array.prototype.join);
 
     var HEX = '0123456789ABCDEF';
@@ -447,7 +451,7 @@
 
     // --- URL ---
     function URL(input, base) {
-        if (this === undefined || this === null || !isProtoOf(URL.prototype, this)) {
+        if (new.target === undefined) {
             throw new TypeError("Failed to construct 'URL': Please use the 'new' operator");
         }
         var comps = parseComponents(toStr(input), base === undefined ? undefined : toStr(base));
@@ -531,10 +535,20 @@
 
     // --- URLSearchParams ---
     function iterate(obj, fn) {
-        var it = fnCall(obj[symIter], obj);
+        var method = obj[symIter];
+        if (isArray(obj) && method === arrValues && arrIterProto.next === arrIterNext) {
+            for (var k = 0; k < obj.length; k++) {
+                fn(obj[k]);
+            }
+            return;
+        }
+        var it = fnCall(method, obj);
         var next = it.next;
         for (;;) {
             var r = fnCall(next, it);
+            if (!isObjectLike(r)) {
+                throw new TypeError('Iterator result is not an object');
+            }
             if (r.done) {
                 return;
             }
@@ -560,7 +574,7 @@
     }
 
     function URLSearchParams(init) {
-        if (this === undefined || this === null || !isProtoOf(URLSearchParams.prototype, this)) {
+        if (new.target === undefined) {
             throw new TypeError("Failed to construct 'URLSearchParams': Please use the 'new' operator");
         }
         var list = [];

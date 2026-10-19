@@ -385,7 +385,7 @@ spec 対応: TASK-71・TASK-108 / MS-6 / `COMPAT-1`・`JS-5`・`JS-6`・`MEAS-4`
 
 ### 次の対応
 
-1. d2: `AbortController` / `AbortSignal`。`EventTarget`（現状は document / window の最小実装のみ）、`DOMException`（`AbortError` の `reason`。DOMException への写像は未実装）、`AbortSignal.timeout`（timers 連携）が絡み、30 分・1 ファイル程度には収まらないと判断し、本 PR では続行せず止めた。`net.js` の `fetch` への `signal` 連携も含めて別 issue（`JS-5`・`JS-8`）。起票は本 PR では行わない
+1. d2: `AbortController` / `AbortSignal`。`EventTarget`（現状は document / window の最小実装のみ）、`DOMException`（`AbortError` の `reason`。DOMException への写像は未実装）、`AbortSignal.timeout`（timers 連携）が絡み、30 分・1 ファイル程度には収まらないと判断し、本 PR では続行せず止めた。`net.js` の `fetch` への `signal` 連携も含めて別 issue（`JS-5`・`JS-8`）。起票済み: #1150
 2. d3 の原因特定（前節 #1145 の次の対応 1 のまま。`REPAIR-4`）
 
 ### 制約
