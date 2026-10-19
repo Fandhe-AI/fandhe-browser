@@ -517,7 +517,8 @@ impl DomOp {
             | Self::IsInclusiveAncestor
             | Self::UrlParse
             | Self::NetCallbackError => 2,
-            Self::InsertBefore | Self::SetAttribute | Self::TimerCallbackError => 3,
+            Self::InsertBefore | Self::SetAttribute => 3,
+            Self::TimerCallbackError => 4,
             Self::NetRequest => 4,
         }
     }
@@ -1018,13 +1019,15 @@ fn execute(
             // 例外の種類の名前（`error.name`。空文字可）。語彙外は要約側で `other` に落とす。
             let error_name = string_arg(op, args, 2, limits)?;
             let message = string_arg(op, args, 3, limits)?;
+            // `error.stack`（空文字可）。計測 example の stderr 専用で、opt-in が無ければ page_runner が破棄する。
+            let stack = string_arg(op, args, 4, limits)?;
             let source = TimerCallbackSource::parse(name).ok_or(DomBridgeError::TypeMismatch {
                 operation: op.name(),
                 index: 1,
                 expected: "a known timer callback source",
             })?;
             page.diagnostics
-                .record_timer_error(source, error_name, message);
+                .record_timer_error(source, error_name, message, stack);
             Ok(JsValue::Undefined)
         }
         DomOp::TimerStringHandlerIgnored => {
@@ -2667,19 +2670,42 @@ mod tests {
         let b = bridge();
         call(
             &b,
-            &[s("timerCallbackError"), s("click"), s("Error"), s("x")],
+            &[
+                s("timerCallbackError"),
+                s("click"),
+                s("Error"),
+                s("x"),
+                s(""),
+            ],
         )
         .expect_err("許可リスト外");
         call(&b, &[s("timerCallbackError"), s("timeout"), s("x")]).expect_err("arity");
         call(
             &b,
-            &[s("timerCallbackError"), s("timeout"), s("Error"), n(1.0)],
+            &[s("timerCallbackError"), s("timeout"), s("Error"), s("x")],
+        )
+        .expect_err("arity 旧形式");
+        call(
+            &b,
+            &[
+                s("timerCallbackError"),
+                s("timeout"),
+                s("Error"),
+                n(1.0),
+                s(""),
+            ],
         )
         .expect_err("type");
         let big = "x".repeat(MAX_CONSOLE_MESSAGE_BYTES + 1);
         call(
             &b,
-            &[s("timerCallbackError"), s("interval"), s("Error"), s(&big)],
+            &[
+                s("timerCallbackError"),
+                s("interval"),
+                s("Error"),
+                s(&big),
+                s(""),
+            ],
         )
         .expect("ok");
         for _ in 0..(MAX_BRIDGE_DIAGNOSTICS + 3) {
@@ -2690,6 +2716,7 @@ mod tests {
                     s("microtask"),
                     s("EvilError"),
                     s("e"),
+                    s("at f (https://h.example/a.js:1:2)"),
                 ],
             )
             .expect("ok");

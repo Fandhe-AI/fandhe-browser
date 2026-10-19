@@ -434,6 +434,25 @@ fn timer_cases(engine: &str) {
         ExceptionMessageClass::Other
     );
 
+    eprintln!("case: JS-7 instanceof rhs errors are classified and stack is opt-in (#1168)");
+    let instanceof_page = page("setTimeout(function(){ var x = {}; x instanceof undefined },1);");
+    let out = run_page(engine, &instanceof_page, &opts);
+    let errors = &out.bridge_diagnostics().timer_errors;
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert_eq!(errors[0].summary.kind(), ExceptionKind::TypeError);
+    assert_eq!(
+        errors[0].summary.message_class(),
+        ExceptionMessageClass::InstanceofNotObject
+    );
+    assert_eq!(errors[0].raw_stack(), None);
+    let retain = opts.clone().with_retain_raw_exception_messages(true);
+    let out = run_page(engine, &instanceof_page, &retain);
+    let errors = &out.bridge_diagnostics().timer_errors;
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    // stack の形式はエンジン依存（boa は非標準）。V8 では取得できることだけ確認する。
+    let stack = errors[0].raw_stack();
+    assert!(stack.is_none_or(|s| s.len() <= 1024), "{stack:?}");
+
     eprintln!("case: JS-6 page cannot invoke the timer dispatcher directly to bypass limits");
     let out = run_page(
         engine,

@@ -1447,7 +1447,13 @@ async fn execute(
 
     let elapsed = page_start.elapsed();
     let net = bridge.net_report().map_err(bridge_error)?;
-    let bridge_diagnostics = bridge.take_diagnostics().map_err(bridge_error)?;
+    let mut bridge_diagnostics = bridge.take_diagnostics().map_err(bridge_error)?;
+    // `error.stack` は URL・本文を含み得るため、opt-in が無ければ保持しない（fail-closed。Issue #1168）。
+    if !options.retain_raw_exception_messages {
+        for e in &mut bridge_diagnostics.timer_errors {
+            e.clear_stack();
+        }
+    }
     // detach で DOM を確定してから runtime を解放する（遅れた変更を結果へ混ぜない）。
     let document = bridge
         .detach()

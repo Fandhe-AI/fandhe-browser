@@ -86,7 +86,20 @@
                 }
                 text = text.slice(0, end);
             }
-            callOp('timerCallbackError', source, name, text);
+            var stack = '';
+            try {
+                // error.stack はページが偽造できる。文字列のときだけ、サロゲートを割らずに切って渡す。
+                if (error && typeof error.stack === 'string') {
+                    stack = error.stack.slice(0, 1024);
+                    var sl = stack.charCodeAt(stack.length - 1);
+                    if (sl >= 0xd800 && sl <= 0xdbff) {
+                        stack = stack.slice(0, -1);
+                    }
+                }
+            } catch (e) {
+                stack = '';
+            }
+            callOp('timerCallbackError', source, name, text, stack);
         } catch (e) {
             // 報告に失敗しても続行する。
         }

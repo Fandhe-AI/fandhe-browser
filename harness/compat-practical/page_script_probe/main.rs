@@ -40,7 +40,7 @@ use fandhe_browser_core::{
 };
 use probe::{
     Origin, ProbeArgs, class_label, debug_stderr_line, exception_label, lifecycle_label,
-    run_options, script_line, timer_error_label,
+    run_options, script_line, timer_error_label, top_stack_frame,
 };
 use reqwest::Url;
 
@@ -338,6 +338,14 @@ async fn measure(
     for (n, e) in diag.timer_errors.iter().enumerate() {
         let label = format!("{} timer_error#{n} {}", args.id, e.source.as_str());
         if let Some(line) = debug_stderr_line(args.debug_raw_exception, &label, Some(&e.message)) {
+            eprintln!("{line}");
+        }
+    }
+    // 先頭フレーム（url:line:col）も stderr だけへ。--debug-raw-exception が無ければ core が stack を保持しない（#1168）。
+    for (n, e) in diag.timer_errors.iter().enumerate() {
+        let label = format!("{} timer_error#{n} {} frame", args.id, e.source.as_str());
+        let frame = e.raw_stack().and_then(top_stack_frame);
+        if let Some(line) = debug_stderr_line(args.debug_raw_exception, &label, frame) {
             eprintln!("{line}");
         }
     }
