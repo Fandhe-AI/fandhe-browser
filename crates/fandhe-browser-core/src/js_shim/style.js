@@ -257,7 +257,8 @@
                 return false;
             }
         }
-        return quote === '';
+        // 閉じていない括弧は、後続の宣言を未完の関数へ取り込み、モデルと実属性をずらすため無効にする。
+        return quote === '' && depth === 0;
     }
 
     function normalizeName(raw) {
@@ -333,11 +334,12 @@
         }
     }
 
+    // 上限超過は null（正常な空宣言の空モデルと区別する。呼び出し側が既存を保持するか空に倒す）。
     function parseText(text) {
         var model = newModel();
         if (text.length > MAX_TOTAL_UNITS) {
             warnLimit();
-            return model;
+            return null;
         }
         parseInto(model, text);
         return model;
@@ -429,8 +431,10 @@
     });
     methodDefine('removeProperty', function removeProperty(name) {
         var state = stateOf(this);
+        // 引数の文字列化で style が更新されうるため、先に文字列化してから最新のモデルを複製する。
+        var n = normalizeName(name);
         var next = cloneModel(state.model);
-        var prev = modelRemove(next, normalizeName(name));
+        var prev = modelRemove(next, n);
         if (prev === null) {
             return '';
         }
@@ -453,7 +457,10 @@
         return null;
     });
     function setCssText(state, value) {
-        commit(state, parseText(valueArg(value)));
+        var parsed = parseText(valueArg(value));
+        if (parsed !== null) {
+            commit(state, parsed);
+        }
     }
     getterDefine(
         'cssText',
@@ -551,7 +558,7 @@
         if (decl === undefined) {
             decl = createObject(CSSStyleDeclaration.prototype);
             var base = wmGet(baselines, el);
-            wmSet(states, decl, { el: el, model: base === undefined ? newModel() : parseText(base) });
+            wmSet(states, decl, { el: el, model: base === undefined ? newModel() : parseText(base) || newModel() });
             wmSet(declarations, el, decl);
         }
         return decl;
@@ -576,7 +583,7 @@
         wmSet(baselines, el, text);
         var decl = wmGet(declarations, el);
         if (decl !== undefined) {
-            stateOf(decl).model = parseText(text);
+            stateOf(decl).model = parseText(text) || newModel();
         }
     }
 

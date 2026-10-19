@@ -964,6 +964,34 @@ fn style_cases(engine: &str) {
         "color: red; top: 1px; left: 2px; width: 3px;",
     );
 
+    eprintln!(
+        "case: JS-5 style unbalanced paren / oversize cssText / removeProperty arg side effects"
+    );
+    let mut p = setup(engine, None);
+    check(
+        &mut p,
+        "var d = document.createElement('div'); document.body.appendChild(d); var s = d.style; \
+         s.background = 'url('; s.color = 'red'; s.setProperty('top', 'calc(1px'); s.cssText",
+        "color: red;",
+    );
+    check(
+        &mut p,
+        "s.cssText = 'x'.repeat(32769); s.cssText + '|' + s.length",
+        "color: red;|1",
+    );
+    assert!(
+        p.html().contains("style=\"color: red;\""),
+        "attribute must be kept: {}",
+        p.html()
+    );
+    check(&mut p, "s.cssText = ''; s.cssText + '|' + s.length", "|0");
+    check(
+        &mut p,
+        "s.color = 'red'; s.removeProperty({ toString: function () { s.backgroundColor = 'blue'; return 'color'; } }); \
+         s.cssText",
+        "background-color: blue;",
+    );
+
     eprintln!("case: JS-6 style limits are enforced and warned once");
     let mut p = setup(engine, None);
     check(
