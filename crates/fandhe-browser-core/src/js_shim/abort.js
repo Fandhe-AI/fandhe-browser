@@ -32,7 +32,6 @@
 //   への写像は未実装。
 // - `AbortSignal.timeout` は timers.js の `setTimeout` の登録に失敗した（id が 0）場合、中止されないシグナルを返す。
 //   `queueMicrotask` が使えない環境ではリスナーの例外を捨てる。
-// - 依存シグナル（`any`）の中止は、仕様の「全依存の状態を先に更新してからイベントを配る」順ではなく、連鎖して順に処理する。
 (function (global) {
     'use strict';
 
@@ -292,34 +291,59 @@
         }
     }
 
+    // any の結果シグナルへの追従 algorithm（関数 → { target, detach }）。signalAbort が中身を見て反復で伝播する。
+    var links = new WeakMap();
+
     // 仕様の "signal abort"。すでに中止済みなら何もしない。
+    // 依存シグナル（any）への伝播は明示的なスタックによる反復で行い、依存の連鎖が深くてもスタックを消費しない。
+    // 全依存の状態を先に更新してから、中止した順に abort イベントを配る。
     function signalAbort(signal, reason) {
-        var st = wmGet(signalStates, signal);
-        if (st === undefined || st.aborted) {
-            return;
-        }
-        st.aborted = true;
-        st.reason = reason === undefined
-            ? new DOMException('signal is aborted without reason', 'AbortError')
-            : reason;
-        var algs = st.algs;
-        var n = algs.count;
-        var snapshot = createObject(null);
-        for (var k = 0; k < n; k++) {
-            snapshot[k] = algs.items[k];
-        }
-        for (var j = 0; j < n; j++) {
-            delete algs.items[j];
-        }
-        algs.count = 0;
-        for (var i = 0; i < n; i++) {
-            try {
-                snapshot[i](st.reason);
-            } catch (e) {
-                reportLater(e);
+        var pending = [signal];
+        var fired = [];
+        var rootReason = reason;
+        while (pending.length > 0) {
+            var cur = pending.pop();
+            var st = wmGet(signalStates, cur);
+            if (st === undefined || st.aborted) {
+                continue;
+            }
+            st.aborted = true;
+            st.reason = cur === signal
+                ? (rootReason === undefined
+                    ? new DOMException('signal is aborted without reason', 'AbortError')
+                    : rootReason)
+                : rootReason;
+            if (cur === signal) {
+                rootReason = st.reason;
+            }
+            fired.push(cur);
+            var algs = st.algs;
+            var n = algs.count;
+            var snapshot = createObject(null);
+            for (var k = 0; k < n; k++) {
+                snapshot[k] = algs.items[k];
+            }
+            for (var j = 0; j < n; j++) {
+                delete algs.items[j];
+            }
+            algs.count = 0;
+            for (var i = 0; i < n; i++) {
+                var link = wmGet(links, snapshot[i]);
+                if (link !== undefined) {
+                    link.detach();
+                    pending.push(link.target);
+                    continue;
+                }
+                try {
+                    snapshot[i](st.reason);
+                } catch (e) {
+                    reportLater(e);
+                }
             }
         }
-        fireAbort(signal, st);
+        for (var f = 0; f < fired.length; f++) {
+            fireAbort(fired[f], wmGet(signalStates, fired[f]));
+        }
     }
 
     function addAlg(st, fn) {
@@ -362,6 +386,9 @@
         if (typeof type !== 'string' || !isListener(listener)) {
             return;
         }
+        // options の getter はページ定義コードなので、重複・件数の確認より前に 1 回だけ読む。
+        // 確認から登録までの間にページのコードを走らせない（getter 内の再登録で上限を回避させない。JS-6）。
+        var once = options !== null && typeof options === 'object' && !!options.once;
         var list = st.listeners;
         for (var i = 0; i < list.count; i++) {
             if (list.items[i].type === type && list.items[i].listener === listener) {
@@ -372,7 +399,6 @@
             notifyLimit();
             return;
         }
-        var once = options !== null && typeof options === 'object' && !!options.once;
         list.items[list.count] = { type: type, listener: listener, once: once };
         list.count += 1;
     });
@@ -441,10 +467,9 @@
                 removeAlg(wmGet(signalStates, inputs[d]), follow);
             }
         };
-        var follow = function (reason) {
-            detach();
-            signalAbort(result, reason);
-        };
+        // 中止時の伝播は signalAbort が links を見て反復で行う（深い連鎖でも再帰しない）。
+        var follow = function () {};
+        wmSet(links, follow, { target: result, detach: detach });
         for (i = 0; i < count; i++) {
             if (!addAlg(wmGet(signalStates, inputs[i]), follow)) {
                 // 登録途中の失敗は、ここまでの登録を巻き戻してから投げる。

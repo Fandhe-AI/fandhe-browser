@@ -1856,4 +1856,25 @@ fn abort_cases(engine: &str) {
          [thrown, again.aborted].join('|')",
         "true|true",
     );
+    eprintln!("case: JS-6 addEventListener reads options before the listener cap check");
+    check(
+        &mut p,
+        "var c7 = new AbortController(); var s7 = c7.signal; var cnt7 = 0; var reentered = false; \
+         for (var q = 0; q < 1023; q++) { s7.addEventListener('abort', function () { cnt7++; }); } \
+         s7.addEventListener('abort', function () { cnt7++; }, { get once() { \
+           if (!reentered) { reentered = true; s7.addEventListener('abort', function () { cnt7++; }); } \
+           return false; } }); \
+         c7.abort(); String(cnt7)",
+        "1024",
+    );
+    eprintln!("case: JS-5 AbortSignal.any propagates through a very deep chain without recursion");
+    check(
+        &mut p,
+        "var root8 = new AbortController(); var tail = root8.signal; \
+         for (var z = 0; z < 3000; z++) { tail = AbortSignal.any([tail]); } \
+         var fired8 = 0; tail.addEventListener('abort', function () { fired8++; }); \
+         root8.abort('deep'); \
+         [tail.aborted, tail.reason, fired8].join('|')",
+        "true|deep|1",
+    );
 }
