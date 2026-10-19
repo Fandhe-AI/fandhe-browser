@@ -2007,16 +2007,16 @@ mod tests {
     }
 
     #[test]
-    fn js_5_get_attribute_rejects_invalid_name() {
+    fn js_5_get_attribute_rejects_invalid_args() {
         let b = bridge();
         let a = num(call(&b, &[s("getElementById"), s("a")]));
         let before = snapshot(&b);
+        // 文字種の不正な名前は例外にせず null（DOM の契約）。
         for name in ["", "1x", "a b"] {
-            let e = call(&b, &[s("getAttribute"), n(a), s(name)]).expect_err("不正");
-            assert!(matches!(
-                e,
-                DomBridgeError::Core(Error::Dom(DomError::InvalidName { .. }))
-            ));
+            assert_eq!(
+                call(&b, &[s("getAttribute"), n(a), s(name)]).expect("ok"),
+                JsValue::Null
+            );
         }
         let long = "x".repeat(DEFAULT_MAX_STRING_ARG_BYTES + 1);
         let e = call(&b, &[s("getAttribute"), n(a), s(&long)]).expect_err("超過");

@@ -551,14 +551,23 @@ impl Document {
     /// 要素 `element` の属性 `name` の値を、要素種別と名前を検証したうえで読む（`JS-5`）。
     ///
     /// [`Document::attribute`] は照合だけで検証しない。本関数は DOM ブリッジの
-    /// `getAttribute` op から呼ばれ、`set_attribute` / `remove_attribute` と同じ順序で
-    /// 検査する（要素以外は [`DomError::InvalidNodeKind`]、名前の規則違反は
-    /// [`DomError::InvalidName`]）。属性が無ければ `Ok(None)`。照合規則は `attribute` と共通。
+    /// `getAttribute` op から呼ばれ、要素種別（[`DomError::InvalidNodeKind`]）と名前の長さ上限
+    /// （[`DomError::InvalidName`]）だけを検査する。書き込み用の文字種規則は適用しない:
+    /// DOM の `getAttribute` は不正な名前でも例外にせず該当なしを返す契約で、パーサーが受理した
+    /// `<div 1x="v">` の属性も読めなければならない（`fragment.rs` と同じ扱い）。
+    /// 属性が無ければ `Ok(None)`。照合規則は `attribute` と共通。
     pub fn attribute_checked(&self, element: NodeId, name: &str) -> Result<Option<&str>> {
         if !matches!(self.require_node(element)?.data, NodeData::Element { .. }) {
             return Err(kind_err("attribute_checked", "node is not an element"));
         }
-        validate_name(NameKind::Attribute, name, self.limits.max_name_bytes)?;
+        if name.len() > self.limits.max_name_bytes {
+            return Err(DomError::InvalidName {
+                kind: NameKind::Attribute,
+                len: name.len(),
+                reason: "name is too long",
+            }
+            .into());
+        }
         Ok(self.attribute(element, name))
     }
 
@@ -706,16 +715,21 @@ mod tests {
         assert_eq!(doc.attribute_checked(a, "id").expect("ok"), Some("a"));
         assert_eq!(doc.attribute_checked(a, "ID").expect("ok"), Some("a"));
         assert_eq!(doc.attribute_checked(a, "nope").expect("ok"), None);
-        for (name, reason) in [
-            ("", "name is empty"),
-            ("1x", "invalid leading character"),
-            ("a b", "name contains a disallowed character"),
-        ] {
-            match dom_err(doc.attribute_checked(a, name)) {
-                DomError::InvalidName { reason: r, .. } => assert_eq!(r, reason),
-                other => panic!("unexpected {other:?}"),
-            }
+        // 読み取りでは文字種を検証しない（不正な名前は該当なし）。
+        for name in ["", "1x", "a b", "日本"] {
+            assert_eq!(doc.attribute_checked(a, name).expect("ok"), None);
         }
+        let long = "x".repeat(DEFAULT_MAX_NAME_BYTES + 1);
+        match dom_err(doc.attribute_checked(a, &long)) {
+            DomError::InvalidName { reason, .. } => assert_eq!(reason, "name is too long"),
+            other => panic!("unexpected {other:?}"),
+        }
+        // パーサーが受理した文字種規則外の属性名も読める。
+        let doc2 = parse("<body><div id=\"b\" 1x=\"v\"></div></body>");
+        let b = query_selector_str(&doc2, doc2.root(), "#b")
+            .expect("selector ok")
+            .expect("exists");
+        assert_eq!(doc2.attribute_checked(b, "1x").expect("ok"), Some("v"));
         let t = doc.create_text_node("x").expect("create");
         assert!(matches!(
             dom_err(doc.attribute_checked(t, "id")),
