@@ -964,6 +964,26 @@ fn style_cases(engine: &str) {
         "color: red; top: 1px; left: 2px; width: 3px;",
     );
 
+    // 引用符内の未エスケープ改行は文字列を終わらせるため、setProperty では拒否し、cssText では
+    // 改行以降を別宣言として扱う（実属性の解釈と一致させる）。
+    check(
+        &mut p,
+        "s.cssText = ''; s.setProperty('--x', '\"a\\n; color: red; x:\"'); s.cssText",
+        "",
+    );
+    check(
+        &mut p,
+        "s.cssText = '--x: \"a\\n; color: red'; s.cssText",
+        "color: red;",
+    );
+    // 名前の文字列化で style が更新されても、getPropertyPriority は最新のモデルを参照する。
+    check(
+        &mut p,
+        "s.cssText = ''; s.getPropertyPriority({ toString: function () { \
+         s.setProperty('color', 'red', 'important'); return 'color'; } })",
+        "important",
+    );
+
     eprintln!(
         "case: JS-5 style unbalanced paren / oversize cssText / removeProperty arg side effects"
     );

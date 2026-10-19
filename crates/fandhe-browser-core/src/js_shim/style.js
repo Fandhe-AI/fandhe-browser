@@ -188,6 +188,16 @@
         return out;
     }
 
+    // CSS では引用符内の未エスケープの改行（LF・CR・FF）で文字列トークンが終わる。
+    function isNewline(ch) {
+        return ch === '\n' || ch === '\r' || ch === '\f';
+    }
+
+    // `\` の直後が CRLF なら 2 文字ぶん（エスケープされた改行 1 つ）進める。
+    function escapeSkip(text, i) {
+        return sCharAt(text, i + 1) === '\r' && sCharAt(text, i + 2) === '\n' ? 2 : 1;
+    }
+
     // 引用符の外の CSS コメント（`/* ... */`。閉じが無ければ末尾まで）を空白 1 つに置き換える。
     // 引用符内とエスケープ（`\` + 1 文字）はそのまま残す。コメント内の `;` や括弧を
     // 宣言境界・括弧深さに数えないための前処理で、cssText と基準属性の解析前に必ず通す。
@@ -201,11 +211,12 @@
         for (var i = 0; i < len; i++) {
             var ch = sCharAt(text, i);
             if (ch === '\\' && i + 1 < len) {
-                out += ch + sCharAt(text, i + 1);
-                i += 1;
+                var skip = escapeSkip(text, i);
+                out += sSub(text, i, i + 1 + skip);
+                i += skip;
             } else if (quote !== '') {
                 out += ch;
-                if (ch === quote) {
+                if (ch === quote || isNewline(ch)) {
                     quote = '';
                 }
             } else if (ch === '/' && sCharAt(text, i + 1) === '*') {
@@ -238,8 +249,12 @@
                 if (i + 1 >= len) {
                     return false;
                 }
-                i += 1;
+                i += escapeSkip(value, i);
             } else if (quote !== '') {
+                if (isNewline(ch)) {
+                    // 未エスケープの改行で文字列が終わり、後続が別宣言として解釈され得るため無効。
+                    return false;
+                }
                 if (ch === quote) {
                     quote = '';
                 }
@@ -311,9 +326,9 @@
         for (var i = 0; i < len; i++) {
             var ch = sCharAt(text, i);
             if (ch === '\\') {
-                i += 1;
+                i += escapeSkip(text, i);
             } else if (quote !== '') {
-                if (ch === quote) {
+                if (ch === quote || isNewline(ch)) {
                     quote = '';
                 }
             } else if (ch === '"' || ch === "'") {
@@ -415,7 +430,10 @@
         return readValue(stateOf(this), normalizeName(name));
     });
     methodDefine('getPropertyPriority', function getPropertyPriority(name) {
-        return stateOf(this).model.prios[normalizeName(name)] === true ? 'important' : '';
+        var state = stateOf(this);
+        // 名前の文字列化で style が更新されうるため、先に文字列化してから最新のモデルを参照する。
+        var n = normalizeName(name);
+        return state.model.prios[n] === true ? 'important' : '';
     });
     methodDefine('setProperty', function setProperty(name, value, priority) {
         var state = stateOf(this);
