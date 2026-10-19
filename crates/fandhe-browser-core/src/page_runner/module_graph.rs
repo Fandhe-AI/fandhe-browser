@@ -59,11 +59,13 @@ use fandhe_browser_js::{
 };
 use reqwest::Url;
 
+use super::exception_summary::summarize_exception_message;
 use super::{
-    AbortKind, DynamicImportFailureKind, DynamicImportReport, MAX_MODULE_GRAPH_DEPTH,
-    MAX_PAGE_DYNAMIC_IMPORTS, PageAbort, RunContext, ScriptBytesScope, ScriptOutcome, SrcFailure,
-    SrcFetchErrorKind, WallTimeScope, check_src_response, classify_fetch_error, engine_error_abort,
-    lossy_len_exceeds, microtask_checkpoint, page_wall_abort, script_budget, tripped_abort_kind,
+    AbortKind, DynamicImportFailureKind, DynamicImportReport, ExceptionSummary,
+    MAX_MODULE_GRAPH_DEPTH, MAX_PAGE_DYNAMIC_IMPORTS, PageAbort, RunContext, ScriptBytesScope,
+    ScriptOutcome, SrcFailure, SrcFetchErrorKind, WallTimeScope, check_src_response,
+    classify_fetch_error, engine_error_abort, lossy_len_exceeds, microtask_checkpoint,
+    page_wall_abort, script_budget, tripped_abort_kind,
 };
 use crate::error::Error;
 use crate::fetch::Fetcher;
@@ -216,8 +218,8 @@ enum EvalState {
     Succeeded,
     /// 保留（top-level await 等）。再参照でも成功とは見なさない。
     Pending,
-    /// 評価の失敗。内容は固定メッセージで返す（生メッセージは保持しない）。
-    Rejected,
+    /// 評価の失敗。`outcome` は固定メッセージで返し、生メッセージは保持しない（要約だけ保持する）。
+    Rejected(ExceptionSummary),
 }
 
 impl ModuleGraph {
@@ -773,6 +775,29 @@ fn rejected_outcome() -> ScriptOutcome {
     }
 }
 
+/// `run_module_entry` の結果。`outcome` は従来どおりの固定文で、`exception` は評価失敗の要約（Issue #1133）。
+pub(super) struct ModuleEntryResult {
+    pub(super) outcome: ScriptOutcome,
+    pub(super) exception: Option<ExceptionSummary>,
+}
+
+impl From<ScriptOutcome> for ModuleEntryResult {
+    fn from(outcome: ScriptOutcome) -> Self {
+        Self {
+            outcome,
+            exception: None,
+        }
+    }
+}
+
+/// 評価失敗を固定文の `outcome` と要約の組にする。
+fn rejected_result(summary: ExceptionSummary) -> ModuleEntryResult {
+    ModuleEntryResult {
+        outcome: rejected_outcome(),
+        exception: Some(summary),
+    }
+}
+
 /// link 済みの root を evaluate して結果を写す。
 fn evaluate_root(
     rt: &mut JsRuntime,
@@ -781,50 +806,58 @@ fn evaluate_root(
     root: ModuleId,
     index: usize,
     abort: &mut Option<PageAbort>,
-) -> ScriptOutcome {
+) -> ModuleEntryResult {
     let options = ctx.options;
     let Some((timeout, scope)) = script_budget(
         options.script_wall_time,
         options.page_wall_time,
         ctx.page_start.elapsed(),
     ) else {
-        return aborted(page_wall_abort(options, None).kind, None, index, abort);
+        return aborted(page_wall_abort(options, None).kind, None, index, abort).into();
     };
     let result = rt.evaluate_module(root, &EvaluateOptions::default().with_timeout(timeout));
     // 子プロセス経路の猶予で、残り時間を超えて応答が届くことがある（`JS-6`）。
     let page_expired = ctx.page_start.elapsed() > options.page_wall_time;
     match result {
-        Ok(_) if page_expired => aborted(page_wall_abort(options, None).kind, None, index, abort),
+        Ok(_) if page_expired => {
+            aborted(page_wall_abort(options, None).kind, None, index, abort).into()
+        }
         Ok(ModuleEvaluation::Fulfilled) => {
             graph.evaluated.insert(root, EvalState::Succeeded);
-            ScriptOutcome::Succeeded
+            ScriptOutcome::Succeeded.into()
         }
         Ok(ModuleEvaluation::Pending) => {
             graph.evaluated.insert(root, EvalState::Pending);
-            ScriptOutcome::ModulePending
+            ScriptOutcome::ModulePending.into()
         }
-        Ok(ModuleEvaluation::Rejected { .. }) => {
-            graph.evaluated.insert(root, EvalState::Rejected);
-            rejected_outcome()
+        Ok(ModuleEvaluation::Rejected { message, .. }) => {
+            let summary = summarize_exception_message(&message);
+            graph
+                .evaluated
+                .insert(root, EvalState::Rejected(summary.clone()));
+            rejected_result(summary)
         }
         // 未知の結果は成功と見なさない（fail-closed）。
-        Ok(_) => aborted(AbortKind::EngineError, None, index, abort),
+        Ok(_) => aborted(AbortKind::EngineError, None, index, abort).into(),
         Err(Error::JsEvaluation(JsEngineError::NotYetImplemented(_))) => {
-            ScriptOutcome::ModuleUnsupported
+            ScriptOutcome::ModuleUnsupported.into()
         }
         // 拒否メッセージの上限超過等。classic の `evaluate_with_budget` と同様に
         // 固定メッセージの例外として記録し、後続を続ける（ページ時計が尽きていれば打ち切り）。
-        Err(Error::JsEvaluation(JsEngineError::EvaluationFailed(_))) => {
+        Err(Error::JsEvaluation(JsEngineError::EvaluationFailed(m))) => {
             if page_expired {
-                aborted(page_wall_abort(options, None).kind, None, index, abort)
+                aborted(page_wall_abort(options, None).kind, None, index, abort).into()
             } else {
-                graph.evaluated.insert(root, EvalState::Rejected);
-                rejected_outcome()
+                let summary = summarize_exception_message(&m);
+                graph
+                    .evaluated
+                    .insert(root, EvalState::Rejected(summary.clone()));
+                rejected_result(summary)
             }
         }
         Err(e) => {
             let (kind, message) = engine_error_abort(&e, scope, options);
-            aborted(kind, message, index, abort)
+            aborted(kind, message, index, abort).into()
         }
     }
 }
@@ -841,17 +874,19 @@ pub(super) async fn run_module_entry(
     source: &ScriptSource,
     index: usize,
     abort: &mut Option<PageAbort>,
-) -> ScriptOutcome {
+) -> ModuleEntryResult {
     let root = match load_graph(rt, ctx, graph, source).await {
         Ok(id) => id,
         Err(GraphError::Failed(ModuleFailure::Fetch(kind))) => {
-            return ScriptOutcome::SrcFetchFailed { kind };
+            return ScriptOutcome::SrcFetchFailed { kind }.into();
         }
         Err(GraphError::Failed(ModuleFailure::Exception { message, truncated })) => {
-            return ScriptOutcome::Exception { message, truncated };
+            return ScriptOutcome::Exception { message, truncated }.into();
         }
-        Err(GraphError::Unsupported) => return ScriptOutcome::ModuleUnsupported,
-        Err(GraphError::Abort(kind, message)) => return aborted(kind, message, index, abort),
+        Err(GraphError::Unsupported) => return ScriptOutcome::ModuleUnsupported.into(),
+        Err(GraphError::Abort(kind, message)) => {
+            return aborted(kind, message, index, abort).into();
+        }
     };
     if let Some(state) = graph.evaluated.get(&root) {
         // 既に evaluate 済みの module（同じ `src` の再指定等）は二度実行せず、確定した結果を返す
@@ -859,8 +894,8 @@ pub(super) async fn run_module_entry(
         // 再参照ではエンジン側の現在の評価状態を取り直し、確定したらキャッシュを更新する
         // （`JS-4`。エンジンは evaluate 済みの root に対し現在の Promise の状態を返す）。
         match state {
-            EvalState::Succeeded => return ScriptOutcome::Succeeded,
-            EvalState::Rejected => return rejected_outcome(),
+            EvalState::Succeeded => return ScriptOutcome::Succeeded.into(),
+            EvalState::Rejected(summary) => return rejected_result(summary.clone()),
             EvalState::Pending => {}
         }
     }
@@ -1093,11 +1128,18 @@ pub(super) async fn pump_one_dynamic_import(
             ModuleEvaluation::Fulfilled => report.fulfilled = report.fulfilled.saturating_add(1),
             ModuleEvaluation::Pending => report.pending = report.pending.saturating_add(1),
             // 評価の例外（Rejected）と未知の確定結果は fail-closed で reject として数える。
-            _ => {
+            other => {
                 report.rejected = report.rejected.saturating_add(1);
                 report
                     .failures
                     .push(DynamicImportFailureKind::EvaluationFailed);
+                // `failures` と同数・同順で要約を積む（未知の確定結果は `Other`。Issue #1133）。
+                report.evaluation_errors.push(match other {
+                    ModuleEvaluation::Rejected { message, .. } => {
+                        summarize_exception_message(&message)
+                    }
+                    _ => ExceptionSummary::other(),
+                });
             }
         },
         (Err((kind, None)), Ok(_)) => {
