@@ -14,6 +14,7 @@
 
 use std::io::{Read, Write};
 use std::net::TcpListener;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -148,12 +149,82 @@ impl Drop for Server {
     }
 }
 
+/// 接続拒否になるループバックのポート番号を返す（`RENDER-3`・`RENDER-4`・`REPAIR-5`・Issue #1153）。
+/// `:0` で取って閉じる方式は再割り当てや自己接続で接続が成立しうるため、
+/// エフェメラル範囲の外のポートを使う。
 fn closed_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .expect("bind")
-        .local_addr()
-        .expect("addr")
-        .port()
+    let l = bind_non_ephemeral_loopback();
+    l.local_addr().expect("addr").port()
+}
+
+/// OS が `:0` bind や送信元ポートに割り当てるエフェメラル範囲 `(下限, 上限)`（両端含む）。
+/// Linux は sysctl を読み、読めない・解釈できない場合と他 OS は既定値（macOS・Windows は 49152 から）を使う。
+fn ephemeral_port_range() -> (u32, u32) {
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(text) = std::fs::read_to_string("/proc/sys/net/ipv4/ip_local_port_range") {
+            let mut it = text
+                .split_whitespace()
+                .filter_map(|v| v.parse::<u32>().ok());
+            if let (Some(lo), Some(hi)) = (it.next(), it.next())
+                && lo <= hi
+                && hi <= 65535
+            {
+                return (lo, hi);
+            }
+        }
+        (32768, 60999)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        (49152, 65535)
+    }
+}
+
+/// 正本は `crates/fandhe-browser-mcp/tests/common/mod.rs`（#1159）。servo-host（別 workspace）と
+/// render の real_host.rs にコピーを置くため、変更時は 3 つを同期する。
+///
+/// エフェメラル範囲の外から loopback の空きポートを 1 つ bind して返す（Issue #843・#1153）。
+///
+/// `:0` で取ったポートを閉じて「接続拒否」を再現する方式では、閉じた直後に同じプロセス内の
+/// 別テストの `:0` bind へ同じポートが再割り当てされ、接続が成立して `HostError::Io` になる
+/// ことがある。`:0` はエフェメラル範囲からしか割り当てないため、範囲外のポートを使えば
+/// 再割り当てが起きない。候補が尽きた場合はテストを黙って通さず panic する（fail-closed）。
+fn bind_non_ephemeral_loopback() -> TcpListener {
+    static CURSOR: AtomicU32 = AtomicU32::new(0);
+    let (lo, hi) = ephemeral_port_range();
+    // 下限側（20000 以上）を優先し、空きが無ければ上限より上を使う。
+    let (start, end) = if lo > 20000 {
+        (20000u32, lo - 1)
+    } else if hi < 65535 {
+        (hi + 1, 65535)
+    } else {
+        panic!("no non-ephemeral port range available (ephemeral {lo}-{hi})");
+    };
+    let span = end - start + 1;
+    // プロセス間の衝突を減らすため、初回は PID 由来のオフセットから始める。
+    let _ = CURSOR.compare_exchange(
+        0,
+        std::process::id() % span + 1,
+        Ordering::SeqCst,
+        Ordering::SeqCst,
+    );
+    for _ in 0..span.min(1000) {
+        let n = CURSOR.fetch_add(1, Ordering::SeqCst);
+        let port = start + n % span;
+        match TcpListener::bind(("127.0.0.1", port as u16)) {
+            Ok(l) => return l,
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::AddrInUse
+                        | std::io::ErrorKind::PermissionDenied
+                        | std::io::ErrorKind::AddrNotAvailable
+                ) => {}
+            Err(e) => panic!("bind 127.0.0.1:{port}: {e}"),
+        }
+    }
+    panic!("no free non-ephemeral port in {start}-{end}");
 }
 
 fn be32(data: &[u8], at: usize) -> u32 {
