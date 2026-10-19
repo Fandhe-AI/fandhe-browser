@@ -34,6 +34,10 @@
 //! `style.js`（#1141・`JS-5`・`JS-6`・`SEC-2`）は要素の `style`（最小の `CSSStyleDeclaration` 相当）を
 //! 提供し、`style` 属性へ既存の `setAttribute` op で同期する（`getComputedStyle`・レイアウト・値の構文検証・
 //! HTML 由来の `style` 属性の読み取りは未実装。ベンダー接頭辞付きのプロパティは意図して定義しない）。
+//! `url.js`（#1144・`JS-5`・`JS-6`・`REPAIR-3`）は `URL` / `URLSearchParams` を提供し、URL の解析は
+//! bridge op `urlParse`（core の `reqwest::Url` に委譲）、form-urlencoded は JS で実装する
+//! （`protocol`・`host`・`port`・`pathname` 等の setter・`createObjectURL`・`URLPattern`・
+//! `URLSearchParams.sort` 等は未実装）。
 
 use fandhe_browser_js::{EvaluateOptions, JsEngine, JsEngineError};
 
@@ -76,6 +80,10 @@ pub const JS_SHIM_SOURCES: &[JsShimSource] = &[
     JsShimSource {
         name: "style.js",
         source: include_str!("style.js"),
+    },
+    JsShimSource {
+        name: "url.js",
+        source: include_str!("url.js"),
     },
 ];
 

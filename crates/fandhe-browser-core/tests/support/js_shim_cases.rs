@@ -49,6 +49,7 @@ fn setup(engine: &str, limit_extra_nodes: Option<usize>) -> Page {
             "net.js",
             "observers.js",
             "style.js",
+            "url.js",
         ]
     );
     Page { bridge, rt, script }
@@ -279,6 +280,7 @@ pub fn run(engine: &str) {
     window_cases(engine);
     observer_cases(engine);
     style_cases(engine);
+    url_cases(engine);
 
     eprintln!("case: JS-5 disabled runtime does not pretend to install");
     let mut disabled = JsRuntime::disabled();
@@ -1215,4 +1217,202 @@ fn style_cases(engine: &str) {
          d.style.cssText + '|' + (d.style instanceof CSSStyleDeclaration)",
         "color: red;|true",
     );
+}
+
+/// `URL` / `URLSearchParams`（#1144・`JS-5`・`JS-6`・`SEC-2`・`REPAIR-3`）のケース。
+fn url_cases(engine: &str) {
+    eprintln!("case: JS-5 URL globals and unsupported APIs stay undefined");
+    let mut p = setup(engine, None);
+    check(&mut p, "typeof URL", "function");
+    check(&mut p, "typeof URLSearchParams", "function");
+    check(&mut p, "typeof URL.createObjectURL", "undefined");
+    check(&mut p, "typeof URL.revokeObjectURL", "undefined");
+    check(&mut p, "typeof URLPattern", "undefined");
+
+    eprintln!("case: JS-5 URL getters / toString / toJSON / failures");
+    check(
+        &mut p,
+        "var u = new URL('https://user:pw@example.com:8080/a/b?x=1#h'); \
+         [u.href, u.origin, u.protocol, u.username, u.password, u.host, u.hostname, u.port, \
+          u.pathname, u.search, u.hash].join('|')",
+        "https://user:pw@example.com:8080/a/b?x=1#h|https://example.com:8080|https:|user|pw|example.com:8080|example.com|8080|/a/b|?x=1|#h",
+    );
+    check(
+        &mut p,
+        "new URL('/p?a=1', 'https://example.com/x').href",
+        "https://example.com/p?a=1",
+    );
+    check(
+        &mut p,
+        "var v = new URL('https://a/p'); String(v) + '|' + JSON.stringify({ u: v })",
+        "https://a/p|{\"u\":\"https://a/p\"}",
+    );
+    check(&mut p, "new URL(v).href", "https://a/p");
+    check(
+        &mut p,
+        "try { new URL('bad'); 'no' } catch (e) { e instanceof TypeError }",
+        "true",
+    );
+    check(
+        &mut p,
+        "try { URL('https://a/'); 'no' } catch (e) { e instanceof TypeError }",
+        "true",
+    );
+    check(
+        &mut p,
+        "[URL.canParse('https://a/'), URL.canParse('bad'), URL.canParse('/x', 'https://a/'), \
+         URL.canParse('/x', 'bad')].join()",
+        "true,false,true,false",
+    );
+    check(
+        &mut p,
+        "try { new URL('https://a/' + new Array(70000).join('x')); 'no' } catch (e) { e instanceof TypeError }",
+        "true",
+    );
+
+    eprintln!("case: JS-5 URLSearchParams encoding / decoding");
+    let mut p = setup(engine, None);
+    check(
+        &mut p,
+        "var q = new URLSearchParams(); q.set('q', 'a b&c'); q.toString()",
+        "q=a+b%26c",
+    );
+    check(
+        &mut p,
+        "q.append('k', '+%'); q.toString()",
+        "q=a+b%26c&k=%2B%25",
+    );
+    check(
+        &mut p,
+        "var d = new URLSearchParams('a=b+c&d=%2B&e=%zz&f=%E3%81%82&g'); \
+         [d.get('a'), d.get('d'), d.get('e'), d.get('f'), d.get('g'), d.get('none')].join('|')",
+        "b c|+|%zz|あ||",
+    );
+    check(&mut p, "d.get('none') === null", "true");
+    check(
+        &mut p,
+        "new URLSearchParams({ k: '*-._', t: '~!' }).toString()",
+        "k=*-._&t=%7E%21",
+    );
+    check(
+        &mut p,
+        "new URLSearchParams([['n', '\\u3042\\ud83d\\ude00']]).toString()",
+        "n=%E3%81%82%F0%9F%98%80",
+    );
+    check(
+        &mut p,
+        "new URLSearchParams([['n', '\\ud800']]).toString()",
+        "n=%EF%BF%BD",
+    );
+    check(
+        &mut p,
+        "new URLSearchParams('x=%ff%41').get('x').charCodeAt(0)",
+        "65533",
+    );
+
+    eprintln!("case: JS-5 URLSearchParams init forms and methods");
+    check(
+        &mut p,
+        "new URLSearchParams([['a', '1'], ['a', '2']]).getAll('a').join(',')",
+        "1,2",
+    );
+    check(&mut p, "new URLSearchParams({ x: 1 }).toString()", "x=1");
+    check(
+        &mut p,
+        "new URLSearchParams('?a=1').get('a') + new URLSearchParams(new URLSearchParams('b=2')).get('b')",
+        "12",
+    );
+    check(
+        &mut p,
+        "try { new URLSearchParams([['a']]); 'no' } catch (e) { e instanceof TypeError }",
+        "true",
+    );
+    check(
+        &mut p,
+        "var m = new URLSearchParams('a=1&b=2&a=3'); \
+         m.has('a') + '|' + m.has('z') + '|' + m.getAll('a').join(',')",
+        "true|false|1,3",
+    );
+    check(&mut p, "m.set('a', '9'); m.toString()", "a=9&b=2");
+    check(&mut p, "m.delete('a'); m.toString()", "b=2");
+    check(&mut p, "m.set('c', '3'); m.toString()", "b=2&c=3");
+    check(
+        &mut p,
+        "var acc = []; for (var kv of m) { acc.push(kv[0] + kv[1]); } acc.join()",
+        "b2,c3",
+    );
+    check(
+        &mut p,
+        "var ks = []; var it = m.keys(); var r; while (!(r = it.next()).done) { ks.push(r.value); } \
+         ks.join() + '|' + Array.from(m.values()).join() + '|' + Array.from(m.entries()).join(';')",
+        "b,c|2,3|b,2;c,3",
+    );
+    check(
+        &mut p,
+        "var fe = []; m.forEach(function (v, k, o) { fe.push(k + v + (o === m)); }); fe.join()",
+        "b2true,c3true",
+    );
+
+    eprintln!("case: JS-5 URL searchParams and search stay in sync");
+    let mut p = setup(engine, None);
+    check(
+        &mut p,
+        "var u = new URL('https://a/p?x=1#h'); u.searchParams.append('y', 'a b'); u.href",
+        "https://a/p?x=1&y=a+b#h",
+    );
+    check(
+        &mut p,
+        "u.searchParams.delete('x'); u.searchParams.delete('y'); u.href",
+        "https://a/p#h",
+    );
+    check(
+        &mut p,
+        "u.search = '?k=v'; u.searchParams.get('k') + '|' + u.href",
+        "v|https://a/p?k=v#h",
+    );
+    check(&mut p, "u.searchParams === u.searchParams", "true");
+    check(&mut p, "u.searchParams.set('k', 'w'); u.search", "?k=w");
+
+    eprintln!("case: JS-5 URL href / search / hash setters");
+    check(
+        &mut p,
+        "u.hash = 'z'; u.hash + '|' + u.href",
+        "#z|https://a/p?k=w#z",
+    );
+    check(&mut p, "u.hash = ''; u.href", "https://a/p?k=w");
+    check(&mut p, "u.search = 'a#b'; u.search", "?a%23b");
+    check(&mut p, "u.search = ''; u.href", "https://a/p");
+    check(
+        &mut p,
+        "u.href = 'https://b/?q=1'; u.host + '|' + u.searchParams.get('q')",
+        "b|1",
+    );
+    check(
+        &mut p,
+        "try { u.href = 'bad'; 'no' } catch (e) { e instanceof TypeError }",
+        "true",
+    );
+    check(
+        &mut p,
+        "var w = new URL('https://a/p?x?y#f?g'); w.search + '|' + w.hash + '|' + w.pathname",
+        "?x?y|#f?g|/p",
+    );
+    check(
+        &mut p,
+        "w.hash = 'n'; w.href + '|' + (new URL('http://a/?')).search + '|' + (new URL('http://a/#')).hash",
+        "https://a/p?x?y#n||",
+    );
+    check(
+        &mut p,
+        "var e1 = new URL('http://a/?'); e1.search = 'z=1'; e1.href",
+        "http://a/?z=1",
+    );
+
+    eprintln!("case: REPAIR-3 unimplemented setters throw in strict mode and do not change state");
+    check(
+        &mut p,
+        "(function () { 'use strict'; try { w.port = '1'; return 'no'; } catch (e) { return e instanceof TypeError; } })()",
+        "true",
+    );
+    check(&mut p, "w.port === ''", "true");
 }
