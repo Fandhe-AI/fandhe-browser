@@ -265,7 +265,11 @@ impl JsEngine for FakeModuleEngine {
                     log.events.push(format!("finish:{}:too-large", id.raw()));
                     return Err(JsEngineError::EvaluationFailed("x".repeat(16)));
                 }
-                let settlement = if src.contains("settle-throw") {
+                let settlement = if src.contains("settle-throw-ref") {
+                    ModuleEvaluation::rejected(
+                        "Uncaught ReferenceError: Foo is not defined (line 1)".to_string(),
+                    )
+                } else if src.contains("settle-throw") {
                     ModuleEvaluation::rejected("boom".to_string())
                 } else if src.contains("settle-pending") {
                     ModuleEvaluation::Pending
@@ -1446,6 +1450,104 @@ fn js_4_dynamic_import_rejected_by_evaluation_is_not_counted_fulfilled() {
     );
     assert_eq!(r.failures(), &[DynamicImportFailureKind::EvaluationFailed]);
     assert!(out.abort().is_none());
+}
+
+/// `JS-5`・Issue #1133: 動的 import の評価失敗は、種別と同数・同順で例外の要約を残す。
+#[test]
+fn js_5_dynamic_import_evaluation_error_is_summarized() {
+    let (port, _hits) = spawn_server(|path| match path {
+        "/r.js" => js("settle-throw-ref"),
+        "/b.js" => js("settle-throw"),
+        _ => js("finish-too-large"),
+    });
+    let html = "<script type=module>dynamic \"/r.js\"</script>\
+                <script type=module>dynamic \"/b.js\"</script>\
+                <script type=module>dynamic \"/l.js\"</script>";
+    let (out, _) = run(html, port, &module_options());
+    let r = out.dynamic_imports();
+    assert_eq!(r.failures().len(), 3);
+    let got: Vec<_> = r
+        .evaluation_errors()
+        .iter()
+        .map(|e| {
+            (
+                e.kind().as_str(),
+                e.message_class().as_str(),
+                e.identifier(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        got,
+        vec![
+            ("ReferenceError", "not_defined", Some("Foo")),
+            ("other", "other", None),
+            ("other", "other", None),
+        ]
+    );
+}
+
+/// `JS-5`・Issue #1133: module 評価失敗は固定文の `outcome` を保ったまま、要約を記録に載せる。
+/// 再参照でも同じ要約を返し、メッセージ中の URL・クエリは `Debug` にも出ない。
+#[test]
+fn js_5_module_evaluation_failure_carries_exception_summary() {
+    let (port, _hits) = spawn_server(|path| match path {
+        "/r.js" => {
+            js("reject:Uncaught ReferenceError: IntersectionObserver is not defined (line 3)")
+        }
+        "/u.js" => js("reject:Uncaught Error: https://h.example/p?token=SECRET"),
+        _ => js("1"),
+    });
+    let html = "<script type=module src=\"/r.js\"></script>\
+                <script type=module src=\"/r.js\"></script>\
+                <script type=module src=\"/u.js\"></script>\
+                <script type=module>1</script>";
+    let (out, _) = run(html, port, &module_options());
+    let fixed = ScriptOutcome::Exception {
+        message: "module evaluation failed".to_string(),
+        truncated: false,
+    };
+    assert_eq!(
+        outcomes(&out),
+        vec![
+            fixed.clone(),
+            fixed.clone(),
+            fixed,
+            ScriptOutcome::Succeeded
+        ]
+    );
+    let sums: Vec<_> = out
+        .scripts()
+        .iter()
+        .map(|r| {
+            r.exception_summary().map(|e| {
+                (
+                    e.kind().as_str(),
+                    e.message_class().as_str(),
+                    e.identifier(),
+                )
+            })
+        })
+        .collect();
+    assert_eq!(
+        sums,
+        vec![
+            Some((
+                "ReferenceError",
+                "not_defined",
+                Some("IntersectionObserver")
+            )),
+            Some((
+                "ReferenceError",
+                "not_defined",
+                Some("IntersectionObserver")
+            )),
+            Some(("Error", "other", None)),
+            None,
+        ]
+    );
+    let dbg = format!("{:?}", out.scripts());
+    assert!(!dbg.contains("SECRET") && !dbg.contains("https"));
 }
 
 /// `JS-4`・Issue #1117: top-level await 等で未確定のままの `import()` は resolve にも reject にも

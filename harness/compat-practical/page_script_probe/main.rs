@@ -36,7 +36,7 @@ use fandhe_browser_core::{
     ScriptKind, ScriptOutcome, ScriptSource, collect_page_scripts, page_script_fetch_options,
     parse_document, query_selector_all_str, run_page_scripts,
 };
-use probe::{Origin, ProbeArgs, class_label, lifecycle_label, script_line};
+use probe::{Origin, ProbeArgs, class_label, exception_label, lifecycle_label, script_line};
 use reqwest::Url;
 
 fn main() -> ExitCode {
@@ -317,7 +317,13 @@ async fn measure(
                 sanitize_debug(message)
             );
         }
-        lines.push(script_line(&args.id, rec.index(), origin, rec.outcome()));
+        lines.push(script_line(
+            &args.id,
+            rec.index(),
+            origin,
+            rec.outcome(),
+            rec.exception_summary(),
+        ));
     }
 
     let diag = out.bridge_diagnostics();
@@ -401,6 +407,13 @@ async fn measure(
         .map(|k| k.as_str().to_string())
         .collect();
     fail_kinds.sort();
+    // 評価失敗の要約（分類名・識別子のラベルのみ。生メッセージ・URL は出さない。Issue #1133）
+    let mut eval_errors: Vec<String> = dyn_imp
+        .evaluation_errors()
+        .iter()
+        .map(exception_label)
+        .collect();
+    eval_errors.sort();
     // 動的 import は件数と reject の種別名だけを出す（URL・specifier は出さない）
     let dyn_obj = Obj::new()
         .n("requested", dyn_imp.requested() as u64)
@@ -408,6 +421,7 @@ async fn measure(
         .n("rejected", dyn_imp.rejected() as u64)
         .n("pending", dyn_imp.pending() as u64)
         .strs("failures", &fail_kinds)
+        .strs("evaluation_errors", &eval_errors)
         .line();
     let lifecycle: Vec<String> = out
         .lifecycle()

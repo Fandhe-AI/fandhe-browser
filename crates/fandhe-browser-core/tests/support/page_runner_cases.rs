@@ -1192,6 +1192,48 @@ pub fn run_module_graph(engine: &str) {
     );
     assert_eq!(outcome_of(&out, 0).as_str(), "skipped");
     assert_eq!(hit_count(&hits), 0);
+
+    eprintln!("case: JS-5 module evaluation failure carries kind / class / identifier only");
+    let (port, _hits) = spawn_recording_server(|path| match path {
+        "/d.js" => js_response("export const v = 1;"),
+        _ => ("404 Not Found", String::new(), "nope".to_string()),
+    });
+    let base = format!("http://127.0.0.1:{port}/");
+    let html = "<body>\
+        <script type=module>missingShimApi.run();</script>\
+        <script type=module>import {nope} from './d.js?token=SECRET';</script>\
+        <script type=module>null.x;</script>\
+        </body>";
+    let out = run_page_at(engine, html, &base, &opts, &loopback_fetcher());
+    let sums: Vec<_> = out
+        .scripts()
+        .iter()
+        .map(|r| {
+            r.exception_summary().map(|e| {
+                (
+                    e.kind().as_str(),
+                    e.message_class().as_str(),
+                    e.identifier().map(str::to_string),
+                )
+            })
+        })
+        .collect();
+    assert_eq!(
+        sums.first(),
+        Some(&Some((
+            "ReferenceError",
+            "not_defined",
+            Some("missingShimApi".to_string())
+        )))
+    );
+    assert_eq!(
+        sums.get(2),
+        Some(&Some(("TypeError", "read_property", None)))
+    );
+    let dbg = format!("{:?}", out.scripts());
+    assert!(!dbg.contains("SECRET") && !dbg.contains("d.js"), "{dbg}");
+    // link / instantiate の失敗は評価失敗ではない（compile 失敗の固定文。分類は対象外）。
+    assert_eq!(sums.get(1), Some(&None));
 }
 /// 動的 `import()` をイベントループ段で取得して完了させるケース（`JS-4`・`JS-6`・`JS-8`・`SEC-2`・
 /// Issue #1117）。V8 のみ（boa は動的 `import()` を compile 時に拒否する）。

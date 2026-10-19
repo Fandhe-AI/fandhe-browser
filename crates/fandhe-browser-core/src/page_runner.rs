@@ -121,7 +121,10 @@ use crate::{NodeId, dom_bridge::truncate_utf8};
 
 pub use crate::dom_bridge::LifecycleEvent;
 
+mod exception_summary;
 mod module_graph;
+
+pub use exception_summary::{ExceptionKind, ExceptionMessageClass, ExceptionSummary};
 
 /// スクリプト 1 件あたりの実時間上限の既定（`EvaluateOptions` の既定と同じ 2 秒）。
 pub const DEFAULT_SCRIPT_WALL_TIME: Duration = EvaluateOptions::DEFAULT_TIMEOUT;
@@ -562,6 +565,7 @@ pub struct ScriptRunRecord {
     index: Option<usize>,
     node: Option<NodeId>,
     outcome: ScriptOutcome,
+    exception: Option<ExceptionSummary>,
 }
 
 impl ScriptRunRecord {
@@ -578,6 +582,14 @@ impl ScriptRunRecord {
     /// 結果。
     pub fn outcome(&self) -> &ScriptOutcome {
         &self.outcome
+    }
+
+    /// 例外の要約（分類名と不足識別子名。生メッセージ・URL は含まない。`JS-5`・Issue #1133）。
+    ///
+    /// 現状は `type=module` の評価失敗（`outcome` が `Exception`）のときだけ埋まる。
+    /// classic の例外は将来対応で、常に `None`（`REPAIR-3`）。`outcome` の固定文は変えない。
+    pub fn exception_summary(&self) -> Option<&ExceptionSummary> {
+        self.exception.as_ref()
     }
 }
 
@@ -722,6 +734,7 @@ pub struct DynamicImportReport {
     pub(crate) rejected: usize,
     pub(crate) pending: usize,
     pub(crate) failures: Vec<DynamicImportFailureKind>,
+    pub(crate) evaluation_errors: Vec<ExceptionSummary>,
 }
 
 impl DynamicImportReport {
@@ -749,6 +762,12 @@ impl DynamicImportReport {
     /// reject の理由（種別のみ。処理順）。
     pub fn failures(&self) -> &[DynamicImportFailureKind] {
         &self.failures
+    }
+
+    /// `failures` 中の `EvaluationFailed` それぞれの例外の要約（同数・同順。`JS-5`・Issue #1133）。
+    /// 生メッセージ・URL は含まない。特定できないものは `Other` の要約になる。
+    pub fn evaluation_errors(&self) -> &[ExceptionSummary] {
+        &self.evaluation_errors
     }
 }
 
@@ -1218,6 +1237,8 @@ async fn execute(
     // ページで 1 つの module グラフ（モジュールマップ・件数・総バイトの計上。Issue #1116）。
     let mut graph = module_graph::ModuleGraph::new();
     for (entry, load) in collected.entries().iter().zip(loads.iter()) {
+        // module 評価失敗の例外の要約（`outcome` が `Exception` のままのときだけ記録に載せる。Issue #1133）。
+        let mut module_exception: Option<ExceptionSummary> = None;
         let outcome = if let Some(a) = &abort {
             ScriptOutcome::NotExecuted {
                 kind: a.kind.clone(),
@@ -1258,6 +1279,7 @@ async fn execute(
                         kind,
                         message: None,
                     },
+                    exception: None,
                 });
                 continue;
             }
@@ -1271,7 +1293,7 @@ async fn execute(
                         Some(rt) => {
                             let mut o = match (load, source) {
                                 (ScriptLoad::Module, _) => {
-                                    module_graph::run_module_entry(
+                                    let result = module_graph::run_module_entry(
                                         rt,
                                         &ctx,
                                         &mut graph,
@@ -1279,7 +1301,9 @@ async fn execute(
                                         entry.index(),
                                         &mut abort,
                                     )
-                                    .await
+                                    .await;
+                                    module_exception = result.exception;
+                                    result.outcome
                                 }
                                 (ScriptLoad::Ready(src), _) | (_, ScriptSource::Inline(src)) => {
                                     run_one(rt, &ctx, entry.node(), entry.index(), src, &mut abort)?
@@ -1330,10 +1354,16 @@ async fn execute(
                 },
             }
         };
+        let exception = if matches!(outcome, ScriptOutcome::Exception { .. }) {
+            module_exception
+        } else {
+            None
+        };
         records.push(ScriptRunRecord {
             index: Some(entry.index()),
             node: Some(entry.node()),
             outcome,
+            exception,
         });
     }
 
@@ -1963,6 +1993,7 @@ fn finish(
                 kind: d.kind(),
                 count: d.count(),
             },
+            exception: None,
         });
     }
     // 安定ソート。通し番号の無い診断（件数上限）は末尾に置く。

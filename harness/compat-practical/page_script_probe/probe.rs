@@ -9,7 +9,8 @@
 use std::path::PathBuf;
 
 use fandhe_browser_core::{
-    LifecycleEvent, LifecycleOutcome, ScriptDiagnosticKind, ScriptOutcome, SrcFetchErrorKind,
+    ExceptionKind, ExceptionSummary, LifecycleEvent, LifecycleOutcome, ScriptDiagnosticKind,
+    ScriptOutcome, SrcFetchErrorKind,
 };
 use reqwest::Url;
 
@@ -118,6 +119,7 @@ pub fn script_line(
     index: Option<usize>,
     origin: Origin,
     outcome: &ScriptOutcome,
+    exception: Option<&ExceptionSummary>,
 ) -> String {
     let mut o = Obj::new()
         .s("type", "script")
@@ -132,6 +134,22 @@ pub fn script_line(
     };
     o = o.s("outcome", outcome.as_str());
     match outcome {
+        // module 評価失敗は core が生メッセージを捨てて要約だけを渡す（Issue #1133）。
+        // 要約が無い（classic）ときは従来どおり固定文でなく生メッセージを `classify` する。
+        ScriptOutcome::Exception { truncated, .. } if exception.is_some() => {
+            if let Some(e) = exception {
+                let kind = match e.kind() {
+                    ExceptionKind::Other => None,
+                    k => Some(k.as_str()),
+                };
+                o = o
+                    .opt_s("error_kind", kind)
+                    .s("message_class", e.message_class().as_str())
+                    .opt_s("missing_api", e.identifier())
+                    .s("exception_source", "module_evaluation")
+                    .raw("truncated", truncated.to_string());
+            }
+        }
         ScriptOutcome::Exception { message, truncated } => {
             let c = classify(message);
             o = o
@@ -163,6 +181,14 @@ pub fn script_line(
         _ => {}
     }
     o.line()
+}
+
+/// 動的 import の評価失敗の要約を `<kind>:<class>[:<identifier>]` のラベルにする。
+pub fn exception_label(e: &ExceptionSummary) -> String {
+    match e.identifier() {
+        Some(id) => format!("{}:{}:{id}", e.kind().as_str(), e.message_class().as_str()),
+        None => format!("{}:{}", e.kind().as_str(), e.message_class().as_str()),
+    }
 }
 
 fn skip_name(k: &ScriptDiagnosticKind) -> &'static str {
@@ -246,7 +272,13 @@ mod tests {
             message: "Uncaught Error: SECRET_TOKEN_VALUE".to_string(),
             truncated: false,
         };
-        let line = script_line("b5", Some(4), Origin::Src { same_origin: false }, &leaky);
+        let line = script_line(
+            "b5",
+            Some(4),
+            Origin::Src { same_origin: false },
+            &leaky,
+            None,
+        );
         assert!(!line.contains("SECRET_TOKEN_VALUE"), "{line}");
         assert!(line.contains(r#""outcome":"exception""#), "{line}");
         assert!(line.contains(r#""source":"src""#), "{line}");
@@ -259,7 +291,7 @@ mod tests {
                 .to_string(),
             truncated: false,
         };
-        let line = script_line("b5", Some(4), Origin::Inline, &known);
+        let line = script_line("b5", Some(4), Origin::Inline, &known, None);
         assert!(line.contains(r#""error_kind":"ReferenceError""#), "{line}");
         assert!(line.contains(r#""message_class":"not_defined""#), "{line}");
         assert!(
@@ -275,12 +307,12 @@ mod tests {
             kind: ScriptDiagnosticKind::SkippedModule,
             count: None,
         };
-        let line = script_line("b5", Some(2), Origin::Unknown, &s);
+        let line = script_line("b5", Some(2), Origin::Unknown, &s, None);
         assert!(line.contains(r#""skip_kind":"skipped_module""#), "{line}");
         let f = ScriptOutcome::SrcFetchFailed {
             kind: SrcFetchErrorKind::HttpStatus { status: 403 },
         };
-        let line = script_line("b5", Some(1), Origin::Src { same_origin: true }, &f);
+        let line = script_line("b5", Some(1), Origin::Src { same_origin: true }, &f, None);
         assert!(line.contains(r#""fetch_error":"http_status""#), "{line}");
         assert!(line.contains(r#""http_status":403"#), "{line}");
     }
@@ -288,20 +320,72 @@ mod tests {
     /// `JS-2`・#1119: module の保留・未対応と別オリジン拒否は種別名だけを出す。
     #[test]
     fn module_outcomes_carry_kinds_only() {
-        let line = script_line("b5", Some(0), Origin::Inline, &ScriptOutcome::ModulePending);
+        let line = script_line(
+            "b5",
+            Some(0),
+            Origin::Inline,
+            &ScriptOutcome::ModulePending,
+            None,
+        );
         assert!(line.contains(r#""outcome":"module_pending""#), "{line}");
         let line = script_line(
             "b5",
             Some(1),
             Origin::Src { same_origin: false },
             &ScriptOutcome::ModuleUnsupported,
+            None,
         );
         assert!(line.contains(r#""outcome":"module_unsupported""#), "{line}");
         let f = ScriptOutcome::SrcFetchFailed {
             kind: SrcFetchErrorKind::CrossOrigin,
         };
-        let line = script_line("b5", Some(2), Origin::Src { same_origin: false }, &f);
+        let line = script_line("b5", Some(2), Origin::Src { same_origin: false }, &f, None);
         assert!(line.contains(r#""fetch_error":"cross_origin""#), "{line}");
+    }
+
+    /// `JS-5`・Issue #1133: module 評価失敗は core の要約から分類と識別子を出し、
+    /// 固定文のメッセージ・specifier・クエリは出力に混入しない。
+    #[test]
+    fn module_exception_line_uses_summary_only() {
+        let fixed = ScriptOutcome::Exception {
+            message: "module evaluation failed".to_string(),
+            truncated: false,
+        };
+        let sum = ExceptionSummary::from_engine_message(
+            "Uncaught ReferenceError: ResizeObserver is not defined (line 9)",
+        );
+        let line = script_line("d2", Some(1), Origin::Inline, &fixed, Some(&sum));
+        assert!(line.contains(r#""error_kind":"ReferenceError""#), "{line}");
+        assert!(line.contains(r#""message_class":"not_defined""#), "{line}");
+        assert!(line.contains(r#""missing_api":"ResizeObserver""#), "{line}");
+        assert!(
+            line.contains(r#""exception_source":"module_evaluation""#),
+            "{line}"
+        );
+        assert_eq!(
+            exception_label(&sum),
+            "ReferenceError:not_defined:ResizeObserver"
+        );
+
+        let sum = ExceptionSummary::from_engine_message(
+            "Uncaught SyntaxError: The requested module './d.js?token=SECRET' does not provide an export named 'nope'",
+        );
+        let line = script_line("d2", Some(2), Origin::Inline, &fixed, Some(&sum));
+        assert!(
+            line.contains(r#""message_class":"missing_export""#),
+            "{line}"
+        );
+        assert!(line.contains(r#""missing_api":"nope""#), "{line}");
+        assert!(!line.contains("SECRET") && !line.contains("d.js"), "{line}");
+
+        let sum = ExceptionSummary::from_engine_message("Uncaught Error: https://h/p?token=SECRET");
+        let line = script_line("d2", Some(3), Origin::Inline, &fixed, Some(&sum));
+        assert!(line.contains(r#""error_kind":"Error""#), "{line}");
+        assert!(line.contains(r#""message_class":"other""#), "{line}");
+        assert!(
+            !line.contains("SECRET") && !line.contains("https"),
+            "{line}"
+        );
     }
 
     #[test]
