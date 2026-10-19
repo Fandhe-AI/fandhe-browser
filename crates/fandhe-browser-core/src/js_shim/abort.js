@@ -312,6 +312,9 @@
         var fired = createObject(null);
         var firedCount = 0;
         var rootReason = reason;
+        // ページ定義の abort algorithm（追従関数）は全依存の状態確定後に実行するため、いったん溜める。
+        var deferred = createObject(null);
+        var deferredCount = 0;
         while (pendingHead < pendingTail) {
             var cur = pending[pendingHead];
             delete pending[pendingHead];
@@ -349,11 +352,15 @@
                     pendingTail += 1;
                     continue;
                 }
-                try {
-                    fnCall(snapshot[i], undefined, st.reason);
-                } catch (e) {
-                    reportLater(e);
-                }
+                deferred[deferredCount] = { fn: snapshot[i], reason: st.reason };
+                deferredCount += 1;
+            }
+        }
+        for (var d = 0; d < deferredCount; d++) {
+            try {
+                fnCall(deferred[d].fn, undefined, deferred[d].reason);
+            } catch (e) {
+                reportLater(e);
             }
         }
         // 仕様では依存シグナルは元の source signal に平坦化されており、依存の作成順（登録順）に配られる。

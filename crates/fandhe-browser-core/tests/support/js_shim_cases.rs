@@ -1836,6 +1836,17 @@ fn abort_cases(engine: &str) {
         "on,first",
     );
 
+    eprintln!("case: JS-5 dependents are settled before page abort algorithms run");
+    check(
+        &mut p,
+        "var fa = new AbortController(); var fb = new AbortController(); \
+         __fandheAbortFollow(fa.signal, function () { fb.abort('second'); }); \
+         var fs = AbortSignal.any([fa.signal, fb.signal]); \
+         fa.abort('first'); \
+         [fa.signal.reason, fs.reason, fb.signal.reason].join('|')",
+        "first|first|second",
+    );
+
     eprintln!("case: JS-6 abort listener count is capped and flagged");
     let mut p = setup(engine, None);
     check(
