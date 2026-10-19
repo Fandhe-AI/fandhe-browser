@@ -59,7 +59,7 @@ use fandhe_browser_js::{
 };
 use reqwest::Url;
 
-use super::exception_summary::summarize_exception_message;
+use super::exception_summary::{RawExceptionMessage, summarize_exception_message};
 use super::{
     AbortKind, DynamicImportFailureKind, DynamicImportReport, ExceptionSummary,
     MAX_MODULE_GRAPH_DEPTH, MAX_PAGE_DYNAMIC_IMPORTS, PageAbort, RunContext, ScriptBytesScope,
@@ -219,7 +219,7 @@ enum EvalState {
     /// 保留（top-level await 等）。再参照でも成功とは見なさない。
     Pending,
     /// 評価の失敗。`outcome` は固定メッセージで返し、生メッセージは保持しない（要約だけ保持する）。
-    Rejected(ExceptionSummary),
+    Rejected(ExceptionSummary, Option<RawExceptionMessage>),
 }
 
 impl ModuleGraph {
@@ -779,6 +779,8 @@ fn rejected_outcome() -> ScriptOutcome {
 pub(super) struct ModuleEntryResult {
     pub(super) outcome: ScriptOutcome,
     pub(super) exception: Option<ExceptionSummary>,
+    /// opt-in 時のみ、切り詰め済みの生メッセージ（Issue #1152）。
+    pub(super) raw_exception: Option<RawExceptionMessage>,
 }
 
 impl From<ScriptOutcome> for ModuleEntryResult {
@@ -786,15 +788,27 @@ impl From<ScriptOutcome> for ModuleEntryResult {
         Self {
             outcome,
             exception: None,
+            raw_exception: None,
         }
     }
 }
 
+/// opt-in が有効なときだけ、生メッセージを切り詰めて保持する（無効時は確保しない。Issue #1152）。
+fn retain_raw(options: &super::PageRunOptions, message: &str) -> Option<RawExceptionMessage> {
+    options
+        .retains_raw_exception_messages()
+        .then(|| RawExceptionMessage::clipped(message))
+}
+
 /// 評価失敗を固定文の `outcome` と要約の組にする。
-fn rejected_result(summary: ExceptionSummary) -> ModuleEntryResult {
+fn rejected_result(
+    summary: ExceptionSummary,
+    raw: Option<RawExceptionMessage>,
+) -> ModuleEntryResult {
     ModuleEntryResult {
         outcome: rejected_outcome(),
         exception: Some(summary),
+        raw_exception: raw,
     }
 }
 
@@ -832,10 +846,11 @@ fn evaluate_root(
         }
         Ok(ModuleEvaluation::Rejected { message, .. }) => {
             let summary = summarize_exception_message(&message);
+            let raw = retain_raw(options, &message);
             graph
                 .evaluated
-                .insert(root, EvalState::Rejected(summary.clone()));
-            rejected_result(summary)
+                .insert(root, EvalState::Rejected(summary.clone(), raw.clone()));
+            rejected_result(summary, raw)
         }
         // 未知の結果は成功と見なさない（fail-closed）。
         Ok(_) => aborted(AbortKind::EngineError, None, index, abort).into(),
@@ -849,10 +864,11 @@ fn evaluate_root(
                 aborted(page_wall_abort(options, None).kind, None, index, abort).into()
             } else {
                 let summary = summarize_exception_message(&m);
+                let raw = retain_raw(options, &m);
                 graph
                     .evaluated
-                    .insert(root, EvalState::Rejected(summary.clone()));
-                rejected_result(summary)
+                    .insert(root, EvalState::Rejected(summary.clone(), raw.clone()));
+                rejected_result(summary, raw)
             }
         }
         Err(e) => {
@@ -895,7 +911,9 @@ pub(super) async fn run_module_entry(
         // （`JS-4`。エンジンは evaluate 済みの root に対し現在の Promise の状態を返す）。
         match state {
             EvalState::Succeeded => return ScriptOutcome::Succeeded.into(),
-            EvalState::Rejected(summary) => return rejected_result(summary.clone()),
+            EvalState::Rejected(summary, raw) => {
+                return rejected_result(summary.clone(), raw.clone());
+            }
             EvalState::Pending => {}
         }
     }
@@ -1134,6 +1152,14 @@ pub(super) async fn pump_one_dynamic_import(
                     .failures
                     .push(DynamicImportFailureKind::EvaluationFailed);
                 // `failures` と同数・同順で要約を積む（未知の確定結果は `Other`。Issue #1133）。
+                if ctx.options.retains_raw_exception_messages() {
+                    report.raw_evaluation_messages.push(match &other {
+                        ModuleEvaluation::Rejected { message, .. } => {
+                            retain_raw(ctx.options, message)
+                        }
+                        _ => None,
+                    });
+                }
                 report.evaluation_errors.push(match other {
                     ModuleEvaluation::Rejected { message, .. } => {
                         summarize_exception_message(&message)

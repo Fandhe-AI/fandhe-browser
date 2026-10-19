@@ -238,6 +238,38 @@ fn identifier_of(s: &str) -> Option<String> {
     is_valid_identifier(s).then(|| s.to_string())
 }
 
+/// 計測用 opt-in で保持する生メッセージの最大文字数（Issue #1152。probe の `sanitize_debug` と揃える）。
+pub(crate) const MAX_RAW_EXCEPTION_DEBUG_CHARS: usize = 300;
+
+/// 計測用 example の stderr 専用に保持する、切り詰め済みの生例外メッセージ（Issue #1152・`REPAIR-4`・`SEC-2`）。
+///
+/// 呼び出し元: [`super::module_graph`] が [`super::PageRunOptions`] の opt-in が有効なときだけ作る。
+/// 本文は URL・トークンを含み得るため、`Debug` では本文を出さず長さだけを出す
+/// （`{:?}` 経由の誤ログを防ぐ）。取得は `#[doc(hidden)]` の getter のみ。
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct RawExceptionMessage(String);
+
+impl RawExceptionMessage {
+    /// 先頭 [`MAX_RAW_EXCEPTION_DEBUG_CHARS`] 文字（char 境界）に切って保持する。
+    pub(crate) fn clipped(msg: &str) -> Self {
+        Self(msg.chars().take(MAX_RAW_EXCEPTION_DEBUG_CHARS).collect())
+    }
+
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for RawExceptionMessage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "RawExceptionMessage(<redacted, {} chars>)",
+            self.0.chars().count()
+        )
+    }
+}
+
 /// 先頭 [`MAX_SCANNED_MESSAGE_BYTES`] バイト（char 境界）に切る。
 fn clip(msg: &str) -> &str {
     if msg.len() <= MAX_SCANNED_MESSAGE_BYTES {
