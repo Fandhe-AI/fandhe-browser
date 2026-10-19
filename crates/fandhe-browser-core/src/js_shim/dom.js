@@ -24,7 +24,7 @@
 // 未実装（REPAIR-3。後続 issue / #779 で追加）:
 // - bridge のエラーはエンジンの例外（Error）のまま伝わる。DOMException への写像は未対応。
 // - NodeList / HTMLCollection 互換（querySelectorAll は素の Array を返す）。
-// - nodeType / tagName / getAttribute / parentNode 等（#771 のスパイク結果に応じて op ごと追加）。
+// - nodeType / tagName / parentNode / attributes（属性の列挙）等（#771 のスパイク結果に応じて op ごと追加）。
 // - window / location / navigator / console は js_shim の別ソース（#779）。
 (function (global) {
     'use strict';
@@ -192,6 +192,24 @@
             if (typeof removedName === 'string') {
                 notifyMutation('attributes', this, { attributeName: removedName });
             }
+        }
+    });
+    // 属性値の読み取り。bridge は文字列か null を返す（エンジン間の null / undefined の差はここで吸収）。
+    function readAttribute(self, method, name) {
+        var v = op('getAttribute', idOf(self, method), String(name));
+        return typeof v === 'string' ? v : null;
+    }
+    define(Element.prototype, 'getAttribute', {
+        writable: true,
+        value: function getAttribute(name) {
+            return readAttribute(this, 'getAttribute', name);
+        }
+    });
+    define(Element.prototype, 'hasAttribute', {
+        writable: true,
+        value: function hasAttribute(name) {
+            // ページが差し替え得る getAttribute を経由せず、同じ op で判定する。
+            return readAttribute(this, 'hasAttribute', name) !== null;
         }
     });
     define(Element.prototype, 'innerHTML', {
