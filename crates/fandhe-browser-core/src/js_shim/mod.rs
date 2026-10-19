@@ -31,6 +31,9 @@
 //! `JS-7`・`JS-6`）は `MutationObserver` / `MutationRecord` を提供し、dom.js の変更系ラッパーが呼ぶ
 //! フックで検出した変更を microtask で配信する（oldValue・transient registered observer・
 //! innerHTML / textContent 設定時の追加・削除ノード等は未実装。診断は `mutationOptionsIgnored` op）。
+//! `style.js`（#1141・`JS-5`・`JS-6`・`SEC-2`）は要素の `style`（最小の `CSSStyleDeclaration` 相当）を
+//! 提供し、`style` 属性へ既存の `setAttribute` op で同期する（`getComputedStyle`・レイアウト・値の構文検証・
+//! HTML 由来の `style` 属性の読み取りは未実装。ベンダー接頭辞付きのプロパティは意図して定義しない）。
 
 use fandhe_browser_js::{EvaluateOptions, JsEngine, JsEngineError};
 
@@ -69,6 +72,10 @@ pub const JS_SHIM_SOURCES: &[JsShimSource] = &[
     JsShimSource {
         name: "observers.js",
         source: include_str!("observers.js"),
+    },
+    JsShimSource {
+        name: "style.js",
+        source: include_str!("style.js"),
     },
 ];
 

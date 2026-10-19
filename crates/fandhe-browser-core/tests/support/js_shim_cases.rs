@@ -48,6 +48,7 @@ fn setup(engine: &str, limit_extra_nodes: Option<usize>) -> Page {
             "timers.js",
             "net.js",
             "observers.js",
+            "style.js",
         ]
     );
     Page { bridge, rt, script }
@@ -277,6 +278,7 @@ pub fn run(engine: &str) {
 
     window_cases(engine);
     observer_cases(engine);
+    style_cases(engine);
 
     eprintln!("case: JS-5 disabled runtime does not pretend to install");
     let mut disabled = JsRuntime::disabled();
@@ -819,5 +821,398 @@ fn observer_cases(engine: &str) {
             .take_diagnostics()
             .expect("diagnostics")
             .mutation_observer_limit_exceeded
+    );
+}
+
+/// 要素の `style`（#1141・`JS-5`・`JS-6`・`SEC-2`・`REPAIR-3`）のケース。
+fn style_cases(engine: &str) {
+    eprintln!("case: JS-5 style in-check (React-style feature detection)");
+    let mut p = setup(engine, None);
+    check(
+        &mut p,
+        "var s = document.createElement('div').style; typeof s",
+        "object",
+    );
+    check(&mut p, "s instanceof CSSStyleDeclaration", "true");
+    check(&mut p, "'display' in s", "true");
+    check(&mut p, "'cssFloat' in s", "true");
+    check(&mut p, "'animation' in s", "true");
+    check(
+        &mut p,
+        "'backgroundColor' in s && 'background-color' in s",
+        "true",
+    );
+    check(&mut p, "'WebkitAnimation' in s", "false");
+    check(&mut p, "'MozAnimation' in s", "false");
+    check(
+        &mut p,
+        "var e = document.createElement('div'); e.style === e.style",
+        "true",
+    );
+    check(
+        &mut p,
+        "try { new CSSStyleDeclaration(); 'no error' } catch (x) { x instanceof TypeError ? 'TypeError' : 'other' }",
+        "TypeError",
+    );
+    check(&mut p, "typeof document.style", "undefined");
+
+    eprintln!("case: JS-5 style camelCase read/write syncs the style attribute");
+    let mut p = setup(engine, None);
+    check(
+        &mut p,
+        "var d = document.createElement('div'); d.style.backgroundColor = 'red'; \
+         d.style.backgroundColor + '|' + d.style.getPropertyValue('background-color')",
+        "red|red",
+    );
+    check(&mut p, "document.body.appendChild(d) === d", "true");
+    assert!(
+        p.html()
+            .contains("<div style=\"background-color: red;\"></div>"),
+        "html: {}",
+        p.html()
+    );
+    check(
+        &mut p,
+        "d.style.cssFloat = 'left'; d.style.getPropertyValue('float')",
+        "left",
+    );
+
+    eprintln!("case: JS-5 setProperty / getPropertyValue / removeProperty / priority");
+    let mut p = setup(engine, None);
+    check(
+        &mut p,
+        "var s = document.createElement('div').style; s.setProperty('color', 'blue', 'important'); \
+         s.getPropertyPriority('color') + '|' + s.cssText",
+        "important|color: blue !important;",
+    );
+    check(&mut p, "s.removeProperty('color')", "blue");
+    check(&mut p, "s.getPropertyValue('color')", "");
+    check(&mut p, "s.removeProperty('color')", "");
+    check(
+        &mut p,
+        "s.setProperty('--MyVar', '1px'); s.setProperty('COLOR', 'red'); s.cssText",
+        "--MyVar: 1px; color: red;",
+    );
+    check(
+        &mut p,
+        "s.getPropertyValue('--MyVar') + s.getPropertyValue('--myvar')",
+        "1px",
+    );
+    check(&mut p, "s.setProperty('color', ''); s.length", "1");
+    check(
+        &mut p,
+        "s.setProperty('1bad', 'x'); s.setProperty('a', 'b', 'bogus'); s.length",
+        "1",
+    );
+
+    eprintln!("case: JS-5 style cssText parse / serialize");
+    let mut p = setup(engine, None);
+    check(
+        &mut p,
+        "var d = document.createElement('div'); document.body.appendChild(d); \
+         d.style.cssText = 'display: none; color: red'; \
+         d.style.display + '|' + d.style.length + '|' + d.style.item(0) + '|' + d.style.item(5) + '|' + d.style.item(-1)",
+        "none|2|display||",
+    );
+    assert!(
+        p.html()
+            .contains("<div style=\"display: none; color: red;\"></div>"),
+        "html: {}",
+        p.html()
+    );
+    check(
+        &mut p,
+        "d.style = 'top: 1px'; d.style.cssText + '|' + d.style.length",
+        "top: 1px;|1",
+    );
+    check(
+        &mut p,
+        "d.style.cssText = 'background: url(\"a;b\") no-repeat !important; bad; : x; left: 2px;; '; d.style.cssText",
+        "background: url(\"a;b\") no-repeat !important; left: 2px;",
+    );
+    check(
+        &mut p,
+        "d.style.cssText = ''; d.style.cssText + '|' + d.style.length",
+        "|0",
+    );
+    assert!(
+        p.html().contains("<div style=\"\"></div>"),
+        "html: {}",
+        p.html()
+    );
+
+    eprintln!("case: JS-5 style invalid value does not smuggle declarations");
+    let mut p = setup(engine, None);
+    check(
+        &mut p,
+        "var s = document.createElement('div').style; s.color = 'red'; \
+         s.color = 'blue; position: fixed'; s.setProperty('width', '1px} x{'); s.cssText",
+        "color: red;",
+    );
+    // コメント内の括弧で深さをずらして別宣言を紛れ込ませる試みは拒否する。
+    check(
+        &mut p,
+        "s.color = 'red/*(*/; position: fixed; /*)*/'; s.setProperty('top', '1px/*'); \
+         s.setProperty('left', 'red\\\\'); s.cssText",
+        "color: red;",
+    );
+    // cssText ではコメントを除去し、コメント内の `;` と括弧を境界・深さに数えない。
+    check(
+        &mut p,
+        "s.cssText = 'color: red/*(*/; top: 1px; /*)*/ left: 2px; /* a; b: c */ width: 3px'; \
+         s.cssText",
+        "color: red; top: 1px; left: 2px; width: 3px;",
+    );
+
+    // 引用符内の未エスケープ改行は文字列を終わらせるため、setProperty では拒否し、cssText では
+    // 改行以降を別宣言として扱う（実属性の解釈と一致させる）。
+    check(
+        &mut p,
+        "s.cssText = ''; s.setProperty('--x', '\"a\\n; color: red; x:\"'); s.cssText",
+        "",
+    );
+    check(
+        &mut p,
+        "s.cssText = '--x: \"a\\n; color: red'; s.cssText",
+        "color: red;",
+    );
+    // 名前の文字列化で style が更新されても、getPropertyPriority は最新のモデルを参照する。
+    check(
+        &mut p,
+        "s.cssText = ''; s.getPropertyPriority({ toString: function () { \
+         s.setProperty('color', 'red', 'important'); return 'color'; } })",
+        "important",
+    );
+
+    let mut q = setup(engine, None);
+    // 角括弧も丸括弧と同様に追跡する。未閉鎖の `[` は拒否し、cssText の `[a;b]` は 1 値として扱う。
+    check(
+        &mut q,
+        "var s = document.createElement('div').style; s.setProperty('--x', '['); s.color = 'red'; s.cssText",
+        "color: red;",
+    );
+    check(
+        &mut q,
+        "s.cssText = '--x: [a;b]; color: red'; s.length + '|' + s.getPropertyValue('--x') + '|' + s.color",
+        "2|[a;b]|red",
+    );
+    // 既存名の更新は宣言の位置を保つ（新規名だけ末尾）。
+    check(
+        &mut q,
+        "s.cssText = 'color: red; display: block'; s.color = 'blue'; s.item(0) + '|' + s.cssText",
+        "color|color: blue; display: block;",
+    );
+
+    // 優先度の区切りは引用符・括弧の外の未エスケープの `!` だけ（core の parse_declarations と同じ）。
+    check(
+        &mut q,
+        r#"s.cssText = '--x: \\!important; color: red'; s.length + '|' + s.getPropertyValue('--x') + '|[' + s.getPropertyPriority('--x') + ']|' + s.cssText"#,
+        r#"2|\!important|[]|--x: \!important; color: red;"#,
+    );
+    check(
+        &mut q,
+        r#"s.cssText = '--y: "a!important"; --z: f(b!important); --w: a!b; color: red !important'; s.getPropertyValue('--y') + '|' + s.getPropertyValue('--z') + '|' + s.getPropertyValue('--w') + '|' + s.getPropertyPriority('--y') + s.getPropertyPriority('--z') + s.getPropertyPriority('--w') + '|' + s.getPropertyPriority('color') + '|' + s.length"#,
+        r#""a!important"|f(b!important)|a!b||important|4"#,
+    );
+
+    // 上限超過の値は走査せずに拒否し、モデルと属性は変わらない（JS-6。二次時間の走査を避ける）。
+    check(
+        &mut q,
+        "var big = '!A'.repeat(1000000); s.cssText = 'color: red'; s.setProperty('--x', big); s.color = big; s.cssText = big; s.cssText",
+        "color: red;",
+    );
+    check(
+        &mut q,
+        "var e = document.createElement('div'); e.style.color = 'blue'; e.style.setProperty('--x', big); e.setAttribute('style', 'color: red'); e.style.setProperty('--y', '!A'.repeat(2049)); e.style.cssText + '|' + e.style.length",
+        "color: red;|1",
+    );
+
+    eprintln!(
+        "case: JS-5 style unbalanced paren / oversize cssText / removeProperty arg side effects"
+    );
+    let mut p = setup(engine, None);
+    check(
+        &mut p,
+        "var d = document.createElement('div'); document.body.appendChild(d); var s = d.style; \
+         s.background = 'url('; s.color = 'red'; s.setProperty('top', 'calc(1px'); s.cssText",
+        "color: red;",
+    );
+    check(
+        &mut p,
+        "s.cssText = 'x'.repeat(32769); s.cssText + '|' + s.length",
+        "color: red;|1",
+    );
+    assert!(
+        p.html().contains("style=\"color: red;\""),
+        "attribute must be kept: {}",
+        p.html()
+    );
+    check(&mut p, "s.cssText = ''; s.cssText + '|' + s.length", "|0");
+    check(
+        &mut p,
+        "s.color = 'red'; s.removeProperty({ toString: function () { s.backgroundColor = 'blue'; return 'color'; } }); \
+         s.cssText",
+        "background-color: blue;",
+    );
+
+    eprintln!("case: JS-6 style limits are enforced and warned once");
+    let mut p = setup(engine, None);
+    check(
+        &mut p,
+        "var s = document.createElement('div').style; \
+         for (var i = 0; i < 300; i++) { s.setProperty('p' + i, '1'); } \
+         s.setProperty('q', 'x'.repeat(5000)); s.length",
+        "256",
+    );
+    let diag = p.bridge.take_diagnostics().expect("diagnostics");
+    assert_eq!(diag.console_messages.len(), 1);
+    assert_eq!(
+        diag.console_messages[0].text,
+        "style shim limit exceeded: declaration ignored"
+    );
+
+    eprintln!("case: JS-5 style attribute sync and MutationObserver");
+    let mut p = setup(engine, None);
+    check(
+        &mut p,
+        "var d = document.createElement('div'); d.setAttribute('STYLE', 'left: 2px'); \
+         d.style.left + '|' + d.style.length",
+        "2px|1",
+    );
+    check(&mut p, "d.removeAttribute('style'); d.style.length", "0");
+    check(
+        &mut p,
+        "var seen = []; var mo = new MutationObserver(function (r) { \
+           for (var i = 0; i < r.length; i++) seen.push(r[i].type + ':' + r[i].attributeName); }); \
+         mo.observe(d, { attributes: true }); d.style.top = '1px'; __fandheRunMicrotasks(); seen.join(',')",
+        "attributes:style",
+    );
+
+    eprintln!("case: REPAIR-3 style baseline of parser-created elements is unknown");
+    let mut p = setup(engine, None);
+    check(
+        &mut p,
+        "document.body.innerHTML = '<p id=\"sp\" style=\"margin: 0\">x</p>'; \
+         var sp = document.getElementById('sp'); sp.style.margin + '|' + sp.style.length",
+        "|0",
+    );
+    check(
+        &mut p,
+        "sp.style.color = 'red'; sp.style.cssText",
+        "color: red;",
+    );
+    assert!(
+        p.html()
+            .contains("<p id=\"sp\" style=\"color: red;\">x</p>"),
+        "html: {}",
+        p.html()
+    );
+
+    eprintln!("case: REPAIR-3 / SEC-2 no computed style stub and no vendor-prefixed names");
+    let mut p = setup(engine, None);
+    check(&mut p, "typeof getComputedStyle", "undefined");
+    check(
+        &mut p,
+        "var bad = 0; var names = Object.getOwnPropertyNames(CSSStyleDeclaration.prototype); \
+         for (var i = 0; i < names.length; i++) { \
+           if (/^(webkit|moz|ms|-webkit-|-moz-|-ms-)/i.test(names[i])) bad++; } bad",
+        "0",
+    );
+    check(&mut p, "names.length > 100", "true");
+
+    eprintln!("case: JS-5 style model is committed only after the attribute write succeeds");
+    let mut p = setup(engine, None);
+    check(
+        &mut p,
+        "var d = document.createElement('div'); document.body.appendChild(d); var s = d.style; var big = ''; \
+         for (var i = 0; i < 4096; i++) big += '\\u3042'; \
+         var thrown = 0; \
+         for (var k = 0; k < 6; k++) { try { s.setProperty('--v' + k, big); } catch (e) { thrown++; } } \
+         thrown + '|' + s.length + '|' + (s.getPropertyValue('--v5') === '')",
+        "1|5|true",
+    );
+    let html = p.html();
+    assert!(
+        html.contains("--v4:") && !html.contains("--v5:"),
+        "attribute must match model"
+    );
+    check(
+        &mut p,
+        "var before = s.cssText; var t2 = 0; \
+         try { s.cssText = '--a: ' + big + '; --b: ' + big + '; --c: ' + big + '; \
+                --d: ' + big + '; --e: ' + big + '; --f: ' + big; } catch (e) { t2++; } \
+         t2 + '|' + (s.cssText === before)",
+        "1|true",
+    );
+    check(&mut p, "s.removeProperty('--v0'); s.length", "4");
+    let html = p.html();
+    assert!(
+        !html.contains("--v0:") && html.contains("--v1:"),
+        "attribute must match model"
+    );
+
+    eprintln!("case: JS-5 style setAttribute / removeAttribute stringify arguments once");
+    let mut p = setup(engine, None);
+    check(
+        &mut p,
+        "var d = document.createElement('div'); document.body.appendChild(d); var n = 0; \
+         var v = { toString: function () { n++; return n === 1 ? 'color: red' : 'color: blue'; } }; \
+         d.setAttribute('style', v); d.style.color + '|' + n",
+        "red|1",
+    );
+    assert!(
+        p.html().contains("color: red"),
+        "attribute must hold the first stringification"
+    );
+    check(
+        &mut p,
+        "var m = 0; var nm = { toString: function () { m++; return m === 1 ? 'style' : 'x'; } }; \
+         d.removeAttribute(nm); d.style.length + '|' + m",
+        "0|1",
+    );
+
+    eprintln!(
+        "case: JS-5 style cssText keeps an earlier !important against a later normal declaration"
+    );
+    let mut p = setup(engine, None);
+    check(
+        &mut p,
+        "var d = document.createElement('div'); var s = d.style; \
+         s.cssText = 'color: red !important; color: blue'; \
+         s.color + '|' + s.getPropertyPriority('color') + '|' + s.cssText",
+        "red|important|color: red !important;",
+    );
+    check(
+        &mut p,
+        "s.cssText = 'color: red !important; color: blue !important'; s.color",
+        "blue",
+    );
+    check(
+        &mut p,
+        "s.cssText = 'color: red !important'; s.setProperty('color', 'green'); s.color + '|' + s.getPropertyPriority('color')",
+        "green|",
+    );
+    // 値内のトップレベル `!important` は拒否し、重要宣言は priority 引数でのみ指定できる。
+    check(
+        &mut p,
+        "s.cssText = ''; s.setProperty('color', 'red !important'); s.color = 'red !important'; \
+         s.getPropertyValue('color') + '|' + s.getPropertyPriority('color') + '|' + s.cssText",
+        "||",
+    );
+    check(
+        &mut p,
+        "s.setProperty('color', 'red', 'important'); \
+         s.getPropertyValue('color') + '|' + s.getPropertyPriority('color') + '|' + s.cssText",
+        "red|important|color: red !important;",
+    );
+
+    eprintln!("case: JS-5 style survives shim re-install without double wrapping");
+    let mut p = setup(engine, None);
+    p.rt.install_dom_shim(&p.bridge).expect("reinstall shim");
+    check(
+        &mut p,
+        "var d = document.createElement('div'); d.style.color = 'red'; d.setAttribute('data-x', '1'); \
+         d.style.cssText + '|' + (d.style instanceof CSSStyleDeclaration)",
+        "color: red;|true",
     );
 }
