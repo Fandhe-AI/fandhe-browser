@@ -51,6 +51,7 @@ fn setup_html(engine: &str, html: &str, limit_extra_nodes: Option<usize>) -> Pag
             "window.js",
             "events.js",
             "timers.js",
+            "abort.js",
             "net.js",
             "observers.js",
             "style.js",
@@ -287,6 +288,7 @@ pub fn run(engine: &str) {
     style_cases(engine);
     url_cases(engine);
     node_cases(engine);
+    abort_cases(engine);
 
     eprintln!("case: JS-5 disabled runtime does not pretend to install");
     let mut disabled = JsRuntime::disabled();
@@ -1700,5 +1702,295 @@ fn node_cases(engine: &str) {
         &mut p,
         "for (var i = 0; i < 1100; i++) { document.body.addEventListener('e' + i, function () {}); } 'ok'",
         "ok",
+    );
+}
+
+/// `DOMException` / `AbortSignal` / `AbortController`（#1150・`JS-5`・`JS-6`・`REPAIR-3`・`SEC-2`）のケース。
+fn abort_cases(engine: &str) {
+    eprintln!("case: JS-5 abort globals exist and EventTarget stays undefined");
+    let mut p = setup(engine, None);
+    check(&mut p, "typeof AbortController", "function");
+    check(&mut p, "typeof AbortSignal", "function");
+    check(&mut p, "typeof DOMException", "function");
+    check(&mut p, "typeof EventTarget", "undefined");
+    check(&mut p, "typeof Event", "undefined");
+
+    eprintln!("case: JS-5 AbortController abort() state and reason");
+    check(
+        &mut p,
+        "var c = new AbortController(); \
+         var before = [c.signal.aborted, String(c.signal.reason), c.signal === c.signal].join('|'); \
+         c.abort(); \
+         var r = c.signal.reason; \
+         before + '/' + [c.signal.aborted, r instanceof DOMException, r instanceof Error, r.name, r.code, r.message].join('|')",
+        "false|undefined|true/true|true|true|AbortError|20|signal is aborted without reason",
+    );
+    check(
+        &mut p,
+        "var c2 = new AbortController(); c2.abort('x'); c2.abort('y'); c2.signal.reason",
+        "x",
+    );
+
+    eprintln!("case: JS-5 abort event via onabort and addEventListener");
+    check(
+        &mut p,
+        "var log = []; var c3 = new AbortController(); var s = c3.signal; \
+         s.onabort = function (e) { log.push('on:' + e.type + ':' + (e.target === s) + ':' + (e.currentTarget === s)); }; \
+         s.addEventListener('abort', function (e) { log.push('add'); }); \
+         var once = function () { log.push('once'); }; \
+         s.addEventListener('abort', once, { once: true }); \
+         s.addEventListener('abort', once, { once: true }); \
+         var removed = function () { log.push('removed'); }; \
+         s.addEventListener('abort', removed); s.removeEventListener('abort', removed); \
+         s.addEventListener('abort', { handleEvent: function (e) { log.push('obj'); } }); \
+         c3.abort(); c3.abort(); log.join(',')",
+        "on:abort:true:true,add,once,obj",
+    );
+
+    eprintln!("case: JS-5 throwIfAborted / illegal constructor / brand check");
+    check(
+        &mut p,
+        "var c4 = new AbortController(); c4.signal.throwIfAborted(); \
+         c4.abort('why'); var got; try { c4.signal.throwIfAborted(); } catch (e) { got = e; } String(got)",
+        "why",
+    );
+    check(
+        &mut p,
+        "var res = []; \
+         try { new AbortSignal(); } catch (e) { res.push(e instanceof TypeError); } \
+         try { Object.getOwnPropertyDescriptor(AbortSignal.prototype, 'aborted').get.call({}); } \
+         catch (e) { res.push(e instanceof TypeError); } \
+         try { AbortController(); } catch (e) { res.push(e instanceof TypeError); } \
+         res.join('|')",
+        "true|true|true",
+    );
+
+    eprintln!("case: JS-5 AbortSignal.abort / any");
+    check(
+        &mut p,
+        "[AbortSignal.abort().aborted, AbortSignal.abort('r').reason, AbortSignal.abort().reason.name].join('|')",
+        "true|r|AbortError",
+    );
+    check(
+        &mut p,
+        "var a = new AbortController(); var b = new AbortController(); \
+         var any = AbortSignal.any([a.signal, b.signal]); var pre = any.aborted; \
+         b.abort('z'); \
+         var pre2 = AbortSignal.any([a.signal, AbortSignal.abort('q')]); \
+         [pre, any.aborted, any.reason, pre2.aborted, pre2.reason].join('|')",
+        "false|true|z|true|q",
+    );
+    check(
+        &mut p,
+        "var bad; try { AbortSignal.any([{}]); } catch (e) { bad = e instanceof TypeError; } String(bad)",
+        "true",
+    );
+
+    eprintln!("case: JS-5 AbortSignal.timeout validates its delay");
+    check(
+        &mut p,
+        "var t = AbortSignal.timeout(10); var bads = []; \
+         [-1, NaN, Infinity].forEach(function (v) { \
+           try { AbortSignal.timeout(v); bads.push('no'); } catch (e) { bads.push(e instanceof TypeError); } \
+         }); [t.aborted, bads.join(',')].join('|')",
+        "false|true,true,true",
+    );
+
+    eprintln!("case: JS-5 DOMException basics");
+    check(
+        &mut p,
+        "var d = new DOMException('m', 'TimeoutError'); var e0 = new DOMException(); \
+         [d.code, d.name, d.message, e0.name, e0.code, e0.message === '', DOMException.ABORT_ERR, \
+          DOMException.prototype.TIMEOUT_ERR, String(d)].join('|')",
+        "23|TimeoutError|m|Error|0|true|20|23|TimeoutError: m",
+    );
+
+    eprintln!("case: JS-5 a throwing listener does not stop later listeners or abort() caller");
+    check(
+        &mut p,
+        "var seen = []; var c5 = new AbortController(); \
+         c5.signal.addEventListener('abort', function () { throw new Error('boom'); }); \
+         c5.signal.addEventListener('abort', function () { seen.push('second'); }); \
+         var threw = false; try { c5.abort(); } catch (e) { threw = true; } \
+         seen.join(',') + '|' + threw",
+        "second|false",
+    );
+
+    eprintln!("case: JS-5 explicit undefined reason yields AbortError");
+    check(
+        &mut p,
+        "var cu = new AbortController(); cu.abort(undefined); \
+         [cu.signal.reason.name, AbortSignal.abort(undefined).reason.name].join('|')",
+        "AbortError|AbortError",
+    );
+
+    eprintln!("case: JS-5 listeners added during dispatch are not called in that dispatch");
+    check(
+        &mut p,
+        "var ld = []; var cd = new AbortController(); \
+         var late = function () { ld.push('late'); }; \
+         cd.signal.onabort = function () { ld.push('on'); cd.signal.addEventListener('abort', late); }; \
+         cd.signal.addEventListener('abort', function () { ld.push('first'); \
+           cd.signal.addEventListener('abort', function () { ld.push('late2'); }); }); \
+         cd.abort(); ld.join(',')",
+        "on,first",
+    );
+
+    eprintln!("case: JS-5 dependents are settled before page abort algorithms run");
+    check(
+        &mut p,
+        "var fa = new AbortController(); var fb = new AbortController(); \
+         __fandheAbortFollow(fa.signal, function () { fb.abort('second'); }); \
+         var fs = AbortSignal.any([fa.signal, fb.signal]); \
+         fa.abort('first'); \
+         [fa.signal.reason, fs.reason, fb.signal.reason].join('|')",
+        "first|first|second",
+    );
+
+    eprintln!("case: JS-6 abort listener count is capped and flagged");
+    let mut p = setup(engine, None);
+    check(
+        &mut p,
+        "var c6 = new AbortController(); var cnt = 0; \
+         for (var i = 0; i < 1025; i++) { c6.signal.addEventListener('abort', function () { cnt++; }); } \
+         c6.abort(); String(cnt)",
+        "1024",
+    );
+    assert!(p.bridge.listener_limit_exceeded().expect("flag"));
+
+    eprintln!(
+        "case: JS-6/JS-8 AbortSignal.any releases follow registrations from long-lived inputs"
+    );
+    let mut p = setup(engine, None);
+    check(
+        &mut p,
+        "var root = new AbortController(); var ok = 0; \
+         for (var k = 0; k < 1100; k++) { \
+           var req = new AbortController(); \
+           AbortSignal.any([root.signal, req.signal]); \
+           req.abort(); ok++; \
+         } \
+         var last = AbortSignal.any([root.signal]); root.abort('r'); \
+         [ok, last.aborted, last.reason].join('|')",
+        "1100|true|r",
+    );
+    eprintln!(
+        "case: JS-6 AbortSignal.any rolls back partial registrations when a dependent cap is hit"
+    );
+    check(
+        &mut p,
+        "var full = new AbortController(); var keep = []; \
+         for (var m = 0; m < 1024; m++) { keep.push(AbortSignal.any([full.signal])); } \
+         var other = new AbortController(); var thrown; \
+         try { AbortSignal.any([other.signal, full.signal]); } catch (e) { thrown = e instanceof TypeError; } \
+         var again = AbortSignal.any([other.signal]); other.abort('o'); \
+         [thrown, again.aborted].join('|')",
+        "true|true",
+    );
+    eprintln!("case: JS-6 addEventListener reads options before the listener cap check");
+    check(
+        &mut p,
+        "var c7 = new AbortController(); var s7 = c7.signal; var cnt7 = 0; var reentered = false; \
+         for (var q = 0; q < 1023; q++) { s7.addEventListener('abort', function () { cnt7++; }); } \
+         s7.addEventListener('abort', function () { cnt7++; }, { get once() { \
+           if (!reentered) { reentered = true; s7.addEventListener('abort', function () { cnt7++; }); } \
+           return false; } }); \
+         c7.abort(); String(cnt7)",
+        "1024",
+    );
+    eprintln!("case: JS-5 AbortSignal.any propagates through a very deep chain without recursion");
+    check(
+        &mut p,
+        "var root8 = new AbortController(); var tail = root8.signal; \
+         for (var z = 0; z < 3000; z++) { tail = AbortSignal.any([tail]); } \
+         var fired8 = 0; tail.addEventListener('abort', function () { fired8++; }); \
+         root8.abort('deep'); \
+         [tail.aborted, tail.reason, fired8].join('|')",
+        "true|deep|1",
+    );
+
+    eprintln!("case: JS-5 AbortSignal.any multi-level dispatch follows creation order");
+    check(
+        &mut p,
+        "var r12 = new AbortController(); var log12 = []; \
+         var a12 = AbortSignal.any([r12.signal]); var b12 = AbortSignal.any([a12]); \
+         var c12 = AbortSignal.any([r12.signal]); \
+         r12.signal.addEventListener('abort', function () { log12[log12.length] = 'root'; }); \
+         a12.addEventListener('abort', function () { log12[log12.length] = 'a'; }); \
+         b12.addEventListener('abort', function () { log12[log12.length] = 'b'; }); \
+         c12.addEventListener('abort', function () { log12[log12.length] = 'c'; }); \
+         r12.abort('x'); log12.join(',')",
+        "root,a,b,c",
+    );
+    eprintln!("case: JS-5 abort(undefined) and any() follow the default AbortError reason");
+    check(
+        &mut p,
+        "var c13 = new AbortController(); c13.abort(undefined); \
+         var c14 = new AbortController(); c14.abort(); \
+         var d13 = AbortSignal.abort(undefined); var e13 = AbortSignal.any([d13]); \
+         [c13.signal.reason.name, c14.signal.reason.name, d13.reason.name, \
+          AbortSignal.abort().reason.name, e13.reason.name].join('|')",
+        "AbortError|AbortError|AbortError|AbortError|AbortError",
+    );
+
+    eprintln!("case: JS-4 tampered Array.prototype push/pop does not break abort() or any");
+    check(
+        &mut p,
+        "var tp = Array.prototype.push, tq = Array.prototype.pop; \
+         Array.prototype.push = function () { throw new Error('tampered'); }; \
+         Array.prototype.pop = function () { throw new Error('tampered'); }; \
+         var c9 = new AbortController(); var any9 = AbortSignal.any([c9.signal]); \
+         var log9 = []; any9.addEventListener('abort', function () { log9[log9.length] = 'any'; }); \
+         c9.abort('t'); \
+         Array.prototype.push = tp; Array.prototype.pop = tq; \
+         [c9.signal.aborted, any9.aborted, any9.reason, log9.join(',')].join('|')",
+        "true|true|t|any",
+    );
+
+    eprintln!("case: JS-4 AbortSignal.any reads iterator value once");
+    check(
+        &mut p,
+        "var c10 = new AbortController(); var reads10 = 0; \
+         var calls10 = 0; \
+         var iter10 = {}; iter10[Symbol.iterator] = function () { return { next: function () { \
+           calls10++; return calls10 === 1 ? { done: false, get value() { reads10++; return reads10 === 1 ? c10.signal : {}; } } : { done: true }; } }; }; \
+         var r10 = AbortSignal.any(iter10); c10.abort('v'); [reads10, r10.aborted, r10.reason].join('|')",
+        "1|true|v",
+    );
+
+    eprintln!("case: JS-4 AbortSignal.any dependents receive abort in registration order");
+    check(
+        &mut p,
+        "var rootO = new AbortController(); var log11 = []; \
+         var sa = AbortSignal.any([rootO.signal]); var sb = AbortSignal.any([rootO.signal]); \
+         rootO.signal.addEventListener('abort', function () { log11.push('root'); }); \
+         sa.addEventListener('abort', function () { log11.push('a'); }); \
+         sb.addEventListener('abort', function () { log11.push('b'); }); \
+         rootO.abort('x'); log11.join(',')",
+        "root,a,b",
+    );
+
+    eprintln!("case: JS-4 AbortSignal.any closes the input iterator when validation fails");
+    check(
+        &mut p,
+        "var closed12 = 0; var iter12 = {}; \
+         iter12[Symbol.iterator] = function () { return { next: function () { return { done: false, value: {} }; }, \
+           'return': function () { closed12++; return {}; } }; }; \
+         var bad12; try { AbortSignal.any(iter12); } catch (e) { bad12 = e instanceof TypeError; } \
+         [bad12, closed12].join('|')",
+        "true|1",
+    );
+
+    eprintln!("case: JS-4 followed algorithm does not receive the internal container as this");
+    check(
+        &mut p,
+        "var c13 = new AbortController(); var seen13 = 'none'; \
+         __fandheAbortFollow(c13.signal, function () { \
+           seen13 = String(this !== null && this !== undefined && (Object.prototype.hasOwnProperty.call(this, 0) || Object.prototype.hasOwnProperty.call(this, 1))); \
+           try { delete this[1]; } catch (e) {} \
+         }); \
+         var s13 = AbortSignal.any([c13.signal]); c13.abort('z'); \
+         [seen13, s13.aborted, s13.reason].join('|')",
+        "false|true|z",
     );
 }

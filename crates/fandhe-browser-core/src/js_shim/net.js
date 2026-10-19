@@ -6,7 +6,7 @@
 // 評価中に待機もしない（要求を Rust 側のキューへ積み、Promise / コールバックを保持するだけ）。
 // URL の解決（navigate 先 URL 基準）、scheme / userinfo / メソッド / ボディの検証、件数・累計バイトの
 // 上限、内部アドレス・リダイレクトの検査（SSRF 対策）は core 側（page_net / Fetcher）が行う。
-// 呼び出し元: core の `js_shim::install`（timers.js の後に評価）と、ランナーのイベントループ段。
+// 呼び出し元: core の `js_shim::install`（abort.js の後に評価）と、ランナーのイベントループ段。
 //
 // 設計上の要点:
 // - __fandheNetDeliver は `netConsume` op（ランナーが指定した配送中 ID への一回限りの許可）が
@@ -20,8 +20,12 @@
 //   コンテナを使う。ES2015 の範囲に留める（V8 と boa で同一ソース）。
 //
 // 未実装（REPAIR-3）:
-// - GET 以外・要求ボディ・同期 XHR（reject / 例外）。Request / AbortController / Response.headers /
+// - GET 以外・要求ボディ・同期 XHR（reject / 例外）。Request / Response.headers /
 //   statusText / blob / arrayBuffer / XHR の responseType / setRequestHeader / addEventListener。
+// - fetch の `signal`（#1150）: 中止済みなら要求を出さずに reason で reject し、要求後の中止は未着手の要求を
+//   `netCancel` で取り除いて reason で reject する。着手済みの要求は取り消せず、応答は届くが pending に無いため
+//   捨てられる（`completed()` は増え得る）。受理件数は中止しても戻らない（連打で上限を回避できない）。
+//   XHR の signal・Request の signal は扱わない。
 // - boa ではネイティブ Promise のジョブが drain されない（js crate が run_jobs を呼ばない。TASK-30）。
 //   そのため boa では fetch の `.then` / await の続きが走らない。XHR（コールバック式）は動く。
 (function (global) {
@@ -43,6 +47,13 @@
     var jsonParse = JSON.parse;
     var toStr = String;
     var queueMicro = global.queueMicrotask;
+    // abort.js の窓口と reason の getter は install 時に捕捉する（ページによる差し替えの影響を避ける。JS-4）。
+    var abortFollow = typeof global.__fandheAbortFollow === 'function' ? global.__fandheAbortFollow : null;
+    var abortReasonDesc =
+        typeof global.AbortSignal === 'function'
+            ? Object.getOwnPropertyDescriptor(global.AbortSignal.prototype, 'reason')
+            : undefined;
+    var abortReasonGet = abortReasonDesc !== undefined ? abortReasonDesc.get : null;
     var MAX_TEXT_UNITS = 4097;
 
     // 要求 ID → { kind: 'fetch', resolve, reject } | { kind: 'xhr', xhr }。
@@ -136,6 +147,7 @@
         var method = 'GET';
         var hasBody = false;
         var ignored = 0;
+        var signal;
         try {
             url =
                 typeof input === 'object' && input !== null && typeof input.href === 'string'
@@ -152,15 +164,29 @@
                 if (b !== undefined && b !== null) {
                     hasBody = true;
                 }
-                // 無視したオプションの集計は method / body と分離する。
+                signal = init.signal;
+                // 無視したオプションの集計は method / body / signal と分離する。
                 for (var key in init) {
-                    if (hasOwn(init, key) && key !== 'method' && key !== 'body') {
+                    if (hasOwn(init, key) && key !== 'method' && key !== 'body' && key !== 'signal') {
                         ignored += 1;
                     }
                 }
             }
         } catch (e) {
             return NativePromise.reject(failedToFetch());
+        }
+        var hasSignal = signal !== undefined && signal !== null;
+        if (hasSignal) {
+            var state = abortFollow !== null ? abortFollow(signal) : 0;
+            if (state === 0) {
+                return NativePromise.reject(
+                    new NativeTypeError("Failed to execute 'fetch': 'signal' is not an AbortSignal")
+                );
+            }
+            if (state === 2) {
+                // 中止済みなら要求を出さない。
+                return NativePromise.reject(abortReasonGet !== null ? fnCall(abortReasonGet, signal) : undefined);
+            }
         }
         if (ignored > 0) {
             try {
@@ -174,7 +200,34 @@
             return NativePromise.reject(failedToFetch());
         }
         return new NativePromise(function (resolve, reject) {
-            pending[id] = { kind: 'fetch', resolve: resolve, reject: reject };
+            var entry = { kind: 'fetch', resolve: resolve, reject: reject, signal: null, onAbort: null };
+            pending[id] = entry;
+            if (hasSignal) {
+                var onAbort = function (reason) {
+                    if (!hasOwn(pending, id) || pending[id] !== entry) {
+                        return;
+                    }
+                    delete pending[id];
+                    try {
+                        callOp('netCancel', id);
+                    } catch (e) {
+                        // 取り消せなくても、応答は pending に無いため捨てられる。
+                    }
+                    reject(reason);
+                };
+                if (abortFollow(signal, onAbort) === true) {
+                    entry.signal = signal;
+                    entry.onAbort = onAbort;
+                } else {
+                    delete pending[id];
+                    try {
+                        callOp('netCancel', id);
+                    } catch (e) {
+                        // 無視する。
+                    }
+                    reject(failedToFetch());
+                }
+            }
         });
     }
 
@@ -333,6 +386,9 @@
         delete pending[id];
         if (entry.kind === 'xhr' && entry.xhr._id === id) {
             entry.xhr._id = 0;
+        }
+        if (entry.kind === 'fetch' && entry.signal !== null) {
+            abortFollow(entry.signal, entry.onAbort, true);
         }
         var body = '';
         var url = '';
