@@ -45,6 +45,11 @@
 //! `sessionStorage` を in-memory で提供し（ページ実行ごとに空から始まる。永続化・オリジン分離・`storage`
 //! イベント・プロパティ形式のアクセスは未実装）、abort.js の `DOMException` を install 時に捕捉するため
 //! abort.js の後に評価する。
+//! `history.js`（#1171・`JS-5`・`JS-6`・`SEC-2`・`REPAIR-3`）は `History` / `history` を提供する。
+//! `pushState` / `replaceState` は同一オリジンの URL だけを bridge op `historySetUrl` で受け付け
+//! （検査は core 側）、state は予算付きの再帰複製（ノード数・深さ・累計サイズの上限・undefined を保持）で保持する。`back` / `forward` / `go` と
+//! `popstate` は未実装（URL を動かさず診断に記録するだけ）。abort.js の `DOMException` を
+//! install 時に捕捉するため abort.js の後（storage.js の次）に評価する。
 //! 汎用の `EventTarget` / `Event` / `dispatchEvent` は未実装（`typeof` は 'undefined' のまま）。
 
 use fandhe_browser_js::{EvaluateOptions, JsEngine, JsEngineError};
@@ -100,6 +105,10 @@ pub const JS_SHIM_SOURCES: &[JsShimSource] = &[
     JsShimSource {
         name: "storage.js",
         source: include_str!("storage.js"),
+    },
+    JsShimSource {
+        name: "history.js",
+        source: include_str!("history.js"),
     },
 ];
 

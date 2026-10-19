@@ -91,6 +91,12 @@ pub enum LocationChangeKind {
     Reload,
     /// `about:blank` 上の `location.hash = ...`（書き換え先が無い）。
     Hash,
+    /// `history.back()`（ページ内履歴を持たないため実行しない。#1171・`REPAIR-3`）。
+    HistoryBack,
+    /// `history.forward()`（同上）。
+    HistoryForward,
+    /// `history.go(delta)`（同上。値の長さは変換後の整数の文字列長）。
+    HistoryGo,
 }
 
 impl LocationChangeKind {
@@ -108,6 +114,9 @@ impl LocationChangeKind {
             "assign" => Self::Assign,
             "replace" => Self::Replace,
             "reload" => Self::Reload,
+            "historyBack" => Self::HistoryBack,
+            "historyForward" => Self::HistoryForward,
+            "historyGo" => Self::HistoryGo,
             _ => return None,
         })
     }
@@ -488,6 +497,27 @@ pub(crate) fn parse_location(input: &str) -> Result<Url, &'static str> {
     Ok(url)
 }
 
+/// `history.pushState` / `replaceState` の URL 引数を、現在の URL と同一オリジンの場合だけ
+/// 受理して新しい `location` を返す（#1171・`JS-5`・`SEC-2`）。
+///
+/// 同一オリジンの検査はページ JS ではなくこの関数（Rust 側）で行う。`__dom.op` はページから
+/// 直接呼べるため、JS 側の検査には頼れない。拒否理由と入力 URL は返さない（反響防止）。
+/// `current` が `None`（`about:blank`。opaque origin）なら常に拒否する（簡略化。`REPAIR-3`）。
+/// userinfo を持つ URL は黙って除去せず拒否する。
+pub(super) fn rewrite_same_origin(current: Option<&Url>, input: &str) -> Option<Url> {
+    let current = current?;
+    // 解析（アロケーション）の前に長さを検証する。
+    if input.len() > MAX_LOCATION_URL_BYTES {
+        return None;
+    }
+    let joined = current.join(input).ok()?;
+    if !joined.username().is_empty() || joined.password().is_some() {
+        return None;
+    }
+    let normalized = parse_location(joined.as_str()).ok()?;
+    (normalized.origin() == current.origin()).then_some(normalized)
+}
+
 /// `location` の `member` を WHATWG の形で文字列化する（`None` は `about:blank`）。
 pub(super) fn location_member(url: Option<&Url>, member: LocationMember) -> String {
     let Some(url) = url else {
@@ -620,6 +650,75 @@ mod tests {
         assert!(input.len() <= MAX_LOCATION_URL_BYTES);
         let e = parse_location(&input).expect_err("normalized too long");
         assert_eq!(e, "URL is too long");
+    }
+
+    fn same_origin(current: &str, input: &str) -> Option<String> {
+        let cur = Url::parse(current).expect("current");
+        rewrite_same_origin(Some(&cur), input).map(|u| u.to_string())
+    }
+
+    #[test]
+    fn js_5_rewrite_same_origin_accepts_relative_and_same_origin_urls() {
+        let cur = "https://example.com:8443/a/b?q=1#f";
+        let cases = [
+            ("c?x=1", "https://example.com:8443/a/c?x=1"),
+            ("/p/q#h", "https://example.com:8443/p/q#h"),
+            ("?z=2", "https://example.com:8443/a/b?z=2"),
+            ("#only", "https://example.com:8443/a/b?q=1#only"),
+            ("", "https://example.com:8443/a/b?q=1"),
+            (
+                "https://example.com:8443/abs?k=v",
+                "https://example.com:8443/abs?k=v",
+            ),
+        ];
+        for (input, want) in cases {
+            assert_eq!(same_origin(cur, input).as_deref(), Some(want), "{input}");
+        }
+    }
+
+    #[test]
+    fn js_5_rewrite_same_origin_rejects_cross_origin_and_unsafe_urls() {
+        let cur = "https://example.com:8443/a/b";
+        for input in [
+            "https://evil.test/",
+            "https://example.com:9000/",
+            "https://example.com/",
+            "http://example.com:8443/",
+            "javascript:alert(1)",
+            "file:///etc/passwd",
+            "data:text/html,x",
+            "https://user:pw@example.com:8443/",
+            "https://user@example.com:8443/",
+        ] {
+            assert_eq!(same_origin(cur, input), None, "{input}");
+        }
+    }
+
+    #[test]
+    fn js_5_rewrite_same_origin_rejects_about_blank_and_oversized_input() {
+        assert!(rewrite_same_origin(None, "/x").is_none());
+        let cur = Url::parse("https://example.com/").expect("current");
+        let long = format!("/{}", "a".repeat(MAX_LOCATION_URL_BYTES));
+        assert!(rewrite_same_origin(Some(&cur), &long).is_none());
+        // 正規化（パーセントエンコード）で上限を超える入力も拒否する。
+        let grow = format!("/{}", " a".repeat(2500));
+        assert!(rewrite_same_origin(Some(&cur), &grow).is_none());
+    }
+
+    #[test]
+    fn js_5_history_location_change_kinds_parse() {
+        assert_eq!(
+            LocationChangeKind::parse("historyBack"),
+            Some(LocationChangeKind::HistoryBack)
+        );
+        assert_eq!(
+            LocationChangeKind::parse("historyForward"),
+            Some(LocationChangeKind::HistoryForward)
+        );
+        assert_eq!(
+            LocationChangeKind::parse("historyGo"),
+            Some(LocationChangeKind::HistoryGo)
+        );
     }
 
     #[test]

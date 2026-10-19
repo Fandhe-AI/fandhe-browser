@@ -43,7 +43,9 @@
 //! `window.location` の実体も Rust 側が持つ。ランナー（TASK-109・TASK-112）が
 //! [`DomBridge::set_location`] へ取得結果の最終 URL を渡し（http / https のみ・userinfo 除去。
 //! 未設定は `about:blank`）、shim は `getLocation` を毎回 op で読む。ページ JS が変えられるのは
-//! `hash`（`setLocationHash`）だけで、それ以外の遷移系の代入・呼び出しは実行せず
+//! `hash`（`setLocationHash`）と、`history.pushState` / `replaceState` による同一オリジン内の
+//! URL 書き換え（`historySetUrl`。同一オリジンの検査は Rust 側。#1171）だけで、それ以外の遷移系の
+//! 代入・呼び出し（`history.back` / `forward` / `go` を含む）は実行せず
 //! `ignoreLocationChange` として診断に記録する（`JS-5`）。`console` のメッセージも
 //! `consoleMessage` で診断に溜める。診断は [`DomBridge::take_diagnostics`] で回収し、
 //! `attach` ごとに空へ戻る。診断に URL 本文は保存しない（種別と長さのみ）。
@@ -51,8 +53,9 @@
 //!
 //! # 未実装（REPAIR-3）
 //!
-//! - `hashchange` / `popstate` イベントの発火、`document.location` / `document.URL`、
-//!   `location` 代入による実際の遷移は未実装（後続 issue）。
+//! - `hashchange` / `popstate` イベントの発火、`location` 代入による実際の遷移、
+//!   `history.back` / `forward` / `go` によるページ内履歴の移動は未実装（後続 issue。
+//!   汎用の `EventTarget` / `dispatchEvent` が前提）。
 //! - #771 のスパイクで判明する追加操作（`parentNode` 等）は後続 issue で足す。
 
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -76,7 +79,7 @@ pub use page_env::{
     MAX_CONSOLE_MESSAGE_BYTES, MAX_LOCATION_URL_BYTES, NetCallbackError, TimerCallbackSource,
     TimerError,
 };
-use page_env::{apply_hash, location_member};
+use page_env::{apply_hash, location_member, rewrite_same_origin};
 
 use crate::event_loop::{EventLoopLimits, NextStep, TimerId, TimerQueue, normalize_delay};
 use crate::page_net::{
@@ -342,6 +345,7 @@ enum DomOp {
     CurrentScript,
     GetLocation,
     SetLocationHash,
+    HistorySetUrl,
     IgnoreLocationChange,
     NavigatorUserAgent,
     ConsoleMessage,
@@ -393,6 +397,7 @@ impl DomOp {
             "currentScript" => Self::CurrentScript,
             "getLocation" => Self::GetLocation,
             "setLocationHash" => Self::SetLocationHash,
+            "historySetUrl" => Self::HistorySetUrl,
             "ignoreLocationChange" => Self::IgnoreLocationChange,
             "navigatorUserAgent" => Self::NavigatorUserAgent,
             "consoleMessage" => Self::ConsoleMessage,
@@ -445,6 +450,7 @@ impl DomOp {
             Self::CurrentScript => "currentScript",
             Self::GetLocation => "getLocation",
             Self::SetLocationHash => "setLocationHash",
+            Self::HistorySetUrl => "historySetUrl",
             Self::IgnoreLocationChange => "ignoreLocationChange",
             Self::NavigatorUserAgent => "navigatorUserAgent",
             Self::ConsoleMessage => "consoleMessage",
@@ -493,6 +499,7 @@ impl DomOp {
             | Self::GetInnerHtml
             | Self::GetLocation
             | Self::SetLocationHash
+            | Self::HistorySetUrl
             | Self::TimerClear
             | Self::TimerConsume
             | Self::TimerPending
@@ -842,6 +849,18 @@ fn execute(
                     .record_location_change(LocationChangeKind::Hash, value.len()),
             }
             Ok(JsValue::Undefined)
+        }
+        // history.pushState / replaceState の URL 書き換え（#1171）。同一オリジンの検査は
+        // ここ（Rust 側）で行い、理由と URL は返さない。遷移も取得もしない。
+        DomOp::HistorySetUrl => {
+            let value = string_arg(op, args, 1, limits)?;
+            match rewrite_same_origin(page.location.as_ref(), value) {
+                Some(url) => {
+                    page.location = Some(url);
+                    Ok(JsValue::Bool(true))
+                }
+                None => Ok(JsValue::Bool(false)),
+            }
         }
         DomOp::IgnoreLocationChange => {
             let name = string_arg(op, args, 1, limits)?;
@@ -2426,6 +2445,44 @@ mod tests {
     }
 
     #[test]
+    fn js_5_history_set_url_rewrites_only_same_origin() {
+        let b = bridge();
+        b.set_location("https://example.com:8443/a/b?q=1#f")
+            .expect("set_location");
+        let href = || match call(&b, &[s("getLocation"), s("href")]).expect("href") {
+            JsValue::String(v) => v,
+            other => panic!("String を期待: {other:?}"),
+        };
+        assert!(matches!(
+            call(&b, &[s("historySetUrl"), s("c?x=1")]),
+            Ok(JsValue::Bool(true))
+        ));
+        assert_eq!(href(), "https://example.com:8443/a/c?x=1");
+        for bad in [
+            "https://evil.test/secret?token=abc",
+            "javascript:1",
+            "file:///x",
+        ] {
+            assert!(matches!(
+                call(&b, &[s("historySetUrl"), s(bad)]),
+                Ok(JsValue::Bool(false))
+            ));
+        }
+        assert_eq!(href(), "https://example.com:8443/a/c?x=1");
+        let diag = b.take_diagnostics().expect("diagnostics");
+        assert!(!format!("{diag:?}").contains("evil.test"));
+    }
+
+    #[test]
+    fn js_5_history_set_url_rejects_on_about_blank() {
+        let b = bridge();
+        assert!(matches!(
+            call(&b, &[s("historySetUrl"), s("/x")]),
+            Ok(JsValue::Bool(false))
+        ));
+    }
+
+    #[test]
     fn js_5_page_env_ops_check_arity_and_types() {
         let b = bridge();
         for (args, label) in [
@@ -2435,6 +2492,8 @@ mod tests {
             (vec![s("getLocation"), s("nope")], "get member"),
             (vec![s("setLocationHash"), n(1.0)], "hash type"),
             (vec![s("ignoreLocationChange"), s("href")], "ignore arity"),
+            (vec![s("historySetUrl")], "history arity"),
+            (vec![s("historySetUrl"), n(1.0)], "history type"),
             (vec![s("consoleMessage"), s("log"), n(1.0)], "console type"),
         ] {
             call(&b, &args).expect_err(label);
