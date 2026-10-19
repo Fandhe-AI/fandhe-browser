@@ -201,9 +201,13 @@
         throw new NativeTypeError('Illegal constructor');
     }
 
+    var signalSeq = 0;
+
     function createSignal() {
+        signalSeq += 1;
         var signal = createObject(AbortSignal.prototype);
         wmSet(signalStates, signal, {
+            seq: signalSeq,
             aborted: false,
             reason: undefined,
             listeners: newList(),
@@ -297,7 +301,7 @@
     // 仕様の "signal abort"。すでに中止済みなら何もしない。
     // 依存シグナル（any）への伝播は明示的なスタックによる反復で行い、依存の連鎖が深くてもスタックを消費しない。
     // 全依存の状態を先に更新してから、中止した順に abort イベントを配る。
-    function signalAbort(signal, reason) {
+    function signalAbort(signal, reason, hasReason) {
         // 実行時の Array メソッドはページに差し替えられうるため、プロトタイプなしのコンテナと件数で持つ（JS-4）。
         // 依存先は FIFO で処理し、abort イベントを依存シグナルの登録順に配る。
         var pending = createObject(null);
@@ -317,7 +321,7 @@
             }
             st.aborted = true;
             st.reason = cur === signal
-                ? (rootReason === undefined
+                ? (!hasReason
                     ? new DOMException('signal is aborted without reason', 'AbortError')
                     : rootReason)
                 : rootReason;
@@ -350,6 +354,18 @@
                     reportLater(e);
                 }
             }
+        }
+        // 仕様では依存シグナルは元の source signal に平坦化されており、依存の作成順（登録順）に配られる。
+        // 多段の any は BFS では段ごとに並ぶため、root を除く分を作成番号で安定な挿入ソートして合わせる（連鎖は作成順に並ぶので実質線形）。
+        for (var s1 = 2; s1 < firedCount; s1++) {
+            var item = fired[s1];
+            var seq = wmGet(signalStates, item).seq;
+            var s2 = s1 - 1;
+            while (s2 >= 1 && wmGet(signalStates, fired[s2]).seq > seq) {
+                fired[s2 + 1] = fired[s2];
+                s2 -= 1;
+            }
+            fired[s2 + 1] = item;
         }
         for (var f = 0; f < firedCount; f++) {
             fireAbort(fired[f], wmGet(signalStates, fired[f]));
@@ -425,7 +441,8 @@
 
     defineMethod(AbortSignal, 'abort', function abort(reason) {
         var signal = createSignal();
-        signalAbort(signal, reason);
+        // 引数省略のときだけ AbortError を作る（明示的な undefined はそのまま保持する）。
+        signalAbort(signal, reason, arguments.length > 0);
         return signal;
     });
 
@@ -438,7 +455,7 @@
         if (typeof nativeSetTimeout === 'function') {
             // 丸めと上限は core の timerSet が受け持つ。登録に失敗（id 0）しても中止されないシグナルのまま返す。
             nativeSetTimeout(function () {
-                signalAbort(signal, new DOMException('signal timed out', 'TimeoutError'));
+                signalAbort(signal, new DOMException('signal timed out', 'TimeoutError'), true);
             }, floor(n));
         }
         return signal;
@@ -481,7 +498,7 @@
         for (i = 0; i < count; i++) {
             var ist = wmGet(signalStates, inputs[i]);
             if (ist.aborted) {
-                signalAbort(result, ist.reason);
+                signalAbort(result, ist.reason, true);
                 return result;
             }
         }
@@ -524,7 +541,7 @@
         if (signal === undefined) {
             throw new NativeTypeError('Illegal invocation');
         }
-        signalAbort(signal, reason);
+        signalAbort(signal, reason, arguments.length > 0);
     });
     defineTag(AbortController.prototype, 'AbortController');
 

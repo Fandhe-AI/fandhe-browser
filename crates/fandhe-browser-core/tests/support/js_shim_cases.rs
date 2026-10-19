@@ -1878,6 +1878,30 @@ fn abort_cases(engine: &str) {
         "true|deep|1",
     );
 
+    eprintln!("case: JS-5 AbortSignal.any multi-level dispatch follows creation order");
+    check(
+        &mut p,
+        "var r12 = new AbortController(); var log12 = []; \
+         var a12 = AbortSignal.any([r12.signal]); var b12 = AbortSignal.any([a12]); \
+         var c12 = AbortSignal.any([r12.signal]); \
+         r12.signal.addEventListener('abort', function () { log12[log12.length] = 'root'; }); \
+         a12.addEventListener('abort', function () { log12[log12.length] = 'a'; }); \
+         b12.addEventListener('abort', function () { log12[log12.length] = 'b'; }); \
+         c12.addEventListener('abort', function () { log12[log12.length] = 'c'; }); \
+         r12.abort('x'); log12.join(',')",
+        "root,a,b,c",
+    );
+    eprintln!("case: JS-5 abort(undefined) keeps an explicit undefined reason");
+    check(
+        &mut p,
+        "var c13 = new AbortController(); c13.abort(undefined); \
+         var c14 = new AbortController(); c14.abort(); \
+         var d13 = AbortSignal.abort(undefined); var e13 = AbortSignal.any([d13]); \
+         [String(c13.signal.reason), c14.signal.reason.name, String(d13.reason), \
+          AbortSignal.abort().reason.name, String(e13.reason)].join('|')",
+        "undefined|AbortError|undefined|AbortError|undefined",
+    );
+
     eprintln!("case: JS-4 tampered Array.prototype push/pop does not break abort() or any");
     check(
         &mut p,
