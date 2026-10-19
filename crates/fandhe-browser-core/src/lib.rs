@@ -102,6 +102,7 @@ pub mod dom;
 pub mod dom_bridge;
 pub mod error;
 pub mod event_loop;
+mod exception_summary;
 pub mod fetch;
 pub mod host;
 pub mod js_shim;

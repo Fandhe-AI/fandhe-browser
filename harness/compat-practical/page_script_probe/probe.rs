@@ -234,6 +234,14 @@ pub fn exception_label(e: &ExceptionSummary) -> String {
     }
 }
 
+/// タイマー / microtask callback の例外 1 件を `<source>:<kind>:<class>[:<missing_api>]` のラベルにする。
+///
+/// core の要約（module 評価失敗と同じ語彙。`error.name` を加味する）をそのまま使い、
+/// ハーネス側の `class_label` では分類しない。生メッセージは含まない（Issue #1156・`JS-7`・`REPAIR-4`）。
+pub fn timer_error_label(source: &str, e: &ExceptionSummary) -> String {
+    format!("{source}:{}", exception_label(e))
+}
+
 fn skip_name(k: &ScriptDiagnosticKind) -> &'static str {
     k.as_str()
 }
@@ -544,6 +552,19 @@ mod tests {
         assert!(line.contains(r#""error_kind":"Error""#), "{line}");
         assert!(line.contains(r#""error_code":"31""#), "{line}");
         assert!(!line.contains("https"), "{line}");
+    }
+
+    /// Issue #1156: timer_errors のラベルは source・kind・class・識別子を持ち、生メッセージを含まない。
+    #[test]
+    fn timer_error_label_carries_source_kind_class_and_api() {
+        let r =
+            ExceptionSummary::from_engine_message("Uncaught ReferenceError: foo is not defined");
+        assert_eq!(
+            timer_error_label("timeout", &r),
+            "timeout:ReferenceError:not_defined:foo"
+        );
+        let r = ExceptionSummary::from_engine_message("boom secret-token");
+        assert_eq!(timer_error_label("microtask", &r), "microtask:other:other");
     }
 
     #[test]

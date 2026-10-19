@@ -8,6 +8,7 @@
 
 use reqwest::Url;
 
+use crate::exception_summary::{ExceptionSummary, summarize_named_exception};
 use crate::page_net::{NetRejectKind, NetRejection, NetRequestKind};
 
 /// 種別ごとの診断の保持上限（件数）。超過分は [`BridgeDiagnostics::dropped`] に数える。
@@ -237,14 +238,18 @@ pub struct TimerError {
     pub message: String,
     /// 切り詰めが起きたか。
     pub truncated: bool,
+    /// 例外の種類・メッセージ型・不足識別子の要約（生メッセージを含まない固定語彙。
+    /// module 評価失敗と同じ分類。Issue #1156・`JS-7`・`REPAIR-4`）。
+    pub summary: ExceptionSummary,
 }
 
-// ページ由来の文字列は秘密を含み得るため、Debug には長さだけを出す。
+// ページ由来の文字列は秘密を含み得るため、Debug には長さと要約だけを出す。
 impl std::fmt::Debug for TimerError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TimerError")
             .field("source", &self.source)
             .field("message_len", &self.message.len())
+            .field("summary", &self.summary)
             .field("truncated", &self.truncated)
             .finish()
     }
@@ -366,13 +371,19 @@ impl BridgeDiagnostics {
         }
     }
 
-    pub(super) fn record_timer_error(&mut self, source: TimerCallbackSource, message: &str) {
+    pub(super) fn record_timer_error(
+        &mut self,
+        source: TimerCallbackSource,
+        name: &str,
+        message: &str,
+    ) {
         if self.timer_errors.len() < MAX_BRIDGE_DIAGNOSTICS {
             let (kept, truncated) = truncate_utf8(message, MAX_CONSOLE_MESSAGE_BYTES);
             self.timer_errors.push(TimerError {
                 source,
                 message: kept.to_owned(),
                 truncated,
+                summary: summarize_named_exception(name, message),
             });
         } else {
             self.dropped = self.dropped.saturating_add(1);

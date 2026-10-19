@@ -1,9 +1,11 @@
 //! JS 例外の要約（分類名と不足識別子名）を、生メッセージを残さずに作る（`JS-5`・`REPAIR-4`・Issue #1133）。
 //!
-//! 呼び出し元: [`super::module_graph`] の module 評価失敗（静的 root・動的 `import()`）。
+//! 呼び出し元: [`crate::page_runner`] の module 評価失敗（静的 root・動的 `import()`）と、
+//! [`crate::dom_bridge`] のタイマー / microtask callback の例外（`error.name` を添えて要約する。Issue #1156）。
 //! 診断に出してよいのは固定語彙の enum と、文字種・段数・長さを検証した識別子だけで、
 //! メッセージ本文・URL・クエリ・specifier は残さない。V8（`Uncaught Kind: ...`）と
-//! boa（接頭辞なし）の両方の形式を受ける。classic の例外は現状対象外（`REPAIR-3`）。
+//! boa（接頭辞なし）の両方の形式を受ける。classic の例外・リスナー・ネットワーク callback は
+//! 現状対象外（`REPAIR-3`）。
 //!
 //! `TypeError` の `other` を減らすため、`Cannot use 'in' operator ...`（V8）・
 //! `right-hand side of 'in' should be an object ...`（boa）と `Cannot set properties of ...`（V8）を
@@ -129,7 +131,7 @@ impl ExceptionMessageClass {
 
 /// JS 例外の要約（生メッセージ・URL・specifier を含まない。`JS-5`・`REPAIR-4`・Issue #1133）。
 ///
-/// 現状は module 評価失敗でのみ作られる（classic は将来。`REPAIR-3`）。
+/// 現状は module 評価失敗とタイマー callback の例外で作られる（classic は将来。`REPAIR-3`）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct ExceptionSummary {
@@ -243,7 +245,7 @@ pub(crate) const MAX_RAW_EXCEPTION_DEBUG_CHARS: usize = 300;
 
 /// 計測用 example の stderr 専用に保持する、切り詰め済みの生例外メッセージ（Issue #1152・`REPAIR-4`・`SEC-2`）。
 ///
-/// 呼び出し元: [`super::module_graph`] が [`super::PageRunOptions`] の opt-in が有効なときだけ作る。
+/// 呼び出し元: [`crate::page_runner`] の module_graph が `PageRunOptions` の opt-in が有効なときだけ作る。
 /// 本文は URL・トークンを含み得るため、`Debug` では本文を出さず長さだけを出す
 /// （`{:?}` 経由の誤ログを防ぐ）。取得は `#[doc(hidden)]` の getter のみ。
 #[derive(Clone, PartialEq, Eq)]
@@ -347,6 +349,20 @@ pub(crate) fn summarize_exception_message(msg: &str) -> ExceptionSummary {
         property,
         code,
     }
+}
+
+/// 例外の種類の名前（`error.name`）とメッセージ本文から要約を作る（純関数。panic しない）。
+///
+/// 呼び出し元: [`crate::dom_bridge`] の `timerCallbackError` op。`name` はページが書き換え得る
+/// untrusted 値のため、固定語彙に一致する場合だけ kind に採用し、語彙外・空は本文からの推定
+/// （`summarize_exception_message`）に任せる。名前そのものは保存しない（Issue #1156・`JS-7`）。
+pub(crate) fn summarize_named_exception(name: &str, message: &str) -> ExceptionSummary {
+    let mut summary = summarize_exception_message(message);
+    let named = ExceptionKind::parse(clip(name));
+    if named != ExceptionKind::Other {
+        summary.kind = named;
+    }
+    summary
 }
 
 #[cfg(test)]
@@ -731,5 +747,24 @@ mod tests {
         assert_eq!(r.message_class(), ExceptionMessageClass::Other);
         assert_eq!(r.code(), None);
         assert_eq!(ExceptionSummary::other().code(), None);
+    }
+
+    /// 種類の名前を添えた要約（Issue #1156・`JS-7`・`REPAIR-4`）。
+    #[test]
+    fn named_exception_uses_vocabulary_name_and_body_class() {
+        let r = summarize_named_exception("TypeError", "foo is not a function");
+        assert_eq!(r.kind(), ExceptionKind::TypeError);
+        assert_eq!(r.message_class(), ExceptionMessageClass::NotAFunction);
+        assert_eq!(r.identifier(), Some("foo"));
+        let r = summarize_named_exception("", "x is not defined");
+        assert_eq!(r.kind(), ExceptionKind::ReferenceError);
+        let r = summarize_named_exception("EvilError", "boom");
+        assert_eq!(r.kind(), ExceptionKind::Other);
+        assert_eq!(r.message_class(), ExceptionMessageClass::Other);
+        let r = summarize_named_exception("Error", "boom");
+        assert_eq!(r.kind(), ExceptionKind::Error);
+        let big = "a".repeat(100_000);
+        let r = summarize_named_exception(&big, &big);
+        assert_eq!(r.kind(), ExceptionKind::Other);
     }
 }

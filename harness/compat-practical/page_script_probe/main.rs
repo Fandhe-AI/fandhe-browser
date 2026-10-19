@@ -40,7 +40,7 @@ use fandhe_browser_core::{
 };
 use probe::{
     Origin, ProbeArgs, class_label, debug_stderr_line, exception_label, lifecycle_label,
-    run_options, script_line,
+    run_options, script_line, timer_error_label,
 };
 use reqwest::Url;
 
@@ -334,6 +334,13 @@ async fn measure(
         v.sort();
         v
     };
+    // timer_errors の生メッセージも stderr だけへ（JSONL の `timer_errors` は要約ラベルのまま。Issue #1156）。
+    for (n, e) in diag.timer_errors.iter().enumerate() {
+        let label = format!("{} timer_error#{n} {}", args.id, e.source.as_str());
+        if let Some(line) = debug_stderr_line(args.debug_raw_exception, &label, Some(&e.message)) {
+            eprintln!("{line}");
+        }
+    }
     let diag_obj = Obj::new()
         .n(
             "console_log",
@@ -355,7 +362,7 @@ async fn measure(
             &labels(
                 diag.timer_errors
                     .iter()
-                    .map(|e| class_label(&e.message))
+                    .map(|e| timer_error_label(e.source.as_str(), &e.summary))
                     .collect(),
             ),
         )

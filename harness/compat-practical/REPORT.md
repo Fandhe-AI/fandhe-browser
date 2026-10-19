@@ -444,7 +444,7 @@ spec 対応: TASK-71・TASK-108 / MS-6 / `COMPAT-1`・`JS-5`・`JS-6`・`MEAS-4`
 
 ### 次の対応
 
-1. d3: タイマー callback の例外の分類（`timer_errors` に `message_class` / `missing_api` を持たせる診断）。これで描画段階の次の不足 API を特定する。診断の拡張が先で、shim 単体では 30 分・1 ファイルに収まらないと判断し、本 PR では続行せず止めた。#1156 で追跡する
+1. d3: タイマー callback の例外の分類（`timer_errors` に `message_class` / `missing_api` を持たせる診断）。これで描画段階の次の不足 API を特定する。診断の拡張が先で、shim 単体では 30 分・1 ファイルに収まらないと判断し、本 PR では続行せず止めた。#1156 で追跡する（済み: #1156。下の節を参照）
 2. d2: `AbortController`（#1150）（済み: #1150。下の節を参照）
 
 ### 制約
@@ -498,7 +498,7 @@ spec 対応: TASK-71・TASK-108・TASK-111 / MS-6 / `COMPAT-1`・`JS-5`・`JS-6`
 ### 次の対応
 
 1. d2: `port` を読む対象の特定（`--debug-raw-exception` で端末のみに出して確かめる）。`location.port` なら `window.js` の `location` の構成要素の不足の可能性がある。追跡: #1158
-2. d3: タイマー callback の例外の分類（#1156）
+2. d3: タイマー callback の例外の分類（#1156）（済み: #1156。下の節を参照）
 
 ### 制約
 
@@ -513,6 +513,56 @@ cargo build --release -p fandhe-browser-core --features js-v8 --example compat_p
 target/release/examples/compat_page_script_probe --target d2=https://www.saucedemo.com --modules --selector form --out /abs/path/d2.jsonl
 target/release/examples/compat_page_script_probe --target d3=https://demoqa.com/automation-practice-form --modules --selector form --out /abs/path/d3.jsonl
 jq -c 'select(.type=="script")' /abs/path/d2.jsonl /abs/path/d3.jsonl
+```
+
+## タイマー callback の例外の分類と d3 の再測定（#1156）
+
+spec 対応: TASK-71・TASK-108 / MS-6 / `COMPAT-1`・`JS-5`・`JS-6`・`JS-7`・`MEAS-4`・`REPAIR-3`・`REPAIR-4`・`SEC-2`。
+前節（#1150）の「次の対応 2」を実装し、d3 を `page_script_probe --modules --debug-raw-exception` で再測定した。出力はコミットしていない。
+
+### 実装の要点
+
+- `exception_summary` を `page_runner` の下から crate 直下へ移し、`dom_bridge` のタイマー callback の例外にも使う。`TimerError` に `summary`（`ExceptionSummary`: `kind`・`message_class`・`identifier`・`property`・`code`）を足した。生メッセージは従来どおり `message` に残るが、JSONL には出さない
+- shim（`timers.js`・`observers.js`）が `error.name` を文字列のときだけ 64 文字までで `timerCallbackError` op（引数は source・name・message の 3 つ）へ渡す。Rust 側は固定語彙に一致する場合だけ `kind` に採用し、語彙外は本文からの推定か `other` に落とす（名前は保存しない）
+- probe の `run` 行の `timer_errors` は `<source>:<kind>:<class>[:<missing_api>]` のラベルになる。`--debug-raw-exception` はタイマー callback の例外の生メッセージも stderr だけへ出す（`<id> timer_error#<n> <source>`）
+- `listener_errors`・`net_callback_errors` は従来どおりハーネス側の `class_label` で分類したまま（`REPAIR-3`）
+
+### 測定条件
+
+| 項目 | 値 |
+| ---- | -- |
+| 実施日時（UTC） | 2026-10-19T17:10Z 前後 |
+| OS | Linux |
+| ベース | main `29b26205` に、本変更を加えたもの |
+| バイナリ | `cargo build --release -p fandhe-browser-core --features js-v8 --example compat_page_script_probe` |
+| 設定 | `--modules`・V8・`--selector form`・`--debug-raw-exception`。実行上限は既定のまま |
+
+### 結果
+
+| id | サイト | script | outcome | `timer_errors` | `form`（実行後） | 判定 |
+| -- | ------ | ------ | ------- | -------------- | ---------------- | ---- |
+| d3 | DemoQA | index 0（module・同一オリジン `src`） | succeeded | `timeout:TypeError:other` | 0 件 | 未解消（原因の種類が分かった） |
+
+- 例外の種類は `TypeError`。`setTimeout` の callback で発生する。メッセージ型は現行の語彙外のため `other` で、`missing_api` は取れない
+- 端末で確認した生メッセージ（エンジン固定文）は `Right-hand side of 'instanceof' is not an object`。`x instanceof Y` の `Y` が関数ではない値（未定義のグローバルコンストラクタなど）であることを示す。**どの `Y` かはメッセージに含まれず、現在の診断では特定できない**
+- abort は無し。`event_loop.fired` は 2。**`form` は 0 件のため #919 にはコメントしていない**
+
+### 次の対応
+
+1. 分類語彙に `Right-hand side of 'instanceof' is not an object`（V8 / boa の文言差を含む）を加える。ただし `Y` の名前は得られないため、不足 API の特定には「`instanceof` の右辺の名前を出す」手段が別に要る（例: callback の `stack` から行位置を得る、または shim 側で主要なグローバルコンストラクタ〔`Element`・`HTMLElement`・`Node` 等〕の有無を測る）。別 issue で追跡する
+2. `listener_errors`・`net_callback_errors` も core の要約で分類する（`REPAIR-3`）
+
+### 制約
+
+- 単一環境（Linux）・単一時点。URL のクエリ・ページ本文・script 本文は記録していない。生メッセージはエンジンの固定文 1 件だけを転記した
+- 判定は最初の例外で止まる測定に基づく。後続の不足 API は未確認
+
+### 再現手順
+
+```bash
+cargo build --release -p fandhe-browser-core --features js-v8 --example compat_page_script_probe
+target/release/examples/compat_page_script_probe --target d3=https://demoqa.com/automation-practice-form --modules --selector form --debug-raw-exception --out /abs/path/d3.jsonl
+jq -c 'select(.type=="run") | .bridge.timer_errors' /abs/path/d3.jsonl
 ```
 
 ## b5（Trello）の原因特定（#964）

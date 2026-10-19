@@ -14,7 +14,7 @@
 //   `timerStringHandlerIgnored` op で件数だけ通知する（インジェクション面を作らない）。
 // - __fandheRunTimer は `timerConsume` op（Rust が選んだ発火の一回限りの許可）が true のときだけ実行する。
 // - ディスパッチャー（__fandheRunTimer / __fandheRunMicrotasks）は決して throw しない。
-//   コールバックの例外は try/catch で捕捉し、`timerCallbackError` op でメッセージだけ通知して
+//   コールバックの例外は try/catch で捕捉し、`timerCallbackError` op で種類の名前とメッセージだけ通知して
 //   後続を続行する。両者は non-writable / non-configurable で固定し、再 install 時の実体の
 //   差し替えは events.js と同じく `lifecycleInstallOpen` op が true（shim 注入中）のときだけ許す。
 // - microtask は shim 内の JS キューで実装し、エンジンに依存しない。drain は各タイマーの発火の
@@ -65,6 +65,13 @@
     function report(source, error) {
         try {
             var text;
+            var name = '';
+            try {
+                // 例外の種類の名前（TypeError 等）。ページが書き換え得るため文字列のときだけ渡す。
+                name = error && typeof error.name === 'string' ? error.name.slice(0, 64) : '';
+            } catch (e) {
+                name = '';
+            }
             try {
                 text = String(error && error.message !== undefined ? error.message : error);
             } catch (e) {
@@ -79,7 +86,7 @@
                 }
                 text = text.slice(0, end);
             }
-            callOp('timerCallbackError', source, text);
+            callOp('timerCallbackError', source, name, text);
         } catch (e) {
             // 報告に失敗しても続行する。
         }

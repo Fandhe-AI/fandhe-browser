@@ -59,7 +59,6 @@ use fandhe_browser_js::{
 };
 use reqwest::Url;
 
-use super::exception_summary::{RawExceptionMessage, summarize_exception_message};
 use super::{
     AbortKind, DynamicImportFailureKind, DynamicImportReport, ExceptionSummary,
     MAX_MODULE_GRAPH_DEPTH, MAX_PAGE_DYNAMIC_IMPORTS, PageAbort, RunContext, ScriptBytesScope,
@@ -68,6 +67,7 @@ use super::{
     page_wall_abort, script_budget, tripped_abort_kind,
 };
 use crate::error::Error;
+use crate::exception_summary::{RawExceptionMessage, summarize_exception_message};
 use crate::fetch::Fetcher;
 use crate::js_stub::JsRuntime;
 use crate::page_script::ScriptSource;
