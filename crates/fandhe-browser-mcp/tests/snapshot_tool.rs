@@ -252,3 +252,22 @@ fn plug4_snapshot_connection_refused_keeps_session() {
     );
     assert!(pinged);
 }
+
+/// PLUG-4・Issue #843: 接続拒否用に返すポートはエフェメラル範囲の外にあり、
+/// 以後の `:0` bind で再割り当てされない（再割り当てされると接続が成立して Io になる）。
+#[test]
+fn plug4_refused_host_port_is_outside_ephemeral_range() {
+    let (lo, hi) = common::ephemeral_port_range();
+    let listener = common::bind_non_ephemeral_loopback();
+    let port = u32::from(listener.local_addr().expect("addr").port());
+    assert!(port < lo || port > hi, "port {port} is inside {lo}-{hi}");
+    drop(listener);
+    let held: Vec<TcpListener> = (0..100)
+        .map(|_| TcpListener::bind("127.0.0.1:0").expect("bind"))
+        .collect();
+    assert!(
+        held.iter()
+            .all(|l| u32::from(l.local_addr().expect("addr").port()) != port),
+        "port {port} was reassigned to a :0 bind"
+    );
+}
