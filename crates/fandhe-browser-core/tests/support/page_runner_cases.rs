@@ -1498,8 +1498,26 @@ pub fn run_dynamic_imports(engine: &str) {
     assert_eq!(out.dynamic_imports().requested(), 0);
 }
 
+/// React `createRoot` の container 検査（`isValidContainer`: nodeType が 1・9・11）相当の最小 fixture
+/// （#1151・`JS-5`）。React #299 の原因が `nodeType` 欠落であることを、React 本体なしで確認する。
+fn react_container_check_cases(engine: &str) {
+    eprintln!("case: JS-5 isValidContainer-like check passes on a root element");
+    let html = "<html><body><div id=\"root\"></div><script>\
+        var r = document.getElementById('root');\
+        var kind = r === null ? 'null' : typeof r.nodeType;\
+        document.body.setAttribute('data-kind', kind);\
+        var ok = !!(r && (r.nodeType === 1 || r.nodeType === 9 || r.nodeType === 11));\
+        if (!ok) { throw new Error('container check failed: ' + kind); }\
+        r.setAttribute('data-ok', '1');\
+        </script></body></html>";
+    let out = run_page(engine, html, &PageRunOptions::default());
+    assert_eq!(outcome_of(&out, 0).as_str(), "succeeded", "{}", out.html());
+    assert!(out.html().contains("data-ok=\"1\""), "{}", out.html());
+}
+
 pub fn run(engine: &str) {
     let opts = PageRunOptions::default();
+    react_container_check_cases(engine);
     timer_cases(engine);
     mutation_observer_cases(engine);
     net_cases(engine);

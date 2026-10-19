@@ -24,7 +24,12 @@
 // 未実装（REPAIR-3。後続 issue / #779 で追加）:
 // - bridge のエラーはエンジンの例外（Error）のまま伝わる。DOMException への写像は未対応。
 // - NodeList / HTMLCollection 互換（querySelectorAll は素の Array を返す）。
-// - nodeType / tagName / parentNode / attributes（属性の列挙）等（#771 のスパイク結果に応じて op ごと追加）。
+// - Element の tagName / nodeName（要素名を返す read-only op が無い。core の
+//   `Document::local_name` / `namespace_url` を使う op が候補）。未定義のまま（装わない）。
+// - parentNode / parentElement / childNodes / firstChild / lastChild / nextSibling /
+//   previousSibling / nodeValue / namespaceURI / isConnected / contains /
+//   compareDocumentPosition / attributes（属性の列挙）。対応する op が無く未定義のまま。
+// - Comment / DocumentFragment のラッパー（nodeType 定数のみ。DOCUMENT_POSITION_* も未定義）。
 // - window / location / navigator / console は js_shim の別ソース（#779）。
 (function (global) {
     'use strict';
@@ -125,6 +130,53 @@
         descriptor.configurable = true;
         Object.defineProperty(proto, name, descriptor);
     }
+
+    // --- Node の基本プロパティ（#1151・JS-5。React createRoot の isValidContainer 等が読む） ---
+    // nodeType の定数。WebIDL どおり Node コンストラクタとプロトタイプの両方に置く（読み取り専用）。
+    var NODE_CONSTANTS = [
+        ['ELEMENT_NODE', 1], ['ATTRIBUTE_NODE', 2], ['TEXT_NODE', 3], ['CDATA_SECTION_NODE', 4],
+        ['ENTITY_REFERENCE_NODE', 5], ['ENTITY_NODE', 6], ['PROCESSING_INSTRUCTION_NODE', 7],
+        ['COMMENT_NODE', 8], ['DOCUMENT_NODE', 9], ['DOCUMENT_TYPE_NODE', 10],
+        ['DOCUMENT_FRAGMENT_NODE', 11], ['NOTATION_NODE', 12]
+    ];
+    for (var ci = 0; ci < NODE_CONSTANTS.length; ci++) {
+        var constDesc = { value: NODE_CONSTANTS[ci][1], writable: false, enumerable: true, configurable: false };
+        Object.defineProperty(Node, NODE_CONSTANTS[ci][0], constDesc);
+        Object.defineProperty(Node.prototype, NODE_CONSTANTS[ci][0], constDesc);
+    }
+
+    // ラッパー型ごとに固定値を返す getter。ラッパー以外の受け手は拒否する（ID は露出しない）。
+    function constGetter(name, value) {
+        return {
+            get: function () {
+                if (!ids.has(this)) {
+                    throw new TypeError("Illegal invocation");
+                }
+                return value;
+            }
+        };
+    }
+    define(Element.prototype, 'nodeType', constGetter('nodeType', 1));
+    define(Text.prototype, 'nodeType', constGetter('nodeType', 3));
+    define(Document.prototype, 'nodeType', constGetter('nodeType', 9));
+    define(Text.prototype, 'nodeName', constGetter('nodeName', '#text'));
+    define(Document.prototype, 'nodeName', constGetter('nodeName', '#document'));
+
+    // 文書は 1 つだけなので ownerDocument は install 時の document ラッパー（op 不要）。
+    var documentWrapper = null;
+    function ownerDocumentGetter(isDocument) {
+        return {
+            get: function () {
+                if (!ids.has(this)) {
+                    throw new TypeError("Illegal invocation");
+                }
+                return isDocument ? null : documentWrapper;
+            }
+        };
+    }
+    define(Element.prototype, 'ownerDocument', ownerDocumentGetter(false));
+    define(Text.prototype, 'ownerDocument', ownerDocumentGetter(false));
+    define(Document.prototype, 'ownerDocument', ownerDocumentGetter(true));
 
     // --- Node ---
     define(Node.prototype, 'appendChild', {
@@ -337,5 +389,6 @@
     expose('Element', Element);
     expose('Text', Text);
     expose('Document', Document);
-    expose('document', wrap(op('documentRoot'), Document));
+    documentWrapper = wrap(op('documentRoot'), Document);
+    expose('document', documentWrapper);
 })(globalThis);

@@ -386,7 +386,7 @@ spec 対応: TASK-71・TASK-108 / MS-6 / `COMPAT-1`・`JS-5`・`JS-6`・`MEAS-4`
 ### 次の対応
 
 1. d2: `AbortController` / `AbortSignal`。`EventTarget`（現状は document / window の最小実装のみ）、`DOMException`（`AbortError` の `reason`。DOMException への写像は未実装）、`AbortSignal.timeout`（timers 連携）が絡み、30 分・1 ファイル程度には収まらないと判断し、本 PR では続行せず止めた。`net.js` の `fetch` への `signal` 連携も含めて別 issue（`JS-5`・`JS-8`）。起票済み: #1150
-2. d3 の原因特定（前節 #1145 の次の対応 1 のまま。`REPAIR-4`）
+2. d3 の原因特定（前節 #1145 の次の対応 1 のまま。`REPAIR-4`）（済み: #1151。下の節を参照）
 
 ### 制約
 
@@ -404,6 +404,63 @@ jq -c 'select(.type=="script")' /abs/path/d2.jsonl /abs/path/d3.jsonl
 ```
 
 生の例外メッセージを確認するときは `--modules --debug-raw-exception` を付ける（#1152）。メッセージは 300 文字に切り詰められ、stderr にだけ出る。URL・トークンを含み得るため、stderr は端末で読むだけにし、ファイルへ保存・転記しない。
+
+## Node の基本プロパティ追加後の再測定（#1151）
+
+spec 対応: TASK-71・TASK-108 / MS-6 / `COMPAT-1`・`JS-5`・`JS-6`・`MEAS-4`・`REPAIR-3`。
+前節（#1144）の「次の対応 2」にあたる d3（React #299）を調べ、`nodeType` など Node の基本プロパティを足して d2・d3 を `page_script_probe --modules` で再測定した。出力はコミットしていない。
+
+### 原因の確認結果
+
+- React 公開のエラーコード表（`facebook/react` の `scripts/error-codes/codes.json`）で #299 は「Target container is not a DOM element.」で、`createRoot` の container 検査（`isValidContainer`: `nodeType` が 1・9・11）にあたることを確認した。#1145 の節で「未確認」としていた表の照合はこれで済み
+- 推測（`getElementById('root')` は要素を返すが `nodeType` が `undefined` のため検査に落ちる）を、React 本体を含まない最小 fixture（`tests/support/page_runner_cases.rs` の `react_container_check_cases`）で確認した。修正前は V8 で `typeof r.nodeType` が `undefined`（root は取得できている）で script が例外終了し、修正後は `number` で検査を通り `data-ok="1"` が付く（V8・boa とも）
+
+### 実装の要点
+
+- `dom.js`: `nodeType`（Element 1・Text 3・Document 9）、`Node` の定数 12 個（コンストラクタとプロトタイプの両方・読み取り専用）、Text / Document の `nodeName`（`#text` / `#document`）、`ownerDocument`（Document は `null`）を足した。getter はラッパー以外の受け手を `TypeError` で拒否し、ノード ID は露出しない
+- `events.js`: 再測定で d3 の次の不足が `i.addEventListener`（要素レベル）と分かったため、`Node.prototype` に `addEventListener` / `removeEventListener` を足した。**保持のみで配送はしない**スタブ（`dispatchEvent` は未定義・capture は区別しない・1 要素 1024 件まで。上限超過は既存の `lifecycleListenerLimit` で通知。`JS-6`）
+- スタブとして残したもの（`REPAIR-3`）: Element の `tagName` / `nodeName`（要素名を返す op が無い）、`parentNode` / `childNodes` 等の関係、`nodeValue` / `namespaceURI` / `isConnected` / `contains` / `compareDocumentPosition`、`attributes`、`Comment` / `DocumentFragment` のラッパー。いずれも未定義のまま（`dom.js` 冒頭に明記）
+
+### 測定条件
+
+| 項目 | 値 |
+| ---- | -- |
+| 実施日時（UTC） | 2026-10-19T10:58Z 前後 |
+| OS | Linux |
+| ベース | main `523779bd` に、本 PR の変更（Node の基本プロパティと要素レベルの `addEventListener` スタブ）を加えたもの |
+| バイナリ | `cargo build --release -p fandhe-browser-core --features js-v8 --example compat_page_script_probe` |
+| 設定 | `--modules`（`[js] execute_modules = true` 相当）・V8・`--selector form`。実行上限は既定のまま |
+
+### 結果
+
+| id | サイト | script | outcome | `error_kind` | `message_class` | `missing_api` | `error_code` | `form`（実行後） | 判定 |
+| -- | ------ | ------ | ------- | ------------ | --------------- | ------------- | ------------ | ---------------- | ---- |
+| d2 | Saucedemo | index 1（module・同一オリジン `src`） | exception | `ReferenceError` | `not_defined` | `AbortController` | なし | 0 件 | 未解消（変化なし） |
+| d3 | DemoQA | index 0（module・同一オリジン `src`） | succeeded | なし | なし | なし | なし | 0 件 | module 評価は成功。`form` は未解消 |
+
+- d3 は `nodeType` を足した時点で #299 を越え、次に要素レベルの `addEventListener` の `TypeError`（`not_a_function`）で止まった。これを保持のみのスタブで越えると、module 評価は例外なしで終わった
+- 実行後も `form` は 0 件で、タイマー（`event_loop.fired` は 2）の callback で `timer_errors` に `other` が 1 件記録されている。描画段階（React の scheduler 以降）の不足が考えられるが、現在の診断では不足 API を特定できない（タイマー callback の例外は `message_class` を持たない）
+- abort は無し。**d2・d3 とも `form` は 0 件のため #919 にはコメントしていない**
+
+### 次の対応
+
+1. d3: タイマー callback の例外の分類（`timer_errors` に `message_class` / `missing_api` を持たせる診断）。これで描画段階の次の不足 API を特定する。診断の拡張が先で、shim 単体では 30 分・1 ファイルに収まらないと判断し、本 PR では続行せず止めた。#1156 で追跡する
+2. d2: `AbortController`（#1150）
+
+### 制約
+
+- 単一環境（Linux）・単一時点。URL のクエリ・ページ本文・script 本文・生の例外メッセージは記録していない
+- 判定は最初の例外で止まる測定に基づく。タイマー callback 内の不足は未特定
+- 要素レベルのイベントは保持のみで、`click` 等は発火しない（`REPAIR-3`）
+
+### 再現手順
+
+```bash
+cargo build --release -p fandhe-browser-core --features js-v8 --example compat_page_script_probe
+target/release/examples/compat_page_script_probe --target d2=https://www.saucedemo.com --modules --selector form --out /abs/path/d2.jsonl
+target/release/examples/compat_page_script_probe --target d3=https://demoqa.com/automation-practice-form --modules --selector form --out /abs/path/d3.jsonl
+jq -c 'select(.type=="script")' /abs/path/d2.jsonl /abs/path/d3.jsonl
+```
 
 ## b5（Trello）の原因特定（#964）
 
