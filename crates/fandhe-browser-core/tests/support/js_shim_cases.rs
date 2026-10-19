@@ -1479,7 +1479,17 @@ fn url_cases(engine: &str) {
         &mut p,
         "var r5 = 0; try { new URLSearchParams('a&'.repeat(100000)) } catch (e) { r5 = e instanceof TypeError } \
          r5 + '|' + new URLSearchParams('a&'.repeat(1000)).toString().length",
-        "true|3999",
+        "true|2999",
+    );
+    // JS-6: Symbol は TypeError、canParse は引数省略で TypeError、例外時は iterator.return を呼ぶ。
+    check(
+        &mut p,
+        "var t1 = 'x'; try { new URLSearchParams([[Symbol('s'), 'v']]) } catch (e) { t1 = e instanceof TypeError } \
+         var t2 = 'x'; try { URL.canParse() } catch (e) { t2 = e instanceof TypeError } \
+         var closed = 0; var it = { [Symbol.iterator]() { return { next() { return { done: false, value: 1 } }, return() { closed++; return {} } } } }; \
+         try { new URLSearchParams(it) } catch (e) {} \
+         t1 + '|' + t2 + '|' + closed",
+        "true|true|1",
     );
     // JS-6: set は置換で消える項目を差し引いた最終状態で予算を検査する。
     check(

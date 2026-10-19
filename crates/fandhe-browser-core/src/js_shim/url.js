@@ -51,8 +51,10 @@
     var createObject = Object.create;
     var objectKeys = Object.keys;
     var isProtoOf = Function.prototype.call.bind(Object.prototype.isPrototypeOf);
-    var toStr = String;
+    var strCtor = String;
     var fromCharCode = String.fromCharCode;
+    var reTest = Function.prototype.call.bind(RegExp.prototype.test);
+    var SURROGATE_RE = /[\uD800-\uDFFF]/;
     var symIter = Symbol.iterator;
     var wmGet = Function.prototype.call.bind(WeakMap.prototype.get);
     var wmSet = Function.prototype.call.bind(WeakMap.prototype.set);
@@ -326,6 +328,10 @@
     }
 
     function usvStr(s) {
+        // サロゲートを含まない文字列は変換不要（長い入力で 1 文字ずつ走査しない）。
+        if (!reTest(SURROGATE_RE, s)) {
+            return s;
+        }
         var out = '';
         var n = s.length;
         var i = 0;
@@ -359,6 +365,14 @@
             }
         }
         return out;
+    }
+
+    // 文字列変換。Symbol は Web IDL どおり TypeError にする（String() は Symbol を文字列化してしまう）。
+    function toStr(value) {
+        if (typeof value === 'symbol') {
+            throw new TypeError('Cannot convert a Symbol value to a string');
+        }
+        return strCtor(value);
     }
 
     function requireArgs(given, needed) {
@@ -511,6 +525,7 @@
         return requireUrl(this).c[IDX_HREF];
     });
     defMethod(URL, 'canParse', function (input, base) {
+        requireArgs(arguments.length, 1);
         return parseComponents(toStr(input), base === undefined ? undefined : toStr(base)) !== null;
     });
 
@@ -523,7 +538,20 @@
             if (r.done) {
                 return;
             }
-            fn(r.value);
+            try {
+                fn(r.value);
+            } catch (e) {
+                // コールバックの例外では IteratorClose 相当（return を呼ぶ）を行い、元の例外を優先して再送出する。
+                try {
+                    var ret = it['return'];
+                    if (ret !== undefined && ret !== null) {
+                        fnCall(ret, it);
+                    }
+                } catch (ignored) {
+                    // 元の例外を優先する。
+                }
+                throw e;
+            }
         }
     }
 
