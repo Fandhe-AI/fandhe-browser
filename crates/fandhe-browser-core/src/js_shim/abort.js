@@ -299,16 +299,18 @@
     // 全依存の状態を先に更新してから、中止した順に abort イベントを配る。
     function signalAbort(signal, reason) {
         // 実行時の Array メソッドはページに差し替えられうるため、プロトタイプなしのコンテナと件数で持つ（JS-4）。
+        // 依存先は FIFO で処理し、abort イベントを依存シグナルの登録順に配る。
         var pending = createObject(null);
-        var pendingCount = 1;
+        var pendingHead = 0;
+        var pendingTail = 1;
         pending[0] = signal;
         var fired = createObject(null);
         var firedCount = 0;
         var rootReason = reason;
-        while (pendingCount > 0) {
-            pendingCount -= 1;
-            var cur = pending[pendingCount];
-            delete pending[pendingCount];
+        while (pendingHead < pendingTail) {
+            var cur = pending[pendingHead];
+            delete pending[pendingHead];
+            pendingHead += 1;
             var st = wmGet(signalStates, cur);
             if (st === undefined || st.aborted) {
                 continue;
@@ -338,8 +340,8 @@
                 var link = wmGet(links, snapshot[i]);
                 if (link !== undefined) {
                     link.detach();
-                    pending[pendingCount] = link.target;
-                    pendingCount += 1;
+                    pending[pendingTail] = link.target;
+                    pendingTail += 1;
                     continue;
                 }
                 try {
@@ -453,11 +455,23 @@
             }
             // getter で値が変わりうるため value は 1 度だけ読み、検証にも保存にも同じ値を使う。
             var value = step.value;
+            // 検証失敗時は IteratorClose 相当に return() を呼んでから投げる（return 自体の例外は握りつぶす）。
+            var invalid = null;
             if (count >= MAX_ENTRIES) {
-                throw new NativeTypeError("Failed to execute 'any' on 'AbortSignal': Too many signals");
+                invalid = "Too many signals";
+            } else if (wmGet(signalStates, value) === undefined) {
+                invalid = "Element is not an AbortSignal";
             }
-            if (wmGet(signalStates, value) === undefined) {
-                throw new NativeTypeError("Failed to execute 'any' on 'AbortSignal': Element is not an AbortSignal");
+            if (invalid !== null) {
+                try {
+                    var ret = it['return'];
+                    if (typeof ret === 'function') {
+                        ret.call(it);
+                    }
+                } catch (closeError) {
+                    // 元の TypeError を優先する。
+                }
+                throw new NativeTypeError("Failed to execute 'any' on 'AbortSignal': " + invalid);
             }
             inputs[count] = value;
             count += 1;

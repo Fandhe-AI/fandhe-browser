@@ -1902,4 +1902,27 @@ fn abort_cases(engine: &str) {
          var r10 = AbortSignal.any(iter10); c10.abort('v'); [reads10, r10.aborted, r10.reason].join('|')",
         "1|true|v",
     );
+
+    eprintln!("case: JS-4 AbortSignal.any dependents receive abort in registration order");
+    check(
+        &mut p,
+        "var rootO = new AbortController(); var log11 = []; \
+         var sa = AbortSignal.any([rootO.signal]); var sb = AbortSignal.any([rootO.signal]); \
+         rootO.signal.addEventListener('abort', function () { log11.push('root'); }); \
+         sa.addEventListener('abort', function () { log11.push('a'); }); \
+         sb.addEventListener('abort', function () { log11.push('b'); }); \
+         rootO.abort('x'); log11.join(',')",
+        "root,a,b",
+    );
+
+    eprintln!("case: JS-4 AbortSignal.any closes the input iterator when validation fails");
+    check(
+        &mut p,
+        "var closed12 = 0; var iter12 = {}; \
+         iter12[Symbol.iterator] = function () { return { next: function () { return { done: false, value: {} }; }, \
+           'return': function () { closed12++; return {}; } }; }; \
+         var bad12; try { AbortSignal.any(iter12); } catch (e) { bad12 = e instanceof TypeError; } \
+         [bad12, closed12].join('|')",
+        "true|1",
+    );
 }
