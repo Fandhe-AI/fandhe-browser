@@ -1585,6 +1585,32 @@ fn js_5_in_operator_type_error_carries_property() {
     );
 }
 
+/// `JS-5`・`REPAIR-4`・Issue #1145: Minified React error は分類と番号だけが
+/// `exception_summary()` まで届き、案内 URL・クエリ・トークンは届かない。
+#[test]
+fn js_5_minified_react_error_carries_code_only() {
+    let (port, _hits) = spawn_server(|path| match path {
+        "/r.js" => js(
+            "reject:Uncaught Error: Minified React error #299; visit https://h.example/errors/299?token=SECRET for the full message. (line 9)",
+        ),
+        _ => js("1"),
+    });
+    let html = "<script type=module src=\"/r.js\"></script>";
+    let (out, _) = run(html, port, &module_options());
+    let e = out
+        .scripts()
+        .first()
+        .and_then(|r| r.exception_summary())
+        .expect("summary");
+    assert_eq!(e.kind().as_str(), "Error");
+    assert_eq!(e.message_class().as_str(), "minified_react_error");
+    assert_eq!(e.code(), Some("299"));
+    assert_eq!(e.identifier(), None);
+    assert_eq!(e.property(), None);
+    let dbg = format!("{e:?}");
+    assert!(!dbg.contains("SECRET") && !dbg.contains("https") && !dbg.contains("token"));
+}
+
 /// `JS-4`・Issue #1117: top-level await 等で未確定のままの `import()` は resolve にも reject にも
 /// 数えず、`pending` に数える。
 #[test]

@@ -147,6 +147,7 @@ pub fn script_line(
                     .s("message_class", e.message_class().as_str())
                     .opt_s("missing_api", e.identifier())
                     .opt_s("property", e.property())
+                    .opt_s("error_code", e.code())
                     .s("exception_source", "module_evaluation")
                     .raw("truncated", truncated.to_string());
             }
@@ -158,6 +159,7 @@ pub fn script_line(
                 .s("message_class", c.message_class)
                 .opt_s("missing_api", c.missing_api.as_deref())
                 .opt_s("property", c.property.as_deref())
+                .opt_s("error_code", c.code.as_deref())
                 .raw("truncated", truncated.to_string());
         }
         ScriptOutcome::Skipped { kind, count } => {
@@ -430,6 +432,50 @@ mod tests {
             "{line}"
         );
         assert!(line.contains(r#""property":"x""#), "{line}");
+    }
+
+    /// `JS-5`・`REPAIR-4`・Issue #1145: `error_code` は検証済みの数字だけを module 要約・classic の
+    /// 両経路で出し、検証外は `null`。案内 URL・トークンは出さず、ラベルにも入れない。
+    #[test]
+    fn error_code_is_emitted_on_both_paths() {
+        let fixed = ScriptOutcome::Exception {
+            message: "module evaluation failed".to_string(),
+            truncated: false,
+        };
+        let sum = ExceptionSummary::from_engine_message(
+            "Uncaught Error: Minified React error #299; visit https://h.example/errors/299?token=SECRET (line 9)",
+        );
+        let line = script_line("d3", Some(0), Origin::Inline, &fixed, Some(&sum));
+        assert!(line.contains(r#""error_kind":"Error""#), "{line}");
+        assert!(
+            line.contains(r#""message_class":"minified_react_error""#),
+            "{line}"
+        );
+        assert!(line.contains(r#""error_code":"299""#), "{line}");
+        assert!(
+            !line.contains("SECRET") && !line.contains("https") && !line.contains("token"),
+            "{line}"
+        );
+        assert_eq!(exception_label(&sum), "Error:minified_react_error");
+
+        let bad = ExceptionSummary::from_engine_message(
+            "Uncaught Error: Minified React error #https://h.example/?token=SECRET",
+        );
+        let line = script_line("d3", Some(0), Origin::Inline, &fixed, Some(&bad));
+        assert!(line.contains(r#""error_code":null"#), "{line}");
+        assert!(
+            !line.contains("SECRET") && !line.contains("https"),
+            "{line}"
+        );
+
+        let classic = ScriptOutcome::Exception {
+            message: "Minified React error #31; visit https://h.example/x".to_string(),
+            truncated: false,
+        };
+        let line = script_line("d3", Some(0), Origin::Inline, &classic, None);
+        assert!(line.contains(r#""error_kind":"Error""#), "{line}");
+        assert!(line.contains(r#""error_code":"31""#), "{line}");
+        assert!(!line.contains("https"), "{line}");
     }
 
     #[test]
