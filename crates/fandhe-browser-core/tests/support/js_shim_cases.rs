@@ -2085,6 +2085,14 @@ fn storage_cases(engine: &str) {
          try { localStorage.getItem(); } catch (e) { r.push(e instanceof TypeError); } r.join('|')",
         "true|true",
     );
+    eprintln!("case: JS-5 storage key() rejects BigInt even if Number is replaced");
+    check(
+        &mut p,
+        "var N = Number; Number = function () { return 0; }; var r = []; \
+         try { localStorage.key(0n); r.push('no-throw'); } catch (e) { r.push(e instanceof TypeError); } \
+         r.push(localStorage.key('1')); Number = N; r.join('|')",
+        "true|x",
+    );
 
     eprintln!("case: JS-5 storage instances are independent");
     check(

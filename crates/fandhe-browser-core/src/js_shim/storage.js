@@ -154,7 +154,8 @@
     defineMethod(Storage.prototype, 'key', function key(index) {
         var st = stateOf(this);
         need(arguments, 1, 'key');
-        var i = Number(index) >>> 0;
+        // 単項 + は ToNumber 相当で BigInt を TypeError にする（WebIDL unsigned long 変換）。グローバル Number の差し替えに依存しない。
+        var i = +index >>> 0;
         return i < st.keys.length ? st.keys[i] : null;
     });
 
