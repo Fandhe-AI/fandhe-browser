@@ -32,9 +32,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use common::{Obj, map_fetch_error, same_origin, sanitize_debug};
 use fandhe_browser_core::config::Config;
 use fandhe_browser_core::{
-    FetchOptions, Fetcher, PageRunInput, PageRunOptions, ParseOptions, ScriptOutcome, ScriptSource,
-    collect_page_scripts, page_script_fetch_options, parse_document, query_selector_all_str,
-    run_page_scripts,
+    FetchOptions, Fetcher, PageRunInput, PageRunOptions, ParseOptions, ScriptCollectionOptions,
+    ScriptKind, ScriptOutcome, ScriptSource, collect_page_scripts, page_script_fetch_options,
+    parse_document, query_selector_all_str, run_page_scripts,
 };
 use probe::{Origin, ProbeArgs, class_label, lifecycle_label, script_line};
 use reqwest::Url;
@@ -54,15 +54,26 @@ fn main() -> ExitCode {
     run(&args)
 }
 
-/// `h1` 要素の件数（grep ではなく本実装のパーサーとセレクタで数える）。
+/// セレクタに一致する要素の件数（grep ではなく本実装のパーサーとセレクタで数える。既定は `h1`）。
 /// スクリプト実行用の解析と条件を揃えるため scripting 有効で解析する
 /// （無効だと `<noscript>` 内の `h1` が要素として数えられ、実行後の件数とずれる）。
-fn count_h1(html: &str) -> Option<u64> {
+fn count_matches(html: &str, selector: &str) -> Option<u64> {
     let parsed =
         parse_document(html, &ParseOptions::default().with_scripting_enabled(true)).ok()?;
     let doc = parsed.document;
-    let found = query_selector_all_str(&doc, doc.root(), "h1").ok()?;
+    let found = query_selector_all_str(&doc, doc.root(), selector).ok()?;
     Some(found.len() as u64)
+}
+
+/// 本番（core の `run_options_for`）と同じく、module 有効時は収集オプションの gate を真にする。
+/// 収集と実行の両方に同じオプションを渡す（片方だけだと module は `skipped_module` のままになる）。
+fn run_options(args: &ProbeArgs) -> PageRunOptions {
+    if args.modules {
+        PageRunOptions::default()
+            .with_collection(ScriptCollectionOptions::default().with_execute_modules(true))
+    } else {
+        PageRunOptions::default()
+    }
 }
 
 fn bool_s(b: bool) -> String {
@@ -70,7 +81,23 @@ fn bool_s(b: bool) -> String {
 }
 
 fn run(args: &ProbeArgs) -> ExitCode {
-    let cfg = match Config::from_toml_str(args.engine.toml()) {
+    // セレクタは実行前に検証する（不正なら使用エラー）。
+    if let Ok(p) = parse_document("<p></p>", &ParseOptions::default())
+        && query_selector_all_str(&p.document, p.document.root(), &args.selector).is_err()
+    {
+        eprintln!("usage error: invalid --selector");
+        return ExitCode::from(2);
+    }
+    // 設定は固定文面だけで作る（引数文字列は連結しない）。module は本番と同じく gate 設定も真にする。
+    let toml = if args.modules {
+        format!(
+            "{}execute_page_scripts = true\nexecute_modules = true\n",
+            args.engine.toml()
+        )
+    } else {
+        args.engine.toml().to_string()
+    };
+    let cfg = match Config::from_toml_str(&toml) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("error: {e}");
@@ -151,6 +178,15 @@ async fn measure(
             .s("engine", &engine)
             .s("os", std::env::consts::OS)
             .s("limits", "run_page_scripts_defaults")
+            .raw("modules", bool_s(args.modules))
+            .s(
+                "selector",
+                if args.selector == "h1" {
+                    "h1"
+                } else {
+                    "custom"
+                },
+            )
             .line(),
     ];
 
@@ -182,7 +218,8 @@ async fn measure(
         );
         return lines;
     };
-    let collected = collect_page_scripts(&parsed.document, PageRunOptions::default().collection());
+    let run_opts = run_options(args);
+    let collected = collect_page_scripts(&parsed.document, run_opts.collection());
     let count_diag = |k: &str| {
         collected
             .diagnostics()
@@ -208,6 +245,13 @@ async fn measure(
             "defer",
             entries.iter().filter(|e| e.is_defer()).count() as u64,
         )
+        .n(
+            "module",
+            entries
+                .iter()
+                .filter(|e| e.kind() == ScriptKind::Module)
+                .count() as u64,
+        )
         .n("skipped_module", count_diag("skipped_module"))
         .n(
             "skipped_unsupported_type",
@@ -226,15 +270,14 @@ async fn measure(
                 "final_same_origin",
                 bool_s(same_origin(&final_url, &args.url)),
             )
-            .opt_n("h1_initial", count_h1(&html))
+            .opt_n("h1_initial", count_matches(&html, "h1"))
+            .opt_n("selector_initial", count_matches(&html, &args.selector))
             .raw("scripts", scripts)
             .line(),
     );
 
     let input = PageRunInput::new(&html, &final_url_str);
-    let out = match run_page_scripts(&input, cfg.js(), &PageRunOptions::default(), script_fetcher)
-        .await
-    {
+    let out = match run_page_scripts(&input, cfg.js(), &run_opts, script_fetcher).await {
         Ok(o) => o,
         Err(e) => {
             // 成功を装わない。エラーの種別名だけを残す（本文は URL を含み得るため出さない）。
@@ -351,6 +394,21 @@ async fn measure(
         .raw("net_limit_exceeded", bool_s(diag.net_limit_exceeded))
         .n("dropped", diag.dropped)
         .line();
+    let dyn_imp = out.dynamic_imports();
+    let mut fail_kinds: Vec<String> = dyn_imp
+        .failures()
+        .iter()
+        .map(|k| k.as_str().to_string())
+        .collect();
+    fail_kinds.sort();
+    // 動的 import は件数と reject の種別名だけを出す（URL・specifier は出さない）
+    let dyn_obj = Obj::new()
+        .n("requested", dyn_imp.requested() as u64)
+        .n("fulfilled", dyn_imp.fulfilled() as u64)
+        .n("rejected", dyn_imp.rejected() as u64)
+        .n("pending", dyn_imp.pending() as u64)
+        .strs("failures", &fail_kinds)
+        .line();
     let lifecycle: Vec<String> = out
         .lifecycle()
         .iter()
@@ -382,7 +440,9 @@ async fn measure(
             .raw("event_loop", ev_obj)
             .raw("net", net_obj)
             .raw("bridge", diag_obj)
-            .opt_n("h1_after", count_h1(out.html()))
+            .raw("dynamic_imports", dyn_obj)
+            .opt_n("h1_after", count_matches(out.html(), "h1"))
+            .opt_n("selector_after", count_matches(out.html(), &args.selector))
             .n("html_bytes_after", out.html().len() as u64)
             .n(
                 "elapsed_ms",

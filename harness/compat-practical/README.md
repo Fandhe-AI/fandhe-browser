@@ -27,6 +27,7 @@ spec 対応: TASK-71.1・TASK-71.2 / MS-6 / `MEAS-4`（関連 `COMPAT-4`・`JS-2
 | `page_script_probe/` | 本番と同じ経路でページ内 script の結果を script 単位に観測する診断プローブ（#964。core の example `compat_page_script_probe` としてビルド） |
 | `results/access_check.jsonl` | 到達可否の実測結果（下記「計測結果」） |
 | `results/core_results.jsonl` | `run_core.sh --page-js v8` の実測結果（ページ JS 有効） |
+| `results/core_results_modules.jsonl` | `run_core.sh --page-js v8 --page-modules` の実測結果（ES module 有効。#1119。`core_results.jsonl` とは別ファイルで、`make_matrix.sh` の入力ではない） |
 | `results/core_results_js_off.jsonl` | 同一バイナリ・同日の対照（ページ JS 無効） |
 | `REPORT.md` | 測定レポート（TASK-71.4） |
 
@@ -80,7 +81,7 @@ bash harness/compat-practical/access_check.sh [--tasks P] [--out P] [--timeout S
 
 ```bash
 bash harness/compat-practical/run_core.sh [--tasks P] [--out P] [--bin P] [--endpoint URL] [--no-spawn] \
-  [--page-js v8|boa] [--log ABS_PATH] \
+  [--page-js v8|boa [--page-modules]] [--log ABS_PATH] \
   [--task-timeout SEC] [--total-timeout SEC] [--startup-timeout SEC] [--validate-only]
 ```
 
@@ -93,7 +94,7 @@ bash harness/compat-practical/run_core.sh [--tasks P] [--out P] [--bin P] [--end
 - 出力は JSONL（メタ行 1 行 + タスクごとに 1 行）。`output_sample` はページ由来の非信頼テキストで、300 文字で切り詰め・制御文字を空白へ置換する（進捗出力にはページ由来テキストを出さない）
 
 ```json
-{"type":"meta","schema_version":1,"measured_at":"...","tasks_sha256":"...","bin":"target/release/fandhe-browser","endpoint":"http://127.0.0.1:9333","cdp_browser":"fandhe-browser/0.1.0","driver":"cdp","page_js_executed":false,"page_js_engine":null,"task_timeout_sec":45,"total_timeout_sec":1200,"os":"Linux"}
+{"type":"meta","schema_version":1,"measured_at":"...","tasks_sha256":"...","bin":"target/release/fandhe-browser","endpoint":"http://127.0.0.1:9333","cdp_browser":"fandhe-browser/0.1.0","driver":"cdp","page_js_executed":false,"page_js_engine":null,"page_modules_executed":false,"task_timeout_sec":45,"total_timeout_sec":1200,"os":"Linux"}
 {"type":"result","id":"b5","cat":"spa","url":"https://trello.com","kind":"text","selector":"h1","success":false,"reason":"no_match","detail":null,"method":"first_match","match_count":null,"elapsed_ms":1234,"output_sample":""}
 ```
 
@@ -177,6 +178,7 @@ jq 'map({id, cat, kind, success, error})' <PoC-9 の chromium_results.json>
 - 結果: 22 件中 15 件が成功
 - b5（Trello）・d2（Saucedemo）・d3（DemoQA）はいずれも失敗（`no_match`）。ページ JS が実行されないため V8 による解消は未確認（上記「制約」）
 - そのほかの失敗: a6（`no_match`・HTTP 403）・c1（`no_match`）・e1（`selector_unsupported`）・e5（`no_match`）
+- `--page-modules`（真偽フラグ。`--page-js` が必須）は設定へ `execute_modules = true` を足し、メタ行に `page_modules_executed` を記録する（ES module 実行。`JS-2`・#1119）。`--page-js` だけの設定はバイト単位で変わらない
 - ネットワーク環境と時期で変わる。再計測したら実施日と OS をここへ追記する
 
 ### 2026-10-11 の再計測（TASK-71.4）
@@ -185,6 +187,10 @@ jq 'map({id, cat, kind, success, error})' <PoC-9 の chromium_results.json>
 - `results/core_results.jsonl`: `--page-js v8`（ページ JS 有効）で 15/22。`results/core_results_js_off.jsonl`: 同日・同一バイナリの対照（無効）で 15/22。成否は全 id で一致
 - b5・d2・d3 は 3 件とも未解消。数値・原因・残存失敗の扱いは `REPORT.md` を参照（二重管理しない）
 - `results/access_check.jsonl` は今回の環境で一部ホストが `curl_exit 7` となったため更新していない（2026-10-03 のまま）
+
+### 2026-10-19 の再計測（#1119）
+
+- 実施日: 2026-10-19 / OS: Linux / ES module 有効（`--page-js v8 --page-modules`）で 15/22。b5・d2・d3 は 3 件とも未解消。数値・原因・次の対応候補は `REPORT.md` の「ES module 有効での再測定（#1119）」を参照（二重管理しない）
 
 ## js_api_spike（TASK-106）
 
@@ -230,7 +236,7 @@ spec 対応: TASK-71 / MS-6 / `MEAS-4`・`JS-4`（関連 `JS-6`・`SEC-2`・`REP
 
 - ソースは `page_script_probe/`。`crates/fandhe-browser-core/Cargo.toml` の `[[example]] compat_page_script_probe`（新規依存なし）。自己テストはオフライン・決定的（`cargo test -p fandhe-browser-core --example compat_page_script_probe`）
 - 実行（実サイトへ出るため手動専用）: `cargo build --release -p fandhe-browser-core --features js-v8 --example compat_page_script_probe` のあと `target/release/examples/compat_page_script_probe --target b5=<https url> --engine v8 --out <path>`
-- 引数: `--target <id>=<https url>`（1 件）/ `--engine v8|boa`（既定 v8）/ `--out <path>`（既存ファイルは上書きせずエラー）/ `--debug-messages`（切り詰めた生メッセージを stderr のみへ）。実行上限・UA は引数から変えられない
+- 引数: `--target <id>=<https url>`（1 件）/ `--engine v8|boa`（既定 v8）/ `--out <path>`（既存ファイルは上書きせずエラー）/ `--debug-messages`（切り詰めた生メッセージを stderr のみへ）/ `--modules`（ES module 実行を有効にして収集・実行。#1119）/ `--selector <css>`（件数を数えるセレクタ。既定 `h1`。出力の `selector_initial`・`selector_after` に反映）。実行上限・UA は引数から変えられない
 - 終了コード: 0 = 記録完了 / 1 = 書き込み失敗 / 2 = 入力・使用エラー（エンジン未同梱を含む）
-- 出力（JSONL）: `meta`・`page`（status・本文バイト数・リダイレクト有無・初期 HTML の `h1` 件数・script の内訳）・`script`（index ごとの outcome と分類）・`run`（abort・ライフサイクル・イベントループ・ページ内 fetch / XHR・ブリッジ診断の件数・実行後の `h1` 件数）
+- 出力（JSONL）: `meta`・`page`（status・本文バイト数・リダイレクト有無・初期 HTML の `h1` 件数・script の内訳）・`script`（index ごとの outcome と分類）・`run`（abort・ライフサイクル・イベントループ・ページ内 fetch / XHR・ブリッジ診断の件数・実行後の `h1` 件数・動的 import の件数と reject 種別名）
 - script の URL・本文・ページテキスト・Cookie・生の例外メッセージは出力しない（src は同一オリジンかの真偽値のみ）
