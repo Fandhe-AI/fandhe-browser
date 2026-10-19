@@ -111,6 +111,8 @@ pub struct Classification {
     pub missing_api: Option<String>,
     /// 検証済みのプロパティ名（読み取り・設定・`in` 検索の対象。不足 API 名ではない。#1140）。
     pub property: Option<String>,
+    /// 検証済みのライブラリのエラー番号（`Minified React error #N` の数字 1〜6 桁だけ。#1145）。
+    pub code: Option<String>,
     /// 失敗ではない結果（スカラーに表現できない評価値）。
     pub non_scalar_result: bool,
 }
@@ -174,6 +176,7 @@ pub fn classify(msg: &str) -> Classification {
         message_class: class,
         missing_api: missing,
         property: None,
+        code: None,
         non_scalar_result: false,
     };
     let with_prop = |mut c: Classification, tail: &str| {
@@ -188,6 +191,7 @@ pub fn classify(msg: &str) -> Classification {
             message_class: "non_scalar_result",
             missing_api: None,
             property: None,
+            code: None,
             non_scalar_result: true,
         };
     }
@@ -220,6 +224,17 @@ pub fn classify(msg: &str) -> Classification {
             Some((_, tail)) => with_prop(c, tail),
             None => c,
         };
+    }
+    if let Some(tail) = body.strip_prefix("Minified React error #") {
+        // 本番ビルドの React は `Error` としてしか投げないため、boa でも Error と推定する
+        // （core の `summarize_exception_message` と同じ規則。#1145）。案内 URL は残さない。
+        let mut c = mk(kind.or(Some("Error")), "minified_react_error", None);
+        let digits: String = tail.chars().take_while(char::is_ascii_digit).collect();
+        let next = tail.get(digits.len()..).and_then(|r| r.chars().next());
+        if (1..=6).contains(&digits.len()) && matches!(next, None | Some(';') | Some(' ')) {
+            c.code = Some(digits);
+        }
+        return c;
     }
     mk(kind, "other", None)
 }

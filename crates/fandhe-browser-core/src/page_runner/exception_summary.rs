@@ -11,7 +11,15 @@
 //! 検証済みの場合だけ入れる。boa には「set properties」に当たる文言が無く、`in` の
 //! キー名もメッセージに含まれないため、boa ではそれぞれ `other`／名前なしになる（`REPAIR-3`）。
 //! `Cannot convert undefined or null to object` は将来の分類候補で、現状は `other` のまま。
+//!
+//! React の本番ビルドが投げる `Minified React error #N; visit <URL> ...` は
+//! [`ExceptionMessageClass::MinifiedReactError`] に分類し、エラー番号 `N` だけを
+//! [`ExceptionSummary::code`] に検証済み（ASCII 数字 1〜6 桁）の場合に入れる。案内 URL・
+//! 引数は残さない（Issue #1145）。この定型は `Error` としてしか投げられないため、
+//! 種類の接頭辞が無い boa でも `Error` と推定する。番号が検証外でも分類は保つ（`REPAIR-3`）。
 
+/// エラー番号（`code`）の最大桁数。
+const MAX_ERROR_CODE_DIGITS: usize = 6;
 /// 識別子 1 段あたりの最大バイト数。
 const MAX_IDENTIFIER_SEGMENT_BYTES: usize = 64;
 /// 識別子の最大段数（`a.b.c` で 3 段）。
@@ -95,6 +103,9 @@ pub enum ExceptionMessageClass {
     CannotUseInOperator,
     /// `Cannot set properties of undefined (setting 'K')`（V8）。
     CannotSetProperties,
+    /// React 本番ビルドの `Minified React error #N; visit ...`。番号は
+    /// [`ExceptionSummary::code`] に検証済みの場合だけ入る（Issue #1145）。
+    MinifiedReactError,
     /// 上記以外。
     Other,
 }
@@ -110,6 +121,7 @@ impl ExceptionMessageClass {
             Self::MissingExport => "missing_export",
             Self::CannotUseInOperator => "cannot_use_in_operator",
             Self::CannotSetProperties => "cannot_set_properties",
+            Self::MinifiedReactError => "minified_react_error",
             Self::Other => "other",
         }
     }
@@ -125,6 +137,7 @@ pub struct ExceptionSummary {
     class: ExceptionMessageClass,
     identifier: Option<String>,
     property: Option<String>,
+    code: Option<String>,
 }
 
 impl ExceptionSummary {
@@ -135,6 +148,7 @@ impl ExceptionSummary {
             class: ExceptionMessageClass::Other,
             identifier: None,
             property: None,
+            code: None,
         }
     }
 
@@ -165,6 +179,28 @@ impl ExceptionSummary {
     /// 不足 API 名ではない（`identifier` とは別物）。特定・検証できなければ `None`。
     pub fn property(&self) -> Option<&str> {
         self.property.as_deref()
+    }
+
+    /// ライブラリのエラー番号（`Minified React error #N` の `N`。ASCII 数字 1〜6 桁だけ）。
+    /// 不足 API 名（`identifier`）とも property とも別物。特定・検証できなければ `None`。
+    pub fn code(&self) -> Option<&str> {
+        self.code.as_deref()
+    }
+}
+
+/// `Minified React error #` の直後から番号を取り出して検証する（数字 1〜6 桁、直後は
+/// 終端・`;`・空白のいずれか。満たさなければ `None`）。
+fn react_error_code(tail: &str) -> Option<String> {
+    let end = tail
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(tail.len());
+    let digits = tail.get(..end)?;
+    if digits.is_empty() || digits.len() > MAX_ERROR_CODE_DIGITS {
+        return None;
+    }
+    match tail.get(end..).and_then(|r| r.chars().next()) {
+        None | Some(';') | Some(' ') => Some(digits.to_string()),
+        _ => None,
     }
 }
 
@@ -232,6 +268,7 @@ pub(crate) fn summarize_exception_message(msg: &str) -> ExceptionSummary {
         _ => body,
     };
     let mut property = None;
+    let mut code = None;
     let (class, ident) = if let Some(x) = body.strip_suffix(" is not defined") {
         (ExceptionMessageClass::NotDefined, identifier_of(x))
     } else if let Some(x) = body.strip_suffix(" is not a function") {
@@ -256,6 +293,9 @@ pub(crate) fn summarize_exception_message(msg: &str) -> ExceptionSummary {
     } else if let Some((_, tail)) = body.split_once("does not provide an export named '") {
         let name = tail.split('\'').next().unwrap_or("");
         (ExceptionMessageClass::MissingExport, identifier_of(name))
+    } else if let Some(tail) = body.strip_prefix("Minified React error #") {
+        code = react_error_code(tail);
+        (ExceptionMessageClass::MinifiedReactError, None)
     } else {
         (ExceptionMessageClass::Other, None)
     };
@@ -265,6 +305,7 @@ pub(crate) fn summarize_exception_message(msg: &str) -> ExceptionSummary {
         (ExceptionKind::Other, ExceptionMessageClass::CannotUseInOperator) => {
             ExceptionKind::TypeError
         }
+        (ExceptionKind::Other, ExceptionMessageClass::MinifiedReactError) => ExceptionKind::Error,
         _ => kind,
     };
     ExceptionSummary {
@@ -272,6 +313,7 @@ pub(crate) fn summarize_exception_message(msg: &str) -> ExceptionSummary {
         class,
         identifier: ident,
         property,
+        code,
     }
 }
 
@@ -567,5 +609,95 @@ mod tests {
             ExceptionMessageClass::ReadProperty.as_str(),
             "read_property"
         );
+    }
+
+    /// V8 形式の Minified React error（番号だけを取り出す。`JS-5`・`REPAIR-4`・Issue #1145）。
+    #[test]
+    fn v8_minified_react_error_extracts_code() {
+        let r = summarize_exception_message(
+            "Uncaught Error: Minified React error #123; visit https://h.example/errors/123?token=SECRET for the full message. (line 9)",
+        );
+        assert_eq!(r.kind(), ExceptionKind::Error);
+        assert_eq!(r.message_class(), ExceptionMessageClass::MinifiedReactError);
+        assert_eq!(r.code(), Some("123"));
+        assert_eq!(r.identifier(), None);
+        assert_eq!(r.property(), None);
+        let dbg = format!("{r:?}");
+        assert!(!dbg.contains("SECRET") && !dbg.contains("https") && !dbg.contains("token"));
+    }
+
+    /// boa 形式（接頭辞なし）でも分類・番号を取り、種類は Error と推定する
+    /// （`JS-5`・`REPAIR-4`・`REPAIR-3`・Issue #1145）。
+    #[test]
+    fn boa_minified_react_error_infers_error() {
+        let r = summarize_exception_message("Minified React error #45; visit https://h.example/x");
+        assert_eq!(r.kind(), ExceptionKind::Error);
+        assert_eq!(r.message_class(), ExceptionMessageClass::MinifiedReactError);
+        assert_eq!(r.code(), Some("45"));
+        // 番号だけで終わる形でも取れる。
+        assert_eq!(
+            summarize_exception_message("Minified React error #7").code(),
+            Some("7")
+        );
+    }
+
+    /// 検証外の番号は分類を保ったまま code が None（`JS-5`・`REPAIR-4`・Issue #1145）。
+    #[test]
+    fn invalid_react_error_codes_become_none() {
+        for bad in [
+            "",
+            "1234567",
+            "12a",
+            "-1",
+            "１２",
+            "https://h.example/?token=SECRET",
+            "0x1",
+        ] {
+            let r = summarize_exception_message(&format!(
+                "Uncaught Error: Minified React error #{bad}; visit https://h.example"
+            ));
+            assert_eq!(
+                r.message_class(),
+                ExceptionMessageClass::MinifiedReactError,
+                "{bad}"
+            );
+            assert_eq!(r.code(), None, "{bad}");
+            let dbg = format!("{r:?}");
+            assert!(!dbg.contains("SECRET") && !dbg.contains("https"), "{bad}");
+        }
+        // 6 桁は上限内。
+        assert_eq!(
+            summarize_exception_message("Minified React error #999999").code(),
+            Some("999999")
+        );
+    }
+
+    /// 巨大入力・マルチバイトでも panic せず上限内（`JS-5`・`REPAIR-4`・Issue #1145）。
+    #[test]
+    fn react_error_code_is_bounded_and_panic_free() {
+        let big = format!(
+            "Uncaught Error: Minified React error #{}",
+            "9".repeat(1 << 20)
+        );
+        assert_eq!(summarize_exception_message(&big).code(), None);
+        let multi = format!("Minified React error #{}", "あ".repeat(5000));
+        assert_eq!(summarize_exception_message(&multi).code(), None);
+        assert_eq!(
+            summarize_exception_message("Minified React error #").code(),
+            None
+        );
+    }
+
+    /// 新しい語彙の表記と、既存の Error 文言が `other` のままであること（Issue #1145）。
+    #[test]
+    fn minified_react_error_vocabulary_is_fixed() {
+        assert_eq!(
+            ExceptionMessageClass::MinifiedReactError.as_str(),
+            "minified_react_error"
+        );
+        let r = summarize_exception_message("Uncaught Error: something else");
+        assert_eq!(r.message_class(), ExceptionMessageClass::Other);
+        assert_eq!(r.code(), None);
+        assert_eq!(ExceptionSummary::other().code(), None);
     }
 }
