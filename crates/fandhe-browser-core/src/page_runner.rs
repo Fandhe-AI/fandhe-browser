@@ -499,7 +499,8 @@ impl SrcFetchErrorKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ScriptOutcome {
-    /// 正常終了（completion 値は保持しない）。
+    /// 正常終了。完了値は変換も保持もしない（オブジェクト等の変換できない完了値でも成功。
+    /// `JS-4`・Issue #1134）。
     Succeeded,
     /// 例外で終了した。後続のスクリプトは続行する。
     Exception {
@@ -1485,7 +1486,14 @@ fn evaluate_with_budget(rt: &mut JsRuntime, ctx: &RunContext<'_>, src: &str) -> 
         return Evaluated::BudgetExhausted(page_wall_abort(options, None).kind);
     };
 
-    let result = rt.execute_with_options(src, &EvaluateOptions::default().with_timeout(timeout));
+    // 完了値は誰も使わないため、変換せず捨てる（オブジェクト等の完了値を例外と誤報告しない。
+    // ソースは書き換えない。`JS-4`・Issue #1134）。
+    let result = rt.execute_with_options(
+        src,
+        &EvaluateOptions::default()
+            .with_timeout(timeout)
+            .with_discard_completion_value(true),
+    );
 
     // 評価後にもページ時計を確認する。子プロセス経路の切り上げ・猶予で、残り時間を
     // 超えて正常応答が届くことがある（`JS-6`）。

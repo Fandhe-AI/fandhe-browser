@@ -1422,6 +1422,64 @@ pub fn run(engine: &str) {
         other => panic!("unexpected: {other:?}"),
     }
 
+    eprintln!("case: JS-4 non-scalar completion value is not an exception (#1134)");
+    let out = run_page(
+        engine,
+        "<body><script>document.body.setAttribute('data-x','1'); ({a:1})</script>\
+         <script>document.body.setAttribute('data-arr','2'); [1,2]</script>\
+         <script>document.body.setAttribute('data-fn','3'); (function(){})</script>\
+         <script>document.body.setAttribute('data-c','4'); ({}) // trailing comment</script>\
+         <script>var g = 7; ({})</script>\
+         <script>document.body.setAttribute('data-g', String(g))</script></body>",
+        &opts,
+    );
+    for attr in [
+        "data-x=\"1\"",
+        "data-arr=\"2\"",
+        "data-fn=\"3\"",
+        "data-c=\"4\"",
+        "data-g=\"7\"",
+    ] {
+        assert!(out.html().contains(attr), "{attr}: {}", out.html());
+    }
+    assert_eq!(out.scripts().len(), 6);
+    for script in out.scripts() {
+        assert_eq!(script.outcome(), &ScriptOutcome::Succeeded);
+    }
+    assert!(out.abort().is_none());
+
+    eprintln!("case: JS-4 real exception keeps side effects and stays Exception (#1134)");
+    let out = run_page(
+        engine,
+        "<body><script>document.body.setAttribute('data-y','1'); throw new Error('boom2')</script>\
+         <script>var = ;</script>\
+         <script>document.body.setAttribute('data-z','1')</script></body>",
+        &opts,
+    );
+    assert!(out.html().contains("data-y=\"1\""), "{}", out.html());
+    assert!(out.html().contains("data-z=\"1\""), "{}", out.html());
+    match out.scripts()[0].outcome() {
+        ScriptOutcome::Exception { message, .. } => assert!(message.contains("boom2"), "{message}"),
+        other => panic!("unexpected: {other:?}"),
+    }
+    assert!(matches!(
+        out.scripts()[1].outcome(),
+        ScriptOutcome::Exception { .. }
+    ));
+    assert_eq!(out.scripts()[2].outcome(), &ScriptOutcome::Succeeded);
+
+    eprintln!("case: JS-4 incomplete control statement stays a syntax error (#1134)");
+    let out = run_page(
+        engine,
+        "<body><script>document.body.setAttribute('data-x','1'); if (true)</script></body>",
+        &opts,
+    );
+    assert!(!out.html().contains("data-x=\"1\""), "{}", out.html());
+    assert!(matches!(
+        out.scripts()[0].outcome(),
+        ScriptOutcome::Exception { .. }
+    ));
+
     eprintln!("case: JS-4 huge exception message stays bounded");
     let out = run_page(
         engine,

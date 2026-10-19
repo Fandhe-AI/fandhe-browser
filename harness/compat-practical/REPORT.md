@@ -168,12 +168,20 @@ b5 で `h1` が得られない原因は **ES module（#918）が主因**。`h1` 
 推測（未検証）:
 
 - module を実行できるようにすれば `h1` が生成される。module の実行には cross-origin の取得が要るため、ページ内 fetch が cross-origin を reject する現状（`JS-8`）との整合を #918 の設計で決める必要がある
-- index 1・2 は `non_scalar_result` と分類されるが、値の変換に失敗しただけでスクリプト自体は実行されている可能性がある（副作用が反映されたかは未確認）。実行結果の報告が実態とずれているなら別途の修正が要る
+- index 1・2 の `non_scalar_result` は、完了値の変換の失敗であり誤報告だった（#1134 で確認・修正。下の小節）
 
 ### 追跡先
 
 - ES module: #918 にコメントした（b5 も対象になる旨と根拠）
-- `non_scalar_result`（完了値がオブジェクトの inline script が `Exception` と報告される点）は本 issue の範囲外。起票はオーナーの承認後（PR 本文に記載）
+- `non_scalar_result`（完了値がオブジェクトの inline script が `Exception` と報告される点）は #1134 で対応した（下の小節）
+
+### 完了値がスカラーでない inline script の誤報告（#1134）
+
+- 原因: エンジンはスクリプトを最後まで実行してから完了値を `JsValue` へ変換する。オブジェクト・配列・関数や上限超過の文字列は変換に失敗し `EvaluationFailed` になり、ページ実行がそれをすべて `Exception` にしていた。評価そのものは完了しており、DOM・グローバルの副作用は反映されている（fixture のケース `non-scalar completion value is not an exception` で確認）
+- `JS-5`（DOM バインディングの不足）とは無関係で、エンジン API（完了値を返す）とページ実行（完了値を使わない）のずれが原因
+- 修正: `EvaluateOptions::with_discard_completion_value(true)` をエンジン抽象に追加し、ページ実行の評価で完了値を変換せず捨てるようにした（V8・boa・子プロセスのワイヤ〔protocol 8〕）。ソースは書き換えない。本当の例外（`throw`・構文エラー・参照エラー）は従来どおり `Exception`
+- 末尾が `if (true)` などで終わる壊れた script は従来どおり構文エラーのまま（ソース不変のため。回帰テストあり）
+- b5 の再測定: 未実施（ネットワークを使う実測のため、本変更では fixture のテストで同じ形の script が `succeeded` になることだけを根拠とする）。実測では index 1・2 の outcome が `succeeded` に変わる見込みだが、未確認
 
 ### 再現手順
 

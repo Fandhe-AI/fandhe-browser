@@ -466,6 +466,7 @@ pub type NativeFn = Box<dyn FnMut(&[JsValue]) -> Result<JsValue, JsEngineError> 
 pub struct EvaluateOptions {
     timeout: Duration,
     max_result_bytes: usize,
+    discard_completion_value: bool,
 }
 
 impl EvaluateOptions {
@@ -490,6 +491,25 @@ impl EvaluateOptions {
         self
     }
 
+    /// 評価成功後に完了値を [`JsValue`] へ変換せず捨てる（`true` なら成功時は常に
+    /// [`JsValue::Undefined`]。`JS-4`・Issue #1134）。
+    ///
+    /// HTML の classic script は完了値を使わない。オブジェクト・配列・関数や上限超過の
+    /// 文字列は変換が [`JsEngineError::EvaluationFailed`] になるため、実行済みのスクリプトが
+    /// 例外と誤報告されるのを防ぐ。ソースを書き換えないので構文エラーや例外の扱いは
+    /// 変わらない。評価中の例外・タイムアウト・資源上限は従来どおりエラー。
+    #[must_use]
+    pub fn with_discard_completion_value(mut self, discard: bool) -> Self {
+        self.discard_completion_value = discard;
+        self
+    }
+
+    /// 完了値を捨てるか。
+    #[must_use]
+    pub fn discard_completion_value(&self) -> bool {
+        self.discard_completion_value
+    }
+
     /// 指定された実時間タイムアウト。
     #[must_use]
     pub fn timeout(&self) -> Duration {
@@ -508,6 +528,7 @@ impl Default for EvaluateOptions {
         Self {
             timeout: Self::DEFAULT_TIMEOUT,
             max_result_bytes: Self::DEFAULT_MAX_RESULT_BYTES,
+            discard_completion_value: false,
         }
     }
 }
