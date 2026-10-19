@@ -25,6 +25,9 @@
 // - fetch の `signal`（#1150）: 中止済みなら要求を出さずに reason で reject し、要求後の中止は未着手の要求を
 //   `netCancel` で取り除いて reason で reject する。着手済みの要求は取り消せず、応答は届くが pending に無いため
 //   捨てられる（`completed()` は増え得る）。受理件数は中止しても戻らない（連打で上限を回避できない）。
+//   応答取得後の中止（#1162・JS-5・JS-8）: 未読の `text()` / `json()` は読み取り時に signal を問い合わせ、
+//   中止済みなら reason で reject する（bodyUsed は true になり、2 回目は TypeError）。読み取り済みの値は変わらない。
+//   配送後の追従登録は持たない（リスナー上限 JS-6 に影響しない）。
 //   XHR の signal・Request の signal は扱わない。
 // - boa ではネイティブ Promise のジョブが drain されない（js crate が run_jobs を呼ばない。TASK-30）。
 //   そのため boa では fetch の `.then` / await の続きが走らない。XHR（コールバック式）は動く。
@@ -101,7 +104,17 @@
         throw new NativeTypeError('Illegal constructor');
     }
 
-    function makeResponse(status, url, body) {
+    // 応答取得後に signal が中止されたかを読み取り時に問い合わせる（#1162・JS-5・JS-8）。
+    // 配送時に追従を解除済みのためリスナーは持たず、install 時捕捉の窓口だけを使う。
+    function isAborted(signal) {
+        return signal !== null && abortFollow !== null && abortFollow(signal) === 2;
+    }
+
+    function abortedReject(signal) {
+        return NativePromise.reject(abortReasonGet !== null ? fnCall(abortReasonGet, signal) : undefined);
+    }
+
+    function makeResponse(status, url, body, signal) {
         var used = false;
         var r = createObject(Response.prototype);
         defineProperty(r, 'status', { value: status, enumerable: true });
@@ -121,6 +134,9 @@
                     );
                 }
                 used = true;
+                if (isAborted(signal)) {
+                    return abortedReject(signal);
+                }
                 return NativePromise.resolve(body);
             }
         });
@@ -132,6 +148,9 @@
                     );
                 }
                 used = true;
+                if (isAborted(signal)) {
+                    return abortedReject(signal);
+                }
                 try {
                     return NativePromise.resolve(jsonParse(body));
                 } catch (e) {
@@ -415,7 +434,7 @@
                 if (status === 0) {
                     entry.reject(failedToFetch());
                 } else {
-                    entry.resolve(makeResponse(status, url, body));
+                    entry.resolve(makeResponse(status, url, body, entry.signal));
                 }
             } catch (e) {
                 reportError('fetch', e);

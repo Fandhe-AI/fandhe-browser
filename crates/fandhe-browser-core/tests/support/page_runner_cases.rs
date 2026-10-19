@@ -1205,6 +1205,87 @@ pub fn run_fetch_promises(engine: &str) {
             out.html()
         );
     }
+    eprintln!("case: JS-8 abort after the response and before text() rejects with the reason");
+    let out = run_page_at(
+        engine,
+        &page(
+            "var c=new AbortController();fetch('data.json',{signal:c.signal}).then(function(r){c.abort('stop');return r.text();}).then(function(t){a('ok:'+t)},function(e){a('rej:'+e)})",
+        ),
+        &base,
+        &opts,
+        &loopback_fetcher(),
+    );
+    assert_eq!(out.net().completed(), 1);
+    assert_eq!(out.net().cancelled(), 0);
+    if promise_runs {
+        assert!(out.html().contains("<p>rej:stop</p>"), "{}", out.html());
+        assert!(!out.html().contains("<p>ok:"), "{}", out.html());
+    }
+
+    eprintln!(
+        "case: JS-8 abort after the response and before json() rejects with AbortError by default"
+    );
+    let out = run_page_at(
+        engine,
+        &page(
+            "var c=new AbortController();fetch('data.json',{signal:c.signal}).then(function(r){c.abort();return r.json();}).then(function(t){a('ok')},function(e){a('rej:'+e.name)})",
+        ),
+        &base,
+        &opts,
+        &loopback_fetcher(),
+    );
+    assert_eq!(out.net().completed(), 1);
+    assert_eq!(out.net().cancelled(), 0);
+    if promise_runs {
+        assert!(
+            out.html().contains("<p>rej:AbortError</p>"),
+            "{}",
+            out.html()
+        );
+        assert!(!out.html().contains("<p>ok</p>"), "{}", out.html());
+    }
+
+    eprintln!(
+        "case: JS-8 an aborted body read marks the body used and a second read is a TypeError"
+    );
+    let out = run_page_at(
+        engine,
+        &page(
+            "var c=new AbortController();fetch('data.json',{signal:c.signal}).then(function(r){c.abort('s');return r.text().catch(function(e){a('first:'+e+':'+r.bodyUsed);return r.text().catch(function(e2){a('second:'+e2.name)})})})",
+        ),
+        &base,
+        &opts,
+        &loopback_fetcher(),
+    );
+    assert_eq!(out.net().completed(), 1);
+    assert_eq!(out.net().cancelled(), 0);
+    if promise_runs {
+        assert!(out.html().contains("<p>first:s:true</p>"), "{}", out.html());
+        assert!(
+            out.html().contains("<p>second:TypeError</p>"),
+            "{}",
+            out.html()
+        );
+    }
+
+    eprintln!("case: JS-8 abort after starting text() / json() does not change the value");
+    let out = run_page_at(
+        engine,
+        &page(
+            "var c=new AbortController();fetch('data.json',{signal:c.signal}).then(function(r){var p=r.text();c.abort('late');return p;}).then(function(t){a('ok:'+t)},function(e){a('rej:'+e)});var d=new AbortController();fetch('data.json',{signal:d.signal}).then(function(r){var p=r.json();d.abort('late');return p;}).then(function(v){a('json:'+JSON.stringify(v))},function(e){a('rej2:'+e)})",
+        ),
+        &base,
+        &opts,
+        &loopback_fetcher(),
+    );
+    assert_eq!(out.net().completed(), 2);
+    assert_eq!(out.net().cancelled(), 0);
+    if promise_runs {
+        assert!(out.html().contains("<p>ok:{}</p>"), "{}", out.html());
+        assert!(out.html().contains("<p>json:{}</p>"), "{}", out.html());
+        assert!(!out.html().contains("<p>rej:"), "{}", out.html());
+        assert!(!out.html().contains("<p>rej2:"), "{}", out.html());
+    }
 }
 
 /// 指定パスへの要求回数（ヒットの先頭行の request target で数える）。
