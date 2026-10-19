@@ -56,6 +56,7 @@ fn setup_html(engine: &str, html: &str, limit_extra_nodes: Option<usize>) -> Pag
             "observers.js",
             "style.js",
             "url.js",
+            "storage.js",
         ]
     );
     Page { bridge, rt, script }
@@ -289,6 +290,7 @@ pub fn run(engine: &str) {
     url_cases(engine);
     node_cases(engine);
     abort_cases(engine);
+    storage_cases(engine);
 
     eprintln!("case: JS-5 disabled runtime does not pretend to install");
     let mut disabled = JsRuntime::disabled();
@@ -2032,4 +2034,101 @@ fn abort_cases(engine: &str) {
          [seen13, s13.aborted, s13.reason].join('|')",
         "false|true|z",
     );
+}
+
+/// `storage.js`（#1167・`JS-5`・`JS-6`・`SEC-2`）の in-memory Web Storage。
+fn storage_cases(engine: &str) {
+    eprintln!("case: JS-5 storage globals");
+    let mut p = setup(engine, None);
+    check(
+        &mut p,
+        "[typeof Storage, typeof localStorage, typeof sessionStorage, window.localStorage === localStorage, \
+         localStorage !== sessionStorage, localStorage instanceof Storage, \
+         Object.prototype.toString.call(localStorage)].join('|')",
+        "function|object|object|true|true|true|[object Storage]",
+    );
+
+    eprintln!("case: JS-5 storage round trip, overwrite, remove, clear");
+    check(
+        &mut p,
+        "localStorage.setItem('a','1'); localStorage.setItem('b','2'); \
+         [localStorage.length, localStorage.getItem('a'), localStorage.key(0), localStorage.key(1), \
+         localStorage.key(2) === null, localStorage.getItem('zz') === null].join('|')",
+        "2|1|a|b|true|true",
+    );
+    check(
+        &mut p,
+        "localStorage.setItem('a','9'); \
+         [localStorage.length, localStorage.getItem('a'), localStorage.key(0)].join('|')",
+        "2|9|a",
+    );
+    check(
+        &mut p,
+        "localStorage.removeItem('nope'); localStorage.removeItem('a'); \
+         [localStorage.length, localStorage.key(0), localStorage.getItem('a') === null].join('|')",
+        "1|b|true",
+    );
+    check(&mut p, "localStorage.clear(); localStorage.length", "0");
+
+    eprintln!("case: JS-5 storage stringification and special keys");
+    check(
+        &mut p,
+        "localStorage.setItem('n', 1); localStorage.setItem('x', null); localStorage.setItem(1, 'v'); \
+         localStorage.setItem('__proto__', 'p'); \
+         [typeof localStorage.getItem('n'), localStorage.getItem('x'), localStorage.getItem('1'), \
+         localStorage.getItem('__proto__'), localStorage.length].join('|')",
+        "string|null|v|p|4",
+    );
+    check(
+        &mut p,
+        "var r = []; try { localStorage.setItem(Symbol('s'), 'v'); } catch (e) { r.push(e instanceof TypeError); } \
+         try { localStorage.getItem(); } catch (e) { r.push(e instanceof TypeError); } r.join('|')",
+        "true|true",
+    );
+
+    eprintln!("case: JS-5 storage instances are independent");
+    check(
+        &mut p,
+        "localStorage.setItem('k','L'); String(sessionStorage.getItem('k'))",
+        "null",
+    );
+
+    eprintln!("case: JS-6 storage quota rejects without changing state");
+    check(
+        &mut p,
+        "localStorage.clear(); localStorage.setItem('keep','1'); var big = 'x'.repeat(5 * 1024 * 1024 + 1); \
+         var q = []; try { localStorage.setItem('big', big); } catch (e) { \
+         q.push(e instanceof DOMException, e.name, e.code); } \
+         q.push(localStorage.length, localStorage.getItem('keep'), localStorage.getItem('big') === null); q.join('|')",
+        "true|QuotaExceededError|22|1|1|true",
+    );
+    check(
+        &mut p,
+        "var n = 0, err = ''; \
+         try { for (; n < 70000; n++) { sessionStorage.setItem('k' + n, ''); } } catch (e) { err = e.name; } \
+         [n, err, sessionStorage.length].join('|')",
+        "65536|QuotaExceededError|65536",
+    );
+
+    eprintln!("case: JS-5 storage brand check and SEC-2 identity surface");
+    check(
+        &mut p,
+        "var b = []; try { Storage.prototype.getItem.call({}, 'a'); } catch (e) { b.push(e instanceof TypeError); } \
+         try { new Storage(); } catch (e) { b.push(e instanceof TypeError); } b.join('|')",
+        "true|true",
+    );
+    check(
+        &mut p,
+        "[typeof StorageEvent, 'remainingSpace' in localStorage, typeof navigator.storage].join('|')",
+        "undefined|false|undefined",
+    );
+
+    eprintln!("case: JS-5 storage resets on reinstall");
+    check(
+        &mut p,
+        "localStorage.clear(); localStorage.setItem('r','1'); localStorage.length",
+        "1",
+    );
+    p.rt.install_dom_shim(&p.bridge).expect("reinstall");
+    check(&mut p, "localStorage.length", "0");
 }
