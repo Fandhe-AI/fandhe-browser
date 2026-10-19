@@ -117,6 +117,78 @@ fn append(n: &str) -> String {
     )
 }
 
+/// `MutationObserver` の実 checkpoint での配信と上限打ち切り（#1138・`JS-7`・`JS-6`）。
+fn mutation_observer_cases(engine: &str) {
+    let page = |tag: &str, script: &str| {
+        format!(
+            "<body><script{tag}>function a(t){{var p=document.createElement('p');\
+             p.textContent=t;document.body.appendChild(p)}}{script}</script></body>"
+        )
+    };
+    let observe = "var mo=new MutationObserver(function(r){a('mo'+r.length)});\
+                   mo.observe(document.getElementById('t')||document.body,{attributes:true});\
+                   document.body.setAttribute('data-x','1');";
+
+    eprintln!("case: JS-7 MutationObserver callback is delivered at the classic script checkpoint");
+    let out = run_page(engine, &page("", observe), &PageRunOptions::default());
+    assert_eq!(
+        out.html().matches("<p>mo1</p>").count(),
+        1,
+        "{}",
+        out.html()
+    );
+    assert!(out.abort().is_none(), "{:?}", out.abort());
+
+    eprintln!("case: JS-7 MutationObserver callback is delivered after a module script");
+    let out = run_page(engine, &page(" type=module", observe), &module_options());
+    assert_eq!(
+        out.html().matches("<p>mo1</p>").count(),
+        1,
+        "{}",
+        out.html()
+    );
+    assert!(out.abort().is_none(), "{:?}", out.abort());
+
+    // 上限（10000 件 / 1000 登録）を 1 件だけ超える回数で止め、遅い環境でも wall time より先に
+    // 上限へ当たるよう、これらのケースだけ wall time を十分大きくして判定を決定的にする。
+    let limit_opts = PageRunOptions::default()
+        .with_script_wall_time(Duration::from_secs(60))
+        .with_page_wall_time(Duration::from_secs(120));
+
+    eprintln!("case: JS-6 pending mutation records are capped and abort the page");
+    // op は 1 変更あたり 1 回のため、observer 100 個 × 変更 101 回で 10000 件を超える。
+    let out = run_page(
+        engine,
+        &page(
+            "",
+            "for(var k=0;k<100;k++){new MutationObserver(function(){}).observe(document.body,{attributes:true})}\
+             for(var i=0;i<101;i++){document.body.setAttribute('data-n',String(i))}",
+        ),
+        &limit_opts,
+    );
+    assert_eq!(
+        out.abort().map(|a| a.kind().clone()),
+        Some(AbortKind::ResourceLimit)
+    );
+    assert!(out.bridge_diagnostics().mutation_observer_limit_exceeded);
+
+    eprintln!("case: JS-6 mutation observer registrations are capped and abort the page");
+    let out = run_page(
+        engine,
+        &page(
+            "",
+            "var el=document.createElement('i');\
+             for(var i=0;i<1001;i++){new MutationObserver(function(){}).observe(el,{childList:true})}",
+        ),
+        &limit_opts,
+    );
+    assert_eq!(
+        out.abort().map(|a| a.kind().clone()),
+        Some(AbortKind::ResourceLimit)
+    );
+    assert!(out.bridge_diagnostics().mutation_observer_limit_exceeded);
+}
+
 /// タイマー・microtask の共通ケース（`JS-7`・`JS-6`）。
 fn timer_cases(engine: &str) {
     // 本文へ `<p>` を足すヘルパーを各ページの先頭に置く。
@@ -1429,6 +1501,7 @@ pub fn run_dynamic_imports(engine: &str) {
 pub fn run(engine: &str) {
     let opts = PageRunOptions::default();
     timer_cases(engine);
+    mutation_observer_cases(engine);
     net_cases(engine);
 
     eprintln!("case: JS-4 document order + console order");

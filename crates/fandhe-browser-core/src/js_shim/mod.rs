@@ -27,7 +27,10 @@
 //! `queueMicrotask` とランナー用ディスパッチャー `__fandheRunTimer` / `__fandheRunMicrotasks` を
 //! 提供する（期限・順序・上限の実体は core の `event_loop`）。`net.js`（#783・`JS-8`）は GET だけの
 //! 最小の `fetch` / `XMLHttpRequest` とランナー用ディスパッチャー `__fandheNetDeliver` を提供する
-//! （取得・上限・SSRF 検査の実体は core の `page_net` と Fetcher）。
+//! （取得・上限・SSRF 検査の実体は core の `page_net` と Fetcher）。`observers.js`（#1138・`JS-5`・
+//! `JS-7`・`JS-6`）は `MutationObserver` / `MutationRecord` を提供し、dom.js の変更系ラッパーが呼ぶ
+//! フックで検出した変更を microtask で配信する（oldValue・transient registered observer・
+//! innerHTML / textContent 設定時の追加・削除ノード等は未実装。診断は `mutationOptionsIgnored` op）。
 
 use fandhe_browser_js::{EvaluateOptions, JsEngine, JsEngineError};
 
@@ -62,6 +65,10 @@ pub const JS_SHIM_SOURCES: &[JsShimSource] = &[
     JsShimSource {
         name: "net.js",
         source: include_str!("net.js"),
+    },
+    JsShimSource {
+        name: "observers.js",
+        source: include_str!("observers.js"),
     },
 ];
 

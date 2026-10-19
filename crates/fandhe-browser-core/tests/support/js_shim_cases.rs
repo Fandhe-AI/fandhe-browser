@@ -41,7 +41,14 @@ fn setup(engine: &str, limit_extra_nodes: Option<usize>) -> Page {
     let installed = rt.install_dom_shim(&bridge).expect("install shim");
     assert_eq!(
         installed.evaluated,
-        vec!["dom.js", "window.js", "events.js", "timers.js", "net.js"]
+        vec![
+            "dom.js",
+            "window.js",
+            "events.js",
+            "timers.js",
+            "net.js",
+            "observers.js",
+        ]
     );
     Page { bridge, rt, script }
 }
@@ -269,6 +276,7 @@ pub fn run(engine: &str) {
     check(&mut p, "typeof document.createElement('p')", "object");
 
     window_cases(engine);
+    observer_cases(engine);
 
     eprintln!("case: JS-5 disabled runtime does not pretend to install");
     let mut disabled = JsRuntime::disabled();
@@ -513,4 +521,248 @@ fn window_cases(engine: &str) {
     let mut p = setup(engine, None);
     p.eval("document.addEventListener('load', function () {}); 'ok'");
     assert!(!p.bridge.listener_limit_exceeded().expect("flag"));
+}
+/// `MutationObserver` / `MutationRecord`（#1138・`JS-5`・`JS-7`・`JS-6`・`REPAIR-3`・`SEC-2`）のケース。
+///
+/// 配信は shim 内の microtask キューで行われるため、ランナーの checkpoint に相当する
+/// `__fandheRunMicrotasks()` を評価して drain する。
+fn observer_cases(engine: &str) {
+    eprintln!("case: JS-5 MutationObserver API surface and argument validation");
+    let mut p = setup(engine, None);
+    check(&mut p, "typeof MutationObserver", "function");
+    check(&mut p, "typeof MutationRecord", "function");
+    check(&mut p, "typeof WebKitMutationObserver", "undefined");
+    for (script, label) in [
+        ("new MutationObserver(1)", "callback"),
+        ("MutationObserver(function () {})", "new"),
+        (
+            "new MutationObserver(function () {}).observe(document.body, {})",
+            "empty options",
+        ),
+        (
+            "new MutationObserver(function () {}).observe({}, { childList: true })",
+            "target",
+        ),
+        (
+            "new MutationObserver(function () {}).observe(document.body, { attributes: false, attributeOldValue: true })",
+            "oldValue without attributes",
+        ),
+        ("new MutationRecord()", "illegal constructor"),
+    ] {
+        eprintln!("  rejected: {label}");
+        check(
+            &mut p,
+            &format!(
+                "try {{ {script}; 'no error' }} catch (e) {{ e instanceof TypeError ? 'TypeError' : 'other' }}"
+            ),
+            "TypeError",
+        );
+    }
+    check(
+        &mut p,
+        "typeof globalThis.__fandheDomMutationHandoff",
+        "undefined",
+    );
+
+    eprintln!("case: JS-7 callback runs once in a microtask with batched records");
+    let mut p = setup(engine, None);
+    check(
+        &mut p,
+        "var calls = 0, got = null; \
+         var mo = new MutationObserver(function (r, o) { calls++; got = r.length + ':' + r[0].type + ':' + (o === mo); }); \
+         mo.observe(document.body, { childList: true }); \
+         document.body.appendChild(document.createElement('i')); calls",
+        "0",
+    );
+    check(
+        &mut p,
+        "__fandheRunMicrotasks(); calls + '|' + got",
+        "1|1:childList:true",
+    );
+    check(&mut p, "__fandheRunMicrotasks(); calls", "1");
+    check(
+        &mut p,
+        "calls = 0; document.body.appendChild(document.createElement('b')); \
+         document.body.appendChild(document.createElement('u')); \
+         __fandheRunMicrotasks(); calls + '|' + got",
+        "1|2:childList:true",
+    );
+
+    eprintln!("case: JS-5 record fields for attributes / removeChild / insertBefore");
+    let mut p = setup(engine, None);
+    check(
+        &mut p,
+        "var recs = []; var el = document.getElementById('a'); \
+         var mo = new MutationObserver(function (r) { for (var i = 0; i < r.length; i++) recs.push(r[i]); }); \
+         mo.observe(el, { attributes: true, childList: true }); \
+         el.setAttribute('data-x', '1'); el.removeAttribute('data-x'); \
+         var first = el.querySelector('p'); var extra = document.createElement('i'); \
+         el.insertBefore(extra, first); el.removeChild(extra); __fandheRunMicrotasks(); recs.length",
+        "4",
+    );
+    check(
+        &mut p,
+        "recs[0].type + ',' + recs[0].attributeName + ',' + recs[0].oldValue + ',' + (recs[0].target === el)",
+        "attributes,data-x,null,true",
+    );
+    check(
+        &mut p,
+        "recs[1].type + ',' + recs[1].attributeName",
+        "attributes,data-x",
+    );
+    check(
+        &mut p,
+        "recs[2].addedNodes.length + ',' + (recs[2].addedNodes[0] === extra) + ',' + (recs[2].nextSibling === first) + ',' + recs[2].removedNodes.length",
+        "1,true,true,0",
+    );
+    check(
+        &mut p,
+        "recs[3].removedNodes.length + ',' + (recs[3].removedNodes[0] === extra) + ',' + recs[3].previousSibling",
+        "1,true,null",
+    );
+
+    eprintln!("case: JS-5 characterData / textContent / innerHTML");
+    let mut p = setup(engine, None);
+    check(
+        &mut p,
+        "var types = []; var mo = new MutationObserver(function (r) { for (var i = 0; i < r.length; i++) types.push(r[i].type + ':' + r[i].addedNodes.length); }); \
+         var t = document.createTextNode('a'); document.body.appendChild(t); \
+         mo.observe(t, { characterData: true }); mo.observe(document.getElementById('a'), { childList: true }); \
+         t.textContent = 'b'; document.getElementById('a').textContent = 'c'; \
+         document.getElementById('a').innerHTML = '<b></b>'; __fandheRunMicrotasks(); types.join(',')",
+        "characterData:0,childList:0,childList:0",
+    );
+
+    eprintln!("case: JS-5 subtree requires the current ancestor relation");
+    let mut p = setup(engine, None);
+    check(
+        &mut p,
+        "var n = 0, tgt = null; var a = document.getElementById('a'); \
+         var mo = new MutationObserver(function (r) { n += r.length; tgt = r[0].target; }); \
+         mo.observe(document.body, { childList: true, subtree: true }); \
+         a.appendChild(document.createElement('i')); __fandheRunMicrotasks(); n + '|' + (tgt === a)",
+        "1|true",
+    );
+    check(
+        &mut p,
+        "n = 0; mo.disconnect(); mo.observe(document.body, { childList: true }); \
+         a.appendChild(document.createElement('i')); __fandheRunMicrotasks(); n",
+        "0",
+    );
+
+    eprintln!("case: JS-7 disconnect drops pending records and later changes");
+    let mut p = setup(engine, None);
+    check(
+        &mut p,
+        "var calls = 0; var mo = new MutationObserver(function () { calls++; }); \
+         mo.observe(document.body, { childList: true }); \
+         document.body.appendChild(document.createElement('i')); mo.disconnect(); \
+         __fandheRunMicrotasks(); document.body.appendChild(document.createElement('i')); \
+         __fandheRunMicrotasks(); calls",
+        "0",
+    );
+
+    eprintln!("case: JS-7 takeRecords returns pending records and empties the queue");
+    let mut p = setup(engine, None);
+    check(
+        &mut p,
+        "var calls = 0; var mo = new MutationObserver(function () { calls++; }); \
+         mo.observe(document.body, { childList: true }); \
+         document.body.appendChild(document.createElement('i')); \
+         var first = mo.takeRecords().length; var second = mo.takeRecords().length; \
+         __fandheRunMicrotasks(); first + ',' + second + ',' + calls",
+        "1,0,0",
+    );
+
+    eprintln!("case: JS-5 attributeFilter restricts attribute records");
+    let mut p = setup(engine, None);
+    check(
+        &mut p,
+        "var names = []; var el = document.getElementById('a'); \
+         var mo = new MutationObserver(function (r) { for (var i = 0; i < r.length; i++) names.push(r[i].attributeName); }); \
+         mo.observe(el, { attributeFilter: ['data-b'] }); \
+         el.setAttribute('data-a', '1'); el.setAttribute('data-b', '1'); __fandheRunMicrotasks(); names.join(',')",
+        "data-b",
+    );
+    assert_eq!(
+        p.bridge
+            .take_diagnostics()
+            .expect("diagnostics")
+            .mutation_options_ignored,
+        0
+    );
+
+    eprintln!("case: REPAIR-3 unsupported oldValue options are accepted and counted");
+    let mut p = setup(engine, None);
+    check(
+        &mut p,
+        "var el = document.getElementById('a'); var mo = new MutationObserver(function () {}); \
+         mo.observe(el, { attributes: true, attributeOldValue: true }); 'ok'",
+        "ok",
+    );
+    assert_eq!(
+        p.bridge
+            .take_diagnostics()
+            .expect("diagnostics")
+            .mutation_options_ignored,
+        1
+    );
+
+    eprintln!("case: JS-7 a throwing callback does not stop other observers");
+    let mut p = setup(engine, None);
+    check(
+        &mut p,
+        "var second = 0; \
+         var m1 = new MutationObserver(function () { throw new Error('boom'); }); \
+         var m2 = new MutationObserver(function () { second++; }); \
+         m1.observe(document.body, { childList: true }); m2.observe(document.body, { childList: true }); \
+         document.body.appendChild(document.createElement('i')); __fandheRunMicrotasks(); second",
+        "1",
+    );
+    let diag = p.bridge.take_diagnostics().expect("diagnostics");
+    assert_eq!(diag.timer_errors.len(), 1);
+    assert_eq!(diag.timer_errors[0].message, "boom");
+
+    eprintln!("case: JS-5 delivery survives page tampering with queueMicrotask");
+    let mut p = setup(engine, None);
+    check(
+        &mut p,
+        "var calls = 0; var mo = new MutationObserver(function () { calls++; }); \
+         mo.observe(document.body, { childList: true }); globalThis.queueMicrotask = null; \
+         document.body.appendChild(document.createElement('i')); __fandheRunMicrotasks(); calls",
+        "1",
+    );
+
+    eprintln!("case: JS-6 pending record limit is reported to the runner");
+    let mut p = setup(engine, None);
+    check(
+        &mut p,
+        // op は worker プロセス越しで遅いため、observer 100 個 × 変更 101 回（op 数を抑えて）で上限を超える。
+        "var mos = []; var total = 0; \
+         for (var k = 0; k < 100; k++) { var m = new MutationObserver(function () {}); m.observe(document.body, { attributes: true }); mos.push(m); } \
+         for (var i = 0; i < 101; i++) { document.body.setAttribute('data-n', String(i)); } \
+         for (var k = 0; k < mos.length; k++) { total += mos[k].takeRecords().length; } total",
+        "10000",
+    );
+    assert!(
+        p.bridge
+            .take_diagnostics()
+            .expect("diagnostics")
+            .mutation_observer_limit_exceeded
+    );
+
+    eprintln!("case: JS-6 registration limit is reported to the runner");
+    let mut p = setup(engine, None);
+    check(
+        &mut p,
+        "var el = document.createElement('i'); \
+         for (var i = 0; i < 1001; i++) { new MutationObserver(function () {}).observe(el, { childList: true }); } 'ok'",
+        "ok",
+    );
+    assert!(
+        p.bridge
+            .take_diagnostics()
+            .expect("diagnostics")
+            .mutation_observer_limit_exceeded
+    );
 }

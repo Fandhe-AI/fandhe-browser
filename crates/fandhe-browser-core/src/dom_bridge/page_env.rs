@@ -322,6 +322,11 @@ pub struct BridgeDiagnostics {
     pub listener_limit_exceeded: bool,
     /// 保留中の microtask 数が shim の上限を超え、登録を無視したか（`JS-6`）。
     pub microtask_limit_exceeded: bool,
+    /// MutationObserver の保留レコード数または登録数が shim の上限を超え、破棄したか（`JS-6`）。
+    pub mutation_observer_limit_exceeded: bool,
+    /// `MutationObserver.observe` の options のうち実装せず無視したもの
+    /// （`attributeOldValue`・`characterDataOldValue`・`attributeFilter`）の件数（`REPAIR-3`）。
+    pub mutation_options_ignored: u64,
     /// タイマー / microtask のコールバック例外（先頭から [`MAX_BRIDGE_DIAGNOSTICS`] 件。`JS-7`）。
     pub timer_errors: Vec<TimerError>,
     /// 文字列ハンドラ（`setTimeout("code", ...)`）として渡され、評価せず無視した件数（`JS-7`）。

@@ -15,6 +15,11 @@
 // - 全体を IIFE で包むため、同じコンテキストで再評価（ページごとの再 install）しても
 //   SyntaxError にならない。
 // - ES2015 の範囲に留める（V8 と boa で同一のソースを使うため。Proxy は使わない）。
+// - 変更系ラッパー（appendChild 等）は、ネイティブ op が成功した後に限り、observers.js の
+//   MutationObserver へ変更を通知するフック（mutationSink）を呼ぶ（#1138・JS-5・JS-7）。
+//   フックの受け渡しは install 中だけ存在する一時グローバル `__fandheDomMutationHandoff`
+//   （observers.js が読んですぐ削除する）で行い、ノード ID はラッパーの外へ出さない。
+//   フックの例外は DOM 操作の結果に影響させない。
 //
 // 未実装（REPAIR-3。後続 issue / #779 で追加）:
 // - bridge のエラーはエンジンの例外（Error）のまま伝わる。DOMException への写像は未対応。
@@ -101,6 +106,21 @@
         return id;
     }
 
+    // MutationObserver への変更通知フック（observers.js が setSink で登録。未登録は null）。
+    var mutationSink = null;
+    var textProtoIsPrototypeOf = Function.prototype.call.bind(Object.prototype.isPrototypeOf, Text.prototype);
+
+    // op 成功後に呼ぶ。フックの例外は握りつぶす（DOM 操作は既に成功している）。
+    function notifyMutation(kind, target, info) {
+        if (mutationSink !== null) {
+            try {
+                mutationSink(kind, target, info);
+            } catch (e) {
+                // 通知の失敗で DOM 操作の結果を変えない。
+            }
+        }
+    }
+
     function define(proto, name, descriptor) {
         descriptor.configurable = true;
         Object.defineProperty(proto, name, descriptor);
@@ -111,6 +131,7 @@
         writable: true,
         value: function appendChild(child) {
             op('appendChild', idOf(this, 'appendChild'), idOf(child, 'appendChild'));
+            notifyMutation('childList', this, { added: [child], removed: [], nextSibling: null });
             return child;
         }
     });
@@ -119,6 +140,11 @@
         value: function insertBefore(node, ref) {
             var refId = ref === null || ref === undefined ? null : idOf(ref, 'insertBefore');
             op('insertBefore', idOf(this, 'insertBefore'), idOf(node, 'insertBefore'), refId);
+            notifyMutation('childList', this, {
+                added: [node],
+                removed: [],
+                nextSibling: refId === null ? null : ref
+            });
             return node;
         }
     });
@@ -126,6 +152,7 @@
         writable: true,
         value: function removeChild(child) {
             op('removeChild', idOf(this, 'removeChild'), idOf(child, 'removeChild'));
+            notifyMutation('childList', this, { added: [], removed: [child], nextSibling: null });
             return child;
         }
     });
@@ -136,6 +163,13 @@
         set: function (value) {
             var text = value === null || value === undefined ? '' : String(value);
             op('setTextContent', idOf(this, 'textContent'), text);
+            // Text は characterData、それ以外（Element / Document）は childList。後者の
+            // 追加・削除ノードは子の列挙 op が無いため空（スタブ。REPAIR-3）。
+            if (textProtoIsPrototypeOf(this)) {
+                notifyMutation('characterData', this, null);
+            } else {
+                notifyMutation('childList', this, { added: [], removed: [], nextSibling: null });
+            }
         }
     });
 
@@ -143,13 +177,17 @@
     define(Element.prototype, 'setAttribute', {
         writable: true,
         value: function setAttribute(name, value) {
-            op('setAttribute', idOf(this, 'setAttribute'), String(name), String(value));
+            var attr = String(name);
+            op('setAttribute', idOf(this, 'setAttribute'), attr, String(value));
+            notifyMutation('attributes', this, { attributeName: attr });
         }
     });
     define(Element.prototype, 'removeAttribute', {
         writable: true,
         value: function removeAttribute(name) {
-            op('removeAttribute', idOf(this, 'removeAttribute'), String(name));
+            var attr = String(name);
+            op('removeAttribute', idOf(this, 'removeAttribute'), attr);
+            notifyMutation('attributes', this, { attributeName: attr });
         }
     });
     define(Element.prototype, 'innerHTML', {
@@ -160,6 +198,8 @@
             // HTML の解析は core のパーサーが行う（JS 側にパーサーは持たない）。
             var html = value === null ? '' : String(value);
             op('setInnerHTML', idOf(this, 'innerHTML'), html);
+            // 追加・削除ノードは子の列挙 op が無いため空（スタブ。REPAIR-3）。
+            notifyMutation('childList', this, { added: [], removed: [], nextSibling: null });
         }
     });
 
@@ -253,6 +293,23 @@
             enumerable: false
         });
     }
+
+    // observers.js へ渡す一回限りのハンドオフ。observers.js が読んで直ちに削除する
+    // （install 中だけ存在し、ページ JS の実行前に消える。JS-5）。
+    Object.defineProperty(global, '__fandheDomMutationHandoff', {
+        value: Object.freeze({
+            setSink: function (fn) {
+                mutationSink = typeof fn === 'function' ? fn : null;
+            },
+            // 祖先関係の判定（MutationObserver の subtree 用）。ID はここで解決し外へ出さない。
+            contains: function (ancestor, node) {
+                return op('isInclusiveAncestor', idOf(ancestor, 'contains'), idOf(node, 'contains')) === true;
+            }
+        }),
+        writable: true,
+        configurable: true,
+        enumerable: false
+    });
 
     expose('Node', Node);
     expose('Element', Element);
