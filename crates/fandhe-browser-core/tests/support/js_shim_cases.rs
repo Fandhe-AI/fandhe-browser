@@ -306,6 +306,8 @@ fn window_cases(engine: &str) {
     check(&mut p, "typeof window", "object");
 
     eprintln!("case: JS-5 location defaults to about:blank");
+    check(&mut p, "document.URL", "about:blank");
+    check(&mut p, "document.location === location", "true");
     check(&mut p, "location.href", "about:blank");
     check(&mut p, "location.origin", "null");
 
@@ -324,6 +326,11 @@ fn window_cases(engine: &str) {
     check(&mut p, "location.hash", "#f");
     check(&mut p, "String(location)", URL);
     check(&mut p, "window.location === location", "true");
+    eprintln!("case: JS-5 document.location / document.URL (#1158)");
+    check(&mut p, "document.location.port", "8443");
+    check(&mut p, "document.location.protocol", "https:");
+    check(&mut p, "document.URL", URL);
+    check(&mut p, "String(document.location)", URL);
     assert!(p.bridge.set_location("file:///etc/passwd").is_err());
 
     eprintln!("case: JS-5 navigation attempts are recorded and ignored");
@@ -342,6 +349,17 @@ fn window_cases(engine: &str) {
             "ok",
         );
     }
+    // document.location / document.URL の代入も無視される。
+    check(
+        &mut p,
+        "try { document.location = 'https://evil.test/'; 'ok' } catch (e) { 'threw' }",
+        "ok",
+    );
+    check(
+        &mut p,
+        "try { document.URL = 'x'; document.URL } catch (e) { 'threw' }",
+        URL,
+    );
     check(&mut p, "location.href", URL);
     let diag = p.bridge.take_diagnostics().expect("diagnostics");
     let got: Vec<_> = diag
@@ -359,6 +377,7 @@ fn window_cases(engine: &str) {
             (LocationChangeKind::Assign, 19),
             (LocationChangeKind::Replace, 19),
             (LocationChangeKind::Reload, 0),
+            (LocationChangeKind::AssignLocation, 18),
         ]
     );
     assert!(!format!("{diag:?}").contains("evil.test"));

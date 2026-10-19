@@ -1,5 +1,5 @@
-// js_shim/window.js: ページ内 JS に見せる window / self / location / navigator / console の shim
-// （TASK-108・Issue #779・ビヘイビア JS-5・SEC-2。SSOT: js-engine.md「ページ内 JS 実行の設計制約」決定 3）。
+// js_shim/window.js: ページ内 JS に見せる window / self / location / document.location / document.URL / navigator / console の shim
+// （TASK-108・Issue #779・#1158・ビヘイビア JS-5・SEC-2。SSOT: js-engine.md「ページ内 JS 実行の設計制約」決定 3）。
 //
 // 役割: ページの bundle が参照する最小のグローバルを揃える。状態（URL・UA・診断）の実体は
 // すべて core 側（dom_bridge.rs）にあり、この shim は値をキャッシュせず毎回
@@ -10,7 +10,10 @@
 // 設計上の要点:
 // - location: 読み取りは getLocation。ページ JS が変えられるのは hash だけ（setLocationHash）。
 //   href 等の代入・assign / replace / reload は実行せず ignoreLocationChange で診断に記録する
-//   （遷移も取得も行わない）。
+//   （遷移も取得も行わない）。document.location は window.location と同一のオブジェクトを返し、
+//   document.URL は location.href と同じ値の読み取り専用 getter（Backtrace SDK 等が
+//   document.location.port を読むため。Issue #1158）。document 側の代入も window 側と同じ
+//   assignLocation 診断に記録する（両者は区別しない簡略化）。
 // - navigator: 自動化ブラウザ fandhe-browser であることを正直に示す（SEC-2）。userAgent は
 //   Fetcher と同じ単一の定数（navigatorUserAgent op）、webdriver は true 固定。UA・webdriver・
 //   window.chrome 等で実ブラウザを装わない・検出回避の目的で操作しない。
@@ -22,10 +25,11 @@
 //
 // 未実装（REPAIR-3）:
 // - hashchange / popstate 等のイベント（DOMContentLoaded / load の addEventListener は events.js、#781）。
-// - document.location / document.URL、location 代入による実際の遷移。
+// - location 代入による実際の遷移。
 // - navigator の追加プロパティ（language / platform / plugins 等。事実と異なる値や
 //   フィンガープリント面を作らないため入れていない。必要性は後続 issue で判断する）。
-// - 実ブラウザの [LegacyUnforgeable]（location / window の再定義不可）との差異。真の状態は
+// - 実ブラウザの [LegacyUnforgeable]（location / window の再定義不可。document.location は
+//   document インスタンスではなく Document.prototype に置いている）との差異。真の状態は
 //   Rust 側にあるため安全性は変わらない。DOMException への写像も未対応。
 (function (global) {
     'use strict';
@@ -223,6 +227,28 @@
     expose('self', global);
     expose('navigator', navigatorObject);
     expose('console', consoleObject);
+    // dom.js の後に評価されるため Document が参照できる。無ければ install の失敗を隠さず throw する。
+    if (typeof global.Document !== 'function') {
+        throw new TypeError('Document is not available');
+    }
+    defineAccessor(
+        global.Document.prototype,
+        'location',
+        function () {
+            return locationObject;
+        },
+        function (value) {
+            ignoreChange('assignLocation', value);
+        }
+    );
+    defineAccessor(
+        global.Document.prototype,
+        'URL',
+        function () {
+            return op('getLocation', 'href');
+        },
+        undefined
+    );
     Object.defineProperty(global, 'location', {
         get: function () {
             return locationObject;
