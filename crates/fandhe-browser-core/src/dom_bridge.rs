@@ -107,6 +107,8 @@ pub enum ResourceLimitKind {
     RegisteredTimers,
     /// 保留中の microtask 数（`queueMicrotask`。shim が上限超過を通知する。`JS-6`）。
     Microtasks,
+    /// 保留中の MutationObserver のレコード数・登録数（shim が上限超過を通知する。`JS-6`）。
+    MutationObservers,
 }
 
 /// 世代の上限（排他）。`generation << 32` が `2^53` 未満に収まる値。
@@ -358,6 +360,9 @@ enum DomOp {
     NetCallbackError,
     NetOptionsIgnored,
     NetCancel,
+    IsInclusiveAncestor,
+    MutationObserverLimit,
+    MutationOptionsIgnored,
 }
 
 impl DomOp {
@@ -404,6 +409,9 @@ impl DomOp {
             "netCallbackError" => Self::NetCallbackError,
             "netOptionsIgnored" => Self::NetOptionsIgnored,
             "netCancel" => Self::NetCancel,
+            "isInclusiveAncestor" => Self::IsInclusiveAncestor,
+            "mutationObserverLimit" => Self::MutationObserverLimit,
+            "mutationOptionsIgnored" => Self::MutationOptionsIgnored,
             _ => return None,
         })
     }
@@ -451,6 +459,9 @@ impl DomOp {
             Self::NetCallbackError => "netCallbackError",
             Self::NetOptionsIgnored => "netOptionsIgnored",
             Self::NetCancel => "netCancel",
+            Self::IsInclusiveAncestor => "isInclusiveAncestor",
+            Self::MutationObserverLimit => "mutationObserverLimit",
+            Self::MutationOptionsIgnored => "mutationOptionsIgnored",
         }
     }
 
@@ -466,6 +477,7 @@ impl DomOp {
             | Self::LifecycleInstallOpen
             | Self::LifecycleListenerLimit
             | Self::MicrotaskLimit
+            | Self::MutationObserverLimit
             | Self::TimerStringHandlerIgnored => 0,
             Self::CreateElement
             | Self::CreateTextNode
@@ -481,6 +493,7 @@ impl DomOp {
             | Self::NetReadBody
             | Self::NetFinalUrl
             | Self::NetOptionsIgnored
+            | Self::MutationOptionsIgnored
             | Self::NetCancel => 1,
             Self::QuerySelector
             | Self::QuerySelectorAll
@@ -494,6 +507,7 @@ impl DomOp {
             | Self::LifecycleListenerError
             | Self::TimerSet
             | Self::TimerCallbackError
+            | Self::IsInclusiveAncestor
             | Self::NetCallbackError => 2,
             Self::InsertBefore | Self::SetAttribute => 3,
             Self::NetRequest => 4,
@@ -773,6 +787,15 @@ fn string_response(s: String, limits: &DomBridgeLimits) -> Result<JsValue, DomBr
     Ok(JsValue::String(s))
 }
 
+/// `Document::set_attribute` が保存する属性名（HTML 要素は ASCII 小文字、それ以外は原文）。
+fn normalized_attribute_name(doc: &Document, element: NodeId, name: &str) -> String {
+    if doc.namespace_url(element) == Some(crate::dom::HTML_NAMESPACE_URI) {
+        name.to_ascii_lowercase()
+    } else {
+        name.to_string()
+    }
+}
+
 /// 検証済みの `op` を実行する。各操作は引数の検証を終えてから `Document` を変更する。
 fn execute(
     op: DomOp,
@@ -924,6 +947,39 @@ fn execute(
         DomOp::MicrotaskLimit => {
             page.diagnostics.microtask_limit_exceeded = true;
             Ok(JsValue::Undefined)
+        }
+        // MutationObserver の保留レコード数・登録数が shim の上限を超えたことの通知。
+        // 通常は予算外で処理済み（下記）。
+        DomOp::MutationObserverLimit => {
+            page.diagnostics.mutation_observer_limit_exceeded = true;
+            Ok(JsValue::Undefined)
+        }
+        // `observe` の options のうち実装せず無視したもの（`attributeOldValue` 等）の件数（`REPAIR-3`）。
+        DomOp::MutationOptionsIgnored => {
+            let Some(JsValue::Number(count)) = args.first() else {
+                return Err(DomBridgeError::TypeMismatch {
+                    operation: op.name(),
+                    index: 1,
+                    expected: "a count number",
+                });
+            };
+            if count.is_finite() && *count >= 1.0 {
+                // 1 回の通知で数える上限（巨大な値で飽和させない）。
+                let add = count.min(64.0) as u64;
+                page.diagnostics.mutation_options_ignored = page
+                    .diagnostics
+                    .mutation_options_ignored
+                    .saturating_add(add);
+            }
+            Ok(JsValue::Undefined)
+        }
+        // `ancestor` が `node` 自身またはその祖先か（MutationObserver の `subtree` 判定用。
+        // 祖先の探索量は `Document::ancestors` が `node_count` 歩で打ち切る）。
+        DomOp::IsInclusiveAncestor => {
+            let ancestor = page.node_arg(op, args, 1)?;
+            let node = page.node_arg(op, args, 2)?;
+            let found = ancestor == node || page.document.ancestors(node).any(|a| a == ancestor);
+            Ok(JsValue::Bool(found))
         }
         DomOp::TimerCallbackError => {
             let name = string_arg(op, args, 1, limits)?;
@@ -1137,13 +1193,29 @@ fn execute(
             let name = string_arg(op, args, 2, limits)?;
             let value = string_arg(op, args, 3, limits)?;
             page.document.set_attribute(element, name, value)?;
-            Ok(JsValue::Undefined)
+            // 実際に保存された（HTML 要素では ASCII 小文字化後の）属性名を返す。
+            // shim が MutationObserver の attributeName・attributeFilter 照合に使う（JS-5・JS-7）。
+            Ok(JsValue::String(normalized_attribute_name(
+                &page.document,
+                element,
+                name,
+            )))
         }
         DomOp::RemoveAttribute => {
             let element = page.node_arg(op, args, 1)?;
             let name = string_arg(op, args, 2, limits)?;
-            page.document.remove_attribute(element, name)?;
-            Ok(JsValue::Undefined)
+            // 実際に属性を削除した場合だけ、その正規化後の属性名を返し、削除しなかったときは null
+            // （shim が MutationObserver の通知要否と属性名に使う。JS-5・JS-7）。
+            let removed = page.document.remove_attribute(element, name)?;
+            if removed.is_some() {
+                Ok(JsValue::String(normalized_attribute_name(
+                    &page.document,
+                    element,
+                    name,
+                )))
+            } else {
+                Ok(JsValue::Null)
+            }
         }
         DomOp::GetTextContent => {
             let node = page.node_arg(op, args, 1)?;
@@ -1314,6 +1386,8 @@ impl DomBridge {
             Some(ResourceLimitKind::Listeners)
         } else if page.diagnostics.microtask_limit_exceeded {
             Some(ResourceLimitKind::Microtasks)
+        } else if page.diagnostics.mutation_observer_limit_exceeded {
+            Some(ResourceLimitKind::MutationObservers)
         } else if page.timers.registration_refused() {
             Some(ResourceLimitKind::RegisteredTimers)
         } else {
@@ -1467,6 +1541,12 @@ impl DomBridge {
         // microtask 上限超過の通知も同様に予算外で処理する（`JS-6`。冪等なフラグ設定のみ）。
         if matches!(args, [JsValue::String(name)] if name == "microtaskLimit") {
             page.diagnostics.microtask_limit_exceeded = true;
+            return Ok(JsValue::Undefined);
+        }
+
+        // MutationObserver 上限超過の通知も同様に予算外で処理する（`JS-6`。冪等なフラグ設定のみ）。
+        if matches!(args, [JsValue::String(name)] if name == "mutationObserverLimit") {
+            page.diagnostics.mutation_observer_limit_exceeded = true;
             return Ok(JsValue::Undefined);
         }
 
@@ -2169,7 +2249,8 @@ mod tests {
         assert_eq!(d.console_messages.len(), 1);
         assert_eq!(d.console_messages[0].text.len(), 4095);
         assert!(d.console_messages[0].truncated);
-        assert!(format!("{d:?}").len() < 400);
+        // Debug 出力に本文を含めないこと（診断フィールドの追加で長さは緩やかに増えるため余裕を持たせる）。
+        assert!(format!("{d:?}").len() < 500);
         for _ in 0..(MAX_BRIDGE_DIAGNOSTICS + 3) {
             call(&b, &[s("consoleMessage"), s("warn"), s("m")]).expect("ok");
         }
@@ -2317,6 +2398,63 @@ mod tests {
             call(&b, &[s("timerPending"), n(1.0)]).expect("p"),
             JsValue::Bool(false)
         );
+    }
+
+    /// JS-6: `mutationObserverLimit` は操作予算を使い切った後でもフラグを立て、
+    /// `resource_limit_tripped` が `MutationObservers` を返す。
+    #[test]
+    fn js_6_mutation_observer_limit_op_is_budget_exempt_and_trips() {
+        let b = bridge_with(DomBridgeLimits::default().with_max_ops_per_page(1));
+        call(&b, &[s("body")]).expect("budget");
+        call(&b, &[s("body")]).expect_err("budget exhausted");
+        assert_eq!(b.resource_limit_tripped().expect("flag"), None);
+        call(&b, &[s("mutationObserverLimit")]).expect("exempt");
+        assert_eq!(
+            b.resource_limit_tripped().expect("flag"),
+            Some(ResourceLimitKind::MutationObservers)
+        );
+        assert!(
+            b.take_diagnostics()
+                .expect("diag")
+                .mutation_observer_limit_exceeded
+        );
+    }
+
+    /// REPAIR-3: `mutationOptionsIgnored` は 1 回の加算を 64 で頭打ちにし、NaN・負値は無視する。
+    #[test]
+    fn repair_3_mutation_options_ignored_op_is_bounded() {
+        let b = bridge();
+        call(&b, &[s("mutationOptionsIgnored"), n(2.0)]).expect("ok");
+        call(&b, &[s("mutationOptionsIgnored"), n(f64::INFINITY)]).expect("ok");
+        call(&b, &[s("mutationOptionsIgnored"), n(f64::NAN)]).expect("ok");
+        call(&b, &[s("mutationOptionsIgnored"), n(-3.0)]).expect("ok");
+        call(&b, &[s("mutationOptionsIgnored"), n(1e9)]).expect("ok");
+        call(&b, &[s("mutationOptionsIgnored"), s("1")]).expect_err("type");
+        call(&b, &[s("mutationOptionsIgnored")]).expect_err("arity");
+        assert_eq!(
+            b.take_diagnostics().expect("diag").mutation_options_ignored,
+            2 + 64
+        );
+    }
+
+    /// JS-5: `isInclusiveAncestor` は自身・祖先で true、無関係・切り離しノードで false、
+    /// 不正 ID・型違いはエラー。
+    #[test]
+    fn js_5_is_inclusive_ancestor_op() {
+        let b = bridge();
+        let body = num(call(&b, &[s("body")]));
+        let div = num(call(&b, &[s("getElementById"), s("a")]));
+        let head = num(call(&b, &[s("head")]));
+        let loose = num(call(&b, &[s("createElement"), s("p")]));
+        let is = |a: f64, x: f64| call(&b, &[s("isInclusiveAncestor"), n(a), n(x)]).expect("ok");
+        assert_eq!(is(div, div), JsValue::Bool(true));
+        assert_eq!(is(body, div), JsValue::Bool(true));
+        assert_eq!(is(div, body), JsValue::Bool(false));
+        assert_eq!(is(head, div), JsValue::Bool(false));
+        assert_eq!(is(body, loose), JsValue::Bool(false));
+        call(&b, &[s("isInclusiveAncestor"), n(1e12), n(div)]).expect_err("invalid id");
+        call(&b, &[s("isInclusiveAncestor"), s("1"), n(div)]).expect_err("type");
+        call(&b, &[s("isInclusiveAncestor"), n(div)]).expect_err("arity");
     }
 
     /// JS-7: `timerCallbackError` は種別を許可リストで検証し、メッセージを切り詰めて件数を頭打ちにする。
