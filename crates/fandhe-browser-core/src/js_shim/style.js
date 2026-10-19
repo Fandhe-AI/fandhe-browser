@@ -242,6 +242,7 @@
     function valueIsSafe(value) {
         var quote = '';
         var depth = 0;
+        var bang = -1;
         var len = value.length;
         for (var i = 0; i < len; i++) {
             var ch = sCharAt(value, i);
@@ -273,11 +274,15 @@
                 }
             } else if (depth === 0 && ch === ';') {
                 return false;
-            } else if (depth === 0 && ch === '!' && sLower(sTrim(sSub(value, i + 1))) === 'important') {
-                // 値内のトップレベル `!important` は優先度指定。実属性だけ重要宣言になりモデルの優先度と
-                // 食い違うため無効にする（重要宣言は setProperty の priority 引数でのみ指定する）。
-                return false;
+            } else if (depth === 0 && ch === '!') {
+                // 最後のトップレベルの `!` の位置だけ記録し、走査後に 1 回だけ判定する（線形時間）。
+                bang = i;
             }
+        }
+        // 値内のトップレベル `!important` は優先度指定。実属性だけ重要宣言になりモデルの優先度と
+        // 食い違うため無効にする（重要宣言は setProperty の priority 引数でのみ指定する）。
+        if (bang >= 0 && sLower(sTrim(sSub(value, bang + 1))) === 'important') {
+            return false;
         }
         // 閉じていない括弧（丸・角）は、後続の宣言を未完の関数へ取り込み、モデルと実属性をずらすため無効にする。
         return quote === '' && depth === 0;
@@ -327,6 +332,7 @@
 
     // 1 宣言 "name: value" をモデルへ入れる。無効・上限超過は無視（上限超過は警告）。
     function parseDeclaration(model, piece) {
+        // 1 宣言の断片が cssText 全体の上限（32768）を超えることは無い（parseText が先に検証済み）。
         var colon = sIndexOf(piece, ':');
         if (colon <= 0) {
             return;
@@ -443,6 +449,11 @@
             if (modelRemove(next, name) !== null) {
                 commit(state, next);
             }
+            return;
+        }
+        // 走査・文字列変換の前に長さ上限（JS-6）を検証する（巨大な値による二次時間・大量確保を防ぐ）。
+        if (value.length > MAX_VALUE_UNITS) {
+            warnLimit();
             return;
         }
         if (!valueIsSafe(value)) {

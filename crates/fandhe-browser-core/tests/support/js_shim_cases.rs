@@ -1015,6 +1015,18 @@ fn style_cases(engine: &str) {
         r#""a!important"|f(b!important)|a!b||important|4"#,
     );
 
+    // 上限超過の値は走査せずに拒否し、モデルと属性は変わらない（JS-6。二次時間の走査を避ける）。
+    check(
+        &mut q,
+        "var big = '!A'.repeat(1000000); s.cssText = 'color: red'; s.setProperty('--x', big); s.color = big; s.cssText = big; s.cssText",
+        "color: red;",
+    );
+    check(
+        &mut q,
+        "var e = document.createElement('div'); e.style.color = 'blue'; e.style.setProperty('--x', big); e.setAttribute('style', 'color: red'); e.style.setProperty('--y', '!A'.repeat(2049)); e.style.cssText + '|' + e.style.length",
+        "color: red;|1",
+    );
+
     eprintln!(
         "case: JS-5 style unbalanced paren / oversize cssText / removeProperty arg side effects"
     );
