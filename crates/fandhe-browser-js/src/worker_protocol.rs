@@ -122,7 +122,10 @@ pub(crate) const MARKER_ENV_VAR: &str = "FANDHE_BROWSER_JS_WORKER";
 /// 7: [`tag::FINISH_DYNAMIC_IMPORT`] のペイロード先頭に [`tag::EVALUATE`] と同じ 16 バイトの
 /// ヘッダ（残り時間）を追加し、応答を ack（`RESULT`）から `import()` の Promise の確定結果
 /// （[`tag::MODULE_RESULT`]）へ変更（`JS-4`・`JS-6`・Issue #1117）。
-pub(crate) const PROTOCOL_VERSION: u16 = 7;
+///
+/// 8: `EVALUATE` 系ヘッダを 17 バイトにし、末尾に flags 1 バイト（bit 0 = 完了値を捨てる）を
+/// 追加（`JS-4`・Issue #1134）。
+pub(crate) const PROTOCOL_VERSION: u16 = 8;
 
 /// フレームの `tag` バイトの値。
 ///
@@ -931,7 +934,7 @@ pub(crate) const MAX_EVALUATE_TIMEOUT: Duration = Duration::from_secs(3600);
 /// `EVALUATE` ヘッダのバイト数（`u64 timeout_ms` ＋ `u64 max_result_bytes`）。
 /// フレーム上限 `MAX_FRAME_PAYLOAD_PARENT_TO_CHILD`（スクリプト上限 1 MiB
 /// ＋ 64 KiB の余白）に十分収まる。
-pub(super) const EVALUATE_HEADER_BYTES: usize = 16;
+pub(super) const EVALUATE_HEADER_BYTES: usize = 17;
 
 /// ワイヤ上の評価タイムアウト（ミリ秒単位へ切り上げ、[`MAX_EVALUATE_TIMEOUT`]
 /// でクランプした値）。
@@ -962,17 +965,19 @@ pub(crate) fn encode_evaluate(script: &str, options: &EvaluateOptions) -> Vec<u8
     out
 }
 
-/// `EVALUATE`・`EVALUATE_MODULE` が共有する 16 バイトのヘッダ
-/// （`u64 LE timeout_ms` ＋ `u64 LE max_result_bytes`）を組み立てる。
+/// `EVALUATE`・`EVALUATE_MODULE` が共有する 17 バイトのヘッダ
+/// （`u64 LE timeout_ms` ＋ `u64 LE max_result_bytes` ＋ `u8 flags`）を組み立てる。
 /// タイムアウトの丸め規則を [`wire_timeout`] に一本化するための共通部
 /// （`JS-6`・Issue #1110）。
 pub(super) fn encode_evaluate_header(options: &EvaluateOptions) -> [u8; EVALUATE_HEADER_BYTES] {
     let timeout_ms = u64::try_from(wire_timeout(options).as_millis()).unwrap_or(u64::MAX);
     let max_bytes = u64::try_from(options.max_result_bytes()).unwrap_or(u64::MAX);
     let mut out = [0u8; EVALUATE_HEADER_BYTES];
-    let (timeout_part, max_part) = out.split_at_mut(8);
+    let (timeout_part, rest) = out.split_at_mut(8);
     timeout_part.copy_from_slice(&timeout_ms.to_le_bytes());
+    let (max_part, flags_part) = rest.split_at_mut(8);
     max_part.copy_from_slice(&max_bytes.to_le_bytes());
+    flags_part.fill(u8::from(options.discard_completion_value()));
     out
 }
 
@@ -987,9 +992,11 @@ pub(super) fn decode_evaluate_header(
         .and_then(|b| b.try_into().ok())
         .ok_or(ProtocolError::Truncated)?;
     let max_bytes: [u8; 8] = payload
-        .get(8..EVALUATE_HEADER_BYTES)
+        .get(8..16)
         .and_then(|b| b.try_into().ok())
         .ok_or(ProtocolError::Truncated)?;
+    // flags: bit 0 = 完了値を捨てる。未知のビットは無視する。
+    let flags = *payload.get(16).ok_or(ProtocolError::Truncated)?;
     let body = payload
         .get(EVALUATE_HEADER_BYTES..)
         .ok_or(ProtocolError::Truncated)?;
@@ -998,7 +1005,8 @@ pub(super) fn decode_evaluate_header(
     let max_result_bytes = usize::try_from(u64::from_le_bytes(max_bytes)).unwrap_or(usize::MAX);
     let options = EvaluateOptions::default()
         .with_timeout(timeout)
-        .with_max_result_bytes(max_result_bytes);
+        .with_max_result_bytes(max_result_bytes)
+        .with_discard_completion_value(flags & 1 != 0);
     Ok((options, body))
 }
 
@@ -2113,12 +2121,25 @@ mod tests {
         assert_eq!(w(Duration::MAX), MAX_EVALUATE_TIMEOUT);
     }
 
+    /// JS-4・Issue #1134: 完了値を捨てるフラグがワイヤを往復し、既定は false。
+    #[test]
+    fn js_4_discard_completion_value_round_trips() {
+        let on = EvaluateOptions::default().with_discard_completion_value(true);
+        let (decoded, script) = decode_evaluate(&encode_evaluate("1", &on)).expect("decode");
+        assert_eq!(script, "1");
+        assert!(decoded.discard_completion_value());
+        let off = EvaluateOptions::default();
+        let (decoded, _) = decode_evaluate(&encode_evaluate("1", &off)).expect("decode");
+        assert!(!decoded.discard_completion_value());
+    }
+
     /// JS-6: 子側でも最大値で再クランプし、`max_result_bytes` は飽和変換する。
     #[test]
     fn js_6_decode_evaluate_reclamps_timeout_and_saturates_size() {
         let mut payload = Vec::new();
         payload.extend_from_slice(&u64::MAX.to_le_bytes());
         payload.extend_from_slice(&u64::MAX.to_le_bytes());
+        payload.push(0);
         payload.extend_from_slice(b"1");
         let (opts, script) = decode_evaluate(&payload).expect("decode must succeed");
         assert_eq!(script, "1");
@@ -2522,7 +2543,7 @@ mod tests {
     #[test]
     fn js_1_marker_env_var_and_protocol_version_have_the_documented_values() {
         assert_eq!(MARKER_ENV_VAR, "FANDHE_BROWSER_JS_WORKER");
-        assert_eq!(PROTOCOL_VERSION, 7);
+        assert_eq!(PROTOCOL_VERSION, 8);
     }
 
     /// JS-1: 想定される tag 値が予約分も含め重複しないこと（プロトコル

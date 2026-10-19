@@ -266,6 +266,8 @@ impl JsEngine for BoaEngine {
             )));
         }
         match outcome {
+            // 完了値は変換せず捨てる（`JS-4`・Issue #1134）。
+            Ok(_) if options.discard_completion_value() => Ok(JsValue::Undefined),
             Ok(value) => from_boa_value_with_limit(&value, Some(options.max_result_bytes()))
                 .map_err(JsEngineError::EvaluationFailed),
             Err(err) => Err(convert_eval_error(&err, context)),
@@ -874,6 +876,20 @@ mod tests {
             eval(&mut e, "'a'.repeat(1048577)"),
             Err(JsEngineError::EvaluationFailed(_))
         ));
+    }
+
+    /// JS-4・Issue #1134: 完了値を捨てると変換できない値でも成功し、構文エラーは残る。
+    #[test]
+    fn js_4_boa_discard_completion_value() {
+        let mut e = BoaEngine::new();
+        let opts = EvaluateOptions::default().with_discard_completion_value(true);
+        assert!(eval_with(&mut e, "({a:1})", &EvaluateOptions::default()).is_err());
+        assert_eq!(
+            eval_with(&mut e, "({a:1})", &opts).unwrap(),
+            JsValue::Undefined
+        );
+        assert!(eval_with(&mut e, "var q = 1; if (true)", &opts).is_err());
+        assert!(eval_with(&mut e, "throw new Error('x')", &opts).is_err());
     }
 
     /// JS-6: 明示した結果上限の境界（ちょうどは成功、+1 は Err）。

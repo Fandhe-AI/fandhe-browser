@@ -179,8 +179,8 @@ b5 で `h1` が得られない原因は **ES module（#918）が主因**。`h1` 
 
 - 原因: エンジンはスクリプトを最後まで実行してから完了値を `JsValue` へ変換する。オブジェクト・配列・関数や上限超過の文字列は変換に失敗し `EvaluationFailed` になり、ページ実行がそれをすべて `Exception` にしていた。評価そのものは完了しており、DOM・グローバルの副作用は反映されている（fixture のケース `non-scalar completion value is not an exception` で確認）
 - `JS-5`（DOM バインディングの不足）とは無関係で、エンジン API（完了値を返す）とページ実行（完了値を使わない）のずれが原因
-- 修正: ページの classic script の評価ソース末尾に `\n;void 0` を付け、完了値を常に `undefined` にした（`page_runner.rs` の `classic_script_source`）。本当の例外（`throw`・構文エラー・参照エラー）は従来どおり `Exception`
-- 既知の制限: 接尾辞で 1 MiB の上限を超えるソースには付けない（従来の挙動）。末尾が `if (x)` などで終わる壊れた script は構文エラーにならなくなる
+- 修正: `EvaluateOptions::with_discard_completion_value(true)` をエンジン抽象に追加し、ページ実行の評価で完了値を変換せず捨てるようにした（V8・boa・子プロセスのワイヤ〔protocol 8〕）。ソースは書き換えない。本当の例外（`throw`・構文エラー・参照エラー）は従来どおり `Exception`
+- 末尾が `if (true)` などで終わる壊れた script は従来どおり構文エラーのまま（ソース不変のため。回帰テストあり）
 - b5 の再測定: 未実施（ネットワークを使う実測のため、本変更では fixture のテストで同じ形の script が `succeeded` になることだけを根拠とする）。実測では index 1・2 の outcome が `succeeded` に変わる見込みだが、未確認
 
 ### 再現手順

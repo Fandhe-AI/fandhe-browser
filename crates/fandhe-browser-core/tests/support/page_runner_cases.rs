@@ -1468,6 +1468,18 @@ pub fn run(engine: &str) {
     ));
     assert_eq!(out.scripts()[2].outcome(), &ScriptOutcome::Succeeded);
 
+    eprintln!("case: JS-4 incomplete control statement stays a syntax error (#1134)");
+    let out = run_page(
+        engine,
+        "<body><script>document.body.setAttribute('data-x','1'); if (true)</script></body>",
+        &opts,
+    );
+    assert!(!out.html().contains("data-x=\"1\""), "{}", out.html());
+    assert!(matches!(
+        out.scripts()[0].outcome(),
+        ScriptOutcome::Exception { .. }
+    ));
+
     eprintln!("case: JS-4 huge exception message stays bounded");
     let out = run_page(
         engine,

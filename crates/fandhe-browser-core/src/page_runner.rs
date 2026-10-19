@@ -94,7 +94,6 @@
 //! - スクリプトの completion 値が結果サイズ上限を超えると例外として扱われる
 //!   （ソースの書き換えによる回避はしない）。
 
-use std::borrow::Cow;
 use std::cell::Cell;
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
@@ -1487,7 +1486,14 @@ fn evaluate_with_budget(rt: &mut JsRuntime, ctx: &RunContext<'_>, src: &str) -> 
         return Evaluated::BudgetExhausted(page_wall_abort(options, None).kind);
     };
 
-    let result = rt.execute_with_options(src, &EvaluateOptions::default().with_timeout(timeout));
+    // 完了値は誰も使わないため、変換せず捨てる（オブジェクト等の完了値を例外と誤報告しない。
+    // ソースは書き換えない。`JS-4`・Issue #1134）。
+    let result = rt.execute_with_options(
+        src,
+        &EvaluateOptions::default()
+            .with_timeout(timeout)
+            .with_discard_completion_value(true),
+    );
 
     // 評価後にもページ時計を確認する。子プロセス経路の切り上げ・猶予で、残り時間を
     // 超えて正常応答が届くことがある（`JS-6`）。
@@ -1509,29 +1515,6 @@ fn evaluate_with_budget(rt: &mut JsRuntime, ctx: &RunContext<'_>, src: &str) -> 
     Evaluated::Aborted { kind, message }
 }
 
-/// classic script の評価ソース末尾に付ける接尾辞（完了値を `undefined` にする）。
-///
-/// エンジンは評価後に完了値を `JsValue` へ変換し、オブジェクト・配列・関数や上限超過の
-/// 文字列では変換が `EvaluationFailed` になる。HTML の classic script は完了値を使わないのに
-/// 例外扱いになる誤報告（スクリプト自体は最後まで実行され副作用も反映済み）を、完了値を
-/// 捨てることで防ぐ（`JS-4`・`REPAIR-4`・Issue #1134）。先頭の改行は末尾が `//` や `<!--`
-/// コメントのソースに飲まれないため。`undefined` は上書き可能なため `void 0` を使う。
-const CLASSIC_COMPLETION_SUFFIX: &str = "\n;void 0";
-
-/// classic script の評価ソースを返す（[`CLASSIC_COMPLETION_SUFFIX`] を付ける）。
-///
-/// `run_one` からのみ呼ばれる。js 側の 1 MiB 上限（非公開定数。[`DEFAULT_MAX_SRC_SCRIPT_BYTES`]
-/// と同値）を接尾辞で新たに超えないよう、超える場合は付けず従来の挙動に留める（その範囲では
-/// 非スカラー完了値の誤報告が残り得る。`REPAIR-3`）。既知の制限: 末尾が `if (x)`・`else`
-/// 等で終わる壊れた script は `;` が空文として本体になり構文エラーにならなくなる。
-fn classic_script_source(src: &str) -> Cow<'_, str> {
-    if src.len() + CLASSIC_COMPLETION_SUFFIX.len() > DEFAULT_MAX_SRC_SCRIPT_BYTES {
-        Cow::Borrowed(src)
-    } else {
-        Cow::Owned(format!("{src}{CLASSIC_COMPLETION_SUFFIX}"))
-    }
-}
-
 /// スクリプト 1 件を評価し、結果を記録用の [`ScriptOutcome`] に写す。
 /// 打ち切りになる場合は `abort` に理由を入れる。
 fn run_one(
@@ -1545,7 +1528,7 @@ fn run_one(
     ctx.bridge
         .set_current_script(Some(node))
         .map_err(bridge_error)?;
-    let evaluated = evaluate_with_budget(rt, ctx, &classic_script_source(src));
+    let evaluated = evaluate_with_budget(rt, ctx, src);
     ctx.bridge.set_current_script(None).map_err(bridge_error)?;
 
     Ok(match evaluated {
@@ -2014,25 +1997,6 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
 
-    /// `JS-4`・Issue #1134: 完了値破棄の接尾辞は改行を挟んで付く（末尾コメントに飲まれない）。
-    #[test]
-    fn classic_script_source_appends_suffix_after_newline() {
-        assert_eq!(classic_script_source("a()"), "a()\n;void 0");
-        assert!(classic_script_source("x // c").ends_with("x // c\n;void 0"));
-    }
-
-    /// `REPAIR-3`: 接尾辞で 1 MiB を超える場合は付けず、元のまま借用する。
-    #[test]
-    fn classic_script_source_skips_suffix_at_size_boundary() {
-        let fit = "a".repeat(DEFAULT_MAX_SRC_SCRIPT_BYTES - CLASSIC_COMPLETION_SUFFIX.len());
-        assert_eq!(
-            classic_script_source(&fit).len(),
-            DEFAULT_MAX_SRC_SCRIPT_BYTES
-        );
-        let over = "a".repeat(DEFAULT_MAX_SRC_SCRIPT_BYTES - CLASSIC_COMPLETION_SUFFIX.len() + 1);
-        assert!(matches!(classic_script_source(&over), Cow::Borrowed(_)));
-    }
-
     /// `JS-6`: 不正バイトは 3 バイトに膨らむ前提で、確保前に上限判定できる。
     #[test]
     fn lossy_len_exceeds_counts_replacement_chars() {
@@ -2088,10 +2052,6 @@ mod tests {
             if JS_SHIM_SOURCES.iter().any(|s| s.source == script) {
                 return Ok(JsValue::Undefined);
             }
-            // classic script の完了値破棄用接尾辞は照合前に外す。
-            let script = script
-                .strip_suffix(CLASSIC_COMPLETION_SUFFIX)
-                .unwrap_or(script);
             if let Some(ev) = script
                 .strip_prefix("__fandheLifecycle(\"")
                 .and_then(|s| s.strip_suffix("\")"))

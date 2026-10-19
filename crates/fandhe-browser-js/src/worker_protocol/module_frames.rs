@@ -757,7 +757,7 @@ mod tests {
             .with_timeout(Duration::from_millis(750))
             .with_max_result_bytes(4096);
         let payload = encode_evaluate_module(ModuleId::from_raw(9), &options);
-        assert_eq!(payload.len(), 20);
+        assert_eq!(payload.len(), 21);
         let (root, decoded) = decode_evaluate_module(&payload).expect("decode");
         assert_eq!(root, ModuleId::from_raw(9));
         assert_eq!(decoded.timeout(), Duration::from_millis(750));

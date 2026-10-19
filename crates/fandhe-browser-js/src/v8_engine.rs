@@ -1284,6 +1284,10 @@ impl V8Engine {
             }
         };
 
+        if options.discard_completion_value() {
+            // 完了値は変換せず捨てる（`JS-4`・Issue #1134）。
+            return Ok(JsValue::Undefined);
+        }
         value_to_js_value(&tc, result, options.max_result_bytes())
     }
 }
@@ -3121,6 +3125,24 @@ mod tests {
             engine.evaluate_script("'a'.repeat(1048577)", &options),
             Err(JsEngineError::EvaluationFailed(_))
         ));
+    }
+
+    /// JS-4・Issue #1134: 完了値を捨てると変換できない値でも成功し、構文エラーは残る。
+    #[test]
+    fn js_4_v8_discard_completion_value() {
+        let mut engine = V8Engine::new().expect("no other V8Engine is active on this thread");
+        let on = EvaluateOptions::default().with_discard_completion_value(true);
+        assert!(
+            engine
+                .evaluate_script("({a:1})", &EvaluateOptions::default())
+                .is_err()
+        );
+        assert_eq!(
+            engine.evaluate_script("({a:1})", &on).unwrap(),
+            JsValue::Undefined
+        );
+        assert!(engine.evaluate_script("var q = 1; if (true)", &on).is_err());
+        assert!(engine.evaluate_script("throw new Error('x')", &on).is_err());
     }
 
     /// TASK-109・`JS-6`: 小さい上限（16 バイト）の境界とメッセージ。
