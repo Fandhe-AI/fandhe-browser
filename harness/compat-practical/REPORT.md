@@ -280,7 +280,7 @@ spec 対応: TASK-71・TASK-108 / MS-6 / `COMPAT-1`・`JS-5`・`JS-6`・`MEAS-4`
 ### 次の対応
 
 1. `URL` / `URLSearchParams` の shim（core の URL 解析を呼ぶ op の設計を含む）。`JS-5` の別 issue として扱う。起票は本 PR では行わない
-2. d3 の `Error` の原因特定。module 評価失敗の診断に、例外の分類名に加えて不足 API の手掛かりを出す拡張を検討する（`REPAIR-4`）
+2. d3 の `Error` の原因特定。module 評価失敗の診断に、例外の分類名に加えて不足 API の手掛かりを出す拡張を検討する（`REPAIR-4`）（済み: #1145。下の節を参照）
 
 ### 制約
 
@@ -288,6 +288,60 @@ spec 対応: TASK-71・TASK-108 / MS-6 / `COMPAT-1`・`JS-5`・`JS-6`・`MEAS-4`
 - 判定は最初の例外で止まる測定に基づく。後続の不足 API は未確認
 - `style` の shim は `profiles/`（`PLUG-8`）を使わない。ブラウザ別の CSS 機能データを JS の面に反映すると、選んだプロファイルで `in` 判定が変わり識別面に近づくため（`SEC-2`）。ベンダー接頭辞付きのプロパティは定義せず、`getComputedStyle` も定義しない
 - HTML パーサー・`innerHTML` で作られた要素の元の `style` 属性は読む op が無く、shim から最初に書くと `style` 属性全体を置き換える（`REPAIR-3`。`getAttribute` 相当の op で解消できる）
+
+### 再現手順
+
+```bash
+cargo build --release -p fandhe-browser-core --features js-v8 --example compat_page_script_probe
+target/release/examples/compat_page_script_probe --target d2=https://www.saucedemo.com --modules --selector form --out /abs/path/d2.jsonl
+target/release/examples/compat_page_script_probe --target d3=https://demoqa.com/automation-practice-form --modules --selector form --out /abs/path/d3.jsonl
+jq -c 'select(.type=="script")' /abs/path/d2.jsonl /abs/path/d3.jsonl
+```
+
+## module 評価失敗の Error の分類追加後の再測定（#1145）
+
+spec 対応: TASK-71・TASK-108 / MS-6 / `COMPAT-1`・`JS-5`・`MEAS-4`・`REPAIR-3`・`REPAIR-4`。
+前節（#1141）の「次の対応 2」を実装した。d3 の `Error`（`message_class=other`）の原因を特定するため、`message_class` に `minified_react_error` を、検証済みのエラー番号として `error_code` を足し、d2・d3 を `page_script_probe --modules` で再測定した。出力はコミットしていない。
+
+### 形の確認
+
+- 生メッセージは core が要約後に捨てるため、コミットしない一時パッチ（要約関数の入口で先頭 300 文字を stderr に出す）でローカルに 1 回だけ確認し、パッチは戻した。生メッセージはファイル・REPORT・テスト fixture には記録していない
+- d3 の例外は **React 本番ビルド（minified）の定型エラー**（`Minified React error #<番号>; visit <案内 URL> ...` の形）だった。アプリ固有の文言ではなく、ライブラリのエラーコード形式（分類 A）。不足 API 名は含まれない
+- 診断には番号だけを `error_code` として出す。案内 URL・引数は出さない
+
+### 測定条件
+
+| 項目 | 値 |
+| ---- | -- |
+| 実施日時（UTC） | 2026-10-19T07:55Z 前後 |
+| OS | Linux |
+| ベース | main `1073cc70` に、分類追加の変更（本 PR）を加えたもの |
+| バイナリ | `cargo build --release -p fandhe-browser-core --features js-v8 --example compat_page_script_probe` |
+| 設定 | `--modules`・V8・`--selector form`。実行上限は既定のまま |
+
+### 結果
+
+| id | サイト | script | outcome | `error_kind` | `message_class` | `missing_api` | `error_code` | `form`（実行後） | 判定 |
+| -- | ------ | ------ | ------- | ------------ | --------------- | ------------- | ------------ | ---------------- | ---- |
+| d2 | Saucedemo | index 1（module・同一オリジン `src`） | exception | `ReferenceError` | `not_defined` | `URL` | なし | 0 件 | 未解消（変化なし） |
+| d3 | DemoQA | index 0（module・同一オリジン `src`） | exception | `Error` | `minified_react_error` | なし | `299` | 0 件 | 未解消（原因の分類を特定） |
+
+- 確認できた事実: d3 は React のエラー番号 299 で module 評価が失敗している。動的 import は 0 件、abort は無し。d2 は #1141 と同じ（`URL` 未定義）
+- 推測（未検証）: React の公開エラーコード表では 299 は「描画先（container）が DOM 要素でない」に当たると記憶している（表は未確認）。もし正しければ、`createRoot` に渡す要素の取得が `null` になっている。候補は、(a) `getElementById` 等で root 要素が取れない、(b) 評価時点で root 要素が DOM に無い（HTML は約 440 バイトと小さく、root 要素は初期 HTML にあるはず）。script 本文は読んでいない（`REPAIR-3`）
+- 不足 API 名は特定できなかった。分類が示すのは React の内部検査の失敗で、どの DOM API が原因かは番号だけからは分からない。足りないのは、`createRoot` に渡された値の種類（`null` か別の値か）と、root の取得に使った API を安全に示す診断
+- #919（回帰ゲート）の条件（d2・d3 の解消）は満たしていない。`form` は 2 件とも 0 件のため、#919 にはコメントしていない
+
+### 次の対応
+
+1. d3: root 要素の取得（`document.getElementById`・`querySelector` と、モジュール評価時点の DOM の状態）を、ローカルの最小 fixture で再現して確認する。`createRoot` の引数が `null` になる条件を特定する。起票は本 PR では行わない
+2. d2: `URL` / `URLSearchParams` の shim（#1141 の次の対応 1 のまま）
+3. 恒久的な診断: module 評価失敗の原因の確認で、一時パッチを要したのは #1140・#1141・#1145 の 3 回目。ローカル限定で安全に確認できる経路を検討する余地がある（起票は本 PR では行わない）
+
+### 制約
+
+- 単一環境（Linux）・単一時点。URL のクエリ・ページ本文・script 本文・生の例外メッセージは記録していない
+- boa は接頭辞なしの本文だけを返す。`Minified React error #N` は `Error` としてしか投げられないため `Error` と推定する。それ以外の文言の種類は `other` のまま
+- 判定は最初の例外で止まる測定に基づく。後続の不足 API は未確認
 
 ### 再現手順
 
