@@ -19,7 +19,10 @@
 // - ES2015 の範囲に留める（V8 と boa で同一のソースを使うため）。
 //
 // 未実装（REPAIR-3）:
-// - 要素レベルの addEventListener、onload / onreadystatechange 等のイベントハンドラ属性。
+// - 要素レベルの addEventListener / removeEventListener は「保持のみ」のスタブ（#1151。React createRoot が
+//   container に約 80 種を登録するため、TypeError で止まらないよう受け付ける）。ネイティブのイベント源が
+//   無く配送は一切しない（dispatchEvent も未定義）。capture は区別せず、保持件数は 1 要素 1024 件まで。
+// - onload / onreadystatechange 等のイベントハンドラ属性。
 // - キャプチャ・完全なバブリング、passive / signal オプション、CustomEvent / dispatchEvent。
 // - readystatechange イベント。
 (function (global) {
@@ -116,6 +119,36 @@
 
     install(global.document, documentTarget);
     install(global, windowTarget);
+
+    // 要素レベルは Node.prototype に定義する（document は上の own プロパティが優先）。要素ごとの保持先は
+    // WeakMap に遅延生成し、ラッパーと一緒に回収される。保持するだけで配送はしない（スタブ。REPAIR-3）。
+    var elementTargets = new WeakMap();
+    var weakGet = WeakMap.prototype.get;
+    var weakSet = WeakMap.prototype.set;
+    var weakHas = WeakMap.prototype.has;
+    if (typeof global.Node === 'function') {
+        defineMethod(global.Node.prototype, 'addEventListener', function addEventListener(type, listener, options) {
+            if (this === null || (typeof this !== 'object' && typeof this !== 'function')) {
+                throw new TypeError('Illegal invocation');
+            }
+            var target;
+            if (fnCall(weakHas, elementTargets, this)) {
+                target = fnCall(weakGet, elementTargets, this);
+            } else {
+                target = newTarget();
+                fnCall(weakSet, elementTargets, this, target);
+            }
+            add(target, type, listener, options);
+        });
+        defineMethod(global.Node.prototype, 'removeEventListener', function removeEventListener(type, listener) {
+            if (this === null || (typeof this !== 'object' && typeof this !== 'function')) {
+                throw new TypeError('Illegal invocation');
+            }
+            if (fnCall(weakHas, elementTargets, this)) {
+                remove(fnCall(weakGet, elementTargets, this), type, listener);
+            }
+        });
+    }
 
     function report(eventName, error) {
         try {

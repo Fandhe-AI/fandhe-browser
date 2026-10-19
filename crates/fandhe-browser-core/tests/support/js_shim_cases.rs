@@ -286,6 +286,7 @@ pub fn run(engine: &str) {
     observer_cases(engine);
     style_cases(engine);
     url_cases(engine);
+    node_cases(engine);
 
     eprintln!("case: JS-5 disabled runtime does not pretend to install");
     let mut disabled = JsRuntime::disabled();
@@ -1627,4 +1628,77 @@ fn url_cases(engine: &str) {
         "true",
     );
     check(&mut p, "w.port === ''", "true");
+}
+
+/// Node の基本プロパティ（`nodeType`・定数・`nodeName`・`ownerDocument`。#1151・`JS-5`）。
+/// 要素の `tagName` / `parentNode` は未実装（REPAIR-3）で、未定義のままであることも固定する。
+fn node_cases(engine: &str) {
+    eprintln!("case: JS-5 Node basic properties");
+    let mut p = setup(engine, None);
+    check(&mut p, "String(document.getElementById('a').nodeType)", "1");
+    check(&mut p, "String(document.nodeType)", "9");
+    check(&mut p, "String(document.createTextNode('t').nodeType)", "3");
+    check(
+        &mut p,
+        "String(document.createElement('div').nodeType)",
+        "1",
+    );
+    check(
+        &mut p,
+        "[Node.ELEMENT_NODE, Node.TEXT_NODE, Node.DOCUMENT_NODE, Node.DOCUMENT_FRAGMENT_NODE, Node.COMMENT_NODE].join(',')",
+        "1,3,9,11,8",
+    );
+    check(&mut p, "String(Node.prototype.DOCUMENT_NODE)", "9");
+    check(&mut p, "String(document.body.ELEMENT_NODE)", "1");
+    check(
+        &mut p,
+        "Node.ELEMENT_NODE = 5; String(Node.ELEMENT_NODE)",
+        "1",
+    );
+    check(&mut p, "document.nodeName", "#document");
+    check(&mut p, "document.createTextNode('t').nodeName", "#text");
+    check(
+        &mut p,
+        "String(document.getElementById('a').ownerDocument === document)",
+        "true",
+    );
+    check(
+        &mut p,
+        "String(document.createElement('p').ownerDocument === document)",
+        "true",
+    );
+    check(&mut p, "String(document.ownerDocument)", "null");
+    check(
+        &mut p,
+        "String('tagName' in document.body) + '|' + String('parentNode' in document.body)",
+        "false|false",
+    );
+    check(
+        &mut p,
+        "try { Object.getOwnPropertyDescriptor(Element.prototype, 'nodeType').get.call({}); 'no' } \
+         catch (e) { e instanceof TypeError ? 'TypeError' : 'other' }",
+        "TypeError",
+    );
+    check(
+        &mut p,
+        "var n = document.getElementById('a'); String(!!(n && (n.nodeType === 1 || n.nodeType === 9 || n.nodeType === 11)))",
+        "true",
+    );
+    p.rt.install_dom_shim(&p.bridge).expect("reinstall");
+    check(&mut p, "String(document.body.nodeType)", "1");
+
+    eprintln!("case: JS-5 element addEventListener is accepted but never dispatched (stub)");
+    check(
+        &mut p,
+        "var el = document.getElementById('a'); var hit = 0; var fn = function () { hit++; }; \
+         el.addEventListener('click', fn, { capture: true, passive: true }); \
+         el.addEventListener('click', fn); el.removeEventListener('click', fn); \
+         typeof el.addEventListener + '|' + typeof el.dispatchEvent + '|' + hit",
+        "function|undefined|0",
+    );
+    check(
+        &mut p,
+        "for (var i = 0; i < 1100; i++) { document.body.addEventListener('e' + i, function () {}); } 'ok'",
+        "ok",
+    );
 }
