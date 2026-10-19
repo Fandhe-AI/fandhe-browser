@@ -279,7 +279,7 @@ spec 対応: TASK-71・TASK-108 / MS-6 / `COMPAT-1`・`JS-5`・`JS-6`・`MEAS-4`
 
 ### 次の対応
 
-1. `URL` / `URLSearchParams` の shim（core の URL 解析を呼ぶ op の設計を含む）。`JS-5` の別 issue として扱う。起票は本 PR では行わない
+1. `URL` / `URLSearchParams` の shim（core の URL 解析を呼ぶ op の設計を含む）。`JS-5` の別 issue として扱う。起票は本 PR では行わない（済み: #1144。後続の節を参照）
 2. d3 の `Error` の原因特定。module 評価失敗の診断に、例外の分類名に加えて不足 API の手掛かりを出す拡張を検討する（`REPAIR-4`）（済み: #1145。下の節を参照）
 
 ### 制約
@@ -342,6 +342,57 @@ spec 対応: TASK-71・TASK-108 / MS-6 / `COMPAT-1`・`JS-5`・`MEAS-4`・`REPAI
 - 単一環境（Linux）・単一時点。URL のクエリ・ページ本文・script 本文・生の例外メッセージは記録していない
 - boa は接頭辞なしの本文だけを返す。`Minified React error #N` は `Error` としてしか投げられないため `Error` と推定する。それ以外の文言の種類は `other` のまま
 - 判定は最初の例外で止まる測定に基づく。後続の不足 API は未確認
+
+### 再現手順
+
+```bash
+cargo build --release -p fandhe-browser-core --features js-v8 --example compat_page_script_probe
+target/release/examples/compat_page_script_probe --target d2=https://www.saucedemo.com --modules --selector form --out /abs/path/d2.jsonl
+target/release/examples/compat_page_script_probe --target d3=https://demoqa.com/automation-practice-form --modules --selector form --out /abs/path/d3.jsonl
+jq -c 'select(.type=="script")' /abs/path/d2.jsonl /abs/path/d3.jsonl
+```
+
+## URL / URLSearchParams shim 追加後の再測定（#1144）
+
+spec 対応: TASK-71・TASK-108 / MS-6 / `COMPAT-1`・`JS-5`・`JS-6`・`MEAS-4`・`REPAIR-3`・`SEC-2`。
+前節（#1141）の「次の対応 1」を実装し、d2・d3 を `page_script_probe --modules` で再測定した。出力はコミットしていない。
+
+### 実装の要点
+
+- bridge op `urlParse(input, base)` を 1 つ追加した。`reqwest::Url`（WHATWG 準拠）に解析を任せ、構成要素 11 個を `\n` 区切りの 1 文字列で返す（失敗は null）。入力長は既存の文字列引数の上限（既定 64 KiB）で解析の前に検証する。ネットワークには出ず、診断も記録しない
+- `js_shim/url.js` が `URL`（getter 11 個・`toString` / `toJSON`・`searchParams`・`URL.canParse`・`href` / `search` / `hash` の setter）と `URLSearchParams`（form-urlencoded の解析・直列化・`get` / `getAll` / `has` / `set` / `append` / `delete` / 反復 / `forEach`、`URL` との同期）を提供する
+
+### 測定条件
+
+| 項目 | 値 |
+| ---- | -- |
+| 実施日時（UTC） | 2026-10-19T08:04Z 前後 |
+| OS | Linux |
+| ベース | main `1073cc70` に、URL / URLSearchParams の shim と `urlParse` op を追加する変更（本 PR の `674e0abb`）を加えたもの |
+| バイナリ | `cargo build --release -p fandhe-browser-core --features js-v8 --example compat_page_script_probe` |
+| 設定 | `--modules`（`[js] execute_modules = true` 相当）・V8・`--selector form`。実行上限は既定のまま |
+
+### 結果
+
+| id | サイト | script | outcome | `error_kind` | `message_class` | `missing_api` | `form`（実行後） | 判定 |
+| -- | ------ | ------ | ------- | ------------ | --------------- | ------------- | ---------------- | ---- |
+| d2 | Saucedemo | index 1（module・同一オリジン `src`） | exception | `ReferenceError` | `not_defined` | `AbortController` | 0 件 | 未解消（例外が前進した） |
+| d3 | DemoQA | index 0（module・同一オリジン `src`） | exception | `Error` | `other` | なし | 0 件 | 未解消（変化なし） |
+
+- d2 は `URL` の `ReferenceError` を越え、次の不足 API `AbortController` で止まった。**d2・d3 とも `form` は 0 件で、解消していない**。abort は無し
+- d3 は #1145 の取り込み前の測定のため `message_class=other` と記録した。#1145 の取り込み後は `minified_react_error`（`error_code=299`）に分類される（前節。再測定していない）。本 issue の対象外
+- #919（回帰ゲート）の条件（d2・d3 の解消）は今回も満たしていない。#919 にはコメントしていない
+
+### 次の対応
+
+1. d2: `AbortController` / `AbortSignal`。`EventTarget`（現状は document / window の最小実装のみ）、`DOMException`（`AbortError` の `reason`。DOMException への写像は未実装）、`AbortSignal.timeout`（timers 連携）が絡み、30 分・1 ファイル程度には収まらないと判断し、本 PR では続行せず止めた。`net.js` の `fetch` への `signal` 連携も含めて別 issue（`JS-5`・`JS-8`）。起票済み: #1150
+2. d3 の原因特定（前節 #1145 の次の対応 1 のまま。`REPAIR-4`）
+
+### 制約
+
+- 単一環境（Linux）・単一時点。URL のクエリ・ページ本文・script 本文・生の例外メッセージは記録していない
+- 判定は最初の例外で止まる測定に基づく。後続の不足 API は未確認
+- 未実装: `protocol` / `username` / `password` / `host` / `hostname` / `port` / `pathname` の setter（getter だけ。strict モードの代入は `TypeError`）、`URL.createObjectURL` / `revokeObjectURL`・`URLPattern`（定義しない）、`URLSearchParams` の `sort` / `size`、op の文字列上限（64 KiB）を超える URL（失敗として扱う）（`REPAIR-3`）
 
 ### 再現手順
 

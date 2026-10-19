@@ -69,6 +69,7 @@ use crate::error::Error;
 use crate::query::{query_selector_all_str_bounded, query_selector_str};
 
 mod page_env;
+mod url_parse;
 pub use page_env::{
     BridgeDiagnostics, ConsoleLevel, ConsoleMessage, IgnoredLocationChange, LifecycleEvent,
     ListenerError, LocationChangeKind, LocationMember, MAX_BRIDGE_DIAGNOSTICS,
@@ -364,6 +365,7 @@ enum DomOp {
     IsInclusiveAncestor,
     MutationObserverLimit,
     MutationOptionsIgnored,
+    UrlParse,
 }
 
 impl DomOp {
@@ -414,6 +416,7 @@ impl DomOp {
             "isInclusiveAncestor" => Self::IsInclusiveAncestor,
             "mutationObserverLimit" => Self::MutationObserverLimit,
             "mutationOptionsIgnored" => Self::MutationOptionsIgnored,
+            "urlParse" => Self::UrlParse,
             _ => return None,
         })
     }
@@ -465,6 +468,7 @@ impl DomOp {
             Self::IsInclusiveAncestor => "isInclusiveAncestor",
             Self::MutationObserverLimit => "mutationObserverLimit",
             Self::MutationOptionsIgnored => "mutationOptionsIgnored",
+            Self::UrlParse => "urlParse",
         }
     }
 
@@ -512,6 +516,7 @@ impl DomOp {
             | Self::TimerSet
             | Self::TimerCallbackError
             | Self::IsInclusiveAncestor
+            | Self::UrlParse
             | Self::NetCallbackError => 2,
             Self::InsertBefore | Self::SetAttribute => 3,
             Self::NetRequest => 4,
@@ -976,6 +981,30 @@ fn execute(
                     .saturating_add(add);
             }
             Ok(JsValue::Undefined)
+        }
+        // `new URL(input, base)` 等の解析（#1144）。第 2 引数は `Null`（base なし）か文字列。
+        // 入力長は既存の文字列引数の上限で解析より前に検証する（`MAX_LOCATION_URL_BYTES` は
+        // URL をページ状態に保持して複製する `set_location` 用で、何も保持しないこの op には使わない）。
+        // 解析失敗は `Null`（shim が `TypeError` にする）。診断は記録せず、ネットワークにも出ない。
+        DomOp::UrlParse => {
+            let input = string_arg(op, args, 1, limits)?;
+            let base = match args.get(1) {
+                Some(JsValue::Null) => None,
+                _ => Some(string_arg(op, args, 2, limits).map_err(|e| match e {
+                    DomBridgeError::TypeMismatch {
+                        operation, index, ..
+                    } => DomBridgeError::TypeMismatch {
+                        operation,
+                        index,
+                        expected: "a string or null",
+                    },
+                    other => other,
+                })?),
+            };
+            match url_parse::parse_url_components(input, base) {
+                Some(joined) => string_response(joined, limits),
+                None => Ok(JsValue::Null),
+            }
         }
         // `ancestor` が `node` 自身またはその祖先か（MutationObserver の `subtree` 判定用。
         // 祖先の探索量は `Document::ancestors` が `node_count` 歩で打ち切る）。
@@ -2482,6 +2511,94 @@ mod tests {
             call(&b, &[s("timerPending"), n(1.0)]).expect("p"),
             JsValue::Bool(false)
         );
+    }
+
+    fn url_parts(v: Result<JsValue, DomBridgeError>) -> Vec<String> {
+        match v.expect("成功するはず") {
+            JsValue::String(joined) => joined.split('\n').map(str::to_owned).collect(),
+            other => panic!("String を期待: {other:?}"),
+        }
+    }
+
+    /// JS-5: `urlParse` は絶対 URL・相対 URL と base・失敗（Null）を返す。
+    #[test]
+    fn js_5_url_parse_op_resolves_and_fails_with_null() {
+        let b = bridge();
+        let parts = url_parts(call(
+            &b,
+            &[
+                s("urlParse"),
+                s("https://user:pw@example.com:8080/a/b?x=1#h"),
+                JsValue::Null,
+            ],
+        ));
+        assert_eq!(parts.len(), 11);
+        assert_eq!(parts[0], "https://user:pw@example.com:8080/a/b?x=1#h");
+        assert_eq!(parts[3], "user");
+        assert_eq!(parts[4], "pw");
+        assert_eq!(parts[10], "#h");
+        let parts = url_parts(call(
+            &b,
+            &[s("urlParse"), s("../c?q"), s("https://example.com/a/b/")],
+        ));
+        assert_eq!(parts[0], "https://example.com/a/c?q");
+        assert_eq!(
+            call(&b, &[s("urlParse"), s("not a url"), JsValue::Null]).expect("ok"),
+            JsValue::Null
+        );
+        assert_eq!(
+            call(&b, &[s("urlParse"), s("/x"), s("also bad")]).expect("ok"),
+            JsValue::Null
+        );
+        let parts = url_parts(call(
+            &b,
+            &[
+                s("urlParse"),
+                s("https://ex\nample.com/a\tb"),
+                JsValue::Null,
+            ],
+        ));
+        assert_eq!(parts.len(), 11);
+        assert_eq!(parts[0], "https://example.com/ab");
+        assert_eq!(
+            b.take_diagnostics().expect("diag"),
+            BridgeDiagnostics::default()
+        );
+    }
+
+    /// JS-6: `urlParse` は型・arity 違反を拒否し、入力長は解析の前に検証する。
+    #[test]
+    fn js_6_url_parse_op_validates_args_and_length() {
+        let b = bridge();
+        assert!(matches!(
+            call(&b, &[s("urlParse"), s("https://a/"), n(1.0)]).expect_err("型"),
+            DomBridgeError::TypeMismatch { index: 2, .. }
+        ));
+        assert!(matches!(
+            call(&b, &[s("urlParse"), s("https://a/")]).expect_err("arity"),
+            DomBridgeError::ArityMismatch { .. }
+        ));
+        let over = "a".repeat(DEFAULT_MAX_STRING_ARG_BYTES + 1);
+        assert!(matches!(
+            call(&b, &[s("urlParse"), s(&over), JsValue::Null]).expect_err("超過"),
+            DomBridgeError::StringTooLong { index: 1, .. }
+        ));
+        assert!(matches!(
+            call(&b, &[s("urlParse"), s("/x"), s(&over)]).expect_err("超過"),
+            DomBridgeError::StringTooLong { index: 2, .. }
+        ));
+        let prefix = "https://a/";
+        let exact = format!(
+            "{prefix}{}",
+            "x".repeat(DEFAULT_MAX_STRING_ARG_BYTES - prefix.len())
+        );
+        let parts = url_parts(call(&b, &[s("urlParse"), s(&exact), JsValue::Null]));
+        assert_eq!(parts[0].len(), DEFAULT_MAX_STRING_ARG_BYTES);
+        let small = bridge_with(DomBridgeLimits::default().with_max_response_bytes(8));
+        assert!(matches!(
+            call(&small, &[s("urlParse"), s("https://a/"), JsValue::Null]).expect_err("応答"),
+            DomBridgeError::ResponseTooLarge { .. }
+        ));
     }
 
     /// JS-6: `mutationObserverLimit` は操作予算を使い切った後でもフラグを立て、
