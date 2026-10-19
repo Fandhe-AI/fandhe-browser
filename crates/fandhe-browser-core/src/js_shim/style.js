@@ -188,20 +188,65 @@
         return out;
     }
 
-    // トップレベル（引用符・括弧の外）に `;` `{` `}` を含むと無効。
+    // 引用符の外の CSS コメント（`/* ... */`。閉じが無ければ末尾まで）を空白 1 つに置き換える。
+    // 引用符内とエスケープ（`\` + 1 文字）はそのまま残す。コメント内の `;` や括弧を
+    // 宣言境界・括弧深さに数えないための前処理で、cssText と基準属性の解析前に必ず通す。
+    function stripComments(text) {
+        if (sIndexOf(text, '/*') < 0) {
+            return text;
+        }
+        var out = '';
+        var quote = '';
+        var len = text.length;
+        for (var i = 0; i < len; i++) {
+            var ch = sCharAt(text, i);
+            if (ch === '\\' && i + 1 < len) {
+                out += ch + sCharAt(text, i + 1);
+                i += 1;
+            } else if (quote !== '') {
+                out += ch;
+                if (ch === quote) {
+                    quote = '';
+                }
+            } else if (ch === '/' && sCharAt(text, i + 1) === '*') {
+                var close = sIndexOf(text, '*/', i + 2);
+                out += ' ';
+                if (close < 0) {
+                    break;
+                }
+                i = close + 1;
+            } else {
+                if (ch === '"' || ch === "'") {
+                    quote = ch;
+                }
+                out += ch;
+            }
+        }
+        return out;
+    }
+
+    // トップレベル（引用符・括弧の外）に `;` `{` `}` を含むと無効。引用符の外のコメント開始 `/*` と
+    // 末尾の孤立した `\`（直列化の `;` をエスケープしてしまう）も、実属性との解釈の食い違いを
+    // 避けるため安全側に倒して無効にする。
     function valueIsSafe(value) {
         var quote = '';
         var depth = 0;
-        for (var i = 0; i < value.length; i++) {
+        var len = value.length;
+        for (var i = 0; i < len; i++) {
             var ch = sCharAt(value, i);
-            if (quote !== '') {
-                if (ch === '\\') {
-                    i += 1;
-                } else if (ch === quote) {
+            if (ch === '\\') {
+                if (i + 1 >= len) {
+                    return false;
+                }
+                i += 1;
+            } else if (quote !== '') {
+                if (ch === quote) {
                     quote = '';
                 }
             } else if (ch === '"' || ch === "'") {
                 quote = ch;
+            } else if (ch === '/' && sCharAt(value, i + 1) === '*') {
+                return false;
             } else if (ch === '(') {
                 depth += 1;
             } else if (ch === ')') {
@@ -256,17 +301,18 @@
     }
 
     // cssText を線形走査で宣言に分け、モデルへ入れる。
-    function parseInto(model, text) {
+    function parseInto(model, raw) {
+        var text = stripComments(raw);
         var len = text.length;
         var start = 0;
         var quote = '';
         var depth = 0;
         for (var i = 0; i < len; i++) {
             var ch = sCharAt(text, i);
-            if (quote !== '') {
-                if (ch === '\\') {
-                    i += 1;
-                } else if (ch === quote) {
+            if (ch === '\\') {
+                i += 1;
+            } else if (quote !== '') {
+                if (ch === quote) {
                     quote = '';
                 }
             } else if (ch === '"' || ch === "'") {

@@ -949,6 +949,20 @@ fn style_cases(engine: &str) {
          s.color = 'blue; position: fixed'; s.setProperty('width', '1px} x{'); s.cssText",
         "color: red;",
     );
+    // コメント内の括弧で深さをずらして別宣言を紛れ込ませる試みは拒否する。
+    check(
+        &mut p,
+        "s.color = 'red/*(*/; position: fixed; /*)*/'; s.setProperty('top', '1px/*'); \
+         s.setProperty('left', 'red\\\\'); s.cssText",
+        "color: red;",
+    );
+    // cssText ではコメントを除去し、コメント内の `;` と括弧を境界・深さに数えない。
+    check(
+        &mut p,
+        "s.cssText = 'color: red/*(*/; top: 1px; /*)*/ left: 2px; /* a; b: c */ width: 3px'; \
+         s.cssText",
+        "color: red; top: 1px; left: 2px; width: 3px;",
+    );
 
     eprintln!("case: JS-6 style limits are enforced and warned once");
     let mut p = setup(engine, None);
