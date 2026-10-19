@@ -238,6 +238,7 @@ mod tests {
         (r.kind, r.class, r.identifier)
     }
 
+    /// V8 形式の ReferenceError から不足識別子名を取り出す（`JS-5`・`REPAIR-4`）。
     #[test]
     fn v8_not_defined_with_line() {
         assert_eq!(
@@ -250,6 +251,7 @@ mod tests {
         );
     }
 
+    /// boa 形式（接頭辞なし）から ReferenceError を推定する（`JS-5`・`REPAIR-4`）。
     #[test]
     fn boa_not_defined_infers_reference_error() {
         assert_eq!(
@@ -262,6 +264,7 @@ mod tests {
         );
     }
 
+    /// `a.b is not a function` の段数付き識別子を取り出す（`JS-5`・`REPAIR-4`）。
     #[test]
     fn not_a_function_dotted() {
         assert_eq!(
@@ -274,6 +277,7 @@ mod tests {
         );
     }
 
+    /// プロパティ読み取り失敗は識別子を残さない（`JS-5`・`REPAIR-4`）。
     #[test]
     fn read_property_has_no_identifier() {
         assert_eq!(
@@ -286,6 +290,7 @@ mod tests {
         );
     }
 
+    /// missing export は specifier を残さない（`JS-5`・`REPAIR-4`）。
     #[test]
     fn missing_export_drops_specifier() {
         let r = summarize_exception_message(
@@ -298,6 +303,7 @@ mod tests {
         assert!(!dbg.contains("SECRET") && !dbg.contains("d.js") && !dbg.contains("token"));
     }
 
+    /// URL を含むメッセージは other に分類し漏らさない（`JS-5`・`REPAIR-4`）。
     #[test]
     fn url_message_is_other_and_not_leaked() {
         let r =
@@ -309,6 +315,7 @@ mod tests {
         assert!(!dbg.contains("SECRET_TOKEN") && !dbg.contains("https"));
     }
 
+    /// 不正な識別子は None になる（`JS-5`・`REPAIR-4`）。
     #[test]
     fn invalid_identifiers_become_none() {
         let long_seg = "a".repeat(65);
@@ -333,6 +340,7 @@ mod tests {
         }
     }
 
+    /// 未知の例外種別は other になる（`JS-5`・`REPAIR-4`）。
     #[test]
     fn unknown_kind_is_other() {
         assert_eq!(
@@ -341,6 +349,7 @@ mod tests {
         );
     }
 
+    /// 巨大入力でも長さが上限内に収まる（`JS-5`・`REPAIR-4`）。
     #[test]
     fn huge_input_is_bounded() {
         let big = format!(
@@ -353,6 +362,7 @@ mod tests {
         let _ = summarize_exception_message(&multibyte);
     }
 
+    /// as_str の語彙が固定である（`JS-5`・`REPAIR-4`）。
     #[test]
     fn as_str_vocabulary_is_fixed() {
         assert_eq!(ExceptionKind::UriError.as_str(), "URIError");
