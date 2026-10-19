@@ -124,6 +124,7 @@ pub use crate::dom_bridge::LifecycleEvent;
 mod exception_summary;
 mod module_graph;
 
+use exception_summary::RawExceptionMessage;
 pub use exception_summary::{ExceptionKind, ExceptionMessageClass, ExceptionSummary};
 
 /// スクリプト 1 件あたりの実時間上限の既定（`EvaluateOptions` の既定と同じ 2 秒）。
@@ -200,6 +201,7 @@ pub struct PageRunOptions {
     max_modules: usize,
     event_loop: EventLoopLimits,
     net_limits: PageNetLimits,
+    retain_raw_exception_messages: bool,
 }
 
 impl Default for PageRunOptions {
@@ -215,11 +217,30 @@ impl Default for PageRunOptions {
             max_modules: DEFAULT_MAX_PAGE_MODULES,
             event_loop: EventLoopLimits::default(),
             net_limits: PageNetLimits::default(),
+            retain_raw_exception_messages: false,
         }
     }
 }
 
 impl PageRunOptions {
+    /// module 評価失敗の生メッセージ（300 文字に切り詰め）を結果に保持するか（既定 false。Issue #1152）。
+    ///
+    /// 計測用 example `compat_page_script_probe` が stderr にだけ出すための opt-in で、
+    /// 本番経路（CLI・CDP・AI API・`Config`）から呼ばない（`SEC-2`・`REPAIR-4`）。
+    /// 生メッセージは URL・トークンを含み得るため、保存・転記しない。
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_retain_raw_exception_messages(mut self, retain: bool) -> Self {
+        self.retain_raw_exception_messages = retain;
+        self
+    }
+
+    /// [`Self::with_retain_raw_exception_messages`] の現在値。
+    #[doc(hidden)]
+    pub fn retains_raw_exception_messages(&self) -> bool {
+        self.retain_raw_exception_messages
+    }
+
     /// パース設定を差し替える。
     #[must_use]
     pub fn with_parse(mut self, parse: ParseOptions) -> Self {
@@ -567,6 +588,7 @@ pub struct ScriptRunRecord {
     node: Option<NodeId>,
     outcome: ScriptOutcome,
     exception: Option<ExceptionSummary>,
+    raw_exception: Option<RawExceptionMessage>,
 }
 
 impl ScriptRunRecord {
@@ -591,6 +613,13 @@ impl ScriptRunRecord {
     /// classic の例外は将来対応で、常に `None`（`REPAIR-3`）。`outcome` の固定文は変えない。
     pub fn exception_summary(&self) -> Option<&ExceptionSummary> {
         self.exception.as_ref()
+    }
+
+    /// 切り詰め済みの生メッセージ（`with_retain_raw_exception_messages(true)` のときの module 評価失敗だけ。
+    /// 既定は常に `None`）。計測用 example の stderr 専用で、保存・転記しない（Issue #1152）。
+    #[doc(hidden)]
+    pub fn raw_exception_message(&self) -> Option<&str> {
+        self.raw_exception.as_ref().map(RawExceptionMessage::as_str)
     }
 }
 
@@ -736,6 +765,8 @@ pub struct DynamicImportReport {
     pub(crate) pending: usize,
     pub(crate) failures: Vec<DynamicImportFailureKind>,
     pub(crate) evaluation_errors: Vec<ExceptionSummary>,
+    /// opt-in 時のみ `evaluation_errors` と同数・同順（無効時は空。Issue #1152）。
+    pub(crate) raw_evaluation_messages: Vec<Option<RawExceptionMessage>>,
 }
 
 impl DynamicImportReport {
@@ -769,6 +800,16 @@ impl DynamicImportReport {
     /// 生メッセージ・URL は含まない。特定できないものは `Other` の要約になる。
     pub fn evaluation_errors(&self) -> &[ExceptionSummary] {
         &self.evaluation_errors
+    }
+
+    /// `evaluation_errors` と同数・同順の切り詰め済み生メッセージ（opt-in 有効時のみ。無効時は空）。
+    /// 計測用 example の stderr 専用で、保存・転記しない（Issue #1152・`SEC-2`）。
+    #[doc(hidden)]
+    pub fn raw_evaluation_messages(&self) -> Vec<Option<&str>> {
+        self.raw_evaluation_messages
+            .iter()
+            .map(|m| m.as_ref().map(RawExceptionMessage::as_str))
+            .collect()
     }
 }
 
@@ -1240,6 +1281,7 @@ async fn execute(
     for (entry, load) in collected.entries().iter().zip(loads.iter()) {
         // module 評価失敗の例外の要約（`outcome` が `Exception` のままのときだけ記録に載せる。Issue #1133）。
         let mut module_exception: Option<ExceptionSummary> = None;
+        let mut module_raw: Option<RawExceptionMessage> = None;
         let outcome = if let Some(a) = &abort {
             ScriptOutcome::NotExecuted {
                 kind: a.kind.clone(),
@@ -1281,6 +1323,7 @@ async fn execute(
                         message: None,
                     },
                     exception: None,
+                    raw_exception: None,
                 });
                 continue;
             }
@@ -1304,6 +1347,7 @@ async fn execute(
                                     )
                                     .await;
                                     module_exception = result.exception;
+                                    module_raw = result.raw_exception;
                                     result.outcome
                                 }
                                 (ScriptLoad::Ready(src), _) | (_, ScriptSource::Inline(src)) => {
@@ -1355,16 +1399,15 @@ async fn execute(
                 },
             }
         };
-        let exception = if matches!(outcome, ScriptOutcome::Exception { .. }) {
-            module_exception
-        } else {
-            None
-        };
+        let is_exception = matches!(outcome, ScriptOutcome::Exception { .. });
+        let exception = module_exception.filter(|_| is_exception);
+        let raw_exception = module_raw.filter(|_| is_exception);
         records.push(ScriptRunRecord {
             index: Some(entry.index()),
             node: Some(entry.node()),
             outcome,
             exception,
+            raw_exception,
         });
     }
 
@@ -2002,6 +2045,7 @@ fn finish(
                 count: d.count(),
             },
             exception: None,
+            raw_exception: None,
         });
     }
     // 安定ソート。通し番号の無い診断（件数上限）は末尾に置く。

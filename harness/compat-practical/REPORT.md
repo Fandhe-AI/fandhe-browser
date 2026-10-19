@@ -252,7 +252,7 @@ spec 対応: TASK-71・TASK-108 / MS-6 / `COMPAT-1`・`JS-5`・`JS-6`・`MEAS-4`
 ### 原因の確認結果
 
 - 前節の推測（要素の `style` が未提供で、CSS 機能検出が `undefined` を引く）は**正しかった**。`style` の shim を足すと、d2・d3 とも `TypeError`（`message_class=other`）が出なくなり、評価が次の例外まで進んだ
-- 確認は shim 追加の前後の `error_kind` / `message_class` の変化による。script 本文・生の例外メッセージは読んでいない（module 評価失敗の理由は `--debug-messages` でも stderr に出ない）
+- 確認は shim 追加の前後の `error_kind` / `message_class` の変化による。script 本文・生の例外メッセージは読んでいない（当時は module 評価失敗の理由を stderr に出す経路が無かった。現在は `--debug-raw-exception` で stderr にだけ出せる。#1152）
 
 ### 測定条件
 
@@ -335,7 +335,7 @@ spec 対応: TASK-71・TASK-108 / MS-6 / `COMPAT-1`・`JS-5`・`MEAS-4`・`REPAI
 
 1. d3: root 要素の取得（`document.getElementById`・`querySelector` と、モジュール評価時点の DOM の状態）を、ローカルの最小 fixture で再現して確認する。`createRoot` の引数が `null` になる条件を特定する。起票は本 PR では行わない
 2. d2: `URL` / `URLSearchParams` の shim（#1141 の次の対応 1 のまま）
-3. 恒久的な診断: module 評価失敗の原因の確認で、一時パッチを要したのは #1140・#1141・#1145 の 3 回目。ローカル限定で安全に確認できる経路を検討する余地がある（起票は本 PR では行わない）
+3. 恒久的な診断: module 評価失敗の原因の確認で、一時パッチを要したのは #1140・#1141・#1145 の 3 回目。ローカル限定で安全に確認できる経路を検討する余地がある（起票は本 PR では行わない）（済み: #1152。`page_script_probe --debug-raw-exception` で stderr にだけ出せる）
 
 ### 制約
 
@@ -403,6 +403,8 @@ target/release/examples/compat_page_script_probe --target d3=https://demoqa.com/
 jq -c 'select(.type=="script")' /abs/path/d2.jsonl /abs/path/d3.jsonl
 ```
 
+生の例外メッセージを確認するときは `--modules --debug-raw-exception` を付ける（#1152）。メッセージは 300 文字に切り詰められ、stderr にだけ出る。URL・トークンを含み得るため、stderr は端末で読むだけにし、ファイルへ保存・転記しない。
+
 ## Node の基本プロパティ追加後の再測定（#1151）
 
 spec 対応: TASK-71・TASK-108 / MS-6 / `COMPAT-1`・`JS-5`・`JS-6`・`MEAS-4`・`REPAIR-3`。
@@ -442,7 +444,7 @@ spec 対応: TASK-71・TASK-108 / MS-6 / `COMPAT-1`・`JS-5`・`JS-6`・`MEAS-4`
 
 ### 次の対応
 
-1. d3: タイマー callback の例外の分類（`timer_errors` に `message_class` / `missing_api` を持たせる診断）。これで描画段階の次の不足 API を特定する。診断の拡張が先で、shim 単体では 30 分・1 ファイルに収まらないと判断し、本 PR では続行せず止めた。起票はしていない
+1. d3: タイマー callback の例外の分類（`timer_errors` に `message_class` / `missing_api` を持たせる診断）。これで描画段階の次の不足 API を特定する。診断の拡張が先で、shim 単体では 30 分・1 ファイルに収まらないと判断し、本 PR では続行せず止めた。#1156 で追跡する
 2. d2: `AbortController`（#1150）
 
 ### 制約

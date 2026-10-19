@@ -1773,3 +1773,83 @@ fn js_6_dynamic_import_checkpoint_limit_counts_remaining_queue() {
     );
     assert_eq!(r.failures(), &[DynamicImportFailureKind::Limit(kind)]);
 }
+/// `JS-5`・`REPAIR-4`・`SEC-2`・Issue #1152: 既定（opt-in なし）では生メッセージを一切保持しない。
+/// 固定文の `outcome` と要約は従来どおりで、`Debug` にも本文は出ない。
+#[test]
+fn js_5_raw_exception_message_absent_by_default() {
+    let (port, _hits) = spawn_server(|path| match path {
+        "/u.js" => js("reject:Uncaught Error: https://h.example/p?token=SECRET"),
+        _ => js("settle-throw"),
+    });
+    let html = "<script type=module src=\"/u.js\"></script>\
+                <script type=module>dynamic \"/t.js\"</script>";
+    let (out, _) = run(html, port, &module_options());
+    assert!(!module_options().retains_raw_exception_messages());
+    assert!(
+        out.scripts()
+            .iter()
+            .all(|r| r.raw_exception_message().is_none())
+    );
+    assert!(out.dynamic_imports().raw_evaluation_messages().is_empty());
+    assert_eq!(out.dynamic_imports().evaluation_errors().len(), 1);
+    let dbg = format!("{:?}{:?}", out.scripts(), out.dynamic_imports());
+    assert!(!dbg.contains("SECRET") && !dbg.contains("https"));
+}
+
+/// `JS-5`・`REPAIR-4`・`SEC-2`・Issue #1152: opt-in 時は 300 文字（char 境界）に切った生メッセージを
+/// 静的 root（再参照を含む）に保持し、`Debug` には本文を出さない。
+#[test]
+fn js_5_raw_exception_message_retained_when_opted_in() {
+    let long = format!("Uncaught Error: {}", "あ".repeat(400));
+    let long_js = format!("reject:{long}");
+    let (port, _hits) = spawn_server(move |path| match path {
+        "/u.js" => js("reject:Uncaught Error: https://h.example/p?token=SECRET"),
+        "/l.js" => js(&long_js),
+        _ => js("1"),
+    });
+    let html = "<script type=module src=\"/u.js\"></script>\
+                <script type=module src=\"/u.js\"></script>\
+                <script type=module src=\"/l.js\"></script>";
+    let opts = module_options().with_retain_raw_exception_messages(true);
+    let (out, _) = run(html, port, &opts);
+    let raws: Vec<_> = out
+        .scripts()
+        .iter()
+        .map(|r| r.raw_exception_message().map(str::to_owned))
+        .collect();
+    assert_eq!(
+        raws.first().cloned().flatten().as_deref(),
+        Some("Uncaught Error: https://h.example/p?token=SECRET")
+    );
+    assert_eq!(raws.first(), raws.get(1));
+    let clipped = raws.get(2).cloned().flatten().unwrap_or_default();
+    assert_eq!(clipped.chars().count(), 300);
+    assert!(clipped.starts_with("Uncaught Error: あ"));
+    let dbg = format!("{:?}", out.scripts());
+    assert!(!dbg.contains("SECRET") && dbg.contains("redacted"));
+}
+
+/// `JS-5`・`SEC-2`・Issue #1152: 動的 import の生メッセージは `evaluation_errors` と同数・同順。
+#[test]
+fn js_5_dynamic_import_raw_messages_align_with_evaluation_errors() {
+    let (port, _hits) = spawn_server(|path| match path {
+        "/r.js" => js("settle-throw-ref"),
+        "/b.js" => js("settle-throw"),
+        _ => js("finish-too-large"),
+    });
+    let html = "<script type=module>dynamic \"/r.js\"</script>\
+                <script type=module>dynamic \"/b.js\"</script>\
+                <script type=module>dynamic \"/l.js\"</script>";
+    let opts = module_options().with_retain_raw_exception_messages(true);
+    let (out, _) = run(html, port, &opts);
+    let r = out.dynamic_imports();
+    assert_eq!(r.evaluation_errors().len(), 3);
+    assert_eq!(
+        r.raw_evaluation_messages(),
+        vec![
+            Some("Uncaught ReferenceError: Foo is not defined (line 1)"),
+            Some("boom"),
+            Some(""),
+        ]
+    );
+}
