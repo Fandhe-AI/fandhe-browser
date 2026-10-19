@@ -1003,6 +1003,18 @@ fn style_cases(engine: &str) {
         "color|color: blue; display: block;",
     );
 
+    // 優先度の区切りは引用符・括弧の外の未エスケープの `!` だけ（core の parse_declarations と同じ）。
+    check(
+        &mut q,
+        r#"s.cssText = '--x: \\!important; color: red'; s.length + '|' + s.getPropertyValue('--x') + '|[' + s.getPropertyPriority('--x') + ']|' + s.cssText"#,
+        r#"2|\!important|[]|--x: \!important; color: red;"#,
+    );
+    check(
+        &mut q,
+        r#"s.cssText = '--y: "a!important"; --z: f(b!important); --w: a!b; color: red !important'; s.getPropertyValue('--y') + '|' + s.getPropertyValue('--z') + '|' + s.getPropertyValue('--w') + '|' + s.getPropertyPriority('--y') + s.getPropertyPriority('--z') + s.getPropertyPriority('--w') + '|' + s.getPropertyPriority('color') + '|' + s.length"#,
+        r#""a!important"|f(b!important)|a!b||important|4"#,
+    );
+
     eprintln!(
         "case: JS-5 style unbalanced paren / oversize cssText / removeProperty arg side effects"
     );

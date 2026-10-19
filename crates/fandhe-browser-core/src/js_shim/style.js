@@ -63,7 +63,6 @@
     var sLower = Function.prototype.call.bind(String.prototype.toLowerCase);
     var sTrim = Function.prototype.call.bind(String.prototype.trim);
     var sIndexOf = Function.prototype.call.bind(String.prototype.indexOf);
-    var sLastIndexOf = Function.prototype.call.bind(String.prototype.lastIndexOf);
     var sSplit = Function.prototype.call.bind(String.prototype.split);
     var reTest = Function.prototype.call.bind(RegExp.prototype.test);
     var IDENT = /^-{0,2}[A-Za-z_][A-Za-z0-9_-]*$/;
@@ -293,8 +292,33 @@
     }
 
     // `value` の末尾 `!important` を分離する。{ value, important }。
+    // core の parse_declarations と同じく、引用符・括弧（丸・角・波括弧）の外で未エスケープの
+    // 最後の `!` だけを優先度の区切りとみなす（`\!important` や `"!important"` は値の一部）。
     function splitPriority(value) {
-        var bang = sLastIndexOf(value, '!');
+        var quote = '';
+        var depth = 0;
+        var bang = -1;
+        var len = value.length;
+        for (var i = 0; i < len; i++) {
+            var ch = sCharAt(value, i);
+            if (ch === '\\') {
+                i += escapeSkip(value, i);
+            } else if (quote !== '') {
+                if (ch === quote || isNewline(ch)) {
+                    quote = '';
+                }
+            } else if (ch === '"' || ch === "'") {
+                quote = ch;
+            } else if (ch === '(' || ch === '[' || ch === '{') {
+                depth += 1;
+            } else if (ch === ')' || ch === ']' || ch === '}') {
+                if (depth > 0) {
+                    depth -= 1;
+                }
+            } else if (ch === '!' && depth === 0) {
+                bang = i;
+            }
+        }
         if (bang >= 0 && sLower(sTrim(sSub(value, bang + 1))) === 'important') {
             return { value: sTrim(sSub(value, 0, bang)), important: true };
         }
