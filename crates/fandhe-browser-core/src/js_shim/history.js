@@ -109,6 +109,11 @@
 
     function cloneValue(v, depth, budget) {
         var t = typeof v;
+        // 値の訪問ごと（null・undefined・空文字列・疎配列の穴を含む）に 1 ノードを累積予算へ計上する。
+        budget.nodes++;
+        if (budget.nodes > MAX_STATE_NODES) {
+            throw 0;
+        }
         if (v === null || t === 'undefined') {
             return v;
         }
@@ -127,10 +132,6 @@
             return v;
         }
         if (t !== 'object' || depth >= MAX_STATE_DEPTH) {
-            throw 0;
-        }
-        budget.nodes++;
-        if (budget.nodes > MAX_STATE_NODES) {
             throw 0;
         }
         var i;

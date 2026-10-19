@@ -2313,6 +2313,17 @@ fn history_cases(engine: &str) {
         "#route",
     );
 
+    eprintln!("case: JS-6 history state clone budget counts every array slot (shared refs)");
+    check(
+        &mut p,
+        "history.replaceState({keep: 9}, ''); var a = new Array(50000); var r; \
+         try { history.pushState(new Array(40000).fill(a), ''); r = 'no-throw'; } catch (e) { r = e.name; } \
+         var b = new Array(60000).fill(null); var r2; \
+         try { history.pushState(b, ''); r2 = 'no-throw'; } catch (e) { r2 = e.name; } \
+         [r, r2, history.state.keep].join('|')",
+        "DataCloneError|DataCloneError|9",
+    );
+
     eprintln!("case: JS-5 history methods can be wrapped (Backtrace SDK pattern)");
     check(
         &mut p,
