@@ -48,6 +48,7 @@ fn setup(engine: &str, limit_extra_nodes: Option<usize>) -> Page {
             "timers.js",
             "net.js",
             "observers.js",
+            "style.js",
         ]
     );
     Page { bridge, rt, script }
@@ -277,6 +278,7 @@ pub fn run(engine: &str) {
 
     window_cases(engine);
     observer_cases(engine);
+    style_cases(engine);
 
     eprintln!("case: JS-5 disabled runtime does not pretend to install");
     let mut disabled = JsRuntime::disabled();
@@ -819,5 +821,207 @@ fn observer_cases(engine: &str) {
             .take_diagnostics()
             .expect("diagnostics")
             .mutation_observer_limit_exceeded
+    );
+}
+
+/// 要素の `style`（#1141・`JS-5`・`JS-6`・`SEC-2`・`REPAIR-3`）のケース。
+fn style_cases(engine: &str) {
+    eprintln!("case: JS-5 style in-check (React-style feature detection)");
+    let mut p = setup(engine, None);
+    check(
+        &mut p,
+        "var s = document.createElement('div').style; typeof s",
+        "object",
+    );
+    check(&mut p, "s instanceof CSSStyleDeclaration", "true");
+    check(&mut p, "'display' in s", "true");
+    check(&mut p, "'cssFloat' in s", "true");
+    check(&mut p, "'animation' in s", "true");
+    check(
+        &mut p,
+        "'backgroundColor' in s && 'background-color' in s",
+        "true",
+    );
+    check(&mut p, "'WebkitAnimation' in s", "false");
+    check(&mut p, "'MozAnimation' in s", "false");
+    check(
+        &mut p,
+        "var e = document.createElement('div'); e.style === e.style",
+        "true",
+    );
+    check(
+        &mut p,
+        "try { new CSSStyleDeclaration(); 'no error' } catch (x) { x instanceof TypeError ? 'TypeError' : 'other' }",
+        "TypeError",
+    );
+    check(&mut p, "typeof document.style", "undefined");
+
+    eprintln!("case: JS-5 style camelCase read/write syncs the style attribute");
+    let mut p = setup(engine, None);
+    check(
+        &mut p,
+        "var d = document.createElement('div'); d.style.backgroundColor = 'red'; \
+         d.style.backgroundColor + '|' + d.style.getPropertyValue('background-color')",
+        "red|red",
+    );
+    check(&mut p, "document.body.appendChild(d) === d", "true");
+    assert!(
+        p.html()
+            .contains("<div style=\"background-color: red;\"></div>"),
+        "html: {}",
+        p.html()
+    );
+    check(
+        &mut p,
+        "d.style.cssFloat = 'left'; d.style.getPropertyValue('float')",
+        "left",
+    );
+
+    eprintln!("case: JS-5 setProperty / getPropertyValue / removeProperty / priority");
+    let mut p = setup(engine, None);
+    check(
+        &mut p,
+        "var s = document.createElement('div').style; s.setProperty('color', 'blue', 'important'); \
+         s.getPropertyPriority('color') + '|' + s.cssText",
+        "important|color: blue !important;",
+    );
+    check(&mut p, "s.removeProperty('color')", "blue");
+    check(&mut p, "s.getPropertyValue('color')", "");
+    check(&mut p, "s.removeProperty('color')", "");
+    check(
+        &mut p,
+        "s.setProperty('--MyVar', '1px'); s.setProperty('COLOR', 'red'); s.cssText",
+        "--MyVar: 1px; color: red;",
+    );
+    check(
+        &mut p,
+        "s.getPropertyValue('--MyVar') + s.getPropertyValue('--myvar')",
+        "1px",
+    );
+    check(&mut p, "s.setProperty('color', ''); s.length", "1");
+    check(
+        &mut p,
+        "s.setProperty('1bad', 'x'); s.setProperty('a', 'b', 'bogus'); s.length",
+        "1",
+    );
+
+    eprintln!("case: JS-5 style cssText parse / serialize");
+    let mut p = setup(engine, None);
+    check(
+        &mut p,
+        "var d = document.createElement('div'); document.body.appendChild(d); \
+         d.style.cssText = 'display: none; color: red'; \
+         d.style.display + '|' + d.style.length + '|' + d.style.item(0) + '|' + d.style.item(5) + '|' + d.style.item(-1)",
+        "none|2|display||",
+    );
+    assert!(
+        p.html()
+            .contains("<div style=\"display: none; color: red;\"></div>"),
+        "html: {}",
+        p.html()
+    );
+    check(
+        &mut p,
+        "d.style = 'top: 1px'; d.style.cssText + '|' + d.style.length",
+        "top: 1px;|1",
+    );
+    check(
+        &mut p,
+        "d.style.cssText = 'background: url(\"a;b\") no-repeat !important; bad; : x; left: 2px;; '; d.style.cssText",
+        "background: url(\"a;b\") no-repeat !important; left: 2px;",
+    );
+    check(
+        &mut p,
+        "d.style.cssText = ''; d.style.cssText + '|' + d.style.length",
+        "|0",
+    );
+    assert!(
+        p.html().contains("<div style=\"\"></div>"),
+        "html: {}",
+        p.html()
+    );
+
+    eprintln!("case: JS-5 style invalid value does not smuggle declarations");
+    let mut p = setup(engine, None);
+    check(
+        &mut p,
+        "var s = document.createElement('div').style; s.color = 'red'; \
+         s.color = 'blue; position: fixed'; s.setProperty('width', '1px} x{'); s.cssText",
+        "color: red;",
+    );
+
+    eprintln!("case: JS-6 style limits are enforced and warned once");
+    let mut p = setup(engine, None);
+    check(
+        &mut p,
+        "var s = document.createElement('div').style; \
+         for (var i = 0; i < 300; i++) { s.setProperty('p' + i, '1'); } \
+         s.setProperty('q', 'x'.repeat(5000)); s.length",
+        "256",
+    );
+    let diag = p.bridge.take_diagnostics().expect("diagnostics");
+    assert_eq!(diag.console_messages.len(), 1);
+    assert_eq!(
+        diag.console_messages[0].text,
+        "style shim limit exceeded: declaration ignored"
+    );
+
+    eprintln!("case: JS-5 style attribute sync and MutationObserver");
+    let mut p = setup(engine, None);
+    check(
+        &mut p,
+        "var d = document.createElement('div'); d.setAttribute('STYLE', 'left: 2px'); \
+         d.style.left + '|' + d.style.length",
+        "2px|1",
+    );
+    check(&mut p, "d.removeAttribute('style'); d.style.length", "0");
+    check(
+        &mut p,
+        "var seen = []; var mo = new MutationObserver(function (r) { \
+           for (var i = 0; i < r.length; i++) seen.push(r[i].type + ':' + r[i].attributeName); }); \
+         mo.observe(d, { attributes: true }); d.style.top = '1px'; __fandheRunMicrotasks(); seen.join(',')",
+        "attributes:style",
+    );
+
+    eprintln!("case: REPAIR-3 style baseline of parser-created elements is unknown");
+    let mut p = setup(engine, None);
+    check(
+        &mut p,
+        "document.body.innerHTML = '<p id=\"sp\" style=\"margin: 0\">x</p>'; \
+         var sp = document.getElementById('sp'); sp.style.margin + '|' + sp.style.length",
+        "|0",
+    );
+    check(
+        &mut p,
+        "sp.style.color = 'red'; sp.style.cssText",
+        "color: red;",
+    );
+    assert!(
+        p.html()
+            .contains("<p id=\"sp\" style=\"color: red;\">x</p>"),
+        "html: {}",
+        p.html()
+    );
+
+    eprintln!("case: REPAIR-3 / SEC-2 no computed style stub and no vendor-prefixed names");
+    let mut p = setup(engine, None);
+    check(&mut p, "typeof getComputedStyle", "undefined");
+    check(
+        &mut p,
+        "var bad = 0; var names = Object.getOwnPropertyNames(CSSStyleDeclaration.prototype); \
+         for (var i = 0; i < names.length; i++) { \
+           if (/^(webkit|moz|ms|-webkit-|-moz-|-ms-)/i.test(names[i])) bad++; } bad",
+        "0",
+    );
+    check(&mut p, "names.length > 100", "true");
+
+    eprintln!("case: JS-5 style survives shim re-install without double wrapping");
+    let mut p = setup(engine, None);
+    p.rt.install_dom_shim(&p.bridge).expect("reinstall shim");
+    check(
+        &mut p,
+        "var d = document.createElement('div'); d.style.color = 'red'; d.setAttribute('data-x', '1'); \
+         d.style.cssText + '|' + (d.style instanceof CSSStyleDeclaration)",
+        "color: red;|true",
     );
 }
