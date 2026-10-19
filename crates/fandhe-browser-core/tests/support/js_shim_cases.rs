@@ -1149,6 +1149,19 @@ fn style_cases(engine: &str) {
         "s.cssText = 'color: red !important'; s.setProperty('color', 'green'); s.color + '|' + s.getPropertyPriority('color')",
         "green|",
     );
+    // 値内のトップレベル `!important` は拒否し、重要宣言は priority 引数でのみ指定できる。
+    check(
+        &mut p,
+        "s.cssText = ''; s.setProperty('color', 'red !important'); s.color = 'red !important'; \
+         s.getPropertyValue('color') + '|' + s.getPropertyPriority('color') + '|' + s.cssText",
+        "||",
+    );
+    check(
+        &mut p,
+        "s.setProperty('color', 'red', 'important'); \
+         s.getPropertyValue('color') + '|' + s.getPropertyPriority('color') + '|' + s.cssText",
+        "red|important|color: red !important;",
+    );
 
     eprintln!("case: JS-5 style survives shim re-install without double wrapping");
     let mut p = setup(engine, None);

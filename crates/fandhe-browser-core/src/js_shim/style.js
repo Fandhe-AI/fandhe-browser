@@ -270,6 +270,10 @@
                 }
             } else if (depth === 0 && (ch === ';' || ch === '{' || ch === '}')) {
                 return false;
+            } else if (depth === 0 && ch === '!' && sLower(sTrim(sSub(value, i + 1))) === 'important') {
+                // 値内のトップレベル `!important` は優先度指定。実属性だけ重要宣言になりモデルの優先度と
+                // 食い違うため無効にする（重要宣言は setProperty の priority 引数でのみ指定する）。
+                return false;
             }
         }
         // 閉じていない括弧は、後続の宣言を未完の関数へ取り込み、モデルと実属性をずらすため無効にする。
