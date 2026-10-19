@@ -657,7 +657,7 @@ spec 対応: TASK-71・TASK-108 / MS-6 / `COMPAT-1`・`JS-5`・`JS-6`・`MEAS-4`
 ### 次の対応
 
 1. d2: `history`（`pushState` / `replaceState` 等）の不足。`location` と履歴の整合を含めて別 issue で追跡する（切り出し候補）
-2. d3: `instanceof` の右辺の特定（#1156 の次の対応 1 のまま。#1168 で扱う）
+2. d3: `instanceof` の右辺の特定（#1156 の次の対応 1 のまま。済み: #1168。下の節を参照）
 
 ### 制約
 
@@ -673,6 +673,68 @@ target/release/examples/compat_page_script_probe --target d2=https://www.saucede
 target/release/examples/compat_page_script_probe --target d3=https://demoqa.com/automation-practice-form --modules --selector form --debug-raw-exception --out /abs/path/d3.jsonl
 jq -c 'select(.type=="script")' /abs/path/d2.jsonl /abs/path/d3.jsonl
 jq -c 'select(.type=="run") | .bridge.timer_errors' /abs/path/d2.jsonl /abs/path/d3.jsonl
+```
+
+## instanceof 右辺の分類と不足コンストラクタの特定（#1168）
+
+spec 対応: TASK-71・TASK-108 / MS-6 / `COMPAT-1`・`JS-5`・`JS-7`・`MEAS-4`・`REPAIR-3`・`REPAIR-4`・`SEC-2`。#1156・#1167 の節の「次の対応」（d3 の `instanceof` 右辺の特定）を扱い、d2・d3 を再測定した。出力はコミットしていない。
+
+### 実装の要点
+
+- 分類語彙に `instanceof_not_object`（右辺が object でない。V8 `Right-hand side of 'instanceof' is not an object`・boa `right-hand side of 'instanceof' should be an object, got ...`）と `instanceof_not_callable`（右辺が関数でない）を足した。boa は種類の接頭辞を付けないため `TypeError` と推定する。ハーネスの `classify` も同じ語彙にした
+- 右辺の名前は文言に含まれないため、タイマー / microtask の callback の例外に限って `error.stack` の先頭 1024 UTF-16 単位を shim が渡し、core が `TimerError` に非公開で保持する。`PageRunOptions::with_retain_raw_exception_messages(true)`（opt-in）が無ければ page_runner が破棄する。`Debug` には長さだけを出す
+- `page_script_probe` は `--debug-raw-exception` のときだけ、先頭フレーム（`url:line:col`）を stderr に出す（`<id> timer_error#<n> <source> frame`）。JSONL・`--out` には出さない。フレームの抽出は V8 の stack 形式が前提で、boa は形式を保証しない（`REPAIR-3`）
+- stack の URL は自動では取得しない（`error.stack` はページが偽造できるため SSRF の入口になる）。該当列の前後を人間が `curl` で手動確認し、識別子名だけを転記した（script 本文・URL のクエリは記録していない）
+- 特定した不足コンストラクタ: `HTMLIFrameElement`。react-dom の commit 段の `getActiveElementDeep` にある `element instanceof win.HTMLIFrameElement`（`document.activeElement` が無く `document.body` が渡る）で、右辺が `undefined` になっていた
+- `dom.js` に `HTMLIFrameElement` を名前だけ足した（`Element.prototype` を継承し、`new` は `Illegal constructor`）。要素名を返す op が無いため、実際の iframe 要素でも `instanceof` は常に `false` になる簡略化（`REPAIR-3`）。標準のコンストラクタで、機能検出に新しい識別面は足さない（`SEC-2`）
+- `HTMLElement` は足さなかった。`HTMLElement` も同時に定義すると、d3 の module 評価が `unsupported selector syntax (pseudo-class)` で失敗する（機能検出が通って別の経路に入ると推定。経路の特定は未実施）。擬似クラス selector の対応は別 issue の対象
+
+### shim が提供する・しないコンストラクタ
+
+| 状況 | コンストラクタ |
+| ---- | -------------- |
+| 提供 | `Node`・`Element`・`Text`・`Document`・`HTMLIFrameElement`（名前のみ）・`DOMException`・`AbortSignal`・`AbortController`・`MutationObserver`・`MutationRecord`・`URL`・`URLSearchParams`・`Storage` |
+| 未定義 | `HTMLElement`・`Event`・`EventTarget`・`CustomEvent`・`DocumentFragment`・`Comment`・`Window` |
+
+### 測定条件
+
+| 項目 | 値 |
+| ---- | -- |
+| 実施日時（UTC） | 2026-10-19 |
+| OS | Linux |
+| ベース | main `0d9fd7cb` に、本変更を加えたもの |
+| バイナリ | `cargo build --release -p fandhe-browser-core --features js-v8 --example compat_page_script_probe` |
+| 設定 | `--modules`・V8・`--selector form`・`--debug-raw-exception`。実行上限は既定のまま |
+
+### 結果
+
+| id | サイト | 変更前の最初の例外 | 変更後 | `form`（実行後） | 判定 |
+| -- | ------ | ------------------ | ------ | ---------------- | ---- |
+| d2 | Saucedemo | `ReferenceError`・`not_defined`・`history`（module） | 同じ（`HTMLIFrameElement` は無関係） | 0 件 | 変化なし |
+| d3 | DemoQA | `timeout:TypeError:instanceof_not_object`（先頭フレーム `assets/index-*.js:8:23571`） | `timer_errors` は 0 件。タイマーは 1 件発火し、module は成功 | 0 件 | タイマーの例外は解消、`form` は未解消 |
+
+- d3 の実行後の HTML は 437 バイトのままで、React の描画は確認できていない。次の不足は未特定
+- **d2・d3 とも `form` は 0 件のため #919 にはコメントしていない**
+
+### 次の対応
+
+1. d3: 描画されない原因の調査（`document.activeElement`、`HTMLElement` の定義で出る擬似クラス selector の対応を含む。別 issue で追跡する切り出し候補）
+2. `listener_errors`・`net_callback_errors` を core の `ExceptionSummary` で分類する（#1156 の次の対応 2。本 issue では未対応）
+3. d2: `history` の不足（#1167 の節の次の対応 1 のまま）
+
+### 制約
+
+- 単一環境（Linux）・単一時点。URL のクエリ・script 本文・stack は転記していない。生メッセージはエンジンの固定文だけを転記した
+- stack の先頭フレームの抽出は実質 V8 だけが対象
+- 判定は最初の例外で止まる測定に基づく。後続の不足 API は未確認
+
+### 再現手順
+
+```bash
+cargo build --release -p fandhe-browser-core --features js-v8 --example compat_page_script_probe
+target/release/examples/compat_page_script_probe --target d3=https://demoqa.com/automation-practice-form --modules --selector form --debug-raw-exception --out /abs/path/d3.jsonl
+# stderr の "timer_error#N ... frame" 行の url:line:col を見て、人間が手動で該当列の前後を読む
+jq -c 'select(.type=="run") | .bridge.timer_errors' /abs/path/d3.jsonl
 ```
 
 ## b5（Trello）の原因特定（#964）

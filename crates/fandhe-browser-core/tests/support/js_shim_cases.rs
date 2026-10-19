@@ -108,6 +108,22 @@ pub fn run(engine: &str) {
         "interactive",
     );
 
+    eprintln!("case: JS-5 HTMLIFrameElement exists so instanceof does not throw (#1168)");
+    let mut p = setup(engine, None);
+    check(&mut p, "typeof HTMLIFrameElement", "function");
+    check(
+        &mut p,
+        "document.body instanceof HTMLIFrameElement",
+        "false",
+    );
+    check(&mut p, "typeof HTMLElement", "undefined");
+    check(&mut p, "document.body instanceof Element", "true");
+    check(
+        &mut p,
+        "try { new HTMLIFrameElement(); 'no' } catch (e) { e.name }",
+        "TypeError",
+    );
+
     eprintln!("case: JS-5 createElement / appendChild / body / head");
     let mut p = setup(engine, None);
     check(

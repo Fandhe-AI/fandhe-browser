@@ -676,6 +676,26 @@ mod tests {
             "cannot_use_in_operator",
             None,
         );
+        want(
+            classify(
+                "Uncaught TypeError: Right-hand side of 'instanceof' is not an object (line 2)",
+            ),
+            Some("TypeError"),
+            "instanceof_not_object",
+            None,
+        );
+        want(
+            classify("right-hand side of 'instanceof' should be an object, got `undefined`"),
+            Some("TypeError"),
+            "instanceof_not_object",
+            None,
+        );
+        want(
+            classify("right-hand side of 'instanceof' is not callable"),
+            Some("TypeError"),
+            "instanceof_not_callable",
+            None,
+        );
         let c = classify("TypeError: Cannot set properties of undefined (setting 'x')");
         assert_eq!(c.message_class, "cannot_set_properties");
         assert_eq!(c.property.as_deref(), Some("x"));

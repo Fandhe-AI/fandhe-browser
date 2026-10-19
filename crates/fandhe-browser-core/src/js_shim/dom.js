@@ -29,6 +29,8 @@
 // - parentNode / parentElement / childNodes / firstChild / lastChild / nextSibling /
 //   previousSibling / nodeValue / namespaceURI / isConnected / contains /
 //   compareDocumentPosition / attributes（属性の列挙）。対応する op が無く未定義のまま。
+// - HTMLIFrameElement は名前だけ（instanceof が throw しないため。常に false。`new` は
+//   Illegal constructor）。HTMLElement と他のサブクラスは未定義のまま（#1168）。
 // - Comment / DocumentFragment のラッパー（nodeType 定数のみ。DOCUMENT_POSITION_* も未定義）。
 // - window / location / navigator / console は js_shim の別ソース（#779）。
 (function (global) {
@@ -73,6 +75,18 @@
     }
     Element.prototype = Object.create(Node.prototype, {
         constructor: { value: Element, writable: true, configurable: true }
+    });
+
+    // react-dom の `getActiveElementDeep` が `el instanceof win.HTMLIFrameElement` で右辺 undefined の
+    // TypeError にならないための名前だけの宣言（Issue #1168・JS-5）。ラッパーは常に Element で作る
+    // （要素名を返す op が無い）ため、どの要素も `instanceof HTMLIFrameElement` は false になる
+    // （REPAIR-3。実装済みを装わない）。HTMLElement は定義しない: 定義すると d3 の module 評価が
+    // 未対応の擬似クラス selector で失敗するようになった（実測。REPORT #1168 節）。
+    function HTMLIFrameElement(token) {
+        Element.call(this, token);
+    }
+    HTMLIFrameElement.prototype = Object.create(Element.prototype, {
+        constructor: { value: HTMLIFrameElement, writable: true, configurable: true }
     });
 
     function Text(token) {
@@ -387,6 +401,7 @@
 
     expose('Node', Node);
     expose('Element', Element);
+    expose('HTMLIFrameElement', HTMLIFrameElement);
     expose('Text', Text);
     expose('Document', Document);
     documentWrapper = wrap(op('documentRoot'), Document);

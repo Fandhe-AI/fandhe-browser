@@ -218,6 +218,17 @@ pub fn classify(msg: &str) -> Classification {
         // boa は種類の接頭辞を付けないため TypeError と推定する（core と同じ規則）。
         return mk(kind.or(Some("TypeError")), "cannot_use_in_operator", None);
     }
+    if body.starts_with("Right-hand side of 'instanceof' is not an object")
+        || body.starts_with("right-hand side of 'instanceof' should be an object")
+    {
+        // boa は種類の接頭辞を付けないため TypeError と推定する（core と同じ規則。#1168）。
+        return mk(kind.or(Some("TypeError")), "instanceof_not_object", None);
+    }
+    if body.starts_with("Right-hand side of 'instanceof' is not callable")
+        || body.starts_with("right-hand side of 'instanceof' is not callable")
+    {
+        return mk(kind.or(Some("TypeError")), "instanceof_not_callable", None);
+    }
     if body.starts_with("Cannot set properties of") {
         let c = mk(kind, "cannot_set_properties", None);
         return match body.split_once("(setting '") {

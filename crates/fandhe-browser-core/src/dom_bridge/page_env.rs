@@ -228,6 +228,9 @@ impl TimerCallbackSource {
     }
 }
 
+/// `TimerError` が保持する `error.stack` の上限バイト数（Issue #1168）。
+const MAX_TIMER_STACK_BYTES: usize = 1024;
+
 /// タイマー / microtask のコールバックが投げた例外 1 件（[`MAX_CONSOLE_MESSAGE_BYTES`] で切り詰め済み）。
 #[derive(Clone, PartialEq, Eq)]
 #[non_exhaustive]
@@ -241,6 +244,23 @@ pub struct TimerError {
     /// 例外の種類・メッセージ型・不足識別子の要約（生メッセージを含まない固定語彙。
     /// module 評価失敗と同じ分類。Issue #1156・`JS-7`・`REPAIR-4`）。
     pub summary: ExceptionSummary,
+    /// `error.stack` の先頭 [`MAX_TIMER_STACK_BYTES`] バイト（空なら `None`）。URL・本文を含み得るため
+    /// 非公開で、`PageRunOptions` の opt-in が無い限り page_runner が破棄する（Issue #1168・`SEC-2`）。
+    stack: Option<String>,
+}
+
+impl TimerError {
+    /// 切り詰め済みの `error.stack`（opt-in が有効なときだけ値がある）。計測 example の stderr 専用で、
+    /// JSONL・要約には出さない（Issue #1168・`REPAIR-4`）。
+    #[doc(hidden)]
+    pub fn raw_stack(&self) -> Option<&str> {
+        self.stack.as_deref()
+    }
+
+    /// stack を破棄する（opt-in が無効なとき page_runner が呼ぶ。fail-closed）。
+    pub(crate) fn clear_stack(&mut self) {
+        self.stack = None;
+    }
 }
 
 // ページ由来の文字列は秘密を含み得るため、Debug には長さと要約だけを出す。
@@ -250,6 +270,7 @@ impl std::fmt::Debug for TimerError {
             .field("source", &self.source)
             .field("message_len", &self.message.len())
             .field("summary", &self.summary)
+            .field("stack_len", &self.stack.as_ref().map(String::len))
             .field("truncated", &self.truncated)
             .finish()
     }
@@ -376,6 +397,7 @@ impl BridgeDiagnostics {
         source: TimerCallbackSource,
         name: &str,
         message: &str,
+        stack: &str,
     ) {
         if self.timer_errors.len() < MAX_BRIDGE_DIAGNOSTICS {
             let (kept, truncated) = truncate_utf8(message, MAX_CONSOLE_MESSAGE_BYTES);
@@ -384,6 +406,8 @@ impl BridgeDiagnostics {
                 message: kept.to_owned(),
                 truncated,
                 summary: summarize_named_exception(name, message),
+                stack: (!stack.is_empty())
+                    .then(|| truncate_utf8(stack, MAX_TIMER_STACK_BYTES).0.to_owned()),
             });
         } else {
             self.dropped = self.dropped.saturating_add(1);

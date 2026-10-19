@@ -132,6 +132,24 @@ pub fn debug_stderr_line(enabled: bool, label: &str, raw: Option<&str>) -> Optio
     Some(format!("[{label}] {body}"))
 }
 
+/// `error.stack` から先頭フレーム（`url:line:col`）を取り出す純関数（Issue #1168・`REPAIR-3`）。
+///
+/// V8 形式（`    at fn (url:line:col)` / `    at url:line:col`）の最初の `at ` 行だけを扱う。
+/// boa の stack 形式は V8 と異なるため、`at ` 行が無ければ先頭行を返す（形式は保証しない）。
+/// 取得結果は `debug_stderr_line` 経由で stderr にだけ出す。stack の URL は自動では取得しない（SSRF 防止）。
+pub fn top_stack_frame(stack: &str) -> Option<&str> {
+    let frame = stack
+        .lines()
+        .find_map(|l| l.trim_start().strip_prefix("at "))
+        .or_else(|| stack.lines().next())?
+        .trim();
+    let frame = match (frame.rfind('('), frame.ends_with(')')) {
+        (Some(i), true) => frame.get(i + 1..frame.len() - 1).unwrap_or(frame),
+        _ => frame,
+    };
+    (!frame.is_empty()).then_some(frame)
+}
+
 /// 例外メッセージを「分類名[:API 名]」へ要約する（本文は残さない）。
 pub fn class_label(msg: &str) -> String {
     let c = classify(msg);
@@ -258,6 +276,29 @@ pub fn lifecycle_label(event: LifecycleEvent, outcome: &LifecycleOutcome) -> Str
 
 #[cfg(test)]
 mod tests {
+    /// 先頭フレームの抽出（V8 括弧あり・なし、boa 風、空、制御文字は debug_stderr_line が除く。#1168）。
+    #[test]
+    fn top_stack_frame_extracts_first_frame() {
+        use super::top_stack_frame;
+        assert_eq!(
+            top_stack_frame(
+                "TypeError: x\n    at f (https://h.example/a.js:1:2)\n    at g (b:3:4)"
+            ),
+            Some("https://h.example/a.js:1:2")
+        );
+        assert_eq!(
+            top_stack_frame("TypeError: x\n    at https://h.example/a.js:5:6"),
+            Some("https://h.example/a.js:5:6")
+        );
+        assert_eq!(
+            top_stack_frame("f@a.js:1:2\ng@b.js:3:4"),
+            Some("f@a.js:1:2")
+        );
+        assert_eq!(top_stack_frame(""), None);
+        let line = super::debug_stderr_line(true, "l", top_stack_frame("at a\u{1b}[31m:1:2"));
+        assert_eq!(line.as_deref().map(|l| l.contains('\u{1b}')), Some(false));
+    }
+
     use super::*;
 
     fn args(v: &[&str]) -> Result<ProbeArgs, UsageError> {

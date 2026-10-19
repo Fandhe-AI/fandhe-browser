@@ -105,6 +105,14 @@ pub enum ExceptionMessageClass {
     CannotUseInOperator,
     /// `Cannot set properties of undefined (setting 'K')`（V8）。
     CannotSetProperties,
+    /// `Right-hand side of 'instanceof' is not an object`（V8）／
+    /// `right-hand side of 'instanceof' should be an object, got ...`（boa）。
+    /// 右辺が未定義のグローバルコンストラクタなどで object でない。右辺の名前は文言に含まれず残せない
+    /// （Issue #1168・`JS-5`）。
+    InstanceofNotObject,
+    /// `Right-hand side of 'instanceof' is not callable`（V8・boa 共通の趣旨）。
+    /// 右辺は存在するが関数ではない（Issue #1168・`JS-5`）。
+    InstanceofNotCallable,
     /// React 本番ビルドの `Minified React error #N; visit ...`。番号は
     /// [`ExceptionSummary::code`] に検証済みの場合だけ入る（Issue #1145）。
     MinifiedReactError,
@@ -123,6 +131,8 @@ impl ExceptionMessageClass {
             Self::MissingExport => "missing_export",
             Self::CannotUseInOperator => "cannot_use_in_operator",
             Self::CannotSetProperties => "cannot_set_properties",
+            Self::InstanceofNotObject => "instanceof_not_object",
+            Self::InstanceofNotCallable => "instanceof_not_callable",
             Self::MinifiedReactError => "minified_react_error",
             Self::Other => "other",
         }
@@ -319,6 +329,14 @@ pub(crate) fn summarize_exception_message(msg: &str) -> ExceptionSummary {
         (ExceptionMessageClass::CannotUseInOperator, None)
     } else if body.starts_with("right-hand side of 'in' should be an object") {
         (ExceptionMessageClass::CannotUseInOperator, None)
+    } else if body.starts_with("Right-hand side of 'instanceof' is not an object")
+        || body.starts_with("right-hand side of 'instanceof' should be an object")
+    {
+        (ExceptionMessageClass::InstanceofNotObject, None)
+    } else if body.starts_with("Right-hand side of 'instanceof' is not callable")
+        || body.starts_with("right-hand side of 'instanceof' is not callable")
+    {
+        (ExceptionMessageClass::InstanceofNotCallable, None)
     } else if body.starts_with("Cannot set properties of") {
         if let Some((_, tail)) = body.split_once("(setting '") {
             property = quoted_property(tail);
@@ -339,6 +357,11 @@ pub(crate) fn summarize_exception_message(msg: &str) -> ExceptionSummary {
         (ExceptionKind::Other, ExceptionMessageClass::CannotUseInOperator) => {
             ExceptionKind::TypeError
         }
+        (
+            ExceptionKind::Other,
+            ExceptionMessageClass::InstanceofNotObject
+            | ExceptionMessageClass::InstanceofNotCallable,
+        ) => ExceptionKind::TypeError,
         (ExceptionKind::Other, ExceptionMessageClass::MinifiedReactError) => ExceptionKind::Error,
         _ => kind,
     };
@@ -637,6 +660,49 @@ mod tests {
         assert_eq!(
             ExceptionMessageClass::NotAFunction.as_str(),
             "not_a_function"
+        );
+    }
+
+    /// instanceof 右辺の V8・boa 文言を分類する（`JS-5`・`REPAIR-4`・Issue #1168）。
+    #[test]
+    fn instanceof_rhs_is_classified_for_v8_and_boa() {
+        let v8 = summarize_exception_message(
+            "Uncaught TypeError: Right-hand side of 'instanceof' is not an object (line 3)",
+        );
+        assert_eq!(v8.kind(), ExceptionKind::TypeError);
+        assert_eq!(
+            v8.message_class(),
+            ExceptionMessageClass::InstanceofNotObject
+        );
+        let named = summarize_named_exception(
+            "TypeError",
+            "Right-hand side of 'instanceof' is not callable",
+        );
+        assert_eq!(
+            named.message_class(),
+            ExceptionMessageClass::InstanceofNotCallable
+        );
+        let boa = summarize_exception_message(
+            "right-hand side of 'instanceof' should be an object, got `undefined`",
+        );
+        assert_eq!(boa.kind(), ExceptionKind::TypeError);
+        assert_eq!(
+            boa.message_class(),
+            ExceptionMessageClass::InstanceofNotObject
+        );
+        let boa2 = summarize_exception_message("right-hand side of 'instanceof' is not callable");
+        assert_eq!(boa2.kind(), ExceptionKind::TypeError);
+        assert_eq!(
+            boa2.message_class(),
+            ExceptionMessageClass::InstanceofNotCallable
+        );
+        assert_eq!(
+            ExceptionMessageClass::InstanceofNotObject.as_str(),
+            "instanceof_not_object"
+        );
+        assert_eq!(
+            ExceptionMessageClass::InstanceofNotCallable.as_str(),
+            "instanceof_not_callable"
         );
     }
 
