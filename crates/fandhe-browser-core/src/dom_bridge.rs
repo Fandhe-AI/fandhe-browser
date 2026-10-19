@@ -514,11 +514,10 @@ impl DomOp {
             | Self::ConsoleMessage
             | Self::LifecycleListenerError
             | Self::TimerSet
-            | Self::TimerCallbackError
             | Self::IsInclusiveAncestor
             | Self::UrlParse
             | Self::NetCallbackError => 2,
-            Self::InsertBefore | Self::SetAttribute => 3,
+            Self::InsertBefore | Self::SetAttribute | Self::TimerCallbackError => 3,
             Self::NetRequest => 4,
         }
     }
@@ -1016,13 +1015,16 @@ fn execute(
         }
         DomOp::TimerCallbackError => {
             let name = string_arg(op, args, 1, limits)?;
-            let message = string_arg(op, args, 2, limits)?;
+            // 例外の種類の名前（`error.name`。空文字可）。語彙外は要約側で `other` に落とす。
+            let error_name = string_arg(op, args, 2, limits)?;
+            let message = string_arg(op, args, 3, limits)?;
             let source = TimerCallbackSource::parse(name).ok_or(DomBridgeError::TypeMismatch {
                 operation: op.name(),
                 index: 1,
                 expected: "a known timer callback source",
             })?;
-            page.diagnostics.record_timer_error(source, message);
+            page.diagnostics
+                .record_timer_error(source, error_name, message);
             Ok(JsValue::Undefined)
         }
         DomOp::TimerStringHandlerIgnored => {
@@ -1647,6 +1649,7 @@ impl DomBridge {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::exception_summary::ExceptionKind;
     use crate::page_net::NetRejectKind;
     use crate::parse::{ParseOptions, parse_document};
 
@@ -2662,13 +2665,34 @@ mod tests {
     #[test]
     fn js_7_timer_callback_error_op_is_bounded() {
         let b = bridge();
-        call(&b, &[s("timerCallbackError"), s("click"), s("x")]).expect_err("許可リスト外");
-        call(&b, &[s("timerCallbackError"), s("timeout")]).expect_err("arity");
-        call(&b, &[s("timerCallbackError"), s("timeout"), n(1.0)]).expect_err("type");
+        call(
+            &b,
+            &[s("timerCallbackError"), s("click"), s("Error"), s("x")],
+        )
+        .expect_err("許可リスト外");
+        call(&b, &[s("timerCallbackError"), s("timeout"), s("x")]).expect_err("arity");
+        call(
+            &b,
+            &[s("timerCallbackError"), s("timeout"), s("Error"), n(1.0)],
+        )
+        .expect_err("type");
         let big = "x".repeat(MAX_CONSOLE_MESSAGE_BYTES + 1);
-        call(&b, &[s("timerCallbackError"), s("interval"), s(&big)]).expect("ok");
+        call(
+            &b,
+            &[s("timerCallbackError"), s("interval"), s("Error"), s(&big)],
+        )
+        .expect("ok");
         for _ in 0..(MAX_BRIDGE_DIAGNOSTICS + 3) {
-            call(&b, &[s("timerCallbackError"), s("microtask"), s("e")]).expect("ok");
+            call(
+                &b,
+                &[
+                    s("timerCallbackError"),
+                    s("microtask"),
+                    s("EvilError"),
+                    s("e"),
+                ],
+            )
+            .expect("ok");
         }
         call(&b, &[s("timerStringHandlerIgnored")]).expect("ok");
         let d = b.take_diagnostics().expect("diag");
@@ -2676,6 +2700,9 @@ mod tests {
         assert_eq!(d.timer_errors[0].source, TimerCallbackSource::Interval);
         assert_eq!(d.timer_errors[0].message.len(), MAX_CONSOLE_MESSAGE_BYTES);
         assert!(d.timer_errors[0].truncated);
+        assert_eq!(d.timer_errors[0].summary.kind(), ExceptionKind::Error);
+        // 語彙外の name は Other に落ちる。
+        assert_eq!(d.timer_errors[1].summary.kind(), ExceptionKind::Other);
         assert_eq!(d.dropped, 4);
         assert_eq!(d.timer_string_handlers_ignored, 1);
     }

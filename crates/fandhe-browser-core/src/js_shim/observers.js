@@ -17,7 +17,7 @@
 //   差し替えても配信は影響を受けない（timers.js と同じ作法）。
 // - 配信 microtask は全 observer で 1 本（フラグで重複を避ける）。同一 microtask 内の複数変更は
 //   observer ごとに 1 回の callback 呼び出しにまとまる。callback の例外は observer ごとに捕捉し、
-//   `timerCallbackError` op（source "microtask"）でメッセージだけ通知して残りへ配信を続ける。
+//   `timerCallbackError` op（source "microtask"）で種類の名前とメッセージだけ通知して残りへ配信を続ける。
 // - 上限（JS-6）: 保留レコードの合計と登録数（observer × target）に上限を設ける。超過分は破棄し、
 //   `mutationObserverLimit` op で一度だけ通知する（ランナーが ResourceLimit で打ち切る）。
 // - `subtree` は変更先ノードの「現在の祖先関係」を `isInclusiveAncestor` op で判定する。登録先と
@@ -90,6 +90,13 @@
     function report(error) {
         try {
             var text;
+            var name = '';
+            try {
+                // 例外の種類の名前（TypeError 等）。ページが書き換え得るため文字列のときだけ渡す。
+                name = error && typeof error.name === 'string' ? error.name.slice(0, 64) : '';
+            } catch (e) {
+                name = '';
+            }
             try {
                 text = toStr(error && error.message !== undefined ? error.message : error);
             } catch (e) {
@@ -104,7 +111,7 @@
                 }
                 text = text.slice(0, end);
             }
-            callOp('timerCallbackError', 'microtask', text);
+            callOp('timerCallbackError', 'microtask', name, text);
         } catch (e) {
             // 報告に失敗しても続行する。
         }

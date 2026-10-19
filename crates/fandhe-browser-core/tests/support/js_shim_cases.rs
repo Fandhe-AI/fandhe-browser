@@ -8,8 +8,8 @@
 use fandhe_browser_core::js_stub::{JsRuntime, execute_js_stub};
 use fandhe_browser_core::selector::parse_selector_list;
 use fandhe_browser_core::{
-    Config, DocumentReadyState, DomBridge, DomBridgeLimits, DomLimits, Error, LocationChangeKind,
-    NodeId, ParseOptions, parse_document, query_selector,
+    Config, DocumentReadyState, DomBridge, DomBridgeLimits, DomLimits, Error, ExceptionKind,
+    LocationChangeKind, NodeId, ParseOptions, parse_document, query_selector,
 };
 
 const FIXTURE: &str =
@@ -789,6 +789,26 @@ fn observer_cases(engine: &str) {
     let diag = p.bridge.take_diagnostics().expect("diagnostics");
     assert_eq!(diag.timer_errors.len(), 1);
     assert_eq!(diag.timer_errors[0].message, "boom");
+    assert_eq!(diag.timer_errors[0].summary.kind(), ExceptionKind::Error);
+
+    eprintln!("case: JS-7 throwing error.name getter keeps reporting (#1156)");
+    let mut p = setup(engine, None);
+    check(
+        &mut p,
+        "var m1 = new MutationObserver(function () { \
+           var e = { message: 'x is not defined' }; \
+           Object.defineProperty(e, 'name', { get: function () { throw 1; } }); throw e; }); \
+         m1.observe(document.body, { childList: true }); \
+         document.body.appendChild(document.createElement('i')); __fandheRunMicrotasks(); 1",
+        "1",
+    );
+    let diag = p.bridge.take_diagnostics().expect("diagnostics");
+    assert_eq!(diag.timer_errors.len(), 1);
+    // name が読めなくても本文から ReferenceError と推定される。
+    assert_eq!(
+        diag.timer_errors[0].summary.kind(),
+        ExceptionKind::ReferenceError
+    );
 
     eprintln!("case: JS-5 delivery survives page tampering with queueMicrotask");
     let mut p = setup(engine, None);

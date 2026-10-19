@@ -13,9 +13,10 @@ use std::sync::{Arc, Mutex};
 use fandhe_browser_core::dom_bridge::TimerCallbackSource;
 use fandhe_browser_core::fetch::{FetchOptions, Fetcher};
 use fandhe_browser_core::{
-    AbortKind, Config, EventLoopLimits, LifecycleOutcome, NetRejectKind, NetRequestKind,
-    PageNetLimits, PageRunInput, PageRunOptions, PageRunOutput, ScriptCollectionOptions,
-    ScriptOutcome, SrcFetchErrorKind, USER_AGENT, WallTimeScope, run_page_scripts,
+    AbortKind, Config, EventLoopLimits, ExceptionKind, ExceptionMessageClass, LifecycleOutcome,
+    NetRejectKind, NetRequestKind, PageNetLimits, PageRunInput, PageRunOptions, PageRunOutput,
+    ScriptCollectionOptions, ScriptOutcome, SrcFetchErrorKind, USER_AGENT, WallTimeScope,
+    run_page_scripts,
 };
 
 const BASE: &str = "https://example.test/";
@@ -403,7 +404,35 @@ fn timer_cases(engine: &str) {
     assert_eq!(errors.len(), 1, "{errors:?}");
     assert_eq!(errors[0].source, TimerCallbackSource::Timeout);
     assert_eq!(errors[0].message, "boom");
+    assert_eq!(errors[0].summary.kind(), ExceptionKind::Error);
+    assert_eq!(
+        errors[0].summary.message_class(),
+        ExceptionMessageClass::Other
+    );
     assert!(out.abort().is_none(), "{:?}", out.abort());
+
+    eprintln!("case: JS-7 timer exceptions carry kind/class/identifier summaries (#1156)");
+    let out = run_page(
+        engine,
+        &page(
+            "setTimeout(function(){undefinedFn()},1);\
+             setTimeout(function(){throw new TypeError('x')},2);",
+        ),
+        &opts,
+    );
+    let errors = &out.bridge_diagnostics().timer_errors;
+    assert_eq!(errors.len(), 2, "{errors:?}");
+    assert_eq!(errors[0].summary.kind(), ExceptionKind::ReferenceError);
+    assert_eq!(
+        errors[0].summary.message_class(),
+        ExceptionMessageClass::NotDefined
+    );
+    assert_eq!(errors[0].summary.identifier(), Some("undefinedFn"));
+    assert_eq!(errors[1].summary.kind(), ExceptionKind::TypeError);
+    assert_eq!(
+        errors[1].summary.message_class(),
+        ExceptionMessageClass::Other
+    );
 
     eprintln!("case: JS-6 page cannot invoke the timer dispatcher directly to bypass limits");
     let out = run_page(

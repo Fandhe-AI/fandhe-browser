@@ -121,11 +121,10 @@ use crate::{NodeId, dom_bridge::truncate_utf8};
 
 pub use crate::dom_bridge::LifecycleEvent;
 
-mod exception_summary;
 mod module_graph;
 
-use exception_summary::RawExceptionMessage;
-pub use exception_summary::{ExceptionKind, ExceptionMessageClass, ExceptionSummary};
+use crate::exception_summary::RawExceptionMessage;
+pub use crate::exception_summary::{ExceptionKind, ExceptionMessageClass, ExceptionSummary};
 
 /// スクリプト 1 件あたりの実時間上限の既定（`EvaluateOptions` の既定と同じ 2 秒）。
 pub const DEFAULT_SCRIPT_WALL_TIME: Duration = EvaluateOptions::DEFAULT_TIMEOUT;
