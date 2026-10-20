@@ -120,6 +120,11 @@ pub fn run(engine: &str) {
         "true",
     );
 
+    eprintln!("case: JS-5 document.defaultView is window (#1173)");
+    let mut p = setup(engine, None);
+    check(&mut p, "document.defaultView === window", "true");
+    check(&mut p, "typeof document.defaultView.history", "object");
+
     eprintln!("case: JS-5 HTMLIFrameElement exists so instanceof does not throw (#1168)");
     let mut p = setup(engine, None);
     check(&mut p, "typeof HTMLIFrameElement", "function");
