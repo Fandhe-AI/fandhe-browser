@@ -423,7 +423,9 @@
         fnCall(NativeEvent, this, type, init);
         var s = null;
         if (init !== undefined && init !== null && (typeof init === 'object' || typeof init === 'function')) {
-            s = init.state === undefined ? null : init.state;
+            // 辞書メンバーは 1 回だけ取得する（WebIDL の辞書変換。getter の評価回数を標準に揃える。#1189）。
+            var raw = init.state;
+            s = raw === undefined ? null : raw;
         }
         wmSet(popStates, this, s);
     }

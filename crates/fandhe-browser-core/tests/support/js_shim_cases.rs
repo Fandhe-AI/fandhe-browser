@@ -3121,6 +3121,33 @@ fn history_traversal_cases(engine: &str) {
           new PopStateEvent('popstate').state === null, d.join()].join('|')",
         "1|popstate|true|true|[object PopStateEvent]|true|true",
     );
+    eprintln!("case: JS-5 PopStateEvent reads init members once (#1189)");
+    check(
+        &mut b,
+        "var n = 0; var e = new PopStateEvent('x', { get state() { return ++n; } }); \
+         [e.state, e.state, n].join('|')",
+        "1|1|1",
+    );
+    check(
+        &mut b,
+        "var c = 0; var r; \
+         try { r = new PopStateEvent('x', { get state() { if (c++) { throw new Error('twice'); } return 'ok'; } }).state; } \
+         catch (x) { r = 'threw'; } r + '|' + c",
+        "ok|1",
+    );
+    check(
+        &mut b,
+        "var log = []; new PopStateEvent('x', { get bubbles() { log.push('bubbles'); }, \
+         get cancelable() { log.push('cancelable'); }, get composed() { log.push('composed'); }, \
+         get state() { log.push('state'); } }); log.join()",
+        "bubbles,cancelable,composed,state",
+    );
+    check(
+        &mut b,
+        "var k = 0; var e2 = new PopStateEvent('x', { get state() { k++; return undefined; } }); \
+         [e2.state === null, k].join('|')",
+        "true|1",
+    );
     check(
         &mut b,
         "var t = []; try { new PopStateEvent(); } catch (x) { t.push(x instanceof TypeError); } \
