@@ -20,11 +20,13 @@
 //! # プロセス全体としての挙動（実装済みを装わない。REPAIR-3）
 //!
 //! - ヒープ上限（[`super::v8_engine`] の `MAX_ISOLATE_HEAP_BYTES`）に
-//!   達すると、本モジュールの制御が及ばないところで V8 の既定の
-//!   fatal OOM によりこのプロセス自体が終了する（`evaluate_script` の
-//!   呼び出しから制御が戻らない）。この場合、親は stdout の EOF と
-//!   stderr の内容から `ResourceLimitExceeded` を推定する
-//!   （`super::process_engine` のドキュメントコメント参照）
+//!   達すると、評価中は near-heap-limit コールバックが実行を打ち切り、
+//!   `ResourceLimitExceeded`（`ResourceLimit`）で返る。Context は残る
+//!   （JS-6・Issue #1193）。ただし引き上げ幅を超える単発の巨大確保は
+//!   V8 の既定の fatal OOM でこのプロセス自体が終了し（`evaluate_script` の
+//!   呼び出しから制御が戻らない）、親は stdout の EOF と stderr の内容から
+//!   `ResourceLimitExceeded` を推定する（`super::process_engine` のドキュメント
+//!   コメント参照）。子プロセス分離が最終防衛線である
 //! - 本モジュールは孤児プロセス化を防ぐため、stdin を読み続けることで
 //!   親の生死を検出する。親が終了すれば stdin が EOF になり、本モジュール
 //!   は正常終了する（設計書 §3.2「孤児の防止」）。**孤児の防止には**

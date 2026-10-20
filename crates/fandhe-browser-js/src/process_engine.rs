@@ -50,7 +50,8 @@
 //! |---|---|---|
 //! | 子の watchdog による打ち切り（`Error{kind=Timeout}`） | [`JsEngineError::Timeout`] | 残る |
 //! | 応答待ち・書き込み待ちの期限切れで親が `kill` した | [`JsEngineError::Timeout`] | 破棄（メッセージに明示） |
-//! | 応答前に EOF になり、stderr に `Fatal ... out of memory` がある | [`JsEngineError::ResourceLimitExceeded`] | 破棄（ヒューリスティック） |
+//! | 子の評価中ヒープ上限による打ち切り（`Error{kind=ResourceLimit}`。V8 は near-heap-limit で実行を止め、boa は上限超過。JS-6・Issue #1193） | [`JsEngineError::ResourceLimitExceeded`] | 残る |
+//! | 応答前に EOF になり、stderr に `Fatal ... out of memory` がある（引き上げ幅を超える単発の巨大確保などの fallback） | [`JsEngineError::ResourceLimitExceeded`] | 破棄（ヒューリスティック） |
 //! | メモリ監視スレッドが RSS 超過を検出して子を `kill` した（評価中・書き込み中・待機中いずれも） | [`JsEngineError::ResourceLimitExceeded`] | 破棄（メッセージに実測 RSS を明示。書き込み中に `kill` された場合の broken pipe も正しくここへ分類する。`discard_context_error`。codex・Bugbot レビュー指摘 #503 P0/P1 対応） |
 //! | 応答（Result/Error）受信直後の同期確認で RSS 超過が判明した | [`JsEngineError::ResourceLimitExceeded`] | 破棄（せっかく得られた応答を握りつぶす。同上） |
 //! | 子から不正な `NativeCall` フレームを受け取った（デコード失敗・未登録 id） | [`JsEngineError::EngineUnavailable`] | 破棄（`dispatch_native_call`・`TASK-29`・Issue #526） |
@@ -2751,12 +2752,15 @@ impl JsEngine for V8ProcessEngine {
             },
         );
         // 子は実行前に完了待ちから id を外すため、Timeout 応答でも結果サイズ超過などの
-        // EvaluationFailed（ERROR 応答）でも子の保留は残らない。親の台帳も外し、後続の take で
+        // EvaluationFailed（ERROR 応答）でも、評価中のヒープ上限による打ち切り
+        // （ResourceLimitExceeded・Context は残る。JS-6・#1193）でも子の保留は残らない。親の台帳も外し、後続の take で
         // 上限超過（プロトコル違反）にならないようにする。id 未知・未 link の
         // ModuleResolutionFailed は子が消費しないので外さない（Err での再試行を許す）。
         if matches!(
             outcome,
-            Err(JsEngineError::Timeout(_) | JsEngineError::EvaluationFailed(_))
+            Err(JsEngineError::Timeout(_)
+                | JsEngineError::EvaluationFailed(_)
+                | JsEngineError::ResourceLimitExceeded(_))
         ) && let Some(worker) = self.worker.as_mut()
         {
             worker.modules.complete_dynamic_import(id);
