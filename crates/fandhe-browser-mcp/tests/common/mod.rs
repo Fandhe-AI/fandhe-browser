@@ -79,8 +79,14 @@ fn serve_register_with_owned(listener: TcpListener) -> String {
 /// listener を閉じた直後のポートへ短い期限で 1 回接続し、拒否以外なら観測結果を stderr に残す。
 /// macOS の不定期失敗（Issue #1187）で wildcard listener の影が原因かを失敗ログから判別するための
 /// 診断で、テストの合否には使わない。
+/// エフェメラル範囲内のポートは同一プロセスの別テストへ再割り当てされ得て、診断の接続が干渉するため
+/// 探査しない（範囲外のポートに限る）。
 fn diagnose_refused(addr: Option<std::net::SocketAddr>) {
     let Some(addr) = addr else { return };
+    let (lo, hi) = ephemeral_port_range();
+    if (lo..=hi).contains(&u32::from(addr.port())) {
+        return;
+    }
     match std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(500)) {
         Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {}
         Ok(_) => eprintln!("diagnostic: closed port {addr} accepted a connection (shadowed?)"),
@@ -149,7 +155,8 @@ pub fn ephemeral_port_range() -> (u32, u32) {
 /// 別テストの `:0` bind へ同じポートが再割り当てされ、接続が成立して `HostError::Io` になる
 /// ことがある。`:0` はエフェメラル範囲からしか割り当てないため、範囲外のポートを使えば
 /// 再割り当てが起きない。また macOS / BSD では wildcard listener の影がある
-/// ポートを避けるため `wildcard_is_free` で事前確認する（Issue #1187）。候補が尽きた場合はテストを黙って通さず panic する（fail-closed）。
+/// ポートを避けるため `wildcard_is_free` で事前確認する（Issue #1187）。
+/// 候補が尽きた場合はテストを黙って通さず panic する（fail-closed）。
 #[allow(dead_code)]
 pub fn bind_non_ephemeral_loopback() -> TcpListener {
     static CURSOR: AtomicU32 = AtomicU32::new(0);
