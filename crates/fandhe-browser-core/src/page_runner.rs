@@ -77,6 +77,9 @@
 //! - 要素レベルの EventTarget・`onload` / `onreadystatechange` プロパティ・
 //!   キャプチャ / 完全なバブリング、`async` / `defer` の順序近似（全て文書順で実行する）。
 //! - 上限値の設定ファイルからの読み込みは未対応（専用スレッド化は [`crate::page_actor`] で実装済み）。
+//! - 保留中タイマーの要約（[`EventLoopReport::pending_timers`]）は期限順の先頭
+//!   [`MAX_REPORTED_PENDING_TIMERS`] 件まで。登録元 stack は opt-in 時のみで、boa では形式が
+//!   保証されない（Issue #1176）。
 //! - イベントループは全スクリプトと load の後に回す近似で、実ブラウザのようにスクリプトの間へ
 //!   0ms タイマーが割り込む順序にはならない。ネイティブ `Promise` のジョブは仮想ループへ
 //!   統合しない（エンジン依存。TASK-30）。HTML のネスト時 4ms クランプも行わない。
@@ -695,12 +698,67 @@ impl PageAbort {
 }
 
 /// イベントループ（仮想時間のタイマー）の実行結果（`JS-7`）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct EventLoopReport {
     fired: usize,
     virtual_elapsed: Duration,
     pending_at_end: usize,
+    pending_timers: Vec<PendingTimer>,
+}
+
+/// 報告する保留中タイマーの最大件数（期限順の先頭から。`JS-6`・Issue #1176）。
+pub const MAX_REPORTED_PENDING_TIMERS: usize = 16;
+
+/// 終了時に残った保留中タイマー 1 件の要約（診断用。Issue #1176・`JS-7`・`REPAIR-4`）。
+///
+/// 上限（仮想時間 30 秒等）で打ち切ったときに「何が残ったか」を、遅延と期限の数値で示す。
+/// 登録元 stack は `error.stack` と同じく untrusted で URL・トークンを含み得るため、
+/// `with_retain_raw_exception_messages(true)` のときだけ保持し、`Debug` には長さしか出さない。
+#[derive(Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct PendingTimer {
+    due_at: Duration,
+    delay: Duration,
+    repeat: bool,
+    origin: Option<String>,
+}
+
+impl PendingTimer {
+    /// 期限（仮想時刻）。
+    pub fn due_at(&self) -> Duration {
+        self.due_at
+    }
+
+    /// 登録時の遅延（丸め済み）。
+    pub fn delay(&self) -> Duration {
+        self.delay
+    }
+
+    /// interval か。
+    pub fn repeat(&self) -> bool {
+        self.repeat
+    }
+
+    /// 切り詰め済みの登録元 stack（opt-in が有効なときだけ値がある）。計測 example の stderr 専用で、
+    /// JSONL・要約には出さない（`REPAIR-4`）。boa は stack の形式を保証しないため `None` もあり得る
+    /// （`REPAIR-3`）。
+    #[doc(hidden)]
+    pub fn raw_origin(&self) -> Option<&str> {
+        self.origin.as_deref()
+    }
+}
+
+// 登録元 stack は秘密を含み得るため、Debug には長さだけを出す。
+impl std::fmt::Debug for PendingTimer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PendingTimer")
+            .field("due_at", &self.due_at)
+            .field("delay", &self.delay)
+            .field("repeat", &self.repeat)
+            .field("origin_len", &self.origin.as_ref().map(String::len))
+            .finish()
+    }
 }
 
 impl EventLoopReport {
@@ -717,6 +775,11 @@ impl EventLoopReport {
     /// 終了時点で保留中だったタイマー数（上限で打ち切ったときに残る）。
     pub fn pending_at_end(&self) -> usize {
         self.pending_at_end
+    }
+
+    /// 終了時に保留中だったタイマーの要約（期限順の先頭から最大 [`MAX_REPORTED_PENDING_TIMERS`] 件）。
+    pub fn pending_timers(&self) -> &[PendingTimer] {
+        &self.pending_timers
     }
 }
 
@@ -1192,6 +1255,10 @@ async fn execute(
 
     let bridge = DomBridge::new(options.bridge_limits.clone());
     bridge.attach(doc).map_err(bridge_error)?;
+    // 登録元 stack の捕捉は shim の install より前に設定する（opt-in のときだけ。Issue #1176）。
+    bridge
+        .set_capture_timer_origin(options.retain_raw_exception_messages)
+        .map_err(bridge_error)?;
     bridge.set_location(input.base_url).map_err(bridge_error)?;
     bridge
         .set_event_loop_limits(options.event_loop.clone())
@@ -1933,10 +2000,28 @@ async fn run_event_loop(
     }
     let (virtual_elapsed, fired, pending_at_end) =
         ctx.bridge.event_loop_state().map_err(bridge_error)?;
+    let pending_timers = ctx
+        .bridge
+        .pending_timers(MAX_REPORTED_PENDING_TIMERS)
+        .map_err(bridge_error)?
+        .into_iter()
+        .map(|e| PendingTimer {
+            due_at: Duration::from_millis(e.due_ms),
+            delay: Duration::from_millis(e.delay_ms),
+            repeat: e.repeat,
+            // opt-in が無いときは捕捉しないが、念のためここでも破棄する（fail-closed）。
+            origin: if ctx.options.retain_raw_exception_messages {
+                e.origin
+            } else {
+                None
+            },
+        })
+        .collect();
     Ok(EventLoopReport {
         fired,
         virtual_elapsed,
         pending_at_end,
+        pending_timers,
     })
 }
 

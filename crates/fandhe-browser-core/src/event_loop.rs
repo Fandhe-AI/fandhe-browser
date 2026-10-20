@@ -164,12 +164,66 @@ pub fn normalize_delay(delay_ms: f64) -> u64 {
     delay_ms.floor() as u64
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct Entry {
     /// 順序キー `(期限ms, 登録順)`。interval の発火中は `order` に無い。
     key: (u64, u64),
     interval_ms: Option<u64>,
+    /// 登録時に渡された（正規化済みの）遅延。診断の報告用（Issue #1176）。
+    delay_ms: u64,
+    /// 登録元の呼び出し stack（opt-in 時だけ。untrusted。Issue #1176）。
+    origin: Option<String>,
 }
+
+/// 保留中タイマー 1 件の要約（診断用。Issue #1176）。
+///
+/// `Debug` は手実装で、`origin`（untrusted。URL・トークンを含み得る）は長さだけを出す（`SEC-2`）。
+#[derive(Clone, PartialEq, Eq)]
+pub struct PendingEntry {
+    /// タイマー ID。
+    pub id: TimerId,
+    /// 期限（仮想時刻・ミリ秒）。
+    pub due_ms: u64,
+    /// 登録時の遅延（ミリ秒）。
+    pub delay_ms: u64,
+    /// interval か。
+    pub repeat: bool,
+    /// 登録元の stack（opt-in 時だけ。untrusted のため `Debug` を通さず扱うこと）。
+    pub origin: Option<String>,
+}
+
+/// `origin` の中身を出さず長さだけを表示する `Debug` 用ヘルパー。
+fn origin_len(origin: &Option<String>) -> Option<usize> {
+    origin.as_ref().map(String::len)
+}
+
+impl std::fmt::Debug for Entry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Entry")
+            .field("key", &self.key)
+            .field("interval_ms", &self.interval_ms)
+            .field("delay_ms", &self.delay_ms)
+            .field("origin_len", &origin_len(&self.origin))
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for PendingEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PendingEntry")
+            .field("id", &self.id)
+            .field("due_ms", &self.due_ms)
+            .field("delay_ms", &self.delay_ms)
+            .field("repeat", &self.repeat)
+            .field("origin_len", &origin_len(&self.origin))
+            .finish()
+    }
+}
+
+/// 登録元 stack を保持する件数の上限（`JS-6`。超過分は捨てる）。
+pub const MAX_RETAINED_TIMER_ORIGINS: usize = 64;
+/// 登録元 stack の保持長の上限（UTF-8 バイト）。
+pub const MAX_TIMER_ORIGIN_BYTES: usize = 1024;
 
 /// 仮想時計つきのタイマーキュー。
 ///
@@ -186,6 +240,8 @@ pub struct TimerQueue {
     registration_refused: bool,
     /// `next` が選び、まだ shim に消費されていない発火（`JS-6`）。
     armed: Option<TimerId>,
+    /// `origin` を保持しているエントリー数（`set_origin` の上限判定を O(1) にする）。
+    retained_origins: usize,
 }
 
 impl TimerQueue {
@@ -220,9 +276,17 @@ impl TimerQueue {
             Entry {
                 key,
                 interval_ms: repeat.then_some(delay_ms),
+                delay_ms,
+                origin: None,
             },
         );
         Ok(id)
+    }
+
+    fn release_origin(&mut self, entry: &Entry) {
+        if entry.origin.is_some() {
+            self.retained_origins = self.retained_origins.saturating_sub(1);
+        }
     }
 
     fn take_seq(&mut self) -> u64 {
@@ -231,9 +295,52 @@ impl TimerQueue {
         seq
     }
 
+    /// 保留中タイマーの登録元 stack を保存する（診断用。Issue #1176）。
+    ///
+    /// 登録中でない ID・保持件数が [`MAX_RETAINED_TIMER_ORIGINS`] に達した後の要求は捨てる。
+    /// 文字列は [`MAX_TIMER_ORIGIN_BYTES`] へ文字境界で切り詰める。エントリーと同時に消えるため、
+    /// 発火済みの one-shot・取り消し済みの分は自動的に解放される。
+    pub fn set_origin(&mut self, id: TimerId, stack: &str) {
+        let Some(entry) = self.entries.get_mut(&id) else {
+            return;
+        };
+        if entry.origin.is_none() {
+            if self.retained_origins >= MAX_RETAINED_TIMER_ORIGINS {
+                return;
+            }
+            self.retained_origins += 1;
+        }
+        let mut end = stack.len().min(MAX_TIMER_ORIGIN_BYTES);
+        while !stack.is_char_boundary(end) {
+            end -= 1;
+        }
+        entry.origin = Some(stack[..end].to_string());
+    }
+
+    /// 期限順に先頭から最大 `limit` 件の保留中タイマーを返す（診断用。Issue #1176）。
+    ///
+    /// 走査は `limit` で打ち切る。interval の発火中で `order` に無いものは対象外。
+    pub fn pending_entries(&self, limit: usize) -> Vec<PendingEntry> {
+        self.order
+            .iter()
+            .take(limit)
+            .filter_map(|(key, id)| {
+                let e = self.entries.get(id)?;
+                Some(PendingEntry {
+                    id: *id,
+                    due_ms: key.0,
+                    delay_ms: e.delay_ms,
+                    repeat: e.interval_ms.is_some(),
+                    origin: e.origin.clone(),
+                })
+            })
+            .collect()
+    }
+
     /// タイマーを取り消す。存在しない ID は何もしない。
     pub fn clear(&mut self, id: TimerId) {
         if let Some(entry) = self.entries.remove(&id) {
+            self.release_origin(&entry);
             self.order.remove(&entry.key);
         }
     }
@@ -257,8 +364,8 @@ impl TimerQueue {
             .entries
             .get(&id)
             .is_some_and(|e| e.interval_ms.is_some());
-        if !is_interval {
-            self.entries.remove(&id);
+        if !is_interval && let Some(entry) = self.entries.remove(&id) {
+            self.release_origin(&entry);
         }
         self.armed = Some(id);
         NextStep::Due(id)
@@ -480,5 +587,75 @@ mod tests {
         q.now_ms = u64::MAX - 1;
         q.register(MAX_TIMER_DELAY_MS, false, &l).expect("r");
         assert_eq!(q.next(&l), NextStep::Limit(TimerLimitKind::VirtualTime));
+    }
+
+    /// JS-7: 保留中の一覧は期限順・件数上限つきで、発火と取り消しで消える（Issue #1176）。
+    #[test]
+    fn js_7_pending_entries_are_deadline_ordered_and_bounded() {
+        let l = limits();
+        let mut q = TimerQueue::new();
+        let late = q.register(500, false, &l).expect("late");
+        let early = q.register(10, true, &l).expect("early");
+        let mid = q.register(100, false, &l).expect("mid");
+        let got = q.pending_entries(2);
+        assert_eq!(got.len(), 2);
+        assert_eq!((got[0].id, got[0].due_ms, got[0].delay_ms), (early, 10, 10));
+        assert!(got[0].repeat);
+        assert_eq!((got[1].id, got[1].due_ms, got[1].delay_ms), (mid, 100, 100));
+        assert!(!got[1].repeat);
+        assert_eq!(q.pending_entries(0).len(), 0);
+        q.clear(mid);
+        assert_eq!(q.next(&l), NextStep::Due(early));
+        // interval は発火中は order に無いため対象外。積み直すと戻る。
+        assert_eq!(q.pending_entries(5).len(), 1);
+        q.rearm_if_alive(early);
+        let got = q.pending_entries(5);
+        assert_eq!(got.len(), 2);
+        assert_eq!((got[0].id, got[0].due_ms), (early, 20));
+        assert_eq!((got[1].id, got[1].due_ms), (late, 500));
+    }
+
+    /// JS-6: 登録元 stack は切り詰め・件数上限つきで、エントリーと一緒に消える（Issue #1176）。
+    #[test]
+    fn sec_2_debug_of_queue_and_pending_entry_hides_origin_text() {
+        let l = limits();
+        let mut q = TimerQueue::new();
+        let id = q.register(1, false, &l).expect("id");
+        q.set_origin(id, "at https://x.test/?token=SECRET");
+        let entries = q.pending_entries(8);
+        let d1 = format!("{:?}", entries);
+        let d2 = format!("{:?}", q);
+        for d in [&d1, &d2] {
+            assert!(!d.contains("SECRET"), "{d}");
+            assert!(!d.contains("x.test"), "{d}");
+        }
+        assert!(d1.contains("origin_len: Some(31)"), "{d1}");
+    }
+
+    #[test]
+    fn js_6_timer_origin_is_truncated_bounded_and_released() {
+        let l = limits();
+        let mut q = TimerQueue::new();
+        let first = q.register(1, false, &l).expect("first");
+        // 1024 バイト境界にまたがる多バイト文字でも文字境界で切る。
+        let long = format!("{}{}", "a".repeat(1023), "あ");
+        q.set_origin(first, &long);
+        let got = q.pending_entries(1);
+        assert_eq!(got[0].origin.as_deref(), Some("a".repeat(1023).as_str()));
+        q.set_origin(TimerId::from_raw(999), "x");
+        for _ in 0..(MAX_RETAINED_TIMER_ORIGINS + 5) {
+            let id = q.register(2, false, &l).expect("r");
+            q.set_origin(id, "s");
+        }
+        let retained = q
+            .pending_entries(usize::MAX)
+            .iter()
+            .filter(|e| e.origin.is_some())
+            .count();
+        assert_eq!(retained, MAX_RETAINED_TIMER_ORIGINS);
+        assert_eq!(q.next(&l), NextStep::Due(first));
+        q.consume_armed(first);
+        q.clear(first);
+        assert_eq!(q.pending_entries(1)[0].id.get(), 2);
     }
 }

@@ -81,7 +81,9 @@ pub use page_env::{
 };
 use page_env::{apply_hash, location_member, rewrite_same_origin};
 
-use crate::event_loop::{EventLoopLimits, NextStep, TimerId, TimerQueue, normalize_delay};
+use crate::event_loop::{
+    EventLoopLimits, NextStep, PendingEntry, TimerId, TimerQueue, normalize_delay,
+};
 use crate::page_net::{
     NET_BODY_CHUNK_BYTES, NetOutcome, NetQueue, NetReport, NetRequestKind, PageNetLimits,
     PendingRequest,
@@ -356,6 +358,8 @@ enum DomOp {
     TimerClear,
     TimerConsume,
     TimerPending,
+    TimerOriginCapture,
+    TimerOrigin,
     MicrotaskLimit,
     TimerCallbackError,
     TimerStringHandlerIgnored,
@@ -408,6 +412,8 @@ impl DomOp {
             "timerClear" => Self::TimerClear,
             "timerConsume" => Self::TimerConsume,
             "timerPending" => Self::TimerPending,
+            "timerOriginCapture" => Self::TimerOriginCapture,
+            "timerOrigin" => Self::TimerOrigin,
             "microtaskLimit" => Self::MicrotaskLimit,
             "timerCallbackError" => Self::TimerCallbackError,
             "timerStringHandlerIgnored" => Self::TimerStringHandlerIgnored,
@@ -461,6 +467,8 @@ impl DomOp {
             Self::TimerClear => "timerClear",
             Self::TimerConsume => "timerConsume",
             Self::TimerPending => "timerPending",
+            Self::TimerOriginCapture => "timerOriginCapture",
+            Self::TimerOrigin => "timerOrigin",
             Self::MicrotaskLimit => "microtaskLimit",
             Self::TimerCallbackError => "timerCallbackError",
             Self::TimerStringHandlerIgnored => "timerStringHandlerIgnored",
@@ -490,6 +498,7 @@ impl DomOp {
             | Self::LifecycleInstallOpen
             | Self::LifecycleListenerLimit
             | Self::MicrotaskLimit
+            | Self::TimerOriginCapture
             | Self::MutationObserverLimit
             | Self::TimerStringHandlerIgnored => 0,
             Self::CreateElement
@@ -520,6 +529,7 @@ impl DomOp {
             | Self::IgnoreLocationChange
             | Self::ConsoleMessage
             | Self::TimerSet
+            | Self::TimerOrigin
             | Self::IsInclusiveAncestor
             | Self::UrlParse => 2,
             Self::InsertBefore | Self::SetAttribute => 3,
@@ -569,6 +579,8 @@ struct PageState {
     op_limit_tripped: bool,
     /// 仮想時間のタイマーキュー（`JS-7`）。
     timers: TimerQueue,
+    /// タイマーの登録元 stack を shim に捕捉させるか（opt-in。既定 false。Issue #1176）。
+    capture_timer_origin: bool,
     /// タイマーの上限（ランナーが [`DomBridge::set_event_loop_limits`] で設定する）。
     event_loop_limits: EventLoopLimits,
     /// ページ内 fetch / XHR の要求キューと上限（`JS-8`・`JS-6`）。
@@ -970,6 +982,32 @@ fn execute(
                 // 範囲を検証済みのため切り詰めなく変換できる。
                 && page.timers.is_alive(TimerId::from_raw(*raw as u32));
             Ok(JsValue::Bool(alive))
+        }
+        // 登録元 stack を捕捉するか（読み取り専用の bool。既定は常に false で、ページが読んでも
+        // 識別面にならない。Issue #1176）。
+        DomOp::TimerOriginCapture => Ok(JsValue::Bool(page.capture_timer_origin)),
+        // 登録直後のタイマーの登録元 stack を保存する（診断用。Issue #1176）。フラグが false なら
+        // 何もしない（ページが直接呼んでも保持させられない）。ID の検証は `timerPending` と同じ。
+        DomOp::TimerOrigin => {
+            let Some(JsValue::Number(raw)) = args.first() else {
+                return Err(DomBridgeError::TypeMismatch {
+                    operation: op.name(),
+                    index: 1,
+                    expected: "a timer id number",
+                });
+            };
+            let stack = string_arg(op, args, 2, limits)?;
+            if page.capture_timer_origin
+                && raw.is_finite()
+                && raw.fract() == 0.0
+                && *raw >= 1.0
+                && *raw <= f64::from(u32::MAX)
+            {
+                // 範囲を検証済みのため切り詰めなく変換できる。
+                page.timers
+                    .set_origin(TimerId::from_raw(*raw as u32), stack);
+            }
+            Ok(JsValue::Undefined)
         }
         // microtask の保留数が shim の上限を超えたことの通知。通常は予算外で処理済み（下記）。
         DomOp::MicrotaskLimit => {
@@ -1380,6 +1418,7 @@ impl DomBridge {
             shim_installing: false,
             op_limit_tripped: false,
             timers: TimerQueue::new(),
+            capture_timer_origin: false,
             event_loop_limits: EventLoopLimits::default(),
             net: NetQueue::new(PageNetLimits::default()),
         });
@@ -1516,6 +1555,22 @@ impl DomBridge {
             page.timers.fired(),
             page.timers.pending(),
         ))
+    }
+
+    /// タイマーの登録元 stack の捕捉を設定する（ランナー用。`attach` のたびに false へ戻る。
+    /// shim の install より前に呼ぶこと。Issue #1176）。
+    pub fn set_capture_timer_origin(&self, capture: bool) -> Result<(), DomBridgeError> {
+        let mut guard = self.lock()?;
+        let page = guard.page.as_mut().ok_or(DomBridgeError::Detached)?;
+        page.capture_timer_origin = capture;
+        Ok(())
+    }
+
+    /// 保留中タイマーを期限順に先頭から最大 `limit` 件返す（ランナー用。診断。Issue #1176）。
+    pub fn pending_timers(&self, limit: usize) -> Result<Vec<PendingEntry>, DomBridgeError> {
+        let guard = self.lock()?;
+        let page = guard.page.as_ref().ok_or(DomBridgeError::Detached)?;
+        Ok(page.timers.pending_entries(limit))
     }
 
     /// ページ内 fetch / XHR の上限を設定する（ランナー用。`attach` のたびに既定へ戻る）。
@@ -2622,6 +2677,46 @@ mod tests {
             call(&b, &[s("timerPending"), n(1.0)]).expect("p"),
             JsValue::Bool(false)
         );
+    }
+
+    /// JS-6: 登録元 stack の op は既定で無視し、opt-in 時だけ切り詰めて保存する。型・arity は拒否する（Issue #1176）。
+    #[test]
+    fn js_6_timer_origin_ops_are_opt_in_and_bounded() {
+        let b = bridge();
+        call(&b, &[s("timerSet"), n(5.0), b_bool(false)]).expect("set");
+        assert_eq!(
+            call(&b, &[s("timerOriginCapture")]).expect("c"),
+            JsValue::Bool(false)
+        );
+        call(&b, &[s("timerOrigin"), n(1.0), s("at a (u:1:1)")]).expect("ignored");
+        assert_eq!(b.pending_timers(4).expect("p")[0].origin, None);
+
+        b.set_capture_timer_origin(true).expect("flag");
+        assert_eq!(
+            call(&b, &[s("timerOriginCapture")]).expect("c"),
+            JsValue::Bool(true)
+        );
+        call(&b, &[s("timerOrigin"), n(1.0), s("at a (u:1:1)")]).expect("kept");
+        let got = b.pending_timers(4).expect("p");
+        assert_eq!(got[0].origin.as_deref(), Some("at a (u:1:1)"));
+        assert_eq!((got[0].delay_ms, got[0].due_ms), (5, 5));
+        // 不正な ID・保留中でない ID は黙って無視する。
+        for bad in [f64::NAN, 0.5, -1.0, 9.0] {
+            call(&b, &[s("timerOrigin"), n(bad), s("x")]).expect("ignored");
+        }
+        let long = "z".repeat(5000);
+        call(&b, &[s("timerOrigin"), n(1.0), s(&long)]).expect("trunc");
+        assert_eq!(
+            b.pending_timers(4).expect("p")[0]
+                .origin
+                .as_deref()
+                .map(str::len),
+            Some(crate::event_loop::MAX_TIMER_ORIGIN_BYTES)
+        );
+        call(&b, &[s("timerOrigin"), s("1"), s("x")]).expect_err("type");
+        call(&b, &[s("timerOrigin"), n(1.0), n(1.0)]).expect_err("type");
+        call(&b, &[s("timerOrigin"), n(1.0)]).expect_err("arity");
+        call(&b, &[s("timerOriginCapture"), n(1.0)]).expect_err("arity");
     }
 
     fn url_parts(v: Result<JsValue, DomBridgeError>) -> Vec<String> {

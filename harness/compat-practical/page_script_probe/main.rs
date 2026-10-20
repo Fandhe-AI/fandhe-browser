@@ -40,8 +40,8 @@ use fandhe_browser_core::{
 };
 use probe::{
     Origin, ProbeArgs, callback_error_label, class_label, debug_stderr_line, exception_label,
-    lifecycle_event_name, lifecycle_label, run_options, script_line, timer_error_label,
-    top_stack_frame,
+    lifecycle_event_name, lifecycle_label, number_array, run_options, script_line,
+    timer_error_label, top_stack_frame,
 };
 use reqwest::Url;
 
@@ -499,9 +499,42 @@ async fn measure(
         .n("pending_at_end", net.pending_at_end() as u64)
         .line();
     let ev = out.event_loop();
+    // 保留中タイマー（上限で打ち切ったとき残るもの）の遅延・期限は数値だけを JSONL へ、登録元の先頭
+    // フレームは --debug-raw-exception のときだけ stderr へ（Issue #1176。stack の URL は取得しない）。
+    let pending_ms =
+        |f: fn(&fandhe_browser_core::PendingTimer) -> std::time::Duration| -> Vec<u64> {
+            ev.pending_timers()
+                .iter()
+                .map(|t| u64::try_from(f(t).as_millis()).unwrap_or(u64::MAX))
+                .collect()
+        };
+    let delays = pending_ms(|t| t.delay());
+    let dues = pending_ms(|t| t.due_at());
+    for (n, t) in ev.pending_timers().iter().enumerate() {
+        let label = format!("{} pending_timer#{n}", args.id);
+        let body = format!(
+            "delay={} due={} repeat={}",
+            delays.get(n).copied().unwrap_or(0),
+            dues.get(n).copied().unwrap_or(0),
+            t.repeat()
+        );
+        if let Some(line) = debug_stderr_line(args.debug_raw_exception, &label, Some(&body)) {
+            eprintln!("{line}");
+        }
+        let label = format!("{label} frame");
+        if let Some(line) = debug_stderr_line(
+            args.debug_raw_exception,
+            &label,
+            t.raw_origin().and_then(top_stack_frame),
+        ) {
+            eprintln!("{line}");
+        }
+    }
     let ev_obj = Obj::new()
         .n("fired", ev.fired() as u64)
         .n("pending_at_end", ev.pending_at_end() as u64)
+        .raw("pending_delays_ms", number_array(&delays))
+        .raw("pending_due_ms", number_array(&dues))
         .line();
     lines.push(
         Obj::new()

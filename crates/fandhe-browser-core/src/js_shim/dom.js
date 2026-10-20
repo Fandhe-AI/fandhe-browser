@@ -31,6 +31,8 @@
 //   compareDocumentPosition / attributes（属性の列挙）。対応する op が無く未定義のまま。
 // - HTMLIFrameElement は名前だけ（instanceof が throw しないため。常に false。`new` は
 //   Illegal constructor）。HTMLElement と他のサブクラスは未定義のまま（#1168）。
+// - IDL 属性の反映は `name` / `type` だけ（簡略版。全要素に定義し、既定値・正規化なし。#1176）。
+//   `id` / `className` / `value` / `checked` 等は未反映のまま（REPAIR-3）。
 // - document.activeElement は簡略版（常に body。無ければ null。#1173）。focus / blur /
 //   hasFocus は未定義のままでフォーカス追跡は無い（REPAIR-3）。
 // - Comment / DocumentFragment のラッパー（nodeType 定数のみ。DOCUMENT_POSITION_* も未定義）。
@@ -280,6 +282,26 @@
             return readAttribute(this, 'hasAttribute', name) !== null;
         }
     });
+    // 属性を反映する IDL プロパティ `name` / `type`（#1176）。react-dom 19 の initInput は
+    // `node.name = ...` / `node.type = ...` とプロパティへ代入するため、反映が無いと属性が残らず、
+    // `input[name]` が空になる（d2 で `form` の名前付きフィールドが 0 件になる原因と推定）。
+    // 簡略版（REPAIR-3）: 要素の種別を知る op が無いため全要素に定義し、`type` の既定値（input の
+    // "text"）や列挙値の正規化はせず、属性の文字列をそのまま返す（無ければ空文字）。
+    function reflectedAttribute(attr) {
+        return {
+            get: function () {
+                var v = readAttribute(this, attr, attr);
+                return v === null ? '' : v;
+            },
+            set: function (value) {
+                // ページが差し替え得る setAttribute を経由せず、同じ op で直接保存する。
+                var stored = op('setAttribute', idOf(this, attr), attr, String(value));
+                notifyMutation('attributes', this, { attributeName: typeof stored === 'string' ? stored : attr });
+            }
+        };
+    }
+    define(Element.prototype, 'name', reflectedAttribute('name'));
+    define(Element.prototype, 'type', reflectedAttribute('type'));
     define(Element.prototype, 'innerHTML', {
         get: function () {
             return op('getInnerHTML', idOf(this, 'innerHTML'));

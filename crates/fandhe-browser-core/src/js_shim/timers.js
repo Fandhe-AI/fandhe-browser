@@ -22,6 +22,11 @@
 // - 配列メソッドは使わず（ページによる Array.prototype の改変の影響を避ける）、null プロトタイプの
 //   コンテナと添字演算で状態を持つ。ES2015 の範囲に留める（V8 と boa で同一ソース）。
 //
+// - 登録元 stack の捕捉（Issue #1176）は診断専用の opt-in。install 時に `timerOriginCapture` op（Rust が
+//   ランナーの `retain_raw_exception_messages` から設定する bool）を 1 回だけ問い合わせ、false（既定）なら
+//   setTimeout ごとのコストも挙動も変えない。true のときだけ `new Error().stack`（文字列のときのみ・
+//   1024 単位で切る）を `timerOrigin` op で渡す。window に新しい名前は足さない。
+//
 // 未実装（REPAIR-3）:
 // - ネイティブ Promise の反応ジョブとの統合（エンジン依存。TASK-30）。
 // - HTML のネスト時 4ms クランプ、文字列ハンドラの評価。
@@ -61,6 +66,13 @@
     // 超過後に登録を繰り返すページが遅い環境で wall time を先に消費することを避ける（JS-6）。
     // 通知が例外で失敗した場合は立てず、次回の登録で再試行する（上限超過の中断を取りこぼさない）。
     var microtaskLimitNotified = false;
+    // 登録元 stack を捕捉するか（install 時に 1 回だけ Rust 側へ問い合わせる。失敗は false。Issue #1176）。
+    var captureOrigin = false;
+    try {
+        captureOrigin = callOp('timerOriginCapture') === true;
+    } catch (e) {
+        captureOrigin = false;
+    }
 
     function report(source, error) {
         try {
@@ -134,6 +146,37 @@
         sweepAt = kept * 2 > SWEEP_MIN ? kept * 2 : SWEEP_MIN;
     }
 
+    // 登録直後のタイマーの登録元 stack を Rust 側へ渡す（診断専用。例外は握りつぶして登録は成功させる）。
+    function noteOrigin(id) {
+        try {
+            var stack = new Error().stack;
+            if (typeof stack !== 'string') {
+                return;
+            }
+            // shim 自身のフレーム（noteOrigin・schedule・setTimeout/setInterval の 3 つ。V8 形式の
+            // `    at ` 行）を先頭から除き、先頭がページ側の呼び出し位置になるようにする。
+            // `at ` 行が 4 本未満（boa 等の非 V8 形式）なら加工しない。
+            var lines = stack.split('\n');
+            var frames = [];
+            for (var li = 0; li < lines.length; li++) {
+                if (lines[li].indexOf('    at ') === 0) {
+                    frames.push(lines[li]);
+                }
+            }
+            if (frames.length > 3) {
+                stack = frames.slice(3).join('\n');
+            }
+            stack = stack.slice(0, 1024);
+            var last = stack.charCodeAt(stack.length - 1);
+            if (last >= 0xd800 && last <= 0xdbff) {
+                stack = stack.slice(0, -1);
+            }
+            callOp('timerOrigin', id, stack);
+        } catch (e) {
+            // 診断の取りこぼしは許容する。
+        }
+    }
+
     function schedule(handler, delay, repeat, extra, extraStart) {
         if (typeof handler !== 'function') {
             try {
@@ -159,6 +202,9 @@
         }
         timers[id] = { fn: handler, args: args, repeat: repeat };
         retained += 1;
+        if (captureOrigin) {
+            noteOrigin(id);
+        }
         return id;
     }
 
