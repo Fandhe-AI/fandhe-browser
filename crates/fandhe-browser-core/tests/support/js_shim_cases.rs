@@ -540,6 +540,7 @@ pub fn run(engine: &str) {
     event_target_cases(engine);
     history_traversal_cases(engine);
     focus_cases(engine);
+    create_element_ns_cases(engine);
 
     eprintln!("case: JS-5 disabled runtime does not pretend to install");
     let mut disabled = JsRuntime::disabled();
@@ -3330,5 +3331,71 @@ fn focus_cases(engine: &str) {
         &mut p,
         "typeof globalThis.__fandheDomFocusHandoff",
         "undefined",
+    );
+}
+
+/// JS-5 / REPAIR-3 (#1192): `document.createElementNS` は HTML・SVG の名前空間だけを扱う簡略版。
+fn create_element_ns_cases(engine: &str) {
+    const SVG: &str = "http://www.w3.org/2000/svg";
+    eprintln!(
+        "case: JS-5 createElementNS builds SVG (case preserved) and HTML (lowercased) elements"
+    );
+    let mut p = setup_html(
+        engine,
+        "<html><head></head><body><script>x</script></body></html>",
+        None,
+    );
+    check(&mut p, "typeof document.createElementNS", "function");
+    check(
+        &mut p,
+        &format!(
+            "var ns = '{SVG}'; var sv = document.createElementNS(ns, 'svg'); \
+             var r = document.createElementNS(ns, 'clipPath'); sv.appendChild(r); \
+             document.body.appendChild(sv); document.body.innerHTML"
+        ),
+        "<script>x</script><svg><clipPath></clipPath></svg>",
+    );
+    check(
+        &mut p,
+        "document.querySelector('svg clipPath') === r",
+        "true",
+    );
+    check(
+        &mut p,
+        "document.querySelector('svg clippath') === null",
+        "true",
+    );
+    check(
+        &mut p,
+        "var h = document.createElementNS('http://www.w3.org/1999/xhtml', 'DIV'); \
+         document.body.appendChild(h); (h instanceof Element) + '|' + (document.querySelector('div') === h)",
+        "true|true",
+    );
+
+    eprintln!("case: JS-5 createElementNS rejects unsupported namespaces and prefixed names");
+    for args in [
+        "null, 'rect'",
+        "undefined, 'rect'",
+        "'http://www.w3.org/1998/Math/MathML', 'mi'",
+        &format!("'{SVG}', 'svg:rect'"),
+        &format!("'{SVG}', ''"),
+    ] {
+        check(
+            &mut p,
+            &format!("try {{ document.createElementNS({args}); 'ok' }} catch (e) {{ 'threw' }}"),
+            "threw",
+        );
+    }
+
+    eprintln!(
+        "case: JS-5 createElementNS result supports style (baseline) and stays a plain Element"
+    );
+    check(
+        &mut p,
+        &format!(
+            "var sr = document.createElementNS('{SVG}', 'rect'); sr.style.fill = 'red'; \
+             sr.getAttribute('style') + '|' + (sr instanceof HTMLElement)"
+        ),
+        "fill: red;|false",
     );
 }
