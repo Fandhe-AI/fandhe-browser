@@ -437,7 +437,7 @@
                 }
                 var v = readAttribute(this, prop, attr);
                 if (v === null && opts && opts.optionText && localNameOf(this) === 'option') {
-                    return stripCollapseWhitespace(String(op('getTextContent', idOf(this, prop))));
+                    return stripCollapseWhitespace(String(op('getOptionText', idOf(this, prop))));
                 }
                 return v === null ? '' : v;
             },

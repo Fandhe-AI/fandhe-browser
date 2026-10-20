@@ -345,6 +345,7 @@ enum DomOp {
     RemoveAttribute,
     GetAttribute,
     GetTextContent,
+    GetOptionText,
     SetTextContent,
     GetInnerHtml,
     SetInnerHtml,
@@ -402,6 +403,7 @@ impl DomOp {
             "removeAttribute" => Self::RemoveAttribute,
             "getAttribute" => Self::GetAttribute,
             "getTextContent" => Self::GetTextContent,
+            "getOptionText" => Self::GetOptionText,
             "setTextContent" => Self::SetTextContent,
             "getInnerHTML" => Self::GetInnerHtml,
             "setInnerHTML" => Self::SetInnerHtml,
@@ -459,6 +461,7 @@ impl DomOp {
             Self::RemoveAttribute => "removeAttribute",
             Self::GetAttribute => "getAttribute",
             Self::GetTextContent => "getTextContent",
+            Self::GetOptionText => "getOptionText",
             Self::SetTextContent => "setTextContent",
             Self::GetInnerHtml => "getInnerHTML",
             Self::SetInnerHtml => "setInnerHTML",
@@ -517,6 +520,7 @@ impl DomOp {
             | Self::CreateTextNode
             | Self::GetElementById
             | Self::GetTextContent
+            | Self::GetOptionText
             | Self::GetInnerHtml
             | Self::GetLocation
             | Self::SetLocationHash
@@ -1377,6 +1381,35 @@ fn execute(
                 Some(text) => string_response(text, limits),
                 None => Ok(JsValue::Null),
             }
+        }
+        DomOp::GetOptionText => {
+            let node = page.node_arg(op, args, 1)?;
+            // 全子孫テキストの総量を上限として先に検査する（script 除外後はこれ以下になる）。
+            check_text_content_len(&page.document, node, limits)?;
+            let doc = &page.document;
+            let mut text = String::new();
+            for d in doc.descendants(node) {
+                let Some(NodeData::Text { contents }) = doc.node_data(d) else {
+                    continue;
+                };
+                // 仕様の option text は script（HTML・SVG）配下のテキストを除く。
+                let mut under_script = false;
+                let mut cur = doc.parent(d);
+                while let Some(a) = cur {
+                    if a == node {
+                        break;
+                    }
+                    if doc.local_name(a) == Some("script") {
+                        under_script = true;
+                        break;
+                    }
+                    cur = doc.parent(a);
+                }
+                if !under_script {
+                    text.push_str(contents);
+                }
+            }
+            string_response(text, limits)
         }
         DomOp::SetTextContent => {
             let node = page.node_arg(op, args, 1)?;

@@ -233,6 +233,11 @@ pub fn run(engine: &str) {
         "var op2 = document.createElement('option'); op2.innerHTML = '\\n   a \\t  b\\n  '; op2.value",
         "a b",
     );
+    check(
+        &mut p,
+        "var op3 = document.createElement('option'); op3.innerHTML = 'A<script>B</script>C'; op3.value",
+        "AC",
+    );
 
     eprintln!("case: JS-5 boolean attributes reflect presence (#1186)");
     let mut p = setup(engine, None);
