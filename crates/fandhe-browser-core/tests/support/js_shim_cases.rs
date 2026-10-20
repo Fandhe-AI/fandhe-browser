@@ -206,6 +206,18 @@ pub fn run(engine: &str) {
          d0 + '|' + dv.value + '|' + dv.hasAttribute('value')",
         "undefined|z|false",
     );
+    check(
+        &mut p,
+        "var dn = document.createElement('div'); dn.value = Object.create(null); \
+         var calls = 0; dn.value = { toString: function () { calls++; return 'x'; } }; \
+         (typeof dn.value) + '|' + calls + '|' + dn.hasAttribute('value')",
+        "object|0|false",
+    );
+    check(
+        &mut p,
+        "var op2 = document.createElement('option'); op2.innerHTML = '\\n   a \\t  b\\n  '; op2.value",
+        "a b",
+    );
 
     eprintln!("case: JS-5 boolean attributes reflect presence (#1186)");
     let mut p = setup(engine, None);
@@ -274,6 +286,15 @@ pub fn run(engine: &str) {
         &mut p,
         "var ti2 = document.createElement('input'); ti2.type = 'RADIO'; ti2.type",
         "radio",
+    );
+    let mut p = setup(engine, None);
+    check(
+        &mut p,
+        "String.prototype.charCodeAt = function () { return 0; }; \
+         String.prototype.charAt = function () { return 'X'; }; \
+         String.fromCharCode = function () { return 'Y'; }; \
+         var ti3 = document.createElement('input'); ti3.setAttribute('type', 'CHECKBOX'); ti3.type",
+        "checkbox",
     );
 
     eprintln!("case: JS-5 HTMLIFrameElement exists so instanceof does not throw (#1168)");

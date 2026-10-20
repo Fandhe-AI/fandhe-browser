@@ -367,12 +367,37 @@
         localNames.set(self, name);
         return name;
     }
-    // ページが差し替え得る String.prototype.toLowerCase に頼らない ASCII 小文字化。
+    // ページが差し替え得る String.prototype のメソッドに読み取り時に頼らないよう、install 時に束縛する。
+    var sCharCodeAt = Function.prototype.call.bind(String.prototype.charCodeAt);
+    var sCharAt = Function.prototype.call.bind(String.prototype.charAt);
+    var fromCharCode = String.fromCharCode;
+    // ASCII 小文字化。
     function asciiLower(str) {
         var out = '';
         for (var i = 0; i < str.length; i++) {
-            var c = str.charCodeAt(i);
-            out += c >= 65 && c <= 90 ? String.fromCharCode(c + 32) : str.charAt(i);
+            var c = sCharCodeAt(str, i);
+            out += c >= 65 && c <= 90 ? fromCharCode(c + 32) : sCharAt(str, i);
+        }
+        return out;
+    }
+    function isAsciiSpace(c) {
+        return c === 0x20 || c === 0x09 || c === 0x0A || c === 0x0C || c === 0x0D;
+    }
+    // 仕様の option の text 値: ASCII 空白の連続を 1 つの U+0020 に畳み、前後を除去する。
+    function stripCollapseWhitespace(str) {
+        var out = '';
+        var pendingSpace = false;
+        for (var i = 0; i < str.length; i++) {
+            var c = sCharCodeAt(str, i);
+            if (isAsciiSpace(c)) {
+                pendingSpace = out !== '';
+            } else {
+                if (pendingSpace) {
+                    out += ' ';
+                    pendingSpace = false;
+                }
+                out += sCharAt(str, i);
+            }
         }
         return out;
     }
@@ -415,16 +440,16 @@
                 }
                 var v = readAttribute(this, prop, attr);
                 if (v === null && opts && opts.optionText && localNameOf(this) === 'option') {
-                    return op('getTextContent', idOf(this, prop));
+                    return stripCollapseWhitespace(String(op('getTextContent', idOf(this, prop))));
                 }
                 return v === null ? '' : v;
             },
             set: function (value) {
-                var text = opts && opts.nullAsEmpty && value === null ? '' : String(value);
                 if (!applies(this, set)) {
                     expandoSet(this, prop, value);
                     return;
                 }
+                var text = opts && opts.nullAsEmpty && value === null ? '' : String(value);
                 storeAttribute(this, attr, text);
             }
         };
