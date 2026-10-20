@@ -37,8 +37,8 @@
 //   `id` / `className` / `value` / `checked` 等は未反映のまま（REPAIR-3）。
 // - フォーカス追跡は簡略版（#1173・#1185）。`Element.prototype.focus()` / `blur()` が `document.activeElement` を
 //   更新する（何もフォーカスされていなければ body。無ければ null）。フォーカスできるかは op `isFocusable`
-//   （Rust 側の簡略判定。dom_bridge/focus.rs）で決め、状態はこのクロージャの 1 枠だけが持つ。`activeElement` を
-//   読むたびに有効性を確かめ直し、切り離し・disabled 付与・tabindex 除去でフォーカスを失った要素は
+//   （Rust 側の簡略判定。dom_bridge/focus.rs）で決め、状態はこのクロージャの 1 枠だけが持つ。DOM・属性を変える操作の直後（と `activeElement` の読み取り時）に有効性を
+//   確かめ直し、切り離し・disabled 付与・tabindex 除去でフォーカスを失った要素は失効を保持して
 //   blur を配らず body に戻す（HTML の focus fixup の近似）。focus / blur は install 中だけの一時グローバル
 //   `__fandheDomFocusHandoff` 経由で events.js が対象要素にだけ配る。
 //   未実装（REPAIR-3）: `document.hasFocus()`・FocusEvent / relatedTarget・focusin / focusout・祖先への
@@ -217,7 +217,12 @@
     define(Node.prototype, 'appendChild', {
         writable: true,
         value: function appendChild(child) {
+            if (focused === child) {
+                // 移動は切り離し＋再接続。フォーカスは失われ、再接続では復活しない。
+                focused = null;
+            }
             op('appendChild', idOf(this, 'appendChild'), idOf(child, 'appendChild'));
+            revalidateFocus();
             notifyMutation('childList', this, { added: [child], removed: [], nextSibling: null });
             return child;
         }
@@ -226,7 +231,11 @@
         writable: true,
         value: function insertBefore(node, ref) {
             var refId = ref === null || ref === undefined ? null : idOf(ref, 'insertBefore');
+            if (focused === node) {
+                focused = null;
+            }
             op('insertBefore', idOf(this, 'insertBefore'), idOf(node, 'insertBefore'), refId);
+            revalidateFocus();
             notifyMutation('childList', this, {
                 added: [node],
                 removed: [],
@@ -239,6 +248,7 @@
         writable: true,
         value: function removeChild(child) {
             op('removeChild', idOf(this, 'removeChild'), idOf(child, 'removeChild'));
+            revalidateFocus();
             notifyMutation('childList', this, { added: [], removed: [child], nextSibling: null });
             return child;
         }
@@ -250,6 +260,7 @@
         set: function (value) {
             var text = value === null || value === undefined ? '' : String(value);
             op('setTextContent', idOf(this, 'textContent'), text);
+            revalidateFocus();
             // Text は characterData、それ以外（Element / Document）は childList。後者の
             // 追加・削除ノードは子の列挙 op が無いため空（スタブ。REPAIR-3）。
             if (textProtoIsPrototypeOf(this)) {
@@ -267,6 +278,7 @@
             var attr = String(name);
             // bridge は実際に保存された（正規化後の）属性名を返す。通知にはその名前を使う。
             var stored = op('setAttribute', idOf(this, 'setAttribute'), attr, String(value));
+            revalidateFocus();
             notifyMutation('attributes', this, { attributeName: typeof stored === 'string' ? stored : attr });
         }
     });
@@ -276,6 +288,7 @@
             var attr = String(name);
             // 属性が無いときは DOM 仕様どおり変更なし（レコードを作らない）。bridge が削除有無を返す。
             var removedName = op('removeAttribute', idOf(this, 'removeAttribute'), attr);
+            revalidateFocus();
             if (typeof removedName === 'string') {
                 notifyMutation('attributes', this, { attributeName: removedName });
             }
@@ -313,6 +326,7 @@
             set: function (value) {
                 // ページが差し替え得る setAttribute を経由せず、同じ op で直接保存する。
                 var stored = op('setAttribute', idOf(this, attr), attr, String(value));
+                revalidateFocus();
                 notifyMutation('attributes', this, { attributeName: typeof stored === 'string' ? stored : attr });
             }
         };
@@ -327,6 +341,7 @@
             // HTML の解析は core のパーサーが行う（JS 側にパーサーは持たない）。
             var html = value === null ? '' : String(value);
             op('setInnerHTML', idOf(this, 'innerHTML'), html);
+            revalidateFocus();
             // 追加・削除ノードは子の列挙 op が無いため空（スタブ。REPAIR-3）。
             notifyMutation('childList', this, { added: [], removed: [], nextSibling: null });
         }
@@ -411,11 +426,17 @@
         return op('isFocusable', ids.get(el)) === true;
     }
 
-    // 有効なフォーカス中の要素か null。無効になっていれば blur を配らずに解除する。
-    function currentFocus() {
+    // フォーカス中の要素が無効（切り離し・disabled・tabindex 除去等）なら blur を配らずに解除する。
+    // DOM・属性を変える各操作の直後に呼び、失効を保持する（後から再接続・属性復元されても復活しない）。
+    function revalidateFocus() {
         if (focused !== null && !focusStillValid(focused)) {
             focused = null;
         }
+    }
+
+    // 有効なフォーカス中の要素か null（読み取り時の保険として再検証する）。
+    function currentFocus() {
+        revalidateFocus();
         return focused;
     }
 

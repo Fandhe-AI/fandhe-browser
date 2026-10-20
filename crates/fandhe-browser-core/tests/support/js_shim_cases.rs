@@ -3021,6 +3021,28 @@ fn focus_cases(engine: &str) {
         "true",
     );
 
+    eprintln!("case: JS-5 focus loss is kept after reattach / disabled removal / tabindex restore");
+    check(
+        &mut p,
+        "$('i').focus(); var ii = $('i'); document.body.removeChild(ii); document.body.appendChild(ii); \
+         document.activeElement === document.body",
+        "true",
+    );
+    check(
+        &mut p,
+        "$('b').removeAttribute('disabled'); $('b').focus(); \
+         $('b').setAttribute('disabled', ''); $('b').removeAttribute('disabled'); \
+         document.activeElement === document.body",
+        "true",
+    );
+    check(
+        &mut p,
+        "var tv = $('dt').getAttribute('tabindex'); if (tv === null) { tv = '0'; $('dt').setAttribute('tabindex', tv); } \
+         $('dt').focus(); $('dt').removeAttribute('tabindex'); $('dt').setAttribute('tabindex', tv); \
+         document.activeElement === document.body",
+        "true",
+    );
+
     eprintln!("case: JS-5 invalid receivers are rejected");
     check(
         &mut p,
