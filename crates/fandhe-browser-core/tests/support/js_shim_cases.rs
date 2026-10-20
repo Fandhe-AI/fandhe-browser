@@ -541,6 +541,7 @@ pub fn run(engine: &str) {
     history_traversal_cases(engine);
     focus_cases(engine);
     create_element_ns_cases(engine);
+    get_elements_by_tag_name_cases(engine);
 
     eprintln!("case: JS-5 disabled runtime does not pretend to install");
     let mut disabled = JsRuntime::disabled();
@@ -3424,5 +3425,72 @@ fn create_element_ns_cases(engine: &str) {
              sr.getAttribute('style') + '|' + (sr instanceof HTMLElement)"
         ),
         "fill: red;|false",
+    );
+}
+
+/// JS-5 / JS-6 / REPAIR-3 (#1200): `getElementsByTagName` は live でない静的な Array を返す簡略版。
+fn get_elements_by_tag_name_cases(engine: &str) {
+    const SVG: &str = "http://www.w3.org/2000/svg";
+    eprintln!("case: JS-5 getElementsByTagName matches tag names (HTML case-insensitive, '*')");
+    let mut p = setup_html(
+        engine,
+        "<html><head></head><body><div id=\"a\"><div id=\"b\"></div></div><p></p><script>x</script></body></html>",
+        None,
+    );
+    check(
+        &mut p,
+        "typeof document.getElementsByTagName + '|' + typeof document.body.getElementsByTagName",
+        "function|function",
+    );
+    check(&mut p, "document.getElementsByTagName('div').length", "2");
+    check(
+        &mut p,
+        "document.getElementsByTagName('script').length",
+        "1",
+    );
+    check(&mut p, "document.getElementsByTagName('DIV').length", "2");
+    check(
+        &mut p,
+        "document.getElementsByTagName('div')[0] === document.querySelector('div')",
+        "true",
+    );
+    check(&mut p, "document.getElementsByTagName('*').length", "7");
+    check(
+        &mut p,
+        "document.getElementsByTagName('span').length + '|' + document.getElementsByTagName('').length",
+        "0|0",
+    );
+    eprintln!("case: JS-5 getElementsByTagName excludes the scope itself and is not live");
+    check(
+        &mut p,
+        "document.body.getElementsByTagName('body').length",
+        "0",
+    );
+    check(
+        &mut p,
+        "document.getElementById('a').getElementsByTagName('div').length",
+        "1",
+    );
+    check(
+        &mut p,
+        "var live = document.getElementsByTagName('p'); \
+         document.body.appendChild(document.createElement('p')); \
+         live.length + '|' + document.getElementsByTagName('p').length",
+        "1|2",
+    );
+    eprintln!("case: JS-5 getElementsByTagName compares SVG names case-sensitively");
+    check(
+        &mut p,
+        &format!(
+            "document.body.appendChild(document.createElementNS('{SVG}', 'clipPath')); \
+             document.getElementsByTagName('clipPath').length + '|' + \
+             document.getElementsByTagName('clippath').length"
+        ),
+        "1|0",
+    );
+    check(
+        &mut p,
+        "try { Document.prototype.getElementsByTagName.call({}, 'div'); 'ok' } catch (e) { 'threw' }",
+        "threw",
     );
 }
