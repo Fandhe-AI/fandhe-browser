@@ -249,6 +249,17 @@
         },
         undefined
     );
+    // document.defaultView: window（global）を返す標準の read-only プロパティ。d3 の bundle が
+    // `options.window = document.defaultView` から `.history` を読む（#1173・JS-5。新しい識別面は
+    // 足さない: SEC-2）。
+    defineAccessor(
+        global.Document.prototype,
+        'defaultView',
+        function () {
+            return global;
+        },
+        undefined
+    );
     Object.defineProperty(global, 'location', {
         get: function () {
             return locationObject;

@@ -352,6 +352,20 @@ async fn measure(
             eprintln!("{line}");
         }
     };
+    // console.error / warn の本文も stderr だけへ（JSONL は件数のみ。--debug-raw-exception 時のみ。
+    // 長さ上限・制御文字の除去は debug_stderr_line が行う。Issue #1173）。
+    for (n, m) in diag
+        .console_messages
+        .iter()
+        .filter(|m| matches!(format!("{:?}", m.level).as_str(), "Error" | "Warn"))
+        .enumerate()
+    {
+        let lv = format!("{:?}", m.level).to_lowercase();
+        let label = format!("{} console_{lv}#{n}", args.id);
+        if let Some(line) = debug_stderr_line(args.debug_raw_exception, &label, Some(&m.text)) {
+            eprintln!("{line}");
+        }
+    }
     for (n, e) in diag.timer_errors.iter().enumerate() {
         emit_raw(
             "timer_error",

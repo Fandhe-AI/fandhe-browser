@@ -109,6 +109,22 @@ pub fn run(engine: &str) {
         "interactive",
     );
 
+    eprintln!("case: JS-5 document.activeElement returns body (simplified, #1173)");
+    let mut p = setup(engine, None);
+    check(&mut p, "typeof document.activeElement", "object");
+    check(&mut p, "document.activeElement === document.body", "true");
+    check(&mut p, "document.activeElement instanceof Element", "true");
+    check(
+        &mut p,
+        "try { document.activeElement = null; } catch (e) {} document.activeElement === document.body",
+        "true",
+    );
+
+    eprintln!("case: JS-5 document.defaultView is window (#1173)");
+    let mut p = setup(engine, None);
+    check(&mut p, "document.defaultView === window", "true");
+    check(&mut p, "typeof document.defaultView.history", "object");
+
     eprintln!("case: JS-5 HTMLIFrameElement exists so instanceof does not throw (#1168)");
     let mut p = setup(engine, None);
     check(&mut p, "typeof HTMLIFrameElement", "function");

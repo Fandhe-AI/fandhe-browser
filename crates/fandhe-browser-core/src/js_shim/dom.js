@@ -31,6 +31,8 @@
 //   compareDocumentPosition / attributes（属性の列挙）。対応する op が無く未定義のまま。
 // - HTMLIFrameElement は名前だけ（instanceof が throw しないため。常に false。`new` は
 //   Illegal constructor）。HTMLElement と他のサブクラスは未定義のまま（#1168）。
+// - document.activeElement は簡略版（常に body。無ければ null。#1173）。focus / blur /
+//   hasFocus は未定義のままでフォーカス追跡は無い（REPAIR-3）。
 // - Comment / DocumentFragment のラッパー（nodeType 定数のみ。DOCUMENT_POSITION_* も未定義）。
 // - window / location / navigator / console は js_shim の別ソース（#779）。
 (function (global) {
@@ -353,6 +355,15 @@
         }
     });
     define(Document.prototype, 'body', {
+        get: function () {
+            return wrap(op('body'), Element);
+        }
+    });
+    // activeElement: フォーカス管理が無いため常に body（無ければ null）を返す簡略版
+    // （REPAIR-3。実装済みを装わない）。react-dom の getActiveElementDeep /
+    // getSelectionInformation が読む（#1168・#1173・JS-5）。標準プロパティで新しい識別面は
+    // 足さない（SEC-2）。setter なし。将来仕様: focus() / blur() と連動したフォーカス追跡。
+    define(Document.prototype, 'activeElement', {
         get: function () {
             return wrap(op('body'), Element);
         }

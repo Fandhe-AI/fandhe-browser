@@ -830,9 +830,9 @@ spec 対応: TASK-71・TASK-108 / MS-6 / `JS-4`・`JS-7`・`JS-8`・`MEAS-4`・`
 
 ### 次の対応
 
-1. d2・d3: `console.error` 1 件の内容の記録。現在の probe は件数しか出さず、描画が進まない手掛かりが残っている（別 issue の切り出し候補）
+1. d2・d3: `console.error` 1 件の内容の記録。現在の probe は件数しか出さず、描画が進まない手掛かりが残っている（別 issue の切り出し候補）（済み: #1173。下の節を参照）
 2. d2: `virtual_time` で打ち切られる未発火タイマー 1 件の原因調査（#1171 の次の対応 1 のまま。別 issue の切り出し候補）
-3. d3: 描画されない原因の調査（#1171 の次の対応 2 のまま。別 issue の切り出し候補）
+3. d3: 描画されない原因の調査（#1171 の次の対応 2 のまま。別 issue の切り出し候補）（一部済み: #1173。下の節を参照）
 
 ### 制約
 
@@ -847,6 +847,59 @@ cargo build --release -p fandhe-browser-core --features js-v8 --example compat_p
 target/release/examples/compat_page_script_probe --target d2=https://www.saucedemo.com --modules --selector form --debug-raw-exception --out /abs/path/d2.jsonl
 target/release/examples/compat_page_script_probe --target d3=https://demoqa.com/automation-practice-form --modules --selector form --debug-raw-exception --out /abs/path/d3.jsonl
 jq -c 'select(.type=="run") | .bridge | {listener_errors, timer_errors, net_callback_errors}' /abs/path/d2.jsonl /abs/path/d3.jsonl
+```
+
+## document.activeElement・document.defaultView の追加と d3 の原因調査（#1173）
+
+spec 対応: TASK-71・TASK-108 / MS-6 / `COMPAT-1`・`JS-5`・`MEAS-4`・`REPAIR-3`・`REPAIR-4`・`SEC-2`。
+前節（#1172）の「次の対応 1・3」にあたる、`console.error` の本文の確認と d3 の描画されない原因の調査を行った。d2・d3 を `page_script_probe --modules --debug-raw-exception` で測定した。出力はコミットしていない。
+
+### 実装の要点
+
+- probe: `--debug-raw-exception` のときだけ、`console.error` / `console.warn` の本文を stderr に `[<id> console_error#<n>] <本文>` で出す。長さ上限・制御文字と bidi 制御の除去は既存の `debug_stderr_line` が行う。JSONL と `--out` には件数だけが残る
+- 原因: d3 の `console.error` は `TypeError: Cannot read properties of undefined (reading 'history')` だった。ルーター系のコードが `document.defaultView.history` を読む形で、`document.defaultView` が未定義だったことによる（標準の既定値 `options.window = document.defaultView` の経路。推定であり、bundle 本体は確認していない）
+- `document.defaultView`（`window.js`）: `window` と同一のオブジェクトを返す read-only の標準プロパティ。新しい識別面は足さない（`SEC-2`）
+- `document.activeElement`（`dom.js`）: フォーカス管理が無いため常に `body`（無ければ `null`）を返す簡略版（`REPAIR-3`。実装済みを装わない）。`focus()` / `blur()` / `hasFocus()` は未定義のまま。react-dom の `getActiveElementDeep` が読むための先回りで、今回の測定で d3 が止まった原因そのものではない
+- 新しい bridge op・依存・`unsafe` の追加は無い。V8・boa 共通ケースで検証した
+
+### 測定条件
+
+| 項目 | 値 |
+| ---- | -- |
+| 実施日時（UTC） | 2026-10-20 |
+| OS | Linux |
+| ベース | main `c9b29849` に、本変更を加えたもの |
+| 設定 | `--modules`・V8・`--selector form`・`--debug-raw-exception`。実行上限は既定のまま |
+
+### 結果
+
+| id | 段階 | `console_error` の分類 | `timer_errors` | HTML バイト（実行後） | `form`（実行後） |
+| -- | ---- | ---------------------- | -------------- | --------------------- | ---------------- |
+| d3 | `defaultView` 追加前 | `TypeError`・undefined の `history` 読み取り | 0 件 | 437 | 0 件 |
+| d3 | `defaultView` 追加後 | `TypeError`・null の `registered` 読み取り | 0 件 | 437 | 0 件 |
+| d2 | `defaultView` 追加後 | 0 件 | 0 件 | 2618 | 1 件 |
+
+- d3 は 1 段進んだが、次の `console.error`（null の `registered` 読み取り）で止まり、`form` は 0 件のまま。**d3 では #919 にコメントしていない**
+- d2 は `abort=virtual_time`（タイマー 2 件発火・1 件未発火）のまま、`console.error` が 1 件から 0 件になり、`form` が 0 件から 1 件になった。**d2 は `form` が 1 件以上になったため #919 にコメントした**。h1 は 0 件
+- `document.activeElement` 単体の効果は今回の測定では分離していない（`defaultView` と同時に入れた）
+
+### 次の対応
+
+1. d3: `console.error` の次の不足（null の `registered` 読み取り）の特定。読む対象の候補は service worker 登録など `navigator` 系だが未確認。`--debug-raw-exception` にスタックの先頭フレームがまだ出ないため、console 側にも先頭フレームを出す診断の拡張を先に検討する（別 issue の切り出し候補）
+2. `HTMLElement` と擬似クラス selector: 今回は特定していない。core の selector は `:` を含む擬似クラスをすべて未対応として扱うため、`HTMLElement` は定義せず `typeof HTMLElement === "undefined"` を保った（`selector.rs` の拡張は別 issue の切り出し候補）
+3. `focus()` / `blur()` と連動したフォーカス追跡（`activeElement` の簡略化の解消。`REPAIR-3`）
+
+### 制約
+
+- 単一環境（Linux）・単一時点。URL のクエリ・script 本文・stack 全文は転記していない。stack 中の URL は取得していない
+- 原因の特定は `console.error` の固定文に基づく。bundle の該当コードは未確認
+
+### 再現手順
+
+```bash
+cargo build --release -p fandhe-browser-core --features js-v8 --example compat_page_script_probe
+target/release/examples/compat_page_script_probe --target d3=https://demoqa.com/automation-practice-form --modules --selector form --debug-raw-exception --out /abs/path/d3.jsonl 2>&1 >/dev/null | grep console_error
+jq -c 'select(.type=="run") | {abort, html_bytes_after, selector_after, console_error: .bridge.console_error}' /abs/path/d3.jsonl
 ```
 
 ## b5（Trello）の原因特定（#964）
