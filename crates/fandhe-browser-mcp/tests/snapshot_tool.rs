@@ -271,3 +271,15 @@ fn plug4_refused_host_port_is_outside_ephemeral_range() {
         "port {port} was reassigned to a :0 bind"
     );
 }
+
+/// PLUG-4・Issue #1187: 選んだポートは wildcard に影が無く、閉じた後に wildcard でも bind できる。
+/// 閉じたポートへの接続結果（拒否・タイムアウト・後続 I/O での拒否）は OS ごとに異なるため
+/// 検証しない。拒否の分類は mcp の分類ロジック側のテストが担う。
+#[test]
+fn plug4_refused_host_port_has_no_wildcard_shadow() {
+    let listener = common::bind_non_ephemeral_loopback();
+    let addr = listener.local_addr().expect("addr");
+    drop(listener);
+    let wildcard = TcpListener::bind(("0.0.0.0", addr.port())).expect("wildcard bind");
+    assert_eq!(wildcard.local_addr().expect("addr").port(), addr.port());
+}
