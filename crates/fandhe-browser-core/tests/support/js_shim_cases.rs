@@ -2383,6 +2383,16 @@ fn history_cases(engine: &str) {
         "#route",
     );
 
+    // url の toString 内で pushState が再入しても、内側のエントリの URL を上書きしない（push・replace 共通）。
+    check(
+        &mut p,
+        "history.replaceState(0, '', '/base'); \
+         history.pushState(2, '', {toString: function () { history.pushState(1, '', '/inner'); return '/outer'; }}); \
+         var a = history.state + ':' + location.pathname; \
+         history.back(); __fandheRunMicrotasks(); a + '|' + history.state + ':' + location.pathname",
+        "2:/outer|1:/inner",
+    );
+    eprintln!("case: history reentrant toString keeps inner entry url");
     eprintln!("case: JS-6 history state clone budget counts every array slot (shared refs)");
     check(
         &mut p,

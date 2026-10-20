@@ -266,14 +266,16 @@
         var copy = cloneState(args[0], name);
         var pubCopy = publicState(copy.value, name);
         var url = args.length > 2 ? args[2] : undefined;
-        // 書き換え前の URL（現在のエントリの URL を確定するため）。
-        var prevHref = currentHref();
+        // 書き換え前の URL（現在のエントリの URL を確定するため）。url の文字列変換は
+        // ページのコード（toString）を実行し pushState を再入させ得るため、変換後に URL op の直前で取得する。
+        var prevHref = null;
         var urlChanged = false;
         if (url !== undefined && url !== null) {
             if (typeof url === 'symbol') {
                 throw new NativeTypeError('Cannot convert a Symbol value to a string');
             }
             var urlText = strCtor(url);
+            prevHref = currentHref();
             // 空文字列は現在の URL を保持する（解決するとフラグメントが落ちるため op を呼ばない）。
             // 長すぎる URL は bridge を呼ばずに拒否する（bridge の StringTooLong を見せない。#1175）。
             if (urlText.length > MAX_URL_UNITS || (urlText !== '' && callOp('historySetUrl', urlText) !== true)) {
@@ -283,6 +285,9 @@
                 );
             }
             urlChanged = urlText !== '';
+        }
+        if (url === undefined || url === null) {
+            prevHref = currentHref();
         }
         var newHref = urlChanged ? currentHref() : prevHref;
         var cur = st.entries[st.index];
