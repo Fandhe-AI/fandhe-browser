@@ -885,7 +885,7 @@ spec 対応: TASK-71・TASK-108 / MS-6 / `COMPAT-1`・`JS-5`・`MEAS-4`・`REPAI
 
 ### 次の対応
 
-1. d3: `console.error` の次の不足（null の `registered` 読み取り）の特定。読む対象の候補は service worker 登録など `navigator` 系だが未確認。`--debug-raw-exception` にスタックの先頭フレームがまだ出ないため、console 側にも先頭フレームを出す診断の拡張を先に検討する（別 issue の切り出し候補）
+1. d3: `console.error` の次の不足（null の `registered` 読み取り）の特定。読む対象の候補は service worker 登録など `navigator` 系だが未確認。`--debug-raw-exception` にスタックの先頭フレームがまだ出ないため、console 側にも先頭フレームを出す診断の拡張を先に検討する（別 issue の切り出し候補）（済み: #1183。下の節を参照）
 2. `HTMLElement` と擬似クラス selector: 今回は特定していない。core の selector は `:` を含む擬似クラスをすべて未対応として扱うため、`HTMLElement` は定義せず `typeof HTMLElement === "undefined"` を保った（`selector.rs` の拡張は別 issue の切り出し候補）
 3. `focus()` / `blur()` と連動したフォーカス追跡（`activeElement` の簡略化の解消。`REPAIR-3`）
 
@@ -944,7 +944,7 @@ spec 対応: TASK-71・TASK-108 / MS-6 / `COMPAT-1`・`JS-6`・`JS-7`・`MEAS-4`
 ### 次の対応
 
 1. 22 タスクの通し実行と `matrix.json` の更新、回帰ゲートの有効化（#919・#920）。d2 は単体で解消を確認済み
-2. d3: `console.error` の次の不足（null の `registered` 読み取り）の特定（#1173 の次の対応 1 のまま）
+2. d3: `console.error` の次の不足（null の `registered` 読み取り）の特定（#1173 の次の対応 1 のまま）（済み: #1183。下の節を参照）
 3. IDL 属性の反映の拡張（`value`・`checked`・`id`・`className` 等と、種別ごとの既定値。`REPAIR-3`。別 issue の切り出し候補）
 4. 仮想時間の上限（30 秒）の見直しと、上限より後の定期タイマーを打ち切りとして扱うかの再評価（TASK-113・オーナー判断）
 
@@ -963,6 +963,58 @@ jq -c 'select(.type=="run") | {abort, event_loop, selector_after, html_bytes_aft
 cargo build --release -p fandhe-browser-cli
 jq '[.[] | select(.id=="d2")]' harness/compat-practical/tasks.json > /abs/path/tasks-d2.json
 bash harness/compat-practical/run_core.sh --tasks /abs/path/tasks-d2.json --page-js v8 --page-modules --out /abs/path/core-d2.jsonl
+```
+
+## console.error の先頭フレーム診断と d3 の原因特定（#1183）
+
+spec 対応: TASK-71・TASK-108 / MS-6 / `COMPAT-1`・`JS-5`・`MEAS-4`・`REPAIR-3`・`REPAIR-4`・`SEC-2`。
+前節（#1176）までの「次の対応」にあたる、d3 の `console.error`（null の `registered` 読み取り）の発生箇所の特定を行った。出力はコミットしていない。
+
+### 実装の要点
+
+- core: `console.error` / `console.warn` に渡された Error 風オブジェクトの `stack`（先頭 1024 バイト）を、`with_retain_raw_exception_messages(true)` のときだけ保持する。shim は opt-in のフラグ（`timerOriginCapture`）が false の間は `.stack` に触れず、bridge も保存せず、page_runner も破棄する（三重の fail-closed。`SEC-2`）。`Debug` には長さしか出さない。新しい op・依存・`unsafe` は無い
+- probe: `--debug-raw-exception` のとき、`console_error#<n>` / `console_warn#<n>` の本文行の次に `... frame` 行を stderr にだけ出す（形式はタイマー・リスナーと同じ。Error が渡されたときだけ）。JSONL・`--out` には出さない
+- 不足 API の補完は行っていない（下の分岐判断を参照）
+
+### 測定条件
+
+| 項目 | 値 |
+| ---- | -- |
+| 実施日時（UTC） | 2026-10-20 |
+| OS | Linux |
+| ベース | main `0ad30400` に、本変更を加えたもの |
+| 設定 | probe は `--modules`・V8・`--selector form`・`--debug-raw-exception`。実行上限は既定のまま |
+
+### 結果
+
+| id | `console_error` | 先頭フレーム |
+| -- | --------------- | ------------ |
+| d3 | 1 件（`TypeError`。null の `registered` 読み取り） | 取得できた（メイン bundle の 1 箇所） |
+
+- 今回は stderr だけを確認した。HTML バイト・`form` 件数の再取得はしていない（補完を入れていないため #1176 の値から変わらない前提。`form` は 0 件のままと推定。#919 にはコメントしていない）
+
+### 特定できた原因
+
+- 該当は emotion（`@emotion/react`）の `css` prop を処理するラッパーで、`useContext` で受けた EmotionCache の `registered` を読んでいた。この context の既定値は `typeof HTMLElement !== "undefined"` のときだけ `createCache` で作られ、未定義だと `null` になる
+- core は `HTMLElement` を意図して未定義にしている（#1168。定義すると module 評価が擬似クラス selector で失敗した）。`createCache` は `document.querySelectorAll` に `style[data-emotion]:not([data-s])` を渡す一方、core の selector は `:` の擬似クラスをすべて未対応として拒否する
+- したがって解消には「`HTMLElement` の定義」と「`:not()` の selector 対応」の両方が要る。`HTMLElement` だけを定義すると #1168 の失敗へ後退する
+
+### 次の対応
+
+1. `selector.rs` の `:not()` 対応（公開の `query` 等と共有する経路で波及が大きいため別 issue の切り出し候補。`CORE-3` 系・`COMPAT-1`）
+2. 上の対応のあとで `HTMLElement` を定義し、d3 を再測定する（`REPAIR-3`。簡略版はコメントに明記する）。`form` が 1 件以上になれば #919 へコメントする
+
+### 制約
+
+- 単一環境（Linux）・単一時点。URL・クエリ・script 本文・stack 全文は転記していない。bundle は一時ディレクトリで確認し削除した
+- `Error` の stack の形式はエンジン依存で、boa では取れない場合がある。ページは `stack` を偽造できるため、診断専用で正しさは保証しない
+- `console.error` に整形済みの文字列だけが渡された場合は先頭フレームが出ない
+
+### 再現手順
+
+```bash
+cargo build --release -p fandhe-browser-core --features js-v8 --example compat_page_script_probe
+target/release/examples/compat_page_script_probe --target d3=https://demoqa.com/automation-practice-form --modules --selector form --debug-raw-exception --out /abs/path/d3.jsonl 2>&1 >/dev/null | grep -E "console_error|frame"
 ```
 
 ## b5（Trello）の原因特定（#964）
