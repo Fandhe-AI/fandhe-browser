@@ -163,3 +163,26 @@ fn core_1_str_query_api_is_usable_from_outside_crate() {
             .is_empty()
     );
 }
+
+/// CORE-1: `:not()` の照合（emotion の `style[data-emotion]:not([data-s])`・Issue #1184）。
+#[test]
+fn core_1_not_pseudo_class_matching() {
+    let doc = parse(
+        r#"<style data-emotion="css" data-s=""></style><style data-emotion="css"></style><style></style><div class="a"></div><div class="b"></div><div></div>"#,
+    );
+    let root = doc.root();
+    let count = |sel: &str| {
+        let list = parse_selector_list(sel).expect("解析できるはず");
+        query_selector_all(&doc, root, &list)
+            .expect("キャッシュ上限に達しない")
+            .len()
+    };
+    assert_eq!(count("style[data-emotion]:not([data-s])"), 1);
+    assert_eq!(count("div:not(.a)"), 2);
+    assert_eq!(
+        count(":not(DIV):not(style):not(html):not(head):not(body)"),
+        0
+    );
+    assert_eq!(count("div:not(.a, .b)"), 1);
+    assert_eq!(count("div:not(:not(.a))"), 1);
+}

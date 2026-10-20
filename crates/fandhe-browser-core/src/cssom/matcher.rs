@@ -23,7 +23,8 @@
 //!   [`MAX_SCANNED_RULES`]、文書全体のルール数は `MAX_DOCUMENT_STYLE_RULES`（#261）で制限するが、
 //!   全要素ループの総量は呼び出し側（TASK-100）の責務
 //! - CSSOM の可観測性計装（`OperationKind` に対応 variant がない）
-//! - 疑似クラス等の未対応セレクタ（`crate::selector` が `Unsupported` にし、AST に現れない）
+//! - `:not()` 以外の疑似クラス等の未対応セレクタ（`crate::selector` が `Unsupported` にし、AST に現れない。
+//!   `:not()` は AST に現れ、照合は `query` が行う）
 
 use crate::dom::{Document, NodeId};
 use crate::error::{Error, Result};

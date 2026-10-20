@@ -15,16 +15,19 @@
 //! | ---- | ------ |
 //! | `#id` | a（[`Specificity::ids`]） |
 //! | `.class`・`[attr]`・`[attr=v]` | b（[`Specificity::classes`]） |
+//! | `:not(list)` | 引数の各複合セレクタのうち辞書順で最大の (a, b, c)（`:not` 自体は数えない） |
 //! | 型セレクタ | c（[`Specificity::types`]） |
 //! | 結合子（空白・`>`） | 数えない |
 //!
-//! 未実装（REPAIR-3: 実装済みを装わない）: `*`・疑似クラス・疑似要素・`:is()` / `:not()` /
-//! `:where()` は [`crate::selector`] が `Error::Unsupported` にするため、AST に現れず
+//! 未実装（REPAIR-3: 実装済みを装わない）: `*`・`:not()` 以外の疑似クラス・疑似要素・
+//! `:is()` / `:where()` は [`crate::selector`] が `Error::Unsupported` にするため、AST に現れず
 //! ここへ到達しない。構文対応を足す際は本モジュールの数え方も同時に拡張する（`match` は
 //! 網羅で書いてあり、`SimpleSelector` への variant 追加はコンパイルエラーで気づける）。
 
 use super::Specificity;
-use crate::selector::{ComplexSelector, CompoundSelector, SelectorList, SimpleSelector};
+use crate::selector::{
+    ComplexSelector, CompoundSelector, PseudoClass, SelectorList, SimpleSelector,
+};
 
 /// 複雑セレクタ 1 個の詳細度を返す。
 ///
@@ -62,6 +65,22 @@ fn add_compound(counts: &mut (u32, u32, u32), compound: &CompoundSelector) {
             SimpleSelector::Class(_) | SimpleSelector::Attribute(_) => {
                 counts.1 = counts.1.saturating_add(1);
             }
+            SimpleSelector::PseudoClass(PseudoClass::Not(args)) => {
+                // Selectors Level 4: 引数のうち最大の詳細度を加算する。
+                // 入れ子の深さはパーサー（MAX_PSEUDO_NESTING_DEPTH）が抑えている。
+                let max = args
+                    .iter()
+                    .map(|arg| {
+                        let mut inner = (0u32, 0u32, 0u32);
+                        add_compound(&mut inner, arg);
+                        inner
+                    })
+                    .max()
+                    .unwrap_or((0, 0, 0));
+                counts.0 = counts.0.saturating_add(max.0);
+                counts.1 = counts.1.saturating_add(max.1);
+                counts.2 = counts.2.saturating_add(max.2);
+            }
         }
     }
 }
@@ -95,6 +114,21 @@ mod tests {
             ("a > b c", (0, 0, 3)),
             ("ul li.x", (0, 1, 2)),
             ("#a #b", (2, 0, 0)),
+        ];
+        for (input, (a, b, c)) in cases {
+            assert_eq!(spec(input), Specificity::new(a, b, c), "input: {input}");
+        }
+    }
+
+    /// CORE-5: `:not()` は引数のうち最大の詳細度を加算する（Issue #1184）。
+    #[test]
+    fn core_5_not_adds_max_argument_specificity() {
+        let cases: [(&str, (u32, u32, u32)); 5] = [
+            (":not(#a)", (1, 0, 0)),
+            ("a:not(.b, #c)", (1, 0, 1)),
+            (".x:not(.y)", (0, 2, 0)),
+            ("div:not(:not(.a))", (0, 1, 1)),
+            (":not(a.b)", (0, 1, 1)),
         ];
         for (input, (a, b, c)) in cases {
             assert_eq!(spec(input), Specificity::new(a, b, c), "input: {input}");

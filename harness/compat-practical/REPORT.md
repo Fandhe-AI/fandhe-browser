@@ -1001,14 +1001,62 @@ spec 対応: TASK-71・TASK-108 / MS-6 / `COMPAT-1`・`JS-5`・`MEAS-4`・`REPAI
 
 ### 次の対応
 
-1. `selector.rs` の `:not()` 対応（公開の `query` 等と共有する経路で波及が大きいため別 issue の切り出し候補。`CORE-3` 系・`COMPAT-1`）
-2. 上の対応のあとで `HTMLElement` を定義し、d3 を再測定する（`REPAIR-3`。簡略版はコメントに明記する）。`form` が 1 件以上になれば #919 へコメントする
+1. `selector.rs` の `:not()` 対応（公開の `query` 等と共有する経路で波及が大きいため別 issue の切り出し候補。`CORE-3` 系・`COMPAT-1`）（済み: #1184。下の節を参照）
+2. 上の対応のあとで `HTMLElement` を定義し、d3 を再測定する（`REPAIR-3`。簡略版はコメントに明記する）。`form` が 1 件以上になれば #919 へコメントする（済み: #1184。ただし d3 は別の不足で止まった。下の節を参照）
 
 ### 制約
 
 - 単一環境（Linux）・単一時点。URL・クエリ・script 本文・stack 全文は転記していない。bundle は一時ディレクトリで確認し削除した
 - `Error` の stack の形式はエンジン依存で、boa では取れない場合がある。ページは `stack` を偽造できるため、診断専用で正しさは保証しない
 - `console.error` に整形済みの文字列だけが渡された場合は先頭フレームが出ない
+
+### 再現手順
+
+```bash
+cargo build --release -p fandhe-browser-core --features js-v8 --example compat_page_script_probe
+target/release/examples/compat_page_script_probe --target d3=https://demoqa.com/automation-practice-form --modules --selector form --debug-raw-exception --out /abs/path/d3.jsonl 2>&1 >/dev/null | grep -E "console_error|frame"
+```
+
+## :not() selector 対応と HTMLElement の定義（#1184）
+
+spec 対応: TASK-71・TASK-108 / MS-6 / `COMPAT-1`・`CORE-1`・`CORE-5`・`JS-5`・`MEAS-4`・`REPAIR-3`・`SEC-2`。
+前節（#1183）の「次の対応」1・2 にあたる。出力はコミットしていない。
+
+### 実装の要点
+
+- core の selector: `:not(<複合セレクタ>[, ...])` に対応した（AST は `SimpleSelector::PseudoClass(PseudoClass::Not)`）。引数は複合セレクタのみで、結合子を含む引数・`:not()` 以外の擬似クラス・擬似要素は従来どおり `Error::Unsupported`。入れ子の深さ（8）と引数件数（32）に上限を置く。詳細度は引数のうち最大のものを加算する。照合は既存の `compound_matches` を再利用する
+- 構造擬似クラス（`:first-child` 等）・`:checked` 等は足していない。cdp の `repair3_query_selector_unsupported_selector_is_error` と ai の AISNAP-9 実験（forbidden 例・指示テンプレート）が `:first-child` の拒否を前提にしており、測定の根拠も無いため（`REPAIR-3`）
+- shim: `HTMLElement` を名前だけの中間クラスとして定義した（`Element ← HTMLElement ← HTMLIFrameElement`）。`new` は Illegal constructor。ラッパーは従来どおり Element で作るため `document.body instanceof HTMLElement` は false（要素名・名前空間を返す op が無く、SVG 要素まで名乗らないため）。新しい op・依存・`unsafe` は無い
+
+### 測定条件
+
+| 項目 | 値 |
+| ---- | -- |
+| 実施日時（UTC） | 2026-10-20 |
+| OS | Linux |
+| ベース | main `d2d41d5e` に、本変更を加えたもの |
+| 設定 | probe は `--modules`・V8・`--selector form`・`--debug-raw-exception`。実行上限は既定のまま |
+
+### 結果
+
+| id | `abort` | `console_error` | HTML バイト | `form`（probe） |
+| -- | ------- | --------------- | ----------- | --------------- |
+| d3 | なし | 1 件（`TypeError: M.createElementNS is not a function`） | 437 | 0 件 |
+| d2 | `virtual_time`（#1176 と同じ保留タイマー） | 0 件 | 2713 | 1 件 |
+
+- d3: #1183 の `registered` 読み取りの TypeError は消えた（`:not()` と `HTMLElement` の両方が効いた）。次の失敗は `document.createElementNS` の未定義（`createElementNS` を呼ぶのは SVG の生成と推定。未検証）。`form` は 0 件のまま
+- d2: probe の `form` は 1 件・`console_error` は 0 件で、#1176 から変わらない（回帰なし）。`run_core.sh` による `success` 判定の再実行は未検証
+
+### 次の対応
+
+1. `document.createElementNS` の追加（簡略版。HTML・SVG 名前空間。要素名を返す op と合わせて `instanceof HTMLElement` の正確化も検討。`REPAIR-3`）。切り出し候補
+2. d3 の `form` が 1 件以上になったら #919 へコメントする
+3. d2 の `run_core.sh` による再確認
+
+### 制約
+
+- 単一環境（Linux）・単一時点。URL・script 本文・stack 全文は転記していない。実サイトの内容は時点で変わる（d2 の HTML バイトは #1176 の 2618 から 2713 に変わっているが、本変更との因果は確認していない）
+- 結論・matrix は書き換えていない（#919・#920 の担当）
 
 ### 再現手順
 

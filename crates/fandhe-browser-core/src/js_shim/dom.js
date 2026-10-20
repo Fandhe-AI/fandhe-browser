@@ -29,8 +29,10 @@
 // - parentNode / parentElement / childNodes / firstChild / lastChild / nextSibling /
 //   previousSibling / nodeValue / namespaceURI / isConnected / contains /
 //   compareDocumentPosition / attributes（属性の列挙）。対応する op が無く未定義のまま。
-// - HTMLIFrameElement は名前だけ（instanceof が throw しないため。常に false。`new` は
-//   Illegal constructor）。HTMLElement と他のサブクラスは未定義のまま（#1168）。
+// - HTMLElement・HTMLIFrameElement は名前だけ（instanceof / typeof 判定が通るため。常に false。
+//   `new` は Illegal constructor。継承は Element ← HTMLElement ← HTMLIFrameElement）。他の
+//   サブクラスは未定義のまま（#1168・#1184）。将来は要素名・名前空間を返す op を足し、HTML
+//   名前空間の要素を HTMLElement のインスタンスにする（REPAIR-3）。
 // - IDL 属性の反映は `name` / `type` だけ（簡略版。全要素に定義し、既定値・正規化なし。#1176）。
 //   `id` / `className` / `value` / `checked` 等は未反映のまま（REPAIR-3）。
 // - document.activeElement は簡略版（常に body。無ければ null。#1173）。focus / blur /
@@ -81,15 +83,23 @@
         constructor: { value: Element, writable: true, configurable: true }
     });
 
-    // react-dom の `getActiveElementDeep` が `el instanceof win.HTMLIFrameElement` で右辺 undefined の
-    // TypeError にならないための名前だけの宣言（Issue #1168・JS-5）。ラッパーは常に Element で作る
-    // （要素名を返す op が無い）ため、どの要素も `instanceof HTMLIFrameElement` は false になる
-    // （REPAIR-3。実装済みを装わない）。HTMLElement は定義しない: 定義すると d3 の module 評価が
-    // 未対応の擬似クラス selector で失敗するようになった（実測。REPORT #1168 節）。
-    function HTMLIFrameElement(token) {
+    // `typeof HTMLElement !== 'undefined'` を判定する emotion（`@emotion/react` の EmotionCacheContext）と、
+    // react-dom の `getActiveElementDeep` の `el instanceof win.HTMLIFrameElement` が右辺 undefined の
+    // TypeError にならないための名前だけの宣言（Issue #1168・#1184・JS-5）。ラッパーは常に Element で
+    // 作る（要素名・名前空間を返す op が無い）ため、どの要素も `instanceof HTMLElement` /
+    // `HTMLIFrameElement` は false になる（REPAIR-3。実装済みを装わない。全ラッパーを
+    // HTMLElement にすると SVG 要素まで名乗ってしまう）。HTMLElement は #1184 で selector の
+    // `:not()` に対応した後に定義した（定義だけ先行すると d3 が失敗した。REPORT #1168 節）。
+    function HTMLElement(token) {
         Element.call(this, token);
     }
-    HTMLIFrameElement.prototype = Object.create(Element.prototype, {
+    HTMLElement.prototype = Object.create(Element.prototype, {
+        constructor: { value: HTMLElement, writable: true, configurable: true }
+    });
+    function HTMLIFrameElement(token) {
+        HTMLElement.call(this, token);
+    }
+    HTMLIFrameElement.prototype = Object.create(HTMLElement.prototype, {
         constructor: { value: HTMLIFrameElement, writable: true, configurable: true }
     });
 
@@ -434,6 +444,7 @@
 
     expose('Node', Node);
     expose('Element', Element);
+    expose('HTMLElement', HTMLElement);
     expose('HTMLIFrameElement', HTMLIFrameElement);
     expose('Text', Text);
     expose('Document', Document);

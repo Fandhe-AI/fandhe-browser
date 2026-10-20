@@ -16,7 +16,8 @@
 //! 対応する構文（サブセット）: 型セレクタ（`div`）・ID（`#id`）・
 //! クラス（`.class`）・属性の存在（`[a]`）・属性の完全一致
 //! （`[a=v]` / `[a="v"]` / `[a='v']`）・属性の前方一致（`[a^=v]`・
-//! TASK-71.6・#760）・子孫結合子（空白）・子結合子（`>`）・
+//! TASK-71.6・#760）・`:not()`（引数は複合セレクタのリスト・入れ子可・
+//! Issue #1184）・子孫結合子（空白）・子結合子（`>`）・
 //! カンマ区切りのセレクタリスト。
 //!
 //! 照合契約（TASK-24.10・`#418`・[`crate::query`] が実装する）: AST（[`CompoundSelector::type_name`]・
@@ -32,7 +33,8 @@
 //! ## 本モジュールの範囲外（将来仕様。REPAIR-3: 実装済みを装わない）
 //!
 //! - 対象外の構文（`Error::Unsupported` を返す。サブセット実装）: `*`
-//!   （全称セレクタ）・疑似クラス / 疑似要素（`:`・`::`）・隣接 / 一般兄弟
+//!   （全称セレクタ）・`:not()` 以外の疑似クラス / 疑似要素（`:`・`::`）・
+//!   `:not()` 内の複雑セレクタ（結合子を含むもの）・隣接 / 一般兄弟
 //!   結合子（`+` / `~`）・名前空間（`|`）・`=` `^=` 以外の属性演算子（`~=` `|=`
 //!   `$=` `*=`）・属性フラグ（`i` / `s`）・エスケープ（`\`）・
 //!   入れ子（`&`）。実需が出た段階で拡張する（各 enum は
@@ -66,6 +68,13 @@ pub const MAX_COMPOUNDS_PER_COMPLEX: usize = 32;
 /// 1 個の複合セレクタに含められる単純セレクタ（ID・クラス・属性）の
 /// 最大件数。型名（`div` 等）はこの件数に数えない。
 pub const MAX_SIMPLE_SELECTORS_PER_COMPOUND: usize = 32;
+
+/// `:not()` の引数に含められる複合セレクタの最大件数（カンマ区切り）。
+pub const MAX_PSEUDO_ARGUMENTS: usize = 32;
+
+/// `:not()` の入れ子（`:not(:not(...))`）の最大の深さ。パーサーの再帰の
+/// 深さと、照合（`query`）の再帰の深さをこの値で抑える（DoS 対策）。
+pub const MAX_PSEUDO_NESTING_DEPTH: usize = 8;
 
 /// CSS の空白文字（U+000B 垂直タブは含まない。CSS Syntax の whitespace 定義）。
 fn is_css_whitespace(c: char) -> bool {
@@ -179,6 +188,18 @@ pub enum SimpleSelector {
     Class(String),
     /// `[name]` / `[name=value]`。
     Attribute(AttributeSelector),
+    /// 擬似クラス（現状は `:not()` のみ。それ以外は `Error::Unsupported`）。
+    PseudoClass(PseudoClass),
+}
+
+/// 対応する擬似クラス。擬似クラスを足すたびに [`SimpleSelector`] の variant を
+/// 増やさずに済むよう、入れ子の enum にしてある（`CORE-1`・Issue #1184）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum PseudoClass {
+    /// `:not(<compound>#)`。引数は 1 個以上の複合セレクタ（結合子は不可。
+    /// 空にはならない。不変条件はパーサーが守る）。
+    Not(Vec<CompoundSelector>),
 }
 
 /// 属性セレクタ（`[name]` または `[name=value]`）。
@@ -465,7 +486,9 @@ fn parse_attribute_value_and_close(cursor: &mut Cursor<'_>) -> Result<String> {
 
 /// 複合セレクタ（型名 + `#`/`.`/`[` の繰り返し）を解析する。
 /// 呼び出し時点でカーソルは複合セレクタの先頭を指している前提。
-fn parse_compound_selector(cursor: &mut Cursor<'_>) -> Result<CompoundSelector> {
+///
+/// `depth` は `:not()` の入れ子の深さ（最上位は 0）。
+fn parse_compound_selector(cursor: &mut Cursor<'_>, depth: usize) -> Result<CompoundSelector> {
     let start_offset = cursor.offset();
     let mut type_name = None;
     let mut simple_selectors = Vec::new();
@@ -538,6 +561,35 @@ fn parse_compound_selector(cursor: &mut Cursor<'_>) -> Result<CompoundSelector> 
                 let attr = parse_attribute_selector(cursor)?;
                 simple_selectors.push(SimpleSelector::Attribute(attr));
             }
+            Some(':') => {
+                let colon_offset = cursor.offset();
+                if simple_selectors.len() >= MAX_SIMPLE_SELECTORS_PER_COMPOUND {
+                    return Err(invalid_input_at(
+                        colon_offset,
+                        "too many simple selectors in compound selector",
+                    ));
+                }
+                cursor.bump();
+                match cursor.peek() {
+                    Some(':') => return Err(unsupported_at(colon_offset, "pseudo-element")),
+                    Some(c) if is_ident_start_or_hyphen(c) => {
+                        let ident = parse_ident(cursor)?;
+                        if ident.eq_ignore_ascii_case("not") && cursor.peek() == Some('(') {
+                            let args = parse_not_arguments(cursor, depth)?;
+                            simple_selectors
+                                .push(SimpleSelector::PseudoClass(PseudoClass::Not(args)));
+                        } else {
+                            return Err(unsupported_at(colon_offset, "pseudo-class"));
+                        }
+                    }
+                    _ => {
+                        return Err(invalid_input_at(
+                            colon_offset,
+                            "expected identifier after ':'",
+                        ));
+                    }
+                }
+            }
             _ => break,
         }
     }
@@ -550,6 +602,65 @@ fn parse_compound_selector(cursor: &mut Cursor<'_>) -> Result<CompoundSelector> 
         type_name,
         simple_selectors,
     })
+}
+
+/// `:not(` の引数（カンマ区切りの複合セレクタ）を `)` まで解析する。
+/// 呼び出し時点でカーソルは `(` を指している前提。`depth` は `:not()` を
+/// 含む複合セレクタの入れ子の深さで、上限（[`MAX_PSEUDO_NESTING_DEPTH`]）を
+/// 再帰の前に検証する。引数内の結合子は `Unsupported`（`CORE-1`・REPAIR-3）。
+fn parse_not_arguments(cursor: &mut Cursor<'_>, depth: usize) -> Result<Vec<CompoundSelector>> {
+    let open_offset = cursor.offset();
+    if depth >= MAX_PSEUDO_NESTING_DEPTH {
+        return Err(invalid_input_at(
+            open_offset,
+            "pseudo-class nesting too deep",
+        ));
+    }
+    cursor.bump();
+    let mut args = Vec::new();
+    loop {
+        cursor.skip_whitespace();
+        match cursor.peek() {
+            None | Some(')') | Some(',') => {
+                return Err(invalid_input_at(
+                    cursor.offset(),
+                    "expected compound selector in pseudo-class arguments",
+                ));
+            }
+            _ => {}
+        }
+        if args.len() >= MAX_PSEUDO_ARGUMENTS {
+            return Err(invalid_input_at(
+                cursor.offset(),
+                "too many pseudo-class arguments",
+            ));
+        }
+        args.push(parse_compound_selector(cursor, depth + 1)?);
+        let had_whitespace = cursor.skip_whitespace();
+        match cursor.peek() {
+            Some(',') => {
+                cursor.bump();
+            }
+            Some(')') => {
+                cursor.bump();
+                return Ok(args);
+            }
+            None => return Err(invalid_input_at(cursor.offset(), "expected ')'")),
+            Some('>') | Some('+') | Some('~') => {
+                return Err(unsupported_at(
+                    cursor.offset(),
+                    "complex selector in :not()",
+                ));
+            }
+            Some(_) if had_whitespace => {
+                return Err(unsupported_at(
+                    cursor.offset(),
+                    "complex selector in :not()",
+                ));
+            }
+            Some(_) => return Err(invalid_input_at(cursor.offset(), "expected ')'")),
+        }
+    }
 }
 
 /// 複合セレクタの先頭で何も解析できなかった場合に、次に来ている文字から
@@ -607,7 +718,7 @@ fn parse_combinator(cursor: &mut Cursor<'_>) -> Result<Option<Combinator>> {
 
 /// 複雑セレクタ（複合セレクタ + 結合子の連なり）を解析する。
 fn parse_complex_selector(cursor: &mut Cursor<'_>) -> Result<ComplexSelector> {
-    let first = parse_compound_selector(cursor)?;
+    let first = parse_compound_selector(cursor, 0)?;
     let mut rest = Vec::new();
 
     while let Some(combinator) = parse_combinator(cursor)? {
@@ -618,7 +729,7 @@ fn parse_complex_selector(cursor: &mut Cursor<'_>) -> Result<ComplexSelector> {
                 "too many compound selectors in complex selector",
             ));
         }
-        let compound = parse_compound_selector(cursor)?;
+        let compound = parse_compound_selector(cursor, 0)?;
         rest.push((combinator, compound));
     }
 
@@ -1292,5 +1403,93 @@ mod tests {
         use std::str::FromStr;
         let list = SelectorList::from_str("div").expect("div は解析できるはず");
         assert_eq!(list.selectors(), &[simple_type("div")]);
+    }
+
+    fn compound_of(input: &str) -> CompoundSelector {
+        let list = parse_selector_list(input).expect("must parse");
+        list.selectors()[0].first().clone()
+    }
+
+    /// CORE-1: `:not()` が AST に現れる（emotion の selector・Issue #1184）。
+    #[test]
+    fn core_1_not_parses_into_pseudo_class() {
+        let c = compound_of("style[data-emotion]:not([data-s])");
+        assert_eq!(c.type_name(), Some("style"));
+        assert_eq!(c.simple_selectors().len(), 2);
+        match &c.simple_selectors()[1] {
+            SimpleSelector::PseudoClass(PseudoClass::Not(args)) => {
+                assert_eq!(args.len(), 1);
+                assert_eq!(args[0].simple_selectors().len(), 1);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        for (input, n) in [
+            ("a:NOT(.x)", 1),
+            (":not( .a , #b )", 2),
+            (":not(:not(.a))", 1),
+        ] {
+            let c = compound_of(input);
+            match c.simple_selectors().last() {
+                Some(SimpleSelector::PseudoClass(PseudoClass::Not(args))) => {
+                    assert_eq!(args.len(), n, "input: {input}")
+                }
+                other => panic!("unexpected: {other:?}"),
+            }
+        }
+        assert_eq!(
+            compound_of("div:not(.a):not(.b)").simple_selectors().len(),
+            2
+        );
+    }
+
+    /// CORE-1・REPAIR-3: `:not()` 以外の擬似クラスと `:not()` 内の複雑セレクタは Unsupported。
+    #[test]
+    fn core_1_other_pseudo_and_complex_not_are_unsupported() {
+        for input in [
+            "a:hover",
+            "a::before",
+            ":is(a)",
+            ":first-child",
+            ":not(a b)",
+            ":not(a > b)",
+            ":not(a + b)",
+            ":not(*)",
+            ":not(a:hover)",
+        ] {
+            let err = parse_selector_list(input).expect_err(input);
+            assert!(matches!(err, Error::Unsupported { .. }), "input: {input}");
+        }
+    }
+
+    /// CORE-1: 不正な `:not()` は InvalidInput。
+    #[test]
+    fn core_1_malformed_not_is_invalid_input() {
+        for input in [
+            ":not()", ":not(a,)", ":not(,a)", ":not(", ":not(a", "a:", "a:1",
+        ] {
+            let err = parse_selector_list(input).expect_err(input);
+            assert!(matches!(err, Error::InvalidInput { .. }), "input: {input}");
+        }
+    }
+
+    /// CORE-1: 入れ子の深さ・引数件数の上限境界。
+    #[test]
+    fn core_1_not_limits_boundaries() {
+        let nest = |n: usize| format!("{}.a{}", ":not(".repeat(n), ")".repeat(n));
+        assert!(parse_selector_list(&nest(MAX_PSEUDO_NESTING_DEPTH)).is_ok());
+        assert!(parse_selector_list(&nest(MAX_PSEUDO_NESTING_DEPTH + 1)).is_err());
+        let args = |n: usize| format!(":not({})", vec![".a"; n].join(","));
+        assert!(parse_selector_list(&args(MAX_PSEUDO_ARGUMENTS)).is_ok());
+        assert!(parse_selector_list(&args(MAX_PSEUDO_ARGUMENTS + 1)).is_err());
+    }
+
+    /// CORE-1: エラーメッセージは擬似クラス名を反響せず、不正入力でも panic しない。
+    #[test]
+    fn core_1_pseudo_error_does_not_echo_name_and_never_panics() {
+        let err = parse_selector_list("a:secretname").expect_err("unsupported");
+        assert!(!err.to_string().contains("secretname"));
+        for input in [":not(あ", ":not(\\", ":not(a)あ", ":あ"] {
+            let _ = parse_selector_list(input);
+        }
     }
 }

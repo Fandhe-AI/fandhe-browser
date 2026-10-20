@@ -49,3 +49,15 @@ fn core_1_from_str_from_outside_crate() {
     assert!(matches!(simple_selectors[0], SimpleSelector::Id(ref v) if v == "main"));
     assert!(matches!(simple_selectors[1], SimpleSelector::Class(ref v) if v == "item"));
 }
+
+/// CORE-1: crate 外から `:not()` の AST を参照できる（Issue #1184）。
+#[test]
+fn core_1_not_pseudo_class_is_exposed() {
+    use fandhe_browser_core::selector::{PseudoClass, SimpleSelector};
+    let list = parse_selector_list("a:not(.x)").expect("解析できるはず");
+    let simple = &list.selectors()[0].first().simple_selectors()[0];
+    assert!(matches!(
+        simple,
+        SimpleSelector::PseudoClass(PseudoClass::Not(args)) if args.len() == 1
+    ));
+}
