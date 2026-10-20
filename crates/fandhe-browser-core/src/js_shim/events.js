@@ -25,6 +25,9 @@
 //   install 時に捕捉した `queueMicrotask` に throw する関数を積んで報告する（timers.js が `timerCallbackError`
 //   〔source microtask〕として診断に残す）。ライフサイクル用の `lifecycleListenerError` op は Rust 側が
 //   DOMContentLoaded / load しか受けないため使わない。配送中の再 dispatch は InvalidStateError（DOMException）。
+// - DOMContentLoaded / load も同じ Event 内部状態（eventStates）で生成し、`instanceof Event` と Event.prototype のメソッドが動く。
+//   初期化済みのイベントへの `Event.call(e, ...)` は TypeError で拒否する。Node の brand check は install 時に捕捉した
+//   Node.prototype で行い、ページによる global.Node の書き換えの影響を受けない。
 // - ページが生成したイベントの `isTrusted` は常に false（信頼済みを装わない。SEC-2）。
 // - `window.onpopstate` は HTML 仕様どおり、最初に非 null を代入した位置で呼ばれる内部エントリで実現する。
 //   `PopStateEvent` / `onpopstate` は主要ブラウザすべてにある標準 API で、UA・navigator 等の識別面を
@@ -182,6 +185,9 @@
     var weakGet = WeakMap.prototype.get;
     var weakSet = WeakMap.prototype.set;
     var weakHas = WeakMap.prototype.has;
+    // Node の判定用に install 時の Node.prototype と isPrototypeOf を捕捉する（dom.js が先に評価済み）。
+    var objIsPrototypeOf = Object.prototype.isPrototypeOf;
+    var nodeProto = typeof global.Node === 'function' && isObjectLike(global.Node.prototype) ? global.Node.prototype : null;
     function recordFor(obj, create) {
         if (!isObjectLike(obj)) {
             throw new NativeTypeError('Illegal invocation');
@@ -196,10 +202,11 @@
             return fnCall(weakGet, objectTargets, obj);
         }
         // brand check: EventTarget のコンストラクターで初期化済みの対象（上の objectTargets）か、
-        // 明示的に対応する Node だけを受け付ける。それ以外のレシーバーは拒否する。
+        // install 時に捕捉した Node.prototype を祖先に持つ対象だけを受け付ける。ライブの global.Node や
+        // その @@hasInstance をページが書き換えても判定は変わらない（SEC-2・JS-4）。
         var isNode = false;
         try {
-            isNode = typeof global.Node === 'function' && obj instanceof global.Node;
+            isNode = nodeProto !== null && fnCall(objIsPrototypeOf, nodeProto, obj) === true;
         } catch (e) {
             isNode = false;
         }
@@ -257,18 +264,9 @@
         return st;
     }
 
-    function Event(type, init) {
-        if (!(this instanceof Event)) {
-            throw new NativeTypeError("Failed to construct 'Event': Please use the 'new' operator");
-        }
-        if (arguments.length < 1) {
-            throw new NativeTypeError("Failed to construct 'Event': 1 argument required");
-        }
-        if (typeof type === 'symbol') {
-            throw new NativeTypeError('Cannot convert a Symbol value to a string');
-        }
-        var st = {
-            type: strCtor(type),
+    function newEventState(type) {
+        return {
+            type: type,
             bubbles: false,
             cancelable: false,
             composed: false,
@@ -281,6 +279,24 @@
             immediateStopped: false,
             inPassive: false
         };
+    }
+
+    function Event(type, init) {
+        if (!(this instanceof Event)) {
+            throw new NativeTypeError("Failed to construct 'Event': Please use the 'new' operator");
+        }
+        if (arguments.length < 1) {
+            throw new NativeTypeError("Failed to construct 'Event': 1 argument required");
+        }
+        if (typeof type === 'symbol') {
+            throw new NativeTypeError('Cannot convert a Symbol value to a string');
+        }
+        // 初期化済みのイベントへの再初期化（`Event.call(e, ...)`）は拒否する。配送中の状態の上書きを防ぐ。
+        // PopStateEvent など派生は未登録の新しい this で呼ぶため影響しない。
+        if (fnCall(weakHas, eventStates, this)) {
+            throw new NativeTypeError("Failed to construct 'Event': the event is already initialized");
+        }
+        var st = newEventState(strCtor(type));
         if (init !== undefined && init !== null) {
             if (!isObjectLike(init)) {
                 throw new NativeTypeError("Failed to construct 'Event': parameter 2 is not of type 'EventInit'");
@@ -343,6 +359,8 @@
     }
     defineTag(Event.prototype, 'Event');
     defineMethod(Event.prototype, 'constructor', Event);
+    // ライフサイクルイベント生成用に install 時の prototype を退避する（ページの Event.prototype 差し替えに影響されない）。
+    var eventProto = Event.prototype;
 
     // 1 リスナーの呼び出し。例外は microtask 経由で報告し、呼び出し元へ伝えない。
     function invokeEntry(entry, thisArg, event, st) {
@@ -511,11 +529,11 @@
 
     // 要素レベルは Node.prototype に保持のみのスタブとして定義する（document は上の own プロパティが優先）。
     // dispatchEvent は意図して定義しない（REPAIR-3）。
-    if (typeof global.Node === 'function') {
-        defineMethod(global.Node.prototype, 'addEventListener', function addEventListener(type, listener, options) {
+    if (nodeProto !== null) {
+        defineMethod(nodeProto, 'addEventListener', function addEventListener(type, listener, options) {
             addEventListenerImpl(this, type, listener, options);
         });
-        defineMethod(global.Node.prototype, 'removeEventListener', function removeEventListener(type, listener, options) {
+        defineMethod(nodeProto, 'removeEventListener', function removeEventListener(type, listener, options) {
             removeEventListenerImpl(this, type, listener, options);
         });
     }
@@ -563,7 +581,9 @@
         }
     }
 
-    function fire(target, currentTarget, event, eventName, state) {
+    // ライフサイクルの 1 対象への配送。イベントは共通の Event 内部状態（eventStates）を使うため、
+    // `instanceof Event` や Event.prototype のメソッドがそのまま動く（#1177・JS-5）。
+    function fire(target, currentTarget, event, eventName, st) {
         // 呼び出し中の登録・削除の影響を受けないよう複製して走査する。
         var source = target.items;
         var sourceCount = target.count;
@@ -572,7 +592,7 @@
             snapshot[k] = source[k];
         }
         for (var i = 0; i < sourceCount; i++) {
-            if (state.immediateStopped) {
+            if (st.immediateStopped) {
                 return;
             }
             var entry = snapshot[i];
@@ -593,8 +613,8 @@
             if (entry.once) {
                 removeEntry(target, entry);
             }
-            // currentTarget は getter 経由（ページ側が event を freeze しても代入で TypeError にならない）。
-            state.current = currentTarget;
+            st.current = currentTarget;
+            st.inPassive = entry.passive;
             try {
                 if (typeof entry.listener === 'function') {
                     fnCall(entry.listener, currentTarget, event);
@@ -603,52 +623,41 @@
                 }
             } catch (e) {
                 report(eventName, e);
+            } finally {
+                st.inPassive = false;
             }
         }
     }
 
     function dispatch(eventName) {
-        var state = null;
+        var st = null;
         try {
-            state = { propagationStopped: false, immediateStopped: false, current: null };
-            var event = {
-                type: eventName,
-                target: eventName === 'load' ? global : global.document,
-                bubbles: eventName === 'DOMContentLoaded',
-                cancelable: false,
-                defaultPrevented: false,
-                preventDefault: function () {},
-                stopPropagation: function () {
-                    state.propagationStopped = true;
-                },
-                stopImmediatePropagation: function () {
-                    state.propagationStopped = true;
-                    state.immediateStopped = true;
-                }
-            };
-            // 記述子は null プロトタイプで作る（Object.prototype.value 等の継承汚染で
-            // get と value が混在して TypeError になるのを防ぐ。JS-4）。
-            var descriptor = createObject(null);
-            descriptor.get = function () {
-                return state.current;
-            };
-            descriptor.enumerable = true;
-            descriptor.configurable = false;
-            defineProperty(event, 'currentTarget', descriptor);
+            var st0 = newEventState(eventName);
+            st0.bubbles = eventName === 'DOMContentLoaded';
+            st0.target = eventName === 'load' ? global : global.document;
+            var event = createObject(eventProto);
+            fnCall(weakSet, eventStates, event, st0);
+            st = st0;
+            st.dispatching = true;
             if (eventName === 'DOMContentLoaded') {
-                fire(documentTarget, global.document, event, eventName, state);
-                if (!state.propagationStopped) {
-                    fire(windowTarget, global, event, eventName, state);
+                st.phase = 2;
+                fire(documentTarget, global.document, event, eventName, st);
+                if (!st.stopped) {
+                    st.phase = 3;
+                    fire(windowTarget, global, event, eventName, st);
                 }
             } else if (eventName === 'load') {
-                fire(windowTarget, global, event, eventName, state);
+                st.phase = 2;
+                fire(windowTarget, global, event, eventName, st);
             }
         } catch (e) {
             // ディスパッチャーは throw しない。
         } finally {
-            // 発火終了後は保存されたイベントの currentTarget を null に戻す。
-            if (state !== null) {
-                state.current = null;
+            // 発火終了後は保存されたイベントの currentTarget を null に戻し、再配送できる状態にしておく。
+            if (st !== null) {
+                st.current = null;
+                st.phase = 0;
+                st.dispatching = false;
             }
         }
     }

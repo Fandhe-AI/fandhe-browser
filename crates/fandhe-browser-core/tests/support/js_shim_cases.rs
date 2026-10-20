@@ -2638,6 +2638,61 @@ fn event_target_cases(engine: &str) {
           document instanceof EventTarget].join('|')",
         "0|false|undefined|false|false",
     );
+
+    eprintln!(
+        "case: JS-5 lifecycle events are real Events (instanceof, prototype methods) (#1177)"
+    );
+    let mut p = setup(engine, None);
+    check(
+        &mut p,
+        "var lr = []; \
+         document.addEventListener('DOMContentLoaded', function (e) { \
+           lr.push(e instanceof Event); \
+           Event.prototype.stopPropagation.call(e); \
+           lr.push(e.type + ':' + e.eventPhase + ':' + e.bubbles + ':' + (e.target === document) + ':' + e.isTrusted); \
+         }); \
+         window.addEventListener('DOMContentLoaded', function () { lr.push('win-ran'); }); \
+         window.addEventListener('load', function (e) { \
+           Event.prototype.preventDefault.call(e); Event.prototype.stopImmediatePropagation.call(e); \
+           lr.push('load:' + e.eventPhase + ':' + (e.target === window) + ':' + e.defaultPrevented); \
+         }); \
+         __fandheLifecycle('DOMContentLoaded'); __fandheLifecycle('load'); lr.join(',')",
+        "true,DOMContentLoaded:2:true:true:false,load:2:true:false",
+    );
+
+    eprintln!("case: JS-5 re-initializing an existing Event is rejected (#1177)");
+    let mut p = setup(engine, None);
+    check(
+        &mut p,
+        "var t = new EventTarget(); var e = new Event('x'); var o = []; \
+         t.addEventListener('x', function () { \
+           try { Event.call(e, 'y'); o.push('reinit-ok'); } catch (x) { o.push(x.name); } \
+           try { t.dispatchEvent(e); o.push('redispatch-ok'); } catch (x) { o.push(x.name); } \
+           o.push(e.type + ':' + e.eventPhase); \
+         }); \
+         t.dispatchEvent(e); \
+         var pe = new PopStateEvent('popstate', { state: 3 }); \
+         o.join() + '|' + pe.state + ':' + (pe instanceof Event) + ':' + new Event('z').type",
+        "TypeError,InvalidStateError,x:2|3:true:z",
+    );
+
+    eprintln!("case: JS-4 element brand check ignores page rewrites of Node (#1177)");
+    let mut p = setup(engine, None);
+    check(
+        &mut p,
+        "var el = document.createElement('div'); var n = 0; var NodeOrig = window.Node; \
+         window.Node = function () {}; \
+         Object.defineProperty(NodeOrig, Symbol.hasInstance, { value: function () { return false; }, configurable: true }); \
+         el.addEventListener('c', function () { n++; }); el.removeEventListener('c', function () {}); \
+         var rej = []; \
+         ['addEventListener', 'removeEventListener'].forEach(function (m) { \
+           try { NodeOrig.prototype[m].call({}, 'c', function () {}); rej.push('ok'); } catch (x) { rej.push(x.name); } \
+         }); \
+         Object.defineProperty(NodeOrig, Symbol.hasInstance, { value: function () { return true; }, configurable: true }); \
+         try { NodeOrig.prototype.addEventListener.call({}, 'c', function () {}); rej.push('ok'); } catch (x) { rej.push(x.name); } \
+         rej.join()",
+        "TypeError,TypeError,TypeError",
+    );
 }
 
 /// `history` の back / forward / go と popstate（#1177・`JS-5`・`JS-6`・`REPAIR-3`・`SEC-2`）のケース。
