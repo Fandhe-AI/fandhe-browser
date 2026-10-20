@@ -29,13 +29,18 @@
 //!
 //! - `innerHTML` 設定は `fragment` サブモジュール（[`Document::set_inner_html`]。
 //!   TASK-108・Issue #778）に実装済み。HTML シリアライズは `serialize`（Issue #773）。
+//! - 名前空間付きの要素作成は [`Document::create_element_ns`]（HTML・SVG のみ。#1192）に実装済み。
+//!   MathML・null 名前空間・任意の名前空間・接頭辞付きの名前は未実装。
 //! - Document 直下に置ける要素を 1 個に限る制約、DocumentFragment の展開挿入、
-//!   名前空間付きの要素作成、`create_element("template")` 時の template contents
+//!   `create_element("template")` 時の template contents
 //!   生成（`template_contents` は `None`）。
 
 use html5ever::{LocalName, Namespace};
 
-use super::{Attribute, Document, HTML_NAMESPACE_URI, Node, NodeData, NodeId, QualName};
+use super::{
+    Attribute, Document, ElementNamespace, HTML_NAMESPACE_URI, Node, NodeData, NodeId, QualName,
+    SVG_NAMESPACE_URI,
+};
 use crate::error::{DomError, Error, NameKind, Result};
 
 /// 変更 API の既定ノード数上限（`JS-6`）。パース側の既定（1,000,000）より小さい。
@@ -305,14 +310,29 @@ impl Document {
     /// 名前の規則違反は [`DomError::InvalidName`]、ノード数上限超過は
     /// [`DomError::NodeLimitExceeded`]。
     pub fn create_element(&mut self, local_name: &str) -> Result<NodeId> {
+        self.create_element_ns(ElementNamespace::Html, local_name)
+    }
+
+    /// 名前空間を指定して未接続の要素を作成する（`JS-5`・`JS-6`・#1192。簡略版）。
+    ///
+    /// `document.createElementNS` の核。dom_bridge の `createElementNS` op から呼ばれる。
+    /// 対応は HTML・SVG の名前空間だけ（[`ElementNamespace`]）。`local_name` は接頭辞を含まない
+    /// （`:` を含む修飾名の拒否は bridge の責務）。
+    ///
+    /// 仕様との差異（REPAIR-3）: HTML 名前空間では `createElement` と同じく ASCII 小文字化する
+    /// （仕様は大文字小文字を保つが、`htmlLocalName`・IDL 属性の種別判定との食い違いを避ける簡略化）。
+    /// SVG 名前空間では大文字小文字を保つ（`clipPath`・`linearGradient` 等）。
+    ///
+    /// 名前の規則違反は [`DomError::InvalidName`]（ASCII 限定。serialize へのマークアップ注入を防ぐ）、
+    /// 上限超過は [`DomError::NodeLimitExceeded`]・[`DomError::TotalBytesExceeded`]。
+    pub fn create_element_ns(&mut self, ns: ElementNamespace, local_name: &str) -> Result<NodeId> {
         validate_name(NameKind::Element, local_name, self.limits.max_name_bytes)?;
         self.check_total_budget(local_name.len())?;
-        let lowered = local_name.to_ascii_lowercase();
-        let name = QualName::new(
-            None,
-            Namespace::from(HTML_NAMESPACE_URI),
-            LocalName::from(lowered.as_str()),
-        );
+        let (uri, local) = match ns {
+            ElementNamespace::Html => (HTML_NAMESPACE_URI, local_name.to_ascii_lowercase()),
+            ElementNamespace::Svg => (SVG_NAMESPACE_URI, local_name.to_string()),
+        };
+        let name = QualName::new(None, Namespace::from(uri), LocalName::from(local.as_str()));
         let id = self.push_node(NodeData::Element {
             name,
             attrs: Vec::new(),
@@ -691,6 +711,46 @@ mod tests {
             *slot = e;
         }
         (b, ids)
+    }
+
+    /// JS-5 / JS-6 (#1192): `create_element_ns` は SVG で大文字小文字を保ち、HTML では小文字化する。
+    #[test]
+    fn js_5_create_element_ns_namespace_and_case() {
+        let mut doc = parse("<html><body></body></html>");
+        let svg = doc
+            .create_element_ns(ElementNamespace::Svg, "linearGradient")
+            .expect("svg");
+        assert_eq!(doc.namespace_url(svg), Some(SVG_NAMESPACE_URI));
+        assert_eq!(doc.local_name(svg), Some("linearGradient"));
+        let html = doc
+            .create_element_ns(ElementNamespace::Html, "DIV")
+            .expect("html");
+        assert_eq!(doc.namespace_url(html), Some(HTML_NAMESPACE_URI));
+        assert_eq!(doc.local_name(html), Some("div"));
+    }
+
+    /// JS-5 / JS-6 (#1192): 不正な名前と上限超過は Err で、arena は変わらない。
+    #[test]
+    fn js_6_create_element_ns_rejects_invalid_and_over_limit() {
+        let mut doc = parse("<html><body></body></html>");
+        for bad in ["", "1a", "a b"] {
+            assert!(matches!(
+                dom_err(doc.create_element_ns(ElementNamespace::Svg, bad)),
+                DomError::InvalidName { .. }
+            ));
+        }
+        let long = "a".repeat(doc.limits().max_name_bytes + 1);
+        assert!(matches!(
+            dom_err(doc.create_element_ns(ElementNamespace::Svg, &long)),
+            DomError::InvalidName { .. }
+        ));
+        let before = snapshot(&doc);
+        doc.set_limits(doc.limits().with_max_nodes(doc.node_count()));
+        assert!(matches!(
+            dom_err(doc.create_element_ns(ElementNamespace::Svg, "rect")),
+            DomError::NodeLimitExceeded { .. }
+        ));
+        assert_eq!(snapshot(&doc), before);
     }
 
     /// JS-5 / JS-6 (TASK-107): `Error::Dom` の Display と source 連鎖。

@@ -32,11 +32,10 @@
 
 use std::time::Instant;
 
-use super::{Document, HTML_NAMESPACE_URI, NodeData, NodeId, QualName};
+use super::{Document, HTML_NAMESPACE_URI, NodeData, NodeId, QualName, SVG_NAMESPACE_URI};
 use crate::error::{DomError, Error, Result};
 use crate::observability::{FailureKind, OperationKind, OperationOutcome};
 
-const SVG_NAMESPACE_URI: &str = "http://www.w3.org/2000/svg";
 const MATHML_NAMESPACE_URI: &str = "http://www.w3.org/1998/Math/MathML";
 const XML_NAMESPACE_URI: &str = "http://www.w3.org/XML/1998/namespace";
 const XMLNS_NAMESPACE_URI: &str = "http://www.w3.org/2000/xmlns/";

@@ -85,6 +85,7 @@
     }
     var origRemoveAttribute = Element.prototype.removeAttribute;
     var origCreateElement = Document.prototype.createElement;
+    var origCreateElementNS = Document.prototype.createElementNS;
 
     var TOKEN = {};
     // 宣言オブジェクト → 内部状態 { el, model }。
@@ -692,6 +693,19 @@
     defineProperty(Document.prototype, 'createElement', {
         value: function createElement(name) {
             var el = fnCall(origCreateElement, this, name);
+            if (el !== null && el !== undefined) {
+                wmSet(baselines, el, '');
+            }
+            return el;
+        },
+        writable: true,
+        configurable: true,
+        enumerable: false
+    });
+
+    defineProperty(Document.prototype, 'createElementNS', {
+        value: function createElementNS(namespace, qualifiedName) {
+            var el = fnCall(origCreateElementNS, this, namespace, qualifiedName);
             if (el !== null && el !== undefined) {
                 wmSet(baselines, el, '');
             }

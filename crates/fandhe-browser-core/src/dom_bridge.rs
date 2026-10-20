@@ -334,6 +334,8 @@ enum DomOp {
     Body,
     Head,
     CreateElement,
+    /// `createElementNS(ns, name)`。HTML・SVG のみ（簡略版。`JS-5`・#1192）。
+    CreateElementNs,
     CreateTextNode,
     GetElementById,
     QuerySelector,
@@ -392,6 +394,7 @@ impl DomOp {
             "body" => Self::Body,
             "head" => Self::Head,
             "createElement" => Self::CreateElement,
+            "createElementNS" => Self::CreateElementNs,
             "createTextNode" => Self::CreateTextNode,
             "getElementById" => Self::GetElementById,
             "querySelector" => Self::QuerySelector,
@@ -450,6 +453,7 @@ impl DomOp {
             Self::Body => "body",
             Self::Head => "head",
             Self::CreateElement => "createElement",
+            Self::CreateElementNs => "createElementNS",
             Self::CreateTextNode => "createTextNode",
             Self::GetElementById => "getElementById",
             Self::QuerySelector => "querySelector",
@@ -536,7 +540,8 @@ impl DomOp {
             | Self::IsFocusable
             | Self::HtmlLocalName
             | Self::NetCancel => 1,
-            Self::QuerySelector
+            Self::CreateElementNs
+            | Self::QuerySelector
             | Self::QuerySelectorAll
             | Self::AppendChild
             | Self::RemoveChild
@@ -1261,6 +1266,27 @@ fn execute(
             let name = string_arg(op, args, 1, limits)?;
             page.ensure_index_space()?;
             let id = page.document.create_element(name)?;
+            page.encode(id)
+        }
+        DomOp::CreateElementNs => {
+            // 名前空間は許可リスト（HTML・SVG）だけを受ける。それ以外は成功を装わず Unsupported（REPAIR-3）。
+            let ns = match string_arg(op, args, 1, limits)? {
+                crate::dom::HTML_NAMESPACE_URI => crate::dom::ElementNamespace::Html,
+                crate::dom::SVG_NAMESPACE_URI => crate::dom::ElementNamespace::Svg,
+                _ => {
+                    return Err(DomBridgeError::Unsupported {
+                        operation: "createElementNS for this namespace",
+                    });
+                }
+            };
+            let name = string_arg(op, args, 2, limits)?;
+            if name.contains(':') {
+                return Err(DomBridgeError::Unsupported {
+                    operation: "createElementNS with a prefixed name",
+                });
+            }
+            page.ensure_index_space()?;
+            let id = page.document.create_element_ns(ns, name)?;
             page.encode(id)
         }
         DomOp::CreateTextNode => {
@@ -3048,6 +3074,54 @@ mod tests {
         call(&b, &[s("htmlLocalName"), s("1")]).expect_err("type");
         call(&b, &[s("htmlLocalName")]).expect_err("arity");
         call(&b, &[s("htmlLocalName"), n(input), n(input)]).expect_err("arity");
+    }
+
+    /// JS-5 / JS-6 / REPAIR-3 (#1192): `createElementNS` は HTML・SVG の名前空間だけを受け、
+    /// それ以外と接頭辞付きの名前は Unsupported で拒否する。
+    #[test]
+    fn js_5_create_element_ns_op() {
+        let b = bridge();
+        let svg = "http://www.w3.org/2000/svg";
+        let html = "http://www.w3.org/1999/xhtml";
+        let body = num(call(&b, &[s("body")]));
+        let make = |ns: &str, name: &str| call(&b, &[s("createElementNS"), s(ns), s(name)]);
+        let local = |x: f64| call(&b, &[s("htmlLocalName"), n(x)]).expect("ok");
+
+        let svg_el = num(make(svg, "svg"));
+        let clip = num(make(svg, "clipPath"));
+        let rect = num(make(svg, "rect"));
+        assert_eq!(local(clip), JsValue::Null);
+        assert_eq!(local(rect), JsValue::Null);
+        let div = num(make(html, "DIV"));
+        assert_eq!(local(div), JsValue::String("div".to_string()));
+
+        call(&b, &[s("appendChild"), n(svg_el), n(clip)]).expect("append clip");
+        call(&b, &[s("appendChild"), n(body), n(svg_el)]).expect("append svg");
+        assert_eq!(
+            call(&b, &[s("getInnerHTML"), n(body)]).expect("html"),
+            JsValue::String("<div id=\"a\"></div><svg><clipPath></clipPath></svg>".to_string())
+        );
+
+        for ns in [
+            "http://www.w3.org/1998/Math/MathML",
+            "",
+            "urn:example:other",
+        ] {
+            let err = make(ns, "rect").expect_err("unsupported ns");
+            assert!(matches!(err, DomBridgeError::Unsupported { .. }), "{err:?}");
+        }
+        let err = make(svg, "svg:rect").expect_err("prefixed");
+        assert!(matches!(err, DomBridgeError::Unsupported { .. }), "{err:?}");
+        make(svg, "").expect_err("empty name");
+        make(svg, "1a").expect_err("bad name");
+        make(svg, "a b").expect_err("bad name");
+
+        call(&b, &[s("createElementNS"), s(svg)]).expect_err("arity");
+        call(&b, &[s("createElementNS"), s(svg), s("a"), s("b")]).expect_err("arity");
+        call(&b, &[s("createElementNS"), n(1.0), s("a")]).expect_err("type");
+        call(&b, &[s("createElementNS"), s(svg), n(1.0)]).expect_err("type");
+        let long = "a".repeat(DomBridgeLimits::default().max_string_arg_bytes + 1);
+        make(svg, &long).expect_err("too long");
     }
 
     /// JS-7: `timerCallbackError` は種別を許可リストで検証し、メッセージを切り詰めて件数を頭打ちにする。

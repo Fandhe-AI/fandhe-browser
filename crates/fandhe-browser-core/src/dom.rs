@@ -183,6 +183,22 @@ use crate::observability::{
 /// よう `pub(crate)` にしてある（単一の真実源を保つ。crate 外には公開しない）。
 pub(crate) const HTML_NAMESPACE_URI: &str = "http://www.w3.org/1999/xhtml";
 
+/// SVG 名前空間の URI。`serialize`（出力規則）と `mutation::create_element_ns`・`dom_bridge` の
+/// `createElementNS`（`JS-5`・#1192）が同じ値を使うための単一の真実源（crate 外には公開しない）。
+pub(crate) const SVG_NAMESPACE_URI: &str = "http://www.w3.org/2000/svg";
+
+/// `Document::create_element_ns` が作れる要素の名前空間（許可リスト。`JS-5`・`JS-6`・#1192）。
+///
+/// 任意の名前空間文字列を arena へ入れないため、HTML・SVG の 2 値だけにする。
+/// MathML・null 名前空間・任意の名前空間は未実装（REPAIR-3。bridge が例外にする）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ElementNamespace {
+    /// HTML 名前空間（`http://www.w3.org/1999/xhtml`）。
+    Html,
+    /// SVG 名前空間（`http://www.w3.org/2000/svg`）。
+    Svg,
+}
+
 /// `parse::parse_document`（#38）が構築する DOM ドキュメント全体。
 ///
 /// `Rc`・`RefCell`・`StrTendril` を含まないため `Send + Sync` になる

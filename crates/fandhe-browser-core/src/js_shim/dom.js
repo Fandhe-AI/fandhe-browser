@@ -33,6 +33,10 @@
 //   `new` は Illegal constructor。継承は Element ← HTMLElement ← HTMLIFrameElement）。他の
 //   サブクラスは未定義のまま（#1168・#1184）。将来は要素名・名前空間を返す op を足し、HTML
 //   名前空間の要素を HTMLElement のインスタンスにする（REPAIR-3）。
+// - createElementNS は HTML・SVG の名前空間だけを扱う簡略版（#1192）。HTML 名前空間では名前を
+//   小文字化する（仕様は大文字小文字を保つ。差異）。MathML・null・その他の名前空間と接頭辞付きの名前
+//   （`svg:rect`）は例外になる（成功を装わない）。`namespaceURI` / `prefix` / `localName` / `tagName`
+//   の IDL、`SVGElement` などの SVG 側のクラス、`setAttributeNS` / `getAttributeNS` は未実装。
 // - IDL 属性の反映（#1176・#1186）は簡略版。反映するのは `name`・`type`（全要素。`type` の getter は
 //   input を列挙値へ正規化し既定 "text"、button は既定 "submit"）、`id`・`className`（全要素。SVG の
 //   className も文字列で返す点が標準と異なる）、`placeholder`・`value`・`disabled`・`checked`・
@@ -103,8 +107,10 @@
     // TypeError にならないための名前だけの宣言（Issue #1168・#1184・JS-5）。ラッパーは常に Element で
     // 作る（要素名・名前空間を返す op が無い）ため、どの要素も `instanceof HTMLElement` /
     // `HTMLIFrameElement` は false になる（REPAIR-3。実装済みを装わない。全ラッパーを
-    // HTMLElement にすると SVG 要素まで名乗ってしまう）。HTMLElement は #1184 で selector の
-    // `:not()` に対応した後に定義した（定義だけ先行すると d3 が失敗した。REPORT #1168 節）。
+    // HTMLElement にすると SVG 要素まで名乗ってしまう）。
+    // #1192 で d3 の次の失敗が instanceof 由来かを確かめた結果は REPORT #1192 節にある
+    // （由来でなければ据え置き）。
+    // HTMLElement は #1184 で selector の `:not()` に対応した後に定義した（定義だけ先行すると d3 が失敗した。REPORT #1168 節）。
     function HTMLElement(token) {
         Element.call(this, token);
     }
@@ -570,6 +576,14 @@
         writable: true,
         value: function createElement(name) {
             return wrap(op('createElement', String(name)), Element);
+        }
+    });
+    // 名前空間は null / undefined を '' にして bridge へ渡す（bridge が HTML・SVG 以外を Unsupported で拒否する）。
+    define(Document.prototype, 'createElementNS', {
+        writable: true,
+        value: function createElementNS(namespace, qualifiedName) {
+            var ns = namespace === null || namespace === undefined ? '' : String(namespace);
+            return wrap(op('createElementNS', ns, String(qualifiedName)), Element);
         }
     });
     define(Document.prototype, 'createTextNode', {

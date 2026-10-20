@@ -131,7 +131,8 @@ pub use cssom_profile::{
 };
 pub use dom::{
     Ancestors, Attribute, Children, DEFAULT_MAX_SERIALIZED_BYTES, Descendants, Document, DomLimits,
-    InnerHtmlOutcome, Node, NodeData, NodeId, QuirksMode, SerializeResult, SerializeScope,
+    ElementNamespace, InnerHtmlOutcome, Node, NodeData, NodeId, QuirksMode, SerializeResult,
+    SerializeScope,
 };
 pub use dom_bridge::{
     BridgeDiagnostics, ConsoleLevel, ConsoleMessage, DOM_BRIDGE_METHOD_NAME,

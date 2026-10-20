@@ -1119,6 +1119,60 @@ d2・d3 の再測定は行っていない（未測定）。本変更の効果は
 - `value` の代入は属性を書き換える（AI スナップショット・セレクタ・22 タスク判定と一致させるため。dirty flag は未実装）
 - `select.type` / `textarea.type` などの計算済み `type`、`form.method` 等の列挙既定値、`htmlFor`・URL 反映属性は未対応
 
+## document.createElementNS の追加と d2・d3 の再測定（#1192）
+
+spec 対応: TASK-71・TASK-108 / MS-6 / `COMPAT-1`・`JS-5`・`JS-6`・`MEAS-4`・`REPAIR-3`・`SEC-2`。
+Issue #1184 節の「次の対応」1〜3、#1185 節の「次の対応 2・3」、#1186 節の「次の対応 4」のうち d2・d3 の再測定にあたる。出力はコミットしていない。
+
+### 実装の要点
+
+- core の dom: `Document::create_element_ns(ElementNamespace, name)`。名前空間は `Html`・`Svg` の 2 値の許可リスト（文字列は arena に保存しない）。名前の検証・件数・保持バイト数の上限は既存の `create_element` と同じ。SVG は大文字小文字を保ち（`clipPath` 等）、HTML は ASCII 小文字化する（仕様は保つ。`htmlLocalName` との整合のための差異。`REPAIR-3`）
+- bridge: op `createElementNS`（2 引数）。HTML・SVG 以外の名前空間（null・空文字・MathML・任意の文字列）と `:` を含む名前は `Unsupported` で拒否する（成功を装わない）
+- shim: `Document.prototype.createElementNS`（null / undefined の名前空間は `''` にして bridge が拒否）。`style.js` でも `createElement` と同様に baseline を `''` にする
+- `instanceof HTMLElement`: 変更しない（据え置き）。d3 の次の失敗（下記）が `instanceof` 由来ではなく、parse 済みの `document.body` と `createElement` の結果を食い違わせないため。ラッパーは Element のままで、`createElementNS` の結果も `instanceof HTMLElement` は false
+- 未実装: MathML・null 名前空間・接頭辞付きの名前、`namespaceURI`・`prefix`・`localName`・`tagName` の IDL、`SVGElement`、`setAttributeNS` / `getAttributeNS`。新しい依存・`unsafe`・window の識別面は無い
+
+### 測定条件
+
+| 項目 | 値 |
+| ---- | -- |
+| 実施日時（UTC） | 2026-10-20 |
+| OS | Linux |
+| ベース | main `b380a792` に、本変更を加えたもの |
+| 設定 | probe は `--modules`・V8・`--selector form`・`--debug-raw-exception`。d2 の `run_core.sh` は `--page-js v8 --page-modules`（d2 のみのタスク定義） |
+
+### 結果
+
+| id | `abort` | `console_error` | HTML バイト | `form`（probe） |
+| -- | ------- | --------------- | ----------- | --------------- |
+| d3 | なし | 32 件（31 件が `TypeError: Cannot read properties of undefined (reading 'length')`、最後の 1 件が `TypeError: document.getElementsByTagName is not a function`） | 1852 | 0 件 |
+| d2 | `virtual_time`（保留タイマー） | 0 件 | 2727 | 1 件 |
+
+- d3: `createElementNS is not a function` は消え、HTML は 437 から 1852 バイトに増えた（描画が進んだ）。`form` は 0 件のまま。次の失敗は `length` 読み取りの TypeError（同一フレームで 31 回。読み取り元のプロパティは未特定）と、`document.getElementsByTagName` の未定義。いずれも `instanceof HTMLElement` の判定とは無関係に見える（未検証）
+- d2: probe の `form` は 1 件・`console_error` は 0 件で回帰なし。`run_core.sh`（d2 単体）は `success=true`（`form_fields`・3 件）
+- d3 の `form` は 0 件のため、#919 へのコメントはしていない
+
+### 次の対応
+
+1. d3 の `length` 読み取りの TypeError の特定（先頭フレームの診断を使い、undefined になっているプロパティを調べる。コレクション系 API の未実装が疑われる。未検証）
+2. `document.getElementsByTagName`（と、要素側の同名メソッド）の追加（簡略版。`REPAIR-3`）。切り出し候補
+3. `namespaceURI`・`tagName`・`localName` の公開と HTML 要素の具象サブクラス（#1186 の次の対応 1）
+4. d3 の `form` が 1 件以上になったら #919 へコメントする
+
+### 制約
+
+- 単一環境（Linux）・単一時点。URL・script 本文・stack 全文は転記していない。実サイトの内容は時点で変わる
+- 結論・matrix は書き換えていない（#919・#920 の担当）
+
+### 再現手順
+
+```bash
+cargo build --release -p fandhe-browser-core --features js-v8 --example compat_page_script_probe
+target/release/examples/compat_page_script_probe --target d3=https://demoqa.com/automation-practice-form --modules --selector form --debug-raw-exception --out /abs/path/d3.jsonl 2>&1 >/dev/null | grep -E "console_error|frame"
+cargo build --release -p fandhe-browser-cli
+bash harness/compat-practical/run_core.sh --tasks /abs/path/d2-tasks.json --page-js v8 --page-modules --out /abs/path/core.jsonl
+```
+
 ## b5（Trello）の原因特定（#964）
 
 spec 対応: TASK-71 / MS-6 / `MEAS-4`・`COMPAT-1`・`COMPAT-4`・`JS-4`・`JS-6`・`SEC-2`・`REPAIR-3`。関連 Issue: #918・#758・#309。
