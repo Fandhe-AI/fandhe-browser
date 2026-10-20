@@ -34,6 +34,10 @@
 //! `style.js`（#1141・`JS-5`・`JS-6`・`SEC-2`）は要素の `style`（最小の `CSSStyleDeclaration` 相当）を
 //! 提供し、`style` 属性へ既存の `setAttribute` op で同期する（`getComputedStyle`・レイアウト・値の構文検証・
 //! HTML 由来の `style` 属性の読み取りは未実装。ベンダー接頭辞付きのプロパティは意図して定義しない）。
+//! `stylesheet.js`（#1202・`JS-5`・`JS-6`・`REPAIR-3`）は `<style>` 要素の `sheet` と `document.styleSheets` の
+//! 最小の面（`insertRule` / `deleteRule` / 持続する `cssRules`）を提供する。emotion の speedy 経路を通すためのもので、
+//! `<style>` の内容の反映・Rust 側 CSSOM との連携・グローバルの `CSSStyleSheet` は未実装。dom.js の窓口
+//! `__fandheDomStyleSheetHandoff` を install 時に捕捉し、abort.js の `DOMException` を使うため style.js の次に評価する。
 //! `url.js`（#1144・`JS-5`・`JS-6`・`REPAIR-3`）は `URL` / `URLSearchParams` を提供し、URL の解析は
 //! bridge op `urlParse`（core の `reqwest::Url` に委譲）、form-urlencoded は JS で実装する
 //! （`protocol`・`host`・`port`・`pathname` 等の setter・`createObjectURL`・`URLPattern`・
@@ -107,6 +111,10 @@ pub const JS_SHIM_SOURCES: &[JsShimSource] = &[
     JsShimSource {
         name: "style.js",
         source: include_str!("style.js"),
+    },
+    JsShimSource {
+        name: "stylesheet.js",
+        source: include_str!("stylesheet.js"),
     },
     JsShimSource {
         name: "url.js",

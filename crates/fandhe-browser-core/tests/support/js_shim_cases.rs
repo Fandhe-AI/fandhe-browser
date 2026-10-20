@@ -55,6 +55,7 @@ fn setup_html(engine: &str, html: &str, limit_extra_nodes: Option<usize>) -> Pag
             "net.js",
             "observers.js",
             "style.js",
+            "stylesheet.js",
             "url.js",
             "storage.js",
             "history.js",
@@ -542,6 +543,7 @@ pub fn run(engine: &str) {
     focus_cases(engine);
     create_element_ns_cases(engine);
     get_elements_by_tag_name_cases(engine);
+    style_sheet_cases(engine);
 
     eprintln!("case: JS-5 disabled runtime does not pretend to install");
     let mut disabled = JsRuntime::disabled();
@@ -3492,5 +3494,148 @@ fn get_elements_by_tag_name_cases(engine: &str) {
         &mut p,
         "try { Document.prototype.getElementsByTagName.call({}, 'div'); 'ok' } catch (e) { 'threw' }",
         "threw",
+    );
+}
+
+/// `Element.prototype.sheet` / `document.styleSheets`（#1202・`JS-5`・`JS-6`・`REPAIR-3`）。
+fn style_sheet_cases(engine: &str) {
+    const SVG: &str = "http://www.w3.org/2000/svg";
+    eprintln!("case: JS-5 style element sheet: null when detached, stable object when connected");
+    let mut p = setup(engine, None);
+    check(
+        &mut p,
+        "var el = document.createElement('style'); String(el.sheet)",
+        "null",
+    );
+    check(
+        &mut p,
+        "document.head.appendChild(el); var s = el.sheet; \
+         (typeof s) + '|' + (el.sheet === s) + '|' + (s.ownerNode === el) + '|' + s.type + '|' + s.href + '|' + s.disabled",
+        "object|true|true|text/css|null|false",
+    );
+    check(
+        &mut p,
+        "document.head.removeChild(el); String(el.sheet)",
+        "null",
+    );
+    eprintln!("case: JS-5 sheet is undefined for non-style and SVG style elements");
+    check(
+        &mut p,
+        &format!(
+            "var sv = document.createElementNS('{SVG}', 'style'); document.body.appendChild(sv); \
+             String(document.createElement('div').sheet) + '|' + String(sv.sheet)"
+        ),
+        "undefined|undefined",
+    );
+    check(
+        &mut p,
+        "try { Object.getOwnPropertyDescriptor(Element.prototype, 'sheet').get.call({}); 'ok' } catch (e) { e instanceof TypeError ? 'TypeError' : 'other' }",
+        "TypeError",
+    );
+
+    eprintln!("case: JS-5 insertRule / deleteRule keep a persistent cssRules list");
+    let mut p = setup(engine, None);
+    check(
+        &mut p,
+        "var t = document.createElement('style'); document.head.appendChild(t); var s = t.sheet; var rules = s.cssRules; \
+         rules.length + '|' + String(rules.item(0)) + '|' + (s.cssRules === rules)",
+        "0|null|true",
+    );
+    check(
+        &mut p,
+        "var r0 = s.insertRule('.a{color:red}', 0); var r1 = s.insertRule('  .b{color:blue}  ', s.cssRules.length); \
+         var r2 = s.insertRule('.c{color:green}'); \
+         [r0, r1, r2, rules.length, rules[0].cssText, rules[1].cssText, rules[2].cssText, rules.item(1) === rules[1], \
+          rules[0].parentStyleSheet === s, s.cssRules === rules].join('|')",
+        "0|1|0|3|.c{color:green}|.a{color:red}|.b{color:blue}|true|true|true",
+    );
+    check(
+        &mut p,
+        "s.deleteRule(0); [rules.length, rules[0].cssText, String(rules[2]), String(rules.item(2))].join('|')",
+        "2|.a{color:red}|undefined|null",
+    );
+    check(
+        &mut p,
+        "var names = []; \
+         try { s.deleteRule(5); } catch (e) { names.push(e.name); } \
+         try { s.insertRule('.z{}', 9); } catch (e) { names.push(e.name); } \
+         names.join('|') + '|' + rules.length",
+        "IndexSizeError|IndexSizeError|2",
+    );
+
+    eprintln!("case: JS-5 insertRule accepts one rule and rejects malformed input (SyntaxError)");
+    check(
+        &mut p,
+        "var ok = []; var bad = []; \
+         ['@media (min-width:1px){.a{color:red}}', '@font-face{font-family:x;src:url(\"a;b}.woff\")}', '@import url(x.css);', \
+          '@import url(x.css)', '.a{content:\"}\"}', '.a{/* } */color:red}', '.a{content:\"\\\\\"}\"}', '/*c*/ .a{} /*d*/'].forEach(function (r) { \
+            try { s.insertRule(r, 0); ok.push(1); } catch (e) { ok.push(e.name); } }); \
+         ['', '   ', '.a{', '.a{}.b{}', '{}', '.a{} x', '}', '.a{color:\"red}', '.a;'].forEach(function (r) { \
+            try { s.insertRule(r, 0); bad.push('ok'); } catch (e) { bad.push(e.name); } }); \
+         ok.join(',') + '|' + bad.join(',')",
+        "1,1,1,1,1,1,1,1|SyntaxError,SyntaxError,SyntaxError,SyntaxError,SyntaxError,SyntaxError,SyntaxError,SyntaxError,SyntaxError",
+    );
+
+    eprintln!("case: JS-5 emotion speedy path (sheet.insertRule at cssRules.length)");
+    let mut p = setup(engine, None);
+    check(
+        &mut p,
+        "var t = document.createElement('style'); document.head.appendChild(t); var s = t.sheet; \
+         for (var i = 0; i < 200; i++) { s.insertRule('.c' + i + '{color:red}', s.cssRules.length); } \
+         s.cssRules.length + '|' + s.cssRules[199].cssText + '|' + document.styleSheets.length",
+        "200|.c199{color:red}|1",
+    );
+
+    eprintln!(
+        "case: JS-6 insertRule over the length limit throws QuotaExceededError without growing"
+    );
+    check(
+        &mut p,
+        "var big = '.a{content:\"' + new Array(65537).join('x') + '\"}'; var nm = ''; \
+         try { s.insertRule(big, 0); nm = 'ok'; } catch (e) { nm = e.name; } nm + '|' + s.cssRules.length",
+        "QuotaExceededError|200",
+    );
+
+    eprintln!(
+        "case: JS-5 document.styleSheets lists connected HTML style sheets in document order"
+    );
+    let mut p = setup_html(
+        engine,
+        "<html><head><style>.p{}</style></head><body><div></div><script>x</script></body></html>",
+        None,
+    );
+    check(&mut p, "document.styleSheets.length", "1");
+    check(
+        &mut p,
+        &format!(
+            "var a = document.createElement('style'); var b = document.createElement('style'); \
+             document.body.appendChild(b); document.head.appendChild(a); \
+             document.body.appendChild(document.createElementNS('{SVG}', 'style')); \
+             var ss = document.styleSheets; \
+             [ss.length, ss[0].ownerNode === document.querySelector('style'), ss[1].ownerNode === a, ss[2].ownerNode === b, \
+              ss.item(2) === ss[2], String(ss.item(3)), String(ss[3])].join('|')"
+        ),
+        "3|true|true|true|true|null|undefined",
+    );
+    check(
+        &mut p,
+        "document.body.removeChild(b); [document.styleSheets.length, String(b.sheet)].join('|')",
+        "2|null",
+    );
+
+    eprintln!("case: JS-5 stylesheet shim exposes no globals and removes its handoff");
+    check(
+        &mut p,
+        "typeof globalThis.__fandheDomStyleSheetHandoff + '|' + typeof CSSStyleSheet + '|' + typeof StyleSheetList + '|' + typeof CSSRule",
+        "undefined|undefined|undefined|undefined",
+    );
+
+    eprintln!("case: JS-5 stylesheet shim survives reinstall");
+    p.rt.install_dom_shim(&p.bridge).expect("reinstall");
+    check(
+        &mut p,
+        "var q = document.createElement('style'); document.head.appendChild(q); \
+         q.sheet.insertRule('.r{}', 0) + '|' + document.styleSheets.length",
+        "0|3",
     );
 }
