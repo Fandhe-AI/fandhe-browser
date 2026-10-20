@@ -1233,7 +1233,7 @@ bash harness/compat-practical/run_core.sh --tasks /abs/path/d2-tasks.json --page
 ## document.styleSheets と style 要素の sheet の追加と d2・d3 の再測定（#1202）
 
 spec 対応: TASK-71・TASK-108 / MS-6 / `COMPAT-1`・`JS-5`・`JS-6`・`MEAS-4`・`REPAIR-3`・`SEC-2`。
-#1200 節の「次の対応」1 にあたる。出力はコミットしていない。
+Issue #1200 節の「次の対応」1 にあたる。出力はコミットしていない。
 
 ### 実装の要点
 
@@ -1282,7 +1282,7 @@ spec 対応: TASK-71・TASK-108 / MS-6 / `COMPAT-1`・`JS-5`・`JS-6`・`MEAS-4`
 
 ### 再現手順
 
-#1200 節の再現手順と同じ（probe は d3、`run_core.sh` は d2 のみのタスク定義）。
+Issue #1200 節の再現手順と同じ（probe は d3、`run_core.sh` は d2 のみのタスク定義）。
 
 ## b5（Trello）の原因特定（#964）
 

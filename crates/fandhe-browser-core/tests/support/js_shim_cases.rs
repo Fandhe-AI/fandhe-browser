@@ -3603,12 +3603,35 @@ fn style_sheet_cases(engine: &str) {
         "TypeError|200",
     );
 
+    eprintln!("case: JS-6 deleteRule refunds the untrimmed charge and detaches parentStyleSheet");
+    check(
+        &mut p,
+        "var t4 = document.createElement('style'); document.head.appendChild(t4); var s4 = t4.sheet; \
+         var pad = new Array(65001).join(' ') + '.a{}'; var kept = null; var okc = 0; \
+         for (var m = 0; m < 65; m++) { s4.insertRule(pad, 0); if (m === 0) { kept = s4.cssRules[0]; } s4.deleteRule(0); okc++; } \
+         var q4 = s4.insertRule(pad, 0); \
+         [okc, q4, s4.cssRules.length, kept.parentStyleSheet === null, s4.cssRules[0].parentStyleSheet === s4].join('|')",
+        "65|0|1|true|true",
+    );
+
     eprintln!("case: JS-6 insertRule beyond 65536 rules throws QuotaExceededError");
+    // 1 回の評価に 2 秒のタイムアウトがあるため、65536 回の挿入を 4 回の評価に分ける（状態は評価をまたいで残る）。
     check(
         &mut p,
         "var t2 = document.createElement('style'); document.head.appendChild(t2); var s2 = t2.sheet; \
-         for (var j = 0; j < 65536; j++) { s2.insertRule('.a{}', s2.cssRules.length); } \
-         var nm3 = ''; try { s2.insertRule('.a{}', 0); nm3 = 'ok'; } catch (e) { nm3 = e.name; } \
+         for (var j = 0; j < 16384; j++) { s2.insertRule('.a{}', s2.cssRules.length); } s2.cssRules.length",
+        "16384",
+    );
+    for expected in ["32768", "49152", "65536"] {
+        check(
+            &mut p,
+            "for (var j = 0; j < 16384; j++) { s2.insertRule('.a{}', s2.cssRules.length); } s2.cssRules.length",
+            expected,
+        );
+    }
+    check(
+        &mut p,
+        "var nm3 = ''; try { s2.insertRule('.a{}', 0); nm3 = 'ok'; } catch (e) { nm3 = e.name; } \
          s2.cssRules.length + '|' + nm3",
         "65536|QuotaExceededError",
     );

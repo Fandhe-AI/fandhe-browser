@@ -75,6 +75,9 @@
     var wmGet = Function.prototype.call.bind(WeakMap.prototype.get);
     var wmSet = Function.prototype.call.bind(WeakMap.prototype.set);
     var sCharCodeAt = Function.prototype.call.bind(String.prototype.charCodeAt);
+    var aPop = Function.prototype.call.bind(Array.prototype.pop);
+    var sTrim = Function.prototype.call.bind(String.prototype.trim);
+    var sIndexOf = Function.prototype.call.bind(String.prototype.indexOf);
     var sSub = Function.prototype.call.bind(String.prototype.substring);
     var ElementProto = Element.prototype;
     var DocumentProto = Document.prototype;
@@ -87,7 +90,7 @@
     var sheetStates = new WeakMap();
     // 要素 → シート（同じ要素は常に同じオブジェクト）。
     var sheetsByElement = new WeakMap();
-    // ルールオブジェクト → { text, sheet }。
+    // ルールオブジェクト → { text, sheet, charge }。
     var ruleStates = new WeakMap();
     var warned = false;
 
@@ -229,7 +232,41 @@
         return blocks === 0 && (atDone || (isAt && prelude));
     }
 
+    // JS の trim が除くが CSS 空白ではない文字（NBSP・VT・各種 Unicode 空白・BOM）。
+    var EXTRA_JS_SPACES = [
+        '\u00a0', '\u000b', '\u1680', '\u2000', '\u2001', '\u2002', '\u2003', '\u2004', '\u2005',
+        '\u2006', '\u2007', '\u2008', '\u2009', '\u200a', '\u2028', '\u2029', '\u202f', '\u205f',
+        '\u3000', '\ufeff'
+    ];
+
+    // JS の trim が除いた部分（JS 空白だけで構成される）が CSS 空白だけかを、ネイティブの
+    // indexOf だけで判定する（CSS 空白でない JS 空白を含まなければ全て CSS 空白）。
+    function isAllCssSpace(str) {
+        for (var k = 0; k < EXTRA_JS_SPACES.length; k++) {
+            if (sIndexOf(str, EXTRA_JS_SPACES[k]) !== -1) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    // 前後の CSS 空白（SP・TAB・LF・CR・FF）を除く。長い空白でも走査が軽くなるよう、まず
+    // ネイティブの trim で候補を作り、除かれた部分に CSS 空白でない JS 空白が無いと確認できたときに採用する
+    // （JS の trim は NBSP 等も除くが、CSS では識別子の一部になり得るため）。確認できなければ
+    // 1 文字ずつの走査に戻る。
     function trimCss(text) {
+        var n = text.length;
+        if (n === 0 || (sCharCodeAt(text, 0) > 32 && sCharCodeAt(text, n - 1) > 32)) {
+            return text;
+        }
+        var t = sTrim(text);
+        if (t.length === text.length) {
+            return text;
+        }
+        var lead = t.length === 0 ? text.length : sIndexOf(text, t);
+        if (isAllCssSpace(sSub(text, 0, lead)) && isAllCssSpace(sSub(text, lead + t.length, text.length))) {
+            return t;
+        }
         var s = 0;
         var e = text.length;
         while (s < e && isSpace(sCharCodeAt(text, s))) {
@@ -287,6 +324,17 @@
         defineProperty(list, 'length', { value: n, writable: false, enumerable: false, configurable: true });
     }
 
+    // length は rules の件数を読む own アクセサ（挿入のたびに定義し直さない。set は無く読み取り専用）。
+    function defineLength(list, rules) {
+        defineProperty(list, 'length', {
+            get: function () {
+                return rules.length;
+            },
+            enumerable: false,
+            configurable: true
+        });
+    }
+
     function syncList(st, from, oldLen) {
         var list = st.list;
         var rules = st.rules;
@@ -296,7 +344,6 @@
         for (var j = rules.length; j < oldLen; j++) {
             delete list[j];
         }
-        setLength(list, rules.length);
     }
 
     // --- CSSStyleSheet 相当 ---
@@ -376,22 +423,29 @@
                     'QuotaExceededError'
                 );
             }
-            if (!isSingleRule(text)) {
+            // 前後の空白は構造検査に影響しないため、trim 後を走査する（長い空白の走査を軽くする）。
+            var trimmed = trimCss(text);
+            if (!isSingleRule(trimmed)) {
                 throw domError(
                     "Failed to execute 'insertRule' on 'CSSStyleSheet': Failed to parse the rule.",
                     'SyntaxError'
                 );
             }
             var ruleObj = createObject(RuleProto);
-            wmSet(ruleStates, ruleObj, { text: trimCss(text), sheet: this });
+            wmSet(ruleStates, ruleObj, { text: trimmed, sheet: this, charge: text.length });
             // 末尾追加は O(1)、途中挿入だけ後ろをずらす。
-            st.rules[oldLen] = ruleObj;
+            var rules = st.rules;
+            rules[oldLen] = ruleObj;
             for (var i = oldLen; i > index; i--) {
-                st.rules[i] = st.rules[i - 1];
+                rules[i] = rules[i - 1];
             }
-            st.rules[index] = ruleObj;
+            rules[index] = ruleObj;
             st.total += text.length;
-            syncList(st, index, oldLen);
+            if (index === oldLen) {
+                defineProperty(st.list, oldLen, { value: ruleObj, writable: false, enumerable: true, configurable: true });
+            } else {
+                syncList(st, index, oldLen);
+            }
             return index;
         },
         writable: true,
@@ -411,12 +465,15 @@
             }
             var rst = wmGet(ruleStates, st.rules[at]);
             if (rst !== undefined) {
-                st.total -= rst.text.length;
+                // 挿入時に計上した文字数（trim 前）をそのまま返す。
+                st.total -= rst.charge;
+                // 保持済みの削除済みルール参照から親シートを外す。
+                rst.sheet = null;
             }
             for (var i = at; i < oldLen - 1; i++) {
                 st.rules[i] = st.rules[i + 1];
             }
-            st.rules.length = oldLen - 1;
+            aPop(st.rules);
             syncList(st, at, oldLen);
         },
         writable: true,
@@ -430,8 +487,9 @@
         }
         s = createObject(SheetProto);
         var list = createObject(CssRuleListLike.prototype);
-        setLength(list, 0);
-        wmSet(sheetStates, s, { el: el, rules: [], total: 0, list: list, disabled: false });
+        var rules = [];
+        defineLength(list, rules);
+        wmSet(sheetStates, s, { el: el, rules: rules, total: 0, list: list, disabled: false });
         wmSet(sheetsByElement, el, s);
         return s;
     }
