@@ -345,6 +345,7 @@ enum DomOp {
     RemoveAttribute,
     GetAttribute,
     GetTextContent,
+    GetOptionText,
     SetTextContent,
     GetInnerHtml,
     SetInnerHtml,
@@ -380,6 +381,8 @@ enum DomOp {
     MutationObserverLimit,
     MutationOptionsIgnored,
     UrlParse,
+    /// HTML 名前空間の要素の local name を返す（#1186。dom.js の IDL 属性の種別判定用）。
+    HtmlLocalName,
 }
 
 impl DomOp {
@@ -400,6 +403,7 @@ impl DomOp {
             "removeAttribute" => Self::RemoveAttribute,
             "getAttribute" => Self::GetAttribute,
             "getTextContent" => Self::GetTextContent,
+            "getOptionText" => Self::GetOptionText,
             "setTextContent" => Self::SetTextContent,
             "getInnerHTML" => Self::GetInnerHtml,
             "setInnerHTML" => Self::SetInnerHtml,
@@ -432,6 +436,7 @@ impl DomOp {
             "netCancel" => Self::NetCancel,
             "isInclusiveAncestor" => Self::IsInclusiveAncestor,
             "isFocusable" => Self::IsFocusable,
+            "htmlLocalName" => Self::HtmlLocalName,
             "mutationObserverLimit" => Self::MutationObserverLimit,
             "mutationOptionsIgnored" => Self::MutationOptionsIgnored,
             "urlParse" => Self::UrlParse,
@@ -456,6 +461,7 @@ impl DomOp {
             Self::RemoveAttribute => "removeAttribute",
             Self::GetAttribute => "getAttribute",
             Self::GetTextContent => "getTextContent",
+            Self::GetOptionText => "getOptionText",
             Self::SetTextContent => "setTextContent",
             Self::GetInnerHtml => "getInnerHTML",
             Self::SetInnerHtml => "setInnerHTML",
@@ -488,6 +494,7 @@ impl DomOp {
             Self::NetCancel => "netCancel",
             Self::IsInclusiveAncestor => "isInclusiveAncestor",
             Self::IsFocusable => "isFocusable",
+            Self::HtmlLocalName => "htmlLocalName",
             Self::MutationObserverLimit => "mutationObserverLimit",
             Self::MutationOptionsIgnored => "mutationOptionsIgnored",
             Self::UrlParse => "urlParse",
@@ -513,6 +520,7 @@ impl DomOp {
             | Self::CreateTextNode
             | Self::GetElementById
             | Self::GetTextContent
+            | Self::GetOptionText
             | Self::GetInnerHtml
             | Self::GetLocation
             | Self::SetLocationHash
@@ -526,6 +534,7 @@ impl DomOp {
             | Self::NetOptionsIgnored
             | Self::MutationOptionsIgnored
             | Self::IsFocusable
+            | Self::HtmlLocalName
             | Self::NetCancel => 1,
             Self::QuerySelector
             | Self::QuerySelectorAll
@@ -769,6 +778,9 @@ fn string_arg<'a>(
     check_string_len(s, index, limits)?;
     Ok(s)
 }
+
+/// `getOptionText` の走査ノード数の上限（短いテキストが多数ある深い DOM でも走査量を抑える）。
+const MAX_OPTION_TEXT_VISITS: usize = 1_000_000;
 
 fn check_string_len(s: &str, index: usize, limits: &DomBridgeLimits) -> Result<(), DomBridgeError> {
     if s.len() > limits.max_string_arg_bytes {
@@ -1089,6 +1101,19 @@ fn execute(
             let node = page.node_arg(op, args, 1)?;
             Ok(JsValue::Bool(focus::is_focusable(&page.document, node)))
         }
+        // HTML 名前空間の要素の local name（ASCII 小文字）。SVG・MathML 要素・テキスト・文書は null
+        // （dom.js が input / button 等の HTML の規則を SVG の同名要素へ当てないため。#1186・JS-5）。
+        // 読み取り専用で、応答は上限（JS-6）に従う。
+        DomOp::HtmlLocalName => {
+            let node = page.node_arg(op, args, 1)?;
+            if page.document.is_element(node)
+                && page.document.namespace_url(node) == Some(crate::dom::HTML_NAMESPACE_URI)
+                && let Some(name) = page.document.local_name(node)
+            {
+                return string_response(name.to_string(), limits);
+            }
+            Ok(JsValue::Null)
+        }
         DomOp::TimerCallbackError => {
             let name = string_arg(op, args, 1, limits)?;
             // 例外の種類の名前（`error.name`。空文字可）。語彙外は要約側で `other` に落とす。
@@ -1359,6 +1384,47 @@ fn execute(
                 Some(text) => string_response(text, limits),
                 None => Ok(JsValue::Null),
             }
+        }
+        DomOp::GetOptionText => {
+            let node = page.node_arg(op, args, 1)?;
+            let doc = &page.document;
+            // getTextContent と同様、Document / Doctype は対象外（走査・確保の前に null を返す）。
+            if matches!(
+                doc.node_data(node),
+                Some(NodeData::Document | NodeData::Doctype { .. }) | None
+            ) {
+                return Ok(JsValue::Null);
+            }
+            // 木を 1 回だけ走査する。script（HTML・SVG）配下かどうかは走査状態として持ち、
+            // 祖先をたどり直さない。連結前に累積バイト数と走査ノード数を上限と比較して打ち切る。
+            let mut text = String::new();
+            let mut visited: usize = 0;
+            let mut stack: Vec<(NodeId, bool)> = doc
+                .children(node)
+                .map(|c| (c, doc.local_name(node) == Some("script")))
+                .collect();
+            stack.reverse();
+            while let Some((id, under_script)) = stack.pop() {
+                visited += 1;
+                if visited > MAX_OPTION_TEXT_VISITS {
+                    return Err(DomBridgeError::ResponseTooLarge {
+                        len: visited,
+                        limit: MAX_OPTION_TEXT_VISITS,
+                    });
+                }
+                if let Some(NodeData::Text { contents }) = doc.node_data(id) {
+                    if !under_script {
+                        check_response_len(text.len().saturating_add(contents.len()), limits)?;
+                        text.push_str(contents);
+                    }
+                    continue;
+                }
+                let child_under = under_script || doc.local_name(id) == Some("script");
+                let start = stack.len();
+                stack.extend(doc.children(id).map(|c| (c, child_under)));
+                stack[start..].reverse();
+            }
+            string_response(text, limits)
         }
         DomOp::SetTextContent => {
             let node = page.node_arg(op, args, 1)?;
@@ -2295,6 +2361,34 @@ mod tests {
     }
 
     #[test]
+    fn js_6_get_option_text_skips_script_and_rejects_document_and_oversize() {
+        let b = bridge_with(DomBridgeLimits::default().with_max_response_bytes(8));
+        let root = num(call(&b, &[s("documentRoot")]));
+        // Document ルートは走査せず null を返す。
+        assert_eq!(
+            call(&b, &[s("getOptionText"), n(root)]).expect("null"),
+            JsValue::Null
+        );
+        let b = DomBridge::new(DomBridgeLimits::default());
+        b.attach(parse(
+            "<div id=\"a\">x<script>no</script><b>y<script><i>z</i></script></b>w</div>",
+        ))
+        .expect("attach");
+        let a = num(call(&b, &[s("getElementById"), s("a")]));
+        assert_eq!(
+            call(&b, &[s("getOptionText"), n(a)]).expect("text"),
+            s("xyw")
+        );
+        let b = bridge_with(DomBridgeLimits::default().with_max_response_bytes(8));
+        let a = num(call(&b, &[s("getElementById"), s("a")]));
+        call(&b, &[s("setTextContent"), n(a), s("123456789")]).expect("set");
+        assert!(matches!(
+            call(&b, &[s("getOptionText"), n(a)]).expect_err("超過"),
+            DomBridgeError::ResponseTooLarge { limit: 8, .. }
+        ));
+    }
+
+    #[test]
     fn js_6_oversized_responses_are_rejected_before_allocation() {
         let b = bridge_with(DomBridgeLimits::default().with_max_response_bytes(8));
         let root = num(call(&b, &[s("documentRoot")]));
@@ -2925,6 +3019,35 @@ mod tests {
         call(&b, &[s("isFocusable"), s("1")]).expect_err("type");
         call(&b, &[s("isFocusable")]).expect_err("arity");
         call(&b, &[s("isFocusable"), n(div), n(div)]).expect_err("arity");
+    }
+
+    /// JS-5: `htmlLocalName` は HTML 要素の小文字名を返し、SVG 要素・テキスト・文書は null、不正入力はエラー（#1186）。
+    #[test]
+    fn js_5_html_local_name_op() {
+        let b = bridge();
+        let body = num(call(&b, &[s("body")]));
+        let root = num(call(&b, &[s("documentRoot")]));
+        let input = num(call(&b, &[s("createElement"), s("INPUT")]));
+        let text = num(call(&b, &[s("createTextNode"), s("t")]));
+        let name = |x: f64| call(&b, &[s("htmlLocalName"), n(x)]).expect("ok");
+        assert_eq!(name(input), JsValue::String("input".to_string()));
+        assert_eq!(name(text), JsValue::Null);
+        assert_eq!(name(root), JsValue::Null);
+        call(
+            &b,
+            &[
+                s("setInnerHTML"),
+                n(body),
+                s("<svg><a id=\"sa\"></a></svg>"),
+            ],
+        )
+        .expect("svg");
+        let svg_a = num(call(&b, &[s("getElementById"), s("sa")]));
+        assert_eq!(name(svg_a), JsValue::Null);
+        call(&b, &[s("htmlLocalName"), n(1e12)]).expect_err("invalid id");
+        call(&b, &[s("htmlLocalName"), s("1")]).expect_err("type");
+        call(&b, &[s("htmlLocalName")]).expect_err("arity");
+        call(&b, &[s("htmlLocalName"), n(input), n(input)]).expect_err("arity");
     }
 
     /// JS-7: `timerCallbackError` は種別を許可リストで検証し、メッセージを切り詰めて件数を頭打ちにする。
