@@ -3596,6 +3596,33 @@ fn style_sheet_cases(engine: &str) {
         "QuotaExceededError|200",
     );
 
+    eprintln!("case: JS-6 insertRule with no argument throws TypeError (not SyntaxError)");
+    check(
+        &mut p,
+        "var nm2 = ''; try { s.insertRule(); } catch (e) { nm2 = e.name; } nm2 + '|' + s.cssRules.length",
+        "TypeError|200",
+    );
+
+    eprintln!("case: JS-6 insertRule beyond 65536 rules throws QuotaExceededError");
+    check(
+        &mut p,
+        "var t2 = document.createElement('style'); document.head.appendChild(t2); var s2 = t2.sheet; \
+         for (var j = 0; j < 65536; j++) { s2.insertRule('.a{}', s2.cssRules.length); } \
+         var nm3 = ''; try { s2.insertRule('.a{}', 0); nm3 = 'ok'; } catch (e) { nm3 = e.name; } \
+         s2.cssRules.length + '|' + nm3",
+        "65536|QuotaExceededError",
+    );
+
+    eprintln!("case: JS-6 insertRule beyond the 4 MiB sheet total throws QuotaExceededError");
+    check(
+        &mut p,
+        "var t3 = document.createElement('style'); document.head.appendChild(t3); var s3 = t3.sheet; \
+         var chunk = '.a{content:\"' + new Array(60001).join('x') + '\"}'; var n3 = 0, nm4 = ''; \
+         try { for (var k = 0; k < 100; k++) { s3.insertRule(chunk, s3.cssRules.length); n3++; } nm4 = 'ok'; } \
+         catch (e) { nm4 = e.name; } n3 + '|' + nm4 + '|' + s3.cssRules.length",
+        "69|QuotaExceededError|69",
+    );
+
     eprintln!(
         "case: JS-5 document.styleSheets lists connected HTML style sheets in document order"
     );

@@ -354,6 +354,11 @@
     defineProperty(SheetProto, 'insertRule', {
         value: function insertRule(rule) {
             var st = stateOf(this);
+            if (arguments.length < 1) {
+                throw new TypeError(
+                    "Failed to execute 'insertRule' on 'CSSStyleSheet': 1 argument required, but only 0 present."
+                );
+            }
             var index = arguments.length > 1 ? arguments[1] >>> 0 : 0;
             var text = toStr(rule);
             var oldLen = st.rules.length;
