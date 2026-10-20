@@ -177,8 +177,15 @@ fn parse_response(raw: &[u8]) -> Result<HostResponse, HostError> {
     })
 }
 
+/// 接続確立後の I/O 失敗を分類する（`request` から呼ばれる）。
+///
+/// `ConnectionRefused` は接続が確立していなかったことを意味するため `Connect` に分類する
+/// （macOS では非ブロッキング connect の拒否が `connect_timeout` で見逃され、最初の書き込みで
+/// 返ることがある。PLUG-3・PLUG-4・Issue #1187）。`ConnectionReset`・`BrokenPipe` 等は
+/// 確立後の失敗なので `Io` のまま残す（成功を装わない）。
 fn map_io(e: &std::io::Error) -> HostError {
     match e.kind() {
+        std::io::ErrorKind::ConnectionRefused => HostError::Connect,
         std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut => HostError::Timeout,
         _ => HostError::Io,
     }
@@ -212,6 +219,11 @@ fn request(
     let deadline = Instant::now() + TOTAL_TIMEOUT;
     let mut stream =
         TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT).map_err(|_| HostError::Connect)?;
+    // std の connect_timeout は SO_ERROR を確かめない。保留中の接続エラー（拒否）は
+    // ここで拾い、接続段階の失敗として分類する（Issue #1187）。
+    if !matches!(stream.take_error(), Ok(None)) {
+        return Err(HostError::Connect);
+    }
     stream
         .set_write_timeout(Some(TOTAL_TIMEOUT))
         .map_err(|_| HostError::Io)?;
@@ -243,6 +255,29 @@ fn request(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// PLUG-3 / Issue #1187: 接続拒否は Connect、確立後の切断は Io、期限切れは Timeout。
+    #[test]
+    fn plug3_map_io_classifies_refused_as_connect() {
+        use std::io::{Error, ErrorKind};
+        assert_eq!(
+            map_io(&Error::from(ErrorKind::ConnectionRefused)),
+            HostError::Connect
+        );
+        assert_eq!(
+            map_io(&Error::from(ErrorKind::ConnectionReset)),
+            HostError::Io
+        );
+        assert_eq!(map_io(&Error::from(ErrorKind::BrokenPipe)), HostError::Io);
+        assert_eq!(
+            map_io(&Error::from(ErrorKind::TimedOut)),
+            HostError::Timeout
+        );
+        assert_eq!(
+            map_io(&Error::from(ErrorKind::WouldBlock)),
+            HostError::Timeout
+        );
+    }
 
     /// PLUG-3 / TASK-94.3: 既定値と loopback（v4 / v6）を受理する。
     #[test]
