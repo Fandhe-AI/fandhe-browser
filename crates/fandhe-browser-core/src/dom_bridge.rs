@@ -528,12 +528,11 @@ impl DomOp {
             | Self::SetTextContent
             | Self::SetInnerHtml
             | Self::IgnoreLocationChange
-            | Self::ConsoleMessage
             | Self::TimerSet
             | Self::TimerOrigin
             | Self::IsInclusiveAncestor
             | Self::UrlParse => 2,
-            Self::InsertBefore | Self::SetAttribute => 3,
+            Self::InsertBefore | Self::SetAttribute | Self::ConsoleMessage => 3,
             Self::TimerCallbackError
             | Self::LifecycleListenerError
             | Self::NetCallbackError
@@ -889,12 +888,16 @@ fn execute(
         DomOp::ConsoleMessage => {
             let name = string_arg(op, args, 1, limits)?;
             let text = string_arg(op, args, 2, limits)?;
+            let stack = string_arg(op, args, 3, limits)?;
             let level = ConsoleLevel::parse(name).ok_or(DomBridgeError::TypeMismatch {
                 operation: op.name(),
                 index: 1,
                 expected: "a known console level",
             })?;
-            page.diagnostics.record_console(level, text);
+            // stack は opt-in（`capture_timer_origin`）のときだけ保持する。ページが直接 op を
+            // 呼んでも既定では残らない（Issue #1183・`SEC-2`）。
+            let stack = if page.capture_timer_origin { stack } else { "" };
+            page.diagnostics.record_console(level, text, stack);
             Ok(JsValue::Undefined)
         }
         // shim 注入中（Rust 側が立てたフラグ）だけ true。events.js が再 install 時の
@@ -1559,7 +1562,8 @@ impl DomBridge {
     }
 
     /// タイマーの登録元 stack の捕捉を設定する（ランナー用。`attach` のたびに false へ戻る。
-    /// shim の install より前に呼ぶこと。Issue #1176）。
+    /// shim の install より前に呼ぶこと。Issue #1176）。同じフラグが console.error / warn の
+    /// Error の stack 保持も有効にする（生の診断情報を取るかの単一フラグ。Issue #1183）。
     pub fn set_capture_timer_origin(&self, capture: bool) -> Result<(), DomBridgeError> {
         let mut guard = self.lock()?;
         let page = guard.page.as_mut().ok_or(DomBridgeError::Detached)?;
@@ -2445,8 +2449,8 @@ mod tests {
     fn js_5_console_message_truncates_on_char_boundary_and_caps_count() {
         let b = bridge();
         let long = "あ".repeat(2000);
-        call(&b, &[s("consoleMessage"), s("log"), s(&long)]).expect("ok");
-        call(&b, &[s("consoleMessage"), s("trace"), s("x")]).expect_err("許可リスト外");
+        call(&b, &[s("consoleMessage"), s("log"), s(&long), s("")]).expect("ok");
+        call(&b, &[s("consoleMessage"), s("trace"), s("x"), s("")]).expect_err("許可リスト外");
         let d = b.take_diagnostics().expect("diag");
         assert_eq!(d.console_messages.len(), 1);
         assert_eq!(d.console_messages[0].text.len(), 4095);
@@ -2454,12 +2458,12 @@ mod tests {
         // Debug 出力に本文を含めないこと（診断フィールドの追加で長さは緩やかに増えるため余裕を持たせる）。
         assert!(format!("{d:?}").len() < 500);
         for _ in 0..(MAX_BRIDGE_DIAGNOSTICS + 3) {
-            call(&b, &[s("consoleMessage"), s("warn"), s("m")]).expect("ok");
+            call(&b, &[s("consoleMessage"), s("warn"), s("m"), s("")]).expect("ok");
         }
         let d = b.take_diagnostics().expect("diag");
         assert_eq!(d.console_messages.len(), MAX_BRIDGE_DIAGNOSTICS);
         assert_eq!(d.dropped, 3);
-        call(&b, &[s("consoleMessage"), s("info"), s("keep")]).expect("ok");
+        call(&b, &[s("consoleMessage"), s("info"), s("keep"), s("")]).expect("ok");
         b.attach(parse(HTML)).expect("attach");
         assert_eq!(
             b.take_diagnostics().expect("empty"),
@@ -2596,10 +2600,33 @@ mod tests {
             (vec![s("ignoreLocationChange"), s("href")], "ignore arity"),
             (vec![s("historySetUrl")], "history arity"),
             (vec![s("historySetUrl"), n(1.0)], "history type"),
-            (vec![s("consoleMessage"), s("log"), n(1.0)], "console type"),
+            (
+                vec![s("consoleMessage"), s("log"), s("a"), n(1.0)],
+                "console stack type",
+            ),
+            (vec![s("consoleMessage"), s("log"), s("a")], "console arity"),
         ] {
             call(&b, &args).expect_err(label);
         }
+    }
+
+    /// JS-5: console の stack は opt-in 時だけ 1024 バイトへ切り詰めて保持し、Debug に本文を出さない
+    /// （Issue #1183・`SEC-2`）。
+    #[test]
+    fn js_5_console_stack_is_opt_in_and_bounded() {
+        let b = bridge();
+        let long = "a".repeat(2000);
+        call(&b, &[s("consoleMessage"), s("error"), s("m"), s(&long)]).expect("ok");
+        let d = b.take_diagnostics().expect("diag");
+        assert_eq!(d.console_messages[0].raw_stack(), None);
+
+        b.set_capture_timer_origin(true).expect("flag");
+        call(&b, &[s("consoleMessage"), s("error"), s("m"), s(&long)]).expect("ok");
+        call(&b, &[s("consoleMessage"), s("error"), s("m"), s("")]).expect("ok");
+        let d = b.take_diagnostics().expect("diag");
+        assert_eq!(d.console_messages[0].raw_stack().map(str::len), Some(1024));
+        assert_eq!(d.console_messages[1].raw_stack(), None);
+        assert!(!format!("{d:?}").contains("aaaa"));
     }
 
     fn b_bool(v: bool) -> JsValue {

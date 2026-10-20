@@ -453,6 +453,27 @@ fn timer_cases(engine: &str) {
     let stack = errors[0].raw_stack();
     assert!(stack.is_none_or(|s| s.len() <= 1024), "{stack:?}");
 
+    eprintln!("case: JS-5 console.error Error stack is opt-in and bounded (#1183)");
+    let console_page = page(
+        "function pageThrower(){ try { null.registered } catch (e) { console.error('%s', e); \
+         console.log(e); } } pageThrower();",
+    );
+    let out = run_page(engine, &console_page, &opts);
+    let msgs = &out.bridge_diagnostics().console_messages;
+    assert_eq!(msgs.len(), 2, "{msgs:?}");
+    assert!(msgs.iter().all(|m| m.raw_stack().is_none()), "{msgs:?}");
+    let retain = opts.clone().with_retain_raw_exception_messages(true);
+    let out = run_page(engine, &console_page, &retain);
+    let msgs = &out.bridge_diagnostics().console_messages;
+    assert_eq!(msgs.len(), 2, "{msgs:?}");
+    // stack の形式はエンジン依存（boa は非標準）。上限だけ確認し、log レベルは拾わない。
+    let stack = msgs[0].raw_stack();
+    assert!(stack.is_none_or(|s| s.len() <= 1024), "{stack:?}");
+    assert_eq!(msgs[1].raw_stack(), None);
+    if let Some(s) = stack.filter(|s| s.contains("    at ")) {
+        assert!(s.contains("pageThrower"), "{s}");
+    }
+
     eprintln!("case: JS-7 pending timers report delay, due time and repeat (Issue #1176)");
     let out = run_page(engine, &page("setTimeout(function(){},60000);"), &opts);
     assert_eq!(

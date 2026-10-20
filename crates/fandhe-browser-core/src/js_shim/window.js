@@ -20,6 +20,9 @@
 // - console: 出力は持ち越さない。記録対象は log/info/warn/error/debug のみで、ページ由来の文字列は
 //   4097 UTF-16 単位（上限超過を Rust 側で検知させる 1 単位込み）で打ち切って consoleMessage op へ渡す（Rust 側でさらに 4 KiB・文字境界で
 //   切り詰める）。op 予算を使い切らせないよう転送は 64 回まで。決して throw しない。
+//   error / warn に渡された Error 風オブジェクトの stack は、診断専用の opt-in（timerOriginCapture と
+//   同じフラグ）が立っているときだけ 1024 UTF-16 単位まで第 3 引数で渡す。既定では `.stack` に触れない
+//   （Issue #1183・SEC-2）。
 // - 再 install（ページごと）に耐えるよう、global への定義は configurable にする。
 // - ES2015 の範囲に留める（V8 と boa で同一のソースを使うため。Proxy は使わない）。
 //
@@ -142,6 +145,38 @@
     var MAX_TEXT_UNITS = 4097;
     var MAX_FORWARDED = 64;
     var forwarded = 0;
+    // console.error / warn の Error の stack を取るか（診断専用の opt-in。install 時に 1 回だけ Rust 側へ
+    // 問い合わせる。失敗は false。false の間は `.stack` に一切触れない。Issue #1183・SEC-2）。
+    var captureStack = false;
+    try {
+        captureStack = op('timerOriginCapture') === true;
+    } catch (e) {
+        captureStack = false;
+    }
+
+    // 引数のうち最初の Error 風オブジェクトの stack を 1024 UTF-16 単位で返す（なければ ''）。
+    // ページが getter で throw しても console を壊さない。
+    function pickStack(args) {
+        for (var i = 0; i < args.length; i++) {
+            try {
+                var a = args[i];
+                if (a !== null && typeof a === 'object') {
+                    var st = a.stack;
+                    if (typeof st === 'string' && st.length > 0) {
+                        var end = Math.min(st.length, 1024);
+                        var c = st.charCodeAt(end - 1);
+                        if (end < st.length && c >= 0xd800 && c <= 0xdbff) {
+                            end -= 1;
+                        }
+                        return st.slice(0, end);
+                    }
+                }
+            } catch (e) {
+                // 次の引数へ。
+            }
+        }
+        return '';
+    }
 
     function send(level, args) {
         try {
@@ -175,7 +210,8 @@
                 text = text.slice(0, end);
             }
             forwarded += 1;
-            op('consoleMessage', level, text);
+            var stack = captureStack && (level === 'error' || level === 'warn') ? pickStack(args) : '';
+            op('consoleMessage', level, text, stack);
         } catch (e) {
             // console はページを壊さない。
         }
