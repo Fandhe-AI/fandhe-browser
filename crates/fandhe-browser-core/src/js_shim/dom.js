@@ -35,8 +35,15 @@
 //   名前空間の要素を HTMLElement のインスタンスにする（REPAIR-3）。
 // - IDL 属性の反映は `name` / `type` だけ（簡略版。全要素に定義し、既定値・正規化なし。#1176）。
 //   `id` / `className` / `value` / `checked` 等は未反映のまま（REPAIR-3）。
-// - document.activeElement は簡略版（常に body。無ければ null。#1173）。focus / blur /
-//   hasFocus は未定義のままでフォーカス追跡は無い（REPAIR-3）。
+// - フォーカス追跡は簡略版（#1173・#1185）。`Element.prototype.focus()` / `blur()` が `document.activeElement` を
+//   更新する（何もフォーカスされていなければ body。無ければ null）。フォーカスできるかは op `isFocusable`
+//   （Rust 側の簡略判定。dom_bridge/focus.rs）で決め、状態はこのクロージャの 1 枠だけが持つ。DOM・属性を変える操作の直後（と `activeElement` の読み取り時）に有効性を
+//   確かめ直し、切り離し・disabled 付与・tabindex 除去でフォーカスを失った要素は失効を保持して
+//   blur を配らず body に戻す（HTML の focus fixup の近似）。focus / blur は install 中だけの一時グローバル
+//   `__fandheDomFocusHandoff` 経由で events.js が対象要素にだけ配る。
+//   未実装（REPAIR-3）: `document.hasFocus()`・FocusEvent / relatedTarget・focusin / focusout・祖先への
+//   伝播・`tabIndex` IDL 属性・autofocus・レンダリングに基づく判定。focus / blur は仕様では
+//   HTMLOrSVGElement の mixin だがラッパーがすべて Element のため Element.prototype に置く。
 // - Comment / DocumentFragment のラッパー（nodeType 定数のみ。DOCUMENT_POSITION_* も未定義）。
 // - window / location / navigator / console は js_shim の別ソース（#779）。
 (function (global) {
@@ -210,7 +217,14 @@
     define(Node.prototype, 'appendChild', {
         writable: true,
         value: function appendChild(child) {
+            // 移動は切り離し＋再接続。移動対象の部分木内のフォーカスは失われ、再接続では復活しない。
+            // 失敗する操作（循環・不正な親）では DOM が変わらないので、解除は op 成功後に確定する。
+            var dropFocus = focusInSubtree(child);
             op('appendChild', idOf(this, 'appendChild'), idOf(child, 'appendChild'));
+            if (dropFocus) {
+                focused = null;
+            }
+            revalidateFocus();
             notifyMutation('childList', this, { added: [child], removed: [], nextSibling: null });
             return child;
         }
@@ -219,7 +233,13 @@
         writable: true,
         value: function insertBefore(node, ref) {
             var refId = ref === null || ref === undefined ? null : idOf(ref, 'insertBefore');
+            // node === ref は Rust 側が DOM を変えず成功する（位置不変）ため、フォーカスも保持する。
+            var dropFocus = ref !== node && focusInSubtree(node);
             op('insertBefore', idOf(this, 'insertBefore'), idOf(node, 'insertBefore'), refId);
+            if (dropFocus) {
+                focused = null;
+            }
+            revalidateFocus();
             notifyMutation('childList', this, {
                 added: [node],
                 removed: [],
@@ -232,6 +252,7 @@
         writable: true,
         value: function removeChild(child) {
             op('removeChild', idOf(this, 'removeChild'), idOf(child, 'removeChild'));
+            revalidateFocus();
             notifyMutation('childList', this, { added: [], removed: [child], nextSibling: null });
             return child;
         }
@@ -243,6 +264,7 @@
         set: function (value) {
             var text = value === null || value === undefined ? '' : String(value);
             op('setTextContent', idOf(this, 'textContent'), text);
+            revalidateFocus();
             // Text は characterData、それ以外（Element / Document）は childList。後者の
             // 追加・削除ノードは子の列挙 op が無いため空（スタブ。REPAIR-3）。
             if (textProtoIsPrototypeOf(this)) {
@@ -260,6 +282,7 @@
             var attr = String(name);
             // bridge は実際に保存された（正規化後の）属性名を返す。通知にはその名前を使う。
             var stored = op('setAttribute', idOf(this, 'setAttribute'), attr, String(value));
+            revalidateFocus();
             notifyMutation('attributes', this, { attributeName: typeof stored === 'string' ? stored : attr });
         }
     });
@@ -269,6 +292,7 @@
             var attr = String(name);
             // 属性が無いときは DOM 仕様どおり変更なし（レコードを作らない）。bridge が削除有無を返す。
             var removedName = op('removeAttribute', idOf(this, 'removeAttribute'), attr);
+            revalidateFocus();
             if (typeof removedName === 'string') {
                 notifyMutation('attributes', this, { attributeName: removedName });
             }
@@ -306,6 +330,7 @@
             set: function (value) {
                 // ページが差し替え得る setAttribute を経由せず、同じ op で直接保存する。
                 var stored = op('setAttribute', idOf(this, attr), attr, String(value));
+                revalidateFocus();
                 notifyMutation('attributes', this, { attributeName: typeof stored === 'string' ? stored : attr });
             }
         };
@@ -320,6 +345,7 @@
             // HTML の解析は core のパーサーが行う（JS 側にパーサーは持たない）。
             var html = value === null ? '' : String(value);
             op('setInnerHTML', idOf(this, 'innerHTML'), html);
+            revalidateFocus();
             // 追加・削除ノードは子の列挙 op が無いため空（スタブ。REPAIR-3）。
             notifyMutation('childList', this, { added: [], removed: [], nextSibling: null });
         }
@@ -391,13 +417,108 @@
             return wrap(op('body'), Element);
         }
     });
-    // activeElement: フォーカス管理が無いため常に body（無ければ null）を返す簡略版
-    // （REPAIR-3。実装済みを装わない）。react-dom の getActiveElementDeep /
-    // getSelectionInformation が読む（#1168・#1173・JS-5）。標準プロパティで新しい識別面は
-    // 足さない（SEC-2）。setter なし。将来仕様: focus() / blur() と連動したフォーカス追跡。
+    // --- フォーカス追跡（#1173・#1185・JS-5・JS-6・REPAIR-3。方針は冒頭コメント） ---
+    // 現在フォーカス中のラッパー（無ければ null）。ページごとに IIFE が作り直されるので状態も消える。
+    var focused = null;
+    // focus / blur イベントのネスト深さ。リスナーが互いに focus() し合っても無限に再帰しない（JS-6）。
+    var MAX_FOCUS_EVENT_DEPTH = 16;
+    var focusDepth = 0;
+    // events.js が setSink で登録する配送関数（未登録は null。その場合イベントは配らず状態だけ追跡する）。
+    var focusSink = null;
+
+    function focusStillValid(el) {
+        return op('isFocusable', ids.get(el)) === true;
+    }
+
+    // フォーカス中の要素が無効（切り離し・disabled・tabindex 除去等）なら blur を配らずに解除する。
+    // DOM・属性を変える各操作の直後に呼び、失効を保持する（後から再接続・属性復元されても復活しない）。
+    function revalidateFocus() {
+        if (focused !== null && !focusStillValid(focused)) {
+            focused = null;
+        }
+    }
+
+    // node が現在のフォーカス要素自身またはその祖先か（移動でフォーカスが外れるか）。
+    // 不正な引数は false を返し、検証エラーは後続の op に任せる。
+    function focusInSubtree(node) {
+        if (focused === null || !ids.has(node)) {
+            return false;
+        }
+        return focused === node
+            || op('isInclusiveAncestor', ids.get(node), ids.get(focused)) === true;
+    }
+
+    // 有効なフォーカス中の要素か null（読み取り時の保険として再検証する）。
+    function currentFocus() {
+        revalidateFocus();
+        return focused;
+    }
+
+    function fireFocusEvent(type, el) {
+        if (focusSink === null || focusDepth >= MAX_FOCUS_EVENT_DEPTH) {
+            return;
+        }
+        focusDepth++;
+        try {
+            focusSink(type, el);
+        } catch (e) {
+            // 配送の失敗でフォーカス状態の更新を壊さない。
+        } finally {
+            focusDepth--;
+        }
+    }
+
+    // options（preventScroll 等）は受け取るだけ。スクロールが無いので使わない。
+    define(Element.prototype, 'focus', {
+        writable: true,
+        value: function focus(options) {
+            if (!ids.has(this)) {
+                throw new TypeError('Illegal invocation');
+            }
+            if (!focusStillValid(this)) {
+                return;
+            }
+            var old = currentFocus();
+            if (old === this) {
+                return;
+            }
+            // blur リスナーの中では activeElement は body（Chrome と同じ）。
+            focused = null;
+            if (old !== null) {
+                fireFocusEvent('blur', old);
+                // blur リスナーが別の要素をフォーカスしたら、そちらを優先してここで中断する。
+                if (focused !== null) {
+                    return;
+                }
+                // blur リスナーが対象を切り離し・disabled にした場合は focus を配らず中断する。
+                if (!focusStillValid(this)) {
+                    return;
+                }
+            }
+            focused = this;
+            fireFocusEvent('focus', this);
+        }
+    });
+    define(Element.prototype, 'blur', {
+        writable: true,
+        value: function blur() {
+            if (!ids.has(this)) {
+                throw new TypeError('Illegal invocation');
+            }
+            if (currentFocus() === this) {
+                focused = null;
+                fireFocusEvent('blur', this);
+            }
+        }
+    });
+
+    // activeElement: フォーカス中の要素。無ければ body（無ければ null）。react-dom の
+    // getActiveElementDeep / getSelectionInformation が読む（#1168・#1173・#1185・JS-5）。
+    // 標準プロパティで新しい識別面は足さない（SEC-2）。setter なし。
     define(Document.prototype, 'activeElement', {
         get: function () {
-            return wrap(op('body'), Element);
+            var c = currentFocus();
+            return c !== null ? c : wrap(op('body'), Element);
         }
     });
     define(Document.prototype, 'head', {
@@ -435,6 +556,18 @@
             // 祖先関係の判定（MutationObserver の subtree 用）。ID はここで解決し外へ出さない。
             contains: function (ancestor, node) {
                 return op('isInclusiveAncestor', idOf(ancestor, 'contains'), idOf(node, 'contains')) === true;
+            }
+        }),
+        writable: true,
+        configurable: true,
+        enumerable: false
+    });
+
+    // events.js へ渡す一回限りのハンドオフ（focus / blur の配送先の登録のみ。events.js が読んで直ちに削除する）。
+    Object.defineProperty(global, '__fandheDomFocusHandoff', {
+        value: Object.freeze({
+            setSink: function (fn) {
+                focusSink = typeof fn === 'function' ? fn : null;
             }
         }),
         writable: true,

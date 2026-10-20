@@ -887,7 +887,7 @@ spec 対応: TASK-71・TASK-108 / MS-6 / `COMPAT-1`・`JS-5`・`MEAS-4`・`REPAI
 
 1. d3: `console.error` の次の不足（null の `registered` 読み取り）の特定。読む対象の候補は service worker 登録など `navigator` 系だが未確認。`--debug-raw-exception` にスタックの先頭フレームがまだ出ないため、console 側にも先頭フレームを出す診断の拡張を先に検討する（別 issue の切り出し候補）（済み: #1183。下の節を参照）
 2. `HTMLElement` と擬似クラス selector: 今回は特定していない。core の selector は `:` を含む擬似クラスをすべて未対応として扱うため、`HTMLElement` は定義せず `typeof HTMLElement === "undefined"` を保った（`selector.rs` の拡張は別 issue の切り出し候補）
-3. `focus()` / `blur()` と連動したフォーカス追跡（`activeElement` の簡略化の解消。`REPAIR-3`）
+3. `focus()` / `blur()` と連動したフォーカス追跡（`activeElement` の簡略化の解消。`REPAIR-3`）（済み: #1185。下の節を参照）
 
 ### 制約
 
@@ -1064,6 +1064,28 @@ spec 対応: TASK-71・TASK-108 / MS-6 / `COMPAT-1`・`CORE-1`・`CORE-5`・`JS-
 cargo build --release -p fandhe-browser-core --features js-v8 --example compat_page_script_probe
 target/release/examples/compat_page_script_probe --target d3=https://demoqa.com/automation-practice-form --modules --selector form --debug-raw-exception --out /abs/path/d3.jsonl 2>&1 >/dev/null | grep -E "console_error|frame"
 ```
+
+## focus・blur と連動した document.activeElement の追跡（#1185）
+
+spec 対応: TASK-71・TASK-108 / MS-6 / `COMPAT-1`・`JS-5`・`JS-6`・`MEAS-4`・`REPAIR-3`・`SEC-2`。
+Issue #1173 節の「次の対応 3」にあたる。
+
+### 実装の要点
+
+- 新しい op `isFocusable`（core の `dom_bridge/focus.rs`）: 要素が文書に接続していて、`button`/`select`/`textarea`/`input`（`disabled` なし・`type=hidden` 以外）、`a`/`area`（`href` あり）、`iframe`、`contenteditable`、`tabindex`（負値を含む整数）のいずれかに当たればフォーカス可。disabled のフォームコントロールは `tabindex` があっても不可。レンダリング（`display:none`・`inert`）・`fieldset[disabled]`・`summary`・`audio`/`video[controls]`・SVG の `a[href]` は判定しない（`REPAIR-3`）
+- shim（`dom.js`）: `Element.prototype.focus()` / `blur()` を追加し、フォーカス中の要素を 1 枠だけ保持する。`document.activeElement` は読むたびに有効性を確かめ直し、切り離し・`disabled` 付与・`tabindex` 除去で無効になっていれば blur を配らず `body` に戻す。仕様では HTMLOrSVGElement の mixin だが、ラッパーがすべて Element のため Element.prototype に置いた
+- イベント（`events.js`）: focus / blur を対象要素にだけ配る（bubbles・cancelable は false、composed は true、`isTrusted` は false のまま）。blur リスナーの中では `activeElement` は `body`。イベントのネストは深さ 16 で打ち切る（`JS-6`）。focusin / focusout・FocusEvent・`relatedTarget`・`document.hasFocus()` は未実装（`REPAIR-3`）
+- 新しい依存・`unsafe` は無い
+
+### 測定
+
+d2・d3 の再測定は行っていない（未測定）。本変更の効果は V8・boa 共通のケース（`js_shim_cases.rs` の `focus_cases`）で確認した。
+
+### 次の対応
+
+1. React 17 以降の `onFocus` / `onBlur` は root で focusin / focusout を聞くため、本変更の後も発火しない。要素の `dispatchEvent` と木に沿った伝播を足すときに focusin / focusout も配る（切り出し候補。`REPAIR-3`）
+2. `document.createElementNS`（#1184 の次の対応 1）
+3. d2・d3 の再測定
 
 ## b5（Trello）の原因特定（#964）
 

@@ -109,7 +109,7 @@ pub fn run(engine: &str) {
         "interactive",
     );
 
-    eprintln!("case: JS-5 document.activeElement returns body (simplified, #1173)");
+    eprintln!("case: JS-5 document.activeElement defaults to body (#1173・#1185)");
     let mut p = setup(engine, None);
     check(&mut p, "typeof document.activeElement", "object");
     check(&mut p, "document.activeElement === document.body", "true");
@@ -369,6 +369,7 @@ pub fn run(engine: &str) {
     history_cases(engine);
     event_target_cases(engine);
     history_traversal_cases(engine);
+    focus_cases(engine);
 
     eprintln!("case: JS-5 disabled runtime does not pretend to install");
     let mut disabled = JsRuntime::disabled();
@@ -2956,5 +2957,208 @@ fn history_traversal_cases(engine: &str) {
          history.pushState(undefined, ''); history.pushState(1, ''); history.back(); __fandheRunMicrotasks(); \
          t.join() + '|' + u.join() + '|' + String(history.state)",
         "true|undefined|undefined",
+    );
+}
+
+/// フォーカス追跡（#1185・`JS-5`・`JS-6`・`REPAIR-3`）: `focus()` / `blur()` と `document.activeElement`、
+/// 対象要素への focus / blur の配送。focusin / focusout は未実装なので 0 件のまま固定する。
+fn focus_cases(engine: &str) {
+    const HTML: &str = "<html><head></head><body><input id=i><input id=h type=hidden>\
+        <button id=b></button><button id=bd disabled tabindex=0></button><a id=ah href=\"#x\"></a>\
+        <a id=an></a><div id=d></div><div id=dt tabindex=-1></div><textarea id=t></textarea>\
+        <script>x</script></body></html>";
+    let id_of = "document.activeElement.getAttribute('id')";
+
+    eprintln!("case: JS-5 focus() updates document.activeElement for focusable elements only");
+    let mut p = setup_html(engine, HTML, None);
+    check(
+        &mut p,
+        "var $ = function (x) { return document.getElementById(x); }; \
+         [typeof Element.prototype.focus, typeof Element.prototype.blur, typeof document.hasFocus].join('|')",
+        "function|function|undefined",
+    );
+    check(&mut p, "document.activeElement === document.body", "true");
+    check(&mut p, &format!("$('i').focus(); {id_of}"), "i");
+    for target in ["d", "h", "bd", "an"] {
+        check(&mut p, &format!("$('{target}').focus(); {id_of}"), "i");
+    }
+    check(&mut p, &format!("$('ah').focus(); {id_of}"), "ah");
+    check(&mut p, &format!("$('dt').focus(); {id_of}"), "dt");
+    check(&mut p, &format!("$('b').blur(); {id_of}"), "dt");
+    check(
+        &mut p,
+        "$('dt').blur(); document.activeElement === document.body",
+        "true",
+    );
+    check(
+        &mut p,
+        "document.createElement('input').focus(); document.activeElement === document.body",
+        "true",
+    );
+    check(
+        &mut p,
+        "try { document.activeElement = $('d'); } catch (e) {} document.activeElement === document.body",
+        "true",
+    );
+
+    eprintln!("case: JS-5 focus loss on detach / disabled / tabindex removal does not fire blur");
+    check(
+        &mut p,
+        "var bl = 0; $('t').addEventListener('blur', function () { bl++; }); \
+         $('t').focus(); var f1 = document.activeElement.getAttribute('id'); \
+         document.body.removeChild($('t')); \
+         [f1, document.activeElement === document.body, bl].join('|')",
+        "t|true|0",
+    );
+    check(
+        &mut p,
+        "$('b').focus(); $('b').setAttribute('disabled', ''); document.activeElement === document.body",
+        "true",
+    );
+    check(
+        &mut p,
+        "$('dt').focus(); $('dt').removeAttribute('tabindex'); document.activeElement === document.body",
+        "true",
+    );
+
+    eprintln!("case: JS-5 focus loss is kept after reattach / disabled removal / tabindex restore");
+    check(
+        &mut p,
+        "$('i').focus(); var ii = $('i'); document.body.removeChild(ii); document.body.appendChild(ii); \
+         document.activeElement === document.body",
+        "true",
+    );
+    check(
+        &mut p,
+        "$('b').removeAttribute('disabled'); $('b').focus(); \
+         $('b').setAttribute('disabled', ''); $('b').removeAttribute('disabled'); \
+         document.activeElement === document.body",
+        "true",
+    );
+    check(
+        &mut p,
+        "var tv = $('dt').getAttribute('tabindex'); if (tv === null) { tv = '0'; $('dt').setAttribute('tabindex', tv); } \
+         $('dt').focus(); $('dt').removeAttribute('tabindex'); $('dt').setAttribute('tabindex', tv); \
+         document.activeElement === document.body",
+        "true",
+    );
+
+    eprintln!("case: JS-5 invalid receivers are rejected");
+    check(
+        &mut p,
+        "var r = []; ['focus', 'blur'].forEach(function (m) { \
+           try { Element.prototype[m].call({}); r.push('ok'); } catch (e) { r.push(e.name + ':' + /Illegal invocation/.test(e.message)); } }); \
+         r.join(',')",
+        "TypeError:true,TypeError:true",
+    );
+
+    eprintln!("case: JS-5 focus and blur events are delivered to the target only");
+    let mut p = setup_html(engine, HTML, None);
+    check(
+        &mut p,
+        "var $ = function (x) { return document.getElementById(x); }; var log = []; var evs = []; \
+         ['i', 'b'].forEach(function (k) { \
+           $(k).addEventListener('blur', function (e) { log.push('blur:' + k + ':' + (document.activeElement === document.body)); }); \
+           $(k).addEventListener('focus', function (e) { evs.push(e); log.push('focus:' + k + ':' + (document.activeElement === $(k))); }); }); \
+         var fi = 0; document.addEventListener('focusin', function () { fi++; }); \
+         $('i').focus(); $('b').focus(); $('b').focus(); \
+         log.join('|') + '#' + fi",
+        "focus:i:true|blur:i:true|focus:b:true#0",
+    );
+    check(
+        &mut p,
+        "var e = evs[1]; [e.type, e.target === $('b'), e.currentTarget === null, e.bubbles, e.cancelable, e.composed, e.isTrusted, e instanceof Event].join('|')",
+        "focus|true|true|false|false|true|false|true",
+    );
+    check(
+        &mut p,
+        "log.length = 0; $('b').blur(); $('b').blur(); log.join('|')",
+        "blur:b:true",
+    );
+
+    eprintln!("case: JS-5 a throwing focus listener does not stop the focus update");
+    check(
+        &mut p,
+        "$('i').addEventListener('focus', function () { throw new Error('boom'); }); \
+         $('i').focus(); document.activeElement === $('i')",
+        "true",
+    );
+
+    eprintln!("case: JS-5 a blur listener that focuses another element aborts the outer focus()");
+    let mut p = setup_html(engine, HTML, None);
+    check(
+        &mut p,
+        "var $ = function (x) { return document.getElementById(x); }; var log = []; \
+         $('i').addEventListener('blur', function () { $('t').focus(); }); \
+         $('t').addEventListener('focus', function () { log.push('t'); }); \
+         $('b').addEventListener('focus', function () { log.push('b'); }); \
+         $('i').focus(); $('b').focus(); log.join(',') + '|' + document.activeElement.getAttribute('id')",
+        "t|t",
+    );
+
+    eprintln!("case: JS-5 a blur listener that disables the next target aborts focus delivery");
+    let mut p = setup_html(engine, HTML, None);
+    check(
+        &mut p,
+        "var $ = function (x) { return document.getElementById(x); }; var log = []; \
+         $('i').addEventListener('blur', function () { $('b').setAttribute('disabled', ''); }); \
+         $('b').addEventListener('focus', function () { log.push('b'); }); \
+         $('i').focus(); $('b').focus(); \
+         log.length + '|' + (document.activeElement === document.body)",
+        "0|true",
+    );
+
+    eprintln!("case: JS-6 mutually re-entrant focus listeners terminate");
+    let mut p = setup_html(engine, HTML, None);
+    check(
+        &mut p,
+        "var $ = function (x) { return document.getElementById(x); }; var n = 0; \
+         $('i').addEventListener('focus', function () { n++; $('b').focus(); }); \
+         $('b').addEventListener('focus', function () { n++; $('i').focus(); }); \
+         $('i').focus(); [n <= 32, ['i', 'b'].indexOf(document.activeElement.getAttribute('id')) >= 0].join('|')",
+        "true|true",
+    );
+
+    eprintln!("case: JS-5 failed moves keep focus; moving a focused subtree drops it");
+    let mut p = setup_html(engine, HTML, None);
+    check(
+        &mut p,
+        "var $ = function (x) { return document.getElementById(x); }; $('i').focus(); \
+         try { $('i').appendChild($('i')); } catch (e) {} \
+         try { document.body.insertBefore($('b'), $('i').firstChild || $('d').appendChild(document.createElement('p'))); } catch (e) {} \
+         document.activeElement === $('i')",
+        "true",
+    );
+    check(
+        &mut p,
+        "var w = document.createElement('div'); var inner = document.createElement('input'); \
+         w.appendChild(inner); document.body.appendChild(w); inner.focus(); \
+         var okf = document.activeElement === inner; document.body.appendChild(w); \
+         [okf, document.activeElement === document.body].join('|')",
+        "true|true",
+    );
+    check(
+        &mut p,
+        "var w2 = document.createElement('div'); var in2 = document.createElement('input'); \
+         w2.appendChild(in2); document.body.appendChild(w2); in2.focus(); \
+         document.body.insertBefore(w2, document.body.firstChild); \
+         document.activeElement === document.body",
+        "true",
+    );
+    // node === ref は DOM が変わらず成功するのでフォーカスを保持する（祖先でも同様）。
+    check(
+        &mut p,
+        "var w3 = document.createElement('div'); var in3 = document.createElement('input'); \
+         w3.appendChild(in3); document.body.appendChild(w3); in3.focus(); \
+         document.body.insertBefore(w3, w3); \
+         document.activeElement === in3",
+        "true",
+    );
+
+    eprintln!("case: JS-5 the focus handoff global is removed after install");
+    check(
+        &mut p,
+        "typeof globalThis.__fandheDomFocusHandoff",
+        "undefined",
     );
 }
