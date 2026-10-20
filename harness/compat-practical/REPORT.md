@@ -550,7 +550,7 @@ spec 対応: TASK-71・TASK-108 / MS-6 / `COMPAT-1`・`JS-5`・`JS-6`・`JS-7`�
 ### 次の対応
 
 1. 分類語彙に `Right-hand side of 'instanceof' is not an object`（V8 / boa の文言差を含む）を加える。ただし `Y` の名前は得られないため、不足 API の特定には「`instanceof` の右辺の名前を出す」手段が別に要る（例: callback の `stack` から行位置を得る、または shim 側で主要なグローバルコンストラクタ〔`Element`・`HTMLElement`・`Node` 等〕の有無を測る）。別 issue で追跡する
-2. `listener_errors`・`net_callback_errors` も core の要約で分類する（`REPAIR-3`）
+2. `listener_errors`・`net_callback_errors` も core の要約で分類する（`REPAIR-3`。済み: #1172。下の節を参照）
 
 ### 制約
 
@@ -719,7 +719,7 @@ spec 対応: TASK-71・TASK-108 / MS-6 / `COMPAT-1`・`JS-5`・`JS-7`・`MEAS-4`
 ### 次の対応
 
 1. d3: 描画されない原因の調査（`document.activeElement`、`HTMLElement` の定義で出る擬似クラス selector の対応を含む。別 issue で追跡する切り出し候補）
-2. `listener_errors`・`net_callback_errors` を core の `ExceptionSummary` で分類する（#1156 の次の対応 2。本 issue では未対応）
+2. `listener_errors`・`net_callback_errors` を core の `ExceptionSummary` で分類する（#1156 の次の対応 2。本 issue では未対応。済み: #1172。下の節を参照）
 3. d2: `history` の不足（#1167 の節の次の対応 1 のまま。済み: #1171。下の節を参照）
 
 ### 制約
@@ -793,6 +793,60 @@ target/release/examples/compat_page_script_probe --target d2=https://www.saucede
 target/release/examples/compat_page_script_probe --target d3=https://demoqa.com/automation-practice-form --modules --selector form --debug-raw-exception --out /abs/path/d3.jsonl
 jq -c 'select(.type=="script")' /abs/path/d2.jsonl /abs/path/d3.jsonl
 jq -c 'select(.type=="run")' /abs/path/d2.jsonl /abs/path/d3.jsonl
+```
+
+## listener_errors・net_callback_errors の分類と d2・d3 の再測定（#1172）
+
+spec 対応: TASK-71・TASK-108 / MS-6 / `JS-4`・`JS-7`・`JS-8`・`MEAS-4`・`REPAIR-3`・`REPAIR-4`・`SEC-2`。
+前節群（#1156・#1168）の「次の対応 2」（リスナーと fetch / XHR callback の例外の分類）を扱い、d2・d3 を `page_script_probe --modules --debug-raw-exception` で再測定した。出力はコミットしていない。
+
+### 実装の要点
+
+- `events.js`・`net.js` の報告関数が、`timers.js` と同じく `error.name`（文字列のときだけ・64 単位）・メッセージ・`error.stack`（文字列のときだけ・先頭 1024 単位）を渡す。bridge op `lifecycleListenerError`・`netCallbackError` は 4 引数（種別・name・message・stack）になり、旧形式の 2 引数は `ArityMismatch` で拒否する
+- core の `ListenerError`・`NetCallbackError` に `summary`（`ExceptionSummary`）と非公開の `stack`（`raw_stack()` は `#[doc(hidden)]`）を足した。`error.name` は固定語彙に一致したときだけ kind に使い、保存しない。stack は `PageRunOptions::with_retain_raw_exception_messages(true)`（opt-in）が無ければ page_runner が破棄する（タイマーと同じ fail-closed）。`Debug` は長さと要約だけを出す
+- probe は 3 種の JSONL ラベルを `<source>:<kind>:<class>[:<api>]` にそろえた（リスナーの source は `dom_content_loaded` / `load`、net は `fetch` / `xhr`）。`property`・`code` は要約が保持するがラベルには出さない。生メッセージと先頭フレームは `--debug-raw-exception` のときだけ stderr へ出す
+- stack 中の URL は自動取得しない（ページが偽造でき SSRF の入口になるため）。依存の追加・`unsafe` の追加は無い。V8・boa の共通ケース（リスナーと XHR の `ReferenceError` の分類・既定で stack なし・opt-in で 1024 バイト以下）と単体テストで検証した
+
+### 測定条件
+
+| 項目 | 値 |
+| ---- | -- |
+| 実施日時（UTC） | 2026-10-20 |
+| OS | Linux |
+| ベース | main `29dae75f` に、本変更を加えたもの |
+| バイナリ | `cargo build --release -p fandhe-browser-core --features js-v8 --example compat_page_script_probe` |
+| 設定 | `--modules`・V8・`--selector form`・`--debug-raw-exception`。実行上限は既定のまま |
+
+### 結果
+
+| id | サイト | script | outcome | `listener_errors` | `net_callback_errors` | `timer_errors` | `form`（実行後） |
+| -- | ------ | ------ | ------- | ----------------- | --------------------- | -------------- | ---------------- |
+| d2 | Saucedemo | index 1（module・同一オリジン `src`） | succeeded | 0 件 | 0 件 | 0 件 | 0 件 |
+| d3 | DemoQA | index 0（module・同一オリジン `src`） | succeeded | 0 件 | 0 件 | 0 件 | 0 件 |
+
+- 2 サイトとも、リスナー・fetch / XHR callback の例外は 0 件だった。#1156・#1168 の節で「ここに隠れている可能性」とした仮説は、少なくとも本測定では否定された。d2・d3 の描画が進まない原因はこの 2 種の例外ではない
+- d2 は `abort=virtual_time`（タイマー 1 件発火・1 件未発火）・`console.error` 1 件、d3 は abort なし（タイマー 1 件発火）・`console.error` 1 件で、#1171 の節から変化はない。ライフサイクルは両サイトとも `dom_content_loaded:dispatched`・`load:dispatched`、`net.started` は 0
+- **d2・d3 とも `form` は 0 件のため #919 にはコメントしていない**
+
+### 次の対応
+
+1. d2・d3: `console.error` 1 件の内容の記録。現在の probe は件数しか出さず、描画が進まない手掛かりが残っている（別 issue の切り出し候補）
+2. d2: `virtual_time` で打ち切られる未発火タイマー 1 件の原因調査（#1171 の次の対応 1 のまま。別 issue の切り出し候補）
+3. d3: 描画されない原因の調査（#1171 の次の対応 2 のまま。別 issue の切り出し候補）
+
+### 制約
+
+- 単一環境（Linux）・単一時点。URL のクエリ・script 本文・stack 全文・生メッセージは転記していない
+- fetch の `.then` 内の例外は Promise の reject になり `netCallbackError` に届かない（unhandled rejection の捕捉は未実装。`REPAIR-3`）。boa では fetch の続きが走らないため、両エンジン共通のテストは XHR で検証している
+- `listener_errors` は `DOMContentLoaded` / `load` のリスナーだけが対象（`click` 等の汎用イベントは未実装）
+
+### 再現手順
+
+```bash
+cargo build --release -p fandhe-browser-core --features js-v8 --example compat_page_script_probe
+target/release/examples/compat_page_script_probe --target d2=https://www.saucedemo.com --modules --selector form --debug-raw-exception --out /abs/path/d2.jsonl
+target/release/examples/compat_page_script_probe --target d3=https://demoqa.com/automation-practice-form --modules --selector form --debug-raw-exception --out /abs/path/d3.jsonl
+jq -c 'select(.type=="run") | .bridge | {listener_errors, timer_errors, net_callback_errors}' /abs/path/d2.jsonl /abs/path/d3.jsonl
 ```
 
 ## b5（Trello）の原因特定（#964）

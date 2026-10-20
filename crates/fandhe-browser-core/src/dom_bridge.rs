@@ -519,14 +519,14 @@ impl DomOp {
             | Self::SetInnerHtml
             | Self::IgnoreLocationChange
             | Self::ConsoleMessage
-            | Self::LifecycleListenerError
             | Self::TimerSet
             | Self::IsInclusiveAncestor
-            | Self::UrlParse
-            | Self::NetCallbackError => 2,
+            | Self::UrlParse => 2,
             Self::InsertBefore | Self::SetAttribute => 3,
-            Self::TimerCallbackError => 4,
-            Self::NetRequest => 4,
+            Self::TimerCallbackError
+            | Self::LifecycleListenerError
+            | Self::NetCallbackError
+            | Self::NetRequest => 4,
         }
     }
 }
@@ -1115,7 +1115,10 @@ fn execute(
         }
         DomOp::NetCallbackError => {
             let kind = string_arg(op, args, 1, limits)?;
-            let message = string_arg(op, args, 2, limits)?;
+            // `error.name`（空文字可）・メッセージ・`error.stack`（空文字可。opt-in が無ければ page_runner が破棄）。
+            let error_name = string_arg(op, args, 2, limits)?;
+            let message = string_arg(op, args, 3, limits)?;
+            let stack = string_arg(op, args, 4, limits)?;
             let request = match kind {
                 "fetch" => NetRequestKind::Fetch,
                 "xhr" => NetRequestKind::Xhr,
@@ -1127,7 +1130,8 @@ fn execute(
                     });
                 }
             };
-            page.diagnostics.record_net_callback_error(request, message);
+            page.diagnostics
+                .record_net_callback_error(request, error_name, message, stack);
             Ok(JsValue::Undefined)
         }
         // XHR の abort() / 再 open() による未送信要求の取り消し。取得前なら要求キューから除外し、
@@ -1157,13 +1161,17 @@ fn execute(
         }
         DomOp::LifecycleListenerError => {
             let name = string_arg(op, args, 1, limits)?;
-            let message = string_arg(op, args, 2, limits)?;
+            // `error.name`（空文字可）・メッセージ・`error.stack`（空文字可。opt-in が無ければ page_runner が破棄）。
+            let error_name = string_arg(op, args, 2, limits)?;
+            let message = string_arg(op, args, 3, limits)?;
+            let stack = string_arg(op, args, 4, limits)?;
             let event = LifecycleEvent::parse(name).ok_or(DomBridgeError::TypeMismatch {
                 operation: op.name(),
                 index: 1,
                 expected: "a known lifecycle event",
             })?;
-            page.diagnostics.record_listener_error(event, message);
+            page.diagnostics
+                .record_listener_error(event, error_name, message, stack);
             Ok(JsValue::Undefined)
         }
         DomOp::Body => page.encode_optional(page.html_child("body")),
@@ -2425,14 +2433,52 @@ mod tests {
     #[test]
     fn js_4_lifecycle_listener_error_op_validates_event_name() {
         let b = bridge();
-        call(&b, &[s("lifecycleListenerError"), s("load"), s("boom")]).expect("ok");
-        call(&b, &[s("lifecycleListenerError"), s("click"), s("x")]).expect_err("許可リスト外");
+        let stack = "x".repeat(1025);
+        call(
+            &b,
+            &[
+                s("lifecycleListenerError"),
+                s("load"),
+                s("TypeError"),
+                s("foo.bar is not a function"),
+                s(&stack),
+            ],
+        )
+        .expect("ok");
+        call(
+            &b,
+            &[
+                s("lifecycleListenerError"),
+                s("click"),
+                s(""),
+                s("x"),
+                s(""),
+            ],
+        )
+        .expect_err("許可リスト外");
         call(&b, &[s("lifecycleListenerError"), s("load")]).expect_err("arity");
-        call(&b, &[s("lifecycleListenerError"), s("load"), n(1.0)]).expect_err("type");
+        // 旧形式（種別・メッセージの 2 引数）と 3 引数は拒否する（Issue #1172）。
+        call(&b, &[s("lifecycleListenerError"), s("load"), s("boom")]).expect_err("旧形式");
+        call(
+            &b,
+            &[s("lifecycleListenerError"), s("load"), s(""), s("boom")],
+        )
+        .expect_err("arity 3");
+        call(
+            &b,
+            &[s("lifecycleListenerError"), s("load"), s(""), n(1.0), s("")],
+        )
+        .expect_err("type");
         let d = b.take_diagnostics().expect("diag");
         assert_eq!(d.listener_errors.len(), 1);
         assert_eq!(d.listener_errors[0].event, LifecycleEvent::Load);
-        assert_eq!(d.listener_errors[0].message, "boom");
+        assert_eq!(d.listener_errors[0].message, "foo.bar is not a function");
+        assert_eq!(
+            d.listener_errors[0].summary.kind(),
+            ExceptionKind::TypeError
+        );
+        assert_eq!(d.listener_errors[0].summary.identifier(), Some("foo.bar"));
+        assert_eq!(d.listener_errors[0].raw_stack().map(str::len), Some(1024));
     }
 
     #[test]
@@ -2914,9 +2960,25 @@ mod tests {
     #[test]
     fn js_8_net_callback_error_and_ignored_options_are_bounded() {
         let b = net_bridge();
-        call(&b, &[s("netCallbackError"), s("beacon"), s("x")]).expect_err("kind");
+        call(
+            &b,
+            &[s("netCallbackError"), s("beacon"), s(""), s("x"), s("")],
+        )
+        .expect_err("kind");
+        // 旧形式（種別・メッセージの 2 引数）は拒否する（Issue #1172）。
+        call(&b, &[s("netCallbackError"), s("xhr"), s("x")]).expect_err("旧形式");
         let big = "e".repeat(MAX_CONSOLE_MESSAGE_BYTES + 10);
-        call(&b, &[s("netCallbackError"), s("xhr"), s(&big)]).expect("ok");
+        call(
+            &b,
+            &[
+                s("netCallbackError"),
+                s("xhr"),
+                s("EvilError"),
+                s(&big),
+                s(""),
+            ],
+        )
+        .expect("ok");
         call(&b, &[s("netOptionsIgnored"), n(2.0)]).expect("ok");
         call(&b, &[s("netOptionsIgnored"), n(f64::INFINITY)]).expect("ok");
         call(&b, &[s("netOptionsIgnored"), s("1")]).expect_err("type");
@@ -2928,6 +2990,7 @@ mod tests {
             MAX_CONSOLE_MESSAGE_BYTES
         );
         assert!(d.net_callback_errors[0].truncated);
+        assert_eq!(d.net_callback_errors[0].raw_stack(), None);
         assert_eq!(d.net_options_ignored, 2);
     }
 }

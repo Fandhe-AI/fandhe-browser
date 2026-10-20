@@ -1,10 +1,11 @@
 //! JS 例外の要約（分類名と不足識別子名）を、生メッセージを残さずに作る（`JS-5`・`REPAIR-4`・Issue #1133）。
 //!
 //! 呼び出し元: [`crate::page_runner`] の module 評価失敗（静的 root・動的 `import()`）と、
-//! [`crate::dom_bridge`] のタイマー / microtask callback の例外（`error.name` を添えて要約する。Issue #1156）。
+//! [`crate::dom_bridge`] のタイマー / microtask callback・ライフサイクルリスナー・fetch / XHR callback の例外
+//! （`error.name` を添えて要約する。Issue #1156・#1172）。
 //! 診断に出してよいのは固定語彙の enum と、文字種・段数・長さを検証した識別子だけで、
 //! メッセージ本文・URL・クエリ・specifier は残さない。V8（`Uncaught Kind: ...`）と
-//! boa（接頭辞なし）の両方の形式を受ける。classic の例外・リスナー・ネットワーク callback は
+//! boa（接頭辞なし）の両方の形式を受ける。classic スクリプト本体の例外は
 //! 現状対象外（`REPAIR-3`）。
 //!
 //! `TypeError` の `other` を減らすため、`Cannot use 'in' operator ...`（V8）・
@@ -141,7 +142,7 @@ impl ExceptionMessageClass {
 
 /// JS 例外の要約（生メッセージ・URL・specifier を含まない。`JS-5`・`REPAIR-4`・Issue #1133）。
 ///
-/// 現状は module 評価失敗とタイマー callback の例外で作られる（classic は将来。`REPAIR-3`）。
+/// 現状は module 評価失敗と、タイマー・リスナー・fetch / XHR callback の例外で作られる（classic 本体は将来。`REPAIR-3`）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct ExceptionSummary {

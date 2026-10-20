@@ -227,6 +227,8 @@ impl PageRunOptions {
     /// 計測用 example `compat_page_script_probe` が stderr にだけ出すための opt-in で、
     /// 本番経路（CLI・CDP・AI API・`Config`）から呼ばない（`SEC-2`・`REPAIR-4`）。
     /// 生メッセージは URL・トークンを含み得るため、保存・転記しない。
+    /// `error.stack` もこの opt-in のときだけ、タイマー / microtask・ライフサイクルリスナー・
+    /// fetch / XHR callback の各例外に保持する（Issue #1168・#1172）。
     #[doc(hidden)]
     #[must_use]
     pub fn with_retain_raw_exception_messages(mut self, retain: bool) -> Self {
@@ -1451,6 +1453,12 @@ async fn execute(
     // `error.stack` は URL・本文を含み得るため、opt-in が無ければ保持しない（fail-closed。Issue #1168）。
     if !options.retain_raw_exception_messages {
         for e in &mut bridge_diagnostics.timer_errors {
+            e.clear_stack();
+        }
+        for e in &mut bridge_diagnostics.listener_errors {
+            e.clear_stack();
+        }
+        for e in &mut bridge_diagnostics.net_callback_errors {
             e.clear_stack();
         }
     }

@@ -257,7 +257,25 @@ pub fn exception_label(e: &ExceptionSummary) -> String {
 /// core の要約（module 評価失敗と同じ語彙。`error.name` を加味する）をそのまま使い、
 /// ハーネス側の `class_label` では分類しない。生メッセージは含まない（Issue #1156・`JS-7`・`REPAIR-4`）。
 pub fn timer_error_label(source: &str, e: &ExceptionSummary) -> String {
+    callback_error_label(source, e)
+}
+
+/// callback 例外（タイマー・ライフサイクルリスナー・fetch / XHR）1 件を
+/// `<source>:<kind>:<class>[:<missing_api>]` のラベルにする。3 種で同じ形式にそろえる。
+///
+/// `property`・`code` は core の要約が保持するがラベルには出さない（timer ラベルの形式を保つため）。
+/// 生メッセージは含まない（Issue #1156・#1172・`JS-4`・`JS-7`・`JS-8`・`REPAIR-4`）。
+pub fn callback_error_label(source: &str, e: &ExceptionSummary) -> String {
     format!("{source}:{}", exception_label(e))
+}
+
+/// ライフサイクルイベントの snake case 表記（`dom_content_loaded` / `load` / それ以外は `other`）。
+pub fn lifecycle_event_name(event: LifecycleEvent) -> &'static str {
+    match event {
+        LifecycleEvent::DomContentLoaded => "dom_content_loaded",
+        LifecycleEvent::Load => "load",
+        _ => "other",
+    }
 }
 
 fn skip_name(k: &ScriptDiagnosticKind) -> &'static str {
@@ -266,12 +284,7 @@ fn skip_name(k: &ScriptDiagnosticKind) -> &'static str {
 
 /// ライフサイクル 1 件の表記（`dom_content_loaded:dispatched` 形式）。
 pub fn lifecycle_label(event: LifecycleEvent, outcome: &LifecycleOutcome) -> String {
-    let e = match event {
-        LifecycleEvent::DomContentLoaded => "dom_content_loaded",
-        LifecycleEvent::Load => "load",
-        _ => "other",
-    };
-    format!("{e}:{}", outcome.as_str())
+    format!("{}:{}", lifecycle_event_name(event), outcome.as_str())
 }
 
 #[cfg(test)]
@@ -606,6 +619,31 @@ mod tests {
         );
         let r = ExceptionSummary::from_engine_message("boom secret-token");
         assert_eq!(timer_error_label("microtask", &r), "microtask:other:other");
+    }
+
+    /// Issue #1172: listener / net callback のラベルも timer と同じ形式で、生メッセージを含まない。
+    #[test]
+    fn callback_error_label_covers_listener_and_net_sources() {
+        let r = ExceptionSummary::from_engine_message(
+            "Uncaught ReferenceError: undefinedFn is not defined",
+        );
+        assert_eq!(
+            callback_error_label(lifecycle_event_name(LifecycleEvent::Load), &r),
+            "load:ReferenceError:not_defined:undefinedFn"
+        );
+        assert_eq!(
+            callback_error_label("xhr", &r),
+            "xhr:ReferenceError:not_defined:undefinedFn"
+        );
+        let r = ExceptionSummary::from_engine_message("boom secret-token");
+        let label = callback_error_label("fetch", &r);
+        assert_eq!(label, "fetch:other:other");
+        assert!(!label.contains("secret-token"));
+        assert_eq!(
+            lifecycle_event_name(LifecycleEvent::DomContentLoaded),
+            "dom_content_loaded"
+        );
+        assert_eq!(timer_error_label("xhr", &r), "xhr:other:other");
     }
 
     #[test]
