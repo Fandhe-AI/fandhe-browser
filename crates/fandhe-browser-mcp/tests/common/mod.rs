@@ -78,7 +78,8 @@ fn serve_register_with_owned(listener: TcpListener) -> String {
 
 /// listener を閉じた直後のポートへ短い期限で 1 回接続し、拒否以外なら観測結果を stderr に残す。
 /// macOS の不定期失敗（Issue #1187）で wildcard listener の影が原因かを失敗ログから判別するための
-/// 診断で、テストの合否には使わない。
+/// 診断で、テストの合否には使わない。connect 成功は wildcard の影（H1）と、閉じたポートでも
+/// connect が成功する macOS の挙動（H2）のどちらでも起きるため、ログ上は区別せず両義のまま残す。
 /// エフェメラル範囲内のポートは同一プロセスの別テストへ再割り当てされ得て、診断の接続が干渉するため
 /// 探査しない（範囲外のポートに限る）。
 fn diagnose_refused(addr: Option<std::net::SocketAddr>) {
@@ -89,7 +90,9 @@ fn diagnose_refused(addr: Option<std::net::SocketAddr>) {
     }
     match std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(500)) {
         Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {}
-        Ok(_) => eprintln!("diagnostic: closed port {addr} accepted a connection (shadowed?)"),
+        Ok(_) => eprintln!(
+            "diagnostic: closed port {addr} connect succeeded (wildcard shadow or OS-level connect success; indistinguishable here)"
+        ),
         Err(e) => eprintln!("diagnostic: closed port {addr} probe: {:?}", e.kind()),
     }
 }
