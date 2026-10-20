@@ -779,6 +779,9 @@ fn string_arg<'a>(
     Ok(s)
 }
 
+/// `getOptionText` の走査ノード数の上限（短いテキストが多数ある深い DOM でも走査量を抑える）。
+const MAX_OPTION_TEXT_VISITS: usize = 1_000_000;
+
 fn check_string_len(s: &str, index: usize, limits: &DomBridgeLimits) -> Result<(), DomBridgeError> {
     if s.len() > limits.max_string_arg_bytes {
         return Err(DomBridgeError::StringTooLong {
@@ -1384,30 +1387,42 @@ fn execute(
         }
         DomOp::GetOptionText => {
             let node = page.node_arg(op, args, 1)?;
-            // 全子孫テキストの総量を上限として先に検査する（script 除外後はこれ以下になる）。
-            check_text_content_len(&page.document, node, limits)?;
             let doc = &page.document;
+            // getTextContent と同様、Document / Doctype は対象外（走査・確保の前に null を返す）。
+            if matches!(
+                doc.node_data(node),
+                Some(NodeData::Document | NodeData::Doctype { .. }) | None
+            ) {
+                return Ok(JsValue::Null);
+            }
+            // 木を 1 回だけ走査する。script（HTML・SVG）配下かどうかは走査状態として持ち、
+            // 祖先をたどり直さない。連結前に累積バイト数と走査ノード数を上限と比較して打ち切る。
             let mut text = String::new();
-            for d in doc.descendants(node) {
-                let Some(NodeData::Text { contents }) = doc.node_data(d) else {
+            let mut visited: usize = 0;
+            let mut stack: Vec<(NodeId, bool)> = doc
+                .children(node)
+                .map(|c| (c, doc.local_name(node) == Some("script")))
+                .collect();
+            stack.reverse();
+            while let Some((id, under_script)) = stack.pop() {
+                visited += 1;
+                if visited > MAX_OPTION_TEXT_VISITS {
+                    return Err(DomBridgeError::ResponseTooLarge {
+                        len: visited,
+                        limit: MAX_OPTION_TEXT_VISITS,
+                    });
+                }
+                if let Some(NodeData::Text { contents }) = doc.node_data(id) {
+                    if !under_script {
+                        check_response_len(text.len().saturating_add(contents.len()), limits)?;
+                        text.push_str(contents);
+                    }
                     continue;
-                };
-                // 仕様の option text は script（HTML・SVG）配下のテキストを除く。
-                let mut under_script = false;
-                let mut cur = doc.parent(d);
-                while let Some(a) = cur {
-                    if a == node {
-                        break;
-                    }
-                    if doc.local_name(a) == Some("script") {
-                        under_script = true;
-                        break;
-                    }
-                    cur = doc.parent(a);
                 }
-                if !under_script {
-                    text.push_str(contents);
-                }
+                let child_under = under_script || doc.local_name(id) == Some("script");
+                let start = stack.len();
+                stack.extend(doc.children(id).map(|c| (c, child_under)));
+                stack[start..].reverse();
             }
             string_response(text, limits)
         }
@@ -2343,6 +2358,34 @@ mod tests {
             call(&b, &[s("getElementById"), s("b")]).expect("none"),
             JsValue::Null
         );
+    }
+
+    #[test]
+    fn js_6_get_option_text_skips_script_and_rejects_document_and_oversize() {
+        let b = bridge_with(DomBridgeLimits::default().with_max_response_bytes(8));
+        let root = num(call(&b, &[s("documentRoot")]));
+        // Document ルートは走査せず null を返す。
+        assert_eq!(
+            call(&b, &[s("getOptionText"), n(root)]).expect("null"),
+            JsValue::Null
+        );
+        let b = DomBridge::new(DomBridgeLimits::default());
+        b.attach(parse(
+            "<div id=\"a\">x<script>no</script><b>y<script><i>z</i></script></b>w</div>",
+        ))
+        .expect("attach");
+        let a = num(call(&b, &[s("getElementById"), s("a")]));
+        assert_eq!(
+            call(&b, &[s("getOptionText"), n(a)]).expect("text"),
+            s("xyw")
+        );
+        let b = bridge_with(DomBridgeLimits::default().with_max_response_bytes(8));
+        let a = num(call(&b, &[s("getElementById"), s("a")]));
+        call(&b, &[s("setTextContent"), n(a), s("123456789")]).expect("set");
+        assert!(matches!(
+            call(&b, &[s("getOptionText"), n(a)]).expect_err("超過"),
+            DomBridgeError::ResponseTooLarge { limit: 8, .. }
+        ));
     }
 
     #[test]
