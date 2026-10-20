@@ -164,7 +164,7 @@ pub fn normalize_delay(delay_ms: f64) -> u64 {
     delay_ms.floor() as u64
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct Entry {
     /// 順序キー `(期限ms, 登録順)`。interval の発火中は `order` に無い。
     key: (u64, u64),
@@ -176,7 +176,9 @@ struct Entry {
 }
 
 /// 保留中タイマー 1 件の要約（診断用。Issue #1176）。
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Debug` は手実装で、`origin`（untrusted。URL・トークンを含み得る）は長さだけを出す（`SEC-2`）。
+#[derive(Clone, PartialEq, Eq)]
 pub struct PendingEntry {
     /// タイマー ID。
     pub id: TimerId,
@@ -188,6 +190,34 @@ pub struct PendingEntry {
     pub repeat: bool,
     /// 登録元の stack（opt-in 時だけ。untrusted のため `Debug` を通さず扱うこと）。
     pub origin: Option<String>,
+}
+
+/// `origin` の中身を出さず長さだけを表示する `Debug` 用ヘルパー。
+fn origin_len(origin: &Option<String>) -> Option<usize> {
+    origin.as_ref().map(String::len)
+}
+
+impl std::fmt::Debug for Entry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Entry")
+            .field("key", &self.key)
+            .field("interval_ms", &self.interval_ms)
+            .field("delay_ms", &self.delay_ms)
+            .field("origin_len", &origin_len(&self.origin))
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for PendingEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PendingEntry")
+            .field("id", &self.id)
+            .field("due_ms", &self.due_ms)
+            .field("delay_ms", &self.delay_ms)
+            .field("repeat", &self.repeat)
+            .field("origin_len", &origin_len(&self.origin))
+            .finish()
+    }
 }
 
 /// 登録元 stack を保持する件数の上限（`JS-6`。超過分は捨てる）。
@@ -586,6 +616,22 @@ mod tests {
     }
 
     /// JS-6: 登録元 stack は切り詰め・件数上限つきで、エントリーと一緒に消える（Issue #1176）。
+    #[test]
+    fn sec_2_debug_of_queue_and_pending_entry_hides_origin_text() {
+        let l = limits();
+        let mut q = TimerQueue::new();
+        let id = q.register(1, false, &l).expect("id");
+        q.set_origin(id, "at https://x.test/?token=SECRET");
+        let entries = q.pending_entries(8);
+        let d1 = format!("{:?}", entries);
+        let d2 = format!("{:?}", q);
+        for d in [&d1, &d2] {
+            assert!(!d.contains("SECRET"), "{d}");
+            assert!(!d.contains("x.test"), "{d}");
+        }
+        assert!(d1.contains("origin_len: Some(31)"), "{d1}");
+    }
+
     #[test]
     fn js_6_timer_origin_is_truncated_bounded_and_released() {
         let l = limits();
