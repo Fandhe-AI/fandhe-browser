@@ -12,7 +12,7 @@
 // - 内部状態（length・state・scrollRestoration）はクロージャに置き、ページから見えるプロパティにしない。
 //   getter・メソッドは自分のインスタンスかを確認し、違えば TypeError。組み込み関数は install 時に捕捉する。
 // - pushState / replaceState: 失敗時に状態を変えない順序（直列化と上限検査 → URL op → 反映）。
-//   別オリジン等は SecurityError（DOMException）。URL の省略 / null は state（と length）だけ更新する。
+//   別オリジン・長すぎる URL（8192 UTF-16 unit 超。bridge を呼ぶ前に判定。#1175）等は SecurityError（DOMException）。URL の省略 / null は state（と length）だけ更新する。
 //   メソッドは writable・configurable で、`history.pushState = wrapper` の包み直しができる。
 // - state は構造化複製の代わりに予算付きの再帰複製（配列は添字で defineProperty、オブジェクトは for...in を
 //   逐次処理。ページが書き換え可能な Array.prototype.push・Object.keys は使わない）で複製し、累計 2 MiB（UTF-16 code unit）・
@@ -57,6 +57,11 @@
     var MAX_STATE_NODES = 100000;
     var MAX_STATE_DEPTH = 100;
     var MAX_LENGTH = 50;
+    // URL の長さ上限（UTF-16 code unit）。Rust 側 page_env.rs の `MAX_LOCATION_URL_BYTES`（UTF-8 で 8192 バイト）と同値。
+    // 1 unit は UTF-8 で 1 バイト以上なので、これを超える文字列は Rust 側でも必ず拒否される（受理される URL は落とさない）。
+    // 8192 unit 以下なら UTF-8 でも最大 49152 バイトで bridge の文字列上限（64 KiB）に届かない。
+    // bridge 到達前に判定し、入力サイズによらず例外を SecurityError に揃える（#1175）。
+    var MAX_URL_UNITS = 8192;
 
     var states = new WeakMapCtor();
 
@@ -191,7 +196,8 @@
             }
             var urlText = strCtor(url);
             // 空文字列は現在の URL を保持する（解決するとフラグメントが落ちるため op を呼ばない）。
-            if (urlText !== '' && callOp('historySetUrl', urlText) !== true) {
+            // 長すぎる URL は bridge を呼ばずに拒否する（bridge の StringTooLong を見せない。#1175）。
+            if (urlText.length > MAX_URL_UNITS || (urlText !== '' && callOp('historySetUrl', urlText) !== true)) {
                 throw new NativeDOMException(
                     "Failed to execute '" + name + "' on 'History': the URL cannot be used.",
                     'SecurityError'
