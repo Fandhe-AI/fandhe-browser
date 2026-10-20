@@ -221,8 +221,14 @@
         }
     }
 
-    function newEntry(url, copy) {
-        return { url: url, state: copy.value, units: copy.units, nodes: copy.nodes };
+    // 保存状態から独立した公開用コピーを作る（history.state・popstate 用。可変オブジェクトの共有を防ぐ）。
+    // 保存状態は検証済みの複製なので予算内に収まるが、失敗時は DataCloneError を投げる。
+    function publicState(stored, name) {
+        return cloneState(stored, name).value;
+    }
+
+    function newEntry(url, copy, pub) {
+        return { url: url, state: copy.value, pub: pub, units: copy.units, nodes: copy.nodes };
     }
 
     // 件数上限と累計予算を満たすまで、現在のエントリ以外を古い順（なければ末尾側）に捨てる（JS-6）。
@@ -258,6 +264,7 @@
         var st = stateOf(self);
         need(args, 2, name);
         var copy = cloneState(args[0], name);
+        var pubCopy = publicState(copy.value, name);
         var url = args.length > 2 ? args[2] : undefined;
         // 書き換え前の URL（現在のエントリの URL を確定するため）。
         var prevHref = currentHref();
@@ -288,11 +295,12 @@
                 delete st.entries[i];
             }
             st.count = st.index + 1;
-            st.entries[st.count] = newEntry(newHref !== null ? newHref : cur.url, copy);
+            st.entries[st.count] = newEntry(newHref !== null ? newHref : cur.url, copy, pubCopy);
             st.count++;
             st.index = st.count - 1;
         } else {
             cur.state = copy.value;
+            cur.pub = pubCopy;
             cur.units = copy.units;
             cur.nodes = copy.nodes;
             if (urlChanged && newHref !== null) {
@@ -319,7 +327,10 @@
         var cur = st.entries[st.index];
         var dest = st.entries[target];
         var ok = true;
+        var pub;
         try {
+            // 状態の準備に成功してから URL と index を確定する。
+            pub = publicState(dest.state, 'traverse');
             var here = currentHref();
             if (here !== null) {
                 cur.url = here;
@@ -336,7 +347,7 @@
         }
         st.index = target;
         // 移動先の公開 state は保存状態から作り直す（以前に公開した可変オブジェクトの変更を持ち込まない）。
-        dest.pub = publicState(dest.state);
+        dest.pub = pub;
         try {
             var ev = new PopStateEvent('popstate', { state: dest.pub });
             // 公開コンストラクターは undefined を null に写すが、traversal では history.state と一致させる。

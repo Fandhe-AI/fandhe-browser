@@ -2659,6 +2659,15 @@ fn history_traversal_cases(engine: &str) {
     let diag = p.bridge.take_diagnostics().expect("diagnostics");
     assert!(diag.location_changes_ignored.is_empty());
 
+    eprintln!("case: JS-5 history.state reflects pushState and replaceState values");
+    let mut p = based(engine);
+    check(
+        &mut p,
+        "history.replaceState({r: 1}, ''); var a = history.state.r; history.pushState({n: 1}, '', '/p'); \
+         [a, history.state.n, history.state !== null].join('|')",
+        "1|1|true",
+    );
+
     eprintln!("case: JS-6 history public state mutation does not leak into stored state");
     let mut p = based(engine);
     check(
