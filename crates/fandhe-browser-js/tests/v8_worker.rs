@@ -90,8 +90,8 @@ fn main() -> ExitCode {
     js_1_state_persists_across_evaluations();
     eprintln!("case: js_1_infinite_loop_times_out_but_context_survives");
     js_1_infinite_loop_times_out_but_context_survives();
-    eprintln!("case: js_1_oom_returns_resource_limit_exceeded_and_next_eval_uses_fresh_context");
-    js_1_oom_returns_resource_limit_exceeded_and_next_eval_uses_fresh_context();
+    eprintln!("case: js_1_oom_returns_resource_limit_exceeded_and_next_eval_succeeds");
+    js_1_oom_returns_resource_limit_exceeded_and_next_eval_succeeds();
     eprintln!("case: js_1_handshake_failure_is_engine_unavailable");
     js_1_handshake_failure_is_engine_unavailable();
     eprintln!("case: js_4_handshake_with_protocol_generation_5_fails");
@@ -397,13 +397,16 @@ fn js_1_infinite_loop_times_out_but_context_survives() {
 }
 
 /// JS-1・Issue #503 W6 観点 4「OOM で ResourceLimitExceeded になり、次の
-/// 評価が新しい Context で成功すること」: ヒープ上限に達すると子
-/// プロセスが V8 の既定の fatal OOM で終了し、親がこれを検出して
-/// [`JsEngineError::ResourceLimitExceeded`] へ変換すること
-/// （メッセージに "context was discarded" を含む）。その後の評価は
-/// 新しい子プロセス・新しい Context で成功し、以前の Context にだけ
-/// 存在した変数はもう見えないこと。
-fn js_1_oom_returns_resource_limit_exceeded_and_next_eval_uses_fresh_context() {
+/// 評価が成功すること」: ヒープ上限に達しても [`JsEngineError::ResourceLimitExceeded`]
+/// で返り、その後の評価が成功すること。
+///
+/// Issue #1193 以降、評価中のヒープ上限到達は near-heap-limit コールバックが実行を
+/// 打ち切って回収するため、通常は子が生き残り Context も残る（メッセージは
+/// "heap limit"・"context was discarded" を含まない・`before_oom` が見え続ける）。
+/// 引き上げの天井を超える確保で子が致命的 OOM になった場合は従来どおり Context を
+/// 破棄する（メッセージに "context was discarded"・`before_oom` は消える）。どちらの
+/// 分岐でも次の評価が成功することを必須とし、各分岐を具体的に確かめる。
+fn js_1_oom_returns_resource_limit_exceeded_and_next_eval_succeeds() {
     let mut engine = V8ProcessEngine::new_for_test(WorkerSpawnConfigForTest {
         heap_limit_bytes: Some(TEST_HEAP_LIMIT_BYTES),
         protocol_version_override: None,
@@ -418,33 +421,47 @@ fn js_1_oom_returns_resource_limit_exceeded_and_next_eval_uses_fresh_context() {
         .unwrap_or_else(|err| panic!("marker declaration must evaluate successfully: {err}"));
 
     let oom_script = "var chunks = []; while (true) { chunks.push(new Array(1e6).fill(0)); }";
-    match engine.evaluate_script(oom_script, &EvaluateOptions::default()) {
+    let discarded = match engine.evaluate_script(oom_script, &EvaluateOptions::default()) {
         Err(JsEngineError::ResourceLimitExceeded(msg)) => {
-            assert!(
-                msg.contains("context was discarded"),
-                "OOM must discard the context, got: {msg}"
-            );
+            if msg.contains("context was discarded") {
+                true
+            } else {
+                assert!(
+                    msg.contains("heap limit and was terminated"),
+                    "unexpected ResourceLimitExceeded message: {msg}"
+                );
+                false
+            }
         }
         other => {
             panic!("expected ResourceLimitExceeded for a heap-exhausting script, got: {other:?}")
         }
-    }
+    };
 
     let result = engine
         .evaluate_script("40 + 2", &EvaluateOptions::default())
-        .unwrap_or_else(|err| panic!("engine must recover with a fresh child after OOM: {err}"));
+        .unwrap_or_else(|err| panic!("engine must keep working after OOM: {err}"));
     assert_eq!(result, JsValue::Number(42.0));
 
-    match engine.evaluate_script("before_oom", &EvaluateOptions::default()) {
-        Err(JsEngineError::EvaluationFailed(msg)) => {
-            assert!(
-                msg.contains("before_oom") || msg.contains("ReferenceError"),
-                "expected a ReferenceError for a variable from the discarded context, got: {msg}"
-            );
+    if discarded {
+        match engine.evaluate_script("before_oom", &EvaluateOptions::default()) {
+            Err(JsEngineError::EvaluationFailed(msg)) => {
+                assert!(
+                    msg.contains("before_oom") || msg.contains("ReferenceError"),
+                    "expected a ReferenceError for a variable from the discarded context, got: {msg}"
+                );
+            }
+            other => {
+                panic!(
+                    "expected the pre-OOM variable to be gone in the fresh context, got: {other:?}"
+                )
+            }
         }
-        other => {
-            panic!("expected the pre-OOM variable to be gone in the fresh context, got: {other:?}")
-        }
+    } else {
+        let kept = engine
+            .evaluate_script("before_oom", &EvaluateOptions::default())
+            .unwrap_or_else(|err| panic!("context must survive a recovered OOM: {err}"));
+        assert_eq!(kept, JsValue::Number(999.0));
     }
 }
 
@@ -1217,9 +1234,12 @@ fn js_1_oversized_test_heap_limit_is_clamped_to_the_production_default() {
     let oom_script = "var chunks = []; while (true) { chunks.push(new Array(1e7).fill(0)); }";
     match engine.evaluate_script(oom_script, &EvaluateOptions::default()) {
         Err(JsEngineError::ResourceLimitExceeded(msg)) => {
+            // Issue #1193: 評価中の打ち切りで回収できれば Context は残る。天井を超えて
+            // 子が致命的 OOM になれば "context was discarded"。どちらもクランプ後の
+            // 128 MiB 上限に由来する（Timeout ではない）ことが要点。
             assert!(
-                msg.contains("context was discarded"),
-                "clamped OOM must discard the context, got: {msg}"
+                msg.contains("context was discarded") || msg.contains("128 MiB heap limit"),
+                "clamped OOM must report the 128 MiB limit or a discarded context, got: {msg}"
             );
         }
         other => panic!(

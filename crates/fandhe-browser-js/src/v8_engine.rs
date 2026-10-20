@@ -77,6 +77,7 @@
 //! | `Allocation` / `Threw` / `ResultConversion` / `ResultTooLarge` | `EvaluationFailed` | `Evaluation` | `EvaluationFailed` |
 //! | `Terminated` | `Timeout` | `Timeout` | `Timeout`（接頭辞付き） |
 //! | `NativeCallFatal` | `EngineUnavailable` | `Evaluation`（畳まれる） | `EvaluationFailed` |
+//! | `HeapLimitReached`（評価中のヒープ上限到達。JS-6・Issue #1193） | `ResourceLimitExceeded` | `ResourceLimit` | `ResourceLimitExceeded`（Context は残る） |
 //! | （boa のループ・再帰・スタック上限。V8 では発生しない） | `ResourceLimitExceeded` | `ResourceLimit` | `ResourceLimitExceeded`（Context は残る） |
 //! | （ES module 用フレームへの未対応応答。プロトコル v6。`JS-4`・Issue #1110） | `NotYetImplemented` | `NotYetImplemented`（4） | `NotYetImplemented`（Context は残る） |
 //! | モジュールの未 link・未知の id・不正な link 表（`link_module`・`evaluate_module` が V8 を呼ぶ前に返す。`JS-4`・Issue #1111） | `ModuleResolutionFailed` | `ModuleResolution`（5） | `ModuleResolutionFailed`（Context は残る） |
@@ -118,13 +119,14 @@
 //! JS を実行しない）を明記している。microtask checkpoint と Promise 状態の取得は
 //! `unsafe` を使わない。それ以外では `unsafe` を使わない（TASK-29・Issue #503・JS プロセス分離の設計書
 //! §5「案 X」。以前存在した `near_heap_limit_callback`〔Issue #507 で承認
-//! した `unsafe`〕は、ヒープ上限到達時の挙動を「V8 の既定の fatal
-//! OOM で Isolate を含むプロセスが終了する」ことに一本化したため削除した。
-//! この Isolate は子プロセス（`super::worker`）の中でだけ生成されるため、
-//! fatal OOM で終了してもホストプロセスは道連れにならない。
-//! 例外として、`Drop for V8Engine` だけが `unsafe` なしの near-heap-limit
-//! コールバックで破棄中に限り上限を一時的に引き上げる〔JS-6・Issue #1161。
-//! JS 実行中の契約は変えない〕。新たに
+//! した `unsafe`〕は削除した。この Isolate は子プロセス（`super::worker`）の
+//! 中でだけ生成されるため、fatal OOM で終了してもホストプロセスは道連れに
+//! ならない。これが最終防衛線である。その手前の多層防御として、`unsafe` なしの
+//! near-heap-limit コールバックを 2 か所に限り使う: 評価中は実行を打ち切って
+//! `ResourceLimitExceeded` で返し（JS-6・Issue #1193。`V8Engine::guarded`）、
+//! `Drop for V8Engine` は破棄中に限り上限を一時的に引き上げる（JS-6・Issue #1161）。
+//! 完全な防止ではなく、引き上げ幅を超える単発の確保は従来どおり fatal OOM になる
+//! （REPAIR-3）。新たに
 //! `unsafe` が必要になった場合は実装を止めてユーザーへ報告する
 //! （security.md「`unsafe` の新規追加はユーザー承認を得る」）。
 //!
@@ -242,8 +244,13 @@ pub(crate) const MAX_SCRIPT_SOURCE_BYTES: usize = super::shared::MAX_SCRIPT_SOUR
 /// よるプロセス全体の abort を防ぎきれない（codex レビューの P0 指摘）。
 ///
 /// そこで本 crate は、[`V8Engine`] を子プロセス（`super::worker`）の中
-/// でだけ生成する構成に変更した。ヒープ上限に達すると、コールバックで
-/// 打ち切りを試みることはせず、V8 の既定の挙動どおり
+/// でだけ生成する構成に変更した。これが最終防衛線で、その手前に Issue #1193 で
+/// 評価中の safe な near-heap-limit コールバック（[`terminate_on_heap_limit`]。
+/// 1 回目の通知は少し引き上げるだけ、2 回目で実行を打ち切り、
+/// [`EVALUATION_HEAP_LIMIT_CAP_BYTES`] まで引き上げる）を足した。無限 microtask の鎖
+/// のように少しずつ増えるスクリプトは `ResourceLimitExceeded`（Context は残る）で
+/// 止まる。引き上げ幅を超える単発の確保など、コールバックで防げなかったときは
+/// V8 の既定の挙動どおり
 /// `Fatal JavaScript out of memory: Reached heap limit` を stderr に
 /// 出して、その子プロセスだけが異常終了する（正規の挙動）。ホスト
 /// プロセスは Isolate を直接持たないため、この終了に巻き込まれない。
@@ -280,22 +287,45 @@ pub(crate) const MAX_ISOLATE_HEAP_BYTES: usize = 128 * 1024 * 1024; // 128 MiB
 /// `crate::resource_limits` の子プロセス RSS 監視しきい値より小さく保つ。
 pub(crate) const TEARDOWN_HEAP_LIMIT_CAP_BYTES: usize = MAX_ISOLATE_HEAP_BYTES * 2; // 256 MiB
 
-/// 破棄時の near-heap-limit コールバックが返す新しい上限を計算する純関数。
+/// near-heap-limit コールバックが返す新しい上限を計算する純関数（評価中・破棄時で共通）。
 ///
 /// 戻り値は `current` より厳密に大きい（V8 は同値以下を「引き上げなし」
 /// とみなして fatal にするため）。ただし `current` が `usize::MAX` のときは
-/// `usize::MAX` で飽和する。通常は [`TEARDOWN_HEAP_LIMIT_CAP_BYTES`] で
-/// 頭打ちにし、すでに天井以上なら 1 バイトだけ上乗せする（オーバーフローしない）。
-pub(crate) fn teardown_heap_limit(current: usize, initial: usize) -> usize {
-    let raised = current
-        .saturating_add(initial.max(1))
-        .min(TEARDOWN_HEAP_LIMIT_CAP_BYTES);
+/// `usize::MAX` で飽和する。通常は `cap` で頭打ちにし、すでに `cap` 以上
+/// なら 1 バイトだけ上乗せする（オーバーフローしない）。
+pub(crate) fn raised_heap_limit(current: usize, initial: usize, cap: usize) -> usize {
+    let raised = current.saturating_add(initial.max(1)).min(cap);
     if raised > current {
         raised
     } else {
         current.saturating_add(1)
     }
 }
+
+/// 破棄時の near-heap-limit コールバックが返す新しい上限
+/// （[`raised_heap_limit`] を [`TEARDOWN_HEAP_LIMIT_CAP_BYTES`] で頭打ちにしたもの）。
+pub(crate) fn teardown_heap_limit(current: usize, initial: usize) -> usize {
+    raised_heap_limit(current, initial, TEARDOWN_HEAP_LIMIT_CAP_BYTES)
+}
+
+/// 評価中（[`V8Engine::guarded`]）だけ許す一時的なヒープ上限の天井（JS-6・Issue #1193）。
+///
+/// 無限 microtask の鎖のようにヒープを単調に増やすスクリプトは、watchdog より先に
+/// [`MAX_ISOLATE_HEAP_BYTES`] へ届くことがある。V8 は上限到達時に引き上げが無ければ
+/// 致命的 OOM になるため、評価中は [`terminate_on_heap_limit`] が実行の打ち切りを
+/// 要求しつつ、打ち切られた JS が巻き戻るまでの猶予としてこの天井まで引き上げる。
+/// 評価ごとに設定値へ戻すため、引き上げは積み上がらない。
+/// 大小関係は 評価の天井 < 破棄の天井 < 親の RSS しきい値（コンパイル時に固定）。
+pub(crate) const EVALUATION_HEAP_LIMIT_CAP_BYTES: usize = MAX_ISOLATE_HEAP_BYTES + 64 * 1024 * 1024; // 192 MiB
+
+/// 1 回目の通知で引き上げる幅 = `initial / FIRST_RAISE_DIVISOR`（打ち切りは 2 回目から）。
+const FIRST_RAISE_DIVISOR: usize = 4;
+
+const _: () = {
+    assert!(EVALUATION_HEAP_LIMIT_CAP_BYTES > MAX_ISOLATE_HEAP_BYTES);
+    assert!(EVALUATION_HEAP_LIMIT_CAP_BYTES < TEARDOWN_HEAP_LIMIT_CAP_BYTES);
+    assert!(TEARDOWN_HEAP_LIMIT_CAP_BYTES < super::resource_limits::MAX_CHILD_RSS_BYTES as usize);
+};
 
 /// `Drop for V8Engine` だけが登録する near-heap-limit コールバック。
 ///
@@ -308,6 +338,59 @@ extern "C" fn raise_heap_limit_for_teardown(
     initial_heap_limit: usize,
 ) -> usize {
     teardown_heap_limit(current_heap_limit, initial_heap_limit)
+}
+
+thread_local! {
+    /// 評価中だけ入る、このスレッドの Isolate への打ち切りハンドル（[`terminate_on_heap_limit`] が読む）。
+    /// 1 スレッドに `V8Engine` は 1 つだけ（[`V8_ISOLATE_ACTIVE`]）なので対応は一意。
+    static HEAP_GUARD_HANDLE: std::cell::RefCell<Option<v8::IsolateHandle>> =
+        const { std::cell::RefCell::new(None) };
+    /// 評価中にヒープ上限へ届いて打ち切りを要求したか。
+    static HEAP_GUARD_FIRED: Cell<bool> = const { Cell::new(false) };
+    /// 現在の評価で [`terminate_on_heap_limit`] が呼ばれた回数。
+    static HEAP_GUARD_CALLS: Cell<u32> = const { Cell::new(0) };
+}
+
+/// 評価中だけ登録する near-heap-limit コールバック（JS-6・Issue #1193）。
+///
+/// `data` には触れない safe な `extern "C" fn`（`unsafe` なし）。FFI 境界で panic すると
+/// abort になるため `try_with`・`try_borrow` だけを使う。処理は (1) 発火フラグを立てる
+/// (2) 実行の打ち切りを要求する (3) [`EVALUATION_HEAP_LIMIT_CAP_BYTES`] までの引き上げを返す。
+/// 呼び出しは `V8Engine::guarded` が arm / disarm する。
+extern "C" fn terminate_on_heap_limit(
+    _data: *mut std::ffi::c_void,
+    current_heap_limit: usize,
+    initial_heap_limit: usize,
+) -> usize {
+    let calls = HEAP_GUARD_CALLS
+        .try_with(|calls| {
+            calls.set(calls.get().saturating_add(1));
+            calls.get()
+        })
+        .unwrap_or(u32::MAX);
+    if calls == 1 {
+        // 1 回目は打ち切らず少しだけ引き上げる。V8 は外部メモリ（ArrayBuffer の確保失敗時の
+        // GC 等）でも到達を通知するため、そこで打ち切ると本来 RangeError になる評価まで
+        // 巻き込む。本当に増え続けるスクリプトは引き上げ後の上限で 2 回目に届く。
+        return raised_heap_limit(
+            current_heap_limit,
+            (initial_heap_limit / FIRST_RAISE_DIVISOR).max(1),
+            EVALUATION_HEAP_LIMIT_CAP_BYTES,
+        );
+    }
+    let _ = HEAP_GUARD_FIRED.try_with(|fired| fired.set(true));
+    let _ = HEAP_GUARD_HANDLE.try_with(|handle| {
+        if let Ok(handle) = handle.try_borrow()
+            && let Some(handle) = handle.as_ref()
+        {
+            handle.terminate_execution();
+        }
+    });
+    raised_heap_limit(
+        current_heap_limit,
+        initial_heap_limit,
+        EVALUATION_HEAP_LIMIT_CAP_BYTES,
+    )
 }
 
 /// テスト専用のヒープ上限（[`super::worker::TEST_HEAP_LIMIT_ENV_VAR`]・
@@ -547,6 +630,8 @@ pub(crate) struct V8Engine {
     /// `OwnedIsolate` の drop 順制約（生成と逆順であること）が問題になる
     /// 状況自体が起こらない。
     isolate: v8::OwnedIsolate,
+    /// 生成時に設定したヒープ上限。評価後に near-heap-limit の引き上げを戻す先。
+    heap_limit_bytes: usize,
 }
 
 /// 同一スレッド上に既に別の [`V8Engine`]（`OwnedIsolate`）が存在するため、
@@ -603,6 +688,8 @@ enum V8Failure {
         stage: &'static str,
         timeout: Duration,
     },
+    /// 評価中にヒープ上限へ届き、実行を打ち切った（JS-6・Issue #1193）。
+    HeapLimitReached { limit_bytes: usize },
     /// 文字列結果が `EvaluateOptions::max_result_bytes` を超えた（UTF-8 バイト数）。
     ResultTooLarge { bytes: usize, limit: usize },
     /// 評価結果の V8 値から [`JsValue`] への変換失敗。
@@ -625,6 +712,12 @@ impl From<V8Failure> for JsEngineError {
                 "script {stage} exceeded the {} second timeout and was terminated",
                 timeout.as_secs_f64()
             )),
+            V8Failure::HeapLimitReached { limit_bytes } => {
+                JsEngineError::ResourceLimitExceeded(format!(
+                    "script reached the {} MiB heap limit and was terminated",
+                    limit_bytes / (1024 * 1024)
+                ))
+            }
             V8Failure::ResultTooLarge { bytes, limit } => JsEngineError::EvaluationFailed(format!(
                 "string result of {bytes} bytes exceeds the result size limit of {limit} bytes"
             )),
@@ -723,7 +816,11 @@ impl V8Engine {
         isolate.set_host_initialize_import_meta_object_callback(import_meta_callback);
         // 動的 `import()` の保留キュー（`JS-4`・`JS-6`・Issue #1113）。
         isolate.set_host_import_module_dynamically_callback(dynamic_import_callback);
-        Ok(Self { context, isolate })
+        Ok(Self {
+            context,
+            isolate,
+            heap_limit_bytes,
+        })
     }
 
     /// [`V8Engine::new_with_heap_limit`] の本体のうち、Context 生成と
@@ -912,7 +1009,45 @@ impl V8Engine {
             return Err(V8Failure::NativeCallFatal(message).into());
         }
 
-        Self::evaluate_in_isolate(&mut self.isolate, &self.context, script, options)
+        self.guarded(|engine| {
+            Self::evaluate_in_isolate(&mut engine.isolate, &engine.context, script, options)
+        })
+    }
+
+    /// 評価中だけヒープ上限への到達を監視して実行する（JS-6・Issue #1193）。
+    ///
+    /// `f` の前に [`terminate_on_heap_limit`] を登録し、後で必ず外して上限を設定値へ戻す
+    /// （arm / disarm は対で、入れ子にしない。V8 は最後に追加したコールバックだけを呼ぶ）。
+    /// 発火していた場合は、`f` 内の watchdog 後始末（打ち切り要求の解除）が済んだ後で
+    /// full GC を走らせて死んだ Promise の鎖を回収し、`Err` を [`V8Failure::HeapLimitReached`]
+    /// （`ResourceLimitExceeded`・Context は残る）へ置き換える（`Timeout` より優先）。
+    /// 既知の制限: 引き上げ幅を超える単発の巨大確保は従来どおり致命的 OOM になり、
+    /// 親が子の終了を `ResourceLimitExceeded`（Context 破棄）として扱う（子プロセス分離が最終防衛線）。
+    fn guarded<T>(
+        &mut self,
+        f: impl FnOnce(&mut Self) -> Result<T, JsEngineError>,
+    ) -> Result<T, JsEngineError> {
+        let handle = self.isolate.thread_safe_handle();
+        HEAP_GUARD_HANDLE.with(|slot| *slot.borrow_mut() = Some(handle));
+        HEAP_GUARD_FIRED.with(|fired| fired.set(false));
+        HEAP_GUARD_CALLS.with(|calls| calls.set(0));
+        self.isolate
+            .add_near_heap_limit_callback(terminate_on_heap_limit, std::ptr::null_mut());
+        let result = f(self);
+        let fired = HEAP_GUARD_FIRED.with(|fired| fired.replace(false));
+        if fired {
+            self.isolate.low_memory_notification();
+        }
+        self.isolate
+            .remove_near_heap_limit_callback(terminate_on_heap_limit, self.heap_limit_bytes);
+        HEAP_GUARD_HANDLE.with(|slot| *slot.borrow_mut() = None);
+        match result {
+            Err(_) if fired => Err(V8Failure::HeapLimitReached {
+                limit_bytes: self.heap_limit_bytes,
+            }
+            .into()),
+            other => other,
+        }
     }
 
     /// この Isolate に、子プロセス（[`super::worker`]）が親と通信するための
@@ -2402,7 +2537,7 @@ impl V8Engine {
     /// - 監視は instantiate の前に起動し、`options.timeout()` を過ぎると `Timeout`
     ///
     /// - evaluate の後に microtask checkpoint を行い（監視はその間も有効。無限に
-    ///   microtask を積むスクリプトは `Timeout`）、評価 Promise の状態を読む。
+    ///   microtask を積むスクリプトは `Timeout`、ヒープ上限に先に届けば `ResourceLimitExceeded`）、評価 Promise の状態を読む。
     ///   未確定（top-level await が解決されない Promise を待つ等）は `Pending`
     ///   （`JS-4`・`REPAIR-3`・Issue #1112）
     /// - `import.meta.url` は compile 時の URL（[`import_meta_callback`]）
@@ -2411,6 +2546,15 @@ impl V8Engine {
     /// `EvaluationFailed`（boa と同じ契約）。メッセージに URL は含めない
     /// （行番号のみ付く）。
     pub(crate) fn evaluate_module(
+        &mut self,
+        root: ModuleId,
+        options: &EvaluateOptions,
+    ) -> Result<ModuleEvaluation, JsEngineError> {
+        self.guarded(|engine| engine.evaluate_module_inner(root, options))
+    }
+
+    /// [`V8Engine::evaluate_module`] の本体（ヒープ上限の監視は呼び出し側の `guarded`）。
+    fn evaluate_module_inner(
         &mut self,
         root: ModuleId,
         options: &EvaluateOptions,
@@ -2505,6 +2649,16 @@ impl V8Engine {
     ///   応答でも台帳から外す）。0 は id の検証と除去のあと V8 を動かさず reject して `Timeout`
     /// - 戻り値は checkpoint 後の `import()` の Promise の状態（Fulfilled・Rejected・Pending）
     pub(crate) fn finish_dynamic_import(
+        &mut self,
+        id: DynamicImportId,
+        result: Result<ModuleId, String>,
+        options: &EvaluateOptions,
+    ) -> Result<ModuleEvaluation, JsEngineError> {
+        self.guarded(|engine| engine.finish_dynamic_import_inner(id, result, options))
+    }
+
+    /// [`V8Engine::finish_dynamic_import`] の本体（ヒープ上限の監視は呼び出し側の `guarded`）。
+    fn finish_dynamic_import_inner(
         &mut self,
         id: DynamicImportId,
         result: Result<ModuleId, String>,
@@ -2779,6 +2933,9 @@ impl Drop for V8Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 外側の Promise を内側の Promise で解決し続け、ヒープを単調に増やす鎖（Issue #1193）。
+    const CHAIN_SCRIPT: &str = "const f = () => Promise.resolve().then(f); f(); export {};";
 
     /// JS-1・TASK-29.2: `ensure_v8_initialized` を複数回呼んでも panic
     /// しないこと（AC-1）。副作用として V8 が実際に初期化されたことを、
@@ -5151,19 +5308,136 @@ mod tests {
     #[test]
     fn js_6_v8_module_infinite_microtask_loop_times_out() {
         let mut engine = module_engine();
-        let record = compile_ok(
-            &mut engine,
-            "https://example.test/loop.js",
-            "const f = () => Promise.resolve().then(f); f(); export {};",
-        );
+        let record = compile_ok(&mut engine, "https://example.test/loop.js", CHAIN_SCRIPT);
         let opts = EvaluateOptions::default().with_timeout(Duration::from_millis(300));
         let started = std::time::Instant::now();
+        assert_stopped_by_timeout_or_heap_limit(engine.evaluate_module(record.id(), &opts));
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(eval_str(&mut engine, "1 + 1"), JsValue::Number(2.0));
+    }
+
+    /// 鎖状の無限 microtask は watchdog とヒープ上限到達が競合する（速い環境では
+    /// 上限が先。Issue #1193 で macOS CI だけ不定期に落ちた理由）。どちらで止まっても
+    /// 回復することが契約で、各分岐は決定的な補完テストで個別に固定する。
+    fn assert_stopped_by_timeout_or_heap_limit<T: std::fmt::Debug>(
+        result: Result<T, JsEngineError>,
+    ) {
+        match result {
+            Err(JsEngineError::Timeout(_)) => {}
+            Err(JsEngineError::ResourceLimitExceeded(message)) => {
+                assert!(message.contains("heap limit"), "unexpected: {message}");
+            }
+            other => panic!("expected Timeout or heap-limit ResourceLimitExceeded: {other:?}"),
+        }
+    }
+
+    /// JS-6・Issue #1193: 小さいヒープで鎖状の無限 microtask を動かすと、評価中の
+    /// ヒープ上限到達が致命的 OOM にならず `ResourceLimitExceeded` で返り、回収後に
+    /// 同じエンジンを使い続けられる。
+    #[test]
+    fn js_6_v8_module_leaking_microtask_chain_hits_heap_limit_and_recovers() {
+        let mut engine = V8Engine::new_with_heap_limit(16 * 1024 * 1024).expect("engine");
+        let record = compile_ok(&mut engine, "https://example.test/leak.js", CHAIN_SCRIPT);
+        let opts = EvaluateOptions::default().with_timeout(Duration::from_secs(10));
+        match engine.evaluate_module(record.id(), &opts) {
+            Err(JsEngineError::ResourceLimitExceeded(message)) => {
+                assert_eq!(
+                    message,
+                    "script reached the 16 MiB heap limit and was terminated"
+                );
+            }
+            other => panic!("expected ResourceLimitExceeded: {other:?}"),
+        }
+        assert_eq!(eval_str(&mut engine, "1 + 1"), JsValue::Number(2.0));
+        assert_eq!(
+            eval_str(&mut engine, "new Array(1e5).fill(0).length"),
+            JsValue::Number(100000.0)
+        );
+    }
+
+    /// JS-6・Issue #1193: メモリが増えない無限 microtask は watchdog の `Timeout` で止まる。
+    #[test]
+    fn js_6_v8_module_non_leaking_infinite_microtask_loop_times_out() {
+        let mut engine = module_engine();
+        let record = compile_ok(
+            &mut engine,
+            "https://example.test/noleak.js",
+            "const f = () => { Promise.resolve().then(f); }; f(); export {};",
+        );
+        let opts = EvaluateOptions::default().with_timeout(Duration::from_millis(300));
         assert!(matches!(
             engine.evaluate_module(record.id(), &opts),
             Err(JsEngineError::Timeout(_))
         ));
-        assert!(started.elapsed() < Duration::from_secs(5));
         assert_eq!(eval_str(&mut engine, "1 + 1"), JsValue::Number(2.0));
+    }
+
+    /// JS-6・Issue #1193: classic script の小刻みなヒープ枯渇も `ResourceLimitExceeded` で
+    /// 返り、Context（事前のグローバル）は残る。
+    #[test]
+    fn js_6_v8_classic_script_heap_exhaustion_is_resource_limit_and_engine_survives() {
+        let mut engine = V8Engine::new_with_heap_limit(16 * 1024 * 1024).expect("engine");
+        eval_str(&mut engine, "var kept = 41;");
+        let opts = EvaluateOptions::default().with_timeout(Duration::from_secs(10));
+        match engine.evaluate_script("var a = []; while (true) a.push({});", &opts) {
+            Err(JsEngineError::ResourceLimitExceeded(message)) => {
+                assert!(
+                    message.contains("16 MiB heap limit"),
+                    "unexpected: {message}"
+                );
+            }
+            other => panic!("expected ResourceLimitExceeded: {other:?}"),
+        }
+        assert_eq!(eval_str(&mut engine, "kept + 1"), JsValue::Number(42.0));
+    }
+
+    /// JS-6・Issue #1193: 上限超過の単発 `ArrayBuffer` 確保は V8 が near-heap-limit を通知しても
+    /// 従来どおり `RangeError`（`EvaluationFailed`）で、`ResourceLimitExceeded` に誤分類しない。
+    #[test]
+    fn js_6_v8_oversized_array_buffer_stays_range_error_under_heap_guard() {
+        let mut engine = V8Engine::new().expect("engine");
+        match engine.evaluate_script(
+            "new ArrayBuffer(129 * 1024 * 1024)",
+            &EvaluateOptions::default(),
+        ) {
+            Err(JsEngineError::EvaluationFailed(message)) => {
+                assert!(message.contains("RangeError"), "unexpected: {message}");
+            }
+            other => panic!("expected EvaluationFailed(RangeError): {other:?}"),
+        }
+        assert_eq!(eval_str(&mut engine, "1 + 1"), JsValue::Number(2.0));
+    }
+
+    /// JS-6・Issue #1193: 本番の上限（128 MiB）でも鎖状の無限 microtask は、`Timeout` か
+    /// ヒープ上限の `ResourceLimitExceeded` で止まり、致命的 OOM にならず再利用できる。
+    #[test]
+    fn js_6_v8_production_heap_microtask_chain_recovers() {
+        let mut engine = module_engine();
+        let record = compile_ok(
+            &mut engine,
+            "https://example.test/prod-leak.js",
+            CHAIN_SCRIPT,
+        );
+        let opts = EvaluateOptions::default().with_timeout(Duration::from_secs(20));
+        assert_stopped_by_timeout_or_heap_limit(engine.evaluate_module(record.id(), &opts));
+        assert_eq!(eval_str(&mut engine, "1 + 1"), JsValue::Number(2.0));
+    }
+
+    /// JS-6・Issue #1193: 評価中の引き上げは天井で頭打ちになり、現在値より必ず大きい。
+    #[test]
+    fn js_6_raised_heap_limit_is_capped_and_always_raises() {
+        let mib = 1024 * 1024;
+        assert_eq!(raised_heap_limit(16 * mib, 16 * mib, 192 * mib), 32 * mib);
+        assert_eq!(
+            raised_heap_limit(128 * mib, 128 * mib, 192 * mib),
+            192 * mib
+        );
+        assert_eq!(
+            raised_heap_limit(192 * mib, 128 * mib, 192 * mib),
+            192 * mib + 1
+        );
+        assert_eq!(raised_heap_limit(10, 0, 100), 11);
+        assert_eq!(raised_heap_limit(usize::MAX, usize::MAX, 100), usize::MAX);
     }
 
     /// JS-6・Issue #1161: 破棄時の上限引き上げは常に現在値より大きく、天井で頭打ち。
@@ -5189,13 +5463,10 @@ mod tests {
         let record = compile_ok(
             &mut engine,
             "https://example.test/loop-drop.js",
-            "const f = () => Promise.resolve().then(f); f(); export {};",
+            CHAIN_SCRIPT,
         );
         let opts = EvaluateOptions::default().with_timeout(Duration::from_millis(300));
-        assert!(matches!(
-            engine.evaluate_module(record.id(), &opts),
-            Err(JsEngineError::Timeout(_))
-        ));
+        assert_stopped_by_timeout_or_heap_limit(engine.evaluate_module(record.id(), &opts));
         drop(engine);
         let mut again = module_engine();
         assert_eq!(eval_str(&mut again, "1 + 1"), JsValue::Number(2.0));
