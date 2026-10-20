@@ -1022,7 +1022,8 @@ impl V8Engine {
     /// 発火していた場合は、`f` 内の watchdog 後始末（打ち切り要求の解除）が済んだ後で
     /// full GC を走らせて死んだ Promise の鎖を回収し、`Err` を [`V8Failure::HeapLimitReached`]
     /// （`ResourceLimitExceeded`・Context は残る）へ置き換える（`Timeout` より優先）。
-    /// 発火後は残った打ち切り要求も解除する。`f` が `Ok` を返していた場合はその結果を
+    /// 発火後は残った打ち切り要求も解除する。1 回目の引き上げだけで終わった場合（発火なし）も、
+    /// 生きたヒープが設定上限を超えたまま上限を戻さないよう回復 GC を走らせる（`Ok` はそのまま）。`f` が `Ok` を返していた場合はその結果を
     /// そのまま返す（評価は完了しており、結果は有効なため）。
     /// 上限は `remove_near_heap_limit_callback` で設定値へ戻す。評価中に実ヒープが設定値を
     /// 超えていた場合は、戻した直後の次の確保で再び上限に届き得る（直後の GC で回収する）。
@@ -1040,7 +1041,10 @@ impl V8Engine {
             .add_near_heap_limit_callback(terminate_on_heap_limit, std::ptr::null_mut());
         let result = f(self);
         let fired = HEAP_GUARD_FIRED.with(|fired| fired.replace(false));
-        if fired {
+        // 1 回目の引き上げだけで評価が成功した場合も、生きたヒープが設定上限を超えたまま
+        // コールバックを外すと後続の無保護な呼び出しが致命的 OOM になり得るため回収する。
+        let raised = HEAP_GUARD_CALLS.with(|calls| calls.get()) > 0;
+        if fired || raised {
             // `f` 内の watchdog 後始末の後に届いた通知（結果変換中の確保・後続の microtask
             // checkpoint）が積んだ打ち切り要求を残すと、次の評価が誤って `Timeout` になる。
             self.isolate.cancel_terminate_execution();
@@ -3681,6 +3685,25 @@ mod tests {
             Ok(7)
         });
         assert_eq!(result.expect("Ok must be returned unchanged"), 7);
+        let next = engine
+            .evaluate_script("40 + 2", &EvaluateOptions::default())
+            .expect("no stale terminate request may remain");
+        assert_eq!(next, JsValue::Number(42.0));
+    }
+
+    /// JS-6・Issue #1193 レビュー指摘: 1 回目の引き上げだけで評価が成功した場合
+    /// （`HEAP_GUARD_FIRED` なし）も `guarded` が回復 GC を走らせ、後始末で残った
+    /// 打ち切り要求を解除すること（`Ok` はそのまま返り、次の評価が成功する）。
+    #[test]
+    fn js_6_guarded_recovers_after_first_raise_only_success() {
+        let mut engine = V8Engine::new().expect("no other V8Engine is active on this thread");
+        let handle = engine.thread_safe_handle_for_test();
+        let result = engine.guarded(|_| {
+            HEAP_GUARD_CALLS.with(|calls| calls.set(1));
+            handle.terminate_execution();
+            Ok(9)
+        });
+        assert_eq!(result.expect("Ok must be returned unchanged"), 9);
         let next = engine
             .evaluate_script("40 + 2", &EvaluateOptions::default())
             .expect("no stale terminate request may remain");
