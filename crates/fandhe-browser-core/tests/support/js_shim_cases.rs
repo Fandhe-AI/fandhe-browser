@@ -542,6 +542,7 @@ pub fn run(engine: &str) {
     focus_cases(engine);
     create_element_ns_cases(engine);
     get_elements_by_tag_name_cases(engine);
+    parent_node_cases(engine);
 
     eprintln!("case: JS-5 disabled runtime does not pretend to install");
     let mut disabled = JsRuntime::disabled();
@@ -1977,7 +1978,7 @@ fn node_cases(engine: &str) {
     check(&mut p, "String(document.ownerDocument)", "null");
     check(
         &mut p,
-        "String('tagName' in document.body) + '|' + String('parentNode' in document.body)",
+        "String('tagName' in document.body) + '|' + String('childNodes' in document.body)",
         "false|false",
     );
     check(
@@ -3491,6 +3492,64 @@ fn get_elements_by_tag_name_cases(engine: &str) {
     check(
         &mut p,
         "try { Document.prototype.getElementsByTagName.call({}, 'div'); 'ok' } catch (e) { 'threw' }",
+        "threw",
+    );
+}
+
+/// JS-5・REPAIR-3・#1203: `parentNode` / `parentElement`。d3 の失敗は `[0]` は取れているのに
+/// `[0].parentNode` が未定義だったことが原因（タグ管理系の定型コード）。
+fn parent_node_cases(engine: &str) {
+    eprintln!("case: JS-5 parentNode of a parsed <script> (#1203)");
+    let mut p = setup_html(
+        engine,
+        "<html><head><script>x</script></head><body></body></html>",
+        None,
+    );
+    check(
+        &mut p,
+        "var f = document.getElementsByTagName('script')[0]; typeof f + '|' + typeof f.parentNode",
+        "object|object",
+    );
+    check(
+        &mut p,
+        "document.getElementsByTagName('script')[0].parentNode === document.head",
+        "true",
+    );
+    eprintln!("case: JS-5 tag-manager boilerplate inserts before the first script");
+    check(
+        &mut p,
+        "var s = document.createElement('script'); \
+         var f2 = document.getElementsByTagName('script')[0]; \
+         f2.parentNode.insertBefore(s, f2); \
+         document.getElementsByTagName('script').length + '|' + (s.parentNode === f2.parentNode)",
+        "2|true",
+    );
+    eprintln!("case: JS-5 parentNode up to document, parentElement, detached");
+    check(
+        &mut p,
+        "document.body.parentNode.parentNode === document",
+        "true",
+    );
+    check(
+        &mut p,
+        "document.parentNode === null && document.body.parentNode.parentElement === null",
+        "true",
+    );
+    check(
+        &mut p,
+        "document.body.parentElement === document.body.parentNode",
+        "true",
+    );
+    check(
+        &mut p,
+        "var d = document.createElement('div'); var r0 = d.parentNode === null; \
+         document.body.appendChild(d); var r1 = d.parentNode === document.body; \
+         document.body.removeChild(d); r0 + '|' + r1 + '|' + (d.parentNode === null)",
+        "true|true|true",
+    );
+    check(
+        &mut p,
+        "try { Object.getOwnPropertyDescriptor(Node.prototype, 'parentNode').get.call({}); 'ok' } catch (e) { 'threw' }",
         "threw",
     );
 }

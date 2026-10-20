@@ -29,7 +29,9 @@
 // - NodeList / HTMLCollection 互換（querySelectorAll は素の Array を返す）。
 // - Element の tagName / localName / nodeName（HTML 要素名を返す op `htmlLocalName` は IDL 属性の
 //   種別判定に使うが、IDL プロパティとしては未公開。サイトの分岐が変わり得るため。装わない）。
-// - parentNode / parentElement / childNodes / firstChild / lastChild / nextSibling /
+// - parentNode / parentElement は簡略版（#1203）: op `parentNode` が返す親（Element か文書）だけを
+//   読み取り専用で返し、親が DocumentFragment なら null（ラッパー型が無い。REPAIR-3）。
+// - childNodes / firstChild / lastChild / nextSibling /
 //   previousSibling / nodeValue / namespaceURI / isConnected / contains /
 //   compareDocumentPosition / attributes（属性の列挙）。対応する op が無く未定義のまま。
 // - HTMLElement・HTMLIFrameElement は名前だけ（instanceof / typeof 判定が通るため。常に false。
@@ -272,6 +274,32 @@
             revalidateFocus();
             notifyMutation('childList', this, { added: [], removed: [child], nextSibling: null });
             return child;
+        }
+    });
+    // 親ノード（タグ管理系の `getElementsByTagName('script')[0].parentNode.insertBefore` が使う。
+    // #1203）。親は Element か document のラッパーで、親なし・fragment 親は null。
+    function parentNodeOf(self) {
+        if (!ids.has(self)) {
+            throw new TypeError("Illegal invocation");
+        }
+        var pid = op('parentNode', ids.get(self));
+        if (pid === null || pid === undefined) {
+            return null;
+        }
+        if (pid === ids.get(documentWrapper)) {
+            return documentWrapper;
+        }
+        return wrap(pid, Element);
+    }
+    define(Node.prototype, 'parentNode', {
+        get: function () {
+            return parentNodeOf(this);
+        }
+    });
+    define(Node.prototype, 'parentElement', {
+        get: function () {
+            var parent = parentNodeOf(this);
+            return parent === documentWrapper ? null : parent;
         }
     });
     define(Node.prototype, 'textContent', {
