@@ -110,6 +110,8 @@ fn main() -> ExitCode {
     js_4_dynamic_import_ledgers_stay_in_sync_after_consumed_failures();
     eprintln!("case: js_6_dynamic_import_timeout_keeps_parent_and_child_ledgers_in_sync");
     js_6_dynamic_import_timeout_keeps_parent_and_child_ledgers_in_sync();
+    eprintln!("case: js_6_dynamic_import_heap_limit_keeps_parent_and_child_ledgers_in_sync");
+    js_6_dynamic_import_heap_limit_keeps_parent_and_child_ledgers_in_sync();
     eprintln!("case: js_4_module_import_meta_url_and_promise_states_through_the_v8_worker");
     js_4_module_import_meta_url_and_promise_states_through_the_v8_worker();
     eprintln!("case: js_1_handshake_rejects_hello_naming_a_different_engine");
@@ -933,6 +935,63 @@ fn js_6_dynamic_import_timeout_keeps_parent_and_child_ledgers_in_sync() {
         JsEngine::evaluate_script(&mut engine, "caught", &options).expect("eval"),
         JsValue::String("yes".to_string())
     );
+    let batch = engine
+        .compile_module(
+            "https://example.test/app/batch.js",
+            "for (let i = 0; i < 256; i++) { import('./m' + i + '.js').catch(() => {}); } export {};",
+        )
+        .expect("compile batch");
+    assert_eq!(
+        engine.evaluate_module(batch.id(), &options).expect("eval"),
+        ModuleEvaluation::Fulfilled
+    );
+    assert_eq!(
+        engine.take_dynamic_import_requests().expect("take").len(),
+        256
+    );
+    assert_eq!(engine.worker_pid_for_test(), pid);
+}
+
+/// JS-6・JS-4・Issue #1193: 動的 import の完了中にヒープ上限で打ち切られ
+/// `ResourceLimitExceeded`（Context は残る）になっても、親子の台帳が揃い（直後に 256 件を
+/// 取り出してもプロトコル違反にならず子は同じ pid）、保留枠が漏れないこと。
+/// 速い環境では watchdog の `Timeout` が先に届くため、どちらかで止まれば良い。
+fn js_6_dynamic_import_heap_limit_keeps_parent_and_child_ledgers_in_sync() {
+    let options = EvaluateOptions::default();
+    let mut engine = V8ProcessEngine::new_for_test(WorkerSpawnConfigForTest {
+        heap_limit_bytes: Some(TEST_HEAP_LIMIT_BYTES),
+        protocol_version_override: None,
+        hello_wrong_engine_for_test: false,
+        hello_extra_byte_for_test: false,
+        rss_threshold_bytes_override: None,
+        native_proxies_for_test: Vec::new(),
+        windows_process_memory_limit_bytes_override: None,
+    });
+    let root = engine
+        .compile_module(
+            "https://example.test/app/main.js",
+            "import('./leak.js').catch(() => {}); export {};",
+        )
+        .expect("compile root");
+    assert_eq!(
+        engine.evaluate_module(root.id(), &options).expect("eval"),
+        ModuleEvaluation::Fulfilled
+    );
+    let pid = engine.worker_pid_for_test();
+    let requests = engine.take_dynamic_import_requests().expect("take");
+    assert_eq!(requests.len(), 1);
+    let leak = engine
+        .compile_module(
+            "https://example.test/app/leak.js",
+            "const f = () => Promise.resolve().then(f); f(); export {};",
+        )
+        .expect("compile leak");
+    engine.link_module(leak.id(), &[]).expect("link leak");
+    let long = EvaluateOptions::default().with_timeout(Duration::from_secs(10));
+    match engine.finish_dynamic_import(requests[0].id(), Ok(leak.id()), &long) {
+        Err(JsEngineError::ResourceLimitExceeded(_) | JsEngineError::Timeout(_)) => {}
+        other => panic!("expected ResourceLimitExceeded or Timeout, got: {other:?}"),
+    }
     let batch = engine
         .compile_module(
             "https://example.test/app/batch.js",

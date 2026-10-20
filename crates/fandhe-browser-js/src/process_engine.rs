@@ -2752,12 +2752,15 @@ impl JsEngine for V8ProcessEngine {
             },
         );
         // 子は実行前に完了待ちから id を外すため、Timeout 応答でも結果サイズ超過などの
-        // EvaluationFailed（ERROR 応答）でも子の保留は残らない。親の台帳も外し、後続の take で
+        // EvaluationFailed（ERROR 応答）でも、評価中のヒープ上限による打ち切り
+        // （ResourceLimitExceeded・Context は残る。JS-6・#1193）でも子の保留は残らない。親の台帳も外し、後続の take で
         // 上限超過（プロトコル違反）にならないようにする。id 未知・未 link の
         // ModuleResolutionFailed は子が消費しないので外さない（Err での再試行を許す）。
         if matches!(
             outcome,
-            Err(JsEngineError::Timeout(_) | JsEngineError::EvaluationFailed(_))
+            Err(JsEngineError::Timeout(_)
+                | JsEngineError::EvaluationFailed(_)
+                | JsEngineError::ResourceLimitExceeded(_))
         ) && let Some(worker) = self.worker.as_mut()
         {
             worker.modules.complete_dynamic_import(id);

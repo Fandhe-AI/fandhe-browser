@@ -1045,6 +1045,10 @@ impl V8Engine {
             // checkpoint）が積んだ打ち切り要求を残すと、次の評価が誤って `Timeout` になる。
             self.isolate.cancel_terminate_execution();
             self.isolate.low_memory_notification();
+            // 回復用 GC 自身が（コールバック登録中のため）引き上げ後の上限へ届くと
+            // `terminate_execution` が再度呼ばれ、以後解除されず次の評価が `Timeout` に
+            // なる。GC の後でもう一度解除する。
+            self.isolate.cancel_terminate_execution();
         }
         self.isolate
             .remove_near_heap_limit_callback(terminate_on_heap_limit, self.heap_limit_bytes);
