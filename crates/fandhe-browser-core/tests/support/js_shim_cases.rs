@@ -2659,6 +2659,28 @@ fn history_traversal_cases(engine: &str) {
     let diag = p.bridge.take_diagnostics().expect("diagnostics");
     assert!(diag.location_changes_ignored.is_empty());
 
+    eprintln!("case: JS-6 history public state mutation does not leak into stored state");
+    let mut p = based(engine);
+    check(
+        &mut p,
+        "history.pushState({n: 1}, '', '/a'); history.state.n = 9; history.pushState({n: 2}, '', '/b'); \
+         history.back(); __fandheRunMicrotasks(); var r = [history.state.n]; \
+         history.state.n = 7; history.forward(); __fandheRunMicrotasks(); history.back(); __fandheRunMicrotasks(); \
+         r.push(history.state.n); r.join('|')",
+        "1|1",
+    );
+
+    eprintln!("case: DOM capture stopPropagation on target skips non-capture listeners");
+    let mut p = setup(engine, None);
+    check(
+        &mut p,
+        "var t = new EventTarget(), o = []; \
+         t.addEventListener('x', function (e) { o.push('cap'); e.stopPropagation(); }, true); \
+         t.addEventListener('x', function () { o.push('bub'); }); \
+         t.dispatchEvent(new Event('x')); o.join(',')",
+        "cap",
+    );
+
     eprintln!("case: JS-5 history out-of-range traversal and go(0)");
     let mut p = based(engine);
     check(

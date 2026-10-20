@@ -335,10 +335,12 @@
             return;
         }
         st.index = target;
+        // 移動先の公開 state は保存状態から作り直す（以前に公開した可変オブジェクトの変更を持ち込まない）。
+        dest.pub = publicState(dest.state);
         try {
-            var ev = new PopStateEvent('popstate', { state: dest.state });
+            var ev = new PopStateEvent('popstate', { state: dest.pub });
             // 公開コンストラクターは undefined を null に写すが、traversal では history.state と一致させる。
-            wmSet(popStates, ev, dest.state);
+            wmSet(popStates, ev, dest.pub);
             fnCall(nativeDispatchEvent, global, ev);
         } catch (e) {
             // 配送の失敗は移動の結果に影響させない（リスナー例外は dispatchEvent が報告する）。
@@ -437,7 +439,7 @@
     defineProperty(History.prototype, 'state', {
         get: function () {
             var st = stateOf(this);
-            return st.entries[st.index].state;
+            return st.entries[st.index].pub;
         },
         configurable: true,
         enumerable: true
@@ -463,7 +465,7 @@
 
     var inst = Object.create(History.prototype);
     var initialEntries = createObject(null);
-    initialEntries[0] = { url: null, state: null, units: 0, nodes: 0 };
+    initialEntries[0] = { url: null, state: null, pub: null, units: 0, nodes: 0 };
     wmSet(states, inst, { entries: initialEntries, count: 1, index: 0, scrollRestoration: 'auto' });
     defineProperty(global, 'history', {
         get: function () {

@@ -391,7 +391,10 @@
         try {
             st.phase = 2;
             runListeners(rec, targetObj, event, st, 1);
-            runListeners(rec, targetObj, event, st, 2);
+            // 対象上の capture で stopPropagation されたら、非 capture の配送へ進まない（DOM 仕様）。
+            if (!st.stopped) {
+                runListeners(rec, targetObj, event, st, 2);
+            }
             if (st.bubbles && !st.stopped && parentRec !== null) {
                 st.phase = 3;
                 runListeners(parentRec, parentObj, event, st, 2);
