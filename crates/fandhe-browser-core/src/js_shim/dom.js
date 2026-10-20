@@ -37,7 +37,7 @@
 //   input を列挙値へ正規化し既定 "text"、button は既定 "submit"）、`id`・`className`（全要素。SVG の
 //   className も文字列で返す点が標準と異なる）、`placeholder`・`value`・`disabled`・`checked`・
 //   `readOnly`・`required`・`multiple`（HTML 名前空間の該当要素のみ。適用外の要素では属性へ反映せず
-//   代入値を読み戻すだけで、`'value' in div` が true になる点が標準と異なる）。
+//   通常の own データプロパティとして代入値を読み戻すだけで、`'value' in div` が代入前から true になる点が標準と異なる）。
 //   未実装（REPAIR-3）: `value` の dirty value flag・内部値（代入は属性を書き換える。AI スナップショット・
 //   セレクタ・22 タスク判定と一致させるため）、checkedness・ラジオ排他、`defaultValue` /
 //   `defaultChecked` / `selected`、value mode・サニタイズ、select / textarea の value（読み戻しのみ）、
@@ -408,20 +408,17 @@
         }
         return set;
     }
-    // 適用外の要素（div.value 等）は属性へ反映せず、ラッパーごとの置き場に保存して従来どおり
-    // 代入値を読み戻せるようにする。own プロパティは作らない（React の値追跡が張る own accessor を壊さない）。
-    var expandos = new WeakMap();
-    function expandoGet(self, key) {
-        var box = expandos.get(self);
-        return box ? box[key] : undefined;
-    }
+    // 適用外の要素（div.value 等）は属性へ反映せず、代入時にラッパー自身へ通常の own データプロパティ
+    // （configurable・enumerable・writable）を定義する。以後の読み書き・delete・hasOwnProperty は
+    // 従来の expando と同じに動く。delete 後はプロトタイプの getter に戻り undefined を返す。
+    // React の値追跡が先に張る own accessor がある場合はこの setter に到達しない。
     function expandoSet(self, key, value) {
-        var box = expandos.get(self);
-        if (!box) {
-            box = Object.create(null);
-            expandos.set(self, box);
-        }
-        box[key] = value;
+        Object.defineProperty(self, key, {
+            value: value,
+            writable: true,
+            enumerable: true,
+            configurable: true
+        });
     }
     function applies(self, set) {
         if (set === null) {
@@ -436,7 +433,7 @@
         return {
             get: function () {
                 if (!applies(this, set)) {
-                    return expandoGet(this, prop);
+                    return undefined;
                 }
                 var v = readAttribute(this, prop, attr);
                 if (v === null && opts && opts.optionText && localNameOf(this) === 'option') {
@@ -449,7 +446,7 @@
                     expandoSet(this, prop, value);
                     return;
                 }
-                var text = opts && opts.nullAsEmpty && value === null ? '' : String(value);
+                var text = opts && opts.nullAsEmpty && value === null && localNameOf(this) === 'input' ? '' : String(value);
                 storeAttribute(this, attr, text);
             }
         };
@@ -460,7 +457,7 @@
         return {
             get: function () {
                 if (!applies(this, set)) {
-                    return expandoGet(this, prop);
+                    return undefined;
                 }
                 return readAttribute(this, prop, attr) !== null;
             },

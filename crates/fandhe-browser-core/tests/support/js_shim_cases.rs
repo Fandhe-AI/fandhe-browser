@@ -215,6 +215,21 @@ pub fn run(engine: &str) {
     );
     check(
         &mut p,
+        "var ob = document.createElement('option'); ob.value = null; \
+         var bt = document.createElement('button'); bt.value = null; \
+         ob.value + '|' + bt.value + '|' + ob.getAttribute('value')",
+        "null|null|null",
+    );
+    check(
+        &mut p,
+        "var de = document.createElement('div'); de.value = 'x'; \
+         var h1 = de.hasOwnProperty('value'); var k = Object.keys(de).indexOf('value') >= 0; \
+         var ok = delete de.value; \
+         h1 + '|' + k + '|' + ok + '|' + de.hasOwnProperty('value') + '|' + String(de.value)",
+        "true|true|true|false|undefined",
+    );
+    check(
+        &mut p,
         "var op2 = document.createElement('option'); op2.innerHTML = '\\n   a \\t  b\\n  '; op2.value",
         "a b",
     );
