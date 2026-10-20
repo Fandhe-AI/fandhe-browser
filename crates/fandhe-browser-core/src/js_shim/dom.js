@@ -233,7 +233,8 @@
         writable: true,
         value: function insertBefore(node, ref) {
             var refId = ref === null || ref === undefined ? null : idOf(ref, 'insertBefore');
-            var dropFocus = focusInSubtree(node);
+            // node === ref は Rust 側が DOM を変えず成功する（位置不変）ため、フォーカスも保持する。
+            var dropFocus = ref !== node && focusInSubtree(node);
             op('insertBefore', idOf(this, 'insertBefore'), idOf(node, 'insertBefore'), refId);
             if (dropFocus) {
                 focused = null;

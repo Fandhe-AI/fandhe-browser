@@ -3145,6 +3145,15 @@ fn focus_cases(engine: &str) {
          document.activeElement === document.body",
         "true",
     );
+    // node === ref は DOM が変わらず成功するのでフォーカスを保持する（祖先でも同様）。
+    check(
+        &mut p,
+        "var w3 = document.createElement('div'); var in3 = document.createElement('input'); \
+         w3.appendChild(in3); document.body.appendChild(w3); in3.focus(); \
+         document.body.insertBefore(w3, w3); \
+         document.activeElement === in3",
+        "true",
+    );
 
     eprintln!("case: JS-5 the focus handoff global is removed after install");
     check(
