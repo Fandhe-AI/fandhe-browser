@@ -3641,8 +3641,15 @@ fn style_sheet_cases(engine: &str) {
         &mut p,
         "var t3 = document.createElement('style'); document.head.appendChild(t3); var s3 = t3.sheet; \
          var chunk = '.a{content:\"' + new Array(60001).join('x') + '\"}'; var n3 = 0, nm4 = ''; \
-         try { for (var k = 0; k < 100; k++) { s3.insertRule(chunk, s3.cssRules.length); n3++; } nm4 = 'ok'; } \
-         catch (e) { nm4 = e.name; } n3 + '|' + nm4 + '|' + s3.cssRules.length",
+         function fill(max) { try { for (var k = 0; k < max; k++) { s3.insertRule(chunk, s3.cssRules.length); n3++; } } \
+         catch (e) { nm4 = e.name; } } fill(23); n3 + '|' + nm4",
+        "23|",
+    );
+    // boa は 1 回の評価が 2 秒のタイムアウトに掛かるため、挿入ループを複数回の評価に分ける。
+    check(&mut p, "fill(23); n3 + '|' + nm4", "46|");
+    check(
+        &mut p,
+        "fill(24); n3 + '|' + nm4 + '|' + s3.cssRules.length",
         "69|QuotaExceededError|69",
     );
 
