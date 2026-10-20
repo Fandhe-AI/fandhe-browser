@@ -57,6 +57,10 @@
 //! abort.js の `DOMException` と timers.js の `queueMicrotask` を使うため、timers.js・abort.js の後に評価する。
 //! `window` / `document` / `AbortSignal` は `EventTarget` を継承せず、要素の `dispatchEvent` と木に沿った
 //! 伝播・`CustomEvent` は未実装（`REPAIR-3`）。
+//! フォーカス追跡（#1185・`JS-5`・`JS-6`・`REPAIR-3`）は `dom.js` が持ち（`Element.prototype.focus` / `blur` と
+//! `document.activeElement`。フォーカス可否は `isFocusable` op）、focus / blur は install 中だけの一時
+//! グローバル `__fandheDomFocusHandoff` 経由で `events.js` が対象要素にだけ配る。focusin / focusout・
+//! FocusEvent・`document.hasFocus()` は未実装。
 
 use fandhe_browser_js::{EvaluateOptions, JsEngine, JsEngineError};
 

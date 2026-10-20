@@ -34,7 +34,12 @@
 //   変えず、未実装を実装済みに見せる機能検出の偽装にもならない（SEC-2 の確認結果。#1177）。
 // - ES2015 の範囲に留める（V8 と boa で同一のソースを使うため）。
 //
+// - 要素への配送は、dom.js のフォーカス追跡（#1185）が出す focus / blur を対象要素にだけ例外的に行う
+//   （install 中だけの一時グローバル `__fandheDomFocusHandoff` で受け取り、直ちに削除する）。
+//
 // 未実装（REPAIR-3）:
+// - focusin / focusout、FocusEvent / relatedTarget、祖先の capture リスナーへの focus / blur の伝播
+//   （React 17 以降の onFocus / onBlur は root の focusin / focusout を聞くため発火しない）。
 // - 要素の dispatchEvent と、DOM の木に沿った capture / bubble の伝播。要素レベルの addEventListener /
 //   removeEventListener は「保持のみ」のスタブ（#1151。React createRoot が container に約 80 種を登録するため、
 //   TypeError で止まらないよう受け付ける）。ネイティブのイベント源が無く配送はしない。保持件数は 1 要素 1024 件まで。
@@ -446,6 +451,33 @@
         }
         return !st.canceled;
     }
+
+    // dom.js のフォーカス追跡（#1185）からの focus / blur を、対象要素にだけ配る。
+    // 要素への dispatchEvent は無く（未実装）、focus / blur はバブリングしないので対象上の配送だけで足りる。
+    // 汎用 Event（bubbles / cancelable は false、composed は true、isTrusted は常に false）で作る。
+    // ハンドオフは install 中だけ存在し、ここで読んで直ちに削除する（ページ JS の実行前に消える）。
+    (function registerFocusSink() {
+        var handoff = global.__fandheDomFocusHandoff;
+        try {
+            delete global.__fandheDomFocusHandoff;
+        } catch (e) {
+            // 削除できなくても配送の登録だけは続ける。
+        }
+        if (!isObjectLike(handoff) || typeof handoff.setSink !== 'function') {
+            return;
+        }
+        handoff.setSink(function (type, el) {
+            var rec = recordFor(el, false);
+            if (rec === null) {
+                return;
+            }
+            var st = newEventState(type);
+            st.composed = true;
+            var ev = createObject(eventProto);
+            fnCall(weakSet, eventStates, ev, st);
+            dispatchImpl(el, rec, ev, null, null);
+        });
+    })();
 
     function dispatchEventImpl(self, event, argc) {
         if (argc < 1 || !isObjectLike(event) || !fnCall(weakHas, eventStates, event)) {

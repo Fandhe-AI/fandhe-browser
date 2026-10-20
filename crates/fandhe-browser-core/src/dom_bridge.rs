@@ -51,6 +51,9 @@
 //! `attach` ごとに空へ戻る。診断に URL 本文は保存しない（種別と長さのみ）。
 //! `navigatorUserAgent` は [`crate::fetch::USER_AGENT`] を返し、実ブラウザを装わない（`SEC-2`）。
 //!
+//! `isFocusable`（引数 1 個: ノード ID）は要素が `focus()` でフォーカスできるかを返す読み取り専用 op
+//! （`document.activeElement` の追跡用。判定は `focus.rs`。#1185）。
+//!
 //! # 未実装（REPAIR-3）
 //!
 //! - `hashchange` イベントの発火と `location` 代入による実際の遷移は未実装（後続 issue）。
@@ -72,6 +75,7 @@ use crate::error::DomError;
 use crate::error::Error;
 use crate::query::{query_selector_all_str_bounded, query_selector_str};
 
+mod focus;
 mod page_env;
 mod url_parse;
 pub use page_env::{
@@ -372,6 +376,7 @@ enum DomOp {
     NetOptionsIgnored,
     NetCancel,
     IsInclusiveAncestor,
+    IsFocusable,
     MutationObserverLimit,
     MutationOptionsIgnored,
     UrlParse,
@@ -426,6 +431,7 @@ impl DomOp {
             "netOptionsIgnored" => Self::NetOptionsIgnored,
             "netCancel" => Self::NetCancel,
             "isInclusiveAncestor" => Self::IsInclusiveAncestor,
+            "isFocusable" => Self::IsFocusable,
             "mutationObserverLimit" => Self::MutationObserverLimit,
             "mutationOptionsIgnored" => Self::MutationOptionsIgnored,
             "urlParse" => Self::UrlParse,
@@ -481,6 +487,7 @@ impl DomOp {
             Self::NetOptionsIgnored => "netOptionsIgnored",
             Self::NetCancel => "netCancel",
             Self::IsInclusiveAncestor => "isInclusiveAncestor",
+            Self::IsFocusable => "isFocusable",
             Self::MutationObserverLimit => "mutationObserverLimit",
             Self::MutationOptionsIgnored => "mutationOptionsIgnored",
             Self::UrlParse => "urlParse",
@@ -518,6 +525,7 @@ impl DomOp {
             | Self::NetFinalUrl
             | Self::NetOptionsIgnored
             | Self::MutationOptionsIgnored
+            | Self::IsFocusable
             | Self::NetCancel => 1,
             Self::QuerySelector
             | Self::QuerySelectorAll
@@ -1074,6 +1082,12 @@ fn execute(
             let node = page.node_arg(op, args, 2)?;
             let found = ancestor == node || page.document.ancestors(node).any(|a| a == ancestor);
             Ok(JsValue::Bool(found))
+        }
+        // 要素が `focus()` でフォーカスできるか（`document.activeElement` の追跡用。#1185・簡略判定は
+        // `focus.rs`、REPAIR-3）。読み取り専用。
+        DomOp::IsFocusable => {
+            let node = page.node_arg(op, args, 1)?;
+            Ok(JsValue::Bool(focus::is_focusable(&page.document, node)))
         }
         DomOp::TimerCallbackError => {
             let name = string_arg(op, args, 1, limits)?;
@@ -2890,6 +2904,27 @@ mod tests {
         call(&b, &[s("isInclusiveAncestor"), n(1e12), n(div)]).expect_err("invalid id");
         call(&b, &[s("isInclusiveAncestor"), s("1"), n(div)]).expect_err("type");
         call(&b, &[s("isInclusiveAncestor"), n(div)]).expect_err("arity");
+    }
+
+    /// JS-5: `isFocusable` は接続した input で true、div・切り離した要素で false、不正入力はエラー。
+    #[test]
+    fn js_5_is_focusable_op() {
+        let b = bridge();
+        let body = num(call(&b, &[s("body")]));
+        let div = num(call(&b, &[s("getElementById"), s("a")]));
+        let input = num(call(&b, &[s("createElement"), s("input")]));
+        let is = |x: f64| call(&b, &[s("isFocusable"), n(x)]).expect("ok");
+        assert_eq!(is(input), JsValue::Bool(false));
+        call(&b, &[s("appendChild"), n(div), n(input)]).expect("append");
+        assert_eq!(is(input), JsValue::Bool(true));
+        assert_eq!(is(div), JsValue::Bool(false));
+        call(&b, &[s("removeChild"), n(div), n(input)]).expect("remove");
+        assert_eq!(is(input), JsValue::Bool(false));
+        assert_eq!(is(body), JsValue::Bool(false));
+        call(&b, &[s("isFocusable"), n(1e12)]).expect_err("invalid id");
+        call(&b, &[s("isFocusable"), s("1")]).expect_err("type");
+        call(&b, &[s("isFocusable")]).expect_err("arity");
+        call(&b, &[s("isFocusable"), n(div), n(div)]).expect_err("arity");
     }
 
     /// JS-7: `timerCallbackError` は種別を許可リストで検証し、メッセージを切り詰めて件数を頭打ちにする。
