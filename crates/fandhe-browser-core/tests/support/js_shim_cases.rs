@@ -155,8 +155,28 @@ pub fn run(engine: &str) {
         "document.body instanceof HTMLIFrameElement",
         "false",
     );
-    check(&mut p, "typeof HTMLElement", "undefined");
+    check(&mut p, "typeof HTMLElement", "function");
+    check(&mut p, "document.body instanceof HTMLElement", "false");
+    check(
+        &mut p,
+        "Object.getPrototypeOf(HTMLIFrameElement.prototype) === HTMLElement.prototype",
+        "true",
+    );
+    check(
+        &mut p,
+        "try { new HTMLElement(); 'no' } catch (e) { e.name }",
+        "TypeError",
+    );
     check(&mut p, "document.body instanceof Element", "true");
+    check(
+        &mut p,
+        "var s1 = document.createElement('style'); s1.setAttribute('data-emotion', 'css'); \
+         var s2 = document.createElement('style'); s2.setAttribute('data-emotion', 'css'); \
+         s2.setAttribute('data-s', ''); \
+         document.head.appendChild(s1); document.head.appendChild(s2); \
+         document.querySelectorAll('style[data-emotion]:not([data-s])').length",
+        "1",
+    );
     check(
         &mut p,
         "try { new HTMLIFrameElement(); 'no' } catch (e) { e.name }",
