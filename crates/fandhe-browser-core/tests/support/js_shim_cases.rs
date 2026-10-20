@@ -3119,6 +3119,33 @@ fn focus_cases(engine: &str) {
         "true|true",
     );
 
+    eprintln!("case: JS-5 failed moves keep focus; moving a focused subtree drops it");
+    let mut p = setup_html(engine, HTML, None);
+    check(
+        &mut p,
+        "var $ = function (x) { return document.getElementById(x); }; $('i').focus(); \
+         try { $('i').appendChild($('i')); } catch (e) {} \
+         try { document.body.insertBefore($('b'), $('i').firstChild || $('d').appendChild(document.createElement('p'))); } catch (e) {} \
+         document.activeElement === $('i')",
+        "true",
+    );
+    check(
+        &mut p,
+        "var w = document.createElement('div'); var inner = document.createElement('input'); \
+         w.appendChild(inner); document.body.appendChild(w); inner.focus(); \
+         var okf = document.activeElement === inner; document.body.appendChild(w); \
+         [okf, document.activeElement === document.body].join('|')",
+        "true|true",
+    );
+    check(
+        &mut p,
+        "var w2 = document.createElement('div'); var in2 = document.createElement('input'); \
+         w2.appendChild(in2); document.body.appendChild(w2); in2.focus(); \
+         document.body.insertBefore(w2, document.body.firstChild); \
+         document.activeElement === document.body",
+        "true",
+    );
+
     eprintln!("case: JS-5 the focus handoff global is removed after install");
     check(
         &mut p,

@@ -217,11 +217,13 @@
     define(Node.prototype, 'appendChild', {
         writable: true,
         value: function appendChild(child) {
-            if (focused === child) {
-                // 移動は切り離し＋再接続。フォーカスは失われ、再接続では復活しない。
+            // 移動は切り離し＋再接続。移動対象の部分木内のフォーカスは失われ、再接続では復活しない。
+            // 失敗する操作（循環・不正な親）では DOM が変わらないので、解除は op 成功後に確定する。
+            var dropFocus = focusInSubtree(child);
+            op('appendChild', idOf(this, 'appendChild'), idOf(child, 'appendChild'));
+            if (dropFocus) {
                 focused = null;
             }
-            op('appendChild', idOf(this, 'appendChild'), idOf(child, 'appendChild'));
             revalidateFocus();
             notifyMutation('childList', this, { added: [child], removed: [], nextSibling: null });
             return child;
@@ -231,10 +233,11 @@
         writable: true,
         value: function insertBefore(node, ref) {
             var refId = ref === null || ref === undefined ? null : idOf(ref, 'insertBefore');
-            if (focused === node) {
+            var dropFocus = focusInSubtree(node);
+            op('insertBefore', idOf(this, 'insertBefore'), idOf(node, 'insertBefore'), refId);
+            if (dropFocus) {
                 focused = null;
             }
-            op('insertBefore', idOf(this, 'insertBefore'), idOf(node, 'insertBefore'), refId);
             revalidateFocus();
             notifyMutation('childList', this, {
                 added: [node],
@@ -432,6 +435,16 @@
         if (focused !== null && !focusStillValid(focused)) {
             focused = null;
         }
+    }
+
+    // node が現在のフォーカス要素自身またはその祖先か（移動でフォーカスが外れるか）。
+    // 不正な引数は false を返し、検証エラーは後続の op に任せる。
+    function focusInSubtree(node) {
+        if (focused === null || !ids.has(node)) {
+            return false;
+        }
+        return focused === node
+            || op('isInclusiveAncestor', ids.get(node), ids.get(focused)) === true;
     }
 
     // 有効なフォーカス中の要素か null（読み取り時の保険として再検証する）。
