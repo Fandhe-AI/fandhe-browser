@@ -777,7 +777,7 @@ spec 対応: TASK-71・TASK-108 / MS-6 / `COMPAT-1`・`JS-5`・`JS-6`・`MEAS-4`
 
 1. d2: 描画されない原因の調査。`virtual_time` で打ち切られ未発火のタイマーが 1 件残る点と、`console.error` 1 件の内容（本測定では記録していない）が手掛かり。別 issue で追跡する（切り出し候補）（済み: #1176。下の節を参照）
 2. d3: 描画されない原因の調査（#1168 の次の対応 1 のまま。別 issue で追跡する切り出し候補）
-3. `back`・`forward`・`go` による実際のページ内履歴の移動と `popstate` の配送（汎用の `EventTarget` が前提。別 issue の切り出し候補）
+3. `back`・`forward`・`go` による実際のページ内履歴の移動と `popstate` の配送（汎用の `EventTarget` が前提。別 issue の切り出し候補）（済み: #1177。汎用 `Event` / `EventTarget` を `events.js` に足し、`history` が最大 50 件の履歴エントリを持って microtask で移動し、`popstate` を `window` へ配る。hashchange と要素の `dispatchEvent` は未実装のまま。実サイトの再測定はしていない）
 
 ### 制約
 

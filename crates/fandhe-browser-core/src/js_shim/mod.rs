@@ -47,10 +47,16 @@
 //! abort.js の後に評価する。
 //! `history.js`（#1171・`JS-5`・`JS-6`・`SEC-2`・`REPAIR-3`）は `History` / `history` を提供する。
 //! `pushState` / `replaceState` は同一オリジンの URL だけを bridge op `historySetUrl` で受け付け
-//! （検査は core 側）、state は予算付きの再帰複製（ノード数・深さ・累計サイズの上限・undefined を保持）で保持する。`back` / `forward` / `go` と
-//! `popstate` は未実装（URL を動かさず診断に記録するだけ）。abort.js の `DOMException` を
-//! install 時に捕捉するため abort.js の後（storage.js の次）に評価する。
-//! 汎用の `EventTarget` / `Event` / `dispatchEvent` は未実装（`typeof` は 'undefined' のまま）。
+//! （検査は core 側）、state は予算付きの再帰複製（ノード数・深さ・累計サイズの上限・undefined を保持）で
+//! 保持する。#1177 でページ内の履歴エントリ（最大 50 件・state の合計 8 MiB まで）を持ち、`back` / `forward` /
+//! `go` が履歴の範囲で URL と state を動かして `popstate`（`PopStateEvent`・`window.onpopstate`）を配る
+//! （取得・遷移はせず、microtask で近似。`go(0)` は実行せず診断に記録。hashchange は未実装）。
+//! abort.js の `DOMException` と events.js の `Event` を install 時に捕捉するため、abort.js・events.js の後
+//! （storage.js の次）に評価する。
+//! 汎用の `EventTarget` / `Event` / `dispatchEvent`（#1177・`JS-5`）は `events.js` にあり、リスナー例外の報告に
+//! abort.js の `DOMException` と timers.js の `queueMicrotask` を使うため、timers.js・abort.js の後に評価する。
+//! `window` / `document` / `AbortSignal` は `EventTarget` を継承せず、要素の `dispatchEvent` と木に沿った
+//! 伝播・`CustomEvent` は未実装（`REPAIR-3`）。
 
 use fandhe_browser_js::{EvaluateOptions, JsEngine, JsEngineError};
 
@@ -75,16 +81,16 @@ pub const JS_SHIM_SOURCES: &[JsShimSource] = &[
         source: include_str!("window.js"),
     },
     JsShimSource {
-        name: "events.js",
-        source: include_str!("events.js"),
-    },
-    JsShimSource {
         name: "timers.js",
         source: include_str!("timers.js"),
     },
     JsShimSource {
         name: "abort.js",
         source: include_str!("abort.js"),
+    },
+    JsShimSource {
+        name: "events.js",
+        source: include_str!("events.js"),
     },
     JsShimSource {
         name: "net.js",

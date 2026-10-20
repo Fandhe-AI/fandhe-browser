@@ -91,11 +91,13 @@ pub enum LocationChangeKind {
     Reload,
     /// `about:blank` 上の `location.hash = ...`（書き換え先が無い）。
     Hash,
-    /// `history.back()`（ページ内履歴を持たないため実行しない。#1171・`REPAIR-3`）。
+    /// `history.back()` の移動を実行できなかった記録（microtask の登録失敗・URL の書き換え失敗。
+    /// 移動できた場合や範囲外は記録しない。#1177・`REPAIR-3`）。
     HistoryBack,
-    /// `history.forward()`（同上）。
+    /// `history.forward()` の移動を実行できなかった記録（同上）。
     HistoryForward,
-    /// `history.go(delta)`（同上。値の長さは変換後の整数の文字列長）。
+    /// `history.go(delta)` の記録（`go(0)` は再読み込みに当たるため実行せず常に記録する。移動を実行できなかった
+    /// 場合も同様。値の長さは変換後の整数の文字列長）。
     HistoryGo,
 }
 

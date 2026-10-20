@@ -4,7 +4,7 @@
 // 役割: ページの bundle が登録したタイマーのコールバックを保持し、タイマーの期限・順序・上限の
 // 管理は core 側（event_loop.rs / dom_bridge の timerSet・timerClear op）に任せる。ランナー
 // （core の page_runner）が仮想時間の順に `__fandheRunTimer(id)` を評価してコールバックを呼ぶ。
-// 実時間は待たない。呼び出し元: core の `js_shim::install`（events.js の後に評価）と、
+// 実時間は待たない。呼び出し元: core の `js_shim::install`（dom.js・window.js の後、abort.js・events.js の前に評価）と、
 // ランナーのイベントループ段および各 <script> / ライフサイクルイベント後の microtask checkpoint。
 //
 // 設計上の要点:

@@ -24,7 +24,7 @@
 // - ES2015 の範囲に留める（V8 と boa で同一のソースを使うため。Proxy は使わない）。
 //
 // 未実装（REPAIR-3）:
-// - hashchange / popstate 等のイベント（popstate と history の扱いは history.js、#1171。DOMContentLoaded / load の addEventListener は events.js、#781）。
+// - hashchange 等のイベント（popstate の配送と history の移動は history.js、#1177。DOMContentLoaded / load の addEventListener は events.js、#781）。
 // - location 代入による実際の遷移。
 // - navigator の追加プロパティ（language / platform / plugins 等。事実と異なる値や
 //   フィンガープリント面を作らないため入れていない。必要性は後続 issue で判断する）。

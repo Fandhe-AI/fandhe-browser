@@ -1,11 +1,13 @@
-// js_shim/events.js: document / window の最小 EventTarget とライフサイクル通知の shim
-// （TASK-109・Issue #781・ビヘイビア JS-4・JS-6。SSOT: js-engine.md「ページ内 JS 実行の設計制約」）。
+// js_shim/events.js: 汎用 Event / EventTarget・document / window のリスナー保持・ライフサイクル通知の shim
+// （TASK-109・Issue #781・#1177・ビヘイビア JS-4・JS-5・JS-6・SEC-2・REPAIR-3。SSOT: js-engine.md「ページ内 JS 実行の設計制約」）。
 //
 // 役割: ページの bundle が `document.addEventListener('DOMContentLoaded', ...)` /
 // `window.addEventListener('load', ...)` で登録したリスナーを保持し、ページランナー
 // （core の page_runner）が全スクリプトの実行後に呼ぶディスパッチャー `__fandheLifecycle` で
 // 順に呼び出す。DOM やページ状態の実体は持たない（readyState は core 側の bridge op）。
-// 呼び出し元: core の `js_shim::install`（dom.js・window.js の後に評価）と、ランナーの発火処理。
+// 呼び出し元: core の `js_shim::install`（dom.js・window.js・timers.js・abort.js の後に評価。
+// リスナー例外の報告に abort.js の `DOMException` と timers.js の `queueMicrotask` を install 時に捕捉するため）と、
+// ランナーの発火処理。history.js が `window.dispatchEvent` で popstate を配る。
 //
 // 設計上の要点:
 // - ディスパッチャーは決して throw しない。リスナーの例外は try/catch で捕捉し、
@@ -17,14 +19,28 @@
 //   差し替え（setImpl）は core が shim 注入中だけ立てるフラグ（`lifecycleInstallOpen` op）が true のときだけ有効で、
 //   ページ JS が呼んでも dispatcher は変わらない。
 // - DOMContentLoaded は document → window の順（バブリングの近似）、load は window のみ。
+// - 汎用の `Event` / `EventTarget`（#1177・JS-5）: 内部状態は WeakMap とクロージャに置き、getter・メソッドは
+//   brand check する。`dispatchEvent` は対象上で capture → 非 capture の順に登録順で呼び、once・passive・
+//   stopImmediatePropagation を扱う。リスナーの例外は後続を止めず `dispatchEvent` の呼び出し元にも伝えず、
+//   install 時に捕捉した `queueMicrotask` に throw する関数を積んで報告する（timers.js が `timerCallbackError`
+//   〔source microtask〕として診断に残す）。ライフサイクル用の `lifecycleListenerError` op は Rust 側が
+//   DOMContentLoaded / load しか受けないため使わない。配送中の再 dispatch は InvalidStateError（DOMException）。
+// - ページが生成したイベントの `isTrusted` は常に false（信頼済みを装わない。SEC-2）。
+// - `window.onpopstate` は HTML 仕様どおり、最初に非 null を代入した位置で呼ばれる内部エントリで実現する。
+//   `PopStateEvent` / `onpopstate` は主要ブラウザすべてにある標準 API で、UA・navigator 等の識別面を
+//   変えず、未実装を実装済みに見せる機能検出の偽装にもならない（SEC-2 の確認結果。#1177）。
 // - ES2015 の範囲に留める（V8 と boa で同一のソースを使うため）。
 //
 // 未実装（REPAIR-3）:
-// - 要素レベルの addEventListener / removeEventListener は「保持のみ」のスタブ（#1151。React createRoot が
-//   container に約 80 種を登録するため、TypeError で止まらないよう受け付ける）。ネイティブのイベント源が
-//   無く配送は一切しない（dispatchEvent も未定義）。capture は区別せず、保持件数は 1 要素 1024 件まで。
-// - onload / onreadystatechange 等のイベントハンドラ属性。
-// - キャプチャ・完全なバブリング、passive / signal オプション、CustomEvent / dispatchEvent。
+// - 要素の dispatchEvent と、DOM の木に沿った capture / bubble の伝播。要素レベルの addEventListener /
+//   removeEventListener は「保持のみ」のスタブ（#1151。React createRoot が container に約 80 種を登録するため、
+//   TypeError で止まらないよう受け付ける）。ネイティブのイベント源が無く配送はしない。保持件数は 1 要素 1024 件まで。
+// - `window` / `document` / `AbortSignal` は `EventTarget` を継承しない（`instanceof EventTarget` は false）。
+//   `AbortSignal` は abort.js の自前の保持を使い、`dispatchEvent` も持たない（中途半端な継承で保持先が割れるのを避ける）。
+// - `document.dispatchEvent` は bubbles が true なら window へも配るが、capture フェーズは近似しない。
+// - `addEventListener` の `signal` オプション、`Event.timeStamp` / `composedPath` / `cancelBubble` / `returnValue` / `srcElement`、
+//   CustomEvent。
+// - onload / onreadystatechange 等の他のイベントハンドラ属性。
 // - readystatechange イベント。
 (function (global) {
     'use strict';
@@ -62,17 +78,34 @@
         return typeof l === 'function' || (l !== null && typeof l === 'object');
     }
 
+    function isObjectLike(v) {
+        return v !== null && (typeof v === 'object' || typeof v === 'function');
+    }
+
+    // リスナーのオプション。boolean は capture、オブジェクトは capture・once・passive（signal は未実装。REPAIR-3）。
+    function parseOptions(options) {
+        var o = { capture: false, once: false, passive: false };
+        if (isObjectLike(options)) {
+            o.capture = !!options.capture;
+            o.once = !!options.once;
+            o.passive = !!options.passive;
+        } else {
+            o.capture = !!options;
+        }
+        return o;
+    }
+
     function add(target, type, listener, options) {
         if (typeof type !== 'string' || !isListener(listener)) {
             return;
         }
+        var opts = parseOptions(options);
         var list = target.items;
         for (var i = 0; i < target.count; i++) {
-            if (list[i].type === type && list[i].listener === listener) {
+            if (list[i].type === type && list[i].listener === listener && list[i].capture === opts.capture) {
                 return;
             }
         }
-        var once = options !== null && typeof options === 'object' && !!options.once;
         if (target.count >= MAX_LISTENERS_PER_TARGET) {
             try {
                 callOp('lifecycleListenerLimit');
@@ -81,20 +114,43 @@
             }
             return;
         }
-        list[target.count] = { type: type, listener: listener, once: once };
+        list[target.count] = {
+            type: type,
+            listener: listener,
+            capture: opts.capture,
+            once: opts.once,
+            passive: opts.passive
+        };
         target.count += 1;
     }
 
-    function remove(target, type, listener) {
+    // 内部エントリ（onpopstate 用）は件数上限の対象外で 1 件だけ足す。
+    function addInternal(target, type, fn) {
+        target.items[target.count] = { type: type, listener: fn, capture: false, once: false, passive: false };
+        target.count += 1;
+    }
+
+    function removeEntry(target, entry) {
         var list = target.items;
         for (var i = 0; i < target.count; i++) {
-            if (list[i].type === type && list[i].listener === listener) {
+            if (list[i] === entry) {
                 var len = target.count;
                 for (var j = i; j < len - 1; j++) {
                     list[j] = list[j + 1];
                 }
                 delete list[len - 1];
                 target.count = len - 1;
+                return;
+            }
+        }
+    }
+
+    function remove(target, type, listener, options) {
+        var capture = isObjectLike(options) ? !!options.capture : !!options;
+        var list = target.items;
+        for (var i = 0; i < target.count; i++) {
+            if (list[i].type === type && list[i].listener === listener && list[i].capture === capture) {
+                removeEntry(target, list[i]);
                 return;
             }
         }
@@ -109,45 +165,321 @@
         });
     }
 
-    function install(obj, target) {
-        defineMethod(obj, 'addEventListener', function addEventListener(type, listener, options) {
-            add(target, type, listener, options);
-        });
-        defineMethod(obj, 'removeEventListener', function removeEventListener(type, listener) {
-            remove(target, type, listener);
-        });
+    var NativeTypeError = TypeError;
+    var NativeDOMException = global.DOMException;
+    var nativeQueueMicrotask = global.queueMicrotask;
+    var strCtor = String;
+    var symTag = Symbol.toStringTag;
+    if (typeof NativeDOMException !== 'function') {
+        throw new NativeTypeError('abort.js must be evaluated before events.js');
     }
 
-    install(global.document, documentTarget);
-    install(global, windowTarget);
-
-    // 要素レベルは Node.prototype に定義する（document は上の own プロパティが優先）。要素ごとの保持先は
-    // WeakMap に遅延生成し、ラッパーと一緒に回収される。保持するだけで配送はしない（スタブ。REPAIR-3）。
-    var elementTargets = new WeakMap();
+    // 要素・汎用 EventTarget の保持先は WeakMap に遅延生成し、ラッパーと一緒に回収される。
+    // window / document だけは上の固定の保持先を使う（EventTarget.prototype のメソッドを call されても同じ保持先に届く）。
+    var objectTargets = new WeakMap();
     var weakGet = WeakMap.prototype.get;
     var weakSet = WeakMap.prototype.set;
     var weakHas = WeakMap.prototype.has;
+    function recordFor(obj, create) {
+        if (!isObjectLike(obj)) {
+            throw new NativeTypeError('Illegal invocation');
+        }
+        if (obj === global) {
+            return windowTarget;
+        }
+        if (obj === global.document) {
+            return documentTarget;
+        }
+        if (fnCall(weakHas, objectTargets, obj)) {
+            return fnCall(weakGet, objectTargets, obj);
+        }
+        if (!create) {
+            return null;
+        }
+        var rec = newTarget();
+        fnCall(weakSet, objectTargets, obj, rec);
+        return rec;
+    }
+
+    function addEventListenerImpl(self, type, listener, options) {
+        add(recordFor(self, true), type, listener, options);
+    }
+    function removeEventListenerImpl(self, type, listener, options) {
+        var rec = recordFor(self, false);
+        if (rec !== null) {
+            remove(rec, type, listener, options);
+        }
+    }
+
+    // ---- 汎用 Event（#1177・JS-5） ----
+    var eventStates = new WeakMap();
+
+    function reportLater(error) {
+        if (typeof nativeQueueMicrotask !== 'function') {
+            return;
+        }
+        try {
+            nativeQueueMicrotask(function () {
+                throw error;
+            });
+        } catch (e) {
+            // 報告に失敗しても配送は続ける。
+        }
+    }
+
+    function eventState(self) {
+        var st = isObjectLike(self) && fnCall(weakHas, eventStates, self) ? fnCall(weakGet, eventStates, self) : undefined;
+        if (st === undefined) {
+            throw new NativeTypeError('Illegal invocation');
+        }
+        return st;
+    }
+
+    function Event(type, init) {
+        if (!(this instanceof Event)) {
+            throw new NativeTypeError("Failed to construct 'Event': Please use the 'new' operator");
+        }
+        if (arguments.length < 1) {
+            throw new NativeTypeError("Failed to construct 'Event': 1 argument required");
+        }
+        if (typeof type === 'symbol') {
+            throw new NativeTypeError('Cannot convert a Symbol value to a string');
+        }
+        var st = {
+            type: strCtor(type),
+            bubbles: false,
+            cancelable: false,
+            composed: false,
+            canceled: false,
+            target: null,
+            current: null,
+            phase: 0,
+            dispatching: false,
+            stopped: false,
+            immediateStopped: false,
+            inPassive: false
+        };
+        if (init !== undefined && init !== null) {
+            if (!isObjectLike(init)) {
+                throw new NativeTypeError("Failed to construct 'Event': parameter 2 is not of type 'EventInit'");
+            }
+            st.bubbles = !!init.bubbles;
+            st.cancelable = !!init.cancelable;
+            st.composed = !!init.composed;
+        }
+        fnCall(weakSet, eventStates, this, st);
+    }
+
+    function defineGetter(proto, name, fn) {
+        var d = createObject(null);
+        d.get = fn;
+        d.configurable = true;
+        d.enumerable = true;
+        defineProperty(proto, name, d);
+    }
+    function defineConst(obj, name, value) {
+        var d = createObject(null);
+        d.value = value;
+        d.enumerable = true;
+        defineProperty(obj, name, d);
+    }
+    function defineTag(proto, tag) {
+        var d = createObject(null);
+        d.value = tag;
+        d.configurable = true;
+        defineProperty(proto, symTag, d);
+    }
+
+    defineGetter(Event.prototype, 'type', function () { return eventState(this).type; });
+    defineGetter(Event.prototype, 'target', function () { return eventState(this).target; });
+    defineGetter(Event.prototype, 'currentTarget', function () { return eventState(this).current; });
+    defineGetter(Event.prototype, 'eventPhase', function () { return eventState(this).phase; });
+    defineGetter(Event.prototype, 'bubbles', function () { return eventState(this).bubbles; });
+    defineGetter(Event.prototype, 'cancelable', function () { return eventState(this).cancelable; });
+    defineGetter(Event.prototype, 'defaultPrevented', function () { return eventState(this).canceled; });
+    defineGetter(Event.prototype, 'composed', function () { return eventState(this).composed; });
+    // ページが生成したイベントは信頼済みではない（SEC-2）。
+    defineGetter(Event.prototype, 'isTrusted', function () { eventState(this); return false; });
+    defineMethod(Event.prototype, 'preventDefault', function preventDefault() {
+        var st = eventState(this);
+        if (st.cancelable && !st.inPassive) {
+            st.canceled = true;
+        }
+    });
+    defineMethod(Event.prototype, 'stopPropagation', function stopPropagation() {
+        eventState(this).stopped = true;
+    });
+    defineMethod(Event.prototype, 'stopImmediatePropagation', function stopImmediatePropagation() {
+        var st = eventState(this);
+        st.stopped = true;
+        st.immediateStopped = true;
+    });
+    var PHASE_NAMES = ['NONE', 'CAPTURING_PHASE', 'AT_TARGET', 'BUBBLING_PHASE'];
+    for (var pi = 0; pi < 4; pi++) {
+        defineConst(Event, PHASE_NAMES[pi], pi);
+        defineConst(Event.prototype, PHASE_NAMES[pi], pi);
+    }
+    defineTag(Event.prototype, 'Event');
+    defineMethod(Event.prototype, 'constructor', Event);
+
+    // 1 リスナーの呼び出し。例外は microtask 経由で報告し、呼び出し元へ伝えない。
+    function invokeEntry(entry, thisArg, event, st) {
+        st.inPassive = entry.passive;
+        try {
+            var l = entry.listener;
+            if (typeof l === 'function') {
+                fnCall(l, thisArg, event);
+            } else {
+                var h = l.handleEvent;
+                if (typeof h === 'function') {
+                    fnCall(h, l, event);
+                }
+            }
+        } catch (e) {
+            reportLater(e);
+        } finally {
+            st.inPassive = false;
+        }
+    }
+
+    // mode: 1 = capture のみ・2 = 非 capture のみ。スナップショットに対し、走査中に外されたものは呼ばない。
+    function runListeners(rec, currentObj, event, st, mode) {
+        var source = rec.items;
+        var sourceCount = rec.count;
+        var snapshot = createObject(null);
+        for (var k = 0; k < sourceCount; k++) {
+            snapshot[k] = source[k];
+        }
+        for (var i = 0; i < sourceCount; i++) {
+            if (st.immediateStopped) {
+                return;
+            }
+            var entry = snapshot[i];
+            if (entry.type !== st.type || entry.capture !== (mode === 1)) {
+                continue;
+            }
+            var alive = false;
+            for (var m = 0; m < rec.count; m++) {
+                if (source[m] === entry) {
+                    alive = true;
+                    break;
+                }
+            }
+            if (!alive) {
+                continue;
+            }
+            if (entry.once) {
+                removeEntry(rec, entry);
+            }
+            st.current = currentObj;
+            invokeEntry(entry, currentObj, event, st);
+        }
+    }
+
+    // parentObj / parentRec は bubbles のときだけ届ける先（document → window）。
+    function dispatchImpl(targetObj, rec, event, parentObj, parentRec) {
+        var st = eventState(event);
+        if (st.dispatching) {
+            throw new NativeDOMException('The event is already being dispatched.', 'InvalidStateError');
+        }
+        st.dispatching = true;
+        st.target = targetObj;
+        st.stopped = false;
+        st.immediateStopped = false;
+        try {
+            st.phase = 2;
+            runListeners(rec, targetObj, event, st, 1);
+            runListeners(rec, targetObj, event, st, 2);
+            if (st.bubbles && !st.stopped && parentRec !== null) {
+                st.phase = 3;
+                runListeners(parentRec, parentObj, event, st, 2);
+            }
+        } finally {
+            st.phase = 0;
+            st.current = null;
+            st.dispatching = false;
+            st.stopped = false;
+            st.immediateStopped = false;
+        }
+        return !st.canceled;
+    }
+
+    function dispatchEventImpl(self, event, argc) {
+        if (argc < 1 || !isObjectLike(event) || !fnCall(weakHas, eventStates, event)) {
+            throw new NativeTypeError("Failed to execute 'dispatchEvent' on 'EventTarget': parameter 1 is not of type 'Event'");
+        }
+        if (self === global.document) {
+            return dispatchImpl(self, documentTarget, event, global, windowTarget);
+        }
+        return dispatchImpl(self, recordFor(self, true), event, null, null);
+    }
+
+    function EventTarget() {
+        if (!(this instanceof EventTarget)) {
+            throw new NativeTypeError("Failed to construct 'EventTarget': Please use the 'new' operator");
+        }
+    }
+    defineMethod(EventTarget.prototype, 'addEventListener', function addEventListener(type, listener, options) {
+        addEventListenerImpl(this, type, listener, options);
+    });
+    defineMethod(EventTarget.prototype, 'removeEventListener', function removeEventListener(type, listener, options) {
+        removeEventListenerImpl(this, type, listener, options);
+    });
+    defineMethod(EventTarget.prototype, 'dispatchEvent', function dispatchEvent(event) {
+        return dispatchEventImpl(this, event, arguments.length);
+    });
+    defineMethod(EventTarget.prototype, 'constructor', EventTarget);
+    defineTag(EventTarget.prototype, 'EventTarget');
+
+    defineProperty(global, 'Event', { value: Event, writable: true, configurable: true, enumerable: false });
+    defineProperty(global, 'EventTarget', { value: EventTarget, writable: true, configurable: true, enumerable: false });
+
+    // window / document は own メソッド（EventTarget は継承しない。REPAIR-3）。
+    function installTarget(obj) {
+        defineMethod(obj, 'addEventListener', function addEventListener(type, listener, options) {
+            add(recordFor(obj, true), type, listener, options);
+        });
+        defineMethod(obj, 'removeEventListener', function removeEventListener(type, listener, options) {
+            remove(recordFor(obj, true), type, listener, options);
+        });
+        defineMethod(obj, 'dispatchEvent', function dispatchEvent(event) {
+            return dispatchEventImpl(obj, event, arguments.length);
+        });
+    }
+    installTarget(global.document);
+    installTarget(global);
+
+    // onpopstate: 最初に非 null を代入した位置で呼ぶ内部エントリ（HTML 仕様のイベントハンドラの順序）。
+    var popstateHandler = null;
+    var popstateRegistered = false;
+    var popstateAccessor = createObject(null);
+    popstateAccessor.get = function () {
+        return popstateHandler;
+    };
+    popstateAccessor.set = function (v) {
+        popstateHandler = typeof v === 'function' ? v : null;
+        if (popstateHandler !== null && !popstateRegistered) {
+            popstateRegistered = true;
+            addInternal(windowTarget, 'popstate', function (e) {
+                var h = popstateHandler;
+                if (typeof h === 'function') {
+                    fnCall(h, global, e);
+                }
+            });
+        }
+    };
+    popstateAccessor.configurable = true;
+    popstateAccessor.enumerable = true;
+    defineProperty(global, 'onpopstate', popstateAccessor);
+
+    // 要素レベルは Node.prototype に保持のみのスタブとして定義する（document は上の own プロパティが優先）。
+    // dispatchEvent は意図して定義しない（REPAIR-3）。
     if (typeof global.Node === 'function') {
         defineMethod(global.Node.prototype, 'addEventListener', function addEventListener(type, listener, options) {
-            if (this === null || (typeof this !== 'object' && typeof this !== 'function')) {
-                throw new TypeError('Illegal invocation');
-            }
-            var target;
-            if (fnCall(weakHas, elementTargets, this)) {
-                target = fnCall(weakGet, elementTargets, this);
-            } else {
-                target = newTarget();
-                fnCall(weakSet, elementTargets, this, target);
-            }
-            add(target, type, listener, options);
+            addEventListenerImpl(this, type, listener, options);
         });
-        defineMethod(global.Node.prototype, 'removeEventListener', function removeEventListener(type, listener) {
-            if (this === null || (typeof this !== 'object' && typeof this !== 'function')) {
-                throw new TypeError('Illegal invocation');
-            }
-            if (fnCall(weakHas, elementTargets, this)) {
-                remove(fnCall(weakGet, elementTargets, this), type, listener);
-            }
+        defineMethod(global.Node.prototype, 'removeEventListener', function removeEventListener(type, listener, options) {
+            removeEventListenerImpl(this, type, listener, options);
         });
     }
 
@@ -222,7 +554,7 @@
                 continue;
             }
             if (entry.once) {
-                remove(target, entry.type, entry.listener);
+                removeEntry(target, entry);
             }
             // currentTarget は getter 経由（ページ側が event を freeze しても代入で TypeError にならない）。
             state.current = currentTarget;
