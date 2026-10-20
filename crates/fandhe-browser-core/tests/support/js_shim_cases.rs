@@ -137,7 +137,7 @@ pub fn run(engine: &str) {
     );
     check(
         &mut p,
-        "document.createElement('input').name === '' && document.createElement('input').type === ''",
+        "document.createElement('input').name === '' && document.createElement('input').type === 'text'",
         "true",
     );
     check(
@@ -145,6 +145,135 @@ pub fn run(engine: &str) {
         "var j = document.createElement('input'); j.setAttribute('name', 'q'); \
          document.body.appendChild(j); document.querySelectorAll('input[name]').length",
         "1",
+    );
+
+    eprintln!("case: JS-5 type defaults and enum normalization per element kind (#1186)");
+    let mut p = setup(engine, None);
+    check(
+        &mut p,
+        "var ti = document.createElement('input'); ti.type + '|' + ti.hasAttribute('type')",
+        "text|false",
+    );
+    check(
+        &mut p,
+        "ti.setAttribute('type', 'CHECKBOX'); ti.type + '|' + ti.getAttribute('type')",
+        "checkbox|CHECKBOX",
+    );
+    check(&mut p, "ti.setAttribute('type', 'foo'); ti.type", "text");
+    check(
+        &mut p,
+        "var tb = document.createElement('button'); var r1 = tb.type; tb.type = 'RESET'; \
+         r1 + '|' + tb.type + '|' + tb.getAttribute('type')",
+        "submit|reset|RESET",
+    );
+    check(&mut p, "tb.setAttribute('type', 'x'); tb.type", "submit");
+    check(&mut p, "document.createElement('div').type", "");
+    check(
+        &mut p,
+        "document.body.innerHTML = '<svg><a id=\"sa\"></a></svg>'; document.getElementById('sa').type",
+        "",
+    );
+
+    eprintln!("case: JS-5 id and className reflect to attributes (#1186)");
+    let mut p = setup(engine, None);
+    check(
+        &mut p,
+        "var e = document.createElement('div'); var r0 = e.id + '|' + e.className; \
+         e.id = 'x'; e.className = 'a b'; document.body.appendChild(e); \
+         r0 + '|' + e.getAttribute('id') + '|' + e.getAttribute('class') + '|' + \
+         (document.getElementById('x') === e) + '|' + document.querySelectorAll('.a').length",
+        "||x|a b|true|1",
+    );
+
+    eprintln!("case: JS-5 value reflects on form controls and falls back on others (#1186)");
+    let mut p = setup(engine, None);
+    check(
+        &mut p,
+        "var vi = document.createElement('input'); var v0 = vi.value; vi.value = 'v'; \
+         var v1 = vi.getAttribute('value'); vi.value = null; \
+         v0 + '|' + v1 + '|' + vi.getAttribute('value') + '|' + vi.value",
+        "|v||",
+    );
+    check(
+        &mut p,
+        "var op1 = document.createElement('option'); op1.textContent = 'T'; var o0 = op1.value; \
+         op1.value = 'ov'; o0 + '|' + op1.value + '|' + op1.getAttribute('value')",
+        "T|ov|ov",
+    );
+    check(
+        &mut p,
+        "var dv = document.createElement('div'); var d0 = String(dv.value); dv.value = 'z'; \
+         d0 + '|' + dv.value + '|' + dv.hasAttribute('value')",
+        "undefined|z|false",
+    );
+
+    eprintln!("case: JS-5 boolean attributes reflect presence (#1186)");
+    let mut p = setup(engine, None);
+    check(
+        &mut p,
+        "var bi = document.createElement('input'); document.body.appendChild(bi); \
+         bi.disabled = true; bi.checked = true; bi.readOnly = true; bi.required = true; bi.multiple = true; \
+         bi.placeholder = 'p'; \
+         [bi.disabled, bi.hasAttribute('disabled'), bi.hasAttribute('readonly'), bi.getAttribute('placeholder'), \
+          document.querySelectorAll('[disabled]').length, document.querySelectorAll('[checked]').length, \
+          bi.required, bi.multiple].join(',')",
+        "true,true,true,p,1,1,true,true",
+    );
+    check(
+        &mut p,
+        "bi.disabled = false; bi.checked = 0; bi.readOnly = ''; \
+         [bi.disabled, bi.hasAttribute('disabled'), bi.checked, bi.hasAttribute('readonly')].join(',')",
+        "false,false,false,false",
+    );
+    check(
+        &mut p,
+        "var bd = document.createElement('div'); var c0 = String(bd.checked); bd.checked = true; \
+         c0 + '|' + bd.checked + '|' + bd.hasAttribute('checked')",
+        "undefined|true|false",
+    );
+
+    eprintln!(
+        "case: JS-5 React value tracking pattern works on Element.prototype accessors (#1186)"
+    );
+    let mut p = setup(engine, None);
+    check(
+        &mut p,
+        "var ri = document.createElement('input'); \
+         var rd = Object.getOwnPropertyDescriptor(ri.constructor.prototype, 'value'); \
+         Object.defineProperty(ri, 'value', { configurable: true, get: function () { return rd.get.call(this); }, \
+           set: function (v) { rd.set.call(this, v); } }); \
+         ri.value = 'tracked'; (typeof rd.get) + '|' + (typeof rd.set) + '|' + ri.value + '|' + ri.getAttribute('value')",
+        "function|function|tracked|tracked",
+    );
+
+    eprintln!("case: JS-5 reflection setters notify MutationObserver only on real change (#1186)");
+    let mut p = setup(engine, None);
+    check(
+        &mut p,
+        "var me = document.createElement('input'); document.body.appendChild(me); var seen = []; \
+         var mo = new MutationObserver(function (r) { \
+           for (var i = 0; i < r.length; i++) seen.push(r[i].attributeName); }); \
+         mo.observe(me, { attributes: true }); me.id = 'i'; me.className = 'c'; me.disabled = true; \
+         me.checked = false; __fandheRunMicrotasks(); seen.join(',')",
+        "id,class,disabled",
+    );
+
+    eprintln!("case: JS-5 reflection ignores page-replaced setAttribute and toLowerCase (#1186)");
+    let mut p = setup(engine, None);
+    check(
+        &mut p,
+        "var ei = document.createElement('input'); \
+         Element.prototype.setAttribute = function () { throw new Error('hijacked'); }; \
+         String.prototype.toLowerCase = function () { return 'hijacked'; }; \
+         ei.id = 'h'; ei.disabled = true; ei.setAttribute === undefined; \
+         var ok = ei.id + '|' + ei.disabled; \
+         ok",
+        "h|true",
+    );
+    check(
+        &mut p,
+        "var ti2 = document.createElement('input'); ti2.type = 'RADIO'; ti2.type",
+        "radio",
     );
 
     eprintln!("case: JS-5 HTMLIFrameElement exists so instanceof does not throw (#1168)");

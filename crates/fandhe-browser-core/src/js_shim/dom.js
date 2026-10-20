@@ -24,8 +24,8 @@
 // 未実装（REPAIR-3。後続 issue / #779 で追加）:
 // - bridge のエラーはエンジンの例外（Error）のまま伝わる。DOMException への写像は未対応。
 // - NodeList / HTMLCollection 互換（querySelectorAll は素の Array を返す）。
-// - Element の tagName / nodeName（要素名を返す read-only op が無い。core の
-//   `Document::local_name` / `namespace_url` を使う op が候補）。未定義のまま（装わない）。
+// - Element の tagName / localName / nodeName（HTML 要素名を返す op `htmlLocalName` は IDL 属性の
+//   種別判定に使うが、IDL プロパティとしては未公開。サイトの分岐が変わり得るため。装わない）。
 // - parentNode / parentElement / childNodes / firstChild / lastChild / nextSibling /
 //   previousSibling / nodeValue / namespaceURI / isConnected / contains /
 //   compareDocumentPosition / attributes（属性の列挙）。対応する op が無く未定義のまま。
@@ -33,8 +33,16 @@
 //   `new` は Illegal constructor。継承は Element ← HTMLElement ← HTMLIFrameElement）。他の
 //   サブクラスは未定義のまま（#1168・#1184）。将来は要素名・名前空間を返す op を足し、HTML
 //   名前空間の要素を HTMLElement のインスタンスにする（REPAIR-3）。
-// - IDL 属性の反映は `name` / `type` だけ（簡略版。全要素に定義し、既定値・正規化なし。#1176）。
-//   `id` / `className` / `value` / `checked` 等は未反映のまま（REPAIR-3）。
+// - IDL 属性の反映（#1176・#1186）は簡略版。反映するのは `name`・`type`（全要素。`type` の getter は
+//   input を列挙値へ正規化し既定 "text"、button は既定 "submit"）、`id`・`className`（全要素。SVG の
+//   className も文字列で返す点が標準と異なる）、`placeholder`・`value`・`disabled`・`checked`・
+//   `readOnly`・`required`・`multiple`（HTML 名前空間の該当要素のみ。適用外の要素では属性へ反映せず
+//   代入値を読み戻すだけで、`'value' in div` が true になる点が標準と異なる）。
+//   未実装（REPAIR-3）: `value` の dirty value flag・内部値（代入は属性を書き換える。AI スナップショット・
+//   セレクタ・22 タスク判定と一致させるため）、checkedness・ラジオ排他、`defaultValue` /
+//   `defaultChecked` / `selected`、value mode・サニタイズ、select / textarea の value（読み戻しのみ）、
+//   select.type 等の計算済み type、form.method 等の列挙既定値・`htmlFor`・URL 反映属性、
+//   HTMLInputElement 等の具象サブクラス。
 // - フォーカス追跡は簡略版（#1173・#1185）。`Element.prototype.focus()` / `blur()` が `document.activeElement` を
 //   更新する（何もフォーカスされていなければ body。無ければ null）。フォーカスできるかは op `isFocusable`
 //   （Rust 側の簡略判定。dom_bridge/focus.rs）で決め、状態はこのクロージャの 1 枠だけが持つ。DOM・属性を変える操作の直後（と `activeElement` の読み取り時）に有効性を
@@ -319,8 +327,7 @@
     // 属性を反映する IDL プロパティ `name` / `type`（#1176）。react-dom 19 の initInput は
     // `node.name = ...` / `node.type = ...` とプロパティへ代入するため、反映が無いと属性が残らず、
     // `input[name]` が空になる（d2 で `form` の名前付きフィールドが 0 件になる原因と推定）。
-    // 簡略版（REPAIR-3）: 要素の種別を知る op が無いため全要素に定義し、`type` の既定値（input の
-    // "text"）や列挙値の正規化はせず、属性の文字列をそのまま返す（無ければ空文字）。
+    // `name` は全要素へ属性をそのまま反映する簡略版（REPAIR-3）。`type` は下の種別規則つき。
     function reflectedAttribute(attr) {
         return {
             get: function () {
@@ -328,15 +335,170 @@
                 return v === null ? '' : v;
             },
             set: function (value) {
-                // ページが差し替え得る setAttribute を経由せず、同じ op で直接保存する。
-                var stored = op('setAttribute', idOf(this, attr), attr, String(value));
-                revalidateFocus();
-                notifyMutation('attributes', this, { attributeName: typeof stored === 'string' ? stored : attr });
+                storeAttribute(this, attr, String(value));
             }
         };
     }
+    // ページが差し替え得る setAttribute を経由せず、同じ op で直接保存する。
+    function storeAttribute(self, attr, text) {
+        var stored = op('setAttribute', idOf(self, attr), attr, text);
+        revalidateFocus();
+        notifyMutation('attributes', self, { attributeName: typeof stored === 'string' ? stored : attr });
+    }
+    // 属性を除去する。属性が無かった場合（bridge が名前を返さない）は通知しない。
+    function dropAttribute(self, attr) {
+        var removed = op('removeAttribute', idOf(self, attr), attr);
+        revalidateFocus();
+        if (typeof removed === 'string') {
+            notifyMutation('attributes', self, { attributeName: removed });
+        }
+    }
+
+    // --- 要素種別ごとの IDL 属性の反映（#1186・JS-5・REPAIR-3・SEC-2）---
+    // 種別（HTML 名前空間の local name）は op `htmlLocalName` で 1 度だけ取得してラッパーごとに
+    // キャッシュする（ノード ID に対し不変。max_ops_per_page を消費し続けないため）。
+    var localNames = new WeakMap();
+    function localNameOf(self) {
+        if (localNames.has(self)) {
+            return localNames.get(self);
+        }
+        var v = op('htmlLocalName', idOf(self, 'localName'));
+        var name = typeof v === 'string' ? v : null;
+        localNames.set(self, name);
+        return name;
+    }
+    // ページが差し替え得る String.prototype.toLowerCase に頼らない ASCII 小文字化。
+    function asciiLower(str) {
+        var out = '';
+        for (var i = 0; i < str.length; i++) {
+            var c = str.charCodeAt(i);
+            out += c >= 65 && c <= 90 ? String.fromCharCode(c + 32) : str.charAt(i);
+        }
+        return out;
+    }
+    function nameSet(list) {
+        var set = Object.create(null);
+        for (var i = 0; i < list.length; i++) {
+            set[list[i]] = true;
+        }
+        return set;
+    }
+    // 適用外の要素（div.value 等）は属性へ反映せず、ラッパーごとの置き場に保存して従来どおり
+    // 代入値を読み戻せるようにする。own プロパティは作らない（React の値追跡が張る own accessor を壊さない）。
+    var expandos = new WeakMap();
+    function expandoGet(self, key) {
+        var box = expandos.get(self);
+        return box ? box[key] : undefined;
+    }
+    function expandoSet(self, key, value) {
+        var box = expandos.get(self);
+        if (!box) {
+            box = Object.create(null);
+            expandos.set(self, box);
+        }
+        box[key] = value;
+    }
+    function applies(self, set) {
+        if (set === null) {
+            return true;
+        }
+        var n = localNameOf(self);
+        return n !== null && set[n] === true;
+    }
+    // 文字列属性（`id` / `className` / `placeholder` / `value`）。`appliesTo` が null なら全要素。
+    function reflectString(prop, attr, appliesTo, opts) {
+        var set = appliesTo === null ? null : nameSet(appliesTo);
+        return {
+            get: function () {
+                if (!applies(this, set)) {
+                    return expandoGet(this, prop);
+                }
+                var v = readAttribute(this, prop, attr);
+                if (v === null && opts && opts.optionText && localNameOf(this) === 'option') {
+                    return op('getTextContent', idOf(this, prop));
+                }
+                return v === null ? '' : v;
+            },
+            set: function (value) {
+                var text = opts && opts.nullAsEmpty && value === null ? '' : String(value);
+                if (!applies(this, set)) {
+                    expandoSet(this, prop, value);
+                    return;
+                }
+                storeAttribute(this, attr, text);
+            }
+        };
+    }
+    // 真偽属性（属性の有無）。
+    function reflectBoolean(prop, attr, appliesTo) {
+        var set = nameSet(appliesTo);
+        return {
+            get: function () {
+                if (!applies(this, set)) {
+                    return expandoGet(this, prop);
+                }
+                return readAttribute(this, prop, attr) !== null;
+            },
+            set: function (value) {
+                if (!applies(this, set)) {
+                    expandoSet(this, prop, value);
+                    return;
+                }
+                if (value) {
+                    storeAttribute(this, attr, '');
+                } else {
+                    dropAttribute(this, attr);
+                }
+            }
+        };
+    }
+    var INPUT_TYPES = nameSet([
+        'hidden', 'text', 'search', 'tel', 'url', 'email', 'password', 'date', 'month', 'week',
+        'time', 'datetime-local', 'number', 'range', 'color', 'checkbox', 'radio', 'file', 'submit',
+        'image', 'reset', 'button'
+    ]);
+    var BUTTON_TYPES = nameSet(['submit', 'reset', 'button']);
+    // `type`: input は列挙値へ正規化（既定 text）、button は既定 submit。他は属性値か空文字。
+    // setter は仕様どおり与えた文字列をそのまま属性へ保存する（正規化は getter だけ）。
+    define(Element.prototype, 'type', {
+        get: function () {
+            var raw = readAttribute(this, 'type', 'type');
+            var kind = localNameOf(this);
+            if (kind === 'input') {
+                var lower = raw === null ? '' : asciiLower(raw);
+                return INPUT_TYPES[lower] === true ? lower : 'text';
+            }
+            if (kind === 'button') {
+                var b = raw === null ? '' : asciiLower(raw);
+                return BUTTON_TYPES[b] === true ? b : 'submit';
+            }
+            return raw === null ? '' : raw;
+        },
+        set: reflectedAttribute('type').set
+    });
     define(Element.prototype, 'name', reflectedAttribute('name'));
-    define(Element.prototype, 'type', reflectedAttribute('type'));
+    define(Element.prototype, 'id', reflectString('id', 'id', null));
+    define(Element.prototype, 'className', reflectString('className', 'class', null));
+    define(Element.prototype, 'placeholder', reflectString('placeholder', 'placeholder', ['input', 'textarea']));
+    // `value` は属性への反映のみ（dirty value flag・内部値は未実装。REPAIR-3）。textarea / select は
+    // 適用外のため従来どおり代入値の読み戻しだけ。
+    define(
+        Element.prototype,
+        'value',
+        reflectString('value', 'value', ['input', 'button', 'data', 'param', 'option'], {
+            nullAsEmpty: true,
+            optionText: true
+        })
+    );
+    define(
+        Element.prototype,
+        'disabled',
+        reflectBoolean('disabled', 'disabled', ['button', 'fieldset', 'input', 'optgroup', 'option', 'select', 'textarea'])
+    );
+    define(Element.prototype, 'checked', reflectBoolean('checked', 'checked', ['input']));
+    define(Element.prototype, 'readOnly', reflectBoolean('readOnly', 'readonly', ['input', 'textarea']));
+    define(Element.prototype, 'required', reflectBoolean('required', 'required', ['input', 'select', 'textarea']));
+    define(Element.prototype, 'multiple', reflectBoolean('multiple', 'multiple', ['input', 'select']));
     define(Element.prototype, 'innerHTML', {
         get: function () {
             return op('getInnerHTML', idOf(this, 'innerHTML'));

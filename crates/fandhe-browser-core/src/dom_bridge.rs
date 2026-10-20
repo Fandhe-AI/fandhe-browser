@@ -380,6 +380,8 @@ enum DomOp {
     MutationObserverLimit,
     MutationOptionsIgnored,
     UrlParse,
+    /// HTML 名前空間の要素の local name を返す（#1186。dom.js の IDL 属性の種別判定用）。
+    HtmlLocalName,
 }
 
 impl DomOp {
@@ -432,6 +434,7 @@ impl DomOp {
             "netCancel" => Self::NetCancel,
             "isInclusiveAncestor" => Self::IsInclusiveAncestor,
             "isFocusable" => Self::IsFocusable,
+            "htmlLocalName" => Self::HtmlLocalName,
             "mutationObserverLimit" => Self::MutationObserverLimit,
             "mutationOptionsIgnored" => Self::MutationOptionsIgnored,
             "urlParse" => Self::UrlParse,
@@ -488,6 +491,7 @@ impl DomOp {
             Self::NetCancel => "netCancel",
             Self::IsInclusiveAncestor => "isInclusiveAncestor",
             Self::IsFocusable => "isFocusable",
+            Self::HtmlLocalName => "htmlLocalName",
             Self::MutationObserverLimit => "mutationObserverLimit",
             Self::MutationOptionsIgnored => "mutationOptionsIgnored",
             Self::UrlParse => "urlParse",
@@ -526,6 +530,7 @@ impl DomOp {
             | Self::NetOptionsIgnored
             | Self::MutationOptionsIgnored
             | Self::IsFocusable
+            | Self::HtmlLocalName
             | Self::NetCancel => 1,
             Self::QuerySelector
             | Self::QuerySelectorAll
@@ -1088,6 +1093,19 @@ fn execute(
         DomOp::IsFocusable => {
             let node = page.node_arg(op, args, 1)?;
             Ok(JsValue::Bool(focus::is_focusable(&page.document, node)))
+        }
+        // HTML 名前空間の要素の local name（ASCII 小文字）。SVG・MathML 要素・テキスト・文書は null
+        // （dom.js が input / button 等の HTML の規則を SVG の同名要素へ当てないため。#1186・JS-5）。
+        // 読み取り専用で、応答は上限（JS-6）に従う。
+        DomOp::HtmlLocalName => {
+            let node = page.node_arg(op, args, 1)?;
+            if page.document.is_element(node)
+                && page.document.namespace_url(node) == Some(crate::dom::HTML_NAMESPACE_URI)
+                && let Some(name) = page.document.local_name(node)
+            {
+                return string_response(name.to_string(), limits);
+            }
+            Ok(JsValue::Null)
         }
         DomOp::TimerCallbackError => {
             let name = string_arg(op, args, 1, limits)?;
@@ -2925,6 +2943,35 @@ mod tests {
         call(&b, &[s("isFocusable"), s("1")]).expect_err("type");
         call(&b, &[s("isFocusable")]).expect_err("arity");
         call(&b, &[s("isFocusable"), n(div), n(div)]).expect_err("arity");
+    }
+
+    /// JS-5: `htmlLocalName` は HTML 要素の小文字名を返し、SVG 要素・テキスト・文書は null、不正入力はエラー（#1186）。
+    #[test]
+    fn js_5_html_local_name_op() {
+        let b = bridge();
+        let body = num(call(&b, &[s("body")]));
+        let root = num(call(&b, &[s("documentRoot")]));
+        let input = num(call(&b, &[s("createElement"), s("INPUT")]));
+        let text = num(call(&b, &[s("createTextNode"), s("t")]));
+        let name = |x: f64| call(&b, &[s("htmlLocalName"), n(x)]).expect("ok");
+        assert_eq!(name(input), JsValue::String("input".to_string()));
+        assert_eq!(name(text), JsValue::Null);
+        assert_eq!(name(root), JsValue::Null);
+        call(
+            &b,
+            &[
+                s("setInnerHTML"),
+                n(body),
+                s("<svg><a id=\"sa\"></a></svg>"),
+            ],
+        )
+        .expect("svg");
+        let svg_a = num(call(&b, &[s("getElementById"), s("sa")]));
+        assert_eq!(name(svg_a), JsValue::Null);
+        call(&b, &[s("htmlLocalName"), n(1e12)]).expect_err("invalid id");
+        call(&b, &[s("htmlLocalName"), s("1")]).expect_err("type");
+        call(&b, &[s("htmlLocalName")]).expect_err("arity");
+        call(&b, &[s("htmlLocalName"), n(input), n(input)]).expect_err("arity");
     }
 
     /// JS-7: `timerCallbackError` は種別を許可リストで検証し、メッセージを切り詰めて件数を頭打ちにする。

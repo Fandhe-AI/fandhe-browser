@@ -945,7 +945,7 @@ spec 対応: TASK-71・TASK-108 / MS-6 / `COMPAT-1`・`JS-6`・`JS-7`・`MEAS-4`
 
 1. 22 タスクの通し実行と `matrix.json` の更新、回帰ゲートの有効化（#919・#920）。d2 は単体で解消を確認済み
 2. d3: `console.error` の次の不足（null の `registered` 読み取り）の特定（#1173 の次の対応 1 のまま）（済み: #1183。下の節を参照）
-3. IDL 属性の反映の拡張（`value`・`checked`・`id`・`className` 等と、種別ごとの既定値。`REPAIR-3`。別 issue の切り出し候補）
+3. IDL 属性の反映の拡張（`value`・`checked`・`id`・`className` 等と、種別ごとの既定値。`REPAIR-3`。別 issue の切り出し候補）（済み: #1186。下の節を参照）
 4. 仮想時間の上限（30 秒）の見直しと、上限より後の定期タイマーを打ち切りとして扱うかの再評価（TASK-113・オーナー判断）
 
 ### 制約
@@ -1086,6 +1086,38 @@ d2・d3 の再測定は行っていない（未測定）。本変更の効果は
 1. React 17 以降の `onFocus` / `onBlur` は root で focusin / focusout を聞くため、本変更の後も発火しない。要素の `dispatchEvent` と木に沿った伝播を足すときに focusin / focusout も配る（切り出し候補。`REPAIR-3`）
 2. `document.createElementNS`（#1184 の次の対応 1）
 3. d2・d3 の再測定
+
+## 主要な IDL 属性の反映と種別ごとの既定値（#1186）
+
+spec 対応: TASK-71・TASK-108 / MS-6 / `COMPAT-1`・`JS-5`・`JS-6`・`MEAS-4`・`REPAIR-3`・`SEC-2`。
+Issue #1176 節の「次の対応 3」にあたる。
+
+### 実装の要点
+
+- 新しい読み取り専用 op `htmlLocalName`（`dom_bridge.rs`）: HTML 名前空間の要素の local name（ASCII 小文字）を返す。SVG・MathML 要素・テキスト・文書は null で、SVG の `<a>` などに HTML の規則を当てない。shim はラッパーごとに結果をキャッシュし、`max_ops_per_page` の消費を増やさない
+- `dom.js` の `Element.prototype` に accessor を定義した（React の値追跡が `node.constructor.prototype` の descriptor を探すため）。setter はページが差し替え得る `setAttribute` を経由せず op を直接呼び、MutationObserver へ通知する（属性が元から無い除去は通知しない）
+  - 全要素: `id`、`className`（`class`）、`name`、`type`
+  - 該当要素のみ: `placeholder`（input・textarea）、`value`（input・button・data・param・option。option は属性が無ければテキスト）、`disabled`、`checked`（input）、`readOnly`（`readonly`）、`required`、`multiple`
+  - `type` の getter: input は列挙値へ ASCII 小文字で正規化し既定 `text`、button は既定 `submit`。setter は与えた文字列をそのまま保存する
+  - 適用外の要素（`div.value` 等）は属性へ反映せず、ラッパーごとの置き場に保存して読み戻すだけ（従来の挙動を保つ）
+- 新しい依存・`unsafe`・window のグローバルは無い
+
+### 測定
+
+d2・d3 の再測定は行っていない（未測定）。本変更の効果は V8・boa 共通のケース（`js_shim_cases.rs`）と `dom_bridge.rs` の unit test で確認した。d2 への影響（`input[type]` 件数・`success`）は未検証で、#919・#920 の通し実行で確認する。
+
+### 次の対応
+
+1. `tagName` / `localName` の公開と、HTML 要素の具象サブクラス（`HTMLInputElement` 等。`op htmlLocalName` は既にある）
+2. `value` の dirty value flag・内部値、checkedness とラジオの排他、`defaultValue` / `defaultChecked`（`REPAIR-3`）
+3. 選択系（`select.value`・`option.selected`）
+4. 22 タスクの通し実行と d2・d3 の再測定（#919・#920）
+
+### 制約
+
+- 標準との差異: `'value' in div` が true になる。SVG 要素の `className` が `SVGAnimatedString` でなく文字列
+- `value` の代入は属性を書き換える（AI スナップショット・セレクタ・22 タスク判定と一致させるため。dirty flag は未実装）
+- `select.type` / `textarea.type` などの計算済み `type`、`form.method` 等の列挙既定値、`htmlFor`・URL 反映属性は未対応
 
 ## b5（Trello）の原因特定（#964）
 
