@@ -210,6 +210,8 @@ pub struct TimerQueue {
     registration_refused: bool,
     /// `next` が選び、まだ shim に消費されていない発火（`JS-6`）。
     armed: Option<TimerId>,
+    /// `origin` を保持しているエントリー数（`set_origin` の上限判定を O(1) にする）。
+    retained_origins: usize,
 }
 
 impl TimerQueue {
@@ -251,6 +253,12 @@ impl TimerQueue {
         Ok(id)
     }
 
+    fn release_origin(&mut self, entry: &Entry) {
+        if entry.origin.is_some() {
+            self.retained_origins = self.retained_origins.saturating_sub(1);
+        }
+    }
+
     fn take_seq(&mut self) -> u64 {
         let seq = self.next_seq;
         self.next_seq = self.next_seq.saturating_add(1);
@@ -263,13 +271,15 @@ impl TimerQueue {
     /// 文字列は [`MAX_TIMER_ORIGIN_BYTES`] へ文字境界で切り詰める。エントリーと同時に消えるため、
     /// 発火済みの one-shot・取り消し済みの分は自動的に解放される。
     pub fn set_origin(&mut self, id: TimerId, stack: &str) {
-        let retained = self.entries.values().filter(|e| e.origin.is_some()).count();
-        if retained >= MAX_RETAINED_TIMER_ORIGINS {
-            return;
-        }
         let Some(entry) = self.entries.get_mut(&id) else {
             return;
         };
+        if entry.origin.is_none() {
+            if self.retained_origins >= MAX_RETAINED_TIMER_ORIGINS {
+                return;
+            }
+            self.retained_origins += 1;
+        }
         let mut end = stack.len().min(MAX_TIMER_ORIGIN_BYTES);
         while !stack.is_char_boundary(end) {
             end -= 1;
@@ -300,6 +310,7 @@ impl TimerQueue {
     /// タイマーを取り消す。存在しない ID は何もしない。
     pub fn clear(&mut self, id: TimerId) {
         if let Some(entry) = self.entries.remove(&id) {
+            self.release_origin(&entry);
             self.order.remove(&entry.key);
         }
     }
@@ -323,8 +334,8 @@ impl TimerQueue {
             .entries
             .get(&id)
             .is_some_and(|e| e.interval_ms.is_some());
-        if !is_interval {
-            self.entries.remove(&id);
+        if !is_interval && let Some(entry) = self.entries.remove(&id) {
+            self.release_origin(&entry);
         }
         self.armed = Some(id);
         NextStep::Due(id)

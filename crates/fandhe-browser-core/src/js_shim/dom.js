@@ -294,7 +294,9 @@
                 return v === null ? '' : v;
             },
             set: function (value) {
-                this.setAttribute(attr, value);
+                // ページが差し替え得る setAttribute を経由せず、同じ op で直接保存する。
+                var stored = op('setAttribute', idOf(this, attr), attr, String(value));
+                notifyMutation('attributes', this, { attributeName: typeof stored === 'string' ? stored : attr });
             }
         };
     }
