@@ -1068,7 +1068,7 @@ target/release/examples/compat_page_script_probe --target d3=https://demoqa.com/
 ## focus・blur と連動した document.activeElement の追跡（#1185）
 
 spec 対応: TASK-71・TASK-108 / MS-6 / `COMPAT-1`・`JS-5`・`JS-6`・`MEAS-4`・`REPAIR-3`・`SEC-2`。
-#1173 節の「次の対応 3」にあたる。
+Issue #1173 節の「次の対応 3」にあたる。
 
 ### 実装の要点
 

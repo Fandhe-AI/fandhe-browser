@@ -455,6 +455,10 @@
                 if (focused !== null) {
                     return;
                 }
+                // blur リスナーが対象を切り離し・disabled にした場合は focus を配らず中断する。
+                if (!focusStillValid(this)) {
+                    return;
+                }
             }
             focused = this;
             fireFocusEvent('focus', this);

@@ -3074,6 +3074,18 @@ fn focus_cases(engine: &str) {
         "t|t",
     );
 
+    eprintln!("case: JS-5 a blur listener that disables the next target aborts focus delivery");
+    let mut p = setup_html(engine, HTML, None);
+    check(
+        &mut p,
+        "var $ = function (x) { return document.getElementById(x); }; var log = []; \
+         $('i').addEventListener('blur', function () { $('b').setAttribute('disabled', ''); }); \
+         $('b').addEventListener('focus', function () { log.push('b'); }); \
+         $('i').focus(); $('b').focus(); \
+         log.length + '|' + (document.activeElement === document.body)",
+        "0|true",
+    );
+
     eprintln!("case: JS-6 mutually re-entrant focus listeners terminate");
     let mut p = setup_html(engine, HTML, None);
     check(
