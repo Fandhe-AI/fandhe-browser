@@ -634,6 +634,33 @@ fn net_cases(engine: &str) {
     assert_eq!(out.net().pending_at_end(), 0);
     assert!(rejections(&out).is_empty());
 
+    eprintln!("case: JS-8 XHR callback exceptions are classified and stack is opt-in (#1172)");
+    let throwing = "<body><script>\
+        var x=new XMLHttpRequest();x.open('GET','data.txt');\
+        x.onload=function(){ undefinedFn(); };x.send();\
+        </script></body>";
+    // 既存ケースの件数検証（hit_count）に影響させないよう、専用のサーバーを使う。
+    let (cb_port, _cb_hits) =
+        spawn_recording_server(|_| ("200 OK", String::new(), "hello".to_string()));
+    let cb_base = format!("http://127.0.0.1:{cb_port}/dir/page.html");
+    let out = run_page_at(engine, throwing, &cb_base, &opts, &loopback_fetcher());
+    let errs = &out.bridge_diagnostics().net_callback_errors;
+    assert_eq!(errs.len(), 1, "{errs:?}");
+    assert_eq!(errs[0].request, NetRequestKind::Xhr);
+    assert_eq!(errs[0].summary.kind(), ExceptionKind::ReferenceError);
+    assert_eq!(
+        errs[0].summary.message_class(),
+        ExceptionMessageClass::NotDefined
+    );
+    assert_eq!(errs[0].summary.identifier(), Some("undefinedFn"));
+    assert_eq!(errs[0].raw_stack(), None);
+    let retain = opts.clone().with_retain_raw_exception_messages(true);
+    let out = run_page_at(engine, throwing, &cb_base, &retain, &loopback_fetcher());
+    let errs = &out.bridge_diagnostics().net_callback_errors;
+    assert_eq!(errs.len(), 1, "{errs:?}");
+    let stack = errs[0].raw_stack();
+    assert!(stack.is_none_or(|s| s.len() <= 1024), "{stack:?}");
+
     eprintln!("case: JS-8 a fire-and-forget fetch is accepted and delivered on both engines");
     let out = run_page_at(
         engine,
@@ -2038,6 +2065,29 @@ pub fn run(engine: &str) {
     let errs = &out.bridge_diagnostics().listener_errors;
     assert_eq!(errs.len(), 1, "{errs:?}");
     assert!(errs[0].message.contains("bad"), "{}", errs[0].message);
+    assert_eq!(errs[0].summary.kind(), ExceptionKind::Error);
+
+    eprintln!("case: JS-4 listener exceptions are classified and stack is opt-in (#1172)");
+    let html = "<body><script>\
+        document.addEventListener('DOMContentLoaded', function () { undefinedFn(); });\
+        </script></body>";
+    let out = run_page(engine, html, &opts);
+    let errs = &out.bridge_diagnostics().listener_errors;
+    assert_eq!(errs.len(), 1, "{errs:?}");
+    assert_eq!(errs[0].summary.kind(), ExceptionKind::ReferenceError);
+    assert_eq!(
+        errs[0].summary.message_class(),
+        ExceptionMessageClass::NotDefined
+    );
+    assert_eq!(errs[0].summary.identifier(), Some("undefinedFn"));
+    assert_eq!(errs[0].raw_stack(), None);
+    let retain = opts.clone().with_retain_raw_exception_messages(true);
+    let out = run_page(engine, html, &retain);
+    let errs = &out.bridge_diagnostics().listener_errors;
+    assert_eq!(errs.len(), 1, "{errs:?}");
+    // stack の形式はエンジン依存（boa は非標準）。存在は前提にせず、上限だけ確認する。
+    let stack = errs[0].raw_stack();
+    assert!(stack.is_none_or(|s| s.len() <= 1024), "{stack:?}");
 
     eprintln!("case: JS-6 lifecycle is not fired after an abort");
     let o = PageRunOptions::default().with_script_wall_time(Duration::from_millis(200));

@@ -192,14 +192,36 @@ pub struct ListenerError {
     pub message: String,
     /// 切り詰めが起きたか。
     pub truncated: bool,
+    /// 例外の種類・メッセージ型・不足識別子の要約（`TimerError::summary` と同じ分類。
+    /// Issue #1172・`REPAIR-4`）。
+    pub summary: ExceptionSummary,
+    /// `error.stack` の先頭 [`MAX_EXCEPTION_STACK_BYTES`] バイト（空なら `None`）。非公開で、
+    /// opt-in が無い限り page_runner が破棄する（Issue #1172・`SEC-2`）。
+    stack: Option<String>,
 }
 
-// ページ由来の文字列は秘密を含み得るため、Debug には長さだけを出す。
+impl ListenerError {
+    /// 切り詰め済みの `error.stack`（opt-in が有効なときだけ値がある）。計測 example の stderr 専用で、
+    /// JSONL・要約には出さない（Issue #1172・`REPAIR-4`）。
+    #[doc(hidden)]
+    pub fn raw_stack(&self) -> Option<&str> {
+        self.stack.as_deref()
+    }
+
+    /// stack を破棄する（opt-in が無効なとき page_runner が呼ぶ。fail-closed）。
+    pub(crate) fn clear_stack(&mut self) {
+        self.stack = None;
+    }
+}
+
+// ページ由来の文字列は秘密を含み得るため、Debug には長さと要約だけを出す。
 impl std::fmt::Debug for ListenerError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ListenerError")
             .field("event", &self.event)
             .field("message_len", &self.message.len())
+            .field("summary", &self.summary)
+            .field("stack_len", &self.stack.as_ref().map(String::len))
             .field("truncated", &self.truncated)
             .finish()
     }
@@ -237,8 +259,14 @@ impl TimerCallbackSource {
     }
 }
 
-/// `TimerError` が保持する `error.stack` の上限バイト数（Issue #1168）。
-const MAX_TIMER_STACK_BYTES: usize = 1024;
+/// `TimerError`・`ListenerError`・`NetCallbackError` が保持する `error.stack` の上限バイト数
+/// （Issue #1168・#1172）。
+const MAX_EXCEPTION_STACK_BYTES: usize = 1024;
+
+/// `error.stack` を上限まで切って保持用に整える（空なら `None`）。3 種の callback 例外で共用する。
+fn clip_stack(stack: &str) -> Option<String> {
+    (!stack.is_empty()).then(|| truncate_utf8(stack, MAX_EXCEPTION_STACK_BYTES).0.to_owned())
+}
 
 /// タイマー / microtask のコールバックが投げた例外 1 件（[`MAX_CONSOLE_MESSAGE_BYTES`] で切り詰め済み）。
 #[derive(Clone, PartialEq, Eq)]
@@ -253,7 +281,7 @@ pub struct TimerError {
     /// 例外の種類・メッセージ型・不足識別子の要約（生メッセージを含まない固定語彙。
     /// module 評価失敗と同じ分類。Issue #1156・`JS-7`・`REPAIR-4`）。
     pub summary: ExceptionSummary,
-    /// `error.stack` の先頭 [`MAX_TIMER_STACK_BYTES`] バイト（空なら `None`）。URL・本文を含み得るため
+    /// `error.stack` の先頭 [`MAX_EXCEPTION_STACK_BYTES`] バイト（空なら `None`）。URL・本文を含み得るため
     /// 非公開で、`PageRunOptions` の opt-in が無い限り page_runner が破棄する（Issue #1168・`SEC-2`）。
     stack: Option<String>,
 }
@@ -295,14 +323,36 @@ pub struct NetCallbackError {
     pub message: String,
     /// 切り詰めが起きたか。
     pub truncated: bool,
+    /// 例外の種類・メッセージ型・不足識別子の要約（`TimerError::summary` と同じ分類。
+    /// Issue #1172・`REPAIR-4`）。
+    pub summary: ExceptionSummary,
+    /// `error.stack` の先頭 [`MAX_EXCEPTION_STACK_BYTES`] バイト（空なら `None`）。非公開で、
+    /// opt-in が無い限り page_runner が破棄する（Issue #1172・`SEC-2`）。
+    stack: Option<String>,
 }
 
-// ページ由来の文字列は秘密を含み得るため、Debug には長さだけを出す。
+impl NetCallbackError {
+    /// 切り詰め済みの `error.stack`（opt-in が有効なときだけ値がある）。計測 example の stderr 専用で、
+    /// JSONL・要約には出さない（Issue #1172・`REPAIR-4`）。
+    #[doc(hidden)]
+    pub fn raw_stack(&self) -> Option<&str> {
+        self.stack.as_deref()
+    }
+
+    /// stack を破棄する（opt-in が無効なとき page_runner が呼ぶ。fail-closed）。
+    pub(crate) fn clear_stack(&mut self) {
+        self.stack = None;
+    }
+}
+
+// ページ由来の文字列は秘密を含み得るため、Debug には長さと要約だけを出す。
 impl std::fmt::Debug for NetCallbackError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("NetCallbackError")
             .field("request", &self.request)
             .field("message_len", &self.message.len())
+            .field("summary", &self.summary)
+            .field("stack_len", &self.stack.as_ref().map(String::len))
             .field("truncated", &self.truncated)
             .finish()
     }
@@ -388,13 +438,21 @@ impl BridgeDiagnostics {
         }
     }
 
-    pub(super) fn record_listener_error(&mut self, event: LifecycleEvent, message: &str) {
+    pub(super) fn record_listener_error(
+        &mut self,
+        event: LifecycleEvent,
+        name: &str,
+        message: &str,
+        stack: &str,
+    ) {
         if self.listener_errors.len() < MAX_BRIDGE_DIAGNOSTICS {
             let (kept, truncated) = truncate_utf8(message, MAX_CONSOLE_MESSAGE_BYTES);
             self.listener_errors.push(ListenerError {
                 event,
                 message: kept.to_owned(),
                 truncated,
+                summary: summarize_named_exception(name, message),
+                stack: clip_stack(stack),
             });
         } else {
             self.dropped = self.dropped.saturating_add(1);
@@ -415,8 +473,7 @@ impl BridgeDiagnostics {
                 message: kept.to_owned(),
                 truncated,
                 summary: summarize_named_exception(name, message),
-                stack: (!stack.is_empty())
-                    .then(|| truncate_utf8(stack, MAX_TIMER_STACK_BYTES).0.to_owned()),
+                stack: clip_stack(stack),
             });
         } else {
             self.dropped = self.dropped.saturating_add(1);
@@ -434,13 +491,21 @@ impl BridgeDiagnostics {
         }
     }
 
-    pub(super) fn record_net_callback_error(&mut self, request: NetRequestKind, message: &str) {
+    pub(super) fn record_net_callback_error(
+        &mut self,
+        request: NetRequestKind,
+        name: &str,
+        message: &str,
+        stack: &str,
+    ) {
         if self.net_callback_errors.len() < MAX_BRIDGE_DIAGNOSTICS {
             let (kept, truncated) = truncate_utf8(message, MAX_CONSOLE_MESSAGE_BYTES);
             self.net_callback_errors.push(NetCallbackError {
                 request,
                 message: kept.to_owned(),
                 truncated,
+                summary: summarize_named_exception(name, message),
+                stack: clip_stack(stack),
             });
         } else {
             self.dropped = self.dropped.saturating_add(1);
@@ -600,13 +665,13 @@ mod tests {
     #[test]
     fn js_4_listener_errors_truncate_and_cap() {
         let mut d = BridgeDiagnostics::default();
-        d.record_listener_error(LifecycleEvent::Load, &"x".repeat(4096));
-        d.record_listener_error(LifecycleEvent::Load, &"x".repeat(4097));
+        d.record_listener_error(LifecycleEvent::Load, "", &"x".repeat(4096), "");
+        d.record_listener_error(LifecycleEvent::Load, "", &"x".repeat(4097), "");
         assert!(!d.listener_errors[0].truncated);
         assert_eq!(d.listener_errors[1].message.len(), 4096);
         assert!(d.listener_errors[1].truncated);
         for _ in 0..(MAX_BRIDGE_DIAGNOSTICS + 3) {
-            d.record_listener_error(LifecycleEvent::DomContentLoaded, "e");
+            d.record_listener_error(LifecycleEvent::DomContentLoaded, "", "e", "");
         }
         assert_eq!(d.listener_errors.len(), MAX_BRIDGE_DIAGNOSTICS);
         assert_eq!(d.dropped, 5);

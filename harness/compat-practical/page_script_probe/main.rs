@@ -39,8 +39,9 @@ use fandhe_browser_core::{
     run_page_scripts,
 };
 use probe::{
-    Origin, ProbeArgs, class_label, debug_stderr_line, exception_label, lifecycle_label,
-    run_options, script_line, timer_error_label, top_stack_frame,
+    Origin, ProbeArgs, callback_error_label, class_label, debug_stderr_line, exception_label,
+    lifecycle_event_name, lifecycle_label, run_options, script_line, timer_error_label,
+    top_stack_frame,
 };
 use reqwest::Url;
 
@@ -334,20 +335,49 @@ async fn measure(
         v.sort();
         v
     };
-    // timer_errors の生メッセージも stderr だけへ（JSONL の `timer_errors` は要約ラベルのまま。Issue #1156）。
-    for (n, e) in diag.timer_errors.iter().enumerate() {
-        let label = format!("{} timer_error#{n} {}", args.id, e.source.as_str());
-        if let Some(line) = debug_stderr_line(args.debug_raw_exception, &label, Some(&e.message)) {
+    // callback 例外（タイマー・リスナー・fetch / XHR）の生メッセージと先頭フレームは stderr だけへ
+    // （JSONL は要約ラベルのまま。--debug-raw-exception が無ければ core が stack を保持しない。
+    // Issue #1156・#1168・#1172）。
+    let emit_raw = |kind: &str, n: usize, source: &str, message: &str, stack: Option<&str>| {
+        let label = format!("{} {kind}#{n} {source}", args.id);
+        if let Some(line) = debug_stderr_line(args.debug_raw_exception, &label, Some(message)) {
             eprintln!("{line}");
         }
+        let label = format!("{label} frame");
+        if let Some(line) = debug_stderr_line(
+            args.debug_raw_exception,
+            &label,
+            stack.and_then(top_stack_frame),
+        ) {
+            eprintln!("{line}");
+        }
+    };
+    for (n, e) in diag.timer_errors.iter().enumerate() {
+        emit_raw(
+            "timer_error",
+            n,
+            e.source.as_str(),
+            &e.message,
+            e.raw_stack(),
+        );
     }
-    // 先頭フレーム（url:line:col）も stderr だけへ。--debug-raw-exception が無ければ core が stack を保持しない（#1168）。
-    for (n, e) in diag.timer_errors.iter().enumerate() {
-        let label = format!("{} timer_error#{n} {} frame", args.id, e.source.as_str());
-        let frame = e.raw_stack().and_then(top_stack_frame);
-        if let Some(line) = debug_stderr_line(args.debug_raw_exception, &label, frame) {
-            eprintln!("{line}");
-        }
+    for (n, e) in diag.listener_errors.iter().enumerate() {
+        emit_raw(
+            "listener_error",
+            n,
+            lifecycle_event_name(e.event),
+            &e.message,
+            e.raw_stack(),
+        );
+    }
+    for (n, e) in diag.net_callback_errors.iter().enumerate() {
+        emit_raw(
+            "net_callback_error",
+            n,
+            e.request.as_str(),
+            &e.message,
+            e.raw_stack(),
+        );
     }
     let diag_obj = Obj::new()
         .n(
@@ -361,7 +391,7 @@ async fn measure(
             &labels(
                 diag.listener_errors
                     .iter()
-                    .map(|e| class_label(&e.message))
+                    .map(|e| callback_error_label(lifecycle_event_name(e.event), &e.summary))
                     .collect(),
             ),
         )
@@ -379,7 +409,7 @@ async fn measure(
             &labels(
                 diag.net_callback_errors
                     .iter()
-                    .map(|e| class_label(&e.message))
+                    .map(|e| callback_error_label(e.request.as_str(), &e.summary))
                     .collect(),
             ),
         )

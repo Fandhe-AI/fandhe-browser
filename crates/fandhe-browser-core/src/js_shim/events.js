@@ -9,7 +9,8 @@
 //
 // 設計上の要点:
 // - ディスパッチャーは決して throw しない。リスナーの例外は try/catch で捕捉し、
-//   `lifecycleListenerError` op でメッセージ（4097 UTF-16 単位で打ち切り）だけ core に渡して
+//   `lifecycleListenerError` op で種類の名前・メッセージ（4097 UTF-16 単位で打ち切り）・
+//   stack（先頭 1024 UTF-16 単位。core が opt-in 時のみ保持。Issue #1172）を core に渡して
 //   後続のリスナーを続行する。
 // - `__fandheLifecycle` は non-writable / non-configurable で固定する（__dom と同じ作法）。
 //   再 install 時（同一 global への再評価）は窓口関数を残し、実体とリスナー状態だけを新しい評価のものへ差し替える。
@@ -153,6 +154,13 @@
     function report(eventName, error) {
         try {
             var text;
+            var name = '';
+            try {
+                // 例外の種類の名前（TypeError 等）。ページが書き換え得るため文字列のときだけ渡す。
+                name = error && typeof error.name === 'string' ? error.name.slice(0, 64) : '';
+            } catch (e) {
+                name = '';
+            }
             try {
                 text = String(error && error.message !== undefined ? error.message : error);
             } catch (e) {
@@ -167,7 +175,20 @@
                 }
                 text = text.slice(0, end);
             }
-            callOp('lifecycleListenerError', eventName, text);
+            var stack = '';
+            try {
+                // error.stack はページが偽造できる。文字列のときだけ、サロゲートを割らずに切って渡す。
+                if (error && typeof error.stack === 'string') {
+                    stack = error.stack.slice(0, 1024);
+                    var sl = stack.charCodeAt(stack.length - 1);
+                    if (sl >= 0xd800 && sl <= 0xdbff) {
+                        stack = stack.slice(0, -1);
+                    }
+                }
+            } catch (e) {
+                stack = '';
+            }
+            callOp('lifecycleListenerError', eventName, name, text, stack);
         } catch (e) {
             // 報告に失敗してもディスパッチは続ける。
         }
