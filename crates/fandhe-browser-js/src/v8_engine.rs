@@ -314,7 +314,8 @@ pub(crate) fn teardown_heap_limit(current: usize, initial: usize) -> usize {
 /// [`MAX_ISOLATE_HEAP_BYTES`] へ届くことがある。V8 は上限到達時に引き上げが無ければ
 /// 致命的 OOM になるため、評価中は [`terminate_on_heap_limit`] が実行の打ち切りを
 /// 要求しつつ、打ち切られた JS が巻き戻るまでの猶予としてこの天井まで引き上げる。
-/// 評価ごとに設定値へ戻すため、引き上げは積み上がらない。
+/// 評価ごとに設定値へ戻すため、引き上げは積み上がらない（ただし評価中に実ヒープが設定値を
+/// 超えていた場合、戻した後は直後の GC が回収するまで設定値より上にいることがある）。
 /// 大小関係は 評価の天井 < 破棄の天井 < 親の RSS しきい値（コンパイル時に固定）。
 pub(crate) const EVALUATION_HEAP_LIMIT_CAP_BYTES: usize = MAX_ISOLATE_HEAP_BYTES + 64 * 1024 * 1024; // 192 MiB
 
@@ -1021,6 +1022,10 @@ impl V8Engine {
     /// 発火していた場合は、`f` 内の watchdog 後始末（打ち切り要求の解除）が済んだ後で
     /// full GC を走らせて死んだ Promise の鎖を回収し、`Err` を [`V8Failure::HeapLimitReached`]
     /// （`ResourceLimitExceeded`・Context は残る）へ置き換える（`Timeout` より優先）。
+    /// 発火後は残った打ち切り要求も解除する。`f` が `Ok` を返していた場合はその結果を
+    /// そのまま返す（評価は完了しており、結果は有効なため）。
+    /// 上限は `remove_near_heap_limit_callback` で設定値へ戻す。評価中に実ヒープが設定値を
+    /// 超えていた場合は、戻した直後の次の確保で再び上限に届き得る（直後の GC で回収する）。
     /// 既知の制限: 引き上げ幅を超える単発の巨大確保は従来どおり致命的 OOM になり、
     /// 親が子の終了を `ResourceLimitExceeded`（Context 破棄）として扱う（子プロセス分離が最終防衛線）。
     fn guarded<T>(
@@ -1036,6 +1041,9 @@ impl V8Engine {
         let result = f(self);
         let fired = HEAP_GUARD_FIRED.with(|fired| fired.replace(false));
         if fired {
+            // `f` 内の watchdog 後始末の後に届いた通知（結果変換中の確保・後続の microtask
+            // checkpoint）が積んだ打ち切り要求を残すと、次の評価が誤って `Timeout` になる。
+            self.isolate.cancel_terminate_execution();
             self.isolate.low_memory_notification();
         }
         self.isolate
@@ -3655,6 +3663,24 @@ mod tests {
             .evaluate_script("40 + 2", &EvaluateOptions::default())
             .expect("engine must remain usable after a pending termination request");
         assert_eq!(result, JsValue::Number(42.0));
+    }
+
+    /// JS-6・Issue #1193 レビュー指摘: 評価後に届いた打ち切り要求が `guarded` で解除され、
+    /// 次の評価が誤って `Timeout` にならないこと（`Ok` はそのまま返る）。
+    #[test]
+    fn js_6_guarded_cancels_stale_terminate_request_after_heap_limit_fired() {
+        let mut engine = V8Engine::new().expect("no other V8Engine is active on this thread");
+        let handle = engine.thread_safe_handle_for_test();
+        let result = engine.guarded(|_| {
+            HEAP_GUARD_FIRED.with(|fired| fired.set(true));
+            handle.terminate_execution();
+            Ok(7)
+        });
+        assert_eq!(result.expect("Ok must be returned unchanged"), 7);
+        let next = engine
+            .evaluate_script("40 + 2", &EvaluateOptions::default())
+            .expect("no stale terminate request may remain");
+        assert_eq!(next, JsValue::Number(42.0));
     }
 
     /// JS-1・PR #503 レビュー指摘 P1 の回帰確認（コンパイル時間そのものが
