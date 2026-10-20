@@ -23,6 +23,9 @@
 //
 // 未実装（REPAIR-3。後続 issue / #779 で追加）:
 // - bridge のエラーはエンジンの例外（Error）のまま伝わる。DOMException への写像は未対応。
+// - getElementsByTagName は簡略版（#1200）: live でない静的な Array で HTMLCollection（item / namedItem）
+//   ではない。照合は要素の名前空間ごと（HTML は小文字化・それ以外は大文字小文字を区別）。
+//   getElementsByTagNameNS・getElementsByClassName は未実装。
 // - NodeList / HTMLCollection 互換（querySelectorAll は素の Array を返す）。
 // - Element の tagName / localName / nodeName（HTML 要素名を返す op `htmlLocalName` は IDL 属性の
 //   種別判定に使うが、IDL プロパティとしては未公開。サイトの分岐が変わり得るため。装わない）。
@@ -546,7 +549,11 @@
     }
 
     function querySelectorAll(scopeId, selector) {
-        var joined = op('querySelectorAll', scopeId, String(selector));
+        return wrapIdList(op('querySelectorAll', scopeId, String(selector)));
+    }
+
+    // カンマ結合の ID 列を要素ラッパーの素の Array にする（querySelectorAll・getElementsByTagName 共通）。
+    function wrapIdList(joined) {
         var result = [];
         if (joined === '') {
             return result;
@@ -557,6 +564,24 @@
         }
         return result;
     }
+
+    // 簡略版（#1200。REPAIR-3）: live でない静的な Array を返す。
+    function getElementsByTagName(scopeId, name) {
+        return wrapIdList(op('getElementsByTagName', scopeId, String(name)));
+    }
+
+    define(Element.prototype, 'getElementsByTagName', {
+        writable: true,
+        value: function getElementsByTagName_(qualifiedName) {
+            return getElementsByTagName(idOf(this, 'getElementsByTagName'), qualifiedName);
+        }
+    });
+    define(Document.prototype, 'getElementsByTagName', {
+        writable: true,
+        value: function getElementsByTagName_(qualifiedName) {
+            return getElementsByTagName(idOf(this, 'getElementsByTagName'), qualifiedName);
+        }
+    });
 
     define(Element.prototype, 'querySelector', {
         writable: true,

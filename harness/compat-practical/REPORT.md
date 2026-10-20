@@ -1154,8 +1154,65 @@ Issue #1184 節の「次の対応」1〜3、#1185 節の「次の対応 2・3」
 
 ### 次の対応
 
-1. d3 の `length` 読み取りの TypeError の特定（先頭フレームの診断を使い、undefined になっているプロパティを調べる。コレクション系 API の未実装が疑われる。未検証）
-2. `document.getElementsByTagName`（と、要素側の同名メソッド）の追加（簡略版。`REPAIR-3`）。切り出し候補
+1. d3 の `length` 読み取りの TypeError の特定（先頭フレームの診断を使い、undefined になっているプロパティを調べる。コレクション系 API の未実装が疑われる。未検証）（済み: #1200。下の節を参照）
+2. `document.getElementsByTagName`（と、要素側の同名メソッド）の追加（簡略版。`REPAIR-3`）。切り出し候補（済み: #1200。下の節を参照）
+3. `namespaceURI`・`tagName`・`localName` の公開と HTML 要素の具象サブクラス（#1186 の次の対応 1）
+4. d3 の `form` が 1 件以上になったら #919 へコメントする
+
+### 制約
+
+- 単一環境（Linux）・単一時点。URL・script 本文・stack 全文は転記していない。実サイトの内容は時点で変わる
+- 結論・matrix は書き換えていない（#919・#920 の担当）
+
+### 再現手順
+
+```bash
+cargo build --release -p fandhe-browser-core --features js-v8 --example compat_page_script_probe
+target/release/examples/compat_page_script_probe --target d3=https://demoqa.com/automation-practice-form --modules --selector form --debug-raw-exception --out /abs/path/d3.jsonl 2>&1 >/dev/null | grep -E "console_error|frame"
+cargo build --release -p fandhe-browser-cli
+bash harness/compat-practical/run_core.sh --tasks /abs/path/d2-tasks.json --page-js v8 --page-modules --out /abs/path/core.jsonl
+```
+
+## getElementsByTagName の追加と d2・d3 の再測定（#1200）
+
+spec 対応: TASK-71・TASK-108 / MS-6 / `COMPAT-1`・`JS-5`・`JS-6`・`MEAS-4`・`REPAIR-3`・`SEC-2`。
+Issue #1192 節の「次の対応」1・2 にあたる。出力はコミットしていない。
+
+### 実装の要点
+
+- bridge: op `getElementsByTagName`（2 引数。scope・名前）。`*` は全要素、HTML 名前空間の要素は名前を ASCII 小文字化して local name と比べ、それ以外（SVG 等）は大文字小文字を区別して比べる。scope 自身は含まない。空文字は空の結果。件数・応答バイト数は `querySelectorAll` と同じ上限で打ち切る（`JS-6`）。ID 列の符号化は 2 つの op で共通の helper にまとめた
+- shim: `Document.prototype` と `Element.prototype` の `getElementsByTagName`。返り値は素の Array（`querySelectorAll` と同じ）
+- 未実装（`REPAIR-3`）: live なコレクション（取得後の DOM 変更は反映されない）、`HTMLCollection` の `item` / `namedItem`、`getElementsByTagNameNS`・`getElementsByClassName`。新しい依存・`unsafe`・window の識別面は無い
+
+### 測定条件
+
+| 項目 | 値 |
+| ---- | -- |
+| 実施日時（UTC） | 2026-10-20 |
+| OS | Linux |
+| ベース | main `6016cda0` に、本変更を加えたもの |
+| 設定 | probe は `--modules`・V8・`--selector form`・`--debug-raw-exception`。d2 の `run_core.sh` は `--page-js v8 --page-modules`（d2 のみのタスク定義） |
+
+### 結果
+
+| id | `abort` | `console_error` | HTML バイト | `form`（probe） |
+| -- | ------- | --------------- | ----------- | --------------- |
+| d3 | なし | 32 件（31 件が `TypeError: Cannot read properties of undefined (reading 'length')`、1 件が `... (reading 'insertBefore')`） | 1852 | 0 件 |
+| d2 | `virtual_time`（保留タイマー） | 0 件 | 2727 | 1 件 |
+
+- d3: `getElementsByTagName is not a function` は消え、最後の 1 件が別の TypeError に変わった。`form` は 0 件のまま。HTML バイトは変わらない
+- d2: probe の `form` は 1 件・`console_error` は 0 件で回帰なし。`run_core.sh`（d2 単体）は `success=true`（`form_fields`・3 件）
+- d3 の `form` は 0 件のため、#919 へのコメントはしていない
+
+### 特定できた原因
+
+- `length` の TypeError（31 件。すべて同一フレーム）: バンドル内の emotion 系のスタイルシート処理で、`document.styleSheets` が未定義のまま `.length` を読んでいる（`e.sheet` が無い場合のフォールバック）。`document.styleSheets`（と `<style>` 要素の `sheet`）は CSSOM のコレクション基盤を要し、小さな欠落ではないため本 Issue では実装せず切り出す
+- 最後の 1 件（`insertBefore`）: タグ管理系スクリプトの挿入処理で、`document.getElementsByTagName("script")[0]` が undefined になり、その `parentNode.insertBefore` を読んでいる。shim 単体では `script` 要素を返すことを確認済みだが、実ページで空になる理由は未特定（ページ実行中の `script` 要素の DOM 上の扱いが疑われる。未検証）
+
+### 次の対応
+
+1. `document.styleSheets` と `<style>` 要素の `sheet`（CSSOM の最小限の公開）。切り出し候補。起票済み: #1202
+2. 実ページの `getElementsByTagName('script')[0]` が空になる理由の調査（実行中の script 要素の扱い）
 3. `namespaceURI`・`tagName`・`localName` の公開と HTML 要素の具象サブクラス（#1186 の次の対応 1）
 4. d3 の `form` が 1 件以上になったら #919 へコメントする
 

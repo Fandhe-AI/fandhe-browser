@@ -340,6 +340,12 @@ enum DomOp {
     GetElementById,
     QuerySelector,
     QuerySelectorAll,
+    /// `getElementsByTagName(scope, name)`。簡略版（`JS-5`・`JS-6`・#1200）。
+    ///
+    /// 照合は要素単位: `*` は全要素、HTML 名前空間の要素は名前を ASCII 小文字化して local name と
+    /// 比べ、それ以外（SVG 等）は大文字小文字を区別して比べる。文書が XML かどうかは見ない。
+    /// 結果は走査時点の静的な ID 列で、live ではない（`REPAIR-3`）。
+    GetElementsByTagName,
     AppendChild,
     InsertBefore,
     RemoveChild,
@@ -399,6 +405,7 @@ impl DomOp {
             "getElementById" => Self::GetElementById,
             "querySelector" => Self::QuerySelector,
             "querySelectorAll" => Self::QuerySelectorAll,
+            "getElementsByTagName" => Self::GetElementsByTagName,
             "appendChild" => Self::AppendChild,
             "insertBefore" => Self::InsertBefore,
             "removeChild" => Self::RemoveChild,
@@ -458,6 +465,7 @@ impl DomOp {
             Self::GetElementById => "getElementById",
             Self::QuerySelector => "querySelector",
             Self::QuerySelectorAll => "querySelectorAll",
+            Self::GetElementsByTagName => "getElementsByTagName",
             Self::AppendChild => "appendChild",
             Self::InsertBefore => "insertBefore",
             Self::RemoveChild => "removeChild",
@@ -543,6 +551,7 @@ impl DomOp {
             Self::CreateElementNs
             | Self::QuerySelector
             | Self::QuerySelectorAll
+            | Self::GetElementsByTagName
             | Self::AppendChild
             | Self::RemoveChild
             | Self::RemoveAttribute
@@ -796,6 +805,26 @@ fn check_string_len(s: &str, index: usize, limits: &DomBridgeLimits) -> Result<(
         });
     }
     Ok(())
+}
+
+/// ノード ID 列をカンマ結合の文字列応答にする（querySelectorAll・getElementsByTagName 共通）。
+fn encode_id_list(
+    generation: u32,
+    ids: Vec<NodeId>,
+    limits: &DomBridgeLimits,
+) -> Result<JsValue, DomBridgeError> {
+    let mut out = String::new();
+    for (i, id) in ids.into_iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        let raw = encode_node_id(generation, id)?;
+        // raw は 0 以上 2^53 未満の整数のため切り詰めは起きない。
+        out.push_str(&(raw as u64).to_string());
+        // 巨大な応答を作り切る前に打ち切る。
+        check_response_len(out.len(), limits)?;
+    }
+    string_response(out, limits)
 }
 
 fn check_response_len(len: usize, limits: &DomBridgeLimits) -> Result<(), DomBridgeError> {
@@ -1328,18 +1357,44 @@ fn execute(
                     limit: limits.max_response_bytes,
                 });
             };
-            let mut out = String::new();
-            for (i, id) in found.into_iter().enumerate() {
-                if i > 0 {
-                    out.push(',');
-                }
-                let raw = encode_node_id(page.generation, id)?;
-                // raw は 0 以上 2^53 未満の整数のため切り詰めは起きない。
-                out.push_str(&(raw as u64).to_string());
-                // 巨大な応答を作り切る前に打ち切る。
-                check_response_len(out.len(), limits)?;
+            encode_id_list(page.generation, found, limits)
+        }
+        DomOp::GetElementsByTagName => {
+            let scope = page.node_arg(op, args, 1)?;
+            let name = string_arg(op, args, 2, limits)?;
+            if name.is_empty() {
+                return string_response(String::new(), limits);
             }
-            string_response(out, limits)
+            let any = name == "*";
+            let lower = name.to_ascii_lowercase();
+            let doc = &page.document;
+            // querySelectorAll と同じ件数上限で走査を打ち切る（全件 Vec を確保しない）。
+            let max_results = limits.max_response_bytes / 2 + 1;
+            let mut found = Vec::new();
+            for n in doc.descendants(scope) {
+                let Some(qn) = doc.element_name(n) else {
+                    continue;
+                };
+                let hit = any
+                    || if &*qn.ns == "http://www.w3.org/1999/xhtml" {
+                        *qn.local == *lower
+                    } else {
+                        match &qn.prefix {
+                            Some(p) => format!("{}:{}", &**p, &*qn.local) == name,
+                            None => &*qn.local == name,
+                        }
+                    };
+                if hit {
+                    if found.len() >= max_results {
+                        return Err(DomBridgeError::ResponseTooLarge {
+                            len: limits.max_response_bytes.saturating_add(1),
+                            limit: limits.max_response_bytes,
+                        });
+                    }
+                    found.push(n);
+                }
+            }
+            encode_id_list(page.generation, found, limits)
         }
         DomOp::AppendChild => {
             let parent = page.node_arg(op, args, 1)?;
@@ -1952,6 +2007,83 @@ mod tests {
         let none = call(&b, &[s("querySelectorAll"), n(root), s("span")]).expect("ok");
         assert_eq!(none, s(""));
         assert_eq!(num(call(&b, &[s("querySelector"), n(root), s("#a")])), a);
+    }
+
+    /// JS-5 / JS-6 / REPAIR-3 (#1200): getElementsByTagName の照合・引数検証。
+    #[test]
+    fn js_5_get_elements_by_tag_name_op() {
+        let b = bridge();
+        let root = num(call(&b, &[s("documentRoot")]));
+        let body = num(call(&b, &[s("body")]));
+        let div = num(call(&b, &[s("createElement"), s("div")]));
+        call(&b, &[s("appendChild"), n(body), n(div)]).expect("append");
+        let a = num(call(&b, &[s("getElementById"), s("a")]));
+        let want = s(&format!("{},{}", a as u64, div as u64));
+        assert_eq!(
+            call(&b, &[s("getElementsByTagName"), n(root), s("div")]).expect("ok"),
+            want
+        );
+        assert_eq!(
+            call(&b, &[s("getElementsByTagName"), n(root), s("DIV")]).expect("ok"),
+            want
+        );
+        let all = call(&b, &[s("getElementsByTagName"), n(root), s("*")]).expect("ok");
+        let JsValue::String(all) = all else {
+            panic!("string expected");
+        };
+        let elements = b
+            .with_document(|d| d.descendants(d.root()).filter(|&x| d.is_element(x)).count())
+            .expect("lock")
+            .expect("attached");
+        assert_eq!(all.split(',').count(), elements);
+        assert!(elements >= 4);
+        // scope 自身は含まない。
+        assert_eq!(
+            call(&b, &[s("getElementsByTagName"), n(body), s("body")]).expect("ok"),
+            s("")
+        );
+        // SVG は大文字小文字を区別する。
+        let svg = num(call(
+            &b,
+            &[
+                s("createElementNS"),
+                s("http://www.w3.org/2000/svg"),
+                s("clipPath"),
+            ],
+        ));
+        call(&b, &[s("appendChild"), n(body), n(svg)]).expect("append");
+        assert_eq!(
+            call(&b, &[s("getElementsByTagName"), n(root), s("clipPath")]).expect("ok"),
+            s(&format!("{}", svg as u64))
+        );
+        assert_eq!(
+            call(&b, &[s("getElementsByTagName"), n(root), s("clippath")]).expect("ok"),
+            s("")
+        );
+        assert_eq!(
+            call(&b, &[s("getElementsByTagName"), n(root), s("span")]).expect("ok"),
+            s("")
+        );
+        assert_eq!(
+            call(&b, &[s("getElementsByTagName"), n(root), s("")]).expect("ok"),
+            s("")
+        );
+        // 引数の誤り。
+        assert!(call(&b, &[s("getElementsByTagName"), n(root)]).is_err());
+        assert!(call(&b, &[s("getElementsByTagName"), n(root), n(1.0)]).is_err());
+        assert!(call(&b, &[s("getElementsByTagName"), s("x"), s("div")]).is_err());
+    }
+
+    /// JS-6 (#1200): getElementsByTagName の応答上限超過は ResponseTooLarge。
+    #[test]
+    fn js_6_get_elements_by_tag_name_response_limit() {
+        let b = bridge_with(DomBridgeLimits::default().with_max_response_bytes(4));
+        let root = num(call(&b, &[s("documentRoot")]));
+        let r = call(&b, &[s("getElementsByTagName"), n(root), s("*")]);
+        assert!(
+            matches!(r, Err(DomBridgeError::ResponseTooLarge { .. })),
+            "{r:?}"
+        );
     }
 
     #[test]
