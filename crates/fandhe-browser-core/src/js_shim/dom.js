@@ -108,8 +108,9 @@
     // 作る（要素名・名前空間を返す op が無い）ため、どの要素も `instanceof HTMLElement` /
     // `HTMLIFrameElement` は false になる（REPAIR-3。実装済みを装わない。全ラッパーを
     // HTMLElement にすると SVG 要素まで名乗ってしまう）。
-    // #1192 で d3 の次の失敗が instanceof 由来かを確かめた結果は REPORT #1192 節（由来でなければ据え置き）。HTMLElement は #1184 で selector の
-    // `:not()` に対応した後に定義した（定義だけ先行すると d3 が失敗した。REPORT #1168 節）。
+    // #1192 で d3 の次の失敗が instanceof 由来かを確かめた結果は REPORT #1192 節にある
+    // （由来でなければ据え置き）。
+    // HTMLElement は #1184 で selector の `:not()` に対応した後に定義した（定義だけ先行すると d3 が失敗した。REPORT #1168 節）。
     function HTMLElement(token) {
         Element.call(this, token);
     }
