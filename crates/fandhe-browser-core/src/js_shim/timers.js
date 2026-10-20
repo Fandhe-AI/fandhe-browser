@@ -4,7 +4,7 @@
 // 役割: ページの bundle が登録したタイマーのコールバックを保持し、タイマーの期限・順序・上限の
 // 管理は core 側（event_loop.rs / dom_bridge の timerSet・timerClear op）に任せる。ランナー
 // （core の page_runner）が仮想時間の順に `__fandheRunTimer(id)` を評価してコールバックを呼ぶ。
-// 実時間は待たない。呼び出し元: core の `js_shim::install`（events.js の後に評価）と、
+// 実時間は待たない。呼び出し元: core の `js_shim::install`（dom.js・window.js の後、abort.js・events.js の前に評価）と、
 // ランナーのイベントループ段および各 <script> / ライフサイクルイベント後の microtask checkpoint。
 //
 // 設計上の要点:
@@ -292,10 +292,9 @@
     defineMethod('clearInterval', function clearInterval(id) {
         clearTimer(id);
     });
-    defineMethod('queueMicrotask', function queueMicrotask(callback) {
-        if (typeof callback !== 'function') {
-            throw new TypeError('queueMicrotask: callback must be a function');
-        }
+    // 積めたら true、保留件数の上限で破棄したら false を返す内部窓口（history.js が登録成否を確認するために使う。
+    // 公開の queueMicrotask は仕様どおり undefined を返す）。
+    function tryEnqueueMicrotask(callback) {
         if (tail - head >= MAX_PENDING_MICROTASKS) {
             if (!microtaskLimitNotified) {
                 try {
@@ -305,11 +304,25 @@
                     // 通知に失敗しても破棄は維持する。
                 }
             }
-            return;
+            return false;
         }
         queue[tail] = callback;
         tail += 1;
+        return true;
+    }
+    var queueMicrotaskImpl = function queueMicrotask(callback) {
+        if (typeof callback !== 'function') {
+            throw new TypeError('queueMicrotask: callback must be a function');
+        }
+        tryEnqueueMicrotask(callback);
+    };
+    defineProperty(queueMicrotaskImpl, '__fandheTry', {
+        value: tryEnqueueMicrotask,
+        writable: false,
+        configurable: false,
+        enumerable: false
     });
+    defineMethod('queueMicrotask', queueMicrotaskImpl);
 
     // 固定の窓口関数は初回だけ定義し、実体は再 install のたびに差し替える（events.js と同じ作法）。
     function defineDispatcher(name, impl) {

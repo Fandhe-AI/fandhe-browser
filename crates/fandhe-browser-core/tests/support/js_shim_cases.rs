@@ -49,9 +49,9 @@ fn setup_html(engine: &str, html: &str, limit_extra_nodes: Option<usize>) -> Pag
         vec![
             "dom.js",
             "window.js",
-            "events.js",
             "timers.js",
             "abort.js",
+            "events.js",
             "net.js",
             "observers.js",
             "style.js",
@@ -347,6 +347,8 @@ pub fn run(engine: &str) {
     abort_cases(engine);
     storage_cases(engine);
     history_cases(engine);
+    event_target_cases(engine);
+    history_traversal_cases(engine);
 
     eprintln!("case: JS-5 disabled runtime does not pretend to install");
     let mut disabled = JsRuntime::disabled();
@@ -1804,13 +1806,13 @@ fn node_cases(engine: &str) {
 
 /// `DOMException` / `AbortSignal` / `AbortController`（#1150・`JS-5`・`JS-6`・`REPAIR-3`・`SEC-2`）のケース。
 fn abort_cases(engine: &str) {
-    eprintln!("case: JS-5 abort globals exist and EventTarget stays undefined");
+    eprintln!("case: JS-5 abort globals exist and EventTarget / Event are generic (#1177)");
     let mut p = setup(engine, None);
     check(&mut p, "typeof AbortController", "function");
     check(&mut p, "typeof AbortSignal", "function");
     check(&mut p, "typeof DOMException", "function");
-    check(&mut p, "typeof EventTarget", "undefined");
-    check(&mut p, "typeof Event", "undefined");
+    check(&mut p, "typeof EventTarget", "function");
+    check(&mut p, "typeof Event", "function");
 
     eprintln!("case: JS-5 AbortController abort() state and reason");
     check(
@@ -2381,6 +2383,16 @@ fn history_cases(engine: &str) {
         "#route",
     );
 
+    // url の toString 内で pushState が再入しても、内側のエントリの URL を上書きしない（push・replace 共通）。
+    check(
+        &mut p,
+        "history.replaceState(0, '', '/base'); \
+         history.pushState(2, '', {toString: function () { history.pushState(1, '', '/inner'); return '/outer'; }}); \
+         var a = history.state + ':' + location.pathname; \
+         history.back(); __fandheRunMicrotasks(); a + '|' + history.state + ':' + location.pathname",
+        "2:/outer|1:/inner",
+    );
+    eprintln!("case: history reentrant toString keeps inner entry url");
     eprintln!("case: JS-6 history state clone budget counts every array slot (shared refs)");
     check(
         &mut p,
@@ -2417,13 +2429,13 @@ fn history_cases(engine: &str) {
         "true",
     );
 
-    eprintln!("case: JS-5 history back/forward/go are recorded, not executed (REPAIR-3)");
+    eprintln!("case: JS-5 history go(0) and go() are recorded as reloads, not executed (REPAIR-3)");
     let _ = p.bridge.take_diagnostics();
     check(
         &mut p,
-        "history.back(); history.forward(); history.go(-1); history.go(); \
+        "history.go(0); history.go(); \
          var t = ''; try { history.go(1n); t = 'no-throw'; } catch (e) { t = e instanceof TypeError; } \
-         [location.pathname, t].join('|')",
+         __fandheRunMicrotasks(); [location.pathname, t].join('|')",
         "/w|true",
     );
     let diag = p.bridge.take_diagnostics().expect("diagnostics");
@@ -2435,9 +2447,7 @@ fn history_cases(engine: &str) {
     assert_eq!(
         got,
         vec![
-            (LocationChangeKind::HistoryBack, 0),
-            (LocationChangeKind::HistoryForward, 0),
-            (LocationChangeKind::HistoryGo, 2),
+            (LocationChangeKind::HistoryGo, 1),
             (LocationChangeKind::HistoryGo, 1),
         ]
     );
@@ -2454,7 +2464,7 @@ fn history_cases(engine: &str) {
     check(
         &mut p,
         "[typeof PopStateEvent, 'onpopstate' in window, typeof navigation].join('|')",
-        "undefined|false|undefined",
+        "function|true|undefined",
     );
 
     eprintln!("case: JS-5 history resets on reinstall");
@@ -2472,5 +2482,446 @@ fn history_cases(engine: &str) {
         "var r; try { history.pushState(null, '', '/x'); r = 'no-throw'; } catch (e) { r = e.name; } \
          history.pushState({z: 1}, ''); [r, history.length, history.state.z, location.href].join('|')",
         "SecurityError|2|1|about:blank",
+    );
+}
+/// 汎用 `Event` / `EventTarget`（#1177・`JS-4`・`JS-5`・`REPAIR-3`・`SEC-2`）のケース。
+///
+/// リスナーの例外は microtask 経由で報告されるため、`__fandheRunMicrotasks()` で drain して診断を確認する。
+fn event_target_cases(engine: &str) {
+    eprintln!("case: JS-5 Event / EventTarget globals exist");
+    let mut p = setup(engine, None);
+    check(
+        &mut p,
+        "[typeof Event, typeof EventTarget, typeof PopStateEvent].join('|')",
+        "function|function|function",
+    );
+
+    eprintln!(
+        "case: JS-5 EventTarget converts type to DOMString and rejects invalid receivers (#1177)"
+    );
+    check(
+        &mut p,
+        "var tc = new EventTarget(); var nc = 0; function fc() { nc++; } \
+         tc.addEventListener(123, fc); tc.dispatchEvent(new Event(123)); \
+         tc.removeEventListener(123, fc); tc.dispatchEvent(new Event('123')); \
+         var sym = ''; try { tc.addEventListener(Symbol('s'), fc); } catch (e) { sym = e.name; } \
+         var bad = []; \
+         ['dispatchEvent', 'addEventListener', 'removeEventListener'].forEach(function (m) { \
+           try { EventTarget.prototype[m].call({}, m === 'dispatchEvent' ? new Event('x') : 'x', function () {}); bad.push('ok'); } \
+           catch (e) { bad.push(e.name); } }); \
+         [nc, sym, bad.join(',')].join('|')",
+        "1|TypeError|TypeError,TypeError,TypeError",
+    );
+
+    eprintln!("case: JS-5 EventTarget basics (dedupe, capture order, once, handleEvent)");
+    check(
+        &mut p,
+        "var t = new EventTarget(); var log = []; \
+         function f(e) { log.push('f:' + e.type + ':' + (e.target === t) + ':' + (e.currentTarget === t) + ':' + e.eventPhase + ':' + e.isTrusted); } \
+         t.addEventListener('x', f); t.addEventListener('x', f); t.addEventListener('x', f, true); \
+         t.addEventListener('x', function () { log.push('once'); }, { once: true }); \
+         t.addEventListener('x', { handleEvent: function (e) { log.push('h:' + (this !== t)); } }); \
+         var ev = new Event('x'); var r1 = t.dispatchEvent(ev); var r2 = t.dispatchEvent(new Event('x')); \
+         log.join('|') + '#' + r1 + r2 + '#' + ev.currentTarget + ev.eventPhase",
+        "f:x:true:true:2:false|f:x:true:true:2:false|once|h:true|f:x:true:true:2:false|f:x:true:true:2:false|h:true#truetrue#null0",
+    );
+    check(
+        &mut p,
+        "var t2 = new EventTarget(); var n = 0; function g() { n++; } \
+         t2.addEventListener('y', g); t2.removeEventListener('y', g, true); t2.dispatchEvent(new Event('y')); \
+         t2.removeEventListener('y', g); t2.dispatchEvent(new Event('y')); n",
+        "1",
+    );
+    check(
+        &mut p,
+        "var t3 = new EventTarget(); var o = []; \
+         t3.addEventListener('s', function () { o.push(1); arguments[0].stopImmediatePropagation(); }); \
+         t3.addEventListener('s', function () { o.push(2); }); t3.dispatchEvent(new Event('s')); \
+         var c = new Event('c', { cancelable: true }); t3.addEventListener('c', function (e) { e.preventDefault(); }); \
+         var rc = t3.dispatchEvent(c); \
+         var nc = new Event('nc'); t3.addEventListener('nc', function (e) { e.preventDefault(); }); \
+         var rn = t3.dispatchEvent(nc); \
+         var pe = new Event('p', { cancelable: true }); t3.addEventListener('p', function (e) { e.preventDefault(); }, { passive: true }); \
+         var rp = t3.dispatchEvent(pe); \
+         [o.join(), rc, c.defaultPrevented, rn, nc.defaultPrevented, rp, pe.defaultPrevented].join('|')",
+        "1|false|true|true|false|true|false",
+    );
+    check(
+        &mut p,
+        "var t4 = new EventTarget(); var r = []; var e4 = new Event('z'); \
+         t4.addEventListener('z', function () { try { t4.dispatchEvent(e4); r.push('no'); } catch (x) { r.push(x.name + ':' + (x instanceof DOMException)); } }); \
+         t4.dispatchEvent(e4); \
+         try { t4.dispatchEvent({}); } catch (x) { r.push(x instanceof TypeError); } \
+         try { t4.dispatchEvent(); } catch (x) { r.push(x instanceof TypeError); } \
+         r.join('|')",
+        "InvalidStateError:true|true|true",
+    );
+
+    eprintln!("case: JS-5 EventTarget subclassing (ES5 and class)");
+    check(
+        &mut p,
+        "function Sub() { EventTarget.call(this); } Sub.prototype = Object.create(EventTarget.prototype); \
+         Sub.prototype.constructor = Sub; var s = new Sub(); var n5 = 0; \
+         s.addEventListener('a', function () { n5++; }); s.dispatchEvent(new Event('a')); \
+         class K extends EventTarget { constructor() { super(); this.v = 7; } } \
+         var k = new K(); var n6 = 0; k.addEventListener('a', function () { n6++; }); k.dispatchEvent(new Event('a')); \
+         [n5, n6, k.v, k instanceof EventTarget, Object.prototype.toString.call(k)].join('|')",
+        "1|1|7|true|[object EventTarget]",
+    );
+
+    eprintln!("case: JS-5 Event constructor");
+    check(
+        &mut p,
+        "var e = new Event('foo', { bubbles: true, cancelable: true, composed: true }); \
+         [e.type, e.bubbles, e.cancelable, e.composed, e.defaultPrevented, e.target, e.eventPhase, e.isTrusted, \
+          Event.AT_TARGET, e.BUBBLING_PHASE, Object.prototype.toString.call(e)].join('|')",
+        "foo|true|true|true|false||0|false|2|3|[object Event]",
+    );
+    check(
+        &mut p,
+        "var b = []; try { Event('x'); } catch (x) { b.push(x instanceof TypeError); } \
+         try { new Event(); } catch (x) { b.push(x instanceof TypeError); } \
+         try { Object.getOwnPropertyDescriptor(Event.prototype, 'type').get.call({}); } catch (x) { b.push(x instanceof TypeError); } \
+         b.join('|')",
+        "true|true|true",
+    );
+
+    eprintln!("case: JS-4 dispatchEvent listener error is reported later and does not stop others");
+    let mut p = setup(engine, None);
+    let _ = p.bridge.take_diagnostics();
+    check(
+        &mut p,
+        "var t = new EventTarget(); var o = []; \
+         t.addEventListener('e', function () { throw new Error('boom'); }); \
+         t.addEventListener('e', function () { o.push('after'); }); \
+         var thrown = 'no'; try { t.dispatchEvent(new Event('e')); } catch (x) { thrown = 'yes'; } \
+         thrown + o.join()",
+        "noafter",
+    );
+    p.eval("__fandheRunMicrotasks(); 'ok'");
+    let diag = p.bridge.take_diagnostics().expect("diagnostics");
+    assert_eq!(diag.timer_errors.len(), 1);
+    assert_eq!(diag.timer_errors[0].message, "boom");
+    assert_eq!(
+        diag.timer_errors[0].source,
+        fandhe_browser_core::dom_bridge::TimerCallbackSource::Microtask
+    );
+
+    eprintln!("case: JS-5 window and document dispatchEvent (bubbles document to window)");
+    let mut p = setup(engine, None);
+    check(
+        &mut p,
+        "var o = []; \
+         document.addEventListener('d', function (e) { o.push('doc:' + e.eventPhase + ':' + (e.currentTarget === document)); }); \
+         window.addEventListener('d', function (e) { o.push('win:' + e.eventPhase + ':' + (e.currentTarget === window) + ':' + (e.target === document)); }); \
+         document.dispatchEvent(new Event('d', { bubbles: true })); document.dispatchEvent(new Event('d')); \
+         window.dispatchEvent(new Event('d')); \
+         document.addEventListener('d', function (e) { e.stopPropagation(); }); \
+         document.dispatchEvent(new Event('d', { bubbles: true })); \
+         o.join(',')",
+        "doc:2:true,win:3:true:true,doc:2:true,win:2:true:false,doc:2:true",
+    );
+    check(
+        &mut p,
+        "var lc = []; document.addEventListener('DOMContentLoaded', function (e) { lc.push('dcl:' + e.type); }); \
+         window.addEventListener('load', function (e) { lc.push('load:' + e.type); }); \
+         __fandheLifecycle('DOMContentLoaded'); __fandheLifecycle('load'); lc.join(',')",
+        "dcl:DOMContentLoaded,load:load",
+    );
+
+    eprintln!("case: JS-5 AbortSignal stays independent of EventTarget (REPAIR-3)");
+    check(
+        &mut p,
+        "var ac = new AbortController(); var an = 0; ac.signal.addEventListener('abort', function () { an++; }); \
+         window.dispatchEvent(new Event('abort')); \
+         [an, ac.signal instanceof EventTarget, typeof ac.signal.dispatchEvent, window instanceof EventTarget, \
+          document instanceof EventTarget].join('|')",
+        "0|false|undefined|false|false",
+    );
+
+    eprintln!(
+        "case: JS-5 lifecycle events are real Events (instanceof, prototype methods) (#1177)"
+    );
+    let mut p = setup(engine, None);
+    check(
+        &mut p,
+        "var lr = []; \
+         document.addEventListener('DOMContentLoaded', function (e) { \
+           lr.push(e instanceof Event); \
+           Event.prototype.stopPropagation.call(e); \
+           lr.push(e.type + ':' + e.eventPhase + ':' + e.bubbles + ':' + (e.target === document) + ':' + e.isTrusted); \
+         }); \
+         window.addEventListener('DOMContentLoaded', function () { lr.push('win-ran'); }); \
+         window.addEventListener('load', function (e) { \
+           Event.prototype.preventDefault.call(e); Event.prototype.stopImmediatePropagation.call(e); \
+           lr.push('load:' + e.eventPhase + ':' + (e.target === window) + ':' + e.defaultPrevented); \
+         }); \
+         __fandheLifecycle('DOMContentLoaded'); __fandheLifecycle('load'); lr.join(',')",
+        "true,DOMContentLoaded:2:true:true:false,load:2:true:false",
+    );
+
+    eprintln!("case: JS-5 re-initializing an existing Event is rejected (#1177)");
+    let mut p = setup(engine, None);
+    check(
+        &mut p,
+        "var t = new EventTarget(); var e = new Event('x'); var o = []; \
+         t.addEventListener('x', function () { \
+           try { Event.call(e, 'y'); o.push('reinit-ok'); } catch (x) { o.push(x.name); } \
+           try { t.dispatchEvent(e); o.push('redispatch-ok'); } catch (x) { o.push(x.name); } \
+           o.push(e.type + ':' + e.eventPhase); \
+         }); \
+         t.dispatchEvent(e); \
+         var pe = new PopStateEvent('popstate', { state: 3 }); \
+         o.join() + '|' + pe.state + ':' + (pe instanceof Event) + ':' + new Event('z').type",
+        "TypeError,InvalidStateError,x:2|3:true:z",
+    );
+
+    eprintln!("case: JS-4 element brand check ignores page rewrites of Node (#1177)");
+    let mut p = setup(engine, None);
+    check(
+        &mut p,
+        "var el = document.createElement('div'); var n = 0; var NodeOrig = window.Node; \
+         window.Node = function () {}; \
+         Object.defineProperty(NodeOrig, Symbol.hasInstance, { value: function () { return false; }, configurable: true }); \
+         el.addEventListener('c', function () { n++; }); el.removeEventListener('c', function () {}); \
+         var rej = []; \
+         ['addEventListener', 'removeEventListener'].forEach(function (m) { \
+           try { NodeOrig.prototype[m].call({}, 'c', function () {}); rej.push('ok'); } catch (x) { rej.push(x.name); } \
+         }); \
+         Object.defineProperty(NodeOrig, Symbol.hasInstance, { value: function () { return true; }, configurable: true }); \
+         try { NodeOrig.prototype.addEventListener.call({}, 'c', function () {}); rej.push('ok'); } catch (x) { rej.push(x.name); } \
+         rej.join()",
+        "TypeError,TypeError,TypeError",
+    );
+}
+
+/// `history` の back / forward / go と popstate（#1177・`JS-5`・`JS-6`・`REPAIR-3`・`SEC-2`）のケース。
+///
+/// 移動は microtask で実行されるため、`__fandheRunMicrotasks()` で drain してから結果を確認する。
+fn history_traversal_cases(engine: &str) {
+    const BASE: &str = "https://example.com:8443/a/b?q=1#f";
+    let based = |engine: &str| {
+        let p = setup(engine, None);
+        p.bridge.set_location(BASE).expect("set_location");
+        let _ = p.bridge.take_diagnostics();
+        p
+    };
+
+    eprintln!("case: JS-5 history traversal moves URL and state and delivers popstate");
+    let mut p = based(engine);
+    check(
+        &mut p,
+        "var log = []; \
+         window.addEventListener('popstate', function (e) { \
+           log.push(location.pathname + ':' + (e.state && e.state.n) + ':' + (e.state === history.state) + ':' + (e instanceof PopStateEvent) + ':' + (e instanceof Event) + ':' + e.isTrusted); }); \
+         history.pushState({n: 1}, '', '/a'); history.pushState({n: 2}, '', '/b'); history.pushState({n: 3}, '', '/c'); \
+         history.back(); location.pathname",
+        "/c",
+    );
+    check(
+        &mut p,
+        "__fandheRunMicrotasks(); log.join(',') + '|' + location.pathname + '|' + history.state.n + '|' + history.length",
+        "/b:2:true:true:true:false|/b|2|4",
+    );
+    check(
+        &mut p,
+        "history.forward(); __fandheRunMicrotasks(); location.pathname + history.state.n",
+        "/c3",
+    );
+    check(
+        &mut p,
+        "history.go(-2); __fandheRunMicrotasks(); location.pathname + history.state.n + log.length",
+        "/a13",
+    );
+    check(
+        &mut p,
+        "history.go(-1); __fandheRunMicrotasks(); location.href + '|' + (history.state === null)",
+        "https://example.com:8443/a/b?q=1#f|true",
+    );
+    let diag = p.bridge.take_diagnostics().expect("diagnostics");
+    assert!(diag.location_changes_ignored.is_empty());
+
+    eprintln!("case: JS-5 history.state reflects pushState and replaceState values");
+    let mut p = based(engine);
+    check(
+        &mut p,
+        "history.replaceState({r: 1}, ''); var a = history.state.r; history.pushState({n: 1}, '', '/p'); \
+         [a, history.state.n, history.state !== null].join('|')",
+        "1|1|true",
+    );
+
+    eprintln!("case: JS-6 history public state mutation does not leak into stored state");
+    let mut p = based(engine);
+    check(
+        &mut p,
+        "history.pushState({n: 1}, '', '/a'); history.state.n = 9; history.pushState({n: 2}, '', '/b'); \
+         history.back(); __fandheRunMicrotasks(); var r = [history.state.n]; \
+         history.state.n = 7; history.forward(); __fandheRunMicrotasks(); history.back(); __fandheRunMicrotasks(); \
+         r.push(history.state.n); r.join('|')",
+        "1|1",
+    );
+
+    eprintln!("case: DOM capture stopPropagation on target skips non-capture listeners");
+    let mut p = setup(engine, None);
+    check(
+        &mut p,
+        "var t = new EventTarget(), o = []; \
+         t.addEventListener('x', function (e) { o.push('cap'); e.stopPropagation(); }, true); \
+         t.addEventListener('x', function () { o.push('bub'); }); \
+         t.dispatchEvent(new Event('x')); o.join(',')",
+        "cap",
+    );
+
+    eprintln!("case: JS-5 history out-of-range traversal and go(0)");
+    let mut p = based(engine);
+    check(
+        &mut p,
+        "var n = 0; window.addEventListener('popstate', function () { n++; }); history.pushState({k: 1}, '', '/k'); \
+         history.go(5); history.back(); history.back(); history.forward(); __fandheRunMicrotasks(); \
+         [location.pathname, history.state === null, n, history.length].join('|')",
+        "/k|false|2|2",
+    );
+    check(
+        &mut p,
+        "history.go(-9); history.go(9); __fandheRunMicrotasks(); [location.pathname, n].join('|')",
+        "/k|2",
+    );
+    let diag = p.bridge.take_diagnostics().expect("diagnostics");
+    assert!(diag.location_changes_ignored.is_empty());
+    check(&mut p, "history.go(0); history.go(); 'ok'", "ok");
+    let diag = p.bridge.take_diagnostics().expect("diagnostics");
+    let got: Vec<_> = diag
+        .location_changes_ignored
+        .iter()
+        .map(|c| (c.kind, c.value_len))
+        .collect();
+    assert_eq!(
+        got,
+        vec![
+            (LocationChangeKind::HistoryGo, 1),
+            (LocationChangeKind::HistoryGo, 1)
+        ]
+    );
+    assert!(!format!("{diag:?}").contains("example.com"));
+
+    eprintln!("case: JS-5 history pushState after back truncates forward entries");
+    let mut p = based(engine);
+    check(
+        &mut p,
+        "var n = 0; window.addEventListener('popstate', function () { n++; }); \
+         history.pushState({n: 1}, '', '/a'); history.pushState({n: 2}, '', '/b'); history.pushState({n: 3}, '', '/c'); \
+         history.back(); __fandheRunMicrotasks(); history.pushState({n: 9}, '', '/d'); \
+         var len = history.length; history.forward(); __fandheRunMicrotasks(); \
+         [len, location.pathname, history.state.n, n].join('|')",
+        "4|/d|9|1",
+    );
+    check(
+        &mut p,
+        "history.back(); __fandheRunMicrotasks(); location.pathname + history.state.n",
+        "/b2",
+    );
+
+    eprintln!("case: JS-6 history releases the public state of entries that are left");
+    let mut p = based(engine);
+    check(
+        &mut p,
+        "history.pushState({payload: {k: 1}}, '', '/a'); var old = history.state; \
+         old.payload.extra = 'mutated'; history.pushState({n: 2}, '', '/b'); \
+         history.back(); __fandheRunMicrotasks(); var back = history.state; \
+         [back !== old, back.payload.k, back.payload.extra === undefined, old.payload.extra, history.state === history.state].join('|')",
+        "true|1|true|mutated|true",
+    );
+    check(
+        &mut p,
+        "history.replaceState({r: 1}, ''); var r1 = history.state; history.forward(); __fandheRunMicrotasks(); \
+         history.back(); __fandheRunMicrotasks(); [history.state !== r1, history.state.r].join('|')",
+        "true|1",
+    );
+
+    eprintln!("case: JS-5 history cap 50 evicts the oldest entry");
+    let mut p = based(engine);
+    check(
+        &mut p,
+        "for (var i = 0; i < 60; i++) { history.pushState({i: i}, '', '/p' + i); } \
+         history.go(-50); __fandheRunMicrotasks(); var a = history.state.i; \
+         history.go(-49); __fandheRunMicrotasks(); [history.length, a, history.state.i, location.pathname].join('|')",
+        "50|59|10|/p10",
+    );
+
+    eprintln!("case: JS-6 history cumulative state budget drops the oldest entries");
+    let mut p = based(engine);
+    check(
+        &mut p,
+        "var big = 'x'.repeat(2 * 1024 * 1024 - 2); \
+         for (var i = 0; i < 5; i++) { history.pushState(big + '', '', '/s' + i); } \
+         var len = history.length; var cur = history.state.length; \
+         history.go(-3); __fandheRunMicrotasks(); var p3 = location.pathname; \
+         history.go(-1); __fandheRunMicrotasks(); \
+         [len, cur, p3, location.pathname].join('|')",
+        "4|2097150|/s1|/s1",
+    );
+
+    eprintln!("case: JS-5 history hash interplay is folded into the entry URL");
+    let mut p = based(engine);
+    check(
+        &mut p,
+        "location.hash = '#x'; history.pushState(null, '', '/c'); history.back(); __fandheRunMicrotasks(); location.href",
+        "https://example.com:8443/a/b?q=1#x",
+    );
+
+    eprintln!("case: JS-5 onpopstate order, coercion and reset");
+    let mut p = based(engine);
+    check(
+        &mut p,
+        "var o = []; window.addEventListener('popstate', function () { o.push('A'); }); \
+         window.onpopstate = function () { o.push('B:' + (this === window)); }; \
+         window.addEventListener('popstate', function () { o.push('C'); }); \
+         history.pushState(1, '', '/a'); history.back(); __fandheRunMicrotasks(); o.join('')",
+        "AB:trueC",
+    );
+    check(
+        &mut p,
+        "window.onpopstate = 5; var z = String(window.onpopstate); history.forward(); __fandheRunMicrotasks(); \
+         window.onpopstate = function () { o.push('D'); }; history.back(); __fandheRunMicrotasks(); z + '|' + o.join('')",
+        "null|AB:trueCACACD",
+    );
+    check(
+        &mut p,
+        "window.onpopstate = null; history.forward(); __fandheRunMicrotasks(); o.join('').length",
+        "15",
+    );
+    p.rt.install_dom_shim(&p.bridge).expect("reinstall");
+    check(
+        &mut p,
+        "[window.onpopstate, history.length, 'onpopstate' in window].join('|')",
+        "|1|true",
+    );
+
+    eprintln!("case: JS-5 history traversal on about:blank moves state only");
+    let mut b = setup(engine, None);
+    check(
+        &mut b,
+        "var n = []; window.onpopstate = function (e) { n.push(e.state && e.state.z); }; \
+         history.pushState({z: 1}, ''); history.pushState({z: 2}, ''); history.back(); __fandheRunMicrotasks(); \
+         [location.href, history.state.z, n.join(), history.length].join('|')",
+        "about:blank|1|1|3",
+    );
+
+    eprintln!("case: JS-5 PopStateEvent constructor");
+    check(
+        &mut b,
+        "var pe = new PopStateEvent('popstate', { state: { q: 1 }, bubbles: true }); \
+         var d = []; try { PopStateEvent('x'); } catch (x) { d.push(x instanceof TypeError); } \
+         [pe.state.q, pe.type, pe.bubbles, pe instanceof Event, Object.prototype.toString.call(pe), \
+          new PopStateEvent('popstate').state === null, d.join()].join('|')",
+        "1|popstate|true|true|[object PopStateEvent]|true|true",
+    );
+    check(
+        &mut b,
+        "var t = []; try { new PopStateEvent(); } catch (x) { t.push(x instanceof TypeError); } \
+         var u = []; window.onpopstate = function (e) { u.push(String(e.state)); }; \
+         history.pushState(undefined, ''); history.pushState(1, ''); history.back(); __fandheRunMicrotasks(); \
+         t.join() + '|' + u.join() + '|' + String(history.state)",
+        "true|undefined|undefined",
     );
 }

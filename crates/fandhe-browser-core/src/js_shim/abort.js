@@ -25,8 +25,10 @@
 // - 文言は固定の英文で、入力（reason・URL）を反響しない。ES2015 の範囲に留める（V8 と boa で同一ソース）。
 //
 // 未実装（REPAIR-3。黙って成功扱いにはしない）:
-// - 汎用の `EventTarget` / `Event` / `dispatchEvent` は定義しない（`typeof` は 'undefined' のまま。機能検出で
-//   対応を装わない。SEC-2）。AbortSignal は `abort` イベントだけを自前で配る。将来仕様: 汎用 EventTarget（JS-5）。
+// - 汎用の `EventTarget` / `Event` は events.js（#1177）にあるが、AbortSignal はそれを継承せず、`abort` イベントだけを
+//   自前のリスナー保持で配る（`instanceof EventTarget` は false・`dispatchEvent` も無い。中途半端な継承で保持先が割れるのを
+//   避けるため。`window.dispatchEvent(new Event('abort'))` でもシグナルのリスナーは呼ばれない）。
+//   将来仕様: AbortSignal を EventTarget へ統合する（JS-5）。
 // - `onabort` はリスナー一覧の設定位置ではなく最初に呼ぶ。addEventListener の `signal` / `passive` / capture は無視する。
 // - `DOMException` は最小実装（`stack` なし、旧来の code 定数は主要なもの）。既存のブリッジエラーの DOMException
 //   への写像は未実装。

@@ -74,7 +74,7 @@
 //!   非可逆変換のみ）。module の応答は JavaScript MIME type を必須とする点が非対称（#1116）。
 //! - `src` 取得全体の時間予算（現状は Fetcher のタイムアウト × 件数。`page_wall_time` は
 //!   JS 実行だけを対象とする）。
-//! - 要素レベルの EventTarget・`onload` / `onreadystatechange` プロパティ・
+//! - 要素レベルの `dispatchEvent`・木に沿った伝播・`onload` / `onreadystatechange` プロパティ・
 //!   キャプチャ / 完全なバブリング、`async` / `defer` の順序近似（全て文書順で実行する）。
 //! - 上限値の設定ファイルからの読み込みは未対応（専用スレッド化は [`crate::page_actor`] で実装済み）。
 //! - 保留中タイマーの要約（[`EventLoopReport::pending_timers`]）は期限順の先頭

@@ -53,9 +53,10 @@
 //!
 //! # 未実装（REPAIR-3）
 //!
-//! - `hashchange` / `popstate` イベントの発火、`location` 代入による実際の遷移、
-//!   `history.back` / `forward` / `go` によるページ内履歴の移動は未実装（後続 issue。
-//!   汎用の `EventTarget` / `dispatchEvent` が前提）。
+//! - `hashchange` イベントの発火と `location` 代入による実際の遷移は未実装（後続 issue）。
+//!   `history.back` / `forward` / `go` によるページ内履歴の移動と `popstate` の配送は shim 内で
+//!   実装済み（#1177・`JS-5`。取得・遷移はしない）。`go(0)`（再読み込み）と、移動を実行できなかった
+//!   場合だけが `ignoreLocationChange` で診断に残る。
 //! - #771 のスパイクで判明する追加操作（`parentNode` 等）は後続 issue で足す。
 
 use std::sync::{Arc, Mutex, MutexGuard};
