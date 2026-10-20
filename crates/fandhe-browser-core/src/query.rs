@@ -126,8 +126,8 @@ use crate::dom::{Document, NodeId, QuirksMode};
 use crate::error::{Error, Result};
 use crate::observability::OperationKind;
 use crate::selector::{
-    AttributeMatcher, Combinator, ComplexSelector, CompoundSelector, SelectorList, SimpleSelector,
-    html_local_name_eq, parse_selector_list,
+    AttributeMatcher, Combinator, ComplexSelector, CompoundSelector, PseudoClass, SelectorList,
+    SimpleSelector, html_local_name_eq, parse_selector_list,
 };
 
 /// `MatchCache`（`chain`・`ancestor` 合計）が保持できるエントリ数の実効上限。
@@ -181,6 +181,13 @@ fn simple_matches(document: &Document, element: NodeId, simple: &SimpleSelector)
             .class_names(element)
             .any(|actual| id_or_class_eq(document, actual, value)),
         SimpleSelector::Attribute(attr) => match_attribute(document, element, attr),
+        SimpleSelector::PseudoClass(pseudo) => match pseudo {
+            // `:not(list)`: 引数のどの複合セレクタにも一致しない。再帰の深さは
+            // パース時の MAX_PSEUDO_NESTING_DEPTH で抑えられ、文書の深さに依存しない。
+            PseudoClass::Not(args) => !args
+                .iter()
+                .any(|compound| compound_matches(document, element, compound)),
+        },
         // `SimpleSelector` は `#[non_exhaustive]`（selector.rs）だが、本
         // モジュールは crate 内でその全 variant を網羅する義務を負う
         // （coding-rust.md: crate 内の match はワイルドカード腕なしで書き、
