@@ -126,8 +126,10 @@
 
     // 内部エントリ（onpopstate 用）は件数上限の対象外で 1 件だけ足す。
     function addInternal(target, type, fn) {
-        target.items[target.count] = { type: type, listener: fn, capture: false, once: false, passive: false };
+        var entry = { type: type, listener: fn, capture: false, once: false, passive: false };
+        target.items[target.count] = entry;
         target.count += 1;
+        return entry;
     }
 
     function removeEntry(target, entry) {
@@ -456,11 +458,21 @@
     popstateAccessor.get = function () {
         return popstateHandler;
     };
+    var popstateEntry = null;
     popstateAccessor.set = function (v) {
         popstateHandler = typeof v === 'function' ? v : null;
-        if (popstateHandler !== null && !popstateRegistered) {
+        if (popstateHandler === null) {
+            // 解除時は内部エントリも外し、再設定時に末尾へ追加し直す（HTML 仕様のハンドラ登録位置）。
+            if (popstateRegistered) {
+                removeEntry(windowTarget, popstateEntry);
+                popstateEntry = null;
+                popstateRegistered = false;
+            }
+            return;
+        }
+        if (!popstateRegistered) {
             popstateRegistered = true;
-            addInternal(windowTarget, 'popstate', function (e) {
+            popstateEntry = addInternal(windowTarget, 'popstate', function (e) {
                 var h = popstateHandler;
                 if (typeof h === 'function') {
                     fnCall(h, global, e);

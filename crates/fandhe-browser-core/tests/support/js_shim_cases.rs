@@ -2753,7 +2753,7 @@ fn history_traversal_cases(engine: &str) {
         &mut p,
         "window.onpopstate = 5; var z = String(window.onpopstate); history.forward(); __fandheRunMicrotasks(); \
          window.onpopstate = function () { o.push('D'); }; history.back(); __fandheRunMicrotasks(); z + '|' + o.join('')",
-        "null|AB:trueCACADC",
+        "null|AB:trueCACACD",
     );
     check(
         &mut p,
@@ -2785,5 +2785,13 @@ fn history_traversal_cases(engine: &str) {
          [pe.state.q, pe.type, pe.bubbles, pe instanceof Event, Object.prototype.toString.call(pe), \
           new PopStateEvent('popstate').state === null, d.join()].join('|')",
         "1|popstate|true|true|[object PopStateEvent]|true|true",
+    );
+    check(
+        &mut b,
+        "var t = []; try { new PopStateEvent(); } catch (x) { t.push(x instanceof TypeError); } \
+         var u = []; window.onpopstate = function (e) { u.push(String(e.state)); }; \
+         history.pushState(undefined, ''); history.pushState(1, ''); history.back(); __fandheRunMicrotasks(); \
+         t.join() + '|' + u.join() + '|' + String(history.state)",
+        "true|undefined|undefined",
     );
 }

@@ -292,10 +292,9 @@
     defineMethod('clearInterval', function clearInterval(id) {
         clearTimer(id);
     });
-    defineMethod('queueMicrotask', function queueMicrotask(callback) {
-        if (typeof callback !== 'function') {
-            throw new TypeError('queueMicrotask: callback must be a function');
-        }
+    // 積めたら true、保留件数の上限で破棄したら false を返す内部窓口（history.js が登録成否を確認するために使う。
+    // 公開の queueMicrotask は仕様どおり undefined を返す）。
+    function tryEnqueueMicrotask(callback) {
         if (tail - head >= MAX_PENDING_MICROTASKS) {
             if (!microtaskLimitNotified) {
                 try {
@@ -305,11 +304,25 @@
                     // 通知に失敗しても破棄は維持する。
                 }
             }
-            return;
+            return false;
         }
         queue[tail] = callback;
         tail += 1;
+        return true;
+    }
+    var queueMicrotaskImpl = function queueMicrotask(callback) {
+        if (typeof callback !== 'function') {
+            throw new TypeError('queueMicrotask: callback must be a function');
+        }
+        tryEnqueueMicrotask(callback);
+    };
+    defineProperty(queueMicrotaskImpl, '__fandheTry', {
+        value: tryEnqueueMicrotask,
+        writable: false,
+        configurable: false,
+        enumerable: false
     });
+    defineMethod('queueMicrotask', queueMicrotaskImpl);
 
     // 固定の窓口関数は初回だけ定義し、実体は再 install のたびに差し替える（events.js と同じ作法）。
     function defineDispatcher(name, impl) {

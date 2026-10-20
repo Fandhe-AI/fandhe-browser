@@ -51,6 +51,8 @@
     var NativeEvent = global.Event;
     var nativeDispatchEvent = global.dispatchEvent;
     var nativeQueueMicrotask = global.queueMicrotask;
+    // timers.js の登録成否を返す内部窓口（install 時に捕捉。無ければ公開の queueMicrotask で成否不明のまま積む）。
+    var nativeTryQueue = typeof nativeQueueMicrotask === 'function' ? nativeQueueMicrotask.__fandheTry : undefined;
     if (typeof NativeEvent !== 'function' || typeof nativeDispatchEvent !== 'function') {
         throw new TypeError('events.js must be evaluated before history.js');
     }
@@ -334,7 +336,10 @@
         }
         st.index = target;
         try {
-            fnCall(nativeDispatchEvent, global, new PopStateEvent('popstate', { state: dest.state }));
+            var ev = new PopStateEvent('popstate', { state: dest.state });
+            // 公開コンストラクターは undefined を null に写すが、traversal では history.state と一致させる。
+            wmSet(popStates, ev, dest.state);
+            fnCall(nativeDispatchEvent, global, ev);
         } catch (e) {
             // 配送の失敗は移動の結果に影響させない（リスナー例外は dispatchEvent が報告する）。
         }
@@ -343,15 +348,18 @@
     // 移動を非同期に積む。積めなかったときは移動せず、診断に記録する（黙って成功扱いにしない）。
     function schedule(st, delta, kind, value) {
         var queued = false;
-        if (typeof nativeQueueMicrotask === 'function') {
-            try {
-                nativeQueueMicrotask(function () {
-                    traverse(st, delta, kind, value);
-                });
+        var task = function () {
+            traverse(st, delta, kind, value);
+        };
+        try {
+            if (typeof nativeTryQueue === 'function') {
+                queued = nativeTryQueue(task) === true;
+            } else if (typeof nativeQueueMicrotask === 'function') {
+                nativeQueueMicrotask(task);
                 queued = true;
-            } catch (e) {
-                queued = false;
             }
+        } catch (e) {
+            queued = false;
         }
         if (!queued) {
             callOp('ignoreLocationChange', kind, value);
@@ -382,6 +390,9 @@
     function PopStateEvent(type, init) {
         if (!(this instanceof PopStateEvent)) {
             throw new NativeTypeError("Failed to construct 'PopStateEvent': Please use the 'new' operator");
+        }
+        if (arguments.length < 1) {
+            throw new NativeTypeError("Failed to construct 'PopStateEvent': 1 argument required, but only 0 present.");
         }
         fnCall(NativeEvent, this, type, init);
         var s = null;
