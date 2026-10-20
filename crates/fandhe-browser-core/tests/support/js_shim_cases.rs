@@ -2496,6 +2496,23 @@ fn event_target_cases(engine: &str) {
         "function|function|function",
     );
 
+    eprintln!(
+        "case: JS-5 EventTarget converts type to DOMString and rejects invalid receivers (#1177)"
+    );
+    check(
+        &mut p,
+        "var tc = new EventTarget(); var nc = 0; function fc() { nc++; } \
+         tc.addEventListener(123, fc); tc.dispatchEvent(new Event(123)); \
+         tc.removeEventListener(123, fc); tc.dispatchEvent(new Event('123')); \
+         var sym = ''; try { tc.addEventListener(Symbol('s'), fc); } catch (e) { sym = e.name; } \
+         var bad = []; \
+         ['dispatchEvent', 'addEventListener', 'removeEventListener'].forEach(function (m) { \
+           try { EventTarget.prototype[m].call({}, m === 'dispatchEvent' ? new Event('x') : 'x', function () {}); bad.push('ok'); } \
+           catch (e) { bad.push(e.name); } }); \
+         [nc, sym, bad.join(',')].join('|')",
+        "1|TypeError|TypeError,TypeError,TypeError",
+    );
+
     eprintln!("case: JS-5 EventTarget basics (dedupe, capture order, once, handleEvent)");
     check(
         &mut p,

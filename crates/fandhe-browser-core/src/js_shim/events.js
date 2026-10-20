@@ -195,6 +195,17 @@
         if (fnCall(weakHas, objectTargets, obj)) {
             return fnCall(weakGet, objectTargets, obj);
         }
+        // brand check: EventTarget のコンストラクターで初期化済みの対象（上の objectTargets）か、
+        // 明示的に対応する Node だけを受け付ける。それ以外のレシーバーは拒否する。
+        var isNode = false;
+        try {
+            isNode = typeof global.Node === 'function' && obj instanceof global.Node;
+        } catch (e) {
+            isNode = false;
+        }
+        if (!isNode) {
+            throw new NativeTypeError('Illegal invocation');
+        }
         if (!create) {
             return null;
         }
@@ -203,13 +214,22 @@
         return rec;
     }
 
+    // type を DOMString へ変換する（Event コンストラクターと同じ規則。Symbol は TypeError）。
+    function toTypeString(type) {
+        if (typeof type === 'symbol') {
+            throw new NativeTypeError('Cannot convert a Symbol value to a string');
+        }
+        return strCtor(type);
+    }
     function addEventListenerImpl(self, type, listener, options) {
-        add(recordFor(self, true), type, listener, options);
+        var rec = recordFor(self, true);
+        add(rec, toTypeString(type), listener, options);
     }
     function removeEventListenerImpl(self, type, listener, options) {
         var rec = recordFor(self, false);
+        var t = toTypeString(type);
         if (rec !== null) {
-            remove(rec, type, listener, options);
+            remove(rec, t, listener, options);
         }
     }
 
@@ -423,6 +443,8 @@
         if (!(this instanceof EventTarget)) {
             throw new NativeTypeError("Failed to construct 'EventTarget': Please use the 'new' operator");
         }
+        // 初期化済みの対象として保持先を作る（brand check の根拠）。
+        fnCall(weakSet, objectTargets, this, newTarget());
     }
     defineMethod(EventTarget.prototype, 'addEventListener', function addEventListener(type, listener, options) {
         addEventListenerImpl(this, type, listener, options);
@@ -442,10 +464,10 @@
     // window / document は own メソッド（EventTarget は継承しない。REPAIR-3）。
     function installTarget(obj) {
         defineMethod(obj, 'addEventListener', function addEventListener(type, listener, options) {
-            add(recordFor(obj, true), type, listener, options);
+            add(recordFor(obj, true), toTypeString(type), listener, options);
         });
         defineMethod(obj, 'removeEventListener', function removeEventListener(type, listener, options) {
-            remove(recordFor(obj, true), type, listener, options);
+            remove(recordFor(obj, true), toTypeString(type), listener, options);
         });
         defineMethod(obj, 'dispatchEvent', function dispatchEvent(event) {
             return dispatchEventImpl(obj, event, arguments.length);
