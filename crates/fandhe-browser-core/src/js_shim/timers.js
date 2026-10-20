@@ -153,6 +153,19 @@
             if (typeof stack !== 'string') {
                 return;
             }
+            // shim 自身のフレーム（noteOrigin・schedule・setTimeout/setInterval の 3 つ。V8 形式の
+            // `    at ` 行）を先頭から除き、先頭がページ側の呼び出し位置になるようにする。
+            // `at ` 行が 4 本未満（boa 等の非 V8 形式）なら加工しない。
+            var lines = stack.split('\n');
+            var frames = [];
+            for (var li = 0; li < lines.length; li++) {
+                if (lines[li].indexOf('    at ') === 0) {
+                    frames.push(lines[li]);
+                }
+            }
+            if (frames.length > 3) {
+                stack = frames.slice(3).join('\n');
+            }
             stack = stack.slice(0, 1024);
             var last = stack.charCodeAt(stack.length - 1);
             if (last >= 0xd800 && last <= 0xdbff) {

@@ -484,6 +484,21 @@ fn timer_cases(engine: &str) {
     assert!(origin.is_none_or(|s| s.len() <= 1024), "{origin:?}");
     // Debug には本文を出さない。
     assert!(!format!("{:?}", pending[0]).contains("setTimeout"));
+    // V8 形式では shim 自身のフレームを除き、先頭がページ側の呼び出し位置になる（Codex 指摘）。
+    let out = run_page(
+        engine,
+        &page("function pageCaller(){setTimeout(function(){},60000);}pageCaller();"),
+        &retain,
+    );
+    let pending = out.event_loop().pending_timers();
+    assert_eq!(pending.len(), 1, "{pending:?}");
+    if let Some(origin) = pending[0].raw_origin().filter(|s| s.contains("    at ")) {
+        let first = origin.lines().next().unwrap_or_default();
+        assert!(first.contains("pageCaller"), "{origin:?}");
+        for shim in ["noteOrigin", "schedule", "setTimeout"] {
+            assert!(!origin.contains(shim), "{shim}: {origin:?}");
+        }
+    }
 
     eprintln!("case: JS-6 page cannot invoke the timer dispatcher directly to bypass limits");
     let out = run_page(
