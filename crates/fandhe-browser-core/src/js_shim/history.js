@@ -228,7 +228,7 @@
     }
 
     function newEntry(url, copy, pub) {
-        return { url: url, state: copy.value, pub: pub, units: copy.units, nodes: copy.nodes };
+        return { url: url, state: copy.value, pub: pub, live: true, units: copy.units, nodes: copy.nodes };
     }
 
     // 件数上限と累計予算を満たすまで、現在のエントリ以外を古い順（なければ末尾側）に捨てる（JS-6）。
@@ -295,6 +295,9 @@
             if (prevHref !== null) {
                 cur.url = prevHref;
             }
+            // 離れるエントリの公開コピーは解放する（非アクティブなエントリに可変オブジェクトを残さない。JS-6）。
+            cur.pub = null;
+            cur.live = false;
             // 前方のエントリを捨てて末尾に足す。
             for (var i = st.index + 1; i < st.count; i++) {
                 delete st.entries[i];
@@ -306,6 +309,7 @@
         } else {
             cur.state = copy.value;
             cur.pub = pubCopy;
+            cur.live = true;
             cur.units = copy.units;
             cur.nodes = copy.nodes;
             if (urlChanged && newHref !== null) {
@@ -351,8 +355,12 @@
             return;
         }
         st.index = target;
-        // 移動先の公開 state は保存状態から作り直す（以前に公開した可変オブジェクトの変更を持ち込まない）。
+        // 離れるエントリの公開コピーは解放し、移動先の公開 state は保存状態から作り直す
+        // （以前に公開した可変オブジェクトの変更を持ち込まない。非アクティブなエントリに保持しない。JS-6）。
+        cur.pub = null;
+        cur.live = false;
         dest.pub = pub;
+        dest.live = true;
         try {
             var ev = new PopStateEvent('popstate', { state: dest.pub });
             // 公開コンストラクターは undefined を null に写すが、traversal では history.state と一致させる。
@@ -455,7 +463,13 @@
     defineProperty(History.prototype, 'state', {
         get: function () {
             var st = stateOf(this);
-            return st.entries[st.index].pub;
+            var e = st.entries[st.index];
+            if (!e.live) {
+                // 通常は到達しない（現在のエントリは常に公開コピーを持つ）。保存状態から再生成する。
+                e.pub = publicState(e.state, 'state');
+                e.live = true;
+            }
+            return e.pub;
         },
         configurable: true,
         enumerable: true
@@ -481,7 +495,7 @@
 
     var inst = Object.create(History.prototype);
     var initialEntries = createObject(null);
-    initialEntries[0] = { url: null, state: null, pub: null, units: 0, nodes: 0 };
+    initialEntries[0] = { url: null, state: null, pub: null, live: true, units: 0, nodes: 0 };
     wmSet(states, inst, { entries: initialEntries, count: 1, index: 0, scrollRestoration: 'auto' });
     defineProperty(global, 'history', {
         get: function () {

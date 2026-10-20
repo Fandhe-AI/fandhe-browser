@@ -2749,6 +2749,23 @@ fn history_traversal_cases(engine: &str) {
         "/b2",
     );
 
+    eprintln!("case: JS-6 history releases the public state of entries that are left");
+    let mut p = based(engine);
+    check(
+        &mut p,
+        "history.pushState({payload: {k: 1}}, '', '/a'); var old = history.state; \
+         old.payload.extra = 'mutated'; history.pushState({n: 2}, '', '/b'); \
+         history.back(); __fandheRunMicrotasks(); var back = history.state; \
+         [back !== old, back.payload.k, back.payload.extra === undefined, old.payload.extra, history.state === history.state].join('|')",
+        "true|1|true|mutated|true",
+    );
+    check(
+        &mut p,
+        "history.replaceState({r: 1}, ''); var r1 = history.state; history.forward(); __fandheRunMicrotasks(); \
+         history.back(); __fandheRunMicrotasks(); [history.state !== r1, history.state.r].join('|')",
+        "true|1",
+    );
+
     eprintln!("case: JS-5 history cap 50 evicts the oldest entry");
     let mut p = based(engine);
     check(
