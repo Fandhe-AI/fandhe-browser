@@ -2281,6 +2281,36 @@ fn history_cases(engine: &str) {
         "診断に URL 本文が残る"
     );
 
+    eprintln!(
+        "case: JS-6 history rejects over-long URLs with SecurityError before the bridge limit (#1175)"
+    );
+    for (label, url_expr) in [
+        ("over 64KiB", "'/' + 'a'.repeat(64 * 1024 + 1)"),
+        ("just over 8192 units", "'/' + 'a'.repeat(8192)"),
+        (
+            "multibyte within unit limit",
+            "'/' + '\\u3042'.repeat(8191)",
+        ),
+    ] {
+        for method in ["pushState", "replaceState"] {
+            check(
+                &mut p,
+                &format!(
+                    "var r; try {{ history.{method}({{k: 2}}, '', {url_expr}); r = 'no-throw'; }} catch (e) {{ \
+                     r = (e instanceof DOMException) + ',' + e.name + ',' + e.code; }} \
+                     [r, location.pathname, history.state.k, history.length].join('|')"
+                ),
+                "true,SecurityError,18|/keep|1|50",
+            );
+            eprintln!("  rejected: {label} via {method}");
+        }
+    }
+    let diag = p.bridge.take_diagnostics().expect("diagnostics");
+    assert!(
+        !format!("{diag:?}").contains("aaaaaaaaaaaaaaaa"),
+        "診断に長大な URL 本文が残る"
+    );
+
     eprintln!("case: JS-5 history omitted or null URL updates only state");
     check(
         &mut p,
