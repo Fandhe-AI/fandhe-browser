@@ -271,3 +271,16 @@ fn plug4_refused_host_port_is_outside_ephemeral_range() {
         "port {port} was reassigned to a :0 bind"
     );
 }
+
+/// PLUG-4・Issue #1187: 選んだポートは wildcard に影が無く、閉じた後の接続は ConnectionRefused になる。
+#[test]
+fn plug4_refused_host_port_has_no_wildcard_shadow() {
+    let listener = common::bind_non_ephemeral_loopback();
+    let addr = listener.local_addr().expect("addr");
+    drop(listener);
+    let wildcard = TcpListener::bind(("0.0.0.0", addr.port())).expect("wildcard bind");
+    drop(wildcard);
+    let err = std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_secs(2))
+        .expect_err("closed port must refuse");
+    assert_eq!(err.kind(), std::io::ErrorKind::ConnectionRefused);
+}
