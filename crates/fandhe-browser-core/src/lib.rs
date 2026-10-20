@@ -170,9 +170,9 @@ pub use page_runner::{
     DynamicImportFailureKind, DynamicImportReport, EventLoopReport, ExceptionKind,
     ExceptionMessageClass, ExceptionSummary, LifecycleEvent, LifecycleEventRecord,
     LifecycleOutcome, MAX_MODULE_GRAPH_DEPTH, MAX_PAGE_DYNAMIC_IMPORTS,
-    MAX_SCRIPT_ERROR_MESSAGE_BYTES, PageAbort, PageRunInput, PageRunOptions, PageRunOutput,
-    ScriptBytesScope, ScriptOutcome, ScriptRunRecord, SrcFetchErrorKind, WallTimeScope,
-    page_script_fetch_options, run_page_scripts,
+    MAX_REPORTED_PENDING_TIMERS, MAX_SCRIPT_ERROR_MESSAGE_BYTES, PageAbort, PageRunInput,
+    PageRunOptions, PageRunOutput, PendingTimer, ScriptBytesScope, ScriptOutcome, ScriptRunRecord,
+    SrcFetchErrorKind, WallTimeScope, page_script_fetch_options, run_page_scripts,
 };
 pub use page_script::{
     CollectedScripts, DEFAULT_MAX_INLINE_SCRIPT_BYTES, DEFAULT_MAX_PAGE_SCRIPTS,

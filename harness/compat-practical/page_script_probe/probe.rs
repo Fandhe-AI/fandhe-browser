@@ -132,6 +132,13 @@ pub fn debug_stderr_line(enabled: bool, label: &str, raw: Option<&str>) -> Optio
     Some(format!("[{label}] {body}"))
 }
 
+/// 数値の列を JSON 配列の文字列にする純関数（保留中タイマーの遅延・期限。数値だけで本文・URL は含まない。
+/// Issue #1176・`REPAIR-4`）。
+pub fn number_array(values: &[u64]) -> String {
+    let items: Vec<String> = values.iter().map(u64::to_string).collect();
+    format!("[{}]", items.join(","))
+}
+
 /// `error.stack` から先頭フレーム（`url:line:col`）を取り出す純関数（Issue #1168・`REPAIR-3`）。
 ///
 /// V8 形式（`    at fn (url:line:col)` / `    at url:line:col`）の最初の `at ` 行だけを扱う。
@@ -359,6 +366,28 @@ mod tests {
         assert!(!line.contains('\u{202E}'));
         let body = line.trim_start_matches("[d2#0 module_evaluation] ");
         assert_eq!(body.chars().count(), 300 - 1);
+    }
+
+    /// #1176: 数値配列は JSON 形式で、空配列も出す。保留中タイマーの行は debug 無効時に出ない。
+    #[test]
+    fn number_array_is_json_and_pending_line_is_gated() {
+        assert_eq!(number_array(&[]), "[]");
+        assert_eq!(number_array(&[60000, 5]), "[60000,5]");
+        assert_eq!(
+            debug_stderr_line(
+                false,
+                "d2 pending_timer#0 frame",
+                Some("https://h/a.js:1:2")
+            ),
+            None
+        );
+        let line = debug_stderr_line(
+            true,
+            "d2 pending_timer#0 frame",
+            top_stack_frame("Error\n    at f (https://h/a.js:1:2)"),
+        )
+        .expect("some");
+        assert_eq!(line, "[d2 pending_timer#0 frame] https://h/a.js:1:2");
     }
 
     /// #1119: `--modules` と `--selector` を受け付ける。

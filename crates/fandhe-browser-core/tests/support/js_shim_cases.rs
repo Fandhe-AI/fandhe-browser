@@ -125,6 +125,28 @@ pub fn run(engine: &str) {
     check(&mut p, "document.defaultView === window", "true");
     check(&mut p, "typeof document.defaultView.history", "object");
 
+    eprintln!(
+        "case: JS-5 name and type reflect to attributes so react-dom 19 inputs keep them (#1176)"
+    );
+    let mut p = setup(engine, None);
+    check(
+        &mut p,
+        "var i = document.createElement('input'); i.type = 'text'; i.name = 'user'; \
+         i.getAttribute('type') + '|' + i.getAttribute('name') + '|' + i.name + '|' + i.type",
+        "text|user|user|text",
+    );
+    check(
+        &mut p,
+        "document.createElement('input').name === '' && document.createElement('input').type === ''",
+        "true",
+    );
+    check(
+        &mut p,
+        "var j = document.createElement('input'); j.setAttribute('name', 'q'); \
+         document.body.appendChild(j); document.querySelectorAll('input[name]').length",
+        "1",
+    );
+
     eprintln!("case: JS-5 HTMLIFrameElement exists so instanceof does not throw (#1168)");
     let mut p = setup(engine, None);
     check(&mut p, "typeof HTMLIFrameElement", "function");

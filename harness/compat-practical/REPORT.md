@@ -775,7 +775,7 @@ spec 対応: TASK-71・TASK-108 / MS-6 / `COMPAT-1`・`JS-5`・`JS-6`・`MEAS-4`
 
 ### 次の対応
 
-1. d2: 描画されない原因の調査。`virtual_time` で打ち切られ未発火のタイマーが 1 件残る点と、`console.error` 1 件の内容（本測定では記録していない）が手掛かり。別 issue で追跡する（切り出し候補）
+1. d2: 描画されない原因の調査。`virtual_time` で打ち切られ未発火のタイマーが 1 件残る点と、`console.error` 1 件の内容（本測定では記録していない）が手掛かり。別 issue で追跡する（切り出し候補）（済み: #1176。下の節を参照）
 2. d3: 描画されない原因の調査（#1168 の次の対応 1 のまま。別 issue で追跡する切り出し候補）
 3. `back`・`forward`・`go` による実際のページ内履歴の移動と `popstate` の配送（汎用の `EventTarget` が前提。別 issue の切り出し候補）
 
@@ -831,7 +831,7 @@ spec 対応: TASK-71・TASK-108 / MS-6 / `JS-4`・`JS-7`・`JS-8`・`MEAS-4`・`
 ### 次の対応
 
 1. d2・d3: `console.error` 1 件の内容の記録。現在の probe は件数しか出さず、描画が進まない手掛かりが残っている（別 issue の切り出し候補）（済み: #1173。下の節を参照）
-2. d2: `virtual_time` で打ち切られる未発火タイマー 1 件の原因調査（#1171 の次の対応 1 のまま。別 issue の切り出し候補）
+2. d2: `virtual_time` で打ち切られる未発火タイマー 1 件の原因調査（#1171 の次の対応 1 のまま。別 issue の切り出し候補）（済み: #1176。下の節を参照）
 3. d3: 描画されない原因の調査（#1171 の次の対応 2 のまま。別 issue の切り出し候補）（一部済み: #1173。下の節を参照）
 
 ### 制約
@@ -900,6 +900,69 @@ spec 対応: TASK-71・TASK-108 / MS-6 / `COMPAT-1`・`JS-5`・`MEAS-4`・`REPAI
 cargo build --release -p fandhe-browser-core --features js-v8 --example compat_page_script_probe
 target/release/examples/compat_page_script_probe --target d3=https://demoqa.com/automation-practice-form --modules --selector form --debug-raw-exception --out /abs/path/d3.jsonl 2>&1 >/dev/null | grep console_error
 jq -c 'select(.type=="run") | {abort, html_bytes_after, selector_after, console_error: .bridge.console_error}' /abs/path/d3.jsonl
+```
+
+## 保留タイマーの診断追加と d2・d3 の再測定（#1176）
+
+spec 対応: TASK-71・TASK-108 / MS-6 / `COMPAT-1`・`JS-6`・`JS-7`・`MEAS-4`・`REPAIR-3`・`REPAIR-4`・`SEC-2`。
+前節（#1173）の時点で d2 は `console.error` 0 件・`form` 1 件になっていた。残っていたのは、(1) `abort=virtual_time` の原因である未発火タイマー 1 件の正体、(2) 22 タスクの判定（`run_core.sh`。名前付きフィールドが 1 件以上）で d2 が成功するか、の 2 点。保留タイマーの遅延と登録元を観測できるようにしたうえで、d2・d3 を再測定した。出力はコミットしていない。
+
+### 実装の要点
+
+- core: 終了時に残った保留中タイマーを `EventLoopReport::pending_timers()`（期限順の先頭 16 件。遅延・期限・interval か）で返す。登録元の stack は `with_retain_raw_exception_messages(true)` のときだけ shim が捕捉し（`timerOriginCapture`・`timerOrigin` op。1024 バイトで切り詰め・保持 64 件まで）、`Debug` には長さしか出さない。opt-in が無い既定経路では捕捉も保持もしない（二重の fail-closed。`SEC-2`）
+- probe: JSONL の `event_loop` に `pending_delays_ms`・`pending_due_ms`（数値の配列）を足した。`--debug-raw-exception` のときだけ、stderr に `[<id> pending_timer#<n>] delay=.. due=.. repeat=..` と先頭フレーム（`... frame`）を出す
+- 不足の特定と補完（`dom.js`）: d2 の入力欄 3 件に `name` 属性が付かないことが `form` 判定の失敗原因だった。`input[id]` は 3 件・`input[name]`・`input[type]` は 0 件で、react-dom 19 は `node.name = ..`・`node.type = ..` とプロパティで代入するのに、shim に属性への反映が無かったため（推定は反映の追加後に `input[name]` が 3 件になったことで裏付けた）。`Element.prototype` に `name` と `type` の反映（getter は属性値か空文字、setter は `setAttribute`）を足した。簡略版（`REPAIR-3`）で、要素の種別を知る op が無いため全要素に定義し、`type` の既定値（input の `text`）や列挙値の正規化はしない
+- 新しい依存・`unsafe` の追加は無い。window に新しいグローバルは足していない。V8・boa 共通ケースで検証した
+
+### 測定条件
+
+| 項目 | 値 |
+| ---- | -- |
+| 実施日時（UTC） | 2026-10-20 |
+| OS | Linux |
+| ベース | main `8de395b4` に、本変更を加えたもの |
+| 設定 | probe は `--modules`・V8・`--selector form`・`--debug-raw-exception`。`run_core.sh` は d2 だけの tasks で `--page-js v8 --page-modules`。実行上限は既定のまま |
+
+### 結果
+
+| id | 段階 | `abort` | `fired` / `pending_at_end` | 保留タイマー（遅延・期限・interval） | `console_error` | HTML バイト | `form`（probe） |
+| -- | ---- | ------- | -------------------------- | ------------------------------------ | --------------- | ----------- | --------------- |
+| d2 | `name`・`type` 反映前 | `virtual_time` | 2 / 1 | 1,800,000ms・1,800,000ms・true | 0 件 | 2618 | 1 件 |
+| d2 | 反映後 | `virtual_time` | 2 / 1 | 同上 | 0 件 | 2713 | 1 件 |
+| d3 | 反映後 | なし | 1 / 0 | なし | 1 件（null の `registered` 読み取り） | 437 | 0 件 |
+
+| id | 経路 | 段階 | `success` | 理由・件数 |
+| -- | ---- | ---- | --------- | ---------- |
+| d2 | `run_core.sh`（d2 単体） | 反映前 | false | `empty_result`・名前付きフィールド 0 件 |
+| d2 | `run_core.sh`（d2 単体） | 反映後 | true | 名前付きフィールド 3 件 |
+
+- **未発火タイマーは 30 分周期の interval（1,800,000ms）**。仮想時間の上限（30 秒）より遥かに後に期限を持つ定期処理（セッション維持・計測の類と推定）で、描画には関係しない。先頭フレームは `<anonymous>` の行（inline の評価コード）で、識別子名までは特定していない。`DEFAULT_MAX_VIRTUAL_TIME` は変えない（`JS-6` の上限。再評価は TASK-113・オーナー判断）。DOM は打ち切り後も採用されるため、`abort=virtual_time` は d2 の失敗原因ではない
+- **d2 の 22 タスク経路での失敗原因は `name` / `type` の反映の欠落**で、補完後に d2 単体で `success:true` になった
+- d3 は変化なし。次の不足は #1173 の次の対応 1 のまま
+- 22 タスクの通し実行・コミット済み結果と `matrix.json` の更新はしていない（#919・#920 の担当）。冒頭の「結論」は書き換えていない
+
+### 次の対応
+
+1. 22 タスクの通し実行と `matrix.json` の更新、回帰ゲートの有効化（#919・#920）。d2 は単体で解消を確認済み
+2. d3: `console.error` の次の不足（null の `registered` 読み取り）の特定（#1173 の次の対応 1 のまま）
+3. IDL 属性の反映の拡張（`value`・`checked`・`id`・`className` 等と、種別ごとの既定値。`REPAIR-3`。別 issue の切り出し候補）
+4. 仮想時間の上限（30 秒）の見直しと、上限より後の定期タイマーを打ち切りとして扱うかの再評価（TASK-113・オーナー判断）
+
+### 制約
+
+- 単一環境（Linux）・単一時点。URL のクエリ・script 本文・stack 全文は転記していない。stack 中の URL は取得していない
+- `name` / `type` の反映は簡略版（全要素に定義・既定値と正規化なし。`REPAIR-3`）。`div.name = ..` のような非フォームの要素でも属性が付く点は標準と異なる
+- 登録元 stack の形式はエンジン依存で、boa では取れない場合がある
+
+### 再現手順
+
+```bash
+cargo build --release -p fandhe-browser-core --features js-v8 --example compat_page_script_probe
+target/release/examples/compat_page_script_probe --target d2=https://www.saucedemo.com --modules --selector form --debug-raw-exception --out /abs/path/d2.jsonl 2>&1 >/dev/null | grep pending_timer
+jq -c 'select(.type=="run") | {abort, event_loop, selector_after, html_bytes_after}' /abs/path/d2.jsonl
+cargo build --release -p fandhe-browser-cli
+jq '[.[] | select(.id=="d2")]' harness/compat-practical/tasks.json > /abs/path/tasks-d2.json
+bash harness/compat-practical/run_core.sh --tasks /abs/path/tasks-d2.json --page-js v8 --page-modules --out /abs/path/core-d2.jsonl
 ```
 
 ## b5（Trello）の原因特定（#964）

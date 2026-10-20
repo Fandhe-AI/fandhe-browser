@@ -453,6 +453,38 @@ fn timer_cases(engine: &str) {
     let stack = errors[0].raw_stack();
     assert!(stack.is_none_or(|s| s.len() <= 1024), "{stack:?}");
 
+    eprintln!("case: JS-7 pending timers report delay, due time and repeat (Issue #1176)");
+    let out = run_page(engine, &page("setTimeout(function(){},60000);"), &opts);
+    assert_eq!(
+        out.abort().map(|a| a.kind().clone()),
+        Some(AbortKind::VirtualTime {
+            limit: Duration::from_secs(30)
+        })
+    );
+    let pending = out.event_loop().pending_timers();
+    assert_eq!(pending.len(), 1, "{pending:?}");
+    assert_eq!(pending[0].delay(), Duration::from_secs(60));
+    assert_eq!(pending[0].due_at(), Duration::from_secs(60));
+    assert!(!pending[0].repeat());
+    // opt-in が無いときは登録元を保持しない。
+    assert_eq!(pending[0].raw_origin(), None);
+    let out = run_page(engine, &page("setInterval(function(){},40000);"), &opts);
+    let pending = out.event_loop().pending_timers();
+    assert_eq!(pending.len(), 1, "{pending:?}");
+    assert_eq!(pending[0].delay(), Duration::from_secs(40));
+    assert!(pending[0].repeat());
+
+    eprintln!("case: JS-6 pending timer origin is captured only with the opt-in (Issue #1176)");
+    let retain = opts.clone().with_retain_raw_exception_messages(true);
+    let out = run_page(engine, &page("setTimeout(function(){},60000);"), &retain);
+    let pending = out.event_loop().pending_timers();
+    assert_eq!(pending.len(), 1, "{pending:?}");
+    // stack の形式はエンジン依存（boa は非標準で None もあり得る。REPAIR-3）。上限だけ確認する。
+    let origin = pending[0].raw_origin();
+    assert!(origin.is_none_or(|s| s.len() <= 1024), "{origin:?}");
+    // Debug には本文を出さない。
+    assert!(!format!("{:?}", pending[0]).contains("setTimeout"));
+
     eprintln!("case: JS-6 page cannot invoke the timer dispatcher directly to bypass limits");
     let out = run_page(
         engine,
