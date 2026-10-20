@@ -498,6 +498,19 @@ fn window_cases(engine: &str) {
     assert_eq!(diag.console_messages[1].text, "[unprintable]");
     assert_eq!(diag.console_messages[2].text, "t");
 
+    eprintln!("case: JS-5 console never keeps an Error stack without opt-in (#1183)");
+    check(
+        &mut p,
+        "console.error(new TypeError('x')); \
+         console.error({ get stack() { throw new Error('boom'); } }); 'ok'",
+        "ok",
+    );
+    let diag = p.bridge.take_diagnostics().expect("diagnostics");
+    assert_eq!(diag.console_messages.len(), 2);
+    assert_eq!(diag.console_messages[0].text, "TypeError: x");
+    assert_eq!(diag.console_messages[0].raw_stack(), None);
+    assert_eq!(diag.console_messages[1].raw_stack(), None);
+
     eprintln!("case: JS-5 console truncates page strings and caps forwarding");
     check(&mut p, "console.log('x'.repeat(100000)); 'ok'", "ok");
     let diag = p.bridge.take_diagnostics().expect("diagnostics");

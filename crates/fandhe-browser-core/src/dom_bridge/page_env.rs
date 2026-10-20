@@ -261,8 +261,8 @@ impl TimerCallbackSource {
     }
 }
 
-/// `TimerError`・`ListenerError`・`NetCallbackError` が保持する `error.stack` の上限バイト数
-/// （Issue #1168・#1172）。
+/// `TimerError`・`ListenerError`・`NetCallbackError`・`ConsoleMessage` が保持する `error.stack` の上限バイト数
+/// （Issue #1168・#1172・#1183）。
 const MAX_EXCEPTION_STACK_BYTES: usize = 1024;
 
 /// `error.stack` を上限まで切って保持用に整える（空なら `None`）。3 種の callback 例外で共用する。
@@ -380,6 +380,24 @@ pub struct ConsoleMessage {
     pub text: String,
     /// 切り詰めが起きたか。
     pub truncated: bool,
+    /// console.error / warn に渡された Error の `stack` 先頭 [`MAX_EXCEPTION_STACK_BYTES`] バイト
+    /// （空なら `None`）。URL・本文を含み得るため非公開で、opt-in が無い限り bridge が保存せず、
+    /// page_runner も破棄する。ページが偽造し得る診断専用の値（Issue #1183・`SEC-2`）。
+    stack: Option<String>,
+}
+
+impl ConsoleMessage {
+    /// 切り詰め済みの `error.stack`（opt-in が有効なときだけ値がある）。計測 example の stderr 専用で、
+    /// JSONL・要約には出さない（Issue #1183・`REPAIR-4`）。
+    #[doc(hidden)]
+    pub fn raw_stack(&self) -> Option<&str> {
+        self.stack.as_deref()
+    }
+
+    /// stack を破棄する（opt-in が無効なとき page_runner が呼ぶ。fail-closed）。
+    pub(crate) fn clear_stack(&mut self) {
+        self.stack = None;
+    }
 }
 
 // ページ由来の文字列は秘密を含み得るため、Debug には長さだけを出す。
@@ -389,6 +407,7 @@ impl std::fmt::Debug for ConsoleMessage {
             .field("level", &self.level)
             .field("text_len", &self.text.len())
             .field("truncated", &self.truncated)
+            .field("stack_len", &self.stack.as_ref().map(String::len))
             .finish()
     }
 }
@@ -514,13 +533,14 @@ impl BridgeDiagnostics {
         }
     }
 
-    pub(super) fn record_console(&mut self, level: ConsoleLevel, text: &str) {
+    pub(super) fn record_console(&mut self, level: ConsoleLevel, text: &str, stack: &str) {
         if self.console_messages.len() < MAX_BRIDGE_DIAGNOSTICS {
             let (kept, truncated) = truncate_utf8(text, MAX_CONSOLE_MESSAGE_BYTES);
             self.console_messages.push(ConsoleMessage {
                 level,
                 text: kept.to_owned(),
                 truncated,
+                stack: clip_stack(stack),
             });
         } else {
             self.dropped = self.dropped.saturating_add(1);

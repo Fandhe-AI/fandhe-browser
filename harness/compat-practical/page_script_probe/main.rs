@@ -365,6 +365,15 @@ async fn measure(
         if let Some(line) = debug_stderr_line(args.debug_raw_exception, &label, Some(&m.text)) {
             eprintln!("{line}");
         }
+        // Error が渡されたときだけ先頭フレームも出す（Issue #1183。形式は emit_raw と同じ）。
+        let frame_label = format!("{label} frame");
+        if let Some(line) = debug_stderr_line(
+            args.debug_raw_exception,
+            &frame_label,
+            m.raw_stack().and_then(top_stack_frame),
+        ) {
+            eprintln!("{line}");
+        }
     }
     for (n, e) in diag.timer_errors.iter().enumerate() {
         emit_raw(

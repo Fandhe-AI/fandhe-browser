@@ -231,7 +231,8 @@ impl PageRunOptions {
     /// 本番経路（CLI・CDP・AI API・`Config`）から呼ばない（`SEC-2`・`REPAIR-4`）。
     /// 生メッセージは URL・トークンを含み得るため、保存・転記しない。
     /// `error.stack` もこの opt-in のときだけ、タイマー / microtask・ライフサイクルリスナー・
-    /// fetch / XHR callback の各例外に保持する（Issue #1168・#1172）。
+    /// fetch / XHR callback の各例外と、console.error / warn に渡された Error に保持する
+    /// （Issue #1168・#1172・#1183）。
     #[doc(hidden)]
     #[must_use]
     pub fn with_retain_raw_exception_messages(mut self, retain: bool) -> Self {
@@ -1527,6 +1528,9 @@ async fn execute(
         }
         for e in &mut bridge_diagnostics.net_callback_errors {
             e.clear_stack();
+        }
+        for m in &mut bridge_diagnostics.console_messages {
+            m.clear_stack();
         }
     }
     // detach で DOM を確定してから runtime を解放する（遅れた変更を結果へ混ぜない）。

@@ -101,7 +101,7 @@
         }
         warned = true;
         try {
-            callOp('consoleMessage', 'warn', 'style shim limit exceeded: declaration ignored');
+            callOp('consoleMessage', 'warn', 'style shim limit exceeded: declaration ignored', '');
         } catch (e) {
             // 診断の失敗でページを止めない。
         }
