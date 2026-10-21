@@ -1322,7 +1322,7 @@ Issue #1200 節の「次の対応」2 にあたる。出力はコミットして
 
 ### 次の対応
 
-1. `document.styleSheets`（#1202）マージ後の d3 再測定は未実施。再測定して次の失敗を特定する
+1. `document.styleSheets`（#1202）マージ後の d3 再測定は未実施。再測定して次の失敗を特定する（済み: #1209。下の節を参照）
 2. 動的に挿入した `<script src>` の扱い（取得・実行は未対応）
 3. `childNodes` / 兄弟の参照 / `isConnected` / `contains` など残りの Node 走査 API
 4. #1186 の次の対応 1
@@ -1335,6 +1335,54 @@ Issue #1200 節の「次の対応」2 にあたる。出力はコミットして
 ### 再現手順
 
 Issue #1200 節と同じ。
+
+## styleSheets と parentNode を含む main での d2・d3 の再測定（#1209）
+
+spec 対応: TASK-71・TASK-108 / MS-6 / `COMPAT-1`・`JS-5`・`JS-6`・`MEAS-4`・`REPAIR-3`・`SEC-2`。
+Issue #1203 節の「次の対応」1 にあたる。コードは変えていない（測定のみ）。出力（JSONL・stderr）はコミットしていない。
+
+### 測定条件
+
+| 項目 | 値 |
+| ---- | -- |
+| 実施日時（UTC） | 2026-10-21 |
+| OS | Linux |
+| ベース | main `5700d544`（#1204 の `styleSheets`・`sheet`、#1205 の `parentNode`、#1210 を含む） |
+| 設定 | #1200 節と同じ（probe は `--modules`・V8・`--selector form`・`--debug-raw-exception`。`run_core.sh` は `--page-js v8 --page-modules`） |
+
+### 結果
+
+| id | `abort` | `console_error` | HTML バイト（実行後） | `form`（probe） | `run_core.sh` |
+| -- | ------- | --------------- | -------------------- | --------------- | ------------- |
+| d3 | なし | 0 件 | 11077（実行前の取得本文は 436） | 1 件 | `success=true`（`form_fields`・3 件） |
+| d2 | `virtual_time`（保留タイマー） | 0 件 | 2727 | 1 件 | `success=true`（`form_fields`・3 件） |
+
+- d3: `reading 'length'`（31 件）と `reading 'insertBefore'`（1 件）の両方が 0 件になり、`console_error` は無い。クライアント描画された `form` が 1 件現れた。`stderr` の診断出力も空だった
+- d2: #1203 の測定と同じ値で回帰なし
+- d3 の `form` が 1 件以上になったため、#919 へ測定事実をコメントした（結論・matrix は変えていない）
+- 次の失敗は無い。d3 に残る失敗は、この測定では確認されなかった
+
+### 特定できた原因
+
+- d3 の失敗は、#1204（`document.styleSheets`・`sheet`）と #1205（`parentNode`）の 2 つが揃うと解消した。単独では #1202 節・#1203 節のとおり、それぞれ別の TypeError が残っていた（確認済み）
+- 実行後 HTML が 532 から 11077 バイトに増えたのは、ページのクライアント描画が最後まで進んだためと推定する（未検証。描画内容の切り分けはしていない）
+
+### 次の対応
+
+1. #919 の判断（結論の更新）と matrix の更新（#920・#312）。本 Issue では書き換えていない
+2. 動的に挿入した `<script src>` の取得・実行（未対応）
+3. `childNodes` / 兄弟の参照 / `isConnected` / `contains` など残りの Node 走査 API
+4. `<style>` の内容からの `cssRules` 初期化と Rust 側 CSSOM への反映
+5. `namespaceURI`・`tagName`・`localName` の公開と HTML 要素の具象サブクラス（#1186 の次の対応 1）
+
+### 制約
+
+- 単一環境（Linux）・単一時点。URL・script 本文・stack 全文は転記していない。実サイトの内容は時点で変わる
+- 結論・matrix は書き換えていない（#919・#920 の担当）
+
+### 再現手順
+
+Issue #1200 節と同じ（probe は d3 に加えて d2 でも同条件で実行。`run_core.sh` は d2・d3 のタスク定義）。
 
 ## b5（Trello）の原因特定（#964）
 
