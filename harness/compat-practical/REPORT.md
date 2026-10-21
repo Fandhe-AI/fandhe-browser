@@ -1211,7 +1211,7 @@ Issue #1192 節の「次の対応」1・2 にあたる。出力はコミット�
 
 ### 次の対応
 
-1. `document.styleSheets` と `<style>` 要素の `sheet`（CSSOM の最小限の公開）。切り出し候補。起票済み: #1202
+1. `document.styleSheets` と `<style>` 要素の `sheet`（CSSOM の最小限の公開）。切り出し候補。起票済み: #1202（済み: #1202。下の節を参照）
 2. 実ページの `getElementsByTagName('script')[0]` が空になる理由の調査（実行中の script 要素の扱い）
 3. `namespaceURI`・`tagName`・`localName` の公開と HTML 要素の具象サブクラス（#1186 の次の対応 1）
 4. d3 の `form` が 1 件以上になったら #919 へコメントする
@@ -1229,6 +1229,60 @@ target/release/examples/compat_page_script_probe --target d3=https://demoqa.com/
 cargo build --release -p fandhe-browser-cli
 bash harness/compat-practical/run_core.sh --tasks /abs/path/d2-tasks.json --page-js v8 --page-modules --out /abs/path/core.jsonl
 ```
+
+## document.styleSheets と style 要素の sheet の追加と d2・d3 の再測定（#1202）
+
+spec 対応: TASK-71・TASK-108 / MS-6 / `COMPAT-1`・`JS-5`・`JS-6`・`MEAS-4`・`REPAIR-3`・`SEC-2`。
+Issue #1200 節の「次の対応」1 にあたる。出力はコミットしていない。
+
+### 実装の要点
+
+- shim: 新規 `js_shim/stylesheet.js`。`Element.prototype.sheet`（接続済みの HTML `<style>` は要素ごとに同じシート、未接続の HTML `<style>` は `null`、それ以外は `undefined`）と `Document.prototype.styleSheets`（アクセスごとの静的な一覧）。シートは `cssRules`（シートごとに持続するオブジェクト）・`insertRule`・`deleteRule`・`ownerNode`・`type` 等を持つ。dom.js に一回限りのハンドオフ `__fandheDomStyleSheetHandoff`（HTML `<style>` 判定と接続判定）を足し、新しい bridge op は無い
+- `insertRule` は「1 つのルールであること」だけを線形走査で検査する（引用符・エスケープ・コメント・括弧を追跡）。構文・セレクタの妥当性は見ない。上限は 1 シート 65,536 ルール・1 ルール 65,536 UTF-16 単位・合計 4 MiB で、超過は `QuotaExceededError`（`JS-6`）
+- 未実装（`REPAIR-3`）: `<style>` の内容を `cssRules` へ反映すること、Rust 側 CSSOM・DOM 直列化への反映、`<link>`・SVG・Shadow DOM のシート、`media`・`disabled` の効果、グローバルの `CSSStyleSheet` / `StyleSheetList` / `CSSRule`（constructable stylesheet の機能検出を変えないため意図して非公開）。`'sheet' in div` が true になる点は標準と異なる。`sheet` の読み取りは op を最大 2 回（初回の `htmlLocalName` と毎回の `isInclusiveAncestor`）消費する。新しい依存・`unsafe`・識別面の変更は無い
+
+### 測定条件
+
+| 項目 | 値 |
+| ---- | -- |
+| 実施日時（UTC） | 2026-10-20 |
+| OS | Linux |
+| ベース | main `ab9f6e55` に、本変更を加えたもの |
+| 設定 | probe は `--modules`・V8・`--selector form`・`--debug-raw-exception`。d2 の `run_core.sh` は `--page-js v8 --page-modules`（d2 のみのタスク定義） |
+
+### 結果
+
+| id | `abort` | `console_error` | HTML バイト（実行後） | `form`（probe） |
+| -- | ------- | --------------- | -------------------- | --------------- |
+| d3 | なし | 1 件（`TypeError: ... (reading 'insertBefore')`） | 532 | 0 件 |
+| d2 | `virtual_time`（保留タイマー） | 0 件 | 2727 | 1 件 |
+
+- d3: `reading 'length'` の TypeError（31 件）は 0 件になった。残る 1 件は #1200 節で記録した `insertBefore` のみ。`form` は 0 件のまま
+- d3 の実行後 HTML バイトは #1200 の測定（1852）から 532 に減った。emotion のスタイルが DOM 上のテキストではなくシートへ入る経路に変わったためと推定するが、未検証（元の差の原因は切り分けていない）
+- d2: probe の `form` は 1 件・`console_error` は 0 件で回帰なし。`run_core.sh`（d2 単体）は `success=true`
+- ページの op 上限（`max_ops_per_page`）に達した兆候は、この測定では見られなかった（上限超過の診断は出ていない）
+- d3 の `form` は 0 件のため、#919 へのコメントはしていない
+
+### 特定できた原因
+
+- `length` の TypeError: バンドル内の emotion 系スタイルシート処理が、`<style>` 要素の `sheet` が無いときに `document.styleSheets.length` を読んでいた。`sheet` と `styleSheets` を足したことで消えた
+- 残る `insertBefore` の TypeError: #1200 節のとおり、`document.getElementsByTagName("script")[0]` が実ページで undefined になる件（#1203 で調査中）。今回の変更では変わっていない
+
+### 次の対応
+
+1. #1203（実ページの `getElementsByTagName('script')[0]` が空になる件）。解消後に d3 を再測定する
+2. `<style>` の内容からの `cssRules` 初期化と、`insertRule` のルールの Rust 側 CSSOM への反映（必要になった時点で）
+3. `namespaceURI`・`tagName`・`localName` の公開と HTML 要素の具象サブクラス（#1186 の次の対応 1）
+4. d3 の `form` が 1 件以上になったら #919 へコメントする
+
+### 制約
+
+- 単一環境（Linux）・単一時点。URL・script 本文・stack 全文は転記していない。実サイトの内容は時点で変わる
+- 結論・matrix は書き換えていない（#919・#920 の担当）
+
+### 再現手順
+
+Issue #1200 節の再現手順と同じ（probe は d3、`run_core.sh` は d2 のみのタスク定義）。
 
 ## b5（Trello）の原因特定（#964）
 

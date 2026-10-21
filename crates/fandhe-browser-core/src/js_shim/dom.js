@@ -59,6 +59,7 @@
 //   未実装（REPAIR-3）: `document.hasFocus()`・FocusEvent / relatedTarget・focusin / focusout・祖先への
 //   伝播・`tabIndex` IDL 属性・autofocus・レンダリングに基づく判定。focus / blur は仕様では
 //   HTMLOrSVGElement の mixin だがラッパーがすべて Element のため Element.prototype に置く。
+// - `Element.prototype.sheet` / `document.styleSheets` は stylesheet.js が担う（#1202）。
 // - Comment / DocumentFragment のラッパー（nodeType 定数のみ。DOCUMENT_POSITION_* も未定義）。
 // - window / location / navigator / console は js_shim の別ソース（#779）。
 (function (global) {
@@ -791,6 +792,26 @@
         value: Object.freeze({
             setSink: function (fn) {
                 focusSink = typeof fn === 'function' ? fn : null;
+            }
+        }),
+        writable: true,
+        configurable: true,
+        enumerable: false
+    });
+
+    // stylesheet.js へ渡す一回限りのハンドオフ（`sheet` / `styleSheets` 用。stylesheet.js が読んで直ちに削除する）。
+    // ID は外へ出さず、ここで解決した真偽値だけを返す（#1202・JS-5）。
+    var protoOfElement = Function.prototype.call.bind(Object.prototype.isPrototypeOf, Element.prototype);
+    Object.defineProperty(global, '__fandheDomStyleSheetHandoff', {
+        value: Object.freeze({
+            // HTML 名前空間の `<style>` 要素か（Element 以外・ID の無いものは false）。
+            isHtmlStyleElement: function (node) {
+                return ids.has(node) && protoOfElement(node) && localNameOf(node) === 'style';
+            },
+            // 文書に接続されているか。
+            isConnected: function (node) {
+                return ids.has(node)
+                    && op('isInclusiveAncestor', ids.get(documentWrapper), ids.get(node)) === true;
             }
         }),
         writable: true,
