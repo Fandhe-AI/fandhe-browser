@@ -385,6 +385,10 @@ enum DomOp {
     NetOptionsIgnored,
     NetCancel,
     IsInclusiveAncestor,
+    /// 親ノードを返す（`Node.prototype.parentNode` の土台。JS-5・#1203）。読み取り専用。
+    /// 親が Element か文書ルートなら ID、親が無い・DocumentFragment なら null（shim にラッパー型が
+    /// 無いため。簡略版の差異。REPAIR-3）。
+    ParentNode,
     IsFocusable,
     MutationObserverLimit,
     MutationOptionsIgnored,
@@ -445,6 +449,7 @@ impl DomOp {
             "netOptionsIgnored" => Self::NetOptionsIgnored,
             "netCancel" => Self::NetCancel,
             "isInclusiveAncestor" => Self::IsInclusiveAncestor,
+            "parentNode" => Self::ParentNode,
             "isFocusable" => Self::IsFocusable,
             "htmlLocalName" => Self::HtmlLocalName,
             "mutationObserverLimit" => Self::MutationObserverLimit,
@@ -505,6 +510,7 @@ impl DomOp {
             Self::NetOptionsIgnored => "netOptionsIgnored",
             Self::NetCancel => "netCancel",
             Self::IsInclusiveAncestor => "isInclusiveAncestor",
+            Self::ParentNode => "parentNode",
             Self::IsFocusable => "isFocusable",
             Self::HtmlLocalName => "htmlLocalName",
             Self::MutationObserverLimit => "mutationObserverLimit",
@@ -546,6 +552,7 @@ impl DomOp {
             | Self::NetOptionsIgnored
             | Self::MutationOptionsIgnored
             | Self::IsFocusable
+            | Self::ParentNode
             | Self::HtmlLocalName
             | Self::NetCancel => 1,
             Self::CreateElementNs
@@ -1128,6 +1135,16 @@ fn execute(
             let node = page.node_arg(op, args, 2)?;
             let found = ancestor == node || page.document.ancestors(node).any(|a| a == ancestor);
             Ok(JsValue::Bool(found))
+        }
+        // 親ノード（`parentNode` getter 用。#1203・JS-5）。読み取り専用で O(1)。親が Element か文書
+        // ルートのときだけ ID を返し、親なし・DocumentFragment は null（shim にラッパー型が無い。REPAIR-3）。
+        DomOp::ParentNode => {
+            let node = page.node_arg(op, args, 1)?;
+            let parent = page
+                .document
+                .parent(node)
+                .filter(|p| *p == page.document.root() || page.document.is_element(*p));
+            page.encode_optional(parent)
         }
         // 要素が `focus()` でフォーカスできるか（`document.activeElement` の追跡用。#1185・簡略判定は
         // `focus.rs`、REPAIR-3）。読み取り専用。
@@ -3156,6 +3173,26 @@ mod tests {
         call(&b, &[s("isInclusiveAncestor"), n(1e12), n(div)]).expect_err("invalid id");
         call(&b, &[s("isInclusiveAncestor"), s("1"), n(div)]).expect_err("type");
         call(&b, &[s("isInclusiveAncestor"), n(div)]).expect_err("arity");
+    }
+
+    /// JS-5・#1203: `parentNode` は body の子で body、html で文書ルート、ルートと切り離しで null、
+    /// 不正入力はエラー。
+    #[test]
+    fn js_5_parent_node_op() {
+        let b = bridge();
+        let body = num(call(&b, &[s("body")]));
+        let div = num(call(&b, &[s("getElementById"), s("a")]));
+        let loose = num(call(&b, &[s("createElement"), s("p")]));
+        let root = num(call(&b, &[s("documentRoot")]));
+        let parent = |x: f64| call(&b, &[s("parentNode"), n(x)]).expect("ok");
+        assert_eq!(parent(div), JsValue::Number(body));
+        assert_eq!(parent(loose), JsValue::Null);
+        assert_eq!(parent(root), JsValue::Null);
+        let html = num(Ok(parent(body)));
+        assert_eq!(parent(html), JsValue::Number(root));
+        call(&b, &[s("parentNode"), n(1e12)]).expect_err("invalid id");
+        call(&b, &[s("parentNode"), s("1")]).expect_err("type");
+        call(&b, &[s("parentNode")]).expect_err("arity");
     }
 
     /// JS-5: `isFocusable` は接続した input で true、div・切り離した要素で false、不正入力はエラー。

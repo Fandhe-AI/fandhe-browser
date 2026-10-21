@@ -1212,7 +1212,7 @@ Issue #1192 節の「次の対応」1・2 にあたる。出力はコミット�
 ### 次の対応
 
 1. `document.styleSheets` と `<style>` 要素の `sheet`（CSSOM の最小限の公開）。切り出し候補。起票済み: #1202（済み: #1202。下の節を参照）
-2. 実ページの `getElementsByTagName('script')[0]` が空になる理由の調査（実行中の script 要素の扱い）
+2. 実ページの `getElementsByTagName('script')[0]` が空になる理由の調査（実行中の script 要素の扱い）（済み: #1203。下の節を参照）
 3. `namespaceURI`・`tagName`・`localName` の公開と HTML 要素の具象サブクラス（#1186 の次の対応 1）
 4. d3 の `form` が 1 件以上になったら #919 へコメントする
 
@@ -1283,6 +1283,58 @@ Issue #1200 節の「次の対応」1 にあたる。出力はコミットして
 ### 再現手順
 
 Issue #1200 節の再現手順と同じ（probe は d3、`run_core.sh` は d2 のみのタスク定義）。
+
+## parentNode の追加と d2・d3 の再測定（#1203）
+
+spec 対応: TASK-71・TASK-108 / MS-6 / `COMPAT-1`・`JS-5`・`JS-6`・`MEAS-4`・`REPAIR-3`・`SEC-2`。
+Issue #1200 節の「次の対応」2 にあたる。出力はコミットしていない。
+
+### 特定できた原因
+
+- #1200 節の推測（`getElementsByTagName('script')[0]` が undefined になる）は誤りだった。V8 のエラーは `(reading 'insertBefore')` で、undefined に対して `insertBefore` を読んだことを示す。`[0]` が undefined なら `(reading 'parentNode')` になる。`[0]` は要素を返しており、欠けていたのは `[0].parentNode`（タグ管理系の定型コード `f.parentNode.insertBefore(j, f)`）
+- shim に `parentNode` / `parentElement` が無かった（`dom.js` 冒頭で「対応する op が無く未定義のまま」と明記していた）。parse 済み `<script>` の扱い（`page_script.rs`）に問題は無い
+
+### 実装の要点
+
+- bridge: 読み取り専用の op `parentNode`（1 引数）。親が Element か文書ルートなら ID、親なし・DocumentFragment は null
+- shim: `Node.prototype` の `parentNode` / `parentElement` getter（読み取り専用）。`parentElement` は親が文書なら null
+- 未実装（`REPAIR-3`）: 親が DocumentFragment のとき null を返す差異、`childNodes` 等の残りの走査 API。挿入した `<script src>` の取得・実行は行わない（タグ管理系が `insertBefore` に成功しても、その script は実行されない）
+- 回帰テスト: V8・boa 共通の `parent_node_cases`（parse 済み script の `[0]` と `parentNode`、定型コードの再現）と bridge の unit test。新しい依存・`unsafe`・window の識別面は無い
+
+### 測定条件
+
+| 項目 | 値 |
+| ---- | -- |
+| 実施日時（UTC） | 2026-10-20 |
+| OS | Linux |
+| ベース | main `ab9f6e55` に、本変更を加えたもの（#1204 は未マージ） |
+| 設定 | #1200 節と同じ（probe は `--modules`・V8・`--selector form`・`--debug-raw-exception`。d2 の `run_core.sh` は `--page-js v8 --page-modules`） |
+
+### 結果
+
+| id | `abort` | `console_error` | HTML バイト | `form`（probe） |
+| -- | ------- | --------------- | ----------- | --------------- |
+| d3 | なし | 31 件（すべて `TypeError: Cannot read properties of undefined (reading 'length')`） | 1852 | 0 件 |
+| d2 | `virtual_time`（保留タイマー） | 0 件 | 2727 | 1 件 |
+
+- d3: `insertBefore` の TypeError は消えた。残りは `document.styleSheets` 未実装による `length` の 31 件（#1202・#1204 の範囲。本変更による回帰ではない）。`form` は 0 件のため、#919 へのコメントはしていない
+- d2: probe の `form` は 1 件・`console_error` は 0 件で回帰なし。`run_core.sh`（d2 単体）は `success=true`（`form_fields`・3 件）
+
+### 次の対応
+
+1. `document.styleSheets`（#1202）マージ後の d3 再測定は未実施。再測定して次の失敗を特定する
+2. 動的に挿入した `<script src>` の扱い（取得・実行は未対応）
+3. `childNodes` / 兄弟の参照 / `isConnected` / `contains` など残りの Node 走査 API
+4. #1186 の次の対応 1
+
+### 制約
+
+- 単一環境（Linux）・単一時点。URL・script 本文・stack 全文は転記していない。実サイトの内容は時点で変わる
+- 結論・matrix は書き換えていない（#919・#920 の担当）
+
+### 再現手順
+
+Issue #1200 節と同じ。
 
 ## b5（Trello）の原因特定（#964）
 
