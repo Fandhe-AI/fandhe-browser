@@ -836,3 +836,43 @@ fn cdp_2_begin_generation_coalescing_does_not_cross_an_evaluate() {
         Err(ScriptContextError::NotFound)
     );
 }
+
+/// 通知と評価は送った順に処理する。先に受理した世代通知（g2）は、後続の評価（g1）より前に
+/// 適用される。後続の世代通知（g3）を統合しても g2 を評価の後ろへ動かさない（g1 は `NotFound`）。
+#[test]
+fn cdp_2_earlier_begin_generation_applies_before_later_evaluate_after_coalescing() {
+    let probe = Arc::new(Probe::default());
+    let h = handle_with(
+        &probe,
+        ScriptContextOptions::default().with_queue_capacity(1),
+    );
+    let t = Target::new();
+    let g1 = t.next_generation();
+    let busy = Target::new();
+    let opts = ScriptEvalOptions::default();
+    let running = h.evaluate(
+        ScriptContextKey::new(busy.scope(), busy.next_generation(), 1),
+        doc(),
+        "block",
+        &opts,
+    );
+    wait_until("worker is blocked", || {
+        probe.blocked.load(Ordering::SeqCst) == 1
+    });
+    // 通知の待ち行列（容量 1）を別 scope の通知で埋める。
+    h.release_scope(Target::new().scope());
+    let g2 = t.next_generation();
+    h.begin_generation(t.scope(), g2);
+    let e1 = h.evaluate(ScriptContextKey::new(t.scope(), g1, 1), doc(), "e1", &opts);
+    let g3 = t.next_generation();
+    h.begin_generation(t.scope(), g3);
+    probe.open_gate();
+    assert_eq!(
+        block_on(running).map(ScriptEvalOutput::into_value),
+        Ok("unblocked".to_string())
+    );
+    assert_eq!(
+        block_on(e1).map(ScriptEvalOutput::into_value),
+        Err(ScriptContextError::NotFound)
+    );
+}

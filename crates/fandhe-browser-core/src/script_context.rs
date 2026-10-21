@@ -612,9 +612,10 @@ struct State {
     live_contexts: usize,
     /// scope ごとに見た最新の世代。ワーカーがアイドル終了・panic で消えても失われないよう共有側に置く。
     latest: HashMap<NavigationScope, NavigationGeneration>,
-    /// 待ち行列が満杯で積めなかった世代通知（scope → 大きい方の世代と、保留した時点の評価 id 採番位置）。
+    /// 待ち行列が満杯で積めなかった世代通知（scope・世代・保留した時点の評価 id 採番位置）を積んだ順に持つ。
+    /// 同一 scope でも、間に評価を挟む通知は別の要素として保持する（評価境界を越えて統合しない）。
     /// ワーカーが必ず消化する。
-    pending_begin: HashMap<NavigationScope, (NavigationGeneration, u64)>,
+    pending_begin: Vec<(NavigationScope, NavigationGeneration, u64)>,
     /// 待ち行列が満杯で積めなかった解放要求（scope → 保留した時点の評価 id 採番位置）。
     /// 件数が上限を超えたら `pending_release_all` に倒す（解放要求を失わない）。
     pending_release: HashMap<NavigationScope, u64>,
@@ -658,8 +659,8 @@ impl State {
         let begins: Vec<_> = self
             .pending_begin
             .iter()
-            .filter(|(s, (g, q))| !blocked(Some(**s), Some(*g), *q))
-            .map(|(s, (g, _))| (*s, *g))
+            .filter(|(s, g, q)| !blocked(Some(*s), Some(*g), *q))
+            .map(|(s, g, q)| (*s, *g, *q))
             .collect();
         let releases: Vec<_> = self
             .pending_release
@@ -673,12 +674,11 @@ impl State {
         if begins.is_empty() && releases.is_empty() && !release_all {
             return None;
         }
-        for (s, _) in &begins {
-            self.pending_begin.remove(s);
-        }
+        self.pending_begin
+            .retain(|b| !begins.iter().any(|a| a.2 == b.2 && a.0 == b.0));
         for s in &releases {
             self.pending_release.remove(s);
-            self.pending_begin.remove(s);
+            self.pending_begin.retain(|b| b.0 != *s);
         }
         if release_all {
             self.pending_release_all = None;
@@ -686,7 +686,7 @@ impl State {
             self.pending_begin.clear();
         }
         Some(PendingWork {
-            begins,
+            begins: begins.into_iter().map(|(s, g, _)| (s, g)).collect(),
             releases,
             release_all,
         })
@@ -694,17 +694,25 @@ impl State {
 
     /// 満杯時の世代通知を保留へ積む（同一 scope は大きい世代へ。記録が上限なら新しい scope は捨てる）。
     fn defer_begin(&mut self, scope: NavigationScope, generation: NavigationGeneration) {
-        if self.pending_begin.len() >= MAX_TRACKED_SCOPES
-            && !self.pending_begin.contains_key(&scope)
+        let seq = self.next_id;
+        // 同一 scope の直近の保留と統合できるのは、その保留以降に積まれた同 scope の評価が無いときだけ。
+        let queue = &self.queue;
+        let last = self.pending_begin.iter_mut().rev().find(|b| b.0 == scope);
+        if let Some(entry) = last
+            && !queue
+                .iter()
+                .any(|t| matches!(t, Task::Evaluate(j) if j.key.scope == scope && j.id >= entry.2))
         {
+            if entry.1 < generation {
+                entry.1 = generation;
+            }
+            entry.2 = seq;
             return;
         }
-        let seq = self.next_id;
-        let entry = self.pending_begin.entry(scope).or_insert((generation, seq));
-        if entry.0 < generation {
-            entry.0 = generation;
+        if self.pending_begin.len() >= MAX_TRACKED_SCOPES {
+            return;
         }
-        entry.1 = seq;
+        self.pending_begin.push((scope, generation, seq));
     }
 
     /// 満杯時の解放要求を保留へ積む。上限を超える分は全破棄へ倒す（解放要求を失わない）。
@@ -866,7 +874,7 @@ impl ScriptContextHandle {
                         next_id: 0,
                         live_contexts: 0,
                         latest: HashMap::new(),
-                        pending_begin: HashMap::new(),
+                        pending_begin: Vec::new(),
                         pending_release: HashMap::new(),
                         pending_release_all: None,
                     }),
