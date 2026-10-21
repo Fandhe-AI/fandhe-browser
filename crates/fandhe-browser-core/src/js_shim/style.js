@@ -33,8 +33,8 @@
 // - ES2015 の範囲に留める（V8 と boa で同一のソース。class / Proxy は使わない）。
 //
 // 未実装（REPAIR-3。黙って成功扱いにはしない）:
-// - `getComputedStyle`・レイアウト（`getBoundingClientRect` 等）・`CSS.supports`・`CSSStyleSheet` /
-//   `CSSRule` は定義しない（`typeof getComputedStyle === 'undefined'` のまま。成功を一律に返す
+// - `getComputedStyle`・レイアウト（`getBoundingClientRect` 等）・`CSS.supports` と、グローバルの `CSSStyleSheet` /
+//   `CSSRule` は定義しない（最小のシートは stylesheet.js が `sheet` / `styleSheets` の形で提供する）（`typeof getComputedStyle === 'undefined'` のまま。成功を一律に返す
 //   偽の実装を作らない）。将来仕様: core の cssom の computed style と連携した `getComputedStyle`
 //   （JS-5）。
 // - 値の構文検証はしない（書いた値はそのまま読み戻せる。機能検出では「何でも対応」に見える）。
