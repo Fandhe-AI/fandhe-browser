@@ -195,7 +195,7 @@ pub use script_context::{
     DEFAULT_SCRIPT_EVAL_TIMEOUT, MAX_SCRIPT_CONTEXT_SOURCE_BYTES, MAX_SCRIPT_EVAL_TIMEOUT,
     RestartCause, ScriptContextError, ScriptContextHandle, ScriptContextKey, ScriptContextLimit,
     ScriptContextOptions, ScriptContextStats, ScriptEvalFuture, ScriptEvalOptions,
-    UnavailableReason,
+    ScriptEvalOutput, UnavailableReason,
 };
 pub use state::{
     AppState, NavigationGeneration, NavigationResult, NavigationScope, NavigationState, StateError,

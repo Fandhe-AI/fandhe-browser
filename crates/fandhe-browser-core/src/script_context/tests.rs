@@ -174,6 +174,7 @@ fn eval(
     src: &str,
 ) -> Result<String, ScriptContextError> {
     block_on(h.evaluate(key, doc(), src, &ScriptEvalOptions::default()))
+        .map(ScriptEvalOutput::into_value)
 }
 
 fn eval_with(
@@ -182,7 +183,7 @@ fn eval_with(
     src: &str,
     opts: &ScriptEvalOptions,
 ) -> Result<String, ScriptContextError> {
-    block_on(h.evaluate(key, doc(), src, opts))
+    block_on(h.evaluate(key, doc(), src, opts)).map(ScriptEvalOutput::into_value)
 }
 
 #[test]
@@ -536,6 +537,44 @@ fn js_1_evaluation_failed_is_truncated_and_not_echoed_in_display() {
     assert_eq!(h.stats().live_contexts(), 1);
 }
 
+/// `JS-6`: 評価実行中に通知を連投しても、待ち行列の通知は上限（待ち行列容量）を超えて増えない。
+/// 積めなかった世代通知は記録へ直接反映され、古い世代の評価は `NotFound` になる。
+#[test]
+fn js_6_notification_flood_is_bounded_and_still_marks_stale() {
+    let probe = Arc::new(Probe::default());
+    let h = handle_with(
+        &probe,
+        ScriptContextOptions::default().with_queue_capacity(2),
+    );
+    let t = Target::new();
+    let g1 = t.next_generation();
+    let key = ScriptContextKey::new(t.scope(), g1, 1);
+    let opts = ScriptEvalOptions::default();
+    let running = h.evaluate(key, doc(), "block", &opts);
+    wait_until("worker is blocked", || {
+        probe.blocked.load(Ordering::SeqCst) == 1
+    });
+    let mut newest = g1;
+    for _ in 0..1000 {
+        newest = t.next_generation();
+        h.begin_generation(t.scope(), newest);
+        h.release_scope(Target::new().scope());
+    }
+    let notes = {
+        let inner = h.inner.as_ref().expect("enabled");
+        inner.shared.lock().queued_notifications()
+    };
+    assert_eq!(notes, 2);
+    probe.open_gate();
+    assert_eq!(
+        block_on(running).map(ScriptEvalOutput::into_value),
+        Ok("unblocked".to_string())
+    );
+    assert_eq!(eval(&h, key, "count"), Err(ScriptContextError::NotFound));
+    let fresh = ScriptContextKey::new(t.scope(), newest, 1);
+    assert_eq!(eval(&h, fresh, "count"), Ok("1".to_string()));
+}
+
 #[test]
 fn js_1_non_string_result_is_evaluation_failed() {
     let probe = Arc::new(Probe::default());
@@ -575,9 +614,18 @@ fn js_6_queue_full_returns_limit_exceeded() {
         })
     );
     probe.open_gate();
-    assert_eq!(block_on(running), Ok("unblocked".to_string()));
-    assert_eq!(block_on(q1), Ok("q1".to_string()));
-    assert_eq!(block_on(q2), Ok("q2".to_string()));
+    assert_eq!(
+        block_on(running).map(ScriptEvalOutput::into_value),
+        Ok("unblocked".to_string())
+    );
+    assert_eq!(
+        block_on(q1).map(ScriptEvalOutput::into_value),
+        Ok("q1".to_string())
+    );
+    assert_eq!(
+        block_on(q2).map(ScriptEvalOutput::into_value),
+        Ok("q2".to_string())
+    );
 }
 
 #[test]
@@ -596,7 +644,10 @@ fn js_6_dropped_future_leaves_the_queue() {
     drop(dropped);
     assert_eq!(h.stats().queued(), 0);
     probe.open_gate();
-    assert_eq!(block_on(running), Ok("unblocked".to_string()));
+    assert_eq!(
+        block_on(running).map(ScriptEvalOutput::into_value),
+        Ok("unblocked".to_string())
+    );
     assert_eq!(probe.evals.load(Ordering::SeqCst), 1);
 }
 

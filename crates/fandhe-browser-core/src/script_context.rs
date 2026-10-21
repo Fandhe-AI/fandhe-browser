@@ -478,7 +478,34 @@ impl ScriptContextStats {
     }
 }
 
-type EvalResult = Result<String, ScriptContextError>;
+/// 評価の成功結果。`ScriptEvalFuture` の `Output` の成功側。
+///
+/// 現時点の中身は評価結果の文字列だけだが、cdp の Runtime ドメイン（#1217〜#1219）が必要とする
+/// 付随情報（値の型・例外詳細など）を後から足せるよう、フラットな文字列ではなく構造体で返す
+/// （`REPAIR-4`・`CDP-2`）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ScriptEvalOutput {
+    value: String,
+}
+
+impl ScriptEvalOutput {
+    fn new(value: String) -> Self {
+        Self { value }
+    }
+
+    /// 評価結果の文字列（結果サイズの上限検査済み）。
+    pub fn value(&self) -> &str {
+        &self.value
+    }
+
+    /// 評価結果の文字列を取り出す。
+    pub fn into_value(self) -> String {
+        self.value
+    }
+}
+
+type EvalResult = Result<ScriptEvalOutput, ScriptContextError>;
 
 /// 要求 1 件の結果スロット。呼び出し側の future・待ち行列・ワーカーが共有する。
 ///
@@ -593,6 +620,41 @@ impl State {
             .iter()
             .filter(|t| matches!(t, Task::Evaluate(_)))
             .count()
+    }
+
+    /// 待ち行列にある通知（世代変更・解放）の件数。
+    fn queued_notifications(&self) -> usize {
+        self.queue.len() - self.queued_evals()
+    }
+
+    /// 積み済みの同一 scope の世代通知があれば、その世代を大きい方へ更新して真を返す。
+    fn coalesce_begin(&mut self, scope: NavigationScope, generation: NavigationGeneration) -> bool {
+        for t in self.queue.iter_mut().rev() {
+            if let Task::BeginGeneration {
+                scope: s,
+                generation: g,
+            } = t
+                && *s == scope
+            {
+                if *g < generation {
+                    *g = generation;
+                }
+                return true;
+            }
+        }
+        false
+    }
+
+    /// ワーカーが生きている間に待ち行列へ積めない世代通知を、記録だけ直接反映する。
+    /// 記録が上限に達していて新しい scope なら無視する（`live` を持たないため捨てる側を選べない）。
+    fn note_latest_bounded(&mut self, scope: NavigationScope, generation: NavigationGeneration) {
+        if self.latest.len() >= MAX_TRACKED_SCOPES && !self.latest.contains_key(&scope) {
+            return;
+        }
+        let entry = self.latest.entry(scope).or_insert(generation);
+        if *entry < generation {
+            *entry = generation;
+        }
     }
 
     /// `scope` の最新世代を `generation` に更新する（より古い値では下げない）。
@@ -771,9 +833,36 @@ impl ScriptContextHandle {
         };
         let mut st = inner.shared.lock();
         if st.worker_alive {
-            st.queue.push_back(task);
-            drop(st);
-            inner.shared.wake.notify_all();
+            // 通知にも評価と同じ上限を課す（`JS-6`。評価実行中に通知を連投されても無制限に増やさない）。
+            // 上限内なら FIFO で積む。上限に達したら、同一 scope の積み済み世代通知へ畳み込む
+            // （世代は大きい方を採る）か、下の直接更新に落とす。
+            if st.queued_notifications() < inner.queue_capacity {
+                st.queue.push_back(task);
+                drop(st);
+                inner.shared.wake.notify_all();
+                return;
+            }
+            let task = match task {
+                Task::BeginGeneration { scope, generation } => {
+                    if st.coalesce_begin(scope, generation) {
+                        return;
+                    }
+                    Task::BeginGeneration { scope, generation }
+                }
+                other => other,
+            };
+            // 畳み込めない通知は共有側の記録だけを直接更新する。評価は取り出し時に `latest` と照合する
+            // ため、古い世代の評価は `NotFound` になる。破棄できなかったコンテキストは
+            // 全体・scope あたりの上限で抑えられ、次の通知か評価で回収される。
+            match task {
+                Task::BeginGeneration { scope, generation } => {
+                    st.note_latest_bounded(scope, generation);
+                }
+                Task::ReleaseScope { scope } => {
+                    st.latest.remove(&scope);
+                }
+                Task::Evaluate(_) => {}
+            }
             return;
         }
         // ワーカーが居ない間はコンテキストも無い（ガードが写しを 0 に戻す）。記録だけ直接更新する。
@@ -788,7 +877,7 @@ impl ScriptContextHandle {
         }
     }
 
-    /// `document` の上で `source` を評価する要求を出す。結果は JS 評価結果の文字列。
+    /// `document` の上で `source` を評価する要求を出す。結果は [`ScriptEvalOutput`]（JS 評価結果の文字列を持つ）。
     ///
     /// `document` は `key` が未作成のときだけ使う（既存のキーでは無視する。モジュール doc）。
     /// 即時に決まる結果（無効・ソース超過・待ち行列の満杯・スレッド生成失敗）は呼び出した時点で
@@ -1202,7 +1291,9 @@ fn classify_evaluation(
     };
     match result {
         Ok(out) => match out.js_value {
-            JsValue::String(s) if s.len() <= opts.max_result_bytes => keep(Ok(s)),
+            JsValue::String(s) if s.len() <= opts.max_result_bytes => {
+                keep(Ok(ScriptEvalOutput::new(s)))
+            }
             JsValue::String(s) => keep(Err(ScriptContextError::LimitExceeded {
                 limit: ScriptContextLimit::ResultBytes {
                     len: s.len(),

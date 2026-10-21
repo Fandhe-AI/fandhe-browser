@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use fandhe_browser_core::{
     Config, DomBridgeLimits, NavigationGeneration, NavigationResult, NavigationState, RestartCause,
     ScriptContextError, ScriptContextHandle, ScriptContextKey, ScriptContextLimit,
-    ScriptContextOptions, ScriptEvalOptions, UnavailableReason,
+    ScriptContextOptions, ScriptEvalOptions, ScriptEvalOutput, UnavailableReason,
 };
 
 const URL: &str = "https://example.test/page";
@@ -120,6 +120,7 @@ fn eval_with(
     opts: &ScriptEvalOptions,
 ) -> Result<String, ScriptContextError> {
     rt.block_on(h.evaluate(key, Arc::clone(doc), src, opts))
+        .map(ScriptEvalOutput::into_value)
 }
 
 /// 全ケースを `engine`（`"v8"` / `"boa"`）で実行する。

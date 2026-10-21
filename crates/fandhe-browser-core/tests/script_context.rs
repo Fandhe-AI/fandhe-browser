@@ -10,11 +10,12 @@
 use std::sync::Arc;
 
 use fandhe_browser_core::{
-    ScriptContextError, ScriptContextHandle, ScriptContextKey, ScriptEvalOptions, UnavailableReason,
+    ScriptContextError, ScriptContextHandle, ScriptContextKey, ScriptEvalOptions, ScriptEvalOutput,
+    UnavailableReason,
 };
 
 /// 評価要求を 1 つ出して結果を待つ（tokio の current_thread ランタイムで `block_on`）。
-fn evaluate_once(handle: &ScriptContextHandle) -> Result<String, ScriptContextError> {
+fn evaluate_once(handle: &ScriptContextHandle) -> Result<ScriptEvalOutput, ScriptContextError> {
     let nav = fandhe_browser_core::NavigationState::new();
     let generation = nav.begin_navigation().expect("generation");
     let key = ScriptContextKey::new(nav.scope(), generation, 1);
