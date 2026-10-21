@@ -583,13 +583,38 @@ enum Task {
     BeginGeneration {
         scope: NavigationScope,
         generation: NavigationGeneration,
+        /// 評価の `id` と共通の採番による到着順（待ち行列と保留を合わせて FIFO にするための印）。
+        seq: u64,
     },
     ReleaseScope {
+        scope: NavigationScope,
+        seq: u64,
+    },
+}
+
+impl Task {
+    /// 到着順の印（評価は `id`）。
+    fn seq(&self) -> u64 {
+        match self {
+            Task::Evaluate(j) => j.id,
+            Task::BeginGeneration { seq, .. } | Task::ReleaseScope { seq, .. } => *seq,
+        }
+    }
+}
+
+/// `notify` が受け取る通知の種類（到着順の印は `notify` がロック内で振る）。
+enum NoticeKind {
+    Begin {
+        scope: NavigationScope,
+        generation: NavigationGeneration,
+    },
+    Release {
         scope: NavigationScope,
     },
 }
 
 struct EvalJob {
+    /// 評価・通知で共通の採番による到着順の印。
     id: u64,
     key: ScriptContextKey,
     document: Arc<NavigationResult>,
@@ -614,111 +639,71 @@ struct State {
     live_contexts: usize,
     /// scope ごとに見た最新の世代。ワーカーがアイドル終了・panic で消えても失われないよう共有側に置く。
     latest: HashMap<NavigationScope, NavigationGeneration>,
-    /// 待ち行列が満杯で積めなかった世代通知（scope・世代・保留した時点の評価 id 採番位置）を積んだ順に持つ。
-    /// 同一 scope でも、間に評価を挟む通知は別の要素として保持する（評価境界を越えて統合しない）。
-    /// ワーカーが必ず消化する。
-    pending_begin: Vec<(NavigationScope, NavigationGeneration, u64)>,
-    /// 待ち行列が満杯で積めなかった解放要求（scope → 保留した時点の評価 id 採番位置）。
-    /// 件数が上限（`MAX_TRACKED_SCOPES`）に達した状態で新しい scope が来たら、黙って捨てず
-    /// 呼び出し側へ `LimitExceeded` を返す（無関係な scope のコンテキストは巻き込まない）。
-    pending_release: HashMap<NavigationScope, u64>,
-}
-
-/// ワーカーが消化する保留中の通知（`State::take_ready_pending` が返す）。
-struct PendingWork {
-    begins: Vec<(NavigationScope, NavigationGeneration)>,
-    releases: Vec<NavigationScope>,
+    /// 待ち行列が満杯で積めなかった通知（世代変更・解放）を到着順に持つ。ワーカーは待ち行列の先頭と
+    /// この先頭のうち `seq` が小さい方を先に処理するため、評価・通知とも常に到着順（FIFO）で適用される。
+    /// 件数が上限（`MAX_TRACKED_SCOPES`）に達したら、黙って捨てず呼び出し側へ `LimitExceeded` を返す
+    /// （無関係な scope のコンテキストは巻き込まない）。ワーカーが必ず消化する。
+    overflow: VecDeque<Task>,
 }
 
 impl State {
     fn has_pending(&self) -> bool {
-        !self.pending_begin.is_empty() || !self.pending_release.is_empty()
+        !self.overflow.is_empty()
     }
 
-    /// 保留のうち、順序境界を越えずに適用できるものを取り出す。
-    /// 評価は通知と送った順に処理する契約のため、保留した時点より前に積まれた評価（id が採番位置未満。
-    /// 世代通知は同じ scope かつ古い世代のもの、解放は同じ scope のもの）が積み済みの間は保留のまま残す。
-    /// 保留より後に送られた評価は境界にならない。待ち行列に残る評価は有限なので必ず消化される。
-    fn take_ready_pending(&mut self) -> Option<PendingWork> {
-        if !self.has_pending() {
-            return None;
-        }
-        let queue = &self.queue;
-        let blocked =
-            |scope: Option<NavigationScope>, below: Option<NavigationGeneration>, seq: u64| {
-                queue.iter().any(|t| {
-                    matches!(t, Task::Evaluate(j)
-                    if j.id < seq
-                        && scope.is_none_or(|s| j.key.scope == s)
-                        && below.is_none_or(|g| j.key.generation < g))
-                })
-            };
-        let begins: Vec<_> = self
-            .pending_begin
-            .iter()
-            .filter(|(s, g, q)| !blocked(Some(*s), Some(*g), *q))
-            .map(|(s, g, q)| (*s, *g, *q))
-            .collect();
-        let releases: Vec<_> = self
-            .pending_release
-            .iter()
-            .filter(|(s, q)| !blocked(Some(**s), None, **q))
-            .map(|(s, _)| *s)
-            .collect();
-        if begins.is_empty() && releases.is_empty() {
-            return None;
-        }
-        self.pending_begin
-            .retain(|b| !begins.iter().any(|a| a.2 == b.2 && a.0 == b.0));
-        for s in &releases {
-            self.pending_release.remove(s);
-            self.pending_begin.retain(|b| b.0 != *s);
-        }
-        Some(PendingWork {
-            begins: begins.into_iter().map(|(s, g, _)| (s, g)).collect(),
-            releases,
-        })
-    }
-
-    /// 満杯時の世代通知を保留へ積む（同一 scope は大きい世代へ）。保留が上限なら黙って捨てず
-    /// `LimitExceeded` を返す（呼び出し側が知らないまま古い世代で評価が通ることを防ぐ。`CDP-2`）。
-    fn defer_begin(
-        &mut self,
-        scope: NavigationScope,
-        generation: NavigationGeneration,
-    ) -> Result<(), ScriptContextError> {
+    /// 次の到着順の位置の印を払い出す（評価の `id` と共通）。
+    fn alloc_seq(&mut self) -> u64 {
         let seq = self.next_id;
-        // 同一 scope の直近の保留と統合できるのは、その保留以降に積まれた同 scope の評価が無いときだけ。
-        let queue = &self.queue;
-        let last = self.pending_begin.iter_mut().rev().find(|b| b.0 == scope);
-        if let Some(entry) = last
-            && !queue
-                .iter()
-                .any(|t| matches!(t, Task::Evaluate(j) if j.key.scope == scope && j.id >= entry.2))
-        {
-            if entry.1 < generation {
-                entry.1 = generation;
+        self.next_id = self.next_id.wrapping_add(1);
+        seq
+    }
+
+    /// 待ち行列と保留の先頭のうち到着順が早い方を取り出す（ワーカーが呼ぶ。`CDP-2`）。
+    fn pop_next(&mut self) -> Option<Task> {
+        let from_overflow = match (self.queue.front(), self.overflow.front()) {
+            (None, None) => return None,
+            (Some(_), None) => false,
+            (None, Some(_)) => true,
+            (Some(q), Some(o)) => o.seq() < q.seq(),
+        };
+        if from_overflow {
+            self.overflow.pop_front()
+        } else {
+            self.queue.pop_front()
+        }
+    }
+
+    /// 満杯時の通知を保留へ積む。保留が上限なら黙って捨てず `LimitExceeded` を返す
+    /// （呼び出し側が知らないまま古い世代で評価が通る・解放が失われることを防ぐ。`CDP-2`）。
+    /// 末尾が同一 scope の同種の通知なら、間に何も無いので畳み込む（世代は大きい方を採る）。
+    fn defer(&mut self, task: Task) -> Result<(), ScriptContextError> {
+        match (self.overflow.back_mut(), &task) {
+            (
+                Some(Task::BeginGeneration {
+                    scope: s,
+                    generation: g,
+                    ..
+                }),
+                Task::BeginGeneration {
+                    scope, generation, ..
+                },
+            ) if s == scope => {
+                if *g < *generation {
+                    *g = *generation;
+                }
+                return Ok(());
             }
-            entry.2 = seq;
-            return Ok(());
+            (Some(Task::ReleaseScope { scope: s, .. }), Task::ReleaseScope { scope, .. })
+                if s == scope =>
+            {
+                return Ok(());
+            }
+            _ => {}
         }
-        if self.pending_begin.len() >= MAX_TRACKED_SCOPES {
+        if self.overflow.len() >= MAX_TRACKED_SCOPES {
             return Err(notification_limit_error());
         }
-        self.pending_begin.push((scope, generation, seq));
-        Ok(())
-    }
-
-    /// 満杯時の解放要求を保留へ積む。保留が上限なら黙って捨てず `LimitExceeded` を返す
-    /// （生きている他 scope のコンテキストは破棄しない。`CDP-2`）。
-    fn defer_release(&mut self, scope: NavigationScope) -> Result<(), ScriptContextError> {
-        let seq = self.next_id;
-        if self.pending_release.len() >= MAX_TRACKED_SCOPES
-            && !self.pending_release.contains_key(&scope)
-        {
-            return Err(notification_limit_error());
-        }
-        self.pending_release.insert(scope, seq);
+        self.overflow.push_back(task);
         Ok(())
     }
 
@@ -740,6 +725,7 @@ impl State {
         if let Some(Task::BeginGeneration {
             scope: s,
             generation: g,
+            ..
         }) = self.queue.back_mut()
             && *s == scope
         {
@@ -878,8 +864,7 @@ impl ScriptContextHandle {
                         next_id: 0,
                         live_contexts: 0,
                         latest: HashMap::new(),
-                        pending_begin: Vec::new(),
-                        pending_release: HashMap::new(),
+                        overflow: VecDeque::new(),
                     }),
                     wake: Condvar::new(),
                 }),
@@ -929,7 +914,7 @@ impl ScriptContextHandle {
         scope: NavigationScope,
         generation: NavigationGeneration,
     ) -> Result<(), ScriptContextError> {
-        self.notify(Task::BeginGeneration { scope, generation })
+        self.notify(NoticeKind::Begin { scope, generation })
     }
 
     /// `scope` のコンテキストをすべて破棄し、世代の記録も消す（非同期。ターゲットのクローズ時に
@@ -938,51 +923,57 @@ impl ScriptContextHandle {
     ///
     /// 保留が上限に達して受け付けられないときは [`ScriptContextError::LimitExceeded`] を返す。
     pub fn release_scope(&self, scope: NavigationScope) -> Result<(), ScriptContextError> {
-        self.notify(Task::ReleaseScope { scope })
+        self.notify(NoticeKind::Release { scope })
     }
 
-    fn notify(&self, task: Task) -> Result<(), ScriptContextError> {
+    fn notify(&self, kind: NoticeKind) -> Result<(), ScriptContextError> {
         let Some(inner) = self.inner.as_ref() else {
             return Ok(());
         };
         let mut st = inner.shared.lock();
         if st.worker_alive {
+            let seq = st.alloc_seq();
+            let task = match kind {
+                NoticeKind::Begin { scope, generation } => Task::BeginGeneration {
+                    scope,
+                    generation,
+                    seq,
+                },
+                NoticeKind::Release { scope } => Task::ReleaseScope { scope, seq },
+            };
             // 通知にも評価と同じ上限を課す（`JS-6`。評価実行中に通知を連投されても無制限に増やさない）。
-            // 上限内なら FIFO で積む。上限に達したら、末尾が同一 scope の世代通知なら畳み込み
-            // （世代は大きい方を採る）、それ以外は有界な保留状態へ積む（ワーカーが順序境界を守って必ず消化する）。
-            if st.queued_notifications() < inner.queue_capacity {
-                st.queue.push_back(task);
-                drop(st);
-                inner.shared.wake.notify_all();
-                return Ok(());
-            }
-            let task = match task {
-                Task::BeginGeneration { scope, generation } => {
-                    if st.coalesce_begin(scope, generation) {
-                        return Ok(());
-                    }
-                    Task::BeginGeneration { scope, generation }
+            // 上限内なら FIFO で積む。上限に達したら有界な保留（`overflow`）へ到着順で積み、ワーカーが
+            // 待ち行列と保留を `seq` で突き合わせて到着順に適用する。保留が残る間は新しい通知も保留へ
+            // 積み、待ち行列の通知が保留より先に並ぶ逆転を作らない（`CDP-2`）。
+            if !st.has_pending() {
+                if st.queued_notifications() < inner.queue_capacity {
+                    st.queue.push_back(task);
+                    drop(st);
+                    inner.shared.wake.notify_all();
+                    return Ok(());
                 }
-                other => other,
-            };
-            let deferred = match task {
-                Task::BeginGeneration { scope, generation } => st.defer_begin(scope, generation),
-                Task::ReleaseScope { scope } => st.defer_release(scope),
-                Task::Evaluate(_) => Ok(()),
-            };
+                // 満杯でも、末尾が同一 scope の世代通知なら間に何も無いので畳み込める。
+                if let Task::BeginGeneration {
+                    scope, generation, ..
+                } = task
+                    && st.coalesce_begin(scope, generation)
+                {
+                    return Ok(());
+                }
+            }
+            let deferred = st.defer(task);
             drop(st);
             inner.shared.wake.notify_all();
             return deferred;
         }
         // ワーカーが居ない間はコンテキストも無い（ガードが写しを 0 に戻す）。記録だけ直接更新する。
-        match task {
-            Task::BeginGeneration { scope, generation } => {
+        match kind {
+            NoticeKind::Begin { scope, generation } => {
                 st.note_latest(scope, generation, &HashSet::new());
             }
-            Task::ReleaseScope { scope } => {
+            NoticeKind::Release { scope } => {
                 st.latest.remove(&scope);
             }
-            Task::Evaluate(_) => {}
         }
         Ok(())
     }
@@ -1175,8 +1166,7 @@ impl Drop for WorkerGuard {
         st.worker_alive = false;
         st.live_contexts = 0;
         // コンテキストはこのワーカーと共に破棄されるため、保留の通知は不要になる。
-        st.pending_begin.clear();
-        st.pending_release.clear();
+        st.overflow.clear();
         // 券の Drop が Terminated を書く。
         st.queue.clear();
     }
@@ -1208,11 +1198,8 @@ fn worker_main(shared: &Arc<Shared>, config: &WorkerConfig, generation: u64) {
                 if st.shutdown {
                     return;
                 }
-                if let Some(work) = st.take_ready_pending() {
-                    break Work::Pending(work);
-                }
-                if let Some(t) = st.queue.pop_front() {
-                    break Work::Task(t);
+                if let Some(t) = st.pop_next() {
+                    break t;
                 }
                 if contexts.is_empty() && !st.has_pending() {
                     // 同じロック内で停止状態にする（取りこぼし防止）。
@@ -1222,21 +1209,16 @@ fn worker_main(shared: &Arc<Shared>, config: &WorkerConfig, generation: u64) {
                 st = shared.wake.wait(st).unwrap_or_else(PoisonError::into_inner);
             }
         };
-        let task = match task {
-            Work::Task(t) => t,
-            Work::Pending(work) => {
-                apply_pending(shared, &mut contexts, work);
-                continue;
-            }
-        };
         match task {
-            Task::BeginGeneration { scope, generation } => {
+            Task::BeginGeneration {
+                scope, generation, ..
+            } => {
                 let live = live_scopes(&contexts);
                 shared.lock().note_latest(scope, generation, &live);
                 contexts.retain(|k, _| k.scope != scope || k.generation >= generation);
                 sync_live(shared, &contexts);
             }
-            Task::ReleaseScope { scope } => {
+            Task::ReleaseScope { scope, .. } => {
                 contexts.retain(|k, _| k.scope != scope);
                 let mut st = shared.lock();
                 st.latest.remove(&scope);
@@ -1268,26 +1250,6 @@ fn worker_main(shared: &Arc<Shared>, config: &WorkerConfig, generation: u64) {
             }
         }
     }
-}
-
-/// ワーカーが取り出す次の仕事（待ち行列の要素か、保留中の通知）。
-enum Work {
-    Task(Task),
-    Pending(PendingWork),
-}
-
-/// 保留中の世代通知・解放要求を適用する（ワーカースレッド上）。
-fn apply_pending(shared: &Shared, contexts: &mut CtxTable, work: PendingWork) {
-    for (scope, generation) in work.begins {
-        let live = live_scopes(contexts);
-        shared.lock().note_latest(scope, generation, &live);
-        contexts.retain(|k, _| k.scope != scope || k.generation >= generation);
-    }
-    for scope in work.releases {
-        contexts.retain(|k, _| k.scope != scope);
-        shared.lock().latest.remove(&scope);
-    }
-    sync_live(shared, contexts);
 }
 
 fn live_scopes(contexts: &CtxTable) -> HashSet<NavigationScope> {

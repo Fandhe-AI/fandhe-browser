@@ -539,7 +539,7 @@ fn js_1_evaluation_failed_is_truncated_and_not_echoed_in_display() {
 }
 
 /// `JS-6`: 評価実行中に通知を連投しても、待ち行列の通知は上限（待ち行列容量）を超えて増えない。
-/// 積めなかった世代通知は記録へ直接反映され、古い世代の評価は `NotFound` になる。
+/// 積めなかった通知は到着順の保留へ入り（上限超過は `LimitExceeded`）、古い世代の評価は `NotFound` になる。
 #[test]
 fn js_6_notification_flood_is_bounded_and_still_marks_stale() {
     let probe = Arc::new(Probe::default());
@@ -556,11 +556,26 @@ fn js_6_notification_flood_is_bounded_and_still_marks_stale() {
         probe.blocked.load(Ordering::SeqCst) == 1
     });
     let mut newest = g1;
+    let mut rejected = None;
     for _ in 0..1000 {
-        newest = t.next_generation();
-        h.begin_generation(t.scope(), newest).expect("notify");
-        h.release_scope(Target::new().scope()).expect("notify");
+        let g = t.next_generation();
+        if let Err(e) = h.begin_generation(t.scope(), g) {
+            rejected = Some(e);
+            break;
+        }
+        newest = g;
+        if let Err(e) = h.release_scope(Target::new().scope()) {
+            rejected = Some(e);
+            break;
+        }
     }
+    // 到着順を保つため保留は件数で有界（1024）。超過は黙って捨てず `LimitExceeded` で返る。
+    assert_eq!(
+        rejected,
+        Some(ScriptContextError::LimitExceeded {
+            limit: ScriptContextLimit::Queue { capacity: 1024 }
+        })
+    );
     let notes = {
         let inner = h.inner.as_ref().expect("enabled");
         inner.shared.lock().queued_notifications()
@@ -953,4 +968,44 @@ fn cdp_2_begin_overflow_returns_error() {
     ));
     probe.open_gate();
     let _ = block_on(running);
+}
+
+/// `CDP-2`・`JS-6`: 待ち行列にある世代通知（begin）の後で、満杯のため保留へ回った解放（release）は
+/// 到着順のまま適用される。release が先に走り、後から begin が記録を書き戻して解放済み scope が
+/// 「最新世代 g2 の live な scope」に見えてしまう逆転を起こさない。
+#[test]
+fn cdp_2_overflowed_release_applies_after_queued_begin_in_arrival_order() {
+    let probe = Arc::new(Probe::default());
+    let h = handle_with(
+        &probe,
+        ScriptContextOptions::default().with_queue_capacity(1),
+    );
+    let t = Target::new();
+    let g1 = t.next_generation();
+    let key = ScriptContextKey::new(t.scope(), g1, 1);
+    assert_eq!(eval(&h, key, "count"), Ok("1".to_string()));
+    let busy = Target::new();
+    let running = h.evaluate(
+        ScriptContextKey::new(busy.scope(), busy.next_generation(), 1),
+        doc(),
+        "block",
+        &ScriptEvalOptions::default(),
+    );
+    wait_until("worker is blocked", || {
+        probe.blocked.load(Ordering::SeqCst) == 1
+    });
+    let g2 = t.next_generation();
+    // begin は待ち行列（容量 1）へ、続く release は満杯で保留へ入る。
+    h.begin_generation(t.scope(), g2).expect("queued");
+    h.release_scope(t.scope()).expect("overflowed");
+    probe.open_gate();
+    assert_eq!(
+        block_on(running).map(ScriptEvalOutput::into_value),
+        Ok("unblocked".to_string())
+    );
+    wait_until("t's context is dropped", || h.stats().live_contexts() == 1);
+    assert_eq!(probe.engine_drops.load(Ordering::SeqCst), 1);
+    // release が最後に適用されたので世代の記録は残らず、g1 は stale 扱い（NotFound）にならない。
+    // （逆転していれば記録が g2 に書き戻され、g1 の評価は NotFound になる。）
+    assert_eq!(eval(&h, key, "count"), Ok("1".to_string()));
 }
