@@ -839,7 +839,13 @@ impl ScriptContextHandle {
         }));
 
         if !st.worker_alive {
-            if spawn_worker(Arc::clone(shared), Arc::clone(&inner.config)).is_err() {
+            if spawn_worker(
+                Arc::clone(shared),
+                Arc::clone(&inner.config),
+                st.worker_spawns.saturating_add(1),
+            )
+            .is_err()
+            {
                 // 積んだ要求を取り消す（券の Drop が書く Terminated ではなく失敗理由を返す）。
                 st.queue.pop_back();
                 return ScriptEvalFuture::ready(Err(ScriptContextError::Unavailable {
@@ -933,23 +939,37 @@ impl Drop for ScriptEvalFuture {
 }
 
 /// ワーカースレッドを起動する。呼び出し元は `State` のロックを保持している。
-fn spawn_worker(shared: Arc<Shared>, config: Arc<WorkerConfig>) -> std::io::Result<()> {
+///
+/// `generation` はこのワーカーの世代番号（起動後の `worker_spawns` と一致する値）。
+fn spawn_worker(
+    shared: Arc<Shared>,
+    config: Arc<WorkerConfig>,
+    generation: u64,
+) -> std::io::Result<()> {
     std::thread::Builder::new()
         .name(WORKER_THREAD_NAME.to_string())
-        .spawn(move || worker_main(&shared, &config))
+        .spawn(move || worker_main(&shared, &config, generation))
         .map(|_| ())
 }
 
 /// ワーカー終了時の後始末（正常終了でも unwind でも）。写しを 0 に戻し、停止状態にし、
 /// 待っている要求を `Terminated` で解決する。戻さないと panic 後に幻の件数が残り、以後の評価が
 /// すべて上限超過になる。`Drop` 内では panic し得る操作を使わない。
+///
+/// アイドル終了の `worker_alive = false` からこの Drop までの隙間に別スレッドが新ワーカーを起動し得る。
+/// そのため自分の世代（`generation`）が最新のときだけ後始末し、新しい世代が居れば何もしない
+/// （新ワーカーの待ち行列・生存フラグ・件数を壊さない）。
 struct WorkerGuard {
     shared: Arc<Shared>,
+    generation: u64,
 }
 
 impl Drop for WorkerGuard {
     fn drop(&mut self) {
         let mut st = self.shared.lock();
+        if st.worker_spawns != self.generation {
+            return;
+        }
         st.worker_alive = false;
         st.live_contexts = 0;
         // 券の Drop が Terminated を書く。
@@ -969,10 +989,11 @@ fn sync_live(shared: &Shared, contexts: &CtxTable) {
     shared.lock().live_contexts = contexts.len();
 }
 
-fn worker_main(shared: &Arc<Shared>, config: &WorkerConfig) {
+fn worker_main(shared: &Arc<Shared>, config: &WorkerConfig, generation: u64) {
     // 宣言順の逆に drop される: `contexts`（子プロセスの破棄）→ `guard`（写しのリセット）。
     let _guard = WorkerGuard {
         shared: Arc::clone(shared),
+        generation,
     };
     let mut contexts: CtxTable = HashMap::new();
     loop {

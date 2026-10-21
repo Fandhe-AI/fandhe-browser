@@ -678,3 +678,35 @@ fn js_1_debug_and_display_do_not_echo_inputs() {
     let key = ScriptContextKey::new(t.scope(), t.next_generation(), 9);
     assert_eq!(key.world(), 9);
 }
+
+/// アイドル終了した旧ワーカーのガードが、その後に起動した新ワーカーの状態を壊さない
+/// （`CDP-2`・`JS-6`。旧世代の Drop は `worker_alive`・件数・待ち行列に触れない）。
+#[test]
+fn cdp_2_stale_worker_guard_does_not_clobber_newer_worker() {
+    let probe = Arc::new(Probe::default());
+    let h = handle_with(&probe, ScriptContextOptions::default());
+    let t = Target::new();
+    let g1 = t.next_generation();
+    assert_eq!(
+        eval(&h, ScriptContextKey::new(t.scope(), g1, 1), "hi"),
+        Ok("hi".to_string())
+    );
+    assert_eq!(h.stats().worker_spawns(), 1);
+    assert!(h.stats().worker_running());
+    assert_eq!(h.stats().live_contexts(), 1);
+
+    // 世代 0 は既に置き換えられた旧ワーカー相当。
+    let shared = Arc::clone(&h.inner.as_ref().expect("enabled").shared);
+    drop(WorkerGuard {
+        shared,
+        generation: 0,
+    });
+    assert!(h.stats().worker_running());
+    assert_eq!(h.stats().live_contexts(), 1);
+    assert_eq!(
+        eval(&h, ScriptContextKey::new(t.scope(), g1, 1), "again"),
+        Ok("again".to_string())
+    );
+    assert_eq!(h.stats().worker_spawns(), 1);
+    assert_eq!(probe.factory_calls.load(Ordering::SeqCst), 1);
+}
