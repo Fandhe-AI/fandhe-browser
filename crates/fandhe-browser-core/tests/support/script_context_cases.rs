@@ -139,8 +139,8 @@ pub fn run(engine: &str) {
         assert!(h.is_enabled());
         let t = Target::new();
         let g = t.generation();
-        h.begin_generation(t.nav.scope(), g);
-        h.release_scope(t.nav.scope());
+        h.begin_generation(t.nav.scope(), g).expect("notify");
+        h.release_scope(t.nav.scope()).expect("notify");
         assert_eq!(h.stats().worker_spawns(), 0);
         assert!(!h.stats().worker_running());
         assert_eq!(thread_count(), base_threads);
@@ -160,7 +160,7 @@ pub fn run(engine: &str) {
         );
 
         eprintln!("case: CDP-2 release leaves no thread or child");
-        h.release_scope(t.nav.scope());
+        h.release_scope(t.nav.scope()).expect("notify");
         wait_until("worker gone after release", || {
             let s = h.stats();
             s.live_contexts() == 0
@@ -443,7 +443,7 @@ pub fn run(engine: &str) {
             h.stats().live_contexts() == 1
                 && child_process_count() == base_children + usize::from(cfg!(target_os = "linux"))
         });
-        h.release_scope(t.nav.scope());
+        h.release_scope(t.nav.scope()).expect("notify");
         wait_until("released", || {
             !h.stats().worker_running() && child_process_count() == base_children
         });

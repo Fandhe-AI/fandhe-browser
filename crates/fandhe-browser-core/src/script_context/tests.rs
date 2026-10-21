@@ -200,8 +200,9 @@ fn js_1_disabled_handle_returns_unavailable() {
     );
     assert_eq!(h.stats().worker_spawns(), 0);
     // 無効なハンドルへの通知は何もしない。
-    h.begin_generation(t.scope(), t.next_generation());
-    h.release_scope(t.scope());
+    h.begin_generation(t.scope(), t.next_generation())
+        .expect("notify");
+    h.release_scope(t.scope()).expect("notify");
     assert_eq!(h.stats().worker_spawns(), 0);
 }
 
@@ -212,9 +213,9 @@ fn perf_7_no_worker_until_first_evaluate() {
     assert!(h.is_enabled());
     let t = Target::new();
     let g1 = t.next_generation();
-    h.begin_generation(t.scope(), g1);
-    h.release_scope(t.scope());
-    h.begin_generation(t.scope(), g1);
+    h.begin_generation(t.scope(), g1).expect("notify");
+    h.release_scope(t.scope()).expect("notify");
+    h.begin_generation(t.scope(), g1).expect("notify");
     assert_eq!(h.stats().worker_spawns(), 0);
     assert!(!h.stats().worker_running());
     assert_eq!(probe.factory_calls.load(Ordering::SeqCst), 0);
@@ -303,7 +304,7 @@ fn cdp_2_begin_generation_drops_contexts() {
     let g2 = t.next_generation();
     let key = ScriptContextKey::new(t.scope(), g1, 1);
     assert_eq!(eval(&h, key, "count"), Ok("1".to_string()));
-    h.begin_generation(t.scope(), g2);
+    h.begin_generation(t.scope(), g2).expect("notify");
     wait_until("context dropped and worker exited", || {
         let s = h.stats();
         s.live_contexts() == 0 && !s.worker_running()
@@ -330,7 +331,7 @@ fn cdp_2_release_scope_drops_contexts_and_worker_exits() {
         );
     }
     assert_eq!(h.stats().live_contexts(), 3);
-    h.release_scope(t.scope());
+    h.release_scope(t.scope()).expect("notify");
     wait_until("all dropped and worker exited", || {
         let s = h.stats();
         s.live_contexts() == 0 && !s.worker_running()
@@ -557,8 +558,8 @@ fn js_6_notification_flood_is_bounded_and_still_marks_stale() {
     let mut newest = g1;
     for _ in 0..1000 {
         newest = t.next_generation();
-        h.begin_generation(t.scope(), newest);
-        h.release_scope(Target::new().scope());
+        h.begin_generation(t.scope(), newest).expect("notify");
+        h.release_scope(Target::new().scope()).expect("notify");
     }
     let notes = {
         let inner = h.inner.as_ref().expect("enabled");
@@ -781,8 +782,8 @@ fn cdp_2_release_scope_is_not_lost_when_notification_queue_is_full() {
         probe.blocked.load(Ordering::SeqCst) == 1
     });
     // 通知の待ち行列（容量 1）を無関係な解放で埋めてから、本命の解放を送る。
-    h.release_scope(Target::new().scope());
-    h.release_scope(closing.scope());
+    h.release_scope(Target::new().scope()).expect("notify");
+    h.release_scope(closing.scope()).expect("notify");
     probe.open_gate();
     assert_eq!(
         block_on(running).map(ScriptEvalOutput::into_value),
@@ -816,10 +817,10 @@ fn cdp_2_begin_generation_coalescing_does_not_cross_an_evaluate() {
         probe.blocked.load(Ordering::SeqCst) == 1
     });
     let g2 = t.next_generation();
-    h.begin_generation(t.scope(), g2);
+    h.begin_generation(t.scope(), g2).expect("notify");
     let e2 = h.evaluate(ScriptContextKey::new(t.scope(), g2, 1), doc(), "e2", &opts);
     let g3 = t.next_generation();
-    h.begin_generation(t.scope(), g3);
+    h.begin_generation(t.scope(), g3).expect("notify");
     probe.open_gate();
     assert_eq!(
         block_on(running).map(ScriptEvalOutput::into_value),
@@ -860,12 +861,12 @@ fn cdp_2_earlier_begin_generation_applies_before_later_evaluate_after_coalescing
         probe.blocked.load(Ordering::SeqCst) == 1
     });
     // 通知の待ち行列（容量 1）を別 scope の通知で埋める。
-    h.release_scope(Target::new().scope());
+    h.release_scope(Target::new().scope()).expect("notify");
     let g2 = t.next_generation();
-    h.begin_generation(t.scope(), g2);
+    h.begin_generation(t.scope(), g2).expect("notify");
     let e1 = h.evaluate(ScriptContextKey::new(t.scope(), g1, 1), doc(), "e1", &opts);
     let g3 = t.next_generation();
-    h.begin_generation(t.scope(), g3);
+    h.begin_generation(t.scope(), g3).expect("notify");
     probe.open_gate();
     assert_eq!(
         block_on(running).map(ScriptEvalOutput::into_value),
@@ -875,4 +876,81 @@ fn cdp_2_earlier_begin_generation_applies_before_later_evaluate_after_coalescing
         block_on(e1).map(ScriptEvalOutput::into_value),
         Err(ScriptContextError::NotFound)
     );
+}
+
+/// `CDP-2`・`JS-6`: 解放の保留が上限に達したら黙って捨てずエラーを返し、
+/// 解放を要求していない生存 scope のコンテキストは破棄しない。
+#[test]
+fn cdp_2_release_overflow_returns_error_and_keeps_live_contexts() {
+    let probe = Arc::new(Probe::default());
+    let h = handle_with(
+        &probe,
+        ScriptContextOptions::default().with_queue_capacity(1),
+    );
+    let live = Target::new();
+    let live_key = ScriptContextKey::new(live.scope(), live.next_generation(), 1);
+    assert_eq!(eval(&h, live_key, "count"), Ok("1".to_string()));
+    let busy = Target::new();
+    let busy_key = ScriptContextKey::new(busy.scope(), busy.next_generation(), 1);
+    let running = h.evaluate(busy_key, doc(), "block", &ScriptEvalOptions::default());
+    wait_until("worker is blocked", || {
+        probe.blocked.load(Ordering::SeqCst) == 1
+    });
+    // 待ち行列（容量 1）を埋め、以後の解放は保留へ入る。
+    h.release_scope(Target::new().scope()).expect("queued");
+    let mut rejected = None;
+    for _ in 0..(MAX_TRACKED_SCOPES + 1) {
+        if let Err(e) = h.release_scope(Target::new().scope()) {
+            rejected = Some(e);
+            break;
+        }
+    }
+    assert_eq!(
+        rejected,
+        Some(ScriptContextError::LimitExceeded {
+            limit: ScriptContextLimit::Queue {
+                capacity: MAX_TRACKED_SCOPES
+            }
+        })
+    );
+    probe.open_gate();
+    assert_eq!(
+        block_on(running).map(ScriptEvalOutput::into_value),
+        Ok("unblocked".to_string())
+    );
+    // 生存 scope のコンテキスト（カウンタ）は保たれる。
+    assert_eq!(eval(&h, live_key, "count"), Ok("2".to_string()));
+}
+
+/// `CDP-2`・`JS-6`: 世代通知の保留が上限に達したら黙って捨てずエラーを返す。
+#[test]
+fn cdp_2_begin_overflow_returns_error() {
+    let probe = Arc::new(Probe::default());
+    let h = handle_with(
+        &probe,
+        ScriptContextOptions::default().with_queue_capacity(1),
+    );
+    let busy = Target::new();
+    let busy_key = ScriptContextKey::new(busy.scope(), busy.next_generation(), 1);
+    let running = h.evaluate(busy_key, doc(), "block", &ScriptEvalOptions::default());
+    wait_until("worker is blocked", || {
+        probe.blocked.load(Ordering::SeqCst) == 1
+    });
+    let first = Target::new();
+    h.begin_generation(first.scope(), first.next_generation())
+        .expect("queued");
+    let mut rejected = None;
+    for _ in 0..(MAX_TRACKED_SCOPES + 1) {
+        let t = Target::new();
+        if let Err(e) = h.begin_generation(t.scope(), t.next_generation()) {
+            rejected = Some(e);
+            break;
+        }
+    }
+    assert!(matches!(
+        rejected,
+        Some(ScriptContextError::LimitExceeded { .. })
+    ));
+    probe.open_gate();
+    let _ = block_on(running);
 }

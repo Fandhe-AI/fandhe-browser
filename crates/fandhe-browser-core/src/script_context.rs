@@ -36,6 +36,8 @@
 //!   同じ世代で未作成のキーは上限内で新規作成する。`release_scope` は scope のコンテキストをすべて破棄し
 //!   記録も消す。release 後に同じ scope へ評価を送らないのは呼び出し側の契約（送られた場合は上限内で
 //!   新規作成になる）。通知と評価は同じ FIFO を通るため、送った順に処理される。
+//!   通知の保留が 1024 件を超える場合は黙って捨てず `LimitExceeded` を返す（他 scope の
+//!   コンテキストは巻き込まない）。
 //! - **上限（`JS-6`）**: 生きているコンテキスト数は全体 [`DEFAULT_MAX_LIVE_SCRIPT_CONTEXTS`]・scope
 //!   あたり [`DEFAULT_MAX_SCRIPT_CONTEXTS_PER_SCOPE`]。待ち行列は [`DEFAULT_SCRIPT_CONTEXT_QUEUE_CAPACITY`]
 //!   件（評価のみ数える。実行中を除く）で、超過は待たせず `LimitExceeded`。ソースは
@@ -617,25 +619,20 @@ struct State {
     /// ワーカーが必ず消化する。
     pending_begin: Vec<(NavigationScope, NavigationGeneration, u64)>,
     /// 待ち行列が満杯で積めなかった解放要求（scope → 保留した時点の評価 id 採番位置）。
-    /// 件数が上限を超えたら `pending_release_all` に倒す（解放要求を失わない）。
+    /// 件数が上限（`MAX_TRACKED_SCOPES`）に達した状態で新しい scope が来たら、黙って捨てず
+    /// 呼び出し側へ `LimitExceeded` を返す（無関係な scope のコンテキストは巻き込まない）。
     pending_release: HashMap<NavigationScope, u64>,
-    /// 保留の解放が上限を超えた（保留した時点の評価 id 採番位置）。先に積まれた評価が無くなった時点で
-    /// 全コンテキストを破棄する（`CDP-2`）。
-    pending_release_all: Option<u64>,
 }
 
 /// ワーカーが消化する保留中の通知（`State::take_ready_pending` が返す）。
 struct PendingWork {
     begins: Vec<(NavigationScope, NavigationGeneration)>,
     releases: Vec<NavigationScope>,
-    release_all: bool,
 }
 
 impl State {
     fn has_pending(&self) -> bool {
-        !self.pending_begin.is_empty()
-            || !self.pending_release.is_empty()
-            || self.pending_release_all.is_some()
+        !self.pending_begin.is_empty() || !self.pending_release.is_empty()
     }
 
     /// 保留のうち、順序境界を越えずに適用できるものを取り出す。
@@ -668,10 +665,7 @@ impl State {
             .filter(|(s, q)| !blocked(Some(**s), None, **q))
             .map(|(s, _)| *s)
             .collect();
-        let release_all = self
-            .pending_release_all
-            .is_some_and(|q| !blocked(None, None, q));
-        if begins.is_empty() && releases.is_empty() && !release_all {
+        if begins.is_empty() && releases.is_empty() {
             return None;
         }
         self.pending_begin
@@ -680,20 +674,19 @@ impl State {
             self.pending_release.remove(s);
             self.pending_begin.retain(|b| b.0 != *s);
         }
-        if release_all {
-            self.pending_release_all = None;
-            self.pending_release.clear();
-            self.pending_begin.clear();
-        }
         Some(PendingWork {
             begins: begins.into_iter().map(|(s, g, _)| (s, g)).collect(),
             releases,
-            release_all,
         })
     }
 
-    /// 満杯時の世代通知を保留へ積む（同一 scope は大きい世代へ。記録が上限なら新しい scope は捨てる）。
-    fn defer_begin(&mut self, scope: NavigationScope, generation: NavigationGeneration) {
+    /// 満杯時の世代通知を保留へ積む（同一 scope は大きい世代へ）。保留が上限なら黙って捨てず
+    /// `LimitExceeded` を返す（呼び出し側が知らないまま古い世代で評価が通ることを防ぐ。`CDP-2`）。
+    fn defer_begin(
+        &mut self,
+        scope: NavigationScope,
+        generation: NavigationGeneration,
+    ) -> Result<(), ScriptContextError> {
         let seq = self.next_id;
         // 同一 scope の直近の保留と統合できるのは、その保留以降に積まれた同 scope の評価が無いときだけ。
         let queue = &self.queue;
@@ -707,24 +700,26 @@ impl State {
                 entry.1 = generation;
             }
             entry.2 = seq;
-            return;
+            return Ok(());
         }
         if self.pending_begin.len() >= MAX_TRACKED_SCOPES {
-            return;
+            return Err(notification_limit_error());
         }
         self.pending_begin.push((scope, generation, seq));
+        Ok(())
     }
 
-    /// 満杯時の解放要求を保留へ積む。上限を超える分は全破棄へ倒す（解放要求を失わない）。
-    fn defer_release(&mut self, scope: NavigationScope) {
+    /// 満杯時の解放要求を保留へ積む。保留が上限なら黙って捨てず `LimitExceeded` を返す
+    /// （生きている他 scope のコンテキストは破棄しない。`CDP-2`）。
+    fn defer_release(&mut self, scope: NavigationScope) -> Result<(), ScriptContextError> {
         let seq = self.next_id;
         if self.pending_release.len() >= MAX_TRACKED_SCOPES
             && !self.pending_release.contains_key(&scope)
         {
-            self.pending_release_all = Some(seq);
-            return;
+            return Err(notification_limit_error());
         }
         self.pending_release.insert(scope, seq);
+        Ok(())
     }
 
     fn queued_evals(&self) -> usize {
@@ -771,6 +766,15 @@ impl State {
         if *entry < generation {
             *entry = generation;
         }
+    }
+}
+
+/// 保留の通知が上限に達したときのエラー。
+fn notification_limit_error() -> ScriptContextError {
+    ScriptContextError::LimitExceeded {
+        limit: ScriptContextLimit::Queue {
+            capacity: MAX_TRACKED_SCOPES,
+        },
     }
 }
 
@@ -876,7 +880,6 @@ impl ScriptContextHandle {
                         latest: HashMap::new(),
                         pending_begin: Vec::new(),
                         pending_release: HashMap::new(),
-                        pending_release_all: None,
                     }),
                     wake: Condvar::new(),
                 }),
@@ -918,20 +921,29 @@ impl ScriptContextHandle {
     /// 古い世代のコンテキストを破棄する（cdp の遷移経路〔#1217〕が世代の払い出し直後に呼ぶ。
     /// `PageScriptHandle::begin_generation` と同じ名前）。ワーカーが居なければコンテキストも無いため、
     /// スレッドは起動せず記録だけ更新する（`PERF-7`）。
-    pub fn begin_generation(&self, scope: NavigationScope, generation: NavigationGeneration) {
-        self.notify(Task::BeginGeneration { scope, generation });
+    ///
+    /// 通知の保留が上限に達して受け付けられないときは [`ScriptContextError::LimitExceeded`] を返す
+    /// （黙って捨てない。呼び出し側は世代の払い出しを巻き戻すか対象を閉じること）。
+    pub fn begin_generation(
+        &self,
+        scope: NavigationScope,
+        generation: NavigationGeneration,
+    ) -> Result<(), ScriptContextError> {
+        self.notify(Task::BeginGeneration { scope, generation })
     }
 
     /// `scope` のコンテキストをすべて破棄し、世代の記録も消す（非同期。ターゲットのクローズ時に
     /// cdp が呼ぶ）。release 後に同じ scope へ評価を送らないのは呼び出し側の契約で、送られた場合は
     /// 上限内で新規作成になる。
-    pub fn release_scope(&self, scope: NavigationScope) {
-        self.notify(Task::ReleaseScope { scope });
+    ///
+    /// 保留が上限に達して受け付けられないときは [`ScriptContextError::LimitExceeded`] を返す。
+    pub fn release_scope(&self, scope: NavigationScope) -> Result<(), ScriptContextError> {
+        self.notify(Task::ReleaseScope { scope })
     }
 
-    fn notify(&self, task: Task) {
+    fn notify(&self, task: Task) -> Result<(), ScriptContextError> {
         let Some(inner) = self.inner.as_ref() else {
-            return;
+            return Ok(());
         };
         let mut st = inner.shared.lock();
         if st.worker_alive {
@@ -942,25 +954,25 @@ impl ScriptContextHandle {
                 st.queue.push_back(task);
                 drop(st);
                 inner.shared.wake.notify_all();
-                return;
+                return Ok(());
             }
             let task = match task {
                 Task::BeginGeneration { scope, generation } => {
                     if st.coalesce_begin(scope, generation) {
-                        return;
+                        return Ok(());
                     }
                     Task::BeginGeneration { scope, generation }
                 }
                 other => other,
             };
-            match task {
+            let deferred = match task {
                 Task::BeginGeneration { scope, generation } => st.defer_begin(scope, generation),
                 Task::ReleaseScope { scope } => st.defer_release(scope),
-                Task::Evaluate(_) => {}
-            }
+                Task::Evaluate(_) => Ok(()),
+            };
             drop(st);
             inner.shared.wake.notify_all();
-            return;
+            return deferred;
         }
         // ワーカーが居ない間はコンテキストも無い（ガードが写しを 0 に戻す）。記録だけ直接更新する。
         match task {
@@ -972,6 +984,7 @@ impl ScriptContextHandle {
             }
             Task::Evaluate(_) => {}
         }
+        Ok(())
     }
 
     /// `document` の上で `source` を評価する要求を出す。結果は [`ScriptEvalOutput`]（JS 評価結果の文字列を持つ）。
@@ -983,7 +996,7 @@ impl ScriptContextHandle {
         &self,
         key: ScriptContextKey,
         document: Arc<NavigationResult>,
-        source: impl Into<String>,
+        source: impl AsRef<str>,
         opts: &ScriptEvalOptions,
     ) -> ScriptEvalFuture {
         let Some(inner) = self.inner.as_ref() else {
@@ -991,7 +1004,9 @@ impl ScriptContextHandle {
                 reason: UnavailableReason::Disabled,
             }));
         };
-        let source = source.into();
+        // 長さを先に検査し、受理するソースだけを所有 String へコピーする（巨大入力の二重確保を避ける。
+        // `JS-6`）。
+        let source = source.as_ref();
         if source.len() > MAX_SCRIPT_CONTEXT_SOURCE_BYTES {
             return ScriptEvalFuture::ready(Err(ScriptContextError::LimitExceeded {
                 limit: ScriptContextLimit::SourceBytes {
@@ -1000,6 +1015,7 @@ impl ScriptContextHandle {
                 },
             }));
         }
+        let source = source.to_owned();
         let shared = &inner.shared;
         let mut st = shared.lock();
         if st.queued_evals() >= inner.queue_capacity {
@@ -1161,7 +1177,6 @@ impl Drop for WorkerGuard {
         // コンテキストはこのワーカーと共に破棄されるため、保留の通知は不要になる。
         st.pending_begin.clear();
         st.pending_release.clear();
-        st.pending_release_all = None;
         // 券の Drop が Terminated を書く。
         st.queue.clear();
     }
@@ -1271,9 +1286,6 @@ fn apply_pending(shared: &Shared, contexts: &mut CtxTable, work: PendingWork) {
     for scope in work.releases {
         contexts.retain(|k, _| k.scope != scope);
         shared.lock().latest.remove(&scope);
-    }
-    if work.release_all {
-        contexts.clear();
     }
     sync_live(shared, contexts);
 }
