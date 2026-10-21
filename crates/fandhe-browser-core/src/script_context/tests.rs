@@ -1009,3 +1009,85 @@ fn cdp_2_overflowed_release_applies_after_queued_begin_in_arrival_order() {
     // （逆転していれば記録が g2 に書き戻され、g1 の評価は NotFound になる。）
     assert_eq!(eval(&h, key, "count"), Ok("1".to_string()));
 }
+
+/// 保留中の通知は、間に評価が入っても畳み込まれない（`CDP-2`）。
+/// 保留が残る状態で begin(g2) → evaluate(g2) → begin(g3) を送っても、evaluate(g2) は Ok になる。
+#[test]
+fn cdp_2_overflowed_begins_are_not_coalesced_across_an_evaluate() {
+    let probe = Arc::new(Probe::default());
+    let h = handle_with(
+        &probe,
+        ScriptContextOptions::default().with_queue_capacity(1),
+    );
+    let t = Target::new();
+    let g1 = t.next_generation();
+    let busy = Target::new();
+    let opts = ScriptEvalOptions::default();
+    let running = h.evaluate(
+        ScriptContextKey::new(busy.scope(), busy.next_generation(), 1),
+        doc(),
+        "block",
+        &opts,
+    );
+    wait_until("worker is blocked", || {
+        probe.blocked.load(Ordering::SeqCst) == 1
+    });
+    // 待ち行列を埋め、以後の通知を保留へ回す。
+    h.release_scope(Target::new().scope()).expect("queued");
+    let g2 = t.next_generation();
+    h.begin_generation(t.scope(), g1).expect("overflowed");
+    h.begin_generation(t.scope(), g2).expect("overflowed");
+    let e2 = h.evaluate(ScriptContextKey::new(t.scope(), g2, 1), doc(), "e2", &opts);
+    let g3 = t.next_generation();
+    h.begin_generation(t.scope(), g3).expect("overflowed");
+    probe.open_gate();
+    assert_eq!(
+        block_on(running).map(ScriptEvalOutput::into_value),
+        Ok("unblocked".to_string())
+    );
+    assert_eq!(
+        block_on(e2).map(ScriptEvalOutput::into_value),
+        Ok("e2".to_string())
+    );
+}
+
+/// 保留中の解放は、間に評価を挟んだ 2 回目も適用される（`CDP-2`）。
+#[test]
+fn cdp_2_overflowed_releases_around_an_evaluate_are_both_applied() {
+    let probe = Arc::new(Probe::default());
+    let h = handle_with(
+        &probe,
+        ScriptContextOptions::default().with_queue_capacity(1),
+    );
+    let t = Target::new();
+    let key = ScriptContextKey::new(t.scope(), t.next_generation(), 1);
+    let busy = Target::new();
+    let opts = ScriptEvalOptions::default();
+    let running = h.evaluate(
+        ScriptContextKey::new(busy.scope(), busy.next_generation(), 1),
+        doc(),
+        "block",
+        &opts,
+    );
+    wait_until("worker is blocked", || {
+        probe.blocked.load(Ordering::SeqCst) == 1
+    });
+    h.release_scope(Target::new().scope()).expect("queued");
+    h.release_scope(t.scope()).expect("overflowed");
+    // 解放の後に作られたコンテキストを、2 回目の解放が破棄する。
+    let e = h.evaluate(key, doc(), "e", &opts);
+    h.release_scope(t.scope()).expect("overflowed");
+    probe.open_gate();
+    assert_eq!(
+        block_on(running).map(ScriptEvalOutput::into_value),
+        Ok("unblocked".to_string())
+    );
+    assert_eq!(
+        block_on(e).map(ScriptEvalOutput::into_value),
+        Ok("e".to_string())
+    );
+    wait_until("t's context is dropped by the second release", || {
+        h.stats().live_contexts() == 1
+    });
+    assert_eq!(probe.engine_drops.load(Ordering::SeqCst), 1);
+}

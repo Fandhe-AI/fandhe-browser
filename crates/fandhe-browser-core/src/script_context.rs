@@ -675,31 +675,9 @@ impl State {
 
     /// 満杯時の通知を保留へ積む。保留が上限なら黙って捨てず `LimitExceeded` を返す
     /// （呼び出し側が知らないまま古い世代で評価が通る・解放が失われることを防ぐ。`CDP-2`）。
-    /// 末尾が同一 scope の同種の通知なら、間に何も無いので畳み込む（世代は大きい方を採る）。
+    /// 評価は別の待ち行列に積まれ、保留の通知の間に評価が入りうるため、保留同士は畳み込まない
+    /// （畳み込むと先に受理した評価が `NotFound` になる・後続の解放が失われる。`CDP-2`）。
     fn defer(&mut self, task: Task) -> Result<(), ScriptContextError> {
-        match (self.overflow.back_mut(), &task) {
-            (
-                Some(Task::BeginGeneration {
-                    scope: s,
-                    generation: g,
-                    ..
-                }),
-                Task::BeginGeneration {
-                    scope, generation, ..
-                },
-            ) if s == scope => {
-                if *g < *generation {
-                    *g = *generation;
-                }
-                return Ok(());
-            }
-            (Some(Task::ReleaseScope { scope: s, .. }), Task::ReleaseScope { scope, .. })
-                if s == scope =>
-            {
-                return Ok(());
-            }
-            _ => {}
-        }
         if self.overflow.len() >= MAX_TRACKED_SCOPES {
             return Err(notification_limit_error());
         }
