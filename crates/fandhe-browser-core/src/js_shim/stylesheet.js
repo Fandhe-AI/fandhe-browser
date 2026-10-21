@@ -19,7 +19,8 @@
 //   （emotion は insert のたびに `cssRules.length` を読むため、作り直すと O(N^2) になる）。
 // - `insertRule` は 1 つのルールであることだけを構造的に検査する（引用符・エスケープ・
 //   コメント・括弧を追跡する線形走査。正規表現も eval も使わない）。文字列は保持して読み戻す
-//   だけで、評価・取得（`@import` を含む）はしない。
+//   だけで、評価・取得（`@import` を含む）はしない。引用符なしの `url(...)` は 1 トークンとして
+//   読み飛ばす（Issue #1208）。
 // - 上限（JS-6）: シートごとのルール数 65536・1 ルール 65536 UTF-16 単位・シートの合計
 //   4 MiB（UTF-16 単位）。超過は成功を装わず `QuotaExceededError`（DOMException）を投げ、
 //   ページごとに 1 回だけ `consoleMessage` op（warn）で通知する。長さは走査より前に判定する。
@@ -28,6 +29,7 @@
 // - ES2015 の範囲に留める（V8 と boa で同一のソース。class / Proxy は使わない）。
 //
 // 未実装（REPAIR-3。黙って成功扱いにはしない）:
+// - エスケープで綴った `url`（`\75 rl(` 等）は url-token として扱わない（従来どおりの走査）。
 // - `cssRules` は空から始まり、`<style>` のテキスト内容・後から追加されたテキストノード・
 //   HTML パーサーで作られた style 要素の内容を反映しない。将来は core の
 //   `cssom::split_rule_blocks` と連携した初期化を検討する。
@@ -118,7 +120,16 @@
         return c === 32 || c === 9 || c === 10 || c === 13 || c === 12;
     }
 
+    // 識別子（名前）に使える文字か（A-Z a-z 0-9 _ - と非 ASCII）。url-token の境界判定用。
+    function isNameCode(c) {
+        return (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || (c >= 48 && c <= 57) ||
+            c === 95 || c === 45 || c >= 128;
+    }
+
     // 1 つのルールであることだけを見る構造検査（構文・セレクタ・宣言は検証しない）。
+    // 引用符なしの `url(` は CSS Syntax の url-token と同じく、エスケープされていない `)` までを
+    // 1 トークンとして読み飛ばす（中の波括弧・引用符・括弧・セミコロンを数えない。Issue #1208）。
+    // 引用符つきの `url("...")` は関数トークンなので、従来どおり括弧と文字列の処理に任せる。
     function isSingleRule(text) {
         var n = text.length;
         var depth = 0;
@@ -129,6 +140,8 @@
         var isAt = false;
         var done = false;
         var i = 0;
+        // 直前の名前文字（またはエスケープ）の直後の位置。`xurl(` を url-token と誤認しないため。
+        var nameEnd = -1;
         while (i < n) {
             var c = sCharCodeAt(text, i);
             // コメント。
@@ -149,6 +162,39 @@
             }
             if (done) {
                 return false;
+            }
+            if ((c === 117 || c === 85) && nameEnd !== i && i + 3 < n &&
+                (sCharCodeAt(text, i + 1) | 32) === 114 && (sCharCodeAt(text, i + 2) | 32) === 108 &&
+                sCharCodeAt(text, i + 3) === 40) {
+                var j = i + 4;
+                while (j < n && isSpace(sCharCodeAt(text, j))) {
+                    j++;
+                }
+                var q = j < n ? sCharCodeAt(text, j) : 0;
+                if (q !== 34 && q !== 39) {
+                    // url-token 本体。`\` は次の 1 文字を飛ばし、`)` で閉じる。
+                    if (depth === 0) {
+                        prelude = true;
+                    }
+                    i = j;
+                    var urlClosed = false;
+                    while (i < n) {
+                        var u = sCharCodeAt(text, i);
+                        if (u === 92) {
+                            i += 2;
+                            continue;
+                        }
+                        i++;
+                        if (u === 41) {
+                            urlClosed = true;
+                            break;
+                        }
+                    }
+                    if (!urlClosed) {
+                        return false;
+                    }
+                    continue;
+                }
             }
             if (c === 34 || c === 39) {
                 // 文字列（バックスラッシュは次の 1 文字を飛ばす）。
@@ -179,6 +225,7 @@
                     prelude = true;
                 }
                 i += 2;
+                nameEnd = i;
                 continue;
             }
             if (c === 40 || c === 91) {
@@ -221,6 +268,9 @@
                 prelude = true;
             }
             i++;
+            if (isNameCode(c)) {
+                nameEnd = i;
+            }
         }
         if (depth !== 0) {
             return false;

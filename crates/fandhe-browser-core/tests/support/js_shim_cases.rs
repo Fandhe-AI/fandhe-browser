@@ -3635,6 +3635,26 @@ fn style_sheet_cases(engine: &str) {
         "1,1,1,1,1,1,1,1|SyntaxError,SyntaxError,SyntaxError,SyntaxError,SyntaxError,SyntaxError,SyntaxError,SyntaxError,SyntaxError",
     );
 
+    eprintln!("case: JS-5 insertRule treats unquoted url() as one token (#1208)");
+    check(
+        &mut p,
+        r#"var ok = []; var bad = [];
+         ['.a{background:url(/img/}.png)}', '.a{background:URL( /a{b}.png )}', '.a{background:url(a\\)}b.png)}',
+          '.a{background:url(a"}b)}', '@import url(a}b.css);', '.a{background:url( "x}.png" )}'].forEach(function (r) {
+            try { s.insertRule(r, 0); ok.push(1); } catch (e) { ok.push(e.name); } });
+         ['.a{background:url(/img/}.png)', '.a{background:url(/img/}.png}', '.a{background:url(/img/}.png\\)}',
+          '.a{b:xurl(})}'].forEach(function (r) {
+            try { s.insertRule(r, 0); bad.push('ok'); } catch (e) { bad.push(e.name); } });
+         ok.join(',') + '|' + bad.join(',')"#,
+        "1,1,1,1,1,1|SyntaxError,SyntaxError,SyntaxError,SyntaxError",
+    );
+    check(
+        &mut p,
+        r#"var t3 = document.createElement('style'); document.head.appendChild(t3); var s3 = t3.sheet;
+         s3.insertRule('.a{background:url(/img/}.png)}', 0); s3.cssRules[0].cssText"#,
+        ".a{background:url(/img/}.png)}",
+    );
+
     eprintln!("case: JS-5 emotion speedy path (sheet.insertRule at cssRules.length)");
     let mut p = setup(engine, None);
     check(
