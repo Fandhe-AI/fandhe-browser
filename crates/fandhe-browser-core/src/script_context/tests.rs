@@ -761,3 +761,78 @@ fn cdp_2_stale_worker_guard_does_not_clobber_newer_worker() {
     assert_eq!(h.stats().worker_spawns(), 1);
     assert_eq!(probe.factory_calls.load(Ordering::SeqCst), 1);
 }
+
+/// `CDP-2`・`JS-6`: 通知の待ち行列が満杯でも `release_scope` の解放要求は失われず、
+/// ワーカーがコンテキスト（エンジン）を必ず破棄する。
+#[test]
+fn cdp_2_release_scope_is_not_lost_when_notification_queue_is_full() {
+    let probe = Arc::new(Probe::default());
+    let h = handle_with(
+        &probe,
+        ScriptContextOptions::default().with_queue_capacity(1),
+    );
+    let closing = Target::new();
+    let busy = Target::new();
+    let closing_key = ScriptContextKey::new(closing.scope(), closing.next_generation(), 1);
+    assert_eq!(eval(&h, closing_key, "x"), Ok("x".to_string()));
+    let busy_key = ScriptContextKey::new(busy.scope(), busy.next_generation(), 1);
+    let running = h.evaluate(busy_key, doc(), "block", &ScriptEvalOptions::default());
+    wait_until("worker is blocked", || {
+        probe.blocked.load(Ordering::SeqCst) == 1
+    });
+    // 通知の待ち行列（容量 1）を無関係な解放で埋めてから、本命の解放を送る。
+    h.release_scope(Target::new().scope());
+    h.release_scope(closing.scope());
+    probe.open_gate();
+    assert_eq!(
+        block_on(running).map(ScriptEvalOutput::into_value),
+        Ok("unblocked".to_string())
+    );
+    wait_until("closed scope's context is dropped", || {
+        h.stats().live_contexts() == 1
+    });
+    assert_eq!(probe.engine_drops.load(Ordering::SeqCst), 1);
+}
+
+/// 通知と評価は送った順に処理する。満杯時の世代通知の畳み込みは、評価を飛び越えて
+/// 先に積んだ世代通知を書き換えない（先に受理した評価が `NotFound` にならない）。
+#[test]
+fn cdp_2_begin_generation_coalescing_does_not_cross_an_evaluate() {
+    let probe = Arc::new(Probe::default());
+    let h = handle_with(
+        &probe,
+        ScriptContextOptions::default().with_queue_capacity(1),
+    );
+    let t = Target::new();
+    let g1 = t.next_generation();
+    let opts = ScriptEvalOptions::default();
+    let running = h.evaluate(
+        ScriptContextKey::new(t.scope(), g1, 1),
+        doc(),
+        "block",
+        &opts,
+    );
+    wait_until("worker is blocked", || {
+        probe.blocked.load(Ordering::SeqCst) == 1
+    });
+    let g2 = t.next_generation();
+    h.begin_generation(t.scope(), g2);
+    let e2 = h.evaluate(ScriptContextKey::new(t.scope(), g2, 1), doc(), "e2", &opts);
+    let g3 = t.next_generation();
+    h.begin_generation(t.scope(), g3);
+    probe.open_gate();
+    assert_eq!(
+        block_on(running).map(ScriptEvalOutput::into_value),
+        Ok("unblocked".to_string())
+    );
+    assert_eq!(
+        block_on(e2).map(ScriptEvalOutput::into_value),
+        Ok("e2".to_string())
+    );
+    // g3 の通知は評価の後に適用され、g2 のコンテキストは破棄される。
+    wait_until("g2 context is dropped", || h.stats().live_contexts() == 0);
+    assert_eq!(
+        eval(&h, ScriptContextKey::new(t.scope(), g2, 1), "count"),
+        Err(ScriptContextError::NotFound)
+    );
+}
