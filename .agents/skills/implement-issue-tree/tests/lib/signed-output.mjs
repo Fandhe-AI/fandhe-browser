@@ -126,11 +126,16 @@ export function treeFetchReply(prompt, nodes, opts = {}) {
   const repo = /--repo ([A-Za-z0-9._/-]+)/.exec(String(prompt))?.[1] ?? ''
   if (nonce === null || root === undefined) throw new Error('プロンプトに fetch-tree.sh のコマンドが無い')
   const truth = opts.digestNodes ?? nodes
-  const payload = { count: truth.length, inputSha256: treeInputSha256(root, repo), nodesSha256: treeNodesSha256(truth), ...(opts.payload ?? {}) }
+  const payload = { count: truth.length, inputSha256: treeInputSha256(root, repo), nodesSha256: treeNodesSha256(truth), pages: 1, ...(opts.payload ?? {}) }
   const env = makeEnvelope(opts.nonce ?? nonce, payload)
   const out = { nodes, nonce: env.nonce, payload: env.payload, sha256: opts.sha256 ?? env.sha256 }
+  // failure 申告（{ exitCode, stderr } か旧形式の文字列）。正直なエージェントは封筒を作らないので既定では封筒の欄を出さない
+  // （opts.withEnvelope = true で封筒つきの failure を模す）
+  if (opts.failure !== undefined) {
+    out.failure = opts.failure
+    if (!opts.withEnvelope) for (const k of ['nonce', 'payload', 'sha256']) delete out[k]
+  }
   for (const k of opts.omit ?? []) delete out[k]
-  if (opts.failure !== undefined) out.failure = opts.failure
   return out
 }
 
