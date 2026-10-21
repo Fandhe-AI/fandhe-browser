@@ -37,7 +37,11 @@
 //!   記録も消す。release 後に同じ scope へ評価を送らないのは呼び出し側の契約（送られた場合は上限内で
 //!   新規作成になる）。通知と評価は同じ FIFO を通るため、送った順に処理される。
 //!   通知の保留が 1024 件を超える場合は黙って捨てず `LimitExceeded` を返す（他 scope の
-//!   コンテキストは巻き込まない）。
+//!   コンテキストは巻き込まない）。世代の記録は `release_scope` でだけ消す（LRU・コンテキストの有無では
+//!   消さない。消すと古い世代の評価が通ってしまう）。記録を持つ scope 数は 1024 までで、上限に達した
+//!   状態で新しい scope の `begin_generation` / `evaluate` が来たら
+//!   [`ScriptContextLimit::TrackedScopes`] で拒否する（既知の scope は上限に関係なく受け付ける。
+//!   release で空きができる）。
 //! - **上限（`JS-6`）**: 生きているコンテキスト数は全体 [`DEFAULT_MAX_LIVE_SCRIPT_CONTEXTS`]・scope
 //!   あたり [`DEFAULT_MAX_SCRIPT_CONTEXTS_PER_SCOPE`]。待ち行列は [`DEFAULT_SCRIPT_CONTEXT_QUEUE_CAPACITY`]
 //!   件（評価のみ数える。実行中を除く）で、超過は待たせず `LimitExceeded`。ソースは
@@ -118,7 +122,10 @@ pub const MAX_SCRIPT_CONTEXT_SOURCE_BYTES: usize = 1_048_576;
 /// ワーカースレッドの名前（診断用）。
 const WORKER_THREAD_NAME: &str = "fandhe-browser-script-ctx";
 
-/// 追跡する scope の記録の上限（超えたら生きていない scope の記録から捨てる）。
+/// 世代の記録を持つ scope 数の上限。記録は `release_scope` でだけ消す（LRU 等では消さない）ため、
+/// 上限に達した状態で新しい scope の `begin_generation` / `evaluate` が来たら
+/// [`ScriptContextLimit::TrackedScopes`] で拒否する（古い世代を受け付け直さない。`CDP-2`・`JS-6`）。
+/// 既知の scope への通知・評価は上限に関係なく受け付ける。保留通知の件数の上限にも使う。
 const MAX_TRACKED_SCOPES: usize = 1024;
 
 /// js crate が全破棄経路に付けることを保証する文言（`ensure_discarded_phrase`・Issue #527）。
@@ -304,6 +311,11 @@ pub enum ScriptContextLimit {
         /// 上限。
         capacity: usize,
     },
+    /// 世代の記録を持つ scope 数（上限は `release_scope` でしか空かない）。
+    TrackedScopes {
+        /// 上限。
+        limit: usize,
+    },
     /// ソースのバイト数。
     SourceBytes {
         /// 渡されたバイト数。
@@ -421,6 +433,9 @@ impl fmt::Display for ScriptContextError {
                 }
                 ScriptContextLimit::Queue { capacity } => {
                     write!(f, "script context queue is full (capacity {capacity})")
+                }
+                ScriptContextLimit::TrackedScopes { limit } => {
+                    write!(f, "too many tracked script scopes (limit {limit})")
                 }
                 ScriptContextLimit::SourceBytes { len, limit } => {
                     write!(f, "script source is too large ({len} bytes, limit {limit})")
@@ -639,6 +654,9 @@ struct State {
     live_contexts: usize,
     /// scope ごとに見た最新の世代。ワーカーがアイドル終了・panic で消えても失われないよう共有側に置く。
     latest: HashMap<NavigationScope, NavigationGeneration>,
+    /// 世代の記録を持つ（受け付け済みの）scope。`release_scope` の受理でだけ減る。通知・評価の受理時に
+    /// 同期的に数え、上限（`MAX_TRACKED_SCOPES`）で新しい scope を拒否する。
+    known: HashSet<NavigationScope>,
     /// 待ち行列が満杯で積めなかった通知（世代変更・解放）を到着順に持つ。ワーカーは待ち行列の先頭と
     /// この先頭のうち `seq` が小さい方を先に処理するため、評価・通知とも常に到着順（FIFO）で適用される。
     /// 件数が上限（`MAX_TRACKED_SCOPES`）に達したら、黙って捨てず呼び出し側へ `LimitExceeded` を返す
@@ -649,6 +667,23 @@ struct State {
 impl State {
     fn has_pending(&self) -> bool {
         !self.overflow.is_empty()
+    }
+
+    /// scope を受け付け済みにする。新しく加えたら `Ok(true)`、既知なら `Ok(false)`。
+    /// 上限に達していて新しい scope なら拒否する。
+    fn admit(&mut self, scope: NavigationScope) -> Result<bool, ScriptContextError> {
+        if self.known.contains(&scope) {
+            return Ok(false);
+        }
+        if self.known.len() >= MAX_TRACKED_SCOPES {
+            return Err(ScriptContextError::LimitExceeded {
+                limit: ScriptContextLimit::TrackedScopes {
+                    limit: MAX_TRACKED_SCOPES,
+                },
+            });
+        }
+        self.known.insert(scope);
+        Ok(true)
     }
 
     /// 次の到着順の位置の印を払い出す（評価の `id` と共通）。
@@ -715,17 +750,8 @@ impl State {
         false
     }
 
-    /// `scope` の最新世代を `generation` に更新する（より古い値では下げない）。
-    /// 記録が上限に達していて新しい scope なら、`live` に無い scope の記録を捨ててから入れる。
-    fn note_latest(
-        &mut self,
-        scope: NavigationScope,
-        generation: NavigationGeneration,
-        live: &HashSet<NavigationScope>,
-    ) {
-        if self.latest.len() >= MAX_TRACKED_SCOPES && !self.latest.contains_key(&scope) {
-            self.latest.retain(|k, _| live.contains(k));
-        }
+    /// `scope` の最新世代を `generation` に更新する（より古い値では下げない。記録は消さない）。
+    fn note_latest(&mut self, scope: NavigationScope, generation: NavigationGeneration) {
         let entry = self.latest.entry(scope).or_insert(generation);
         if *entry < generation {
             *entry = generation;
@@ -842,6 +868,7 @@ impl ScriptContextHandle {
                         next_id: 0,
                         live_contexts: 0,
                         latest: HashMap::new(),
+                        known: HashSet::new(),
                         overflow: VecDeque::new(),
                     }),
                     wake: Condvar::new(),
@@ -908,6 +935,32 @@ impl ScriptContextHandle {
         let Some(inner) = self.inner.as_ref() else {
             return Ok(());
         };
+        // 受け付け済みの scope の集合は、通知の受理時に同期的に更新する（上限の判定のため）。
+        let (scope, newly, was_known) = {
+            let mut st = inner.shared.lock();
+            match kind {
+                NoticeKind::Begin { scope, .. } => (scope, st.admit(scope)?, false),
+                NoticeKind::Release { scope } => (scope, false, st.known.remove(&scope)),
+            }
+        };
+        let result = self.notify_admitted(kind);
+        if result.is_err() {
+            // 受理されなかった通知で集合を変えたままにしない。
+            let mut st = inner.shared.lock();
+            if newly {
+                st.known.remove(&scope);
+            }
+            if was_known {
+                st.known.insert(scope);
+            }
+        }
+        result
+    }
+
+    fn notify_admitted(&self, kind: NoticeKind) -> Result<(), ScriptContextError> {
+        let Some(inner) = self.inner.as_ref() else {
+            return Ok(());
+        };
         let mut st = inner.shared.lock();
         if st.worker_alive {
             let seq = st.alloc_seq();
@@ -947,7 +1000,7 @@ impl ScriptContextHandle {
         // ワーカーが居ない間はコンテキストも無い（ガードが写しを 0 に戻す）。記録だけ直接更新する。
         match kind {
             NoticeKind::Begin { scope, generation } => {
-                st.note_latest(scope, generation, &HashSet::new());
+                st.note_latest(scope, generation);
             }
             NoticeKind::Release { scope } => {
                 st.latest.remove(&scope);
@@ -994,6 +1047,10 @@ impl ScriptContextHandle {
                 },
             }));
         }
+        let newly_admitted = match st.admit(key.scope) {
+            Ok(n) => n,
+            Err(e) => return ScriptEvalFuture::ready(Err(e)),
+        };
         let id = st.next_id;
         st.next_id = st.next_id.wrapping_add(1);
         let state = JobState::new();
@@ -1019,6 +1076,9 @@ impl ScriptContextHandle {
             {
                 // 積んだ要求を取り消す（券の Drop が書く Terminated ではなく失敗理由を返す）。
                 st.queue.pop_back();
+                if newly_admitted {
+                    st.known.remove(&key.scope);
+                }
                 return ScriptEvalFuture::ready(Err(ScriptContextError::Unavailable {
                     reason: UnavailableReason::SpawnFailed,
                 }));
@@ -1191,8 +1251,7 @@ fn worker_main(shared: &Arc<Shared>, config: &WorkerConfig, generation: u64) {
             Task::BeginGeneration {
                 scope, generation, ..
             } => {
-                let live = live_scopes(&contexts);
-                shared.lock().note_latest(scope, generation, &live);
+                shared.lock().note_latest(scope, generation);
                 contexts.retain(|k, _| k.scope != scope || k.generation >= generation);
                 sync_live(shared, &contexts);
             }
@@ -1230,10 +1289,6 @@ fn worker_main(shared: &Arc<Shared>, config: &WorkerConfig, generation: u64) {
     }
 }
 
-fn live_scopes(contexts: &CtxTable) -> HashSet<NavigationScope> {
-    contexts.keys().map(|k| k.scope).collect()
-}
-
 /// 世代の判定・コンテキストの作成・評価を行う（ワーカースレッド上）。
 fn handle_evaluate(
     shared: &Shared,
@@ -1245,13 +1300,12 @@ fn handle_evaluate(
     opts: &ScriptEvalOptions,
 ) -> EvalResult {
     // 世代の判定。FIFO で取り出した時点で行うので、通知との順序が保たれる。
-    let live = live_scopes(contexts);
     let stale = {
         let mut st = shared.lock();
         match st.latest.get(&key.scope).copied() {
             Some(g) if g > key.generation => true,
             _ => {
-                st.note_latest(key.scope, key.generation, &live);
+                st.note_latest(key.scope, key.generation);
                 false
             }
         }

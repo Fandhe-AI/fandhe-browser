@@ -1091,3 +1091,63 @@ fn cdp_2_overflowed_releases_around_an_evaluate_are_both_applied() {
     });
     assert_eq!(probe.engine_drops.load(Ordering::SeqCst), 1);
 }
+
+/// `CDP-2`: 未解放の scope の世代記録は、別の scope が大量に通知されても消えない。
+/// begin(A, g2) のあと別 scope を 1500 個通知しても、A への g1 の評価は `NotFound` になる。
+#[test]
+fn cdp_2_generation_record_survives_many_other_scopes() {
+    let probe = Arc::new(Probe::default());
+    let h = handle_with(&probe, ScriptContextOptions::default());
+    let a = Target::new();
+    let g1 = a.next_generation();
+    let g2 = a.next_generation();
+    h.begin_generation(a.scope(), g2).expect("notify");
+    let mut accepted = 1;
+    for _ in 0..1500 {
+        if h.begin_generation(Target::new().scope(), g2).is_ok() {
+            accepted += 1;
+        }
+    }
+    assert_eq!(accepted, 1024);
+    assert_eq!(
+        eval(&h, ScriptContextKey::new(a.scope(), g1, 1), "count"),
+        Err(ScriptContextError::NotFound)
+    );
+    assert_eq!(
+        eval(&h, ScriptContextKey::new(a.scope(), g2, 1), "count"),
+        Ok("1".to_string())
+    );
+}
+
+/// `CDP-2`・`JS-6`: 追跡 scope 数が上限（1024）に達したら新しい scope を `TrackedScopes` で拒否し、
+/// 既知の scope は受け付ける。release で空きができたら新しい scope を受け付ける。
+#[test]
+fn cdp_2_tracked_scope_limit_rejects_new_scopes_until_release() {
+    let probe = Arc::new(Probe::default());
+    let h = handle_with(&probe, ScriptContextOptions::default());
+    let first = Target::new();
+    let g = first.next_generation();
+    h.begin_generation(first.scope(), g).expect("notify");
+    for _ in 1..1024 {
+        h.begin_generation(Target::new().scope(), g)
+            .expect("notify");
+    }
+    let limit = ScriptContextError::LimitExceeded {
+        limit: ScriptContextLimit::TrackedScopes { limit: 1024 },
+    };
+    let fresh = Target::new();
+    assert_eq!(h.begin_generation(fresh.scope(), g), Err(limit.clone()));
+    assert_eq!(
+        eval(&h, ScriptContextKey::new(fresh.scope(), g, 1), "x"),
+        Err(limit)
+    );
+    // 既知の scope は上限に関係なく受け付ける。
+    let g_next = first.next_generation();
+    assert_eq!(h.begin_generation(first.scope(), g_next), Ok(()));
+    h.release_scope(first.scope()).expect("release");
+    assert_eq!(h.begin_generation(fresh.scope(), g), Ok(()));
+    assert_eq!(
+        eval(&h, ScriptContextKey::new(fresh.scope(), g, 1), "x"),
+        Ok("x".to_string())
+    );
+}
