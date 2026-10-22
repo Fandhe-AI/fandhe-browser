@@ -59,8 +59,8 @@
 //! （storage.js の次）に評価する。
 //! 汎用の `EventTarget` / `Event` / `dispatchEvent`（#1177・`JS-5`）は `events.js` にあり、リスナー例外の報告に
 //! abort.js の `DOMException` と timers.js の `queueMicrotask` を使うため、timers.js・abort.js の後に評価する。
-//! `window` / `document` / `AbortSignal` は `EventTarget` を継承せず、要素の `dispatchEvent` と木に沿った
-//! 伝播・`CustomEvent` は未実装（`REPAIR-3`）。
+//! `window` / `document` / `AbortSignal` は `EventTarget` を継承しない。`CustomEvent`・要素の
+//! `dispatchEvent`（対象要素の上だけに配る。#1242）は実装済みで、木に沿った伝播は未実装（`REPAIR-3`）。
 //! フォーカス追跡（#1185・`JS-5`・`JS-6`・`REPAIR-3`）は `dom.js` が持ち（`Element.prototype.focus` / `blur` と
 //! `document.activeElement`。フォーカス可否は `isFocusable` op）、focus / blur は install 中だけの一時
 //! グローバル `__fandheDomFocusHandoff` 経由で `events.js` が対象要素にだけ配る。focusin / focusout・
