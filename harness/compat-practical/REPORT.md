@@ -1384,6 +1384,39 @@ Issue #1203 節の「次の対応」1 にあたる。コードは変えていな
 
 Issue #1200 節と同じ（probe は d3 に加えて d2 でも同条件で実行。`run_core.sh` は d2・d3 のタスク定義）。
 
+## react.dev（b1）の DOM API 補完後の再測定（#1227）
+
+spec 対応: TASK-71 / MS-6 / `COMPAT-1`・`JS-5`・`JS-6`・`SEC-2`・`REPAIR-3`。関連 Issue: #920・#1205。
+
+### 実装の要点
+
+- `Node.prototype.isEqualNode`: DOM 標準の node equals。比較は Rust の bridge op `isEqualNode`（`dom_bridge/node_equal.rs`。明示スタック・反復上限は `node_count`）
+- `window.matchMedia`: 環境の実値を読まない固定値（`matches` は常に false、`media` は渡した文字列のまま。`SEC-2`）
+- 追加 2 件（プローブで次に出た例外）: `IntersectionObserver`（何も観測しない不活性な実装）・`performance.now()`（install からの経過ミリ秒のみ）
+
+### 測定条件
+
+`compat_page_script_probe --target b1=... --modules`（v8）と、`run_core.sh --page-js v8 --page-modules` の b1 のみを 2 回。
+
+### 結果
+
+- 元の例外 2 種（`isEqualNode is not a function`・`matchMedia is not a function`）は解消した
+- 2 回とも JS は完走した（打ち切りは `virtual_time` で `wall_time` ではない）が、b1 は `success=false`（`no_match`）。実行後の `h1` は 0 個
+- 残った例外の分類: `read_property`（`toLowerCase`・`length`・`getAttribute`・`classList` の undefined 参照）。Next.js がエラーページへ差し替える経路にある
+
+### 次の対応
+
+不足 API の推定（プローブの分類に基づく）: 要素の `tagName` / `nodeName` / `localName`、`childNodes` / `attributes` の公開。ほかに `navigator.platform` 等の識別面があっても `SEC-2` のため本 Issue では追加しない。別 Issue で扱う。
+
+### 制約
+
+- 単一環境（Linux）・単一時点。URL・script 本文・stack 全文は転記していない
+- 結論・matrix は書き換えていない（#919・#920 の担当）
+
+### 再現手順
+
+`cargo build --release -p fandhe-browser-core --features js-v8 --example compat_page_script_probe` のあと probe を実行し、`run_core.sh` は b1 のみのタスク定義で 2 回実行する。
+
 ## b5（Trello）の原因特定（#964）
 
 spec 対応: TASK-71 / MS-6 / `MEAS-4`・`COMPAT-1`・`COMPAT-4`・`JS-4`・`JS-6`・`SEC-2`・`REPAIR-3`。関連 Issue: #918・#758・#309。

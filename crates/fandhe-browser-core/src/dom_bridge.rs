@@ -76,6 +76,7 @@ use crate::error::Error;
 use crate::query::{query_selector_all_str_bounded, query_selector_str};
 
 mod focus;
+mod node_equal;
 mod page_env;
 mod url_parse;
 pub use page_env::{
@@ -364,6 +365,8 @@ enum DomOp {
     HistorySetUrl,
     IgnoreLocationChange,
     NavigatorUserAgent,
+    /// ページ attach からの単調時計の経過ミリ秒（`performance.now()` 用。#1227・JS-5）。
+    MonotonicNow,
     ConsoleMessage,
     LifecycleListenerError,
     LifecycleInstallOpen,
@@ -385,6 +388,9 @@ enum DomOp {
     NetOptionsIgnored,
     NetCancel,
     IsInclusiveAncestor,
+    /// 2 ノードが DOM 標準の意味で等しいか（`Node.prototype.isEqualNode` の土台。JS-5・#1227）。
+    /// 読み取り専用。比較は `node_equal.rs`（明示スタック・反復上限つき）。
+    IsEqualNode,
     /// 親ノードを返す（`Node.prototype.parentNode` の土台。JS-5・#1203）。読み取り専用。
     /// 親が Element か文書ルートなら ID、親が無い・DocumentFragment なら null（shim にラッパー型が
     /// 無いため。簡略版の差異。REPAIR-3）。
@@ -428,6 +434,7 @@ impl DomOp {
             "historySetUrl" => Self::HistorySetUrl,
             "ignoreLocationChange" => Self::IgnoreLocationChange,
             "navigatorUserAgent" => Self::NavigatorUserAgent,
+            "monotonicNow" => Self::MonotonicNow,
             "consoleMessage" => Self::ConsoleMessage,
             "lifecycleListenerError" => Self::LifecycleListenerError,
             "lifecycleInstallOpen" => Self::LifecycleInstallOpen,
@@ -449,6 +456,7 @@ impl DomOp {
             "netOptionsIgnored" => Self::NetOptionsIgnored,
             "netCancel" => Self::NetCancel,
             "isInclusiveAncestor" => Self::IsInclusiveAncestor,
+            "isEqualNode" => Self::IsEqualNode,
             "parentNode" => Self::ParentNode,
             "isFocusable" => Self::IsFocusable,
             "htmlLocalName" => Self::HtmlLocalName,
@@ -489,6 +497,7 @@ impl DomOp {
             Self::HistorySetUrl => "historySetUrl",
             Self::IgnoreLocationChange => "ignoreLocationChange",
             Self::NavigatorUserAgent => "navigatorUserAgent",
+            Self::MonotonicNow => "monotonicNow",
             Self::ConsoleMessage => "consoleMessage",
             Self::LifecycleListenerError => "lifecycleListenerError",
             Self::LifecycleInstallOpen => "lifecycleInstallOpen",
@@ -510,6 +519,7 @@ impl DomOp {
             Self::NetOptionsIgnored => "netOptionsIgnored",
             Self::NetCancel => "netCancel",
             Self::IsInclusiveAncestor => "isInclusiveAncestor",
+            Self::IsEqualNode => "isEqualNode",
             Self::ParentNode => "parentNode",
             Self::IsFocusable => "isFocusable",
             Self::HtmlLocalName => "htmlLocalName",
@@ -528,6 +538,7 @@ impl DomOp {
             | Self::ReadyState
             | Self::CurrentScript
             | Self::NavigatorUserAgent
+            | Self::MonotonicNow
             | Self::LifecycleInstallOpen
             | Self::LifecycleListenerLimit
             | Self::MicrotaskLimit
@@ -569,6 +580,7 @@ impl DomOp {
             | Self::TimerSet
             | Self::TimerOrigin
             | Self::IsInclusiveAncestor
+            | Self::IsEqualNode
             | Self::UrlParse => 2,
             Self::InsertBefore | Self::SetAttribute | Self::ConsoleMessage => 3,
             Self::TimerCallbackError
@@ -605,6 +617,8 @@ impl DocumentReadyState {
 /// 取り付け中のページの状態。
 struct PageState {
     document: Document,
+    /// attach 時点の単調時計（`monotonicNow` op の基準）。
+    started: std::time::Instant,
     ready_state: DocumentReadyState,
     current_script: Option<NodeId>,
     /// `None` は `about:blank`。
@@ -896,6 +910,10 @@ fn execute(
         DomOp::DocumentRoot => page.encode(page.document.root()),
         DomOp::ReadyState => Ok(JsValue::String(page.ready_state.as_str().to_owned())),
         DomOp::CurrentScript => page.encode_optional(page.current_script),
+        // 単調時計（`Instant`）の経過ミリ秒。壁時計の補正・ページ側の `Date.now` 差し替えの影響を受けない。
+        DomOp::MonotonicNow => Ok(JsValue::Number(
+            page.started.elapsed().as_secs_f64() * 1000.0,
+        )),
         DomOp::NavigatorUserAgent => Ok(JsValue::String(crate::fetch::USER_AGENT.to_owned())),
         DomOp::GetLocation => {
             let name = string_arg(op, args, 1, limits)?;
@@ -1135,6 +1153,12 @@ fn execute(
             let node = page.node_arg(op, args, 2)?;
             let found = ancestor == node || page.document.ancestors(node).any(|a| a == ancestor);
             Ok(JsValue::Bool(found))
+        }
+        // 2 ノードの等価判定（`isEqualNode` 用。#1227・JS-5）。読み取り専用で、比較量は `node_count` で抑える。
+        DomOp::IsEqualNode => {
+            let a = page.node_arg(op, args, 1)?;
+            let b = page.node_arg(op, args, 2)?;
+            Ok(JsValue::Bool(node_equal::nodes_equal(&page.document, a, b)))
         }
         // 親ノード（`parentNode` getter 用。#1203・JS-5）。読み取り専用で O(1)。親が Element か文書
         // ルートのときだけ ID を返し、親なし・DocumentFragment は null（shim にラッパー型が無い。REPAIR-3）。
@@ -1591,6 +1615,7 @@ impl DomBridge {
         state.next_generation = generation.saturating_add(1);
         state.page = Some(PageState {
             document,
+            started: std::time::Instant::now(),
             ready_state: DocumentReadyState::Loading,
             current_script: None,
             location: None,
@@ -3173,6 +3198,26 @@ mod tests {
         call(&b, &[s("isInclusiveAncestor"), n(1e12), n(div)]).expect_err("invalid id");
         call(&b, &[s("isInclusiveAncestor"), s("1"), n(div)]).expect_err("type");
         call(&b, &[s("isInclusiveAncestor"), n(div)]).expect_err("arity");
+    }
+
+    /// JS-5・#1227: `isEqualNode` は同形の要素で true、属性値違い・切り離し対 body で false、不正入力はエラー。
+    #[test]
+    fn js_5_is_equal_node_op() {
+        let b = bridge();
+        let body = num(call(&b, &[s("body")]));
+        let p1 = num(call(&b, &[s("createElement"), s("p")]));
+        let p2 = num(call(&b, &[s("createElement"), s("p")]));
+        let eq = |a: f64, x: f64| call(&b, &[s("isEqualNode"), n(a), n(x)]).expect("ok");
+        assert_eq!(eq(body, body), JsValue::Bool(true));
+        assert_eq!(eq(p1, p2), JsValue::Bool(true));
+        call(&b, &[s("setAttribute"), n(p1), s("id"), s("x")]).expect("set");
+        assert_eq!(eq(p1, p2), JsValue::Bool(false));
+        call(&b, &[s("setAttribute"), n(p2), s("id"), s("x")]).expect("set");
+        assert_eq!(eq(p1, p2), JsValue::Bool(true));
+        assert_eq!(eq(body, p1), JsValue::Bool(false));
+        call(&b, &[s("isEqualNode"), n(1e12), n(body)]).expect_err("invalid id");
+        call(&b, &[s("isEqualNode"), s("1"), n(body)]).expect_err("type");
+        call(&b, &[s("isEqualNode"), n(body)]).expect_err("arity");
     }
 
     /// JS-5・#1203: `parentNode` は body の子で body、html で文書ルート、ルートと切り離しで null、

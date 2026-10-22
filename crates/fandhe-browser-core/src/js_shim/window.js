@@ -23,6 +23,13 @@
 //   error / warn に渡された Error 風オブジェクトの stack は、診断専用の opt-in（timerOriginCapture と
 //   同じフラグ）が立っているときだけ 1024 UTF-16 単位まで第 3 引数で渡す。既定では `.stack` に触れない
 //   （Issue #1183・SEC-2）。
+// - matchMedia: 画面サイズ・色テーマ・ポインタ等、環境の実値を一切読まない固定値の最小実装
+//   （#1227・SEC-2。メディアクエリを評価しないので識別面を増やさない）。`matches` は常に false、
+//   `media` は渡された文字列をそのまま返す。
+// - IntersectionObserver: 何も観測しない不活性な最小実装（#1227・SEC-2。ビューポートや要素の寸法を
+//   読まないので識別面を増やさない）。callback は一度も呼ばず、登録も保持しない（無制限に増えない）。
+// - performance.now(): ページ attach からの経過ミリ秒（Rust 側の単調時計 `monotonicNow` op）だけを返す最小実装（#1227。timeOrigin・mark・measure・
+//   getEntries 等は持たない）。
 // - 再 install（ページごと）に耐えるよう、global への定義は configurable にする。
 // - ES2015 の範囲に留める（V8 と boa で同一のソースを使うため。Proxy は使わない）。
 //
@@ -31,6 +38,14 @@
 // - location 代入による実際の遷移。
 // - navigator の追加プロパティ（language / platform / plugins 等。事実と異なる値や
 //   フィンガープリント面を作らないため入れていない。必要性は後続 issue で判断する）。
+// - matchMedia は固定値（REPAIR-3・#1227）: 常に `matches: false`（`all` や `(min-width: 1px)` のように
+//   実ブラウザで常に真になるクエリでも false）、`media` を正規化しない、`change` を配らない、
+//   MediaQueryList は EventTarget を継承せず dispatchEvent も無い。将来はレンダリング層の実ビューポートと
+//   連動させる（ただし SEC-2 の範囲で）。
+// - IntersectionObserver は常に交差なし（REPAIR-3・#1227）: callback を呼ばず、`observe` の引数も検証しない。
+//   `root` は null・`rootMargin` は '0px 0px 0px 0px'・`thresholds` は [0] の固定値で、options は無視する。
+//   将来はレンダリング層のレイアウトと連動させる（ただし SEC-2 の範囲で）。
+// - performance は `now()` のみ（REPAIR-3）。単調時計の差分で、壁時計・仮想時間とは連動しない。
 // - 実ブラウザの [LegacyUnforgeable]（location / window の再定義不可。document.location は
 //   document インスタンスではなく Document.prototype に置いている）との差異。真の状態は
 //   Rust 側にあるため安全性は変わらない。DOMException への写像も未対応。
@@ -57,6 +72,14 @@
     }
 
     function Navigator(token) {
+        if (token !== TOKEN) {
+            throw new TypeError('Illegal constructor');
+        }
+    }
+
+    // matchMedia が返す MediaQueryList。状態（media 文字列）は WeakMap だけが持つ（#1227）。
+    var mediaOf = new WeakMap();
+    function MediaQueryList(token) {
         if (token !== TOKEN) {
             throw new TypeError('Illegal constructor');
         }
@@ -139,6 +162,83 @@
         },
         undefined
     );
+
+    // MediaQueryList: 環境を評価しない固定値（SEC-2）。リスナーは保持せず呼ばない。
+    function mediaBrand(self) {
+        var m = mediaOf.get(self);
+        if (m === undefined) {
+            throw new TypeError('Illegal invocation');
+        }
+        return m;
+    }
+    defineAccessor(
+        MediaQueryList.prototype,
+        'media',
+        function () {
+            return mediaBrand(this);
+        },
+        undefined
+    );
+    defineAccessor(
+        MediaQueryList.prototype,
+        'matches',
+        function () {
+            mediaBrand(this);
+            return false;
+        },
+        undefined
+    );
+    var onchangeOf = new WeakMap();
+    defineAccessor(
+        MediaQueryList.prototype,
+        'onchange',
+        function () {
+            mediaBrand(this);
+            return onchangeOf.has(this) ? onchangeOf.get(this) : null;
+        },
+        function (value) {
+            mediaBrand(this);
+            onchangeOf.set(this, value);
+        }
+    );
+    ['addListener', 'removeListener', 'addEventListener', 'removeEventListener'].forEach(function (name) {
+        defineMethod(MediaQueryList.prototype, name, function () {
+            mediaBrand(this);
+        });
+    });
+    function matchMedia(query) {
+        if (arguments.length < 1) {
+            throw new TypeError("Failed to execute 'matchMedia' on 'Window': 1 argument required, but only 0 present.");
+        }
+        var list = new MediaQueryList(TOKEN);
+        mediaOf.set(list, String(query));
+        return list;
+    }
+
+    // IntersectionObserver: 何も観測しない不活性な最小実装（SEC-2。環境の実値を読まない）。
+    function IntersectionObserver(callback) {
+        if (!(this instanceof IntersectionObserver)) {
+            throw new TypeError("Failed to construct 'IntersectionObserver': Please use the 'new' operator.");
+        }
+        if (typeof callback !== 'function') {
+            throw new TypeError("Failed to construct 'IntersectionObserver': The callback provided as parameter 1 is not a function.");
+        }
+    }
+    defineAccessor(IntersectionObserver.prototype, 'root', function () { return null; }, undefined);
+    defineAccessor(IntersectionObserver.prototype, 'rootMargin', function () { return '0px 0px 0px 0px'; }, undefined);
+    defineAccessor(IntersectionObserver.prototype, 'thresholds', function () { return [0]; }, undefined);
+    defineMethod(IntersectionObserver.prototype, 'observe', function observe() {});
+    defineMethod(IntersectionObserver.prototype, 'unobserve', function unobserve() {});
+    defineMethod(IntersectionObserver.prototype, 'disconnect', function disconnect() {});
+    defineMethod(IntersectionObserver.prototype, 'takeRecords', function takeRecords() {
+        return [];
+    });
+
+    // performance: now() だけ（install 時点からの経過ms）。
+    var performanceObject = {};
+    defineMethod(performanceObject, 'now', function now() {
+        return op('monotonicNow');
+    });
 
     // console: 記録は log/info/warn/error/debug のみ。引数の文字列化や転送で throw しない。
     // Rust 側の上限（4096 バイト）を超えたことが分かるよう、1 単位余分に残す。
@@ -259,6 +359,10 @@
 
     expose('Location', Location);
     expose('Navigator', Navigator);
+    expose('MediaQueryList', MediaQueryList);
+    expose('matchMedia', matchMedia);
+    expose('IntersectionObserver', IntersectionObserver);
+    expose('performance', performanceObject);
     expose('window', global);
     expose('self', global);
     expose('navigator', navigatorObject);

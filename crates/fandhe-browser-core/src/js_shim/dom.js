@@ -31,6 +31,7 @@
 //   種別判定に使うが、IDL プロパティとしては未公開。サイトの分岐が変わり得るため。装わない）。
 // - parentNode / parentElement は簡略版（#1203）: op `parentNode` が返す親（Element か文書）だけを
 //   読み取り専用で返し、親が DocumentFragment なら null（ラッパー型が無い。REPAIR-3）。
+// - isEqualNode（#1227）は標準どおりの比較。Comment・Doctype のラッパーは無いが、子としては比較に含まれる。
 // - childNodes / firstChild / lastChild / nextSibling /
 //   previousSibling / nodeValue / namespaceURI / isConnected / contains /
 //   compareDocumentPosition / attributes（属性の列挙）。対応する op が無く未定義のまま。
@@ -292,6 +293,20 @@
         }
         return wrap(pid, Element);
     }
+    // isEqualNode: DOM 標準の「node equals」。比較は Rust 側（dom_bridge/node_equal.rs。明示スタック・
+    // 反復上限つき）。引数省略・null / undefined は false（IDL は optional Node? otherNode = null）、Node でない値は TypeError（#1227・JS-5。React / Next.js
+    // のクライアントが差分検出に使う）。
+    define(Node.prototype, 'isEqualNode', {
+        writable: true,
+        value: function isEqualNode(other) {
+            var self = idOf(this, 'isEqualNode');
+            if (other === null || other === undefined) {
+                return false;
+            }
+            return op('isEqualNode', self, idOf(other, 'isEqualNode')) === true;
+        }
+    });
+
     define(Node.prototype, 'parentNode', {
         get: function () {
             return parentNodeOf(this);
