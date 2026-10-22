@@ -20,7 +20,6 @@ use fandhe_browser_profile::ProfileStore;
 use super::profile::{self, ProfileSelection};
 use super::{CommandArgs, CommandError, CommandOutcome, CommandSpec, UsageError};
 use crate::server::{self, StartupError};
-
 use crate::{page_scripts, render_host, startup_config};
 
 /// 登録表（[`super::COMMANDS`]）へ載せる仕様。

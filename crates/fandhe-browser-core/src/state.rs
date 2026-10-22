@@ -412,7 +412,7 @@ impl AppState {
     }
 
     /// 確定文書の上で保持する評価コンテキストのハンドルを差し替える（TASK-44.5・`CDP-2`・`JS-1`）。
-    /// cli が `[js] engine` から構築したハンドルを起動時に 1 度だけ渡す（cli の `commands::launch::start_server` で配線済み。#1220）。
+    /// cli が `[js] engine` から構築したハンドルを起動時に 1 度だけ渡す（配線は cli の `commands::launch::start_server`、#1220）。
     #[must_use]
     pub fn with_script_contexts(mut self, handle: ScriptContextHandle) -> Self {
         self.script_contexts = handle;
