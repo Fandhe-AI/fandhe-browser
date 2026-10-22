@@ -89,7 +89,7 @@ cargo tree --offline --locked --workspace --all-features --target all -e normal 
 | `*-linux-musl`（コンテナ） | 動的リンク 0 件 | `readelf -d`・`ldd` | #362 | 実装済み（前節） |
 | `*-linux-gnu`（ネイティブ） | 許可リスト | `readelf -d`・`ldd` | 未起票 | 方針のみ決定・検査は未実装 |
 | `*-apple-darwin` | 許可リスト | `otool -L` | #364 | 方針のみ決定・検査は未実装 |
-| `*-pc-windows-msvc` | 許可リスト（`+crt-static` 前提） | `dumpbin /dependents` | #365 | 方針のみ決定・検査は未実装 |
+| `*-pc-windows-msvc` | 許可リスト（`+crt-static` 前提） | `dumpbin /dependents` | #365 | `+crt-static` 設定済み（#917・Windows ジョブでの確認待ち）・検査は未実装 |
 
 - ネイティブ 3 OS は OS のシステムライブラリへの動的リンクが避けられないため、許可リスト方式を採る。許可リストに無い依存（第三者共有ライブラリ・`dylib` プラグイン等）を検出したら失敗させる方針である
 - OS 外のパス（macOS の `@rpath`・`@loader_path`・`/usr/local`・`/opt/homebrew` 等）は許可しない
@@ -100,7 +100,10 @@ cargo tree --offline --locked --workspace --all-features --target all -e normal 
 - 根拠は 2 点
   - `v8 =152.2.0` の `build.rs` は、msvc で `crt-static` が有効なら `libcpmt`（静的）、無効なら `msvcprt`（dylib）をリンクする。静的化で C++ ランタイム DLL 依存を外せる（本リポで読める一次資料）
   - 固定版 `v8` の prebuilt が静的 CRT（`/MT`）でビルドされている（#363 のオーナー記述。本リポでのリンク可否は未検証）
-- 現時点では未設定である（`.cargo/config.toml` は無い）。Windows ターゲット限定の設定方法・リンク確認・サイズ差の記録は #917 が担う（`REPAIR-3`）
+- 設定は `.cargo/config.toml` の `[target.x86_64-pc-windows-msvc]` に `rustflags = ["-C", "target-feature=+crt-static"]` を置く形で行う（#917）。対象ターゲットを限定しており、Linux・macOS には影響しない
+- Cargo は cwd から親へ遡って config を探すため、この設定は別 workspace の `servo-host/` の Windows ビルドにも効く。Servo ホスト配布物へ適用するかの方針は未決定である
+- 設定の追加時点では `workflow_dispatch` での Windows 全ジョブの確認・設定後のサイズ記録は未実施である（`REPAIR-3`）。ベースライン（`+crt-static` なし）は main の push run 39852789445 の `[binary-size]` で 47,247,360 bytes（上限 91,480,000）。設定後の値と run URL は、`gh workflow run ci.yml --ref <branch>` の結果を PR 本文と本節へ追記する
+- リンクできない・テストが落ちる場合は回避策で通さず、設定を main に入れずに #363 で判断する
 
 ### 暫定許可リスト案（実測前の案であり確定値ではない）
 
@@ -197,7 +200,7 @@ cargo tree --offline --locked --workspace --all-features --target all -e normal 
 | #361 | feature と配布プロファイルの対応表（`TASK-93.2`） | 作成済み（「feature と配布プロファイルの対応」） |
 | #363 | 3 OS ネイティブ配布物の動的リンク方針（人間判断） | 判断済み（オーナー判断 2026-10-12）。記録は #916 |
 | #916 | 上記方針の記録（`TASK-93.h1`） | 作成済み（「3 OS ネイティブ配布物の動的リンク方針」） |
-| #917 | Windows の `+crt-static` 設定とリンク確認 | 未実装 |
+| #917 | Windows の `+crt-static` 設定とリンク確認 | 設定済み・`workflow_dispatch` での確認待ち |
 | #362 | Linux 向け動的リンクなし検査スクリプト（`TASK-93.3`） | 実装済み（「Linux（musl）配布バイナリの動的リンクなし検査」） |
 | #364 | macOS 向け動的リンク検査スクリプト（`TASK-93.4`） | 実装済み・記録のみ（「macOS 配布バイナリの動的リンク検査」。許可リスト確定と fail-closed 化は後続） |
 | #365 | Windows 向け動的リンク検査スクリプト（`TASK-93.5`） | 未実装（記録のみで導入し、実測後に fail-closed 化） |
@@ -211,7 +214,7 @@ cargo tree --offline --locked --workspace --all-features --target all -e normal 
 - PoC-15 の実測は macOS ローカルのみ。3 OS 横断の確認は XOS 系へ申し送り済み
 - 本ドキュメントは新規の実測を含まない
 - 動的リンクの CI による機械検査は Linux（musl）と macOS（記録のみ）が実装済みで、Windows は未実装である（#365）
-- 3 OS ネイティブの許可リストは実測前の暫定案である。`+crt-static` は方針として採用済みだが未設定で、本リポでのリンク可否は未検証である（#917）。`*-linux-gnu` ネイティブの検査を担う Issue は未起票である
+- 3 OS ネイティブの許可リストは実測前の暫定案である。`+crt-static` は `.cargo/config.toml` で設定済みだが、Windows ネイティブでのリンク可否は `workflow_dispatch` で未検証である（#917）。`*-linux-gnu` ネイティブの検査を担う Issue は未起票である
 
 ## 関連
 

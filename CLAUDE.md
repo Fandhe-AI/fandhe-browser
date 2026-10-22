@@ -22,6 +22,7 @@ fandhe-browser/
 ├── LICENSE-MIT / LICENSE-APACHE   # デュアルライセンス
 ├── NOTICE                         # サードパーティ帰属表示・MPL 適用範囲（Servo ホストの配布物）。全文は LICENSE-THIRD-PARTY
 ├── rust-toolchain.toml            # stable + rustfmt/clippy（単一真実源）
+├── .cargo/config.toml             # Windows（msvc）限定の `+crt-static`（#917・PLUG-1）。cwd から遡って効くため servo-host/ にも及ぶ
 ├── .editorconfig                  # インデント・改行・文字コード規約
 ├── skills-lock.json               # 導入スキルのロックファイル
 ├── Makefile                       # 開発タスク集約の薄い入口（処理の定義は scripts/。`make help`。編集は makefile.md）
