@@ -32,9 +32,9 @@ Playwright のソースは長く引用せず、関数名と要約に留める。
 | `connectOverCDP(http://…)` | 成功（`noDefaults:true` 指定時。TASK-43.3g・#942 で到達）。`Browser.getVersion`・`Target.setAutoAttach`（`waitForDebuggerOnStart:true` は受理）・`Target.getTargetInfo` が成功する。指定なしの既定オプションでは接続直後の `Browser.setDownloadBehavior`（`allowAndName`）が `-32602` で拒否され通らない（後述「段階 2g」） | A（現行 head での再取得）: seq 1〜9 |
 | `connectOverCDP(ws://…)` | 未実行（http 経由が成功するため、収集ハーネスの ws 直接の再試行は行われない） | A |
 | `newContext()` | 成功（`acceptDownloads:false` 指定時。TASK-43.3d・#909 で到達）。`Target.createBrowserContext`（`disposeOnDetach:true`）と `browserContextId` 付き `Browser.setDownloadBehavior`（`deny` + `eventsEnabled:true`）が成功する（後述「段階 2b の実施結果」） | A: seq 10〜14 |
-| `newPage()` | 成功（`connectOverCDP(noDefaults:true)`・`newContext({acceptDownloads:false, viewport:null})` 指定時。TASK-43.3n・#1042 で到達を確認。後述「到達結果（TASK-43.3n）」）。`Browser.getWindowForTarget` は `-32601` のまま残るが `newPage()` は失敗しない（`Page.createIsolatedWorld` は TASK-44.6・#1217 で実装済み。評価器が無効な構成ではエラー） | A: seq 15〜41 |
+| `newPage()` | 成功（`connectOverCDP(noDefaults:true)`・`newContext({acceptDownloads:false, viewport:null})` 指定時。TASK-43.3n・#1042 で到達を確認。後述「到達結果（TASK-43.3n）」）。`Browser.getWindowForTarget` は `-32601` のまま残るが `newPage()` は失敗しない（`Page.createIsolatedWorld` は TASK-44.6・#1217 で実装済み。評価器が無効な構成ではエラー。cli 既定〔V8〕では TASK-44.9・#1220 で有効） | A: seq 15〜41 |
 | `goto`（ローカル fixture） | 成功（TASK-44.3・TASK-44.4 で確認。後述「テスト結果レポート（TASK-44.4）」） | A |
-| `selector`（`#target`） | 失敗（`StageTimeout` 10 秒。Runtime ドメイン未実装。後述「テスト結果レポート（TASK-44.4）」） | A |
+| `selector`（`#target`） | 失敗（TASK-44.9・#1220 の再実測で `StageTimeout` は解消し、評価コンテキスト成立後に `locator.count` が core の universal selector（`*`）未対応で失敗する。後述「再実測（TASK-44.9）」。追跡: #1237） | A |
 
 `-32601` は未実装メソッドへ成功を捏造しない `CDP-6`・`SEC-2` の方針どおりの挙動で、バグではない。
 
@@ -594,12 +594,49 @@ TASK-43.3o（#1050）の取り込み後に再取得した同梱トレース（3 
 #### 扱い・未達の明示
 
 - #250 の受入基準（セレクタで要素を取得すること）は未達。解消の前提は Runtime ドメインの最小実装（`Runtime.executionContextCreated` の送出・`Page.createIsolatedWorld`・`Runtime.callFunctionOn`・`Runtime.evaluate`）で、後続 Issue は #1062 で追跡
-- 実装済みを装わない（`REPAIR-3`）。Runtime 実装後に `selector` が通ることを再実測して本節を更新する
+- 実装済みを装わない（`REPAIR-3`）。Runtime 実装後に `selector` が通ることを再実測して本節を更新する（TASK-44.9・#1220 で再実測済み。次節。本節の記録は当時のまま残す）
 
 #### 再現手順
 
 1. `make test-playwright-connect`（要 node/npm/ネットワーク。CI 対象外）で 5 段階の結果を得る
 2. トレースは、上記の一時変更を入れた `trace_server` を `cargo run -p fandhe-browser-cdp --features test-support --example trace_server` で起動し、`DEBUG=pw:protocol`・`FANDHE_CDP_WS_ENDPOINT`・`FANDHE_PLAYWRIGHT_MODULE_DIR`・`FANDHE_FIXTURE_URL` を渡して `node harness/playwright-connect/connect.mjs` を実行する。ハーネスとしての恒久化は今後の課題
+
+### 再実測（TASK-44.9・#1220。実測 A）
+
+`CDP-2`（関連: `CDP-6`・`SEC-2`・`REPAIR-3`・`PERF-7`）・TASK-44（44.9）・MS-4。#1216〜#1219 で揃った Runtime ドメインの最小実装を、cli 本番と接続試験のテストサーバーの両方で有効にして `selector` 段階を再実測した。
+
+#### 実測条件
+
+| 項目 | 値 |
+| ---- | -- |
+| 基準コミット | main の `fc619994` |
+| 実測日 | 2026-10-22 |
+| playwright-core | 1.63.0（出典: `scripts/versions.sh`。`verify-install.mjs` で integrity 検証済み） |
+| node | v24.21.0 |
+| エンジン / feature | V8（cli の既定と同じ）/ `test-support,js-v8` |
+| 評価コンテキストの配線 | cli は `commands::launch::start_server` が `[js] engine` の解決結果から `ScriptContextHandle::new` を作り `AppState` へ渡す（エンジンなしのビルドでは無効のまま。新しい設定キーは無い）。テストサーバーは同じ `ScriptContextHandle::new(&JsConfig::default())` を `start_server_allowing_loopback_with_scripts` で渡す |
+| 接続オプション・ループバック・fixture | TASK-44.4 節と同じ（ループバック許可は `test-support` 限定） |
+
+#### 5 段階の到達結果
+
+| 段階 | 結果 | 失敗内容 |
+| ---- | ---- | -------- |
+| `connect` | 成功 | なし |
+| `newContext` | 成功 | なし |
+| `newPage` | 成功 | なし |
+| `goto` | 成功 | なし |
+| `selector` | 失敗 | `locator.count: Error: script evaluation failed: DOM operation failed: unsupported: unsupported selector syntax (universal selector) at byte offset 0` |
+
+`StageTimeout`（実行コンテキストが成立しない）は解消し、評価器が注入スクリプトを実行して core の query に到達するようになった。失敗の原因は core のセレクタパーサー（`selector.rs`）が `*` を未対応として拒否することと推定される（プロトコルトレースでの確定は未実施）。skip・期待値の弱体化・成功フォールバックは入れていない。
+
+#### 扱い・未達の明示
+
+- #250 の受入基準（セレクタで要素を取得すること）は未達。追跡は #1237（universal selector の対応）。対応後に再実測して本節を更新する
+- 残る差異（`REPAIR-3`）: main world の評価は未対応（固定文言で拒否）、`Runtime.getProperties` は未実装、評価中の DOM 変更は `NavigationResult` へ書き戻さない、イベントループ・タイマーは回さない。#1237 の対応後に他の未対応 API が出た場合は同じ手順で追跡する
+
+#### 再現手順
+
+`make test-playwright-connect`（要 node/npm/ネットワーク。CI 対象外）。`run.sh` が `--features test-support,js-v8` で `playwright_flow`（`harness = false`）をケース名の引数付きで実行し、完了マーカー行が 1 件のときだけ成功とする。
 
 ### 原則
 

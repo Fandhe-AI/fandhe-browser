@@ -10,7 +10,7 @@
 //! 続けられる実体」を要する。依存方向（cdp → js を直接作らない）により、その実体を core に置く。
 //! `AppState::script_contexts()`（`CdpState::app_state()` 経由）で到達できる。`page_actor` は遷移中に
 //! `<script>` を 1 回実行して破棄する用途で、評価後もランタイムを保持できないため別アクターとした。
-//! cli が `[js] engine` から構築したハンドルを `AppState` へ渡す（配線は #1220）。本モジュールだけでは
+//! cli が `[js] engine` から構築したハンドルを `AppState` へ渡す（cli の `commands::launch::start_server` で配線済み（#1220））。本モジュールだけでは
 //! 既定の挙動は変わらない（`AppState` の既定は無効）。
 //!
 //! # 契約
