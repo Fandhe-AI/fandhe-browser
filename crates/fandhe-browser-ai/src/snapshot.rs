@@ -59,6 +59,8 @@
 
 pub mod build;
 mod disambiguate;
+#[cfg(test)]
+pub(crate) use disambiguate::MAX_SUFFIX_ATTEMPTS;
 pub mod element_ref;
 pub mod name;
 pub mod role;

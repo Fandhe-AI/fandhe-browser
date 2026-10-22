@@ -35,7 +35,7 @@ ref 保持要素には、通常ノード、圧縮表のヘッダセル（`Header
 
 | 行 | 条件 | 結果 |
 | -- | ---- | ---- |
-| A1 | L1 | `Ambiguous{After,k}`（ページ由来の name との衝突。#1222。fail-closed） |
+| A1 | L1 | `Ambiguous{After,k}`（衝突解消の試行上限〔`MAX_SUFFIX_ATTEMPTS` = 64〕超過で残った重複。#1222。fail-closed） |
 | A2 | L2 かつ `ref_oi` | `Stable` |
 | A3 | L2 かつ `ref_oi` でなく `ctx_same` | `Stable` |
 | A4 | L2 かつ `ref_oi` でなく `ctx_same` でもない | `Ambiguous{After,グループ件数}` |

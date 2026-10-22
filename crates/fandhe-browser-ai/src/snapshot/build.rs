@@ -96,7 +96,8 @@
 //!   （`| |` 等）は除去しない。`heading`・`columnheader` と子リンクの重複は未対応。
 //! - 同じ `(role, name)` の ref 保持要素は、木の確定後に文書順の 2 件目以降の name へ
 //!   ` #2`・` #3`… を付ける（`disambiguate` モジュール。`AISNAP-10`・TASK-17・Issue #1221）。
-//!   ref と accname は不変。ページ由来 name との衝突解消は未対応（Issue #1222。REPAIR-3）。
+//!   ref と accname は不変。ページ由来 name との衝突は次の番号へ進めて解消し、試行上限
+//!   （`MAX_SUFFIX_ATTEMPTS`）を超えた要素は区別子なしで残す（fail-closed。Issue #1222）。
 //! - 深さが [`MAX_TREE_DEPTH`] を超えるサブツリーは省略し `Snapshot::truncated` を立てる。
 //! - いずれかの name が打ち切られた場合（文字数上限・子孫走査の上限・構築全体で共有する
 //!   走査予算）も `Snapshot::truncated` を立てる。
