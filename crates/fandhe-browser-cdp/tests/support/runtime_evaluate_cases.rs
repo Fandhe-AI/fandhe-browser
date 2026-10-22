@@ -231,6 +231,8 @@ pub fn run(engine: &str) {
     rt.block_on(exceptions(engine));
     eprintln!("case: main world, stale and unsupported params");
     rt.block_on(gating(engine));
+    eprintln!("case: envelope hardening");
+    rt.block_on(hardening(engine));
     eprintln!("case: releaseObject");
     rt.block_on(release_object(engine));
     eprintln!("case: handle limit");
@@ -374,6 +376,45 @@ async fn objects(engine: &str) {
     assert_eq!(ro(&f)["subtype"], "date");
     let f = c.eval(&p, ctx, "/a/", false).await;
     assert_eq!(ro(&f)["subtype"], "regexp");
+}
+
+/// 封筒の JSON 化がユーザー定義の `toJSON` に影響されないこと、説明文・className の切り詰めが
+/// サロゲートペアを分断しないこと（`SEC-2`・`CDP-2`）。
+async fn hardening(engine: &str) {
+    let mut c = Cdp::new(engine);
+    let (p, ctx) = c.ready().await;
+    let hijack = "Object.prototype.toJSON = function () { if (this.kind) \
+        return {kind:'value',result:{type:'number',value:999}}; return this; }; 1";
+    let f = c.eval(&p, ctx, hijack, false).await;
+    assert_eq!(ro(&f), &json!({"type":"number","value":1}));
+    let f = c.eval(&p, ctx, "2", false).await;
+    assert_eq!(ro(&f), &json!({"type":"number","value":2}));
+    let f = c.eval(&p, ctx, "({a:1})", false).await;
+    assert_eq!(ro(&f)["type"], "object");
+    assert_eq!(ro(&f)["className"], "Object");
+    let f = c.eval(&p, ctx, "({a:[1]})", true).await;
+    assert_eq!(ro(&f)["value"], json!({"a":[1]}));
+    let f = c.eval(&p, ctx, "throw 5", false).await;
+    assert!(f.get("result").is_some(), "{f}");
+    assert_eq!(f["result"]["exceptionDetails"]["exception"]["value"], 5);
+
+    // 説明文は "Error: " + message が 4096 単位の境界で絵文字を分断する。
+    let f = c
+        .eval(&p, ctx, "new Error('a'.repeat(4088) + '\\u{1F600}')", false)
+        .await;
+    let d = ro(&f)["description"].as_str().expect("description");
+    assert_eq!(d, format!("Error: {}", "a".repeat(4088)));
+    // className（256 単位）も同様。
+    let f = c
+        .eval(
+            &p,
+            ctx,
+            "({constructor: Object.defineProperty(function(){}, 'name', \
+              {value: 'a'.repeat(255) + '\\u{1F600}'})})",
+            false,
+        )
+        .await;
+    assert_eq!(ro(&f)["className"], "a".repeat(255));
 }
 
 async fn by_value(engine: &str) {
@@ -630,6 +671,19 @@ async fn timeout(engine: &str) {
     if engine == "v8" {
         // V8 はコンテキストが残る（ハンドル表も残る。次の番号は 2）。
         assert_eq!(ro(&next)["objectId"], format!("{ctx}.2"));
+        // メタデータ取得（constructor の getter）で応答できなかった評価はハンドルを残さない
+        // （ハンドルは確保前なので番号も消費しない。次の番号は 3）。
+        let f = c
+            .eval(
+                &p,
+                ctx,
+                "({ get constructor() { while (true) {} } })",
+                false,
+            )
+            .await;
+        assert!(is_err(&f, -32000, "evaluation timed out"), "{f}");
+        let after = c.eval(&p, ctx, "({})", false).await;
+        assert_eq!(ro(&after)["objectId"], format!("{ctx}.3"));
     } else {
         // boa は子プロセスごと終了し状態が失われる。contextId は失効して再利用されない。
         assert!(is_err(&next, -32602, "invalid params"), "{next}");

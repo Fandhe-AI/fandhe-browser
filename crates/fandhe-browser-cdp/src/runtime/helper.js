@@ -29,6 +29,9 @@
   var fnToString = Function.prototype.toString;
   var defineProperty = Object.defineProperty;
   var freeze = Object.freeze;
+  var objCreate = Object.create;
+  var objKeys = Object.keys;
+  var charCodeAt = String.prototype.charCodeAt;
 
   var cfg = jsonParse(cfgText);
   var epoch = cfg.epoch;
@@ -45,13 +48,43 @@
   // 内部の制御用に投げる固有の値（ユーザーコードからは見えない）。
   var HANDLE_LIMIT = {};
   var NOT_SERIALIZABLE = {};
+  var TOO_LARGE = {};
 
   var RESET = '{"kind":"reset"}';
   var INTERNAL_ERROR = '{"kind":"internalError"}';
 
+  // 封筒・RemoteObject の素材は null prototype で作る。ユーザーが Object.prototype.toJSON 等を
+  // 足しても JSON 化に影響しないようにする（封筒の偽装を防ぐ）。
+  function mk(o) {
+    var r = objCreate(null);
+    var ks = objKeys(o);
+    for (var i = 0; i < ks.length; i++) {
+      r[ks[i]] = o[ks[i]];
+    }
+    return r;
+  }
+
+  // UTF-16 の上限位置で切る。直前が上位サロゲートなら 1 つ手前で切り、ペアを分断しない。
   function cut(s, n) {
     var t = StringCtor(s);
-    return t.length > n ? apply(strSlice, t, [0, n]) : t;
+    if (t.length <= n) return t;
+    var end = n;
+    if (end > 0) {
+      var c = apply(charCodeAt, t, [end - 1]);
+      if (c >= 0xd800 && c <= 0xdbff) end = end - 1;
+    }
+    return apply(strSlice, t, [0, end]);
+  }
+
+  // 払い出したハンドルのうち、クライアントへ通知できなかったものを回収する。
+  var allocated = [];
+  function rollback() {
+    for (var i = 0; i < allocated.length; i++) {
+      if (apply(mapDelete, handles, [allocated[i]]) === true) {
+        handleCount = handleCount - 1;
+      }
+    }
+    allocated = [];
   }
 
   function allocHandle(v) {
@@ -61,6 +94,7 @@
     var n = nextHandle;
     nextHandle = n + 1;
     apply(mapSet, handles, [n, v]);
+    allocated[allocated.length] = n;
     handleCount = handleCount + 1;
     return n;
   }
@@ -144,33 +178,37 @@
   }
 
   // 値を RemoteObject の素材へ。オブジェクト・関数・symbol はハンドルを払い出す。
+  // ユーザーコードを呼び得るメタデータ（constructor・toStringTag・説明）はハンドル確保の前に済ませ、
+  // 応答できない評価にハンドルが残らないようにする。
   function remote(v) {
     var t = typeof v;
-    if (v === undefined) return { type: "undefined" };
-    if (v === null) return { type: "object", subtype: "null", value: null };
-    if (t === "boolean" || t === "string") return { type: t, value: v };
+    if (v === undefined) return mk({ type: "undefined" });
+    if (v === null) return mk({ type: "object", subtype: "null", value: null });
+    if (t === "boolean" || t === "string") return mk({ type: t, value: v });
     if (t === "number") {
-      if (v !== v) return { type: "number", unserializableValue: "NaN" };
-      if (v === Infinity) return { type: "number", unserializableValue: "Infinity" };
-      if (v === -Infinity) return { type: "number", unserializableValue: "-Infinity" };
-      if (objectIs(v, -0)) return { type: "number", unserializableValue: "-0" };
-      return { type: "number", value: v };
+      if (v !== v) return mk({ type: "number", unserializableValue: "NaN" });
+      if (v === Infinity) return mk({ type: "number", unserializableValue: "Infinity" });
+      if (v === -Infinity) return mk({ type: "number", unserializableValue: "-Infinity" });
+      if (objectIs(v, -0)) return mk({ type: "number", unserializableValue: "-0" });
+      return mk({ type: "number", value: v });
     }
     if (t === "bigint") {
-      return { type: "bigint", unserializableValue: StringCtor(v) + "n" };
+      return mk({ type: "bigint", unserializableValue: StringCtor(v) + "n" });
     }
-    var h = allocHandle(v);
     if (t === "symbol") {
-      return { type: "symbol", description: descriptionOf(v, t, undefined, "Symbol"), handle: h };
+      var sd = descriptionOf(v, t, undefined, "Symbol");
+      return mk({ type: "symbol", description: sd, handle: allocHandle(v) });
     }
     var tag = tagOf(v);
     var subtype = t === "function" ? undefined : subtypeOf(v, tag);
     var className = classNameOf(v, tag);
-    var out = { type: t === "function" ? "function" : "object" };
+    var type = t === "function" ? "function" : "object";
+    var description = descriptionOf(v, type, subtype, className);
+    var out = mk({ type: type });
     if (subtype !== undefined) out.subtype = subtype;
     out.className = className;
-    out.description = descriptionOf(v, out.type, subtype, className);
-    out.handle = h;
+    out.description = description;
+    out.handle = allocHandle(v);
     return out;
   }
 
@@ -179,7 +217,7 @@
     var t = typeof v;
     if (t !== "object" || v === null) {
       if (t === "function" || t === "symbol") throw NOT_SERIALIZABLE;
-      return remote(v);
+      return finish(mk({ kind: "value", result: remote(v) }));
     }
     var s;
     try {
@@ -188,23 +226,25 @@
       throw NOT_SERIALIZABLE;
     }
     if (typeof s !== "string") throw NOT_SERIALIZABLE;
-    if (s.length > maxResultLength) return { kind: "resultTooLarge" };
+    if (s.length > maxResultLength) throw TOO_LARGE;
     var tag = tagOf(v);
     var subtype = subtypeOf(v, tag);
-    var out = { type: "object" };
+    var out = mk({ type: "object" });
     if (subtype !== undefined) out.subtype = subtype;
     out.className = classNameOf(v, tag);
-    out.value = jsonParse(s);
-    return out;
+    // value は JSON.parse し直さず文字列のまま埋め込む（通常の Object を介さない）。
+    var rs = jsonStringify(out);
+    return '{"kind":"value","result":' + apply(strSlice, rs, [0, -1]) + ',"value":' + s + "}}";
   }
 
   function finish(env) {
     var text = jsonStringify(env);
-    if (text.length > maxResultLength) return '{"kind":"resultTooLarge"}';
+    if (text.length > maxResultLength) throw TOO_LARGE;
     return text;
   }
 
   function evaluate(text) {
+    allocated = [];
     try {
       var p = jsonParse(text);
       if (p.epoch !== epoch) return RESET;
@@ -216,20 +256,24 @@
         v = e;
         threw = true;
       }
+      var out;
       if (threw) {
         var id = nextExceptionId;
         nextExceptionId = id + 1;
-        return finish({ kind: "exception", exceptionId: id, exception: remote(v) });
+        out = finish(mk({ kind: "exception", exceptionId: id, exception: remote(v) }));
+      } else if (p.returnByValue === true) {
+        out = byValue(v);
+        if (out.length > maxResultLength) throw TOO_LARGE;
+      } else {
+        out = finish(mk({ kind: "value", result: remote(v) }));
       }
-      if (p.returnByValue === true) {
-        var r = byValue(v);
-        if (r.kind === "resultTooLarge") return finish(r);
-        return finish({ kind: "value", result: r });
-      }
-      return finish({ kind: "value", result: remote(v) });
+      allocated = [];
+      return out;
     } catch (e) {
+      rollback();
       if (e === HANDLE_LIMIT) return '{"kind":"handleLimit"}';
       if (e === NOT_SERIALIZABLE) return '{"kind":"notSerializable"}';
+      if (e === TOO_LARGE) return '{"kind":"resultTooLarge"}';
       return INTERNAL_ERROR;
     }
   }
@@ -243,7 +287,7 @@
         apply(mapDelete, handles, [p.handle]);
         handleCount = handleCount - 1;
       }
-      return finish({ kind: "released", found: found });
+      return finish(mk({ kind: "released", found: found }));
     } catch (e) {
       return INTERNAL_ERROR;
     }
