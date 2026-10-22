@@ -346,6 +346,7 @@ fn reidentify_after(
     // 同じグループ（role・切り詰め前の name）の件数が変わった場合、出現順の区別子（#1221）では
     // 対象より前での増減が別要素の同一視になる。対象の位置を変化後のセレクタで引き、グループ内
     // 位置が変化前と同じ（対象より前が不変）なら通常判定へ進み、それ以外は `Ambiguous`。
+    // 対象が別グループへ移っていれば `SignatureChanged`。
     // 対象より後ろへの追加・削除は位置が変わらないので `Stable` のまま。
     let before_doc = parse(before_html);
     if let Ok((_, before_holders)) = build_snapshot_with_holders(&before_doc)
@@ -353,16 +354,24 @@ fn reidentify_after(
     {
         let (before_pos, before_size) = group_position(&before_holders, target);
         let after_size = group_size(&holders, target);
+        let resolved = query_selector_all_str(&doc, doc.root(), selector)
+            .ok()
+            .and_then(|m| match m.as_slice() {
+                [id] => holders.iter().find(|h| h.node == *id),
+                _ => None,
+            });
+        // 対象が別グループへ移った（名前変更）なら、残った同名要素が元の ref を得ても別要素の
+        // 同一視になるため、グループの件数によらず `SignatureChanged`（破損）で返す。
+        if let Some(h) = resolved
+            && (h.role != target.role || h.group_name != target.group_name)
+        {
+            return Reidentification::SignatureChanged {
+                before: (b_role, b_name),
+                after: (h.role.clone(), h.name.clone()),
+            };
+        }
         if after_size > 0 && after_size != before_size {
-            let resolved = query_selector_all_str(&doc, doc.root(), selector)
-                .ok()
-                .and_then(|m| match m.as_slice() {
-                    [id] => holders.iter().find(|h| h.node == *id),
-                    _ => None,
-                });
             let same_place = match resolved {
-                // 別グループへ移った（名前変更）なら下の通常判定（SignatureChanged 等）に任せる。
-                Some(h) if h.role != target.role || h.group_name != target.group_name => true,
                 Some(h) => group_position(&holders, h).0 == before_pos,
                 None => false,
             };
@@ -933,6 +942,24 @@ fn aisnap_10_truncated_name_group_insert_before_is_ambiguous() {
             side: Side::After,
             count: 2
         }
+    );
+}
+
+/// AISNAP-10・Issue #1221: 対象が名前変更で別グループへ移り、元の name の同名要素が増えた場合、
+/// 先頭の別ボタンが元の ref を得ても `Stable` にせず `SignatureChanged`。
+#[test]
+fn aisnap_10_renamed_into_other_group_is_signature_changed() {
+    let before = page("<button class=\"target\">Go</button>");
+    let after =
+        page("<button class=\"target\">Stop</button><button>Go</button><button>Go</button>");
+    let result = check_reidentification(&StabilityCase {
+        before_html: &before,
+        after_html: &after,
+        selector: ".target",
+    });
+    assert!(
+        matches!(&result, Reidentification::SignatureChanged { after, .. } if after.1 == "Stop"),
+        "{result:?}"
     );
 }
 
