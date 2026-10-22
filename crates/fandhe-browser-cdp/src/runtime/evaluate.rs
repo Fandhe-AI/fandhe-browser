@@ -154,6 +154,7 @@ fn install_source(epoch: u64, limits: &EvalLimits) -> String {
         "maxHandles": limits.max_handles,
         "maxResultLength": limits.max_result_len,
         "maxDescriptionLength": MAX_DESCRIPTION_UNITS,
+        "maxUnserializableLength": MAX_UNSERIALIZABLE_BYTES,
     });
     format!("{}({})", HELPER_JS.trim(), js_string_literal(&cfg))
 }
@@ -825,6 +826,7 @@ mod tests {
             "maxHandles": 4096,
             "maxResultLength": 1_000_000,
             "maxDescriptionLength": 4096,
+            "maxUnserializableLength": 1024,
         });
         assert!(src.ends_with(&format!("({})", js_string_literal(&cfg))));
         assert!(src.starts_with(HELPER_JS.trim()));

@@ -8,6 +8,8 @@
 
 use std::process::ExitCode;
 
+// macOS では評価器が無効で `run_disabled` しか使わないため、未使用の項目を許す（共有モジュール）。
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 #[path = "support/runtime_evaluate_cases.rs"]
 mod cases;
 

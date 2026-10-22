@@ -398,6 +398,29 @@ async fn hardening(engine: &str) {
     assert!(f.get("result").is_some(), "{f}");
     assert_eq!(f["result"]["exceptionDetails"]["exception"]["value"], 5);
 
+    // Array.prototype の index setter でハンドルの追跡記録を妨げられない（件数・上限が保たれる）。
+    let f = c
+        .eval(
+            &p,
+            ctx,
+            "Object.defineProperty(Array.prototype, '0', {configurable:true, set:function(){ throw 1; }}); 1",
+            false,
+        )
+        .await;
+    assert_eq!(ro(&f), &json!({"type":"number","value":1}));
+    let f = c.eval(&p, ctx, "({})", false).await;
+    assert_eq!(ro(&f)["type"], "object");
+    let f = c.eval(&p, ctx, "[{}, {}]", false).await;
+    assert_eq!(ro(&f)["subtype"], "array");
+    // bigint は Rust 側の 1024 バイト上限ちょうどまで通り、超過は明示的なサイズ上限エラー。
+    let f = c.eval(&p, ctx, "10n ** 1022n", false).await;
+    assert_eq!(
+        ro(&f)["unserializableValue"].as_str().map(str::len),
+        Some(1024)
+    );
+    let f = c.eval(&p, ctx, "10n ** 1023n", false).await;
+    assert!(is_err(&f, -32000, "evaluation result too large"), "{f}");
+
     // 説明文は "Error: " + message が 4096 単位の境界で絵文字を分断する。
     let f = c
         .eval(&p, ctx, "new Error('a'.repeat(4088) + '\\u{1F600}')", false)

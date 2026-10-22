@@ -38,6 +38,7 @@
   var maxHandles = cfg.maxHandles;
   var maxResultLength = cfg.maxResultLength;
   var maxDescriptionLength = cfg.maxDescriptionLength;
+  var maxUnserializableLength = cfg.maxUnserializableLength;
   var MAX_HANDLE = 9007199254740991;
 
   var handles = new MapCtor();
@@ -77,14 +78,17 @@
   }
 
   // 払い出したハンドルのうち、クライアントへ通知できなかったものを回収する。
-  var allocated = [];
+  // 1 回の評価で払い出す id は連番で連続するため、開始位置（evalStart）から nextHandle 未満までを
+  // 数値だけで走査して回収する。通常の配列を使わないので、ユーザーが Array.prototype に
+  // setter を仕込んでも記録の欠落・件数のずれは起きない（`SEC-2`・リソース上限）。
+  var evalStart = 1;
   function rollback() {
-    for (var i = 0; i < allocated.length; i++) {
-      if (apply(mapDelete, handles, [allocated[i]]) === true) {
+    for (var i = evalStart; i < nextHandle; i++) {
+      if (apply(mapDelete, handles, [i]) === true) {
         handleCount = handleCount - 1;
       }
     }
-    allocated = [];
+    evalStart = nextHandle;
   }
 
   function allocHandle(v) {
@@ -92,10 +96,15 @@
       throw HANDLE_LIMIT;
     }
     var n = nextHandle;
+    // 先に件数と番号を確保し、保存に失敗したら必ず巻き戻す。
     nextHandle = n + 1;
-    apply(mapSet, handles, [n, v]);
-    allocated[allocated.length] = n;
     handleCount = handleCount + 1;
+    try {
+      apply(mapSet, handles, [n, v]);
+    } catch (e) {
+      handleCount = handleCount - 1;
+      throw e;
+    }
     return n;
   }
 
@@ -193,7 +202,10 @@
       return mk({ type: "number", value: v });
     }
     if (t === "bigint") {
-      return mk({ type: "bigint", unserializableValue: StringCtor(v) + "n" });
+      var bs = StringCtor(v) + "n";
+      // Rust 側の検証（maxUnserializableLength）と同じ上限。超えたら明示的なサイズ上限エラーにする。
+      if (bs.length > maxUnserializableLength) throw TOO_LARGE;
+      return mk({ type: "bigint", unserializableValue: bs });
     }
     if (t === "symbol") {
       var sd = descriptionOf(v, t, undefined, "Symbol");
@@ -244,7 +256,7 @@
   }
 
   function evaluate(text) {
-    allocated = [];
+    evalStart = nextHandle;
     try {
       var p = jsonParse(text);
       if (p.epoch !== epoch) return RESET;
@@ -267,7 +279,7 @@
       } else {
         out = finish(mk({ kind: "value", result: remote(v) }));
       }
-      allocated = [];
+      evalStart = nextHandle;
       return out;
     } catch (e) {
       rollback();
