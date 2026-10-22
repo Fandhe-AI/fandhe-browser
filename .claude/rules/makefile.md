@@ -27,7 +27,7 @@ description: >
 | `scripts/harness.sh <name>` | 実測ハーネス・ベンチ・計測系の実体 |
 | `scripts/lint-docs.sh <kind>` | markdownlint・yamllint・editorconfig-checker・commitlint |
 | `scripts/help.sh` | Make 非依存のターゲット一覧（手動保守） |
-| その他 | `setup.sh`・`rustup-check.sh`・`submodule.sh`・`install-hooks.sh`・`deny.sh`・`about.sh`・`check-deny-license-reject.sh`、CI も直接呼ぶ `check-render-isolation.sh`・`check-js-engine-isolation.sh`・`check-static-link.sh`・`ci-changes.sh`・`ci-prune-target.sh` |
+| その他 | `setup.sh`・`rustup-check.sh`・`submodule.sh`・`install-hooks.sh`・`deny.sh`・`about.sh`・`check-deny-license-reject.sh`、CI も直接呼ぶ `check-render-isolation.sh`・`check-js-engine-isolation.sh`・`check-static-link.sh`・`check-dynamic-link-macos.sh`・`ci-changes.sh`・`ci-prune-target.sh` |
 
 `scripts/hooks/**` は存在しない。lefthook の編集方針は [git-hooks](./git-hooks.md) が担当し、`lefthook.yml` の `run:` はインラインで書く。
 

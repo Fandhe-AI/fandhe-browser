@@ -8,7 +8,7 @@
 #   - .github/workflows/ci.yml の harness-ubuntu [static-link] ステップ（上記 harness 経由）
 #
 # 対象は musl ビルドの配布バイナリ（TASK-64 の既定・軽量コンテナ向け）。`*-linux-gnu` のネイティブ配布物は
-# 対象外（方針は #363 で人間が判断する）。検出できるのはロード時の動的リンクだけで、dlopen による
+# 対象外（#363 で許可リスト方式に決定済み。macOS は check-dynamic-link-macos.sh が担当）。検出できるのはロード時の動的リンクだけで、dlopen による
 # 実行時ロードは検出しない（PLUG-1 の残りはレビューと docs/design/plugin-boundary-policy.md で担保する）。
 # glibc の ldd は対象のローダを起動しうるため、信頼できる（同じジョブでビルドした）バイナリにだけ使う。
 #

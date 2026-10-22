@@ -8,6 +8,7 @@
 #   check-ci-changes         CI の docs-only 判定スクリプトの自己テスト
 #   check-binary-size        既定 feature のリリースバイナリサイズ検査（RENDER-2。要 jq）
 #   check-static-link        musl 配布バイナリ（既定・軽量）の動的リンクなし検査（PLUG-1・CTR-4・TASK-93.3。Linux のみ）
+#   check-dynamic-link-macos macOS 配布バイナリ（既定・軽量）の動的リンクを許可リストと照合（PLUG-1・TASK-93.4・#364。macOS のみ。既定は記録のみ・#363）
 #   measure-mcp-envelope     方式 B 本体と MCP エンベロープの測定（PLUG-5。unix のみ）
 #   check-mcp-envelope       上記ハーネスの e2e smoke（unix のみ。0 件実行は NG）
 #   measure-plugin-overhead  mcp プラグインのアイドル RSS 増分・cold start・呼び出しレイテンシの測定（PLUG-3・TASK-95.1・95.2・95.3。unix のみ）
@@ -31,7 +32,7 @@
 # CONTAINER_SIZE_LITE_IMAGE・CONTAINER_SIZE_PLATFORM・CONTAINER_SIZE_SKIP_BUILD・CONTAINER_SIZE_NO_PULL（非空で有効）・
 # CONTAINER_SMOKE_ROLE（lite|default）・CONTAINER_SMOKE_IMAGE・CONTAINER_SMOKE_PLATFORM・CONTAINER_SMOKE_SKIP_BUILD（非空で有効）・CONTAINER_SMOKE_TASK_TIMEOUT・
 # CONTAINER_JS_SMOKE_IMAGE・CONTAINER_JS_SMOKE_PLATFORM・CONTAINER_JS_SMOKE_SKIP_BUILD（非空で有効）・CONTAINER_JS_SMOKE_CASE_TIMEOUT・
-# MCP_ENVELOPE_TARGET_DIR・STATIC_LINK_TARGET_DIR・PLAYWRIGHT_VERSION・PLAYWRIGHT_INTEGRITY（既定値は scripts/versions.sh）。
+# MCP_ENVELOPE_TARGET_DIR・STATIC_LINK_TARGET_DIR・MACOS_DYLIB_TARGET_DIR・MACOS_DYLIB_MODE（record|enforce）・PLAYWRIGHT_VERSION・PLAYWRIGHT_INTEGRITY（既定値は scripts/versions.sh）。
 # 各ハーネスの詳細は harness/*/README.md・benches/*/README.md を参照。
 set -euo pipefail
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -128,9 +129,9 @@ case "${name}" in
     ;;
   check-static-link)
     # `make ci` には含めない（release ビルド 2 回と musl ツールチェーンを要するため。check-binary-size と同じ扱い）。
-    # CI では ci.yml の harness-ubuntu [static-link] ステップが担う。macOS は #364、Windows は #365 が別手段で担う。
+    # CI では ci.yml の harness-ubuntu [static-link] ステップが担う。macOS は check-dynamic-link-macos（#364）、Windows は #365 が別手段で担う。
     # 出荷物そのものの関門は docker/Dockerfile.release の verify-* ステージ（判定ロジックは同じ scripts/check-static-link.sh）。
-    [ "$(uname -s)" = "Linux" ] || skip "${name} supports Linux only (macOS: #364, Windows: #365)"
+    [ "$(uname -s)" = "Linux" ] || skip "${name} supports Linux only (macOS: check-dynamic-link-macos, Windows: #365)"
     case "$(uname -m)" in
       x86_64) triple="x86_64-unknown-linux-musl"; musl_cc="musl-gcc" ;;
       aarch64) triple="aarch64-unknown-linux-musl"; musl_cc="aarch64-linux-musl-gcc" ;;
@@ -180,6 +181,39 @@ case "${name}" in
       bash scripts/check-static-link.sh "${sl_bin}" || sl_rc=1
     done
     exit "${sl_rc}"
+    ;;
+  check-dynamic-link-macos)
+    # `make ci` には含めない（release ビルド 2 回を要するため。check-static-link と同じ扱い）。
+    # CI では ci.yml の harness-macos [dynamic-link-macos] ステップが担う（PR では harness-macos が skipped のため、
+    # harness-ubuntu は自己テスト（合成データ）だけを回す）。判定ロジックの正本は scripts/check-dynamic-link-macos.sh。
+    [ "$(uname -s)" = "Darwin" ] || skip "${name} supports macOS only (Linux: check-static-link, Windows: #365)"
+    require_cmd cargo "required by ${name}"
+    require_cmd otool "required by ${name}"
+    require_cmd file "required by ${name}"
+    bash scripts/check-dynamic-link-macos.sh --self-test
+    dl_dir="${MACOS_DYLIB_TARGET_DIR:-${CARGO_TARGET_DIR:-${ROOT_DIR}/target}}"
+    case "${dl_dir}" in
+      /*) ;;
+      *) dl_dir="${ROOT_DIR}/${dl_dir}" ;;
+    esac
+    # 既定は記録のみ（#363 のオーナー判断 2026-10-12）。許可リスト確定後に既定を enforce へ切り替える。
+    dl_mode="${MACOS_DYLIB_MODE:-record}"
+    dl_bin="${dl_dir}/release/fandhe-browser"
+    dl_rc=0
+    # 2 構成は同じ出力パスへ上書きされるため、各ビルドの直後に検査する。片方が NG でももう片方を実行する。
+    for flavor in default lite; do
+      echo "dynamic-link-macos: flavor=${flavor}"
+      if [ "${flavor}" = "default" ]; then
+        cargo build --release --locked -p fandhe-browser-cli --bin fandhe-browser \
+          --target-dir "${dl_dir}" || { dl_rc=1; continue; }
+      else
+        cargo build --release --locked -p fandhe-browser-cli --bin fandhe-browser \
+          --target-dir "${dl_dir}" --no-default-features --features js-boa || { dl_rc=1; continue; }
+      fi
+      echo "dynamic-link-macos: flavor=${flavor} size=$(wc -c <"${dl_bin}" | tr -d ' ')"
+      bash scripts/check-dynamic-link-macos.sh --mode "${dl_mode}" "${dl_bin}" || dl_rc=1
+    done
+    exit "${dl_rc}"
     ;;
   measure-mcp-envelope)
     unix_only || { echo "error: ${name} supports unix only" >&2; exit 1; }
