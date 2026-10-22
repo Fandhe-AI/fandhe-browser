@@ -1,4 +1,5 @@
-//! V8 / boa 共通の `Runtime.evaluate`・`Runtime.releaseObject` の結合テストケース（TASK-44.7・#1218・
+//! V8 / boa 共通の `Runtime.evaluate`・`Runtime.releaseObject`・`Runtime.callFunctionOn`・`awaitPromise` の
+//! 結合テストケース（TASK-44.7・#1218・TASK-44.8・#1219・
 //! ビヘイビア `CDP-2`・`CDP-6`・`CDP-7`・`SEC-2`・`REPAIR-3`・関連 `JS-6`・`PERF-7`）。
 //!
 //! `tests/runtime_evaluate_v8.rs` と `tests/runtime_evaluate_boa.rs` が `#[path]` で取り込む。実エンジンの
@@ -179,6 +180,20 @@ impl Cdp {
             .expect("response frame")
     }
 
+    /// `Runtime.callFunctionOn` の応答フレーム（最後のフレーム）。
+    async fn callf(&mut self, p: &Page, params: Value) -> Value {
+        self.call(p, "Runtime.callFunctionOn", params)
+            .await
+            .pop()
+            .expect("response frame")
+    }
+
+    /// 式を評価して `objectId` を得る。
+    async fn handle(&mut self, p: &Page, ctx: u64, expr: &str) -> String {
+        let f = self.eval(p, ctx, expr, false).await;
+        ro(&f)["objectId"].as_str().expect("objectId").to_owned()
+    }
+
     async fn release(&mut self, p: &Page, object_id: &str) -> Value {
         self.call(p, "Runtime.releaseObject", json!({"objectId": object_id}))
             .await
@@ -245,6 +260,12 @@ pub fn run(engine: &str) {
     rt.block_on(contexts_per_scope(engine));
     eprintln!("case: timeout");
     rt.block_on(timeout(engine));
+    eprintln!("case: callFunctionOn");
+    rt.block_on(call_function_on(engine));
+    eprintln!("case: callFunctionOn rejections");
+    rt.block_on(call_function_on_rejections(engine));
+    eprintln!("case: awaitPromise");
+    rt.block_on(await_promise(engine));
 }
 
 async fn primitives(engine: &str) {
@@ -584,7 +605,7 @@ async fn gating(engine: &str) {
     // 未対応・未知のパラメータは成功を装わず拒否する。
     let iso = c.isolated(&p, "u").await;
     for params in [
-        json!({"expression":"1","contextId":iso,"awaitPromise":true}),
+        json!({"expression":"1","contextId":iso,"objectGroup":"g"}),
         json!({"expression":"1","contextId":iso,"generatePreview":true}),
         json!({"expression":"1","contextId":iso,"includeCommandLineAPI":true}),
     ] {
@@ -769,4 +790,321 @@ pub fn run_disabled() {
         assert!(is_err(&f, -32000, "execution contexts unavailable"), "{f}");
         assert_eq!(c.worker_spawns(), 0);
     });
+}
+/// Playwright の utility script 相当（`evaluate(isFunction, returnByValue, expression, argCount, ...args)`）。
+const UTILITY_SCRIPT: &str = "({ tag: 'utility', evaluate: function (isFunction, returnByValue, expression, argCount) { \
+     var fn = (0, eval)(expression); return isFunction ? fn.apply(null, Array.prototype.slice.call(arguments, 4)) : fn; } })";
+
+async fn call_function_on(engine: &str) {
+    let mut c = Cdp::new(engine);
+    let (p, ctx) = c.ready().await;
+    let h = c.handle(&p, ctx, UTILITY_SCRIPT).await;
+
+    // Playwright 型: this は utility script、arguments は {objectId} と value 4 件。
+    let f = c
+        .callf(
+            &p,
+            json!({
+                "functionDeclaration": "(utilityScript, ...args) => utilityScript.evaluate(...args)",
+                "objectId": h,
+                "arguments": [
+                    {"objectId": h},
+                    {"value": true},
+                    {"value": true},
+                    {"value": "() => 'hello' + 1"},
+                    {"value": 0}
+                ],
+                "returnByValue": true,
+                "awaitPromise": true,
+                "userGesture": true,
+            }),
+        )
+        .await;
+    assert_eq!(ro(&f), &json!({"type":"string","value":"hello1"}), "{f}");
+    assert_eq!(f["sessionId"], p.sid.as_str());
+
+    // this の束縛（具体値）。
+    let f = c
+        .callf(
+            &p,
+            json!({"functionDeclaration": "function () { return this.tag; }", "objectId": h, "returnByValue": true}),
+        )
+        .await;
+    assert_eq!(ro(&f), &json!({"type":"string","value":"utility"}));
+
+    // userGesture の有無で結果は変わらない（REPAIR-3: 効果なし）。
+    for ug in [false, true] {
+        let f = c
+            .callf(
+                &p,
+                json!({"functionDeclaration": "function () { return 7; }", "objectId": h, "userGesture": ug, "returnByValue": true}),
+            )
+            .await;
+        assert_eq!(ro(&f), &json!({"type":"number","value":7}));
+    }
+
+    // unserializableValue の往復。
+    let f = c
+        .callf(
+            &p,
+            json!({
+                "functionDeclaration": "function (a, b, c, d, e, f) { return [typeof a + String(a), 1 / b === -Infinity, c, d, typeof e + String(e), f === undefined].join('|'); }",
+                "objectId": h,
+                "arguments": [
+                    {"unserializableValue": "NaN"},
+                    {"unserializableValue": "-0"},
+                    {"unserializableValue": "Infinity"},
+                    {"unserializableValue": "-Infinity"},
+                    {"unserializableValue": "-12n"},
+                    {}
+                ],
+                "returnByValue": true,
+            }),
+        )
+        .await;
+    assert_eq!(
+        ro(&f),
+        &json!({"type":"string","value":"numberNaN|true|Infinity|-Infinity|bigint-12|true"}),
+        "{f}"
+    );
+
+    // ハンドル返し。戻りのオブジェクトは objectId を持つ。
+    let f = c
+        .callf(
+            &p,
+            json!({"functionDeclaration": "function () { return { n: 1 }; }", "objectId": h}),
+        )
+        .await;
+    assert_eq!(ro(&f)["type"], "object");
+    assert!(ro(&f)["objectId"].as_str().is_some(), "{f}");
+
+    // 関数でない・構文エラー・throw。
+    let f = c
+        .callf(&p, json!({"functionDeclaration": "42", "objectId": h}))
+        .await;
+    assert!(
+        is_err(
+            &f,
+            -32000,
+            "function declaration did not evaluate to a function"
+        ),
+        "{f}"
+    );
+    for decl in ["function (", "function () { throw new Error('boom'); }"] {
+        let f = c
+            .callf(&p, json!({"functionDeclaration": decl, "objectId": h}))
+            .await;
+        assert_eq!(
+            f["result"]["exceptionDetails"]["text"], "uncaught exception",
+            "{decl}: {f}"
+        );
+        assert_eq!(f["result"]["result"]["type"], "object", "{decl}: {f}");
+    }
+
+    // 64 件ちょうどは成功する。
+    let args: Vec<Value> = (0..64).map(|i| json!({"value": i})).collect();
+    let f = c
+        .callf(
+            &p,
+            json!({"functionDeclaration": "function () { return arguments.length; }", "objectId": h, "arguments": args, "returnByValue": true}),
+        )
+        .await;
+    assert_eq!(ro(&f), &json!({"type":"number","value":64}));
+}
+
+async fn call_function_on_rejections(engine: &str) {
+    let mut c = Cdp::new(engine);
+    let (p, ctx) = c.ready().await;
+    let h = c.handle(&p, ctx, "({})").await;
+    let other_ctx = c.isolated(&p, "other").await;
+    let foreign = c.handle(&p, other_ctx, "({})").await;
+    let decl = "function () { return 1; }";
+
+    // 65 件は拒否される。
+    let args: Vec<Value> = (0..65).map(|i| json!({"value": i})).collect();
+    let f = c
+        .callf(
+            &p,
+            json!({"functionDeclaration": decl, "objectId": h, "arguments": args}),
+        )
+        .await;
+    assert!(is_err(&f, -32000, "too many call arguments"), "{f}");
+    // 書式不正の objectId。
+    for bad in ["01.1", "x", ""] {
+        let f = c
+            .callf(&p, json!({"functionDeclaration": decl, "objectId": bad}))
+            .await;
+        assert!(is_err(&f, -32602, "invalid params"), "{bad}: {f}");
+    }
+    // 引数要素が 2 キー。
+    let f = c
+        .callf(
+            &p,
+            json!({"functionDeclaration": decl, "objectId": h, "arguments": [{"value": 1, "objectId": h}]}),
+        )
+        .await;
+    assert!(is_err(&f, -32602, "invalid params"), "{f}");
+    // 他コンテキストの引数。
+    let f = c
+        .callf(
+            &p,
+            json!({"functionDeclaration": decl, "objectId": h, "arguments": [{"objectId": foreign}]}),
+        )
+        .await;
+    assert!(
+        is_err(&f, -32000, "argument belongs to another execution context"),
+        "{f}"
+    );
+    // 未対応キー・型の誤り。
+    for params in [
+        json!({"functionDeclaration": decl, "objectId": h, "executionContextId": ctx}),
+        json!({"functionDeclaration": decl, "objectId": h, "objectGroup": "g"}),
+    ] {
+        let f = c.callf(&p, params).await;
+        assert!(is_err(&f, -32602, "unsupported params"), "{f}");
+    }
+    let f = c
+        .callf(
+            &p,
+            json!({"functionDeclaration": decl, "objectId": h, "userGesture": 1}),
+        )
+        .await;
+    assert!(is_err(&f, -32602, "invalid params"), "{f}");
+    // 解放済みのハンドルは this でも引数でも「無い」。ユーザーコードは実行しない。
+    let gone = c.handle(&p, ctx, "({})").await;
+    assert_eq!(c.release(&p, &gone).await["result"], json!({}));
+    let f = c
+        .callf(&p, json!({"functionDeclaration": decl, "objectId": gone}))
+        .await;
+    assert!(is_err(&f, -32000, "remote object not found"), "{f}");
+    let f = c.eval(&p, ctx, "globalThis.__ran = 0", false).await;
+    assert_eq!(ro(&f), &json!({"type":"number","value":0}));
+    let f = c
+        .callf(
+            &p,
+            json!({"functionDeclaration": "function () { globalThis.__ran = 1; }", "objectId": h, "arguments": [{"objectId": gone.clone()}]}),
+        )
+        .await;
+    assert!(is_err(&f, -32000, "remote object not found"), "{f}");
+    let f = c.eval(&p, ctx, "globalThis.__ran", true).await;
+    assert_eq!(
+        ro(&f),
+        &json!({"type":"number","value":0}),
+        "引数が無ければ実行しない"
+    );
+    // 他セッションの objectId。
+    let other = c.page().await;
+    c.navigate(&other).await;
+    let f = c
+        .callf(&other, json!({"functionDeclaration": decl, "objectId": h}))
+        .await;
+    assert!(is_err(&f, -32000, "remote object not found"), "{f}");
+    // ヘルパー未注入の contextId。
+    let fresh = c.isolated(&p, "fresh").await;
+    let spawns = c.worker_spawns();
+    let f = c
+        .callf(
+            &p,
+            json!({"functionDeclaration": decl, "objectId": format!("{fresh}.1")}),
+        )
+        .await;
+    assert!(is_err(&f, -32000, "remote object not found"), "{f}");
+    assert_eq!(
+        c.worker_spawns(),
+        spawns,
+        "ヘルパー未注入では評価器を起動しない"
+    );
+}
+
+async fn await_promise(engine: &str) {
+    let mut c = Cdp::new(engine);
+    let (p, ctx) = c.ready().await;
+    let h = c.handle(&p, ctx, "({})").await;
+
+    // 非 Promise の値はそのまま返る（evaluate・callFunctionOn とも）。
+    let f = c
+        .call(
+            &p,
+            "Runtime.evaluate",
+            json!({"expression": "40 + 2", "contextId": ctx, "awaitPromise": true, "returnByValue": true}),
+        )
+        .await
+        .pop()
+        .expect("frame");
+    assert_eq!(ro(&f), &json!({"type":"number","value":42}), "{f}");
+    let f = c
+        .callf(
+            &p,
+            json!({"functionDeclaration": "function () { return 'v'; }", "objectId": h, "awaitPromise": true, "returnByValue": true}),
+        )
+        .await;
+    assert_eq!(ro(&f), &json!({"type":"string","value":"v"}), "{f}");
+
+    // microtask checkpoint の後も pending なら成功を装わず -32000。
+    let pending = "function () { return new Promise(function () {}); }";
+    for _ in 0..100 {
+        let f = c
+            .callf(
+                &p,
+                json!({"functionDeclaration": pending, "objectId": h, "awaitPromise": true}),
+            )
+            .await;
+        assert!(is_err(&f, -32000, "promise was not settled"), "{f}");
+    }
+    let f = c
+        .call(
+            &p,
+            "Runtime.evaluate",
+            json!({"expression": "new Promise(function () {})", "contextId": ctx, "awaitPromise": true}),
+        )
+        .await
+        .pop()
+        .expect("frame");
+    assert!(is_err(&f, -32000, "promise was not settled"), "{f}");
+    // 100 回繰り返してもスロット・ハンドルが枯渇しない（毎回削除される）。
+    let f = c.eval(&p, ctx, "({})", false).await;
+    assert!(ro(&f)["objectId"].as_str().is_some(), "{f}");
+
+    // awaitPromise なしの Promise は RemoteObject（subtype promise）のまま返る。
+    let f = c
+        .callf(&p, json!({"functionDeclaration": pending, "objectId": h}))
+        .await;
+    assert_eq!(ro(&f)["subtype"], "promise", "{f}");
+
+    // native Promise の決着（エンジンごとの実測値。REPAIR-3: call_function_on.rs の差異節に記録）。
+    for (name, decl) in [
+        ("resolved", "function () { return Promise.resolve(42); }"),
+        (
+            "rejected",
+            "function () { return Promise.reject(new Error('no')); }",
+        ),
+        (
+            "queued",
+            "function () { return new Promise(function (r) { Promise.resolve().then(function () { r(7); }); }); }",
+        ),
+    ] {
+        let f = c
+            .callf(
+                &p,
+                json!({"functionDeclaration": decl, "objectId": h, "awaitPromise": true, "returnByValue": true}),
+            )
+            .await;
+        if engine == "v8" {
+            // V8 は評価の終わりに microtask が流れ、反応ジョブが決着を記録する。
+            match name {
+                "resolved" => assert_eq!(ro(&f), &json!({"type":"number","value":42}), "{f}"),
+                "queued" => assert_eq!(ro(&f), &json!({"type":"number","value":7}), "{f}"),
+                _ => {
+                    assert_eq!(
+                        f["result"]["exceptionDetails"]["text"],
+                        "uncaught exception"
+                    );
+                    assert_eq!(f["result"]["result"]["description"], "Error: no", "{f}");
+                }
+            }
+        } else {
+            // boa は js crate が native Promise のジョブを流さないため決着せず、成功を装わない（REPAIR-3）。
+            assert!(is_err(&f, -32000, "promise was not settled"), "{name}: {f}");
+        }
+    }
 }

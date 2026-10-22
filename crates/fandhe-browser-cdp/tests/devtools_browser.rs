@@ -116,6 +116,37 @@ fn send_text(s: &mut TcpStream, text: &str) {
     s.write_all(&frame).unwrap();
 }
 
+/// 長いペイロード（16 bit・64 bit の拡張長）を 1 フレームで送る。`send_text` と同じくマスク付き。
+fn send_text_large(s: &mut TcpStream, text: &str) {
+    let payload = text.as_bytes();
+    let key = [0x11u8, 0x22, 0x33, 0x44];
+    let mut frame = vec![0x81u8];
+    if payload.len() < 126 {
+        frame.push(0x80 | payload.len() as u8);
+    } else if payload.len() <= usize::from(u16::MAX) {
+        frame.push(0x80 | 126);
+        frame.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+    } else {
+        frame.push(0x80 | 127);
+        frame.extend_from_slice(&(payload.len() as u64).to_be_bytes());
+    }
+    frame.extend_from_slice(&key);
+    frame.extend(payload.iter().enumerate().map(|(i, b)| b ^ key[i % 4]));
+    s.write_all(&frame).unwrap();
+}
+
+/// サーバー発の close フレーム（0x88）を読み、close code を返す。
+fn read_close_code(s: &mut TcpStream) -> u16 {
+    let mut h = [0u8; 2];
+    s.read_exact(&mut h).expect("close frame header");
+    assert_eq!(h[0], 0x88, "expected FIN + close frame");
+    let len = usize::from(h[1] & 0x7f);
+    assert!(len >= 2, "close frame without a status code");
+    let mut payload = vec![0u8; len];
+    s.read_exact(&mut payload).expect("close payload");
+    u16::from_be_bytes([payload[0], payload[1]])
+}
+
 /// サーバー発の非マスクテキストフレームを 1 つ読んで JSON にする。
 fn read_text_json(s: &mut TcpStream) -> Value {
     let mut h = [0u8; 2];
@@ -203,6 +234,68 @@ async fn cdp6_unimplemented_method_over_ws_is_error_and_logged() {
         .map(|(_, c)| *c)
         .expect("logged");
     assert_eq!((c.handled, c.unimplemented), (0, 2));
+}
+
+/// `{"id":N,"method":"Browser.getVersion","params":{}}` を空白で `total` バイトまで水増しする。
+fn padded_get_version(id: u32, total: usize) -> String {
+    let base = format!(r#"{{"id":{id},"method":"Browser.getVersion","params":{{}}"#);
+    let pad = total - base.len() - 1;
+    format!("{base}{}}}", " ".repeat(pad))
+}
+
+/// `CDP-7`（#1219）: Playwright の注入スクリプト（実測 320,783 バイト）相当の 1 フレームが、
+/// 切断されずに処理される（WS の 1 フレーム上限は 1 MiB）。
+#[tokio::test]
+async fn cdp7_single_frame_over_300kib_is_processed() {
+    let dir = TempDir::new();
+    let addr = start(&dir).await;
+    tokio::task::spawn_blocking(move || {
+        let mut s = connect(addr);
+        let head = upgrade(
+            &mut s,
+            "/devtools/browser/fixed-1",
+            &format!("127.0.0.1:{}", addr.port()),
+            "",
+        );
+        assert_eq!(status_of(&head), 101, "head: {head}");
+        let product = format!("fandhe-browser/{}", env!("CARGO_PKG_VERSION"));
+        let expected = |id: u32| {
+            json!({"id": id, "result": {
+                "protocolVersion": "1.3", "product": product, "userAgent": product
+            }})
+        };
+        send_text_large(&mut s, &padded_get_version(1, 330_000));
+        assert_eq!(read_text_json(&mut s), expected(1));
+        // 切断されておらず、続く小さい要求にも応答する。
+        send_text(&mut s, r#"{"id":2,"method":"Browser.getVersion"}"#);
+        assert_eq!(read_text_json(&mut s), expected(2));
+    })
+    .await
+    .unwrap();
+}
+
+/// `CDP-7`（#1219）: 上限は無くなったのではなく 1 MiB に移った。上限ちょうど（1,048,576 バイト）は
+/// 処理され、1 バイト超えると close 1009（Message Too Big）で切断される。
+#[tokio::test]
+async fn cdp7_single_frame_over_one_mib_is_closed_with_1009() {
+    let dir = TempDir::new();
+    let addr = start(&dir).await;
+    tokio::task::spawn_blocking(move || {
+        let mut s = connect(addr);
+        let head = upgrade(
+            &mut s,
+            "/devtools/browser/fixed-1",
+            &format!("127.0.0.1:{}", addr.port()),
+            "",
+        );
+        assert_eq!(status_of(&head), 101, "head: {head}");
+        send_text_large(&mut s, &padded_get_version(1, 1_048_576));
+        assert_eq!(read_text_json(&mut s)["id"], 1);
+        send_text_large(&mut s, &padded_get_version(2, 1_048_576 + 1));
+        assert_eq!(read_close_code(&mut s), 1009);
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test]

@@ -1,5 +1,5 @@
-//! `Runtime.evaluate`・`Runtime.releaseObject` と RemoteObject の最小表現
-//! （TASK-44.7・#1218、ビヘイビア `CDP-2`・`CDP-6`・`CDP-7`・`SEC-2`・`REPAIR-3`・関連 `JS-6`・`PERF-7`・MS-4）。
+//! `Runtime.evaluate`・`Runtime.releaseObject`・`Runtime.callFunctionOn` と RemoteObject の最小表現
+//! （TASK-44.7・#1218・TASK-44.8・#1219、ビヘイビア `CDP-2`・`CDP-6`・`CDP-7`・`SEC-2`・`REPAIR-3`・関連 `JS-6`・`PERF-7`・MS-4）。
 //!
 //! 親モジュール [`super`] の contextId の表（[`super::ExecutionContextTable`]）で解決した isolated world の
 //! 評価コンテキスト（core の `ScriptContextHandle`。確定文書の上で JS ランタイムを保持する。#1216）の上で、
@@ -27,12 +27,19 @@
 //!
 //! `Runtime.evaluate`: `sessionId` なし → `UNSUPPORTED_PARAMS` → `params` が非オブジェクト → `INVALID_PARAMS`
 //! → 未知キー（既知は `expression`・`contextId`・`returnByValue`・`awaitPromise`・`silent`）→
-//! `UNSUPPORTED_PARAMS` → 型の誤り → `INVALID_PARAMS` → `awaitPromise: true` → `UNSUPPORTED_PARAMS` →
+//! `UNSUPPORTED_PARAMS` → 型の誤り → `INVALID_PARAMS` →
 //! 式が 1 MiB 超 → `EXPRESSION_TOO_LARGE`（評価器を起動しない）→ 未知セッション → `INVALID_PARAMS` →
 //! 止めたターゲット → `TARGET_WAITING_FOR_DEBUGGER` → 評価器が無効 → `EXECUTION_CONTEXTS_UNAVAILABLE` →
 //! 確定文書なし・世代の食い違い → `TARGET_DOCUMENT_UNAVAILABLE` → contextId の解決失敗（未知・他セッションは
 //! `INVALID_PARAMS`、世代違いは `EXECUTION_CONTEXT_STALE`）→ main world・`contextId` 省略 →
 //! `MAIN_WORLD_EVALUATION_UNSUPPORTED`。
+//!
+//! `Runtime.callFunctionOn`（`call_function_on` モジュール）: `sessionId` なし → `UNSUPPORTED_PARAMS` →
+//! 非オブジェクト → `INVALID_PARAMS` → 未知キー → `UNSUPPORTED_PARAMS` → 型の誤り・`objectId` 無し・書式不正 →
+//! `INVALID_PARAMS` → `arguments` が 64 件超 → `TOO_MANY_CALL_ARGUMENTS`（要素を走査する前）→ 引数要素の誤り →
+//! `INVALID_PARAMS` → 引数の `objectId` が `this` と別の contextId → `ARGUMENT_CONTEXT_MISMATCH`（Rust 側の比較だけ）
+//! → `functionDeclaration` が 1 MiB 超 → `EXPRESSION_TOO_LARGE` → 以降は `Runtime.releaseObject` と同じ
+//! 解決（未知・他セッション・main world・ヘルパー未注入は `REMOTE_OBJECT_NOT_FOUND`）。
 //!
 //! `Runtime.releaseObject`: `sessionId` なし → `UNSUPPORTED_PARAMS` → 非オブジェクト → `INVALID_PARAMS` →
 //! `objectId` 以外のキー → `UNSUPPORTED_PARAMS` → `objectId` 無し・非文字列・書式不正 → `INVALID_PARAMS` →
@@ -42,8 +49,13 @@
 //!
 //! # 差異・スタブ（`REPAIR-3`）
 //!
-//! - `awaitPromise: true`（microtask の実行）は `UNSUPPORTED_PARAMS`（#1219）。`silent` は受け入れるが効果は無い。
-//!   `callFunctionOn`・`getProperties`・`releaseObjectGroup` は未登録（`-32601`）。`objectGroup`・
+//! - `awaitPromise: true`（#1219）: 結果が native Promise なら、別の評価で microtask checkpoint
+//!   （shim の `__fandheRunMicrotasks`）を 1 回流してから決着を読む。checkpoint の後も pending なら
+//!   `PROMISE_NOT_SETTLED`（`-32000`。偽の値を返さない）。待機スロットは決着・未決着のどちらでも削除する。
+//!   native Promise の反応ジョブ自体を流せるかはエンジンに依存する（`call_function_on` モジュールの差異節）。
+//!   所要時間は評価が最大 3 回（本体・checkpoint・決着）になるため `timeout` の最大 3 倍になり得る。
+//!   `silent` は受け入れるが効果は無い。
+//!   `getProperties`・`releaseObjectGroup` は未登録（`-32601`）。`objectGroup`・
 //!   `generatePreview`・`includeCommandLineAPI` 等の未知キーも `UNSUPPORTED_PARAMS`（成功を装わない。`CDP-6`）。
 //! - main world への評価はエラー（上記）。`exceptionDetails` の `lineNumber`・`columnNumber` は 0 固定で
 //!   `text` は固定文言 `uncaught exception`（Chromium の文言は使わない）。
@@ -70,6 +82,10 @@ use fandhe_browser_core::{
 };
 use serde_json::{Map, Value, json};
 
+mod call_function_on;
+
+pub(crate) use call_function_on::RuntimeCallFunctionOn;
+
 use super::{ContextLookupError, ContextView, MAX_CONTEXT_ID, World};
 use crate::protocol::{BoxFuture, CdpError, CommandContext, CommandHandler, HandlerOutput};
 use crate::server::CdpState;
@@ -92,6 +108,8 @@ const MAX_DESCRIPTION_BYTES: usize = MAX_DESCRIPTION_UNITS * 3;
 const MAX_CLASS_NAME_BYTES: usize = 256 * 3;
 /// `unserializableValue`（bigint）の最大バイト長。
 const MAX_UNSERIALIZABLE_BYTES: usize = 1024;
+/// 1 コンテキストが同時に保持できる `awaitPromise` の待機スロット数の上限（`SEC-2`）。
+const MAX_AWAITING_SLOTS: usize = 64;
 /// `objectId` の最大バイト長。
 const MAX_OBJECT_ID_BYTES: usize = 64;
 /// ハンドル番号・例外 ID の上限（JS の安全整数）。
@@ -155,6 +173,7 @@ fn install_source(epoch: u64, limits: &EvalLimits) -> String {
         "maxResultLength": limits.max_result_len,
         "maxDescriptionLength": MAX_DESCRIPTION_UNITS,
         "maxUnserializableLength": MAX_UNSERIALIZABLE_BYTES,
+        "maxAwaiting": MAX_AWAITING_SLOTS,
     });
     format!("{}({})", HELPER_JS.trim(), js_string_literal(&cfg))
 }
@@ -168,15 +187,39 @@ fn helper_call_source(method: &str, payload: &Value) -> String {
 }
 
 /// 式の評価ソース。可変のデータ（epoch・式・returnByValue）はすべてリテラルの中に入る。
-fn evaluate_source(epoch: u64, expression: &str, return_by_value: bool) -> String {
+fn evaluate_source(
+    epoch: u64,
+    expression: &str,
+    return_by_value: bool,
+    await_promise: bool,
+) -> String {
     helper_call_source(
         "evaluate",
         &json!({
             "epoch": epoch,
             "expression": expression,
             "returnByValue": return_by_value,
+            "awaitPromise": await_promise,
         }),
     )
+}
+
+/// `awaitPromise` の 1 段目（microtask checkpoint）の評価ソース。
+fn checkpoint_source(epoch: u64) -> String {
+    helper_call_source("checkpoint", &json!({ "epoch": epoch }))
+}
+
+/// `awaitPromise` の 2 段目（スロットの読み出しと削除）の評価ソース。
+fn settle_source(epoch: u64, slot: u64, return_by_value: bool) -> String {
+    helper_call_source(
+        "settle",
+        &json!({ "epoch": epoch, "slot": slot, "returnByValue": return_by_value }),
+    )
+}
+
+/// 待機スロットだけを捨てる評価ソース（決着を読めなかったときの後始末。冪等）。
+fn drop_slot_source(epoch: u64, slot: u64) -> String {
+    helper_call_source("dropSlot", &json!({ "epoch": epoch, "slot": slot }))
 }
 
 /// 直近の評価が払い出したハンドルの回収ソース（返却できない結果のハンドルを残さない。`SEC-2`）。
@@ -223,15 +266,36 @@ fn parse_decimal(s: &str, max: u64) -> Option<u64> {
 /// ヘルパーが返す JSON 文字列（封筒）を解析した値。
 #[derive(Debug, PartialEq)]
 enum Envelope {
-    Installed { epoch: u64 },
+    Installed {
+        epoch: u64,
+    },
     Reset,
     InternalError,
     HandleLimit,
     ResultTooLarge,
     NotSerializable,
-    Value { result: Value },
-    Exception { id: u64, exception: Value },
-    Released { found: bool },
+    Value {
+        result: Value,
+    },
+    Exception {
+        id: u64,
+        exception: Value,
+    },
+    Released {
+        found: bool,
+    },
+    /// `awaitPromise` で Promise を待機スロットに入れた（#1219）。
+    Awaiting {
+        slot: u64,
+    },
+    /// microtask checkpoint を流した（#1219）。
+    Checkpointed,
+    /// checkpoint の後も Promise が未決着（#1219）。
+    NotSettled,
+    /// `this` または引数のハンドルが無い（`callFunctionOn`。#1219）。
+    ObjectNotFound,
+    /// `functionDeclaration` が関数に評価されなかった（`callFunctionOn`。#1219）。
+    NotFunction,
 }
 
 /// 封筒を解析する。解析失敗・未知の `kind`・欠落は `SERVER_ERROR`（成功を装わない）。
@@ -264,6 +328,13 @@ fn parse_envelope(text: &str) -> Result<Envelope, CdpError> {
             id: safe_id("exceptionId")?,
             exception: field("exception")?,
         },
+        "awaiting" => Envelope::Awaiting {
+            slot: safe_id("slot")?,
+        },
+        "checkpointed" => Envelope::Checkpointed,
+        "notSettled" => Envelope::NotSettled,
+        "objectNotFound" => Envelope::ObjectNotFound,
+        "notFunction" => Envelope::NotFunction,
         "released" => Envelope::Released {
             found: v
                 .get("found")
@@ -559,6 +630,122 @@ fn bool_param(obj: &Map<String, Value>, name: &str) -> Result<bool, CdpError> {
     }
 }
 
+/// 1 回の評価呼び出しの文脈（`Runtime.evaluate`・`Runtime.callFunctionOn` が共有する）。
+/// 評価の実行・失効の記録・封筒から応答への変換・`awaitPromise` の決着をここへ集める。
+struct EvalSite<'a> {
+    state: &'a CdpState,
+    sid: &'a SessionId,
+    view: &'a ContextView,
+    located: &'a Located,
+    key: ScriptContextKey,
+    epoch: u64,
+    limits: &'a EvalLimits,
+}
+
+impl EvalSite<'_> {
+    /// 1 回の評価を出す。core のエラーは固定文言へ写し、コンテキストが作り直された印があれば失効させる。
+    async fn run(&self, source: &str) -> Result<String, CdpError> {
+        run_script(
+            self.state,
+            self.key,
+            &self.located.doc,
+            source,
+            self.limits.timeout,
+        )
+        .await
+        .map_err(|e| {
+            let (err, invalidate) = map_script_error(&e);
+            if invalidate {
+                self.state
+                    .registry()
+                    .invalidate_context(self.sid, self.view.id);
+            }
+            err
+        })
+    }
+
+    /// 呼び出しの結果（封筒）を応答にする。`Awaiting` なら決着を読んでから変換する。
+    /// 解析・検証に失敗した結果は通知できないため、確保済みハンドルを回収する（`SEC-2`）。
+    async fn conclude(&self, text: &str, return_by_value: bool) -> Result<HandlerOutput, CdpError> {
+        let settled;
+        let mut text = text;
+        if let Ok(Envelope::Awaiting { slot }) = parse_envelope(text) {
+            settled = self.settle_awaited(slot, return_by_value).await?;
+            text = &settled;
+        }
+        let outcome = self.envelope_output(text);
+        if matches!(&outcome, Err(CdpError::SERVER_ERROR)) {
+            // ベストエフォート。回収自体の失敗は元のエラーを優先する。
+            let _ = self.run(&discard_source(self.epoch)).await;
+        }
+        outcome
+    }
+
+    /// `awaitPromise` の決着: checkpoint（microtask を流す）→ settle（スロットを読んで削除）の 2 評価。
+    /// 反応ジョブは JS の呼び出しフレームが残る間は走らないため、評価を分ける（core `script_context` の申し送り）。
+    /// どこかで失敗したらスロットを捨てる（残さない）。
+    async fn settle_awaited(&self, slot: u64, return_by_value: bool) -> Result<String, CdpError> {
+        let result = async {
+            let t = self.run(&checkpoint_source(self.epoch)).await?;
+            match parse_envelope(&t)? {
+                Envelope::Checkpointed => {}
+                Envelope::Reset => {
+                    self.state
+                        .registry()
+                        .invalidate_context(self.sid, self.view.id);
+                    return Err(CdpError::EXECUTION_CONTEXT_RESET);
+                }
+                _ => return Err(CdpError::SERVER_ERROR),
+            }
+            self.run(&settle_source(self.epoch, slot, return_by_value))
+                .await
+        }
+        .await;
+        if result.is_err() {
+            let _ = self.run(&drop_slot_source(self.epoch, slot)).await;
+        }
+        result
+    }
+
+    /// 封筒を CDP の応答へ変換する（`Runtime.evaluate`・`Runtime.callFunctionOn` 共通）。
+    fn envelope_output(&self, text: &str) -> Result<HandlerOutput, CdpError> {
+        let view_id = self.view.id;
+        match parse_envelope(text)? {
+            Envelope::Value { result } => Ok(HandlerOutput::result(
+                json!({ "result": remote_object(&result, view_id)? }),
+            )),
+            Envelope::Exception { id, exception } => {
+                let ro = remote_object(&exception, view_id)?;
+                Ok(HandlerOutput::result(json!({
+                    "result": ro,
+                    "exceptionDetails": {
+                        "exceptionId": id,
+                        "text": EXCEPTION_TEXT,
+                        "lineNumber": 0,
+                        "columnNumber": 0,
+                        "exception": ro,
+                    },
+                })))
+            }
+            Envelope::Reset => {
+                self.state.registry().invalidate_context(self.sid, view_id);
+                Err(CdpError::EXECUTION_CONTEXT_RESET)
+            }
+            Envelope::HandleLimit => Err(CdpError::TOO_MANY_REMOTE_OBJECTS),
+            Envelope::ResultTooLarge => Err(CdpError::EVALUATION_RESULT_TOO_LARGE),
+            Envelope::NotSerializable => Err(CdpError::VALUE_NOT_SERIALIZABLE),
+            Envelope::NotSettled => Err(CdpError::PROMISE_NOT_SETTLED),
+            Envelope::ObjectNotFound => Err(CdpError::REMOTE_OBJECT_NOT_FOUND),
+            Envelope::NotFunction => Err(CdpError::NOT_A_FUNCTION),
+            Envelope::InternalError
+            | Envelope::Installed { .. }
+            | Envelope::Released { .. }
+            | Envelope::Awaiting { .. }
+            | Envelope::Checkpointed => Err(CdpError::SERVER_ERROR),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Runtime.evaluate
 // ---------------------------------------------------------------------------
@@ -612,9 +799,6 @@ impl CommandHandler for RuntimeEvaluate {
             let await_promise = bool_param(obj, "awaitPromise")?;
             // `silent` は受け入れるが効果は無い（`REPAIR-3`）。型だけ検査する。
             bool_param(obj, "silent")?;
-            if await_promise {
-                return Err(CdpError::UNSUPPORTED_PARAMS);
-            }
             if expression.len() > self.limits.max_expression_bytes {
                 return Err(CdpError::EXPRESSION_TOO_LARGE);
             }
@@ -639,59 +823,18 @@ impl CommandHandler for RuntimeEvaluate {
             };
             let key = ScriptContextKey::new(located.scope, located.generation, view.id);
             let epoch = ensure_helper(state, sid, &view, &located, key, &self.limits).await?;
-            let source = evaluate_source(epoch, expression, return_by_value);
-            let text =
-                match run_script(state, key, &located.doc, &source, self.limits.timeout).await {
-                    Ok(t) => t,
-                    Err(e) => {
-                        let (err, invalidate) = map_script_error(&e);
-                        if invalidate {
-                            registry.invalidate_context(sid, view.id);
-                        }
-                        return Err(err);
-                    }
-                };
-            let outcome: Result<HandlerOutput, CdpError> = (|| match parse_envelope(&text)? {
-                Envelope::Value { result } => Ok(HandlerOutput::result(
-                    json!({ "result": remote_object(&result, view.id)? }),
-                )),
-                Envelope::Exception { id, exception } => {
-                    let ro = remote_object(&exception, view.id)?;
-                    Ok(HandlerOutput::result(json!({
-                        "result": ro,
-                        "exceptionDetails": {
-                            "exceptionId": id,
-                            "text": EXCEPTION_TEXT,
-                            "lineNumber": 0,
-                            "columnNumber": 0,
-                            "exception": ro,
-                        },
-                    })))
-                }
-                Envelope::Reset => {
-                    registry.invalidate_context(sid, view.id);
-                    Err(CdpError::EXECUTION_CONTEXT_RESET)
-                }
-                Envelope::HandleLimit => Err(CdpError::TOO_MANY_REMOTE_OBJECTS),
-                Envelope::ResultTooLarge => Err(CdpError::EVALUATION_RESULT_TOO_LARGE),
-                Envelope::NotSerializable => Err(CdpError::VALUE_NOT_SERIALIZABLE),
-                Envelope::InternalError
-                | Envelope::Installed { .. }
-                | Envelope::Released { .. } => Err(CdpError::SERVER_ERROR),
-            })();
-            if matches!(&outcome, Err(CdpError::SERVER_ERROR)) {
-                // 解析・検証に失敗した結果はクライアントへ通知できないため、確保済みハンドルを回収する
-                // （ベストエフォート。回収自体の失敗は元のエラーを優先する）。
-                let _ = run_script(
-                    state,
-                    key,
-                    &located.doc,
-                    &discard_source(epoch),
-                    self.limits.timeout,
-                )
-                .await;
-            }
-            outcome
+            let site = EvalSite {
+                state,
+                sid,
+                view: &view,
+                located: &located,
+                key,
+                epoch,
+                limits: &self.limits,
+            };
+            let source = evaluate_source(epoch, expression, return_by_value, await_promise);
+            let text = site.run(&source).await?;
+            site.conclude(&text, return_by_value).await
         })
     }
 }
@@ -812,8 +955,8 @@ mod tests {
             "日本語 😀",
         ];
         for expr in nasty {
-            let src = evaluate_source(7, expr, true);
-            let payload = json!({"epoch": 7, "expression": expr, "returnByValue": true});
+            let src = evaluate_source(7, expr, true, false);
+            let payload = json!({"epoch": 7, "expression": expr, "returnByValue": true, "awaitPromise": false});
             let lit = js_string_literal(&payload);
             let want = format!(
                 "typeof __fandheCdpHelper === \"object\" ? __fandheCdpHelper.evaluate({lit}) : \"{{\\\"kind\\\":\\\"reset\\\"}}\""
@@ -845,6 +988,7 @@ mod tests {
             "maxResultLength": 1_000_000,
             "maxDescriptionLength": 4096,
             "maxUnserializableLength": 1024,
+            "maxAwaiting": 64,
         });
         assert!(src.ends_with(&format!("({})", js_string_literal(&cfg))));
         assert!(src.starts_with(HELPER_JS.trim()));
@@ -1285,11 +1429,11 @@ mod dispatch_tests {
             let v = call(&st, Some(&sid), m, p).await;
             assert_eq!(error(&v), invalid, "{p}");
         }
-        // awaitPromise: true は未対応（型検査のあと、サイズ検査の前）。
+        // awaitPromise: true は受理され（#1219）、サイズ検査に進む。
         let big = "1".repeat(1_048_577);
         let p = format!(r#"{{"expression":"{big}","contextId":1,"awaitPromise":true}}"#);
         let v = call(&st, Some(&sid), m, &p).await;
-        assert_eq!(error(&v), unsupported);
+        assert_eq!(error(&v), (-32000, "expression too large"));
         // 未知のセッション。
         let ghost = SessionId::parse("NOPE").unwrap();
         let v = call(&st, Some(&ghost), m, r#"{"expression":"1","contextId":1}"#).await;
