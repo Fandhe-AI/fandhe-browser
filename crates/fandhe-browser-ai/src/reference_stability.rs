@@ -295,29 +295,28 @@ fn check_reidentification(case: &StabilityCase<'_>) -> Reidentification {
     )
 }
 
-/// 区別子（` #n`・n は 2 以上。base が空なら `#n`）を除いた base name を返す。
-fn strip_occurrence_suffix(name: &str) -> &str {
-    let Some(i) = name.rfind('#') else {
-        return name;
-    };
-    let (head, tail) = (&name[..i], &name[i + 1..]);
-    let numeric = !tail.is_empty()
-        && tail.bytes().all(|b| b.is_ascii_digit())
-        && tail.parse::<usize>().is_ok_and(|n| n >= 2);
-    if !numeric {
-        return name;
+/// 重複グループ（role と切り詰め前の name）内での位置（0 起点）とグループの件数。
+/// `holders` は文書順（区別子の出現番号と同じ順）。
+fn group_position(holders: &[RefHolder], target: &RefHolder) -> (usize, usize) {
+    let mut pos = 0;
+    let mut size = 0;
+    for h in holders
+        .iter()
+        .filter(|h| h.role == target.role && h.group_name == target.group_name)
+    {
+        if h.node == target.node {
+            pos = size;
+        }
+        size += 1;
     }
-    if head.is_empty() {
-        return "";
-    }
-    head.strip_suffix(' ').unwrap_or(name)
+    (pos, size)
 }
 
-/// role が一致し、name が base または base に区別子を付けたものである ref 保持要素の件数。
-fn group_size(holders: &[RefHolder], role: &str, base: &str) -> usize {
+/// 変化後のグループの件数だけを返す（キーは変化前の対象のグループ）。
+fn group_size(holders: &[RefHolder], target: &RefHolder) -> usize {
     holders
         .iter()
-        .filter(|h| h.role == role && strip_occurrence_suffix(&h.name) == base)
+        .filter(|h| h.role == target.role && h.group_name == target.group_name)
         .count()
 }
 
@@ -344,19 +343,36 @@ fn reidentify_after(
         .iter()
         .filter(|h| h.role == b_role && h.name == b_name)
         .collect();
-    // 同 role・base name の要素が変化後に増えた場合、出現順の区別子（#1221）では増えた要素が
-    // 前方に入ったときに別要素を同一視しうるため、`Stable` にせず `Ambiguous` で検出する。
-    let base = strip_occurrence_suffix(&b_name);
+    // 同じグループ（role・切り詰め前の name）の件数が変わった場合、出現順の区別子（#1221）では
+    // 対象より前での増減が別要素の同一視になる。対象の位置を変化後のセレクタで引き、グループ内
+    // 位置が変化前と同じ（対象より前が不変）なら通常判定へ進み、それ以外は `Ambiguous`。
+    // 対象より後ろへの追加・削除は位置が変わらないので `Stable` のまま。
     let before_doc = parse(before_html);
-    let before_group = build_snapshot_with_holders(&before_doc)
-        .map(|(_, hs)| group_size(&hs, &b_role, base))
-        .unwrap_or(0);
-    let after_group = group_size(&holders, &b_role, base);
-    if before_group > 0 && after_group > before_group {
-        return Reidentification::Ambiguous {
-            side: Side::After,
-            count: after_group,
-        };
+    if let Ok((_, before_holders)) = build_snapshot_with_holders(&before_doc)
+        && let Some(target) = before_holders.iter().find(|h| h.r#ref == b_ref)
+    {
+        let (before_pos, before_size) = group_position(&before_holders, target);
+        let after_size = group_size(&holders, target);
+        if after_size > 0 && after_size != before_size {
+            let resolved = query_selector_all_str(&doc, doc.root(), selector)
+                .ok()
+                .and_then(|m| match m.as_slice() {
+                    [id] => holders.iter().find(|h| h.node == *id),
+                    _ => None,
+                });
+            let same_place = match resolved {
+                // 別グループへ移った（名前変更）なら下の通常判定（SignatureChanged 等）に任せる。
+                Some(h) if h.role != target.role || h.group_name != target.group_name => true,
+                Some(h) => group_position(&holders, h).0 == before_pos,
+                None => false,
+            };
+            if !same_place {
+                return Reidentification::Ambiguous {
+                    side: Side::After,
+                    count: after_size,
+                };
+            }
+        }
     }
     match candidates.as_slice() {
         [one] if one.r#ref == b_ref => Reidentification::Stable {
@@ -850,6 +866,66 @@ fn aisnap_10_unique_selector_but_duplicate_signature_after_is_ambiguous() {
         before_html: &before,
         after_html: &after,
         selector: "#go",
+    });
+    assert_eq!(
+        result,
+        Reidentification::Ambiguous {
+            side: Side::After,
+            count: 2
+        }
+    );
+}
+
+/// AISNAP-10・Issue #1221: 対象より後ろへ同名要素が追加されても、対象（先頭）の name・ref は
+/// 変わらないので `Stable`（リストが伸びる変化への耐性）。
+#[test]
+fn aisnap_10_same_signature_appended_after_is_stable() {
+    let before = page("<button class=\"target\">Go</button>");
+    let after = page("<button class=\"target\">Go</button><button>Go</button>");
+    let result = check_reidentification(&StabilityCase {
+        before_html: &before,
+        after_html: &after,
+        selector: ".target",
+    });
+    assert!(
+        matches!(&result, Reidentification::Stable { name, .. } if name == "Go"),
+        "{result:?}"
+    );
+}
+
+/// AISNAP-10・Issue #1221: 重複が減って対象自身が消え、残った別要素が素の name と先頭の ref を
+/// 引き継ぐ場合は `Stable` にせず `Ambiguous`。
+#[test]
+fn aisnap_10_duplicate_removed_target_is_ambiguous() {
+    let before = page("<button class=\"target\">Go</button><button>Go</button>");
+    let after = page("<button>Go</button>");
+    let result = check_reidentification(&StabilityCase {
+        before_html: &before,
+        after_html: &after,
+        selector: ".target",
+    });
+    assert_eq!(
+        result,
+        Reidentification::Ambiguous {
+            side: Side::After,
+            count: 1
+        }
+    );
+}
+
+/// AISNAP-10・Issue #1221: name が上限（120 文字）で区別子付きの表示 name が切り詰められても、
+/// 切り詰め前のグループキーで件数を比較するので、前方挿入は `Ambiguous`。
+#[test]
+fn aisnap_10_truncated_name_group_insert_before_is_ambiguous() {
+    let long = "a".repeat(120);
+    let before = page(&format!("<button id=\"t\">{long}</button>"));
+    let after = page(&format!(
+        "<button>{long}</button><button id=\"t\">{long}</button>"
+    ));
+    let result = check_reidentification(&StabilityCase {
+        before_html: &before,
+        after_html: &after,
+        selector: "#t",
     });
     assert_eq!(
         result,

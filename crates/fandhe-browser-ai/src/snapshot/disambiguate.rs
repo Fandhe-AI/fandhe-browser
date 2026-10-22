@@ -12,8 +12,9 @@
 //! - ページ由来の name と区別子付き name の衝突（元から `alpha #2` がある等）の解消は未対応
 //!   （Issue #1222）。base の切り詰めで新たに衝突する場合も同じ。
 //! - 同じ `(role, name)` の要素が対象より前に挿入されると出現番号がずれ、別要素が素の name と元の
-//!   ref を得る。この変化は `reference_stability` が同 role・base name の要素数の増加として
-//!   `Ambiguous` で検出し、`Stable` にはしない（誤同定を成功として固定しない）。
+//!   ref を得る。この変化は `reference_stability` が、同グループ（role・切り詰め前の name）の
+//!   件数が変わり対象のグループ内位置がずれる変化として `Ambiguous` で検出し、`Stable` には
+//!   しない（誤同定を成功として固定しない）。対象より後ろでの増減は位置が変わらず `Stable`。
 //! - 重複時の [`super::Node::name`] はアクセシブルネームそのものではなくなる（出力 name の補完）。
 
 use std::collections::HashMap;

@@ -820,6 +820,9 @@ pub(crate) struct RefHolder {
     pub(crate) role: String,
     /// 区別子付与後（Issue #1221）の出力 name。
     pub(crate) name: String,
+    /// 区別子付与前・切り詰め前の name。重複グループのキー（`role`＋この値）で、出力 name を
+    /// 逆解析せずに同グループの件数を比較するために保持する（`name` は base を切り詰めうる）。
+    pub(crate) group_name: String,
     pub(crate) r#ref: String,
 }
 
@@ -1124,6 +1127,7 @@ fn build_snapshot_inner(
                 sink.push(RefHolder {
                     node: child,
                     role: role.to_string(),
+                    group_name: out_name.clone(),
                     name: out_name,
                     r#ref: elem_ref.to_ref_string(),
                 });
@@ -1158,6 +1162,7 @@ fn build_snapshot_inner(
                         node: h.cell,
                         role: h.role.clone(),
                         name: h.name.clone(),
+                        group_name: h.name.clone(),
                         r#ref: h.elem_ref.to_ref_string(),
                     });
                 }
@@ -1177,6 +1182,7 @@ fn build_snapshot_inner(
                             node: *id,
                             role: c.role.clone(),
                             name: c.name.clone(),
+                            group_name: c.name.clone(),
                             r#ref: c.r#ref.clone(),
                         });
                     }
