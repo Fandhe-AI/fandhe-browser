@@ -27,7 +27,7 @@
 	check-workspace-manifest fmt fmt-check lint test test-harness lint-rendering test-rendering \
 	check-render-isolation check-js-engine-isolation check-publish-private deny deny-servo-host license-inventory license-inventory-servo-host check-deny-license-reject ci \
 	check-compat-practical check-compat-regression bench-record check-ci-changes check-bench-record \
-	check-binary-size check-static-link check-dynamic-link-macos measure-mcp-envelope check-mcp-envelope measure-plugin-overhead check-plugin-overhead measure-js-binary-size measure-container-size check-container-smoke check-container-js-smoke check-container-memory measure-container-memory compare-container-memory measure-cssom-profile-cost \
+	check-binary-size check-static-link check-dynamic-link-macos check-dynamic-link-windows measure-mcp-envelope check-mcp-envelope measure-plugin-overhead check-plugin-overhead measure-js-binary-size measure-container-size check-container-smoke check-container-js-smoke check-container-memory measure-container-memory compare-container-memory measure-cssom-profile-cost \
 	docker-build docker-shell docker-ci trace-playwright check-playwright-trace check-puppeteer-connect check-playwright-connect test-playwright-connect
 
 help: ## ターゲット一覧を表示する（Make 非依存の一覧: scripts/help.sh）
@@ -151,6 +151,9 @@ check-static-link: ## musl 配布バイナリ（既定・軽量）に動的リ�
 
 check-dynamic-link-macos: ## macOS 配布バイナリ（既定・軽量）の動的リンクを許可リストと照合する（PLUG-1・TASK-93.4・#364。macOS のみ・既定は記録のみ）
 	@scripts/harness.sh check-dynamic-link-macos
+
+check-dynamic-link-windows: ## Windows 配布バイナリ（既定・軽量）の動的リンクを許可リストと照合する（PLUG-1・TASK-93.5・#365。Windows のみ・既定は記録のみ）
+	@scripts/harness.sh check-dynamic-link-windows
 
 measure-mcp-envelope: ## 方式 B 本体と MCP エンベロープのトークン・レイテンシを測定する（PLUG-5・TASK-97.1。unix のみ）
 	@scripts/harness.sh measure-mcp-envelope
