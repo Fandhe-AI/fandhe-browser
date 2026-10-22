@@ -556,15 +556,20 @@
     define(DOMTokenListProto, 'item', {
         writable: true,
         value: function item(index) {
-            var tokens = readTokens(tokenListOwner(this)).tokens;
+            var el = tokenListOwner(this);
+            // 引数変換（valueOf が class を変更し得る）を属性読み取りより先に行う
             var i = Number(index) >>> 0;
+            var tokens = readTokens(el).tokens;
             return i < tokens.length ? tokens[i] : null;
         }
     });
     define(DOMTokenListProto, 'contains', {
         writable: true,
         value: function contains(token) {
-            return indexOfToken(readTokens(tokenListOwner(this)).tokens, String(token)) !== -1;
+            var el = tokenListOwner(this);
+            // 引数変換（toString が class を変更し得る）を属性読み取りより先に行う
+            var t = String(token);
+            return indexOfToken(readTokens(el).tokens, t) !== -1;
         }
     });
     define(DOMTokenListProto, 'add', {

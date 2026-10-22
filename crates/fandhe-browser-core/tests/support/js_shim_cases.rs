@@ -3744,8 +3744,17 @@ fn class_list_cases(engine: &str) {
     eprintln!("case: JS-5 classList (#1236)");
     let mut p = setup(engine, None);
     let pre = "var e = document.createElement('div'); e.setAttribute('class','a a b'); var L = e.classList; ";
-    let cases: [(&str, &str); 14] = [
+    let cases: [(&str, &str); 16] = [
         ("String(e.classList === e.classList)", "true"),
+        // 引数変換が class を変更する場合は変換後の集合で判定する（receiver 検証 → 引数変換 → 属性読み取り）
+        (
+            "e.className = 'a'; String(L.contains({ toString: function () { e.className = 'b'; return 'b'; } }))",
+            "true",
+        ),
+        (
+            "e.className = 'a'; String(L.item({ valueOf: function () { e.className = 'x y'; return 1; } }))",
+            "y",
+        ),
         (
             "L.length + '|' + L.item(0) + L.item(1) + '|' + L.item(5)",
             "2|ab|null",
