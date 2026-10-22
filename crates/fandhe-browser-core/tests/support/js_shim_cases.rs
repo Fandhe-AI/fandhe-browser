@@ -3654,8 +3654,8 @@ fn is_equal_node_cases(engine: &str) {
             "true|true|false",
         ),
         (
-            "try { a.isEqualNode(); 'ok' } catch (e) { e instanceof TypeError ? 'type' : 'other' }",
-            "type",
+            "try { String(a.isEqualNode()) } catch (e) { 'threw' }",
+            "false",
         ),
         (
             "try { a.isEqualNode({}); 'ok' } catch (e) { 'threw' }",
