@@ -1006,6 +1006,13 @@ mod tests {
         assert_eq!(qs(6, "h1"), Ok(0));
     }
 
+    /// Issue #1237: `*` は文書順で最初の要素（html）に一致する。
+    #[test]
+    fn cdp1_query_selector_universal_returns_first_element() {
+        assert_eq!(qs(1, "*"), Ok(3));
+        assert_eq!(qs(1, "body > *"), Ok(6));
+    }
+
     #[test]
     fn cdp5_query_selector_missing_selector_returns_zero() {
         assert_eq!(qs(1, "#does-not-exist"), Ok(0));
@@ -1018,7 +1025,7 @@ mod tests {
 
     #[test]
     fn repair3_query_selector_unsupported_selector_is_error() {
-        for sel in ["h1:first-child", "*", "h1 + p", "[id$=t]"] {
+        for sel in ["h1:first-child", "a::before", "h1 + p", "[id$=t]"] {
             assert_eq!(qs(1, sel), Err(CdpError::UNSUPPORTED_PARAMS), "{sel}");
         }
     }

@@ -216,7 +216,8 @@ pub fn render_allocation_markdown(rows: &[Assignment]) -> String {
 
 /// 生 DOM 方式で回答に使ってよいセレクタ構文の例（core `selector.rs` の対応サブセット）。
 /// テンプレートの記載と core 実装の乖離をテストで検出するため、テンプレートはこの定数から組む。
-pub const RAW_ALLOWED_SELECTOR_EXAMPLES: [&str; 10] = [
+pub const RAW_ALLOWED_SELECTOR_EXAMPLES: [&str; 11] = [
+    "*",
     "button",
     "#login",
     ".item",
@@ -230,8 +231,7 @@ pub const RAW_ALLOWED_SELECTOR_EXAMPLES: [&str; 10] = [
 ];
 
 /// 使用できない構文の例（core が未対応で、回答すると採点上 `invalid_shape` になる）。
-pub const RAW_FORBIDDEN_SELECTOR_EXAMPLES: [&str; 9] = [
-    "*",
+pub const RAW_FORBIDDEN_SELECTOR_EXAMPLES: [&str; 8] = [
     "a:first-child",
     "li::before",
     "h1 + p",
@@ -303,7 +303,7 @@ pub fn instruction(mode: InputMode, task: &Task) -> String {
     s.push_str("- steps の fill と select は value が必須。click は value を持たない。\n");
     s.push_str(&format!("- {SELECT_VALUE_NOTE}\n"));
     if mode == InputMode::RawDom {
-        s.push_str("- 使用できるセレクタ構文: 型セレクタ・#id・.class・[属性]・[属性=値]（値は引用符あり/なし）・[属性^=値]・子孫結合子（空白）・子結合子 >・カンマ区切り。\n");
+        s.push_str("- 使用できるセレクタ構文: 型セレクタ・全称セレクタ *・#id・.class・[属性]・[属性=値]（値は引用符あり/なし）・[属性^=値]・子孫結合子（空白）・子結合子 >・カンマ区切り。\n");
         s.push_str(&format!(
             "  使用できる例: {}\n",
             RAW_ALLOWED_SELECTOR_EXAMPLES
@@ -320,7 +320,7 @@ pub fn instruction(mode: InputMode, task: &Task) -> String {
                 .collect::<Vec<_>>()
                 .join("、")
         ));
-        s.push_str("  疑似クラス・疑似要素・兄弟結合子・属性値の部分一致（$= *= ~= |=）・ワイルドカード・エスケープは使えない。\n");
+        s.push_str("  疑似クラス・疑似要素・兄弟結合子・属性値の部分一致（$= *= ~= |=）・エスケープは使えない。\n");
     }
     s.push_str(&format!(
         "\n回答形式:\n```json\n{example}\n```\n\n回答不能の場合:\n```json\n{null_example}\n```\n"

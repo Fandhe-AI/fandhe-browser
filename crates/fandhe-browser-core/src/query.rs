@@ -32,6 +32,8 @@
 //! # 照合規則
 //!
 //! - 要素以外のノードは常に不一致（[`Document::is_element`] で判定）。
+//! - 全称セレクタ（[`crate::selector::CompoundSelector::is_universal`]・Issue #1237）は
+//!   型名なしと同じく任意の要素に一致する（要素以外には一致しない）。
 //! - 型名（[`crate::selector::CompoundSelector::type_name`]）: HTML 名前空間
 //!   の要素なら [`crate::selector::html_local_name_eq`]（ASCII 大文字小文字
 //!   を無視）、それ以外（SVG・MathML 等）は完全一致（`==`）で比較する

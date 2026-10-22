@@ -689,7 +689,7 @@ fn aisnap9_raw_wrong_element_and_out_of_range_are_mismatch() {
 fn aisnap9_raw_unsupported_or_malformed_selector_is_invalid_shape() {
     let mut a = raw_perfect_answers();
     a.insert("click-01".into(), locator_answer("div:nth-child(1)", 0));
-    a.insert("click-02".into(), locator_answer("*", 0));
+    a.insert("click-02".into(), locator_answer("li::before", 0));
     a.insert("click-03".into(), locator_answer("a + b", 0));
     a.insert("nav-02".into(), locator_answer("a[href", 0));
     let rep = raw_run(&a);

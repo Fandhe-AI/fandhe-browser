@@ -2502,7 +2502,7 @@ mod tests {
         let e = call(&b, &[s("getInnerHTML"), n(a)]).expect_err("超過");
         assert!(matches!(e, DomBridgeError::ResponseTooLarge { .. }));
         let e = call(&b, &[s("querySelectorAll"), n(root), s("*")]);
-        assert!(e.is_err());
+        assert!(matches!(e, Err(DomBridgeError::ResponseTooLarge { .. })));
         let e = call(&b, &[s("querySelectorAll"), n(root), s("div")]).expect_err("超過");
         assert!(matches!(e, DomBridgeError::ResponseTooLarge { .. }));
     }

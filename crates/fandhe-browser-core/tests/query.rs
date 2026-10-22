@@ -186,3 +186,33 @@ fn core_1_not_pseudo_class_matching() {
     assert_eq!(count("div:not(.a, .b)"), 1);
     assert_eq!(count("div:not(:not(.a))"), 1);
 }
+
+/// CORE-1: 全称セレクタ `*` は要素だけに文書順・重複なしで一致する（Issue #1237・TASK-44）。
+#[test]
+fn core_1_universal_selector_matches_every_element_in_document_order() {
+    let doc =
+        parse(r#"<div id="d" class="c"><p id="p">t</p><svg id="s"><a id="sa"></a></svg></div>"#);
+    let root = doc.root();
+    let ids = |sel: &str| -> Vec<String> {
+        query_selector_all_str(&doc, root, sel)
+            .expect("解析できる")
+            .into_iter()
+            .map(|n| doc.attribute(n, "id").unwrap_or("-").to_string())
+            .collect()
+    };
+    // html・head・body は id なし。テキストノードは含まれない。
+    assert_eq!(ids("*"), vec!["-", "-", "-", "d", "p", "s", "sa"]);
+    assert_eq!(ids("div > *"), vec!["p", "s"]);
+    assert_eq!(ids("*.c"), vec!["d"]);
+    assert_eq!(ids("#d *"), vec!["p", "s", "sa"]);
+    assert!(ids(":not(*)").is_empty());
+
+    let first = query_selector_str(&doc, root, "*")
+        .expect("解析できる")
+        .expect("要素が存在する");
+    assert_eq!(doc.attribute(first, "id"), None);
+    let d = query_selector_str(&doc, root, "body > *")
+        .expect("解析できる")
+        .expect("存在する");
+    assert_eq!(doc.attribute(d, "id"), Some("d"));
+}

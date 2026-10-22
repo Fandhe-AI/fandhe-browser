@@ -14,7 +14,8 @@
         p:hover { color: pink }
         @media (min-width: 1px) { span { color: pink; width: 1px } }
         span.c { color: teal }
-        div * { color: pink }
+        /* 未対応の兄弟結合子の例（元は div *。* 対応 #1237 で差し替え） */
+        div ~ span { color: pink }
     </style>
 </head>
 <body>
