@@ -42,7 +42,7 @@ use fandhe_backend_core::server::{BoundServer, Server};
 use fandhe_backend_routes::{Router, RouterMergeError};
 use fandhe_browser_cdp::{CdpState, WsConfigError, endpoints};
 use fandhe_browser_core::render::Renderer;
-use fandhe_browser_core::{AppState, PageScriptHandle};
+use fandhe_browser_core::{AppState, PageScriptHandle, ScriptContextHandle};
 use fandhe_browser_profile::{ProfileError, ProfileStore};
 use fandhe_browser_render::host_process::HostProcessError;
 
@@ -191,6 +191,7 @@ pub(crate) fn open_app_state(store: &dyn ProfileStore) -> Result<Arc<AppState>, 
     open_app_state_with(
         store,
         PageScriptHandle::disabled(),
+        ScriptContextHandle::disabled(),
         Arc::new(fandhe_browser_core::render::DisabledRenderer::new()),
     )
 }
@@ -201,16 +202,24 @@ pub(crate) fn open_app_state(store: &dyn ProfileStore) -> Result<Arc<AppState>, 
 /// `AppState` → `CdpState::app_state()` 経由で cdp の `Page.navigate` 経路から到達できる
 /// （cdp の `navigate_gated` へ接続済み。TASK-112・#785）。ハンドルを渡してもスレッドは起動しない（遅延起動）。
 ///
+/// `script_contexts` は評価コンテキスト（`Page.createIsolatedWorld`・`Runtime.*` のゲート）で、
+/// `commands::launch::start_server` が `[js] engine` の解決結果から `ScriptContextHandle::new` で作る。
+/// エンジンなしのビルド・生成不能なら無効のままで、cdp は固定エラーを返す（TASK-44.9・#1220・`CDP-2`）。
+/// 構築時にスレッドも子プロセスも作らない（遅延起動。`PERF-7`）。
+///
 /// `renderer` は `main` が `render_host` で選んだ描画実装（ホスト解決時のみ `HostRenderer`、
 /// 未設定なら無効レンダラー。TASK-38.7・#236・`RENDER-3`）。
 pub(crate) fn open_app_state_with(
     store: &dyn ProfileStore,
     page_scripts: PageScriptHandle,
+    script_contexts: ScriptContextHandle,
     renderer: Arc<dyn Renderer>,
 ) -> Result<Arc<AppState>, StartupError> {
     let profile = store.open_or_create().map_err(StartupError::Profile)?;
     Ok(Arc::new(
-        AppState::new(Arc::new(profile), renderer).with_page_scripts(page_scripts),
+        AppState::new(Arc::new(profile), renderer)
+            .with_page_scripts(page_scripts)
+            .with_script_contexts(script_contexts),
     ))
 }
 
@@ -269,9 +278,10 @@ pub(crate) async fn run(
     addr: SocketAddr,
     extra: Vec<RouterFactory>,
     page_scripts: PageScriptHandle,
+    script_contexts: ScriptContextHandle,
     renderer: Arc<dyn Renderer>,
 ) -> Result<(), StartupError> {
-    let app = open_app_state_with(store, page_scripts, renderer)?;
+    let app = open_app_state_with(store, page_scripts, script_contexts, renderer)?;
     let (bound, cdp) = bind(&app, addr, extra).await?;
     let local = bound.local_addr().map_err(StartupError::Bind)?;
     eprintln!("{}", listening_line(local, cdp.browser_id().as_str()));
@@ -562,6 +572,7 @@ pub(crate) mod tests {
             let app = open_app_state_with(
                 &FixedStore(dir.path.clone()),
                 handle,
+                ScriptContextHandle::disabled(),
                 Arc::new(fandhe_browser_core::render::DisabledRenderer::new()),
             )
             .unwrap();
@@ -571,6 +582,51 @@ pub(crate) mod tests {
             drop(bound);
             assert_eq!(cdp.app_state().page_scripts().is_enabled(), enabled);
             assert_eq!(cdp.app_state().page_scripts().stats().worker_spawns(), 0);
+        }
+
+        /// TASK-44.9（#1220・`CDP-2`・`PERF-7`）: `open_app_state_with` に渡した評価コンテキストが
+        /// bind 後の `CdpState::app_state()` から同じ状態で見え、構築だけでは worker を起動しない。
+        /// 既定の `open_app_state` は無効。
+        #[tokio::test]
+        async fn cdp2_script_context_handle_reaches_cdp_state() {
+            let dir = TempDir::new();
+            let default = open_app_state(&FixedStore(dir.path.clone())).unwrap();
+            assert!(!default.script_contexts().is_enabled());
+            drop(default);
+
+            let handle = ScriptContextHandle::new(&fandhe_browser_core::JsConfig::default());
+            let enabled = handle.is_enabled();
+            let app = open_app_state_with(
+                &FixedStore(dir.path.clone()),
+                PageScriptHandle::disabled(),
+                handle,
+                Arc::new(fandhe_browser_core::render::DisabledRenderer::new()),
+            )
+            .unwrap();
+            let (bound, cdp) = bind(&app, "127.0.0.1:0".parse().unwrap(), vec![])
+                .await
+                .unwrap();
+            drop(bound);
+            assert_eq!(cdp.app_state().script_contexts().is_enabled(), enabled);
+            assert_eq!(cdp.app_state().script_contexts().stats().worker_spawns(), 0);
+        }
+
+        /// TASK-44.9（`CDP-2`・`JS-1`）: エンジンなしのビルドでは評価コンテキストは無効のまま。
+        #[cfg(not(any(feature = "js-v8", feature = "js-boa")))]
+        #[test]
+        fn cdp2_script_contexts_disabled_without_engine() {
+            let handle = ScriptContextHandle::new(&fandhe_browser_core::JsConfig::default());
+            assert!(!handle.is_enabled());
+        }
+
+        /// TASK-44.9（`CDP-2`・`JS-1`）: 既定構成（V8）では有効（生成は子プロセスを起動しない）。
+        /// boa 単独は macOS で生成失敗し得るため、有効の assert は V8 に限る。
+        #[cfg(feature = "js-v8")]
+        #[test]
+        fn cdp2_script_contexts_enabled_with_v8() {
+            let handle = ScriptContextHandle::new(&fandhe_browser_core::JsConfig::default());
+            assert!(handle.is_enabled());
+            assert_eq!(handle.stats().worker_spawns(), 0);
         }
 
         #[tokio::test]

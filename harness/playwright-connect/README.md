@@ -25,7 +25,7 @@ Playwright 接続試験の実行基盤（TASK-44.1・Issue #476・ビヘイビ�
 | `self-test.mjs` / `self-test.sh` | オフライン自己テスト（`make check-playwright-connect`。要 node。Playwright・ネットワーク不要） |
 | `run.sh` | 実 Playwright 実行の入口（`make test-playwright-connect`。手動・要ネットワーク・CI 対象外） |
 | `tests/script_harness/fixture.rs` | ローカル fixture HTTP サーバー（`127.0.0.1:0` のみ。到達パスを記録） |
-| `tests/playwright_flow.rs` | 基盤の自己テスト（unix のみ。node 不要）と実 Playwright 実行テスト（`#[ignore]`） |
+| `tests/playwright_flow.rs` | 基盤の自己テスト（node 不要）と実 Playwright 実行テスト。独自 `main`（`harness = false`。V8 ワーカー役を兼ねる）で、ケース名 `cdp2_real_playwright_goto_and_selector` を引数に渡したときだけ実ケースを実行する（TASK-44.9・#1220） |
 | `tests/playwright_contract.rs` | `stages.mjs` と Rust パーサーの契約テスト（`#[ignore]`。`self-test.sh` が実行し、0 件実行は fail） |
 
 ## スクリプトとの契約
@@ -67,8 +67,10 @@ skip せず、理由と導入手順（`PLAYWRIGHT_INSTALL_HINT`）つきの `Har
 - ループバック fixture への `goto`: 本番の `endpoints()` は `Page.navigate` を内部アドレス拒否（SSRF ガード）で構築する。
   実テストは feature `test-support` の `test_support::endpoints_allowing_loopback` でサーバーを起動して許可する
   （既定ビルド・本番の `endpoints()` は拒否のまま）。
-- セレクタ段階は現状到達しない: `Runtime.callFunctionOn`・`Runtime.evaluate`・`Page.createIsolatedWorld` が未実装
-  （`-32601`）のため、Playwright の locator が utility world の注入スクリプトを動かせず `StageTimeout` になる。
-  実測は `docs/design/playwright-compat.md` の「段階 TASK-44.3 の実施結果」を参照。解消には Runtime ドメインの実装が要る。
+- 評価コンテキスト（TASK-44.9・#1220）: 実ケースは cli 本番と同じ `ScriptContextHandle::new(&JsConfig::default())` を
+  テストサーバーへ渡す。`run.sh` は `--features test-support,js-v8` で実行し、評価器が無効なら（feature の付け忘れ）
+  起動前に panic する。成功は完了マーカー行 `playwright_flow: real playwright case passed (1 case)` がちょうど 1 件のときだけ。
+- セレクタ段階: 実行コンテキストは成立し `StageTimeout` は解消したが、再実測では core の universal selector（`*`）
+  未対応で失敗する（追跡: #1237）。結果は `docs/design/playwright-compat.md` の「再実測（TASK-44.9）」を参照。
 
-Windows は `Profile::open` が未対応（#295・#955）のため `playwright_flow.rs` は unix のみ。
+`Profile::open` は Windows でも `%LOCALAPPDATA%` 配下なら成功するため、`playwright_flow.rs` は 3 OS 共通（#955）。

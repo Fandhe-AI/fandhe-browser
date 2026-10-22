@@ -6,6 +6,9 @@
 # FANDHE_PLAYWRIGHT_MODULE_DIR に渡して実 Playwright 実行テスト（goto・セレクタ取得まで。TASK-44.3。
 # ループバック fixture を許す feature test-support が必要）
 # （tests/playwright_flow.rs の cdp2_real_playwright_goto_and_selector）を実行する。
+# TASK-44.9・#1220: 評価コンテキストを有効にするためエンジン feature（js-v8。cli の既定と同じ）を
+# 付け、テストは独自 main（harness = false）でケース名の引数で実行する。成功時の完了マーカー行が
+# ちょうど 1 件であることを検査する（0 件・2 件以上は失敗。fail-closed）。
 # ブラウザ本体は取得せず、install script も実行しない。要 node/npm/cargo とネットワーク。
 # 導入の承認状況は README の「導入状況」を参照。
 #
@@ -42,13 +45,13 @@ node "$SCRIPT_DIR/../playwright-trace/verify-install.mjs" "$WORK" playwright-cor
 
 cd "$REPO_ROOT"
 out="$(FANDHE_PLAYWRIGHT_MODULE_DIR="$WORK" FANDHE_PLAYWRIGHT_VERSION="$PW_VERSION" \
-  cargo test -p fandhe-browser-cdp --features test-support --test playwright_flow -- --ignored --exact cdp2_real_playwright_goto_and_selector 2>&1)" || {
+  cargo test -p fandhe-browser-cdp --features test-support,js-v8 --test playwright_flow -- cdp2_real_playwright_goto_and_selector 2>&1)" || {
   printf '%s\n' "$out" >&2
   exit 1
 }
 printf '%s\n' "$out"
 # 0 件一致を成功扱いにしない（fail-closed）。
-if ! grep -qE '^test result: ok\. 1 passed;' <<<"$out"; then
+if [ "$(grep -cE '^playwright_flow: real playwright case passed \(1 case\)$' <<<"$out" || true)" != "1" ]; then
   echo "FAIL: real playwright test did not run exactly once" >&2
   exit 1
 fi

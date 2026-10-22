@@ -14,6 +14,7 @@
 //! - `launch --help`: ハンドラは出力先を受け取らないため未対応（`--help` は未知のオプション扱い。
 //!   トップレベルの `--help` に `launch` が載る）
 
+use fandhe_browser_core::ScriptContextHandle;
 use fandhe_browser_profile::ProfileStore;
 
 use super::profile::{self, ProfileSelection};
@@ -144,6 +145,10 @@ pub(crate) fn start_server(
     // `JS-1`・`JS-4`）。ハンドルの構築だけではスレッドも JS 子プロセスも作らない（遅延起動）。
     let config = startup_config::load_startup_config()?;
     let page_scripts = page_scripts::handle_from_config(config.js());
+    // 評価コンテキスト（`Page.createIsolatedWorld`・`Runtime.*` のゲート）も同じ `[js] engine` の
+    // 解決結果から作る。エンジンなしのビルドでは無効のまま（TASK-44.9・#1220・`CDP-2`）。
+    // 構築だけではスレッドも子プロセスも作らない（遅延起動。`PERF-7`）。新しい設定キーは足さない。
+    let script_contexts = ScriptContextHandle::new(config.js());
     // 描画ホストの解決も bind より前に行う。不正なパスはサーバーを起動せず非 0 終了させる（fail-closed）。
     // 設定キーは core の `Config` に未定義のため `None` 固定（REPAIR-3。後続課題で config から渡す）。
     // 解決できてもホストはここでは起動しない（`HostRenderer` は初回の描画要求で遅延起動する）。
@@ -158,6 +163,7 @@ pub(crate) fn start_server(
         options.addr,
         server::default_router_factories(),
         page_scripts,
+        script_contexts,
         renderer,
     ))
 }

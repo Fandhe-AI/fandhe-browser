@@ -83,6 +83,7 @@ mod tests {
         let app = open_app_state_with(
             &FixedStore(dir.path.clone()),
             PageScriptHandle::disabled(),
+            fandhe_browser_core::ScriptContextHandle::disabled(),
             renderer,
         )
         .unwrap();
@@ -143,6 +144,7 @@ mod tests {
         let app = open_app_state_with(
             &FixedStore(tmp.path.clone()),
             PageScriptHandle::disabled(),
+            fandhe_browser_core::ScriptContextHandle::disabled(),
             renderer,
         )
         .unwrap();
