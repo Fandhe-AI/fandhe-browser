@@ -15,7 +15,7 @@
 `.github/workflows/ci.yml`・`scripts/harness.sh`（`make check-compat-regression`）は
 `check-matrix.sh --threshold 70 --categories static,spa,form` で呼び出し、
 `--allow-missing` は渡さない。ファイルが無い場合は exit 2（fail-closed）で赤になる。
-`--all-categories` と `--category-threshold lazy=50`・`table=33`（実測ベースライン）を渡す。
+lazy・table は実測が 70% 未満のため判定対象に含めていない（閾値は緩めていない。含める基準変更は人間判断が必要なため別 Issue で扱う）。
 
 マトリクスは手で編集せず、再計測して `make_matrix.sh` で再生成する
 （手順は `harness/compat-practical/README.md`。コミット済みの内容と再生成結果の一致は
@@ -47,7 +47,6 @@ harness/compat-regression/check-matrix.sh \
   [--key <name>] \
   [--categories <csv>] \
   [--all-categories] \
-  [--category-threshold <cat>=<0-100>]... \
   [--allow-missing]
 ```
 
@@ -55,8 +54,7 @@ harness/compat-regression/check-matrix.sh \
 - `--threshold`: 全体・各類型に共通の合格閾値（既定 70。0〜100 の整数のみ・先頭ゼロ不可（bash の 8 進数解釈を避けるため）。`passed * 100 >= threshold * total` で判定し、閾値ちょうどは合格）
 - `--key`: 判定に使う boolean フィールド名（既定 `fandhe_browser_core`）
 - `--categories`: 個別にも 70% 以上を要求する `cat` 値の CSV（例: `static,spa,form`）。各値は `cat` と同じ `^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$` に一致すること（不一致は使用エラー exit 2）。列挙した類型のエントリが 0 件なら使用エラー（exit 2）。列挙した類型が「必ずマトリクスに存在すること」を保証する用途
-- `--category-threshold <cat>=<0-100>`（複数指定可）: 指定した類型だけ閾値を上書きする。70% 未満の類型を実測ベースラインに固定し、さらなる悪化を検出するために使う（形式違反は exit 2）。
-- `--all-categories`: `--categories` の CSV に加え、マトリクス内に実在する **全ての** `cat` 値を判定対象にする。`--categories` の固定 CSV だけでは呼び出し側が列挙し忘れた類型（例: `lazy`・`table`）が閾値未満でも検出されずに通過し得る（COMPAT-1 が要求する類型別回帰検出の抜け）。CI・`make check-compat-regression` は #919 の判断でこのフラグを使わない（lazy・table は判定外）。自己テストと手動実行向けの汎用機能
+- `--all-categories`: `--categories` の CSV に加え、マトリクス内に実在する **全ての** `cat` 値を判定対象にする。`--categories` の固定 CSV だけでは呼び出し側が列挙し忘れた類型（例: `lazy`・`table`）が閾値未満でも検出されずに通過し得る（COMPAT-1 が要求する類型別回帰検出の抜け）。CI・`make check-compat-regression` は現状このフラグを使わない（lazy・table は判定対象外。実測が 70% 未満のためで、閾値は緩めていない）。自己テストと手動実行向けの汎用機能
 - `--allow-missing`: `--matrix` のファイルが存在しない場合に `::warning::` を出して exit 0 にする（汎用の暫定運用オプション。CI・`make check-compat-regression` は使わない。上記「実マトリクスの運用」参照）
 
 ## 終了コード

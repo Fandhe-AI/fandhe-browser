@@ -72,7 +72,7 @@ cargo test --workspace
   `make check-compat-regression`（CI では `harness-*` ジョブの `[compat-regression]` ステップ）が
   `harness/compat-regression/check-matrix.sh --threshold 70 --categories static,spa,form` で
   全体と static/spa/form（存在必須として明示列挙）の動作率が閾値 70% 以上かを判定する。
-  `--all-categories` で全類型を判定し、70% 未満の lazy・table は `--category-threshold lazy=50`・`table=33`（実測ベースライン）で悪化を検出する。
+  lazy・table は実測が 70% 未満のため判定対象に含めていない（閾値は緩めていない。含める基準変更は人間判断が必要なため別 Issue で扱う）。
   実マトリクス `harness/compat-practical/results/matrix.json` は実測（`run_core.sh`）から
   `make_matrix.sh` で生成してコミット済み（TASK-71.3・#920）。`--allow-missing` は渡さず、
   ファイル不在は exit 2（fail-closed）。手編集せず、再計測して再生成する

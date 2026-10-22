@@ -172,7 +172,7 @@ jq 'map({id, cat, kind, success, error})' <PoC-9 の chromium_results.json>
 | form（d） | 5/5 | 5/5 |
 | table（e）（判定外） | 1/3 | 1/3 |
 
-- 判定は `check-matrix.sh --threshold 70 --categories static,spa,form --all-categories --category-threshold lazy=50 --category-threshold table=33`（lazy・table は実測が 70% 未満のため実測ベースラインで判定し、悪化を検出する）。全体・static・spa・form がすべて PASS で exit 0
+- 判定は `check-matrix.sh --threshold 70 --categories static,spa,form`（lazy・table は実測が 70% 未満のため判定対象に含めない。閾値は緩めていない）。全体・static・spa・form がすべて PASS で exit 0
 - 実測値をそのまま `results/core_results.jsonl`・`results/matrix.json` にコミットした（手で補正していない。値を整えるための再実行もしていない）。`make_matrix.sh` の再生成結果との一致は `self-test.sh` が検査する
 - 失敗 5 件（すべて `no_match`）: a6（HTTP 403）・b5（#964）・c1（anti-bot）・e1・e5
 - 再生成: `bash harness/compat-practical/run_core.sh --page-js v8 --page-modules` で再計測してから `bash harness/compat-practical/make_matrix.sh`

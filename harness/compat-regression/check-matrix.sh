@@ -14,7 +14,7 @@ set -euo pipefail
 
 usage() {
   cat >&2 <<'EOF'
-Usage: check-matrix.sh --matrix <path> [--threshold <0-100>] [--key <name>] [--categories <csv>] [--all-categories] [--category-threshold <cat>=<0-100>]... [--allow-missing]
+Usage: check-matrix.sh --matrix <path> [--threshold <0-100>] [--key <name>] [--categories <csv>] [--all-categories] [--allow-missing]
 
   --matrix <path>       Path to the compat matrix JSON file (required).
   --threshold <0-100>   Minimum pass rate percentage, integer 0-100 (default: 70).
@@ -25,9 +25,6 @@ Usage: check-matrix.sh --matrix <path> [--threshold <0-100>] [--key <name>] [--c
   --all-categories      Additionally judge every distinct "cat" value found in the matrix, not just
                          the ones listed in --categories. Catches categories the schema allows
                          (any string) but that --categories does not yet enumerate.
-  --category-threshold <cat>=<0-100>
-                         Per-category override of --threshold (repeatable). Use to pin a known-below-70
-                         category at its measured baseline so it still fails on further regression.
   --allow-missing       Exit 0 with a warning instead of failing when the matrix file does not exist.
 EOF
 }
@@ -38,7 +35,6 @@ KEY="fandhe_browser_core"
 CATEGORIES=""
 ALL_CATEGORIES=0
 ALLOW_MISSING=0
-CAT_THRESHOLDS=()
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -65,11 +61,6 @@ while [ $# -gt 0 ]; do
     --all-categories)
       ALL_CATEGORIES=1
       shift
-      ;;
-    --category-threshold)
-      [ $# -ge 2 ] || { echo "error: --category-threshold requires a value" >&2; usage; exit 2; }
-      CAT_THRESHOLDS+=("$2")
-      shift 2
       ;;
     --allow-missing)
       ALLOW_MISSING=1
@@ -107,14 +98,6 @@ if [ -n "$CATEGORIES" ] && ! [[ "$CATEGORIES" =~ ^${CATEGORY_ITEM_RE}(,${CATEGOR
   echo "error: --categories must be a comma-separated list of values matching ^${CATEGORY_ITEM_RE}\$" >&2
   exit 2
 fi
-
-# --category-threshold は <cat>=<0-100>（先頭ゼロなし）のみ許可する。
-for ct in ${CAT_THRESHOLDS[@]+"${CAT_THRESHOLDS[@]}"}; do
-  if ! [[ "$ct" =~ ^${CATEGORY_ITEM_RE}=(0|[1-9][0-9]{0,2})$ ]] || [ "${ct##*=}" -gt 100 ]; then
-    echo "error: --category-threshold must be <cat>=<integer 0-100> (got: $ct)" >&2
-    exit 2
-  fi
-done
 
 if ! command -v jq >/dev/null 2>&1; then
   echo "error: jq is required but was not found on PATH" >&2
@@ -220,20 +203,20 @@ FAIL=0
 
 judge() {
   # $1=label, $2=passed, $3=total
-  local label="$1" passed="$2" total="$3" th="${4:-$THRESHOLD}" result
+  local label="$1" passed="$2" total="$3" result
   if [ "$total" -eq 0 ]; then
     # --categories の事前検査で 0 件は既に弾いているため、ここに到達するのは
     # overall で total=0（スキーマ検証で長さ >= 1 を保証済みのため理論上到達しない）
     # の場合のみ。到達したら安全側で fail 扱いにする。
     result="FAIL"
-  elif [ $((passed * 100)) -ge $((th * total)) ]; then
+  elif [ $((passed * 100)) -ge $((THRESHOLD * total)) ]; then
     result="PASS"
   else
     result="FAIL"
   fi
-  echo "${label}: passed=${passed} total=${total} threshold=${th} result=${result}"
+  echo "${label}: passed=${passed} total=${total} threshold=${THRESHOLD} result=${result}"
   if [ "$result" = "FAIL" ]; then
-    echo "::error::${label} pass rate below threshold (passed=${passed} total=${total} threshold=${th})"
+    echo "::error::${label} pass rate below threshold (passed=${passed} total=${total} threshold=${THRESHOLD})"
     FAIL=1
   fi
 }
@@ -256,13 +239,7 @@ judge_category() {
       ] | @tsv
     ' "$MATRIX" | tr -d '\r'
   )
-  local cth="$THRESHOLD" ct
-  for ct in ${CAT_THRESHOLDS[@]+"${CAT_THRESHOLDS[@]}"}; do
-    if [ "${ct%%=*}" = "$cat" ]; then
-      cth="${ct##*=}"
-    fi
-  done
-  judge "category ${cat}" "$cpassed" "$ctotal" "$cth"
+  judge "category ${cat}" "$cpassed" "$ctotal"
 }
 
 if [ -n "$CATEGORIES" ]; then

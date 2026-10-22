@@ -92,15 +92,6 @@ expect_contains "$LAST_OUTPUT" "category form: passed=1 total=4 threshold=70 res
 expect_exit "below category with --all-categories fails without --categories" 1 --matrix "$FIXTURES/below-category.json" --all-categories
 expect_contains "$LAST_OUTPUT" "category form: passed=1 total=4 threshold=70 result=FAIL" "all-categories form counts"
 
-# --category-threshold: 類型別の閾値上書き。below-category.json の form は 1/4 (25%)。
-# 閾値 25 なら PASS、26 なら FAIL（境界）、他類型は既定閾値のまま判定される。
-expect_exit "category-threshold pins form at 25 passes" 0 --matrix "$FIXTURES/below-category.json" --all-categories --category-threshold form=25
-expect_contains "$LAST_OUTPUT" "category form: passed=1 total=4 threshold=25 result=PASS" "category-threshold form counts"
-expect_exit "category-threshold 26 fails" 1 --matrix "$FIXTURES/below-category.json" --all-categories --category-threshold form=26
-expect_exit "category-threshold invalid value rejected" 2 --matrix "$FIXTURES/below-category.json" --category-threshold form=abc
-expect_exit "category-threshold leading zero rejected" 2 --matrix "$FIXTURES/below-category.json" --category-threshold form=025
-expect_exit "category-threshold over 100 rejected" 2 --matrix "$FIXTURES/below-category.json" --category-threshold form=101
-
 # --categories と --all-categories を併用した場合、--categories 側で既に判定した
 # 類型を --all-categories 側で重複して二重出力しないことを確認する（同一 cat 値の
 # judge 呼び出しが 1 回だけであることを出現回数で検証）。

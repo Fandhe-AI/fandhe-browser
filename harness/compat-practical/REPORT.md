@@ -1630,8 +1630,8 @@ Chromium 側（コミットしていない）は `mktemp -d` の中に `playwrig
 ## 回帰ゲートとマトリクスの状況
 
 - `results/matrix.json` は #920 で**コミットした**。`make_matrix.sh` が `results/core_results.jsonl`（2026-10-22 の実測）から生成した内容そのままで、手で編集していない
-- 判定は `check-matrix.sh --threshold 70 --categories static,spa,form --all-categories --category-threshold lazy=50 --category-threshold table=33`（lazy・table は実測が 70% 未満のため実測ベースラインで判定し、悪化を検出する）。CI の `[compat-regression]` と `make check-compat-regression` から `--allow-missing` を外し、ファイル不在は exit 2（fail-closed）にした
-- 閾値・判定類型・`tasks.json`・セレクタ・UA・実行上限・タイムアウトは変えていない
+- 判定は `check-matrix.sh --threshold 70 --categories static,spa,form`（lazy・table は実測が 70% 未満のため判定対象に含めない）。CI の `[compat-regression]` と `make check-compat-regression` から `--allow-missing` を外し、ファイル不在は exit 2（fail-closed）にした
+- 閾値 70・類型別の上書きなし。`tasks.json`・セレクタ・UA・実行上限・タイムアウトは変えていない
 
 ## 22 タスク再測定と回帰ゲートの有効化（#920）
 

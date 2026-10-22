@@ -1000,10 +1000,7 @@ jobs:
           bash harness/compat-regression/check-matrix.sh \
             --matrix harness/compat-practical/results/matrix.json \
             --threshold 70 \
-            --categories static,spa,form \
-            --all-categories \
-            --category-threshold lazy=50 \
-            --category-threshold table=33
+            --categories static,spa,form
       - name: "[bench-record-selftest] record.sh 自己テスト"
         if: ${{ !cancelled() }}
         run: bash benches/competitor_lightpanda/self-test.sh
@@ -1686,10 +1683,7 @@ jobs:
           bash harness/compat-regression/check-matrix.sh \
             --matrix harness/compat-practical/results/matrix.json \
             --threshold 70 \
-            --categories static,spa,form \
-            --all-categories \
-            --category-threshold lazy=50 \
-            --category-threshold table=33
+            --categories static,spa,form
       - name: "[bench-record-selftest] record.sh 自己テスト"
         if: ${{ !cancelled() }}
         run: bash benches/competitor_lightpanda/self-test.sh
@@ -1846,10 +1840,7 @@ jobs:
           bash harness/compat-regression/check-matrix.sh \
             --matrix harness/compat-practical/results/matrix.json \
             --threshold 70 \
-            --categories static,spa,form \
-            --all-categories \
-            --category-threshold lazy=50 \
-            --category-threshold table=33
+            --categories static,spa,form
       - name: "[bench-record-selftest] record.sh 自己テスト"
         if: ${{ !cancelled() }}
         run: bash benches/competitor_lightpanda/self-test.sh
