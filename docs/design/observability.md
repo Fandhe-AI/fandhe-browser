@@ -132,7 +132,7 @@ REPAIR-9（Must）は、各モジュールの操作結果を操作種別・成�
 ## 他タスクへの影響
 
 - TASK-10.3（Issue #221）: 出力先の実装。本書の決定事項が入力
-- TASK-95（MS-9）: 本タスクの出力形式（JSON Lines）を前提とする
+- TASK-95（MS-9）: 本タスクの出力形式（JSON Lines）を前提とする。プラグイン性能計測（TASK-95.4）は `OperationRecord` を変えず、bench 専用イベント `event: plugin_overhead` として同じ規約（固定キー・整数のみ・自由形式文字列なし）で出す。詳細は [plugin-overhead-report.md](./plugin-overhead-report.md)
 
 ## 関連ビヘイビア・タスク
 

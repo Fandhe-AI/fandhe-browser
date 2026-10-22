@@ -2,7 +2,7 @@
 //!
 //! `idle_rss.rs` が `ps` を実行して得た表を、ここで解析・ツリー合算・中央値・MB 換算・TSV 整形する。
 //! I/O を持たないため全 OS でユニットテストできる（`rss_tests.rs`）。結果は `IdleRssMeasurement` として
-//! 構造のまま返し、整形は別関数に分ける（TASK-95.4 が同じ値を TASK-10 形式へ流せるように。REPAIR-4）。
+//! 構造のまま返し、整形は別関数に分ける（`report.rs`（TASK-95.4）が同じ値を TASK-10 形式へ流せるように。REPAIR-4）。
 //! 外部コマンドの出力は untrusted として扱い、添字アクセス・`unwrap` を使わない。
 
 use std::collections::{HashMap, HashSet};

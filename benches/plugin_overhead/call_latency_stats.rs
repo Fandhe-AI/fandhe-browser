@@ -3,7 +3,7 @@
 //! `call_latency.rs` が採取した標本（ms）を受け取り、`plugin_overhead.rs` の main が p50・p95 を含む
 //! TSV を stdout へ出す。I/O を持たない純関数のため `call_latency_tests.rs` が全 OS で検証する。
 //! パーセンタイルは nearest-rank 法（補間なし）で、PoC-15 と `mcp_envelope/stats.rs` と同じ定義。
-//! 値（`CallLatencyMeasurement`）と整形（`render_call_latency`）を分け、TASK-95.4 が同じ値を
+//! 値（`CallLatencyMeasurement`）と整形（`render_call_latency`）を分け、`report.rs`（TASK-95.4）が同じ値を
 //! TASK-10 形式のレポートへ流せるようにする（REPAIR-4）。目標の達成判定はここでは行わない（#379）。
 
 use std::fmt;

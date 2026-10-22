@@ -1,6 +1,6 @@
 # plugin_overhead: MCP プラグインの性能計測
 
-TASK-95.1（Issue #375）・TASK-95.2（Issue #376）・TASK-95.3（Issue #377）・`PLUG-3`・`MS-9`。MCP 参照プラグイン
+TASK-95.1（Issue #375）・TASK-95.2（Issue #376）・TASK-95.3（Issue #377）・TASK-95.4（Issue #378）・`PLUG-3`・`MS-9`。MCP 参照プラグイン
 `fandhe-browser-mcp` のアイドル RSS 増分・cold start・呼び出しレイテンシ p50/p95 を計測する。
 
 ## 使い方
@@ -10,15 +10,33 @@ make measure-plugin-overhead                                  # mcp を release 
 make measure-plugin-overhead PLUGIN_OVERHEAD_ARGS="--samples 5"
 make measure-plugin-overhead PLUGIN_OVERHEAD_ARGS="--metric cold-start --trials 5"
 make measure-plugin-overhead PLUGIN_OVERHEAD_ARGS="--metric call-latency"   # 呼び出しレイテンシ（既定 30 回）
+make measure-plugin-overhead PLUGIN_OVERHEAD_ARGS="--metric all --format jsonl"   # 3 指標を JSON Lines の単一レポートで
 make check-plugin-overhead                                    # 実バイナリでの e2e smoke
 ```
 
-引数: `--metric idle-rss|cold-start|call-latency`（既定は `idle-rss` のみ・複数指定可）、`--samples 1..=20`（既定 3。RSS 用）、
+引数: `--metric idle-rss|cold-start|call-latency|all`（既定は `idle-rss` のみ・複数指定可。`all` は 3 指標）、`--format tsv|jsonl`（既定 `tsv`）、`--samples 1..=20`（既定 3。RSS 用）、
 `--trials 1..=20`（既定 5。cold start 用）、`--calls 1..=1000`（既定 30。call-latency 用）、
 `--settle-ms 0..=30000`（既定 800）、`--interval-ms 0..=5000`（既定 200。RSS の採取間隔と cold start の試行間隔）。
 cold start は `--samples`・`--settle-ms` を使わない。
 
 要件: unix（Linux・macOS）、`ps(1)`、ネットワーク不使用（loopback のみ）。
+
+## JSON Lines レポート（`--format jsonl`・TASK-95.4）
+
+TASK-10 の可観測性出力形式（`docs/design/observability.md`）と同じ規約で、1 指標 1 行の JSON を stdout へ出す。
+core の `OperationRecord` は変えず、bench 専用イベント `plugin_overhead` として出す（`report.rs`）。
+
+- 出力順は指標の指定順によらず `idle_rss` → `cold_start` → `call_latency` で固定。各行は `\n` で終端し、最終行の後ろにも改行が付く
+- 全指標を計測し終え整形に成功してから 1 回だけ出す。失敗時は何も出さず非 0 で終わる（部分的なレポートを残さない）。stdout は JSON 行のみ（診断は stderr）
+- キーは固定の snake_case・順序固定。値は固定 ASCII 文字列と整数のみ（浮動小数なし）。時間は `_us`（µs・四捨五入）、メモリは `_bytes`。自由形式文字列は含めない
+- 共通キー: `event`（`plugin_overhead`）・`metric`・`tier`（`official`）・末尾の `timestamp_unix_ms`（3 行で共有）
+- `idle_rss`: `samples`・`host_only_bytes`・`host_plus_plugin_bytes`・`plugin_bytes`・`increment_bytes`（符号付き。負でも丸めない）・`target_increment_max_bytes`
+- `cold_start`: `trials`・`median_us`・`min_us`・`max_us`・`target_median_max_us`
+- `call_latency`: `calls`・`p50_us`・`p95_us`・`mean_us`・`min_us`・`max_us`・`target_p50_max_us`・`target_p95_max_us`
+- `target_*` は `PLUG-3` の参考値で、判定はしない（#379）
+- 全試行・全標本の配列は JSONL に含めない。詳細は TSV 形式で確認する
+
+実測例と測定環境は `docs/design/plugin-overhead-report.md`。
 
 ## 計測定義（アイドル RSS）
 
