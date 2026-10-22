@@ -39,7 +39,8 @@
 #      rust-test ジョブ（rust-test-macos・rust-test-windows）まで走らせるかの判断材料。
 #      OS 依存のテスト失敗が main への push 後にしか分からない問題の再発防止（案 A）。
 #      次のいずれかで native=true にする。
-#        a. crates/fandhe-browser-profile/ 配下の変更（パス・ロック・ファイルシステム依存）
+#        a. crates/fandhe-browser-profile/ 配下、または .cargo/ 配下（target 別 rustflags の +crt-static 等。
+#           リンク・テストの失敗が Windows でしか出ないため。#917）の変更
 #        b. 環境変数 CI_CHANGES_RS_DIFF_FILE が指す unified diff（`git diff -U0 -- '*.rs'` の出力）の
 #           追加・削除行に、単語境界つき（BSD grep でも動くよう \b ではなく POSIX 文字クラスで表現）の windows / unix トークン、または target_os / target_family
 #           が含まれる。cfg( の有無は問わない（複数行の #[cfg(any(\n windows,\n unix,\n))] で
@@ -112,14 +113,14 @@ classify() {
     # rust-toolchain.toml はホストも使う toolchain の単一真実源（設計 §1.3）
     case "$path" in
       servo-host/* | crates/fandhe-browser-render/* | docs/design/render-host-protocol* | \
-        scripts/* | .github/* | rust-toolchain.toml)
+        scripts/* | .github/* | rust-toolchain.toml | .cargo/*)
         servo=true
         ;;
       *) ;;
     esac
     # native 軸（独立判定）。profile crate はパス・ロック・FS 依存で OS 差が出やすい
     case "$path" in
-      crates/fandhe-browser-profile/*) native=true ;;
+      crates/fandhe-browser-profile/* | .cargo/*) native=true ;;
       *) ;;
     esac
   done
@@ -211,11 +212,13 @@ self_test() {
   expect "servo-host-design md is not servo" "rust=true harness=false servo=false" $'docs/design/servo-host-design.md'
   expect "scripts" "rust=true harness=false servo=true" $'scripts/ci-changes.sh'
   expect "rust-toolchain.toml" "rust=true harness=false servo=true" $'rust-toolchain.toml'
+  expect ".cargo/config.toml (affects servo-host too)" "rust=true harness=false servo=true" $'.cargo/config.toml'
   expect "empty input runs all (fail-closed)" "rust=true harness=true servo=true" ''
   expect "blank lines only run all" "rust=true harness=true servo=true" $'\n\n'
   local rs=$'crates/fandhe-browser-core/src/lib.rs'
   expect_native "profile crate path" true $'crates/fandhe-browser-profile/src/lib.rs' ""
   expect_native "profile crate test path" true $'crates/fandhe-browser-profile/tests/a.rs' $'+let x = 1;'
+  expect_native ".cargo/config.toml" true $'.cargo/config.toml' ""
   expect_native "no cfg in diff" false "$rs" $'--- a/x.rs\n+++ b/x.rs\n@@ -1 +1 @@\n-let a = 1;\n+let a = 2;'
   expect_native "cfg(windows added" true "$rs" $'+#[cfg(windows)]'
   expect_native "cfg(unix removed" true "$rs" $'-#[cfg(unix)]'

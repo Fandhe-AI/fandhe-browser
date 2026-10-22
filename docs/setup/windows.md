@@ -38,6 +38,13 @@ Servo は現時点でどの crate の依存にも入っていません（`fandhe
 
 `make setup` と `make ci` は、上記 1〜7 がすべて PATH 上にある状態で実行してください。その後は README「クイックスタート」の手順（`make setup` → `cargo build --workspace` → `make ci`）に従います。
 
+### CRT の静的リンク（`+crt-static`）
+
+- `.cargo/config.toml` により `x86_64-pc-windows-msvc` のビルドへ自動で適用されます。手作業の設定は不要です（WSL や他 OS には効きません）。
+- 意味: VC++ 再頒布可能パッケージが不要になります。代わりに CRT のセキュリティ修正は OS 更新では届かず、再ビルドで取り込む必要があります（#363 で受容したトレードオフ）。
+- 確認方法: Developer PowerShell で `dumpbin /dependents target\release\fandhe-browser.exe` を実行し、`vcruntime140.dll`・`msvcp140.dll`・`ucrtbase.dll`・`api-ms-win-crt-*.dll` が出ないことを見ます（CI での機械検査は #365）。
+- 根拠・サイズ差・未検証事項は [plugin-boundary-policy](../design/plugin-boundary-policy.md) を参照してください（`PLUG-1`・TASK-93）。
+
 ### WSL について
 
 WSL 上で rustup や Make を実行すると、ホストは Linux（`x86_64-unknown-linux-gnu`）になり、本手順書の対象である `x86_64-pc-windows-msvc` のビルドにはなりません。WSL は Linux ビルドを Windows 上で行う別の方式であり、Linux 側の手順（README の開発環境構築）に従ってください。本手順では Git Bash など Windows 側で動く環境を使います。

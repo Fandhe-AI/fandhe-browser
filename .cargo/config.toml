@@ -1,0 +1,10 @@
+# Windows（msvc）ビルドの CRT 静的リンク設定（#917・#363・PLUG-1・TASK-93）。
+#
+# 役割: x86_64-pc-windows-msvc だけ CRT を静的にリンクし、配布バイナリが VC++ 再頒布可能
+# パッケージ（vcruntime140.dll 等）に依存しないようにする。他 OS・他ターゲットには効かない。
+# 根拠と確認方法は docs/design/plugin-boundary-policy.md と docs/setup/windows.md を参照。
+#
+# 注意: Cargo は cwd から親ディレクトリへ遡って config を探すため、この設定は別 workspace の
+# servo-host/ のビルドにも効く。ここには rustflags 以外（source・registries・linker・env 等）を書かない。
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
