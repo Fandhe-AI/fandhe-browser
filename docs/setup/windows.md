@@ -42,7 +42,7 @@ Servo は現時点でどの crate の依存にも入っていません（`fandhe
 
 - `.cargo/config.toml` により `x86_64-pc-windows-msvc` のビルドへ自動で適用されます。手作業の設定は不要です（WSL や他 OS には効きません）。
 - 意味: VC++ 再頒布可能パッケージが不要になります。代わりに CRT のセキュリティ修正は OS 更新では届かず、再ビルドで取り込む必要があります（#363 で受容したトレードオフ）。
-- 確認方法: Developer PowerShell で `dumpbin /dependents target\release\fandhe-browser.exe` を実行し、`vcruntime140.dll`・`msvcp140.dll`・`ucrtbase.dll`・`api-ms-win-crt-*.dll` が出ないことを見ます（CI での機械検査は #365）。
+- 確認方法: Developer PowerShell で `dumpbin /dependents target\release\fandhe-browser.exe` を実行し、`vcruntime140.dll`・`msvcp140.dll`・`ucrtbase.dll`・`api-ms-win-crt-*.dll` が出ないことを見ます（CI での機械検査は `make check-dynamic-link-windows`・`[dynamic-link-windows]`（記録のみ。#365））。
 - 根拠・サイズ差・未検証事項は [plugin-boundary-policy](../design/plugin-boundary-policy.md) を参照してください（`PLUG-1`・TASK-93）。
 
 ### WSL について

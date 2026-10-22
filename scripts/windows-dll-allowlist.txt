@@ -1,0 +1,21 @@
+# Windows 配布バイナリ（*-pc-windows-msvc）がロード時に動的リンクしてよい DLL の許可リスト（TASK-93.5・PLUG-1・#365）。
+#
+# 状態: 実測前の暫定案。#363 のオーナー判断（2026-10-12）により、まず記録のみで導入し、
+#   実測値を見て内容を確定してから fail-closed へ切り替える。
+#   切り替えは scripts/harness.sh の WINDOWS_DLL_MODE 既定値（record -> enforce）を変えるだけで済む。
+# 正本: このファイルが機械可読の正本。文章版の方針は docs/design/plugin-boundary-policy.md（#916）。
+# 判定は scripts/check-dynamic-link-windows.sh。
+#
+# 書式（1 行 1 エントリ。小文字の DLL 名・完全一致だけ。パス・glob・接頭辞ルールは使わない）。
+# CRT 系（vcruntime140・msvcp140・ucrtbase・api-ms-win-crt-*）は +crt-static（#917）で静的化する前提のため
+# 意図的に載せない。現れた場合は許可リスト外として記録され、専用の warning も出る。
+kernel32.dll
+ntdll.dll
+ws2_32.dll
+advapi32.dll
+userenv.dll
+bcryptprimitives.dll
+api-ms-win-core-synch-l1-2-0.dll
+winmm.dll
+dbghelp.dll
+crypt32.dll

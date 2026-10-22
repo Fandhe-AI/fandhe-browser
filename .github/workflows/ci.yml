@@ -917,12 +917,15 @@ jobs:
   #                            （TASK-41.5・#174・REPAIR-5・#633）
   #   [static-link]            musl 配布バイナリ（既定・軽量）の動的リンクなし検査（TASK-93.3・#362・
   #                            PLUG-1・CTR-4）。Linux の ELF 成果物の検査のため ubuntu のみ
-  #                            （macOS は [dynamic-link-macos]・Windows は #365 が別手段で担う。前例は unix のみの
+  #                            （macOS は [dynamic-link-macos]・Windows は [dynamic-link-windows] が別手段で担う。前例は unix のみの
   #                            [mcp-envelope-smoke]）。`*-linux-gnu` のネイティブ配布物は対象外（#363）。
   #                            ビルド先は target/ の外（RUNNER_TEMP）に置き、cache に入れない
   #   [dynamic-link-macos]     macOS 配布バイナリ（既定・軽量）の動的リンクを許可リストと照合（TASK-93.4・
   #                            #364・PLUG-1）。#363 の判断で当面は記録のみ（許可リスト外は warning で失敗させない）。
   #                            実検査は harness-macos（PR では skipped）、harness-ubuntu は自己テスト（合成データ）だけ
+  #   [dynamic-link-windows]   Windows 配布バイナリ（既定・軽量）の動的リンクを許可リストと照合（TASK-93.5・
+  #                            #365・PLUG-1）。#363 の判断で当面は記録のみ。実検査は harness-windows（PR では
+  #                            skipped）、harness-ubuntu は自己テスト（合成データ）だけ
   #   [container-memory-selftest]  コンテナ同時起動の集約メモリ測定スクリプトの自己テスト（TASK-67・
   #                            #929・CTR-3・CTR-7）。偽 docker シムと偽の cgroup で動かし、実 docker・実測は
   #                            行わない。測定対象がホストの cgroup v2 で Linux 固有のため ubuntu のみ
@@ -1086,6 +1089,9 @@ jobs:
       - name: "[dynamic-link-macos] 自己テスト（合成データのみ・PR は harness-macos が skipped のためパーサーの退行をここで検出）"
         if: ${{ !cancelled() }}
         run: bash scripts/check-dynamic-link-macos.sh --self-test
+      - name: "[dynamic-link-windows] 自己テスト（合成データのみ・PR は harness-windows が skipped のためパーサーの退行をここで検出）"
+        if: ${{ !cancelled() }}
+        run: bash scripts/check-dynamic-link-windows.sh --self-test
       - name: "[container-memory-selftest] コンテナ同時起動の集約メモリ測定スクリプトの自己テスト（偽 docker・Linux 固有）"
         if: ${{ !cancelled() }}
         run: bash harness/container-memory/self-test.sh
@@ -1942,6 +1948,45 @@ jobs:
               done
             else
               echo "(no binary-size output was produced; check-binary-size.sh exited with a usage/build error)"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit "$status"
+      - name: "[dynamic-link-windows] 自己テスト（合成データ・実物の陰性対照による検出の証跡確認）"
+        if: ${{ !cancelled() }}
+        run: bash scripts/check-dynamic-link-windows.sh --self-test
+      - name: "[dynamic-link-windows] Windows 配布バイナリ（既定・軽量）の動的リンク検査（記録のみ・#363）"
+        if: ${{ !cancelled() }}
+        # Windows ランナーでの make の有無に依存しないよう harness.sh を直接呼ぶ（make 経由の他 OS 版と同じ処理）。
+        run: |
+          out="$(mktemp)"
+          trap 'rm -f "$out"' EXIT
+          status=0
+          WINDOWS_DLL_TARGET_DIR="${RUNNER_TEMP}/dynamic-link-windows-target" \
+            bash scripts/harness.sh check-dynamic-link-windows | tee "$out" || status=${PIPESTATUS[0]}
+          {
+            echo "### Windows dynamic link ($RUNNER_OS, record only)"
+            echo
+            if grep -q '^dll:' "$out"; then
+              echo "| bin | kind | dll | allowed |"
+              echo "| --- | ---- | --- | ------- |"
+              grep '^dll:' "$out" | while IFS= read -r line; do
+                bin="$(printf '%s\n' "$line" | sed -nE 's/^dll: bin=([A-Za-z0-9._+-]{1,64}) .*/\1/p')"
+                kind="$(printf '%s\n' "$line" | sed -nE 's/.* kind=(load|delay) .*/\1/p')"
+                dll="$(printf '%s\n' "$line" | sed -nE 's/.* name=([A-Za-z0-9._-]{1,128}) allowed=.*/\1/p')"
+                allowed="$(printf '%s\n' "$line" | sed -nE 's/.* allowed=(yes|no)$/\1/p')"
+                echo "| $bin | $kind | $dll | $allowed |"
+              done
+              echo
+              grep '^dynamic-link-windows: bin=' "$out" | while IFS= read -r line; do
+                bin="$(printf '%s\n' "$line" | sed -nE 's/^dynamic-link-windows: bin=([A-Za-z0-9._+-]{1,64}) .*/\1/p')"
+                deps="$(printf '%s\n' "$line" | sed -nE 's/.* deps=([0-9]{1,6}) .*/\1/p')"
+                outside="$(printf '%s\n' "$line" | sed -nE 's/.* outside=([0-9]{1,6}) .*/\1/p')"
+                crt="$(printf '%s\n' "$line" | sed -nE 's/.* forbidden_crt=([0-9]{1,6}) .*/\1/p')"
+                result="$(printf '%s\n' "$line" | sed -nE 's/.* result=(pass|outside|error)$/\1/p')"
+                echo "- $bin: deps=$deps outside=$outside forbidden_crt=$crt result=$result"
+              done
+            else
+              echo "(no dll output was produced; the build or the check failed before inspection)"
             fi
           } >> "$GITHUB_STEP_SUMMARY"
           exit "$status"

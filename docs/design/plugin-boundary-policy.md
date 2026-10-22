@@ -33,7 +33,7 @@ spec 本文中の旧称 `rust-browser` は `fandhe-browser` に読み替える�
 ## ロード時動的リンクと実行時ロードの区別
 
 - `ldd`・`readelf -d` の `NEEDED`・`otool -L`・`dumpbin /dependents` が検出するのはロード時の動的リンクである。`dlopen` / `LoadLibrary` による実行時ロードは別の機構で、これらでは検出できない
-- CI 検査（Linux は #362、macOS は #364 で実装済み。Windows は後続の #365）が担うのは前者である。後者は本ポリシーとレビュー（`AGENTS.md` のレビュー観点「プラグイン境界」・[security](../../.claude/rules/security.md)）で防ぐ。CI 検査が `dlopen` まで網羅するものとは扱わない
+- CI 検査（Linux は #362、macOS は #364、Windows は #365 で実装済み）が担うのは前者である。後者は本ポリシーとレビュー（`AGENTS.md` のレビュー観点「プラグイン境界」・[security](../../.claude/rules/security.md)）で防ぐ。CI 検査が `dlopen` まで網羅するものとは扱わない
 - コンテナ配布物（musl・`scratch`）は動的リンク 0 件が前提である（`CTR-4`）。ネイティブ配布物（`*-linux-gnu`・`*-apple-darwin`・`*-pc-windows-msvc`）は OS のシステムライブラリへの動的リンクが避けられず、その扱いは #363 のオーナー判断で許可リスト方式に決まった（「3 OS ネイティブ配布物の動的リンク方針」）
 
 ## 本リポジトリでの現状
@@ -89,7 +89,7 @@ cargo tree --offline --locked --workspace --all-features --target all -e normal 
 | `*-linux-musl`（コンテナ） | 動的リンク 0 件 | `readelf -d`・`ldd` | #362 | 実装済み（前節） |
 | `*-linux-gnu`（ネイティブ） | 許可リスト | `readelf -d`・`ldd` | 未起票 | 方針のみ決定・検査は未実装 |
 | `*-apple-darwin` | 許可リスト | `otool -L` | #364 | 方針のみ決定・検査は未実装 |
-| `*-pc-windows-msvc` | 許可リスト（`+crt-static` 前提） | `dumpbin /dependents` | #365 | `+crt-static` 設定済み（#917・Windows ジョブでの確認待ち）・検査は未実装 |
+| `*-pc-windows-msvc` | 許可リスト（`+crt-static` 前提） | `dumpbin /dependents` | #365 | `+crt-static` 設定済み（#917・Windows ジョブでの確認待ち）・検査は実装済み・記録のみ（「Windows 配布バイナリの動的リンク検査」） |
 
 - ネイティブ 3 OS は OS のシステムライブラリへの動的リンクが避けられないため、許可リスト方式を採る。許可リストに無い依存（第三者共有ライブラリ・`dylib` プラグイン等）を検出したら失敗させる方針である
 - OS 外のパス（macOS の `@rpath`・`@loader_path`・`/usr/local`・`/opt/homebrew` 等）は許可しない
@@ -149,6 +149,18 @@ cargo tree --offline --locked --workspace --all-features --target all -e normal 
 - CI では `harness-macos` の `[dynamic-link-macos]` ステップが実行する（PR では skipped で、main への push と `workflow_dispatch` のみ）。`harness-ubuntu` は合成データの自己テストだけを PR でも回す。ビルド先は `RUNNER_TEMP` で cache には入れない
 - 対象外: `dlopen` による実行時ロード（レビューで防ぐ）。許可リストの確定と fail-closed への切り替えは後続 Issue
 
+## Windows 配布バイナリの動的リンク検査
+
+対応: `TASK-93`（93.5）・`PLUG-1`・Issue #365。
+
+- 判定の正本は `scripts/check-dynamic-link-windows.sh`、許可リストは `scripts/windows-dll-allowlist.txt`（実測前の暫定案）である
+- `dumpbin -nologo -dependents` が列挙するロード時依存 DLL（通常の import と delay load の両方）を、小文字にした DLL 名の完全一致で許可リストと照合する。接頭辞・glob ルールは設けない
+- #363 のオーナー判断により当面は記録のみとする（許可リスト外は warning で失敗させない）。許可リスト確定後に `scripts/harness.sh` の `WINDOWS_DLL_MODE` 既定を `enforce` へ切り替える。検査不能（dumpbin 不在・非 PE・依存 0 件・許可リスト不正）はモードに関係なく NG とする
+- CRT 系 DLL（`vcruntime140*`・`msvcp140*`・`ucrtbase`・`api-ms-win-crt-*`）が現れたら、`+crt-static` が効いていない兆候として専用の warning を出す（#917 の確認用）
+- 実行は `make check-dynamic-link-windows`（Windows のみ。既定・軽量の 2 構成を release ビルドして検査する。`make ci` には含めない）
+- CI では `harness-windows` の `[dynamic-link-windows]` ステップ（PR では skipped。main・`workflow_dispatch` のみ）が実行し、`harness-ubuntu` は合成データの自己テストだけを PR でも回す
+- 対象外: `LoadLibrary` による実行時ロード、許可リストの確定（実測後に人間が判断する）
+
 ## feature と配布プロファイルの対応
 
 対応 `TASK-93`（93.2）/ `PLUG-1`。確認日 2026-10-11、基準コミット `c48cbf40`（`origin/main`）。
@@ -203,7 +215,7 @@ cargo tree --offline --locked --workspace --all-features --target all -e normal 
 | #917 | Windows の `+crt-static` 設定とリンク確認 | 設定済み・`workflow_dispatch` での確認待ち |
 | #362 | Linux 向け動的リンクなし検査スクリプト（`TASK-93.3`） | 実装済み（「Linux（musl）配布バイナリの動的リンクなし検査」） |
 | #364 | macOS 向け動的リンク検査スクリプト（`TASK-93.4`） | 実装済み・記録のみ（「macOS 配布バイナリの動的リンク検査」。許可リスト確定と fail-closed 化は後続） |
-| #365 | Windows 向け動的リンク検査スクリプト（`TASK-93.5`） | 未実装（記録のみで導入し、実測後に fail-closed 化） |
+| #365 | Windows 向け動的リンク検査スクリプト（`TASK-93.5`） | 実装済み・記録のみ（「Windows 配布バイナリの動的リンク検査」。許可リスト確定と fail-closed 化は後続） |
 
 親 Issue は #359（`TASK-93`）。
 
@@ -213,7 +225,7 @@ cargo tree --offline --locked --workspace --all-features --target all -e normal 
 - WASM ランタイムのサイズ増分は未実測の目安である
 - PoC-15 の実測は macOS ローカルのみ。3 OS 横断の確認は XOS 系へ申し送り済み
 - 本ドキュメントは新規の実測を含まない
-- 動的リンクの CI による機械検査は Linux（musl）と macOS（記録のみ）が実装済みで、Windows は未実装である（#365）
+- 動的リンクの CI による機械検査は Linux（musl）と macOS・Windows（いずれも記録のみ）が実装済みである
 - 3 OS ネイティブの許可リストは実測前の暫定案である。`+crt-static` は `.cargo/config.toml` で設定済みだが、Windows ネイティブでのリンク可否は `workflow_dispatch` で未検証である（#917）。`*-linux-gnu` ネイティブの検査を担う Issue は未起票である
 
 ## 関連
