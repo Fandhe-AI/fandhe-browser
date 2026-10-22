@@ -390,9 +390,8 @@ fn reidentify_after(
         .ok()
         .is_some_and(|m| match m.as_slice() {
             [id] => !holders.iter().any(|h| h.node == *id),
-            // セレクタが 0 件（対象自体が DOM から消えた）場合も、同名要素の追加と相殺されて
-            // 残った要素が元の ref を引き継ぎ得るため、対象の消失として扱う。
-            [] => true,
+            // セレクタが 0 件の場合は消失の根拠にしない（class 等の変更でも 0 件になる。
+            // 変化後は role+name と ref で再特定する契約。AISNAP-10）。
             _ => false,
         });
     match candidates.as_slice() {
@@ -962,10 +961,27 @@ fn aisnap_10_hidden_target_with_added_sibling_same_count_is_ambiguous() {
     );
 }
 
-/// AISNAP-10・Issue #1221: 対象自体が DOM から削除され、同名要素の追加でグループ件数が相殺
-/// されても、残った先頭要素が元の ref を引き継いで `Stable` にならず `Ambiguous`。
+/// AISNAP-10・Issue #1221: 変化前のセレクタが変化後に 0 件でも、role+name と ref が維持される
+/// 対象は `Stable`（class だけの変更を参照破損にしない）。
 #[test]
-fn aisnap_10_removed_target_with_added_sibling_same_count_is_ambiguous() {
+fn aisnap_10_class_only_change_keeps_stable() {
+    let before = page("<button class=\"target\">Go</button>");
+    let after = page("<button>Go</button>");
+    let result = check_reidentification(&StabilityCase {
+        before_html: &before,
+        after_html: &after,
+        selector: ".target",
+    });
+    assert!(
+        matches!(&result, Reidentification::Stable { name, .. } if name == "Go"),
+        "{result:?}"
+    );
+}
+
+/// AISNAP-10・Issue #1221: 同名ボタンが並ぶ中で対象が class を失うだけで件数が同じ場合は、
+/// 変化後の HTML だけでは消失と区別できないため、role+name と ref の一致を根拠に `Stable`。
+#[test]
+fn aisnap_10_class_only_change_among_duplicates_same_count_is_stable() {
     let before = page("<button class=\"target\">Go</button><button>Go</button>");
     let after = page("<button>Go</button><button>Go</button>");
     let result = check_reidentification(&StabilityCase {
@@ -973,12 +989,32 @@ fn aisnap_10_removed_target_with_added_sibling_same_count_is_ambiguous() {
         after_html: &after,
         selector: ".target",
     });
-    assert_eq!(
-        result,
-        Reidentification::Ambiguous {
-            side: Side::After,
-            count: 1
-        }
+    assert!(
+        matches!(&result, Reidentification::Stable { name, .. } if name == "Go"),
+        "{result:?}"
+    );
+}
+
+/// AISNAP-10・Issue #1221: 対象が実際に消え、同名の別要素だけが残る（グループ件数が減る）場合は
+/// `Ambiguous`。
+#[test]
+fn aisnap_10_removed_target_with_remaining_same_name_is_ambiguous() {
+    let before = page("<button class=\"target\">Go</button><button>Go</button><button>Go</button>");
+    let after = page("<button>Go</button><button>Go</button>");
+    let result = check_reidentification(&StabilityCase {
+        before_html: &before,
+        after_html: &after,
+        selector: ".target",
+    });
+    assert!(
+        matches!(
+            result,
+            Reidentification::Ambiguous {
+                side: Side::After,
+                ..
+            }
+        ),
+        "{result:?}"
     );
 }
 
