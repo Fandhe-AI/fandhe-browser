@@ -34,7 +34,7 @@ Playwright のソースは長く引用せず、関数名と要約に留める。
 | `newContext()` | 成功（`acceptDownloads:false` 指定時。TASK-43.3d・#909 で到達）。`Target.createBrowserContext`（`disposeOnDetach:true`）と `browserContextId` 付き `Browser.setDownloadBehavior`（`deny` + `eventsEnabled:true`）が成功する（後述「段階 2b の実施結果」） | A: seq 10〜14 |
 | `newPage()` | 成功（`connectOverCDP(noDefaults:true)`・`newContext({acceptDownloads:false, viewport:null})` 指定時。TASK-43.3n・#1042 で到達を確認。後述「到達結果（TASK-43.3n）」）。`Browser.getWindowForTarget` は `-32601` のまま残るが `newPage()` は失敗しない（`Page.createIsolatedWorld` は TASK-44.6・#1217 で実装済み。評価器が無効な構成ではエラー。cli 既定〔V8〕では TASK-44.9・#1220 で有効） | A: seq 15〜41 |
 | `goto`（ローカル fixture） | 成功（TASK-44.3・TASK-44.4 で確認。後述「テスト結果レポート（TASK-44.4）」） | A |
-| `selector`（`#target`） | 失敗（TASK-44.9・#1220 の再実測で `StageTimeout` は解消し、評価コンテキスト成立後に `locator.count` が core の universal selector（`*`）未対応で失敗する。後述「再実測（TASK-44.9）」。追跡: #1237） | A |
+| `selector`（`#target`） | 失敗（TASK-44.9・#1220 の再実測で `StageTimeout` は解消。#1237 で core が `*` に対応し `locator.count` は通るようになったが、続く `locator.textContent` が `CustomEvent is not defined` で失敗する。後述「再実測（#1237）」） | A |
 
 `-32601` は未実装メソッドへ成功を捏造しない `CDP-6`・`SEC-2` の方針どおりの挙動で、バグではない。
 
@@ -631,12 +631,47 @@ TASK-43.3o（#1050）の取り込み後に再取得した同梱トレース（3 
 
 #### 扱い・未達の明示
 
-- #250 の受入基準（セレクタで要素を取得すること）は未達。追跡は #1237（universal selector の対応）。対応後に再実測して本節を更新する
+- #250 の受入基準（セレクタで要素を取得すること）は未達。universal selector の対応（#1237）後の再実測は次節
 - 残る差異（`REPAIR-3`）: main world の評価は未対応（固定文言で拒否）、`Runtime.getProperties` は未実装、評価中の DOM 変更は `NavigationResult` へ書き戻さない、イベントループ・タイマーは回さない。#1237 の対応後に他の未対応 API が出た場合は同じ手順で追跡する
 
 #### 再現手順
 
 `make test-playwright-connect`（要 node/npm/ネットワーク。CI 対象外）。`run.sh` が `--features test-support,js-v8` で `playwright_flow`（`harness = false`）をケース名の引数付きで実行し、完了マーカー行が 1 件のときだけ成功とする。
+
+### 再実測（#1237。実測 A）
+
+`CDP-2`（関連: `CORE-1`・`CORE-5`・`REPAIR-3`）・TASK-44・MS-4。core のセレクタサブセットに全称セレクタ `*` を加えた（`CompoundSelector::is_universal`。詳細度は (0,0,0)。`*|a` などの名前空間と `div*` のような不正な並びは従来どおり拒否）うえで、`selector` 段階を再実測した。
+
+#### 実測条件
+
+| 項目 | 値 |
+| ---- | -- |
+| 基準コミット | main の `4f7ef849` に #1237 の変更を載せたもの |
+| 実測日 | 2026-10-22 |
+| playwright-core | 1.63.0（出典: `scripts/versions.sh`） |
+| node | v24.21.0 |
+| エンジン / feature | V8 / `test-support,js-v8` |
+
+#### 5 段階の到達結果
+
+| 段階 | 結果 | 失敗内容 |
+| ---- | ---- | -------- |
+| `connect` | 成功 | なし |
+| `newContext` | 成功 | なし |
+| `newPage` | 成功 | なし |
+| `goto` | 成功 | なし |
+| `selector` | 失敗 | `locator.textContent: ReferenceError: CustomEvent is not defined`（call log: `waiting for locator('#target').first()`） |
+
+`stages.mjs` は `locator.count()` を先に呼んでから `locator.first().textContent()` を呼ぶ。前回失敗した `locator.count` は通過し、`*` の未対応は解消した。失敗は次の未対応 API である `CustomEvent`（js_shim にグローバルが無い）に移った。プロトコルトレースでの確定は未実施で、`CustomEvent` を Playwright の注入スクリプトが `textContent` の待機中に参照すると推定している。
+
+#### 扱い・未達の明示
+
+- #250 の受入基準（セレクタで要素を取得すること）は未達（5/5 には届いていない）。`CustomEvent` の提供（js_shim）を後続の課題として追跡する。skip・期待値の弱体化・成功フォールバックは入れていない（`CDP-6`・`SEC-2`）
+- さらに先で別の未対応 API が出る可能性がある。出た時点で同じ手順で記録する
+
+#### 再現手順
+
+`make test-playwright-connect`（前節と同じ）。
 
 ### 原則
 
