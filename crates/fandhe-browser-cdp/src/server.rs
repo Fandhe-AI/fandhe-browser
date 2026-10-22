@@ -321,6 +321,19 @@ impl std::error::Error for WsConfigError {
     }
 }
 
+/// WS の受信メッセージ上限（バイト。`CDP-7` の確定値 1 MiB。2026-10-21 のオーナー判断）。
+///
+/// バックエンド既定値の将来の変更に引きずられないよう、既定と同じ値でも明示的に設定する。
+pub(crate) const WS_MAX_MESSAGE_SIZE: usize = 1024 * 1024;
+
+/// WS の受信 1 フレームの上限（バイト。`CDP-7`。メッセージ上限と同じ値）。
+///
+/// 根拠: Playwright 1.63 が `Runtime.callFunctionOn`・`Page.addScriptToEvaluateOnNewDocument` で送る
+/// 注入スクリプトは 1 メッセージ 320,783 バイトを 1 フレームで送り、バックエンド既定の 256 KiB では
+/// 受信時に close 1009 で切断されていた（#1062・#1219）。メッセージ上限が既に 1 MiB のため、
+/// 1 接続あたりの最大確保量は増えない（DoS 観点）。超過は close 1009 のまま。
+pub(crate) const WS_MAX_FRAME_SIZE: usize = WS_MAX_MESSAGE_SIZE;
+
 /// `/devtools/browser/{id}` の WebSocket 受け口設定（`CDP-1`・TASK-41.4・MS-3）。
 ///
 /// cli（TASK-41.5）が [`endpoints`] の結果を `Server::new().handler(router)
@@ -328,7 +341,7 @@ impl std::error::Error for WsConfigError {
 /// （Host・Origin・ブラウザ ID。[`crate::ws`]）は本設定のハンドシェイク検査で行う。
 /// メッセージハンドラは [`crate::protocol`] のディスパッチャへ委譲する（TASK-42.1）。
 /// bind・loopback 限定（`SEC-4`）・同時接続数上限は cli / core 側の責務。
-/// メッセージ・フレームサイズ上限は core の既定値（DoS 安全側）のまま使う。
+/// 受信メッセージ・フレームの上限は [`WS_MAX_MESSAGE_SIZE`]・[`WS_MAX_FRAME_SIZE`]（`CDP-7`）。
 pub(crate) fn browser_websocket_config(
     state: &Arc<CdpState>,
 ) -> Result<WebSocketConfig, WsConfigError> {
@@ -348,6 +361,8 @@ pub(crate) fn browser_websocket_config_with(
         .map_err(WsConfigError::PathPattern)?
         .with_ping_interval(WS_PING_INTERVAL, WS_PONG_TIMEOUT)
         .map_err(WsConfigError::PingInterval)?
+        .with_max_message_size(WS_MAX_MESSAGE_SIZE)
+        .with_max_frame_size(WS_MAX_FRAME_SIZE)
         .with_handshake_check(move |ctx: &WsHandshakeContext<'_>| {
             ws::check_handshake(
                 ctx.header("host"),
@@ -405,5 +420,13 @@ mod tests {
     fn cdp1_cdp_state_is_send_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<CdpState>();
+    }
+
+    /// `CDP-7`: WS の受信上限はメッセージ・フレームとも 1 MiB（1,048,576 バイト）。
+    #[test]
+    fn cdp7_ws_receive_limits_are_one_mib() {
+        // 実際の受信挙動（設定が WS に効くこと）は tests/devtools_browser.rs の結合テストで検証する。
+        assert_eq!(WS_MAX_MESSAGE_SIZE, 1_048_576);
+        assert_eq!(WS_MAX_FRAME_SIZE, 1_048_576);
     }
 }

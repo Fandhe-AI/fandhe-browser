@@ -8,7 +8,7 @@
 //! [`contexts_cleared_event`]）・`Page.createIsolatedWorld` ハンドラを持つ。評価系の
 //! `Runtime.evaluate`・`Runtime.releaseObject`（TASK-44.7・#1218）は子モジュール `evaluate` が持ち、
 //! contextId の照合（[`ExecutionContextTable::resolve`]）・評価ヘルパーの注入記録（epoch）・失効を本表が提供する。
-//! `Runtime.callFunctionOn`・`awaitPromise` は #1219 の範囲。
+//! `Runtime.callFunctionOn` と `awaitPromise`（TASK-44.8・#1219）も同じ子モジュールが持つ。
 //!
 //! # 構成と呼び出し元
 //!
@@ -52,7 +52,9 @@ use serde_json::{Value, json};
 
 mod evaluate;
 
-pub(crate) use evaluate::{EvalLimits, RuntimeEvaluate, RuntimeReleaseObject};
+pub(crate) use evaluate::{
+    EvalLimits, RuntimeCallFunctionOn, RuntimeEvaluate, RuntimeReleaseObject,
+};
 
 use crate::page::main_frame_id;
 use crate::protocol::{

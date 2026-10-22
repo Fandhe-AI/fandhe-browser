@@ -138,6 +138,18 @@ impl CdpError {
     pub const TOO_MANY_REMOTE_OBJECTS: Self = Self::new(-32000, "too many remote objects");
     /// `objectId` が指す値が無い（未知・他セッション・解放済みを区別しない。`Runtime.releaseObject`・#1218）。
     pub const REMOTE_OBJECT_NOT_FOUND: Self = Self::new(-32000, "remote object not found");
+    /// `awaitPromise` で microtask checkpoint の後も Promise が未決着（成功を装わない。`CDP-6`・`REPAIR-3`・#1219）。
+    pub const PROMISE_NOT_SETTLED: Self = Self::new(-32000, "promise was not settled");
+    /// `Runtime.callFunctionOn` の `arguments` が上限（64 件）を超えた（`CDP-7`・`SEC-2`・#1219）。
+    pub const TOO_MANY_CALL_ARGUMENTS: Self = Self::new(-32000, "too many call arguments");
+    /// `Runtime.callFunctionOn` の引数の `objectId` が `this` と別の実行コンテキストのもの（#1219）。
+    pub const ARGUMENT_CONTEXT_MISMATCH: Self =
+        Self::new(-32000, "argument belongs to another execution context");
+    /// `Runtime.callFunctionOn` の `functionDeclaration` が関数に評価されなかった（#1219）。
+    pub const NOT_A_FUNCTION: Self = Self::new(
+        -32000,
+        "function declaration did not evaluate to a function",
+    );
     /// `returnByValue` で値にできない（循環参照・関数・symbol 等。`REPAIR-3`・#1218）。
     pub const VALUE_NOT_SERIALIZABLE: Self =
         Self::new(-32000, "value could not be returned by value");
@@ -504,6 +516,12 @@ pub(crate) fn builtin_handlers_with(fetch: FetchOptions) -> Result<HandlerTable,
         (
             "Runtime.releaseObject",
             Box::new(crate::runtime::RuntimeReleaseObject),
+        ),
+        (
+            "Runtime.callFunctionOn",
+            Box::new(crate::runtime::RuntimeCallFunctionOn::new(
+                crate::runtime::EvalLimits::default(),
+            )),
         ),
         ("Log.enable", Box::new(crate::playwright_compat::LogEnable)),
         (

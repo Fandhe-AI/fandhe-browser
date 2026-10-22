@@ -52,7 +52,7 @@ harness = false
 required-features = ["js-boa", "test-support"]
 
 # TASK-44.7・Issue #1218・`CDP-2`/`CDP-6`/`CDP-7`/`SEC-2`/`REPAIR-3`: `Runtime.evaluate`・
-# `Runtime.releaseObject` を CDP の入口から実エンジンで検証する結合テスト（プリミティブ・RemoteObject・
+# `Runtime.releaseObject`・`Runtime.callFunctionOn`・`awaitPromise`（TASK-44.8・#1219）を CDP の入口から実エンジンで検証する結合テスト（プリミティブ・RemoteObject・
 # 例外・ハンドル上限・結果サイズ・タイムアウト・インジェクション対策）。ケース本体は
 # `tests/support/runtime_evaluate_cases.rs`（エンジン共通）。JS ワーカー役を兼ねるため独自 `main`。
 [[test]]

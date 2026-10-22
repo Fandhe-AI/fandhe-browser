@@ -1,11 +1,15 @@
-// Runtime.evaluate / Runtime.releaseObject 用の評価ヘルパー（fandhe-browser-cdp。TASK-44.7・#1218・
-// `CDP-2`・`CDP-6`・`SEC-2`・`REPAIR-3`）。`runtime/evaluate.rs` が `include_str!` で取り込み、
+// Runtime.evaluate / Runtime.releaseObject / Runtime.callFunctionOn 用の評価ヘルパー（fandhe-browser-cdp。
+// TASK-44.7・#1218・TASK-44.8・#1219・`CDP-2`・`CDP-6`・`SEC-2`・`REPAIR-3`）。
+// `runtime/evaluate.rs` が `include_str!` で取り込み、
 // 評価コンテキストごとに 1 回だけ「(本ファイルの関数式)(設定の JSON 文字列リテラル)」として評価する。
 // ES2015 の範囲（V8 と boa で同じソースを使う。Proxy は使わない）。
 //
 // 役割: ユーザー式をグローバルスコープで評価し（間接 eval）、結果を CDP RemoteObject の素材へ整え、
 // objectId の元になるハンドル表を JS の中で保持する。戻り値は常に JSON 文字列（封筒）で、Rust 側が
 // 許可リストで検証して組み立て直す。式や設定値を JS ソースへ連結しない（呼び出しは JSON.parse 経由）。
+// awaitPromise: Promise の結果は「待機スロット」に記録し、Rust 側が別の評価で checkpoint（microtask の
+// drain）→ settle（スロットの読み出しと削除）を呼んで決着させる。反応ジョブは JS の呼び出しフレームが
+// 残っている間は走らないため、1 回の評価の中では待たない。
 (function (cfgText) {
   "use strict";
   var G = globalThis;
@@ -18,6 +22,11 @@
   var mapSet = MapCtor.prototype.set;
   var mapDelete = MapCtor.prototype.delete;
   var mapHas = MapCtor.prototype.has;
+  var mapGet = MapCtor.prototype.get;
+  var promiseThen = Promise.prototype.then;
+  var BigIntCtor = typeof BigInt === "function" ? BigInt : null;
+  // shim の microtask キューを流す関数（checkpoint が呼ぶ。無ければ checkpoint は何もしない）。
+  var runMicrotasks = typeof G.__fandheRunMicrotasks === "function" ? G.__fandheRunMicrotasks : null;
   var objectIs = Object.is;
   var objToString = Object.prototype.toString;
   var isArray = Array.isArray;
@@ -39,12 +48,17 @@
   var maxResultLength = cfg.maxResultLength;
   var maxDescriptionLength = cfg.maxDescriptionLength;
   var maxUnserializableLength = cfg.maxUnserializableLength;
+  var maxAwaiting = cfg.maxAwaiting;
   var MAX_HANDLE = 9007199254740991;
 
   var handles = new MapCtor();
   var handleCount = 0;
   var nextHandle = 1;
   var nextExceptionId = 1;
+  // 待機スロット（awaitPromise 用）。決着・未決着のどちらでも settle / dropSlot で必ず削除する。
+  var slots = new MapCtor();
+  var slotCount = 0;
+  var nextSlot = 1;
 
   // 内部の制御用に投げる固有の値（ユーザーコードからは見えない）。
   var HANDLE_LIMIT = {};
@@ -333,6 +347,112 @@
     return text;
   }
 
+  // 値（または例外）を封筒の文字列へ整える。払い出したハンドルの範囲は呼び出し側が commit で確定する。
+  function render(v, threw, returnByValue) {
+    var out;
+    if (threw) {
+      var id = nextExceptionId;
+      nextExceptionId = id + 1;
+      out = finish(mk({ kind: "exception", exceptionId: id, exception: remote(v) }));
+    } else if (returnByValue === true) {
+      out = byValue(v);
+      if (out.length > maxResultLength) throw TOO_LARGE;
+    } else {
+      out = finish(mk({ kind: "value", result: remote(v) }));
+    }
+    return wellFormed(out);
+  }
+
+  function commit(out) {
+    lastFrom = evalStart;
+    lastTo = nextHandle;
+    evalStart = nextHandle;
+    return out;
+  }
+
+  // 失敗時: この評価で払い出したハンドルを巻き戻し、制御用の値を封筒にする。
+  function failure(e) {
+    rollback();
+    lastFrom = nextHandle;
+    lastTo = nextHandle;
+    if (e === HANDLE_LIMIT) return '{"kind":"handleLimit"}';
+    if (e === NOT_SERIALIZABLE) return '{"kind":"notSerializable"}';
+    if (e === TOO_LARGE) return '{"kind":"resultTooLarge"}';
+    return INTERNAL_ERROR;
+  }
+
+  // v が Promise か（組込みの brand を使う判定。then は呼ばない）。
+  // 識別と反応登録の失敗を分けるための判定で、登録の例外を「非 Promise」の根拠にしない（`REPAIR-3`）。
+  function isPromiseValue(v) {
+    try {
+      return tagOf(v) === "Promise" && v instanceof Promise;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  // 反応登録が投げた例外（Promise と判定できたのに then が失敗したとき。constructor・Symbol.species の
+  // 解決が投げる場合など）。呼び出し側が exceptionDetails 付きの例外封筒にする。
+  var thenError;
+  var THEN_FAILED = -1;
+
+  // v が native Promise なら待機スロットを払い出してその番号を返す。Promise でなければ 0。
+  // Promise と判定できたのに反応登録が失敗したら thenError に記録して THEN_FAILED を返す。
+  // 反応は記録だけを行い、遅れて決着してもスロットが無ければ何も復活させない（レコードは閉じ込める）。
+  function track(v) {
+    var rec = objCreate(null);
+    rec.state = 0;
+    rec.value = undefined;
+    try {
+      apply(promiseThen, v, [
+        function (x) {
+          if (rec.state === 0) {
+            rec.state = 1;
+            rec.value = x;
+          }
+        },
+        function (e) {
+          if (rec.state === 0) {
+            rec.state = 2;
+            rec.value = e;
+          }
+        }
+      ]);
+    } catch (e) {
+      if (!isPromiseValue(v)) return 0;
+      thenError = e;
+      return THEN_FAILED;
+    }
+    if (slotCount >= maxAwaiting || nextSlot > MAX_HANDLE) throw HANDLE_LIMIT;
+    var n = nextSlot;
+    nextSlot = n + 1;
+    slotCount = slotCount + 1;
+    apply(mapSet, slots, [n, rec]);
+    return n;
+  }
+
+  function dropSlotNow(n) {
+    if (apply(mapDelete, slots, [n]) === true) {
+      slotCount = slotCount - 1;
+    }
+  }
+
+  // 結果が awaitPromise 対象の Promise なら待機中の封筒、そうでなければ通常の封筒。
+  function finishCall(v, p) {
+    if (p.awaitPromise === true) {
+      var n = track(v);
+      if (n === THEN_FAILED) {
+        var te = thenError;
+        thenError = undefined;
+        return commit(render(te, true, false));
+      }
+      if (n > 0) {
+        return commit('{"kind":"awaiting","slot":' + StringCtor(n) + "}");
+      }
+    }
+    return commit(render(v, false, p.returnByValue));
+  }
+
   function evaluate(text) {
     evalStart = nextHandle;
     try {
@@ -346,29 +466,124 @@
         v = e;
         threw = true;
       }
-      var out;
       if (threw) {
-        var id = nextExceptionId;
-        nextExceptionId = id + 1;
-        out = finish(mk({ kind: "exception", exceptionId: id, exception: remote(v) }));
-      } else if (p.returnByValue === true) {
-        out = byValue(v);
-        if (out.length > maxResultLength) throw TOO_LARGE;
-      } else {
-        out = finish(mk({ kind: "value", result: remote(v) }));
+        return commit(render(v, true, false));
       }
-      out = wellFormed(out);
-      lastFrom = evalStart;
-      lastTo = nextHandle;
-      evalStart = nextHandle;
-      return out;
+      return finishCall(v, p);
     } catch (e) {
-      rollback();
-      lastFrom = nextHandle;
-      lastTo = nextHandle;
-      if (e === HANDLE_LIMIT) return '{"kind":"handleLimit"}';
-      if (e === NOT_SERIALIZABLE) return '{"kind":"notSerializable"}';
-      if (e === TOO_LARGE) return '{"kind":"resultTooLarge"}';
+      return failure(e);
+    }
+  }
+
+  var NOT_FOUND = '{"kind":"objectNotFound"}';
+  var NOT_FUNCTION = '{"kind":"notFunction"}';
+
+  // 引数のハンドルが無いときに投げる固有の印（ユーザーコードからは見えない）。
+  var MISSING = {};
+  // 引数 1 件を JS の値にする（k: "v" 値・"u" unserializableValue・"h" ハンドル・それ以外は undefined）。
+  function argValue(a) {
+    var k = a.k;
+    if (k === "v") return a.value;
+    if (k === "u") {
+      var t = a.text;
+      if (t === "NaN") return NaN;
+      if (t === "Infinity") return Infinity;
+      if (t === "-Infinity") return -Infinity;
+      if (t === "-0") return -0;
+      if (BigIntCtor === null) throw MISSING;
+      var neg = apply(strSlice, t, [0, 1]) === "-";
+      var digits = apply(strSlice, t, [neg ? 1 : 0, t.length - 1]);
+      var b = apply(BigIntCtor, undefined, [digits]);
+      return neg ? -b : b;
+    }
+    if (k === "h") {
+      if (apply(mapHas, handles, [a.handle]) !== true) throw MISSING;
+      return apply(mapGet, handles, [a.handle]);
+    }
+    return undefined;
+  }
+
+  // Runtime.callFunctionOn。this と引数のハンドルはユーザーコードを動かす前にすべて解決する。
+  function callFunctionOn(text) {
+    evalStart = nextHandle;
+    try {
+      var p = jsonParse(text);
+      if (p.epoch !== epoch) return RESET;
+      if (apply(mapHas, handles, [p.thisHandle]) !== true) return NOT_FOUND;
+      var thisValue = apply(mapGet, handles, [p.thisHandle]);
+      // 引数リストは null prototype の array-like にする（Array.prototype の setter の影響を避ける）。
+      var list = objCreate(null);
+      var n = p.args.length;
+      try {
+        for (var i = 0; i < n; i++) {
+          list[i] = argValue(p.args[i]);
+        }
+      } catch (e) {
+        if (e === MISSING) return NOT_FOUND;
+        throw e;
+      }
+      list.length = n;
+      var fn;
+      try {
+        fn = indirectEval("(" + p.functionDeclaration + "\n)");
+      } catch (e) {
+        return commit(render(e, true, false));
+      }
+      if (typeof fn !== "function") return NOT_FUNCTION;
+      var v;
+      try {
+        v = apply(fn, thisValue, list);
+      } catch (e) {
+        return commit(render(e, true, false));
+      }
+      return finishCall(v, p);
+    } catch (e) {
+      return failure(e);
+    }
+  }
+
+  // microtask を流す（awaitPromise の 1 段目。Rust 側は評価を分けて呼ぶ）。
+  function checkpoint(text) {
+    try {
+      var p = jsonParse(text);
+      if (p.epoch !== epoch) return RESET;
+      if (runMicrotasks !== null) {
+        try {
+          apply(runMicrotasks, undefined, []);
+        } catch (e) {
+          // shim のコールバックの例外は決着の可否に影響しない。
+        }
+      }
+      return '{"kind":"checkpointed"}';
+    } catch (e) {
+      return INTERNAL_ERROR;
+    }
+  }
+
+  // スロットを読んで必ず削除し、決着していれば封筒にする（未決着は notSettled）。
+  function settle(text) {
+    evalStart = nextHandle;
+    try {
+      var p = jsonParse(text);
+      if (p.epoch !== epoch) return RESET;
+      if (apply(mapHas, slots, [p.slot]) !== true) return INTERNAL_ERROR;
+      var rec = apply(mapGet, slots, [p.slot]);
+      dropSlotNow(p.slot);
+      if (rec.state === 0) return '{"kind":"notSettled"}';
+      return commit(render(rec.value, rec.state === 2, p.returnByValue));
+    } catch (e) {
+      return failure(e);
+    }
+  }
+
+  // 決着を待てなかった場合にスロットだけを捨てる（冪等）。
+  function dropSlot(text) {
+    try {
+      var p = jsonParse(text);
+      if (p.epoch !== epoch) return RESET;
+      dropSlotNow(p.slot);
+      return '{"kind":"checkpointed"}';
+    } catch (e) {
       return INTERNAL_ERROR;
     }
   }
@@ -411,7 +626,16 @@
   if (typeof __fandheCdpHelper === "object" && __fandheCdpHelper !== null) {
     return '{"kind":"installed","epoch":' + StringCtor(__fandheCdpHelper.epoch) + "}";
   }
-  var api = freeze({ epoch: epoch, evaluate: evaluate, release: release, discard: discard });
+  var api = freeze({
+    epoch: epoch,
+    evaluate: evaluate,
+    release: release,
+    discard: discard,
+    callFunctionOn: callFunctionOn,
+    checkpoint: checkpoint,
+    settle: settle,
+    dropSlot: dropSlot
+  });
   defineProperty(G, "__fandheCdpHelper", {
     value: api,
     writable: false,
