@@ -9,6 +9,7 @@ spec 対応: TASK-71.1・TASK-71.2 / MS-6 / `MEAS-4`（関連 `COMPAT-4`・`JS-2
 | #311（TASK-71.2） | 22 タスクの実行スクリプト `run_core.sh`（本 README「run_core.sh」節） |
 | #312（TASK-71.3） | Chromium 実測との突合・`results/matrix.json` 生成（本 README「make_matrix.sh」節。生成スクリプトに加え、実測から生成した `results/matrix.json` をコミット済みで、回帰ゲートは有効。#920） |
 | #315（TASK-72.1） | 類型別動作率集計 `aggregate_by_type.sh`（本 README「aggregate_by_type.sh」節） |
+| #316（TASK-72.2） | 類型別の達成判定レポート `type-report.md`（static・spa・form の 70% 達成確認） |
 | #313（TASK-71.4） | 測定レポート `REPORT.md`（JS 有効の再計測と b5・d2・d3 の解消確認） |
 
 ## ファイル
@@ -19,6 +20,7 @@ spec 対応: TASK-71.1・TASK-71.2 / MS-6 / `MEAS-4`（関連 `COMPAT-4`・`JS-2
 | `lib.sh` | 共通関数 `resolve_bin`（実行対象バイナリの解決と検証）・`sha256_of` |
 | `make_matrix.sh` | core 実測と Chromium 参照データを `id` で突合し動作率マトリクスを生成（TASK-71.3） |
 | `aggregate_by_type.sh` | `results/matrix.json` を類型 (a)〜(e) 別に集計し成功数・全体数・動作率を出力（TASK-72.1。判定はしない） |
+| `type-report.md` | 類型別動作率の達成判定と失敗の原因分類（TASK-72.2） |
 | `reference/chromium_results.json` | PoC-9 の Chromium（Playwright）実測の転記（22 件。出所は「make_matrix.sh」節） |
 | `access_check.sh` | tasks.json の検証と、22 サイトへの到達可否の記録（curl） |
 | `run_core.sh` | 22 タスクを `fandhe-browser` の CDP サーバーで実行し結果を JSONL へ記録（TASK-71.2） |
