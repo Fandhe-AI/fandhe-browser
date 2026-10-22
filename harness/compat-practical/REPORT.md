@@ -1444,6 +1444,40 @@ spec 対応: TASK-71 / MS-6 / `COMPAT-1`・`JS-5`・`JS-6`・`SEC-2`・`REPAIR-3
 
 - 結果ファイルはコミットしていない。結論・全体動作率・マトリクスは書き換えない（#919・#920 の担当）。
 
+## react.dev（b1）の childNodes・firstChild・nextSibling 補完後の再測定（#1241）
+
+spec 対応: TASK-71 / MS-6 / `COMPAT-1`・`COMPAT-4`・`JS-5`・`JS-6`・`SEC-2`・`REPAIR-3`。関連 Issue: #920・#1236。
+
+### 実装の要点
+
+- 子・兄弟を辿る op（`firstChild`・`lastChild`・`nextSibling`・`previousSibling`・`childNodes`）と、ラッパー型を選ぶ `nodeType`、`DocumentType.name` 用の `doctypeName` を追加した（`dom_bridge.rs`。読み取り専用）。`JS-5`
+- `dom.js` に `CharacterData`・`Comment`・`DocumentType` を足し（`Text` は `CharacterData` を継承）、Text・Comment・Doctype を含む Node 単位で `childNodes`・`firstChild`・`lastChild`・`nextSibling`・`previousSibling`・`hasChildNodes`・`nodeValue`・`data`・`length` を DOM 標準どおりに公開した
+- 簡略版の差異（`REPAIR-3`）: `childNodes` は live でない静的な Array（`item()` つき）で、呼ぶたびに別の配列になる。ProcessingInstruction・DocumentFragment のラッパーは無く、当たると `TypeError`（HTML パースでは到達しない）。`publicId`・`systemId`・`splitText` 等は未実装
+- 兄弟の探索は O(親の子数) のため、広い兄弟列を辿るページ JS は op 数の上限（`JS-6`）で止まる
+- 識別面（`navigator.platform` 等）は増やしていない。`SEC-2`
+
+### 結果（v8・module 有効・2 回）
+
+| 項目 | 値 |
+| ---- | -- |
+| run_core.sh の b1 | `success=true`（2 回とも。`output_sample` は `React`） |
+| probe の `h1_initial` / `h1_after` | 2 / 2（#1236 時点は 2 / 0） |
+| probe の script 結果 | 13 件が成功、1 件が例外（`read_property`・`includes`）、2 件が skip |
+| `abort` | `timer_fires`（繰り返しタイマーが発火上限の 1000 回に達した。DOM の確定には影響しない） |
+
+- 解消した例外: React error #418（ハイドレーション不一致）と、main chunk の `length` の undefined 参照。クライアント描画への切り替えが起きなくなり、`h1` が残る。
+- 残った例外: テーマ script の `navigator.platform` の `includes` 読み取り（`undefined`）。識別面を増やすため追加しない（`SEC-2`。判断事項。b1 の成否には影響しなかった）。
+- 本 Issue での追加の補修は無し。
+
+### 制約
+
+- 単一環境（Linux）・単一時点。URL・script 本文・stack 全文は転記していない
+- 結果ファイルはコミットしていない。matrix・全体動作率・結論は書き換えていない（#919・#920 の担当）。spa 類型の再集計は #920 で行う
+
+### 再現手順
+
+`cargo build --release -p fandhe-browser-core --features js-v8 --example compat_page_script_probe` と `cargo build --release -p fandhe-browser-cli` のあと、probe を `--target b1=https://react.dev --modules` で実行し、`run_core.sh --page-js v8 --page-modules` は b1 のみのタスク定義で 2 回実行する。
+
 ## b5（Trello）の原因特定（#964）
 
 spec 対応: TASK-71 / MS-6 / `MEAS-4`・`COMPAT-1`・`COMPAT-4`・`JS-4`・`JS-6`・`SEC-2`・`REPAIR-3`。関連 Issue: #918・#758・#309。
