@@ -200,6 +200,19 @@ fn unrunnable_json(reftest: &[&str], other: &[&str]) -> String {
          {{\"reason\":\"reftest-comparison-not-implemented\",\"basis\":\"confirmed\",\
          \"harness\":\"reftest\",\"description\":\"reftest needs a rendering comparison against a \
          reference page; this harness does not implement it\",\"count\":{},\"files\":[{}]}},\
+         {{\"reason\":\"crashtest-requires-rendering\",\"basis\":\"confirmed\",\
+         \"harness\":\"other\",\"description\":\"crashtest passes only if loading and layout complete \
+         without a crash; this harness has no layout or rendering\",\"count\":0,\"files\":[]}},\
+         {{\"reason\":\"reftest-link-comparison-not-implemented\",\"basis\":\"confirmed\",\
+         \"harness\":\"other\",\"description\":\"file declares a rel=match reference (reftest by \
+         content) although labeled other; this harness does not implement rendering comparison\",\
+         \"count\":0,\"files\":[]}},\
+         {{\"reason\":\"visual-test-requires-human-judgment\",\"basis\":\"confirmed\",\
+         \"harness\":\"other\",\"description\":\"visual test judged by a human comparing rendered \
+         output; not automatable by this harness\",\"count\":0,\"files\":[]}},\
+         {{\"reason\":\"manual-test-requires-interaction\",\"basis\":\"confirmed\",\
+         \"harness\":\"other\",\"description\":\"manual test requires user interaction and visual \
+         judgment; not automatable\",\"count\":0,\"files\":[]}},\
          {{\"reason\":\"unverified-likely-unrunnable\",\"basis\":\"speculative\",\
          \"harness\":\"other\",\"description\":\"content not verified; likely unrunnable \
          (speculative)\",\"count\":{},\"files\":[{}]}}]}}",

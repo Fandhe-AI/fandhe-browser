@@ -22,13 +22,17 @@
 //! - reftest: `match`/`mismatch` は同一ブラウザーで描画して比較すれば原理上は実行できる。
 //!   実行できないのは本ハーネスが描画比較（ピクセル比較等）を実装していないという実装上の制約のため
 //!   （ハーネスの機能範囲から確認できる事実。[`Basis::Confirmed`]。第 2 エンジンが要るとは主張しない）
-//! - other: ファイル内容を確かめておらず、実行できない可能性が高いという推測
-//!   （[`Basis::Speculative`]）。推測を確認済みに見せかけない（REPAIR-3）
+//! - other のうち実サブセットの 17 件: 固定リビジョンのファイル内容を確認済み（#811）。
+//!   `testharness.js` を読み込むものは 0 件で、crashtest・内容上の reftest・visual・manual のいずれか
+//!   （[`Basis::Confirmed`]。静的表 `OTHER_CLASSIFICATION` に判定根拠を残す）
+//! - other のうち表に無いファイル: 内容未確認のため、実行できない可能性が高いという推測のまま
+//!   （[`Basis::Speculative`]。安全側の受け皿。実サブセットでは 0 件）。推測を確認済みに見せかけない（REPAIR-3）
 //!
 //! # 方針との関係
 //!
-//! ここで記録するのは理由だけ。対象外にする方針の承認は人間担当の #279（TASK-101.h1）が
-//! 決めるため、「excluded」「approved」など方針が決まったように読める語は使わない。
+//! ここで記録するのは理由と根拠だけ。reftest・other を実行対象外にする方針は人間担当の #279
+//! （TASK-101.h1）が 2026-10-10 に承認済みで、other 17 件の確認と分類は #811 で行った。
+//! ランナーの `Skipped` 判定は harness ラベル単位のままで、分母（`executed`）は分類で変わらない。
 //!
 //! 入力は `wpt-subset.json` の `harness` 列挙文字列と `file` の組。JSON パーサーを
 //! 持たない（依存最小）ので、ライブラリは JSON を読まず手書きで書き出すだけにする。
@@ -71,21 +75,38 @@ impl Basis {
 pub enum UnrunnableReason {
     /// reftest: 本ハーネスが描画比較を実装していない（実装上の制約。確認済み）。
     ReftestComparisonNotImplemented,
-    /// other: 内容未検証で、実行できない可能性が高い（推測）。
+    /// other の crashtest: 読み込みとレイアウト完了でクラッシュしないことが判定条件で、
+    /// レイアウト・描画エンジンが要る（確認済み。#811）。
+    CrashtestRequiresRendering,
+    /// other だが内容上は `rel=match` を持つ reftest: 描画比較が要る（確認済み。#811）。
+    ReftestLinkComparisonNotImplemented,
+    /// other の visual: 描画結果を人が見て判定する（確認済み。#811）。
+    VisualTestRequiresHumanJudgment,
+    /// other の manual: 人の操作と目視が要る（確認済み。#811）。
+    ManualTestRequiresInteraction,
+    /// other のうち表に無いもの: 内容未検証で、実行できない可能性が高い（推測。受け皿）。
     UnverifiedLikelyUnrunnable,
 }
 
 impl UnrunnableReason {
     /// 出力順（宣言順）で固定した全理由。
-    const ALL: [UnrunnableReason; 2] = [
+    const ALL: [UnrunnableReason; 6] = [
         UnrunnableReason::ReftestComparisonNotImplemented,
+        UnrunnableReason::CrashtestRequiresRendering,
+        UnrunnableReason::ReftestLinkComparisonNotImplemented,
+        UnrunnableReason::VisualTestRequiresHumanJudgment,
+        UnrunnableReason::ManualTestRequiresInteraction,
         UnrunnableReason::UnverifiedLikelyUnrunnable,
     ];
 
     fn index(&self) -> usize {
         match self {
             UnrunnableReason::ReftestComparisonNotImplemented => 0,
-            UnrunnableReason::UnverifiedLikelyUnrunnable => 1,
+            UnrunnableReason::CrashtestRequiresRendering => 1,
+            UnrunnableReason::ReftestLinkComparisonNotImplemented => 2,
+            UnrunnableReason::VisualTestRequiresHumanJudgment => 3,
+            UnrunnableReason::ManualTestRequiresInteraction => 4,
+            UnrunnableReason::UnverifiedLikelyUnrunnable => 5,
         }
     }
 
@@ -95,6 +116,14 @@ impl UnrunnableReason {
             UnrunnableReason::ReftestComparisonNotImplemented => {
                 "reftest-comparison-not-implemented"
             }
+            UnrunnableReason::CrashtestRequiresRendering => "crashtest-requires-rendering",
+            UnrunnableReason::ReftestLinkComparisonNotImplemented => {
+                "reftest-link-comparison-not-implemented"
+            }
+            UnrunnableReason::VisualTestRequiresHumanJudgment => {
+                "visual-test-requires-human-judgment"
+            }
+            UnrunnableReason::ManualTestRequiresInteraction => "manual-test-requires-interaction",
             UnrunnableReason::UnverifiedLikelyUnrunnable => "unverified-likely-unrunnable",
         }
     }
@@ -102,8 +131,12 @@ impl UnrunnableReason {
     /// 理由の確度。
     pub fn basis(&self) -> Basis {
         match self {
-            UnrunnableReason::ReftestComparisonNotImplemented => Basis::Confirmed,
             UnrunnableReason::UnverifiedLikelyUnrunnable => Basis::Speculative,
+            UnrunnableReason::ReftestComparisonNotImplemented
+            | UnrunnableReason::CrashtestRequiresRendering
+            | UnrunnableReason::ReftestLinkComparisonNotImplemented
+            | UnrunnableReason::VisualTestRequiresHumanJudgment
+            | UnrunnableReason::ManualTestRequiresInteraction => Basis::Confirmed,
         }
     }
 
@@ -111,7 +144,12 @@ impl UnrunnableReason {
     pub fn harness_label(&self) -> &'static str {
         match self {
             UnrunnableReason::ReftestComparisonNotImplemented => "reftest",
-            UnrunnableReason::UnverifiedLikelyUnrunnable => "other",
+            // 内容上の reftest 6 件も定義上は other のため、reftest とは報告しない。
+            UnrunnableReason::CrashtestRequiresRendering
+            | UnrunnableReason::ReftestLinkComparisonNotImplemented
+            | UnrunnableReason::VisualTestRequiresHumanJudgment
+            | UnrunnableReason::ManualTestRequiresInteraction
+            | UnrunnableReason::UnverifiedLikelyUnrunnable => "other",
         }
     }
 
@@ -120,6 +158,18 @@ impl UnrunnableReason {
         match self {
             UnrunnableReason::ReftestComparisonNotImplemented => {
                 "reftest needs a rendering comparison against a reference page; this harness does not implement it"
+            }
+            UnrunnableReason::CrashtestRequiresRendering => {
+                "crashtest passes only if loading and layout complete without a crash; this harness has no layout or rendering"
+            }
+            UnrunnableReason::ReftestLinkComparisonNotImplemented => {
+                "file declares a rel=match reference (reftest by content) although labeled other; this harness does not implement rendering comparison"
+            }
+            UnrunnableReason::VisualTestRequiresHumanJudgment => {
+                "visual test judged by a human comparing rendered output; not automatable by this harness"
+            }
+            UnrunnableReason::ManualTestRequiresInteraction => {
+                "manual test requires user interaction and visual judgment; not automatable"
             }
             UnrunnableReason::UnverifiedLikelyUnrunnable => {
                 "content not verified; likely unrunnable (speculative)"
@@ -197,13 +247,117 @@ impl fmt::Display for ReportError {
 
 impl std::error::Error for ReportError {}
 
-/// harness ラベルを実行不能理由へ分類する。testharness は実行対象なので `None`。
-/// 未知のラベルは `Err`（fail-closed）。
-pub fn classify_unrunnable(harness_label: &str) -> Result<Option<UnrunnableReason>, ReportError> {
+/// 実サブセットの other 17 件の確定分類（#811・TASK-101・`PLUG-10`）。パスの昇順。
+///
+/// 固定リビジョン（`wpt-subset.json` の `source.wptRevision`）のファイル内容を読んで決めた。
+/// 17 件とも `testharness.js` を読み込まないため、本ハーネス（DOM・レイアウト・描画なし）では
+/// 実行できない。テストコードは転記せず、根拠だけを 1 行で残す。定義との過不足は
+/// ユニットテストが検出する。
+const OTHER_CLASSIFICATION: [(&str, UnrunnableReason); 17] = [
+    // crashtest: Web Animations・dialog の ::backdrop・フレーム待ちを使うレイアウトと描画。
+    (
+        "css/css-backgrounds/animations/background-color-animation-backdrop-infinite-duration-crash.html",
+        UnrunnableReason::CrashtestRequiresRendering,
+    ),
+    // crashtest: CSS animation（system color Field）の描画。
+    (
+        "css/css-backgrounds/animations/background-color-animation-field-crash.html",
+        UnrunnableReason::CrashtestRequiresRendering,
+    ),
+    // crashtest: CSS animation・opacity・小数高さの描画。
+    (
+        "css/css-backgrounds/animations/background-color-animation-non-empty-no-draw-crash.html",
+        UnrunnableReason::CrashtestRequiresRendering,
+    ),
+    // crashtest: display: contents と table-cell の再レイアウト。
+    (
+        "css/css-display/display-contents-001-crash.html",
+        UnrunnableReason::CrashtestRequiresRendering,
+    ),
+    // visual: match リンクなし。grid レイアウトとフォント描画を目視で比べる。
+    (
+        "css/css-grid/abspos/absolute-positioning-grid-container-parent-002.html",
+        UnrunnableReason::VisualTestRequiresHumanJudgment,
+    ),
+    // crashtest: flex・grid・abspos の入れ子のレイアウト（JS なし）。
+    (
+        "css/css-grid/abspos/abspos-in-flexbox-in-grid-crash.html",
+        UnrunnableReason::CrashtestRequiresRendering,
+    ),
+    // crashtest: requestAnimationFrame・::scroll-marker・content-visibility。
+    (
+        "css/css-overflow/chrome-480554290-crash.html",
+        UnrunnableReason::CrashtestRequiresRendering,
+    ),
+    // crashtest: scroll-snap と巨大寸法のレイアウト（JS なし）。
+    (
+        "css/css-scroll-snap/crashtests/fractional-covering-area-crash.html",
+        UnrunnableReason::CrashtestRequiresRendering,
+    ),
+    // crashtest: onload・document.all・DOM 変更・行分割レイアウト。
+    (
+        "css/css-text/altering-dom-crash.html",
+        UnrunnableReason::CrashtestRequiresRendering,
+    ),
+    // 内容上の reftest: rel=match・woff の合字シェイピング。
+    (
+        "css/css-text/boundary-shaping/boundary-shaping-001.html",
+        UnrunnableReason::ReftestLinkComparisonNotImplemented,
+    ),
+    // 内容上の reftest: 同上。
+    (
+        "css/css-text/boundary-shaping/boundary-shaping-002.html",
+        UnrunnableReason::ReftestLinkComparisonNotImplemented,
+    ),
+    // 内容上の reftest: 同上。
+    (
+        "css/css-text/boundary-shaping/boundary-shaping-003.html",
+        UnrunnableReason::ReftestLinkComparisonNotImplemented,
+    ),
+    // 内容上の reftest: 同上。
+    (
+        "css/css-text/boundary-shaping/boundary-shaping-004.html",
+        UnrunnableReason::ReftestLinkComparisonNotImplemented,
+    ),
+    // 内容上の reftest: rel=match・reftest-wait・checkbox の描画。
+    (
+        "css/css-ui/accent-color-invalidation-currentcolor.html",
+        UnrunnableReason::ReftestLinkComparisonNotImplemented,
+    ),
+    // 内容上の reftest: rel=match・checkbox の accent-color の描画。
+    (
+        "css/css-ui/accent-color-parent-currentcolor.html",
+        UnrunnableReason::ReftestLinkComparisonNotImplemented,
+    ),
+    // crashtest: 閉じ括弧の欠けた var() のスタイル計算と box-shadow の描画。
+    (
+        "css/css-variables/missing-closing-nested-fallback-crash.html",
+        UnrunnableReason::CrashtestRequiresRendering,
+    ),
+    // manual: ボタン操作・requestAnimationFrame の動きを目視で確かめる。
+    (
+        "html/webappapis/animation-frames/cancel-handle-manual.html",
+        UnrunnableReason::ManualTestRequiresInteraction,
+    ),
+];
+
+/// `(harness ラベル, file)` を実行不能理由へ分類する。testharness は実行対象なので `None`。
+/// other は静的表 `OTHER_CLASSIFICATION` を引き、表に無ければ推測の受け皿
+/// [`UnrunnableReason::UnverifiedLikelyUnrunnable`]。未知のラベルは `Err`（fail-closed）。
+/// `from_entries`（理由別記録）と `WptReport::from_runs`（Skipped 整合検証）から呼ばれる。
+pub fn classify_unrunnable(
+    harness_label: &str,
+    file: &str,
+) -> Result<Option<UnrunnableReason>, ReportError> {
     match harness_label {
         "testharness" => Ok(None),
         "reftest" => Ok(Some(UnrunnableReason::ReftestComparisonNotImplemented)),
-        "other" => Ok(Some(UnrunnableReason::UnverifiedLikelyUnrunnable)),
+        "other" => Ok(Some(
+            OTHER_CLASSIFICATION
+                .iter()
+                .find(|(f, _)| *f == file)
+                .map_or(UnrunnableReason::UnverifiedLikelyUnrunnable, |(_, r)| *r),
+        )),
         other => Err(ReportError::UnknownHarness {
             label: other.to_string(),
         }),
@@ -213,7 +367,7 @@ pub fn classify_unrunnable(harness_label: &str) -> Result<Option<UnrunnableReaso
 /// 理由ごとにまとめた実行不能項目。#276 のレポートが埋め込む。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnrunnableReport {
-    files: [Vec<String>; 2],
+    files: [Vec<String>; UnrunnableReason::ALL.len()],
 }
 
 impl UnrunnableReport {
@@ -232,7 +386,7 @@ impl UnrunnableReport {
     where
         I: IntoIterator<Item = (&'a str, &'a str)>,
     {
-        let mut files: [Vec<String>; 2] = [Vec::new(), Vec::new()];
+        let mut files: [Vec<String>; UnrunnableReason::ALL.len()] = Default::default();
         let mut seen: HashSet<&str> = HashSet::new();
         let mut count = 0usize;
         for (label, file) in entries {
@@ -269,7 +423,7 @@ impl UnrunnableReport {
                     file: file.to_string(),
                 });
             }
-            if let Some(reason) = classify_unrunnable(label)?
+            if let Some(reason) = classify_unrunnable(label, file)?
                 && let Some(list) = files.get_mut(reason.index())
             {
                 list.push(file.to_string());
@@ -529,7 +683,8 @@ impl WptReport {
                 // reftest・other は Skipped であること（入れ替わりで分母と実行不能記録が
                 // 食い違うのを防ぐ。fail-closed）。
                 for (entry, outcome) in &run.results {
-                    let must_skip = classify_unrunnable(entry.harness.as_str())?.is_some();
+                    let must_skip =
+                        classify_unrunnable(entry.harness.as_str(), entry.file.as_str())?.is_some();
                     if must_skip != matches!(outcome, FileOutcome::Skipped { .. }) {
                         return Err(ReportError::InconsistentSkipCount { profile: p });
                     }
@@ -625,12 +780,35 @@ mod tests {
 
     #[test]
     fn plug_10_classify_labels() {
-        assert_eq!(classify_unrunnable("testharness"), Ok(None));
-        assert_eq!(classify_unrunnable("reftest"), Ok(Some(R)));
-        assert_eq!(classify_unrunnable("other"), Ok(Some(O)));
+        assert_eq!(classify_unrunnable("testharness", "t.html"), Ok(None));
+        assert_eq!(classify_unrunnable("reftest", "r.html"), Ok(Some(R)));
+        // 表に無い other は推測の受け皿。
+        assert_eq!(classify_unrunnable("other", "unknown.html"), Ok(Some(O)));
+        // 表にある other は確定理由。
+        let table = [
+            (
+                "css/css-display/display-contents-001-crash.html",
+                UnrunnableReason::CrashtestRequiresRendering,
+            ),
+            (
+                "css/css-text/boundary-shaping/boundary-shaping-001.html",
+                UnrunnableReason::ReftestLinkComparisonNotImplemented,
+            ),
+            (
+                "css/css-grid/abspos/absolute-positioning-grid-container-parent-002.html",
+                UnrunnableReason::VisualTestRequiresHumanJudgment,
+            ),
+            (
+                "html/webappapis/animation-frames/cancel-handle-manual.html",
+                UnrunnableReason::ManualTestRequiresInteraction,
+            ),
+        ];
+        for (file, reason) in table {
+            assert_eq!(classify_unrunnable("other", file), Ok(Some(reason)));
+        }
         for bad in ["", "Reftest", "crashtest"] {
             assert_eq!(
-                classify_unrunnable(bad),
+                classify_unrunnable(bad, "x.html"),
                 Err(ReportError::UnknownHarness {
                     label: bad.to_string()
                 })
@@ -644,6 +822,31 @@ mod tests {
         assert_eq!(O.code(), "unverified-likely-unrunnable");
         assert_eq!(R.basis().code(), "confirmed");
         assert_eq!(O.basis().code(), "speculative");
+        let confirmed = [
+            (
+                UnrunnableReason::CrashtestRequiresRendering,
+                "crashtest-requires-rendering",
+            ),
+            (
+                UnrunnableReason::ReftestLinkComparisonNotImplemented,
+                "reftest-link-comparison-not-implemented",
+            ),
+            (
+                UnrunnableReason::VisualTestRequiresHumanJudgment,
+                "visual-test-requires-human-judgment",
+            ),
+            (
+                UnrunnableReason::ManualTestRequiresInteraction,
+                "manual-test-requires-interaction",
+            ),
+        ];
+        for (reason, code) in confirmed {
+            assert_eq!(reason.code(), code);
+            assert_eq!(reason.basis().code(), "confirmed");
+            assert_eq!(reason.harness_label(), "other");
+        }
+        assert_eq!(R.harness_label(), "reftest");
+        assert_eq!(O.harness_label(), "other");
     }
 
     #[test]
@@ -669,6 +872,19 @@ mod tests {
             "{\"reason\":\"reftest-comparison-not-implemented\",\"basis\":\"confirmed\",",
             "\"harness\":\"reftest\",\"description\":\"reftest needs a rendering comparison against a ",
             "reference page; this harness does not implement it\",\"count\":1,\"files\":[\"a.html\"]},",
+            "{\"reason\":\"crashtest-requires-rendering\",\"basis\":\"confirmed\",",
+            "\"harness\":\"other\",\"description\":\"crashtest passes only if loading and layout complete ",
+            "without a crash; this harness has no layout or rendering\",\"count\":0,\"files\":[]},",
+            "{\"reason\":\"reftest-link-comparison-not-implemented\",\"basis\":\"confirmed\",",
+            "\"harness\":\"other\",\"description\":\"file declares a rel=match reference (reftest by ",
+            "content) although labeled other; this harness does not implement rendering comparison\",",
+            "\"count\":0,\"files\":[]},",
+            "{\"reason\":\"visual-test-requires-human-judgment\",\"basis\":\"confirmed\",",
+            "\"harness\":\"other\",\"description\":\"visual test judged by a human comparing rendered ",
+            "output; not automatable by this harness\",\"count\":0,\"files\":[]},",
+            "{\"reason\":\"manual-test-requires-interaction\",\"basis\":\"confirmed\",",
+            "\"harness\":\"other\",\"description\":\"manual test requires user interaction and visual ",
+            "judgment; not automatable\",\"count\":0,\"files\":[]},",
             "{\"reason\":\"unverified-likely-unrunnable\",\"basis\":\"speculative\",",
             "\"harness\":\"other\",\"description\":\"content not verified; likely unrunnable ",
             "(speculative)\",\"count\":0,\"files\":[]}]}"
@@ -752,7 +968,7 @@ mod tests {
     }
 
     #[test]
-    fn plug_10_real_subset_counts_88_and_17() {
+    fn plug_10_real_subset_other_17_are_confirmed() {
         let json = include_str!("../wpt-subset.json");
         let pairs = scan_subset(json);
         assert_eq!(pairs.len(), 257);
@@ -760,13 +976,67 @@ mod tests {
         let r = UnrunnableReport::from_entries(pairs.iter().map(|(h, f)| (h.as_str(), f.as_str())))
             .unwrap();
         assert_eq!(r.count(R), 88);
-        assert_eq!(r.count(O), 17);
-        assert_eq!(r.total(), 105);
-        assert!(
-            r.records(O)
-                .iter()
-                .any(|f| f == "html/webappapis/animation-frames/cancel-handle-manual.html")
+        assert_eq!(r.count(UnrunnableReason::CrashtestRequiresRendering), 9);
+        assert_eq!(
+            r.count(UnrunnableReason::ReftestLinkComparisonNotImplemented),
+            6
         );
+        assert_eq!(
+            r.count(UnrunnableReason::VisualTestRequiresHumanJudgment),
+            1
+        );
+        assert_eq!(r.count(UnrunnableReason::ManualTestRequiresInteraction), 1);
+        // 推測の受け皿は実サブセットでは使われない。
+        assert_eq!(r.count(O), 0);
+        assert_eq!(r.total(), 105);
+        assert_eq!(
+            r.records(UnrunnableReason::ManualTestRequiresInteraction),
+            ["html/webappapis/animation-frames/cancel-handle-manual.html"]
+        );
+    }
+
+    /// 静的表の 17 件が定義の `harness: other` の集合と過不足なく一致する（定義が変わって
+    /// 表が古くなったらここで失敗させる）。表はパスの昇順。
+    #[test]
+    fn plug_10_other_table_matches_subset_definition() {
+        let pairs = scan_subset(include_str!("../wpt-subset.json"));
+        let mut defined: Vec<&str> = pairs
+            .iter()
+            .filter(|(h, _)| h == "other")
+            .map(|(_, f)| f.as_str())
+            .collect();
+        defined.sort_unstable();
+        let table: Vec<&str> = OTHER_CLASSIFICATION.iter().map(|(f, _)| *f).collect();
+        assert_eq!(table.len(), 17);
+        assert_eq!(table, defined);
+        let mut dedup = table.clone();
+        dedup.dedup();
+        assert_eq!(dedup.len(), 17);
+    }
+
+    /// 分母テスト: 分類を細分化しても `executed`（分母）は 152 のまま変わらない。
+    #[test]
+    fn plug_10_real_subset_denominator_is_unchanged() {
+        let pairs = scan_subset(include_str!("../wpt-subset.json"));
+        let results = pairs
+            .iter()
+            .map(|(h, f)| {
+                let (kind, outcome) = match h.as_str() {
+                    "testharness" => (HarnessKind::Testharness, completed(Verdict::Pass)),
+                    "reftest" => (HarnessKind::Reftest, skipped(HarnessKind::Reftest)),
+                    _ => (HarnessKind::Other, skipped(HarnessKind::Other)),
+                };
+                (entry(f, kind), outcome)
+            })
+            .collect();
+        let run = ProfileRun {
+            profile: WptProfile::Chrome,
+            results,
+        };
+        let r = WptReport::from_runs(&[run], None).unwrap();
+        let p = r.profiles.first().unwrap();
+        assert_eq!((p.total, p.skipped(), p.executed), (257, 105, 152));
+        assert_eq!(r.unrunnable.total(), 105);
     }
 
     use crate::runner::{HarnessKind, SubsetEntry};
