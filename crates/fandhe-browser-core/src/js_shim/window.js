@@ -28,7 +28,7 @@
 //   `media` は渡された文字列をそのまま返す。
 // - IntersectionObserver: 何も観測しない不活性な最小実装（#1227・SEC-2。ビューポートや要素の寸法を
 //   読まないので識別面を増やさない）。callback は一度も呼ばず、登録も保持しない（無制限に増えない）。
-// - performance.now(): install 時点からの経過ミリ秒だけを返す最小実装（#1227。timeOrigin・mark・measure・
+// - performance.now(): ページ attach からの経過ミリ秒（Rust 側の単調時計 `monotonicNow` op）だけを返す最小実装（#1227。timeOrigin・mark・measure・
 //   getEntries 等は持たない）。
 // - 再 install（ページごと）に耐えるよう、global への定義は configurable にする。
 // - ES2015 の範囲に留める（V8 と boa で同一のソースを使うため。Proxy は使わない）。
@@ -45,7 +45,7 @@
 // - IntersectionObserver は常に交差なし（REPAIR-3・#1227）: callback を呼ばず、`observe` の引数も検証しない。
 //   `root` は null・`rootMargin` は '0px 0px 0px 0px'・`thresholds` は [0] の固定値で、options は無視する。
 //   将来はレンダリング層のレイアウトと連動させる（ただし SEC-2 の範囲で）。
-// - performance は `now()` のみ（REPAIR-3）。実時間の差分で、仮想時間とは連動しない。
+// - performance は `now()` のみ（REPAIR-3）。単調時計の差分で、壁時計・仮想時間とは連動しない。
 // - 実ブラウザの [LegacyUnforgeable]（location / window の再定義不可。document.location は
 //   document インスタンスではなく Document.prototype に置いている）との差異。真の状態は
 //   Rust 側にあるため安全性は変わらない。DOMException への写像も未対応。
@@ -235,10 +235,9 @@
     });
 
     // performance: now() だけ（install 時点からの経過ms）。
-    var perfStart = Date.now();
     var performanceObject = {};
     defineMethod(performanceObject, 'now', function now() {
-        return Date.now() - perfStart;
+        return op('monotonicNow');
     });
 
     // console: 記録は log/info/warn/error/debug のみ。引数の文字列化や転送で throw しない。

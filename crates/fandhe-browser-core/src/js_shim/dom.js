@@ -294,12 +294,15 @@
         return wrap(pid, Element);
     }
     // isEqualNode: DOM 標準の「node equals」。比較は Rust 側（dom_bridge/node_equal.rs。明示スタック・
-    // 反復上限つき）。null / undefined は false、Node でない値は TypeError（#1227・JS-5。React / Next.js
+    // 反復上限つき）。引数なしは TypeError、null / undefined は false、Node でない値は TypeError（#1227・JS-5。React / Next.js
     // のクライアントが差分検出に使う）。
     define(Node.prototype, 'isEqualNode', {
         writable: true,
         value: function isEqualNode(other) {
             var self = idOf(this, 'isEqualNode');
+            if (arguments.length === 0) {
+                throw new TypeError("Failed to execute 'isEqualNode' on 'Node': 1 argument required, but only 0 present.");
+            }
             if (other === null || other === undefined) {
                 return false;
             }

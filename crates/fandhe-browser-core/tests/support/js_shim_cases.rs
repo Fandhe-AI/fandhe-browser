@@ -619,6 +619,12 @@ fn window_cases(engine: &str) {
         "var t0 = performance.now(); typeof t0 + '|' + (t0 >= 0) + '|' + (performance.now() >= t0)",
         "number|true|true",
     );
+    // 壁時計（Date.now）を差し替えても performance.now は影響を受けない。
+    check(
+        &mut p,
+        "var t1 = performance.now(); Date.now = function () { return -1e12; }; var t2 = performance.now(); String(t2 >= t1 && t2 >= 0)",
+        "true",
+    );
 
     eprintln!("case: JS-5 location defaults to about:blank");
     check(&mut p, "document.URL", "about:blank");
@@ -3620,7 +3626,7 @@ fn is_equal_node_cases(engine: &str) {
     eprintln!("case: JS-5 isEqualNode (#1227)");
     let mut p = setup(engine, None);
     let pre = "var a = document.createElement('div'); var b = document.createElement('div'); ";
-    let cases: [(&str, &str); 10] = [
+    let cases: [(&str, &str); 11] = [
         (
             "a.setAttribute('x','1'); a.setAttribute('y','2'); b.setAttribute('y','2'); b.setAttribute('x','1'); a.isEqualNode(b)",
             "true",
@@ -3646,6 +3652,10 @@ fn is_equal_node_cases(engine: &str) {
         (
             "document.isEqualNode(document) + '|' + a.isEqualNode(a) + '|' + a.isEqualNode(null)",
             "true|true|false",
+        ),
+        (
+            "try { a.isEqualNode(); 'ok' } catch (e) { e instanceof TypeError ? 'type' : 'other' }",
+            "type",
         ),
         (
             "try { a.isEqualNode({}); 'ok' } catch (e) { 'threw' }",

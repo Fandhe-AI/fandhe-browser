@@ -365,6 +365,8 @@ enum DomOp {
     HistorySetUrl,
     IgnoreLocationChange,
     NavigatorUserAgent,
+    /// ページ attach からの単調時計の経過ミリ秒（`performance.now()` 用。#1227・JS-5）。
+    MonotonicNow,
     ConsoleMessage,
     LifecycleListenerError,
     LifecycleInstallOpen,
@@ -432,6 +434,7 @@ impl DomOp {
             "historySetUrl" => Self::HistorySetUrl,
             "ignoreLocationChange" => Self::IgnoreLocationChange,
             "navigatorUserAgent" => Self::NavigatorUserAgent,
+            "monotonicNow" => Self::MonotonicNow,
             "consoleMessage" => Self::ConsoleMessage,
             "lifecycleListenerError" => Self::LifecycleListenerError,
             "lifecycleInstallOpen" => Self::LifecycleInstallOpen,
@@ -494,6 +497,7 @@ impl DomOp {
             Self::HistorySetUrl => "historySetUrl",
             Self::IgnoreLocationChange => "ignoreLocationChange",
             Self::NavigatorUserAgent => "navigatorUserAgent",
+            Self::MonotonicNow => "monotonicNow",
             Self::ConsoleMessage => "consoleMessage",
             Self::LifecycleListenerError => "lifecycleListenerError",
             Self::LifecycleInstallOpen => "lifecycleInstallOpen",
@@ -534,6 +538,7 @@ impl DomOp {
             | Self::ReadyState
             | Self::CurrentScript
             | Self::NavigatorUserAgent
+            | Self::MonotonicNow
             | Self::LifecycleInstallOpen
             | Self::LifecycleListenerLimit
             | Self::MicrotaskLimit
@@ -612,6 +617,8 @@ impl DocumentReadyState {
 /// 取り付け中のページの状態。
 struct PageState {
     document: Document,
+    /// attach 時点の単調時計（`monotonicNow` op の基準）。
+    started: std::time::Instant,
     ready_state: DocumentReadyState,
     current_script: Option<NodeId>,
     /// `None` は `about:blank`。
@@ -903,6 +910,10 @@ fn execute(
         DomOp::DocumentRoot => page.encode(page.document.root()),
         DomOp::ReadyState => Ok(JsValue::String(page.ready_state.as_str().to_owned())),
         DomOp::CurrentScript => page.encode_optional(page.current_script),
+        // 単調時計（`Instant`）の経過ミリ秒。壁時計の補正・ページ側の `Date.now` 差し替えの影響を受けない。
+        DomOp::MonotonicNow => Ok(JsValue::Number(
+            page.started.elapsed().as_secs_f64() * 1000.0,
+        )),
         DomOp::NavigatorUserAgent => Ok(JsValue::String(crate::fetch::USER_AGENT.to_owned())),
         DomOp::GetLocation => {
             let name = string_arg(op, args, 1, limits)?;
@@ -1604,6 +1615,7 @@ impl DomBridge {
         state.next_generation = generation.saturating_add(1);
         state.page = Some(PageState {
             document,
+            started: std::time::Instant::now(),
             ready_state: DocumentReadyState::Loading,
             current_script: None,
             location: None,
