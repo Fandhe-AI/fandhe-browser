@@ -15,7 +15,7 @@
 //! 以下は未実装で、実装済みを装う公開 API・ダミー実装は置かない
 //! （`code-comment-style.md`・REPAIR-3）。
 //!
-//! - JSON-RPC ディスパッチャ（`protocol.rs`。TASK-42.1）は実装済みで、組込みメソッドは `Page.navigate`（TASK-42.2）・`DOM.getDocument`（TASK-42.4。`sessionId` 付きはターゲット別の確定文書を返す。#658）・`DOM.querySelector`（TASK-42.5。#243）・`DOM.requestChildNodes`（#657）・`Browser.getVersion`（TASK-43.3a。`CDP-2`）・`Target.getTargetInfo`（TASK-43.3b。`CDP-2`）・`Target.setAutoAttach`・`Browser.setDownloadBehavior`（TASK-43.3c。`CDP-2`。前者は既存ターゲットへの自動 attach と `Target.attachedToTarget` 送出まで、後者は設定の検証と保持のみでダウンロード実行系は未実装。`browserContextId` 付きは context 単位で保持）・`Target.createBrowserContext`（TASK-43.3d・#909。`disposeOnDetach:true` のみ受理し接続切断で破棄。`Target.disposeBrowserContext` は未実装）・`Target.closeTarget`（TASK-43.3h・#1028。既定 context か接続所有 context のページを閉じ、自接続の `Target.detachedFromTarget` を送出。`Target.targetDestroyed` は `Target.setDiscoverTargets` 未実装のため未送出）・`Page.createIsolatedWorld` と `Runtime.executionContextCreated`（TASK-44.6・#1217。評価器が有効なときだけ。`runtime.rs`。評価系は #1218 以降）
+//! - JSON-RPC ディスパッチャ（`protocol.rs`。TASK-42.1）は実装済みで、組込みメソッドは `Page.navigate`（TASK-42.2）・`DOM.getDocument`（TASK-42.4。`sessionId` 付きはターゲット別の確定文書を返す。#658）・`DOM.querySelector`（TASK-42.5。#243）・`DOM.requestChildNodes`（#657）・`Browser.getVersion`（TASK-43.3a。`CDP-2`）・`Target.getTargetInfo`（TASK-43.3b。`CDP-2`）・`Target.setAutoAttach`・`Browser.setDownloadBehavior`（TASK-43.3c。`CDP-2`。前者は既存ターゲットへの自動 attach と `Target.attachedToTarget` 送出まで、後者は設定の検証と保持のみでダウンロード実行系は未実装。`browserContextId` 付きは context 単位で保持）・`Target.createBrowserContext`（TASK-43.3d・#909。`disposeOnDetach:true` のみ受理し接続切断で破棄。`Target.disposeBrowserContext` は未実装）・`Target.closeTarget`（TASK-43.3h・#1028。既定 context か接続所有 context のページを閉じ、自接続の `Target.detachedFromTarget` を送出。`Target.targetDestroyed` は `Target.setDiscoverTargets` 未実装のため未送出）・`Page.createIsolatedWorld` と `Runtime.executionContextCreated`（TASK-44.6・#1217。評価器が有効なときだけ。`runtime.rs`）・`Runtime.evaluate`・`Runtime.releaseObject`（TASK-44.7・#1218。isolated world のみ。`runtime/evaluate.rs`。`callFunctionOn`・`awaitPromise` は #1219）
 //! - 個別 CDP メソッドのハンドラ（`CDP-1`/`CDP-5`/`CDP-7`、`TASK-42.2`〜`42.5`、`MS-4`）
 //!
 //! 未実装メソッドの応答方針（`-32601` を返し成功を捏造しない）と受信ログは TASK-42.6（`CDP-6`・`SEC-2`）で
@@ -82,6 +82,56 @@ pub mod test_support {
         }
 
         /// 1 リクエストを処理し、送出順（応答 → イベント列）の JSON フレームを返す。
+        pub async fn dispatch(&self, state: &Arc<CdpState>, text: &str) -> Vec<String> {
+            self.0.dispatch_on(state, None, text).await.into_frames()
+        }
+    }
+
+    /// 評価系（TASK-44.7・#1218）の結合テスト用ディスパッチャ。ループバック許可の `Page.navigate`・
+    /// `Page.createIsolatedWorld`・`Runtime.enable`・`Runtime.evaluate`・`Runtime.releaseObject` を持つ。
+    /// `sessionId` 付きのリクエスト（`text` の JSON に含める）をそのまま処理する。
+    pub struct RuntimeDispatcher(Dispatcher);
+
+    impl RuntimeDispatcher {
+        /// 既定の上限（タイムアウト 5 秒等）で構築する。`Fetcher` 構築失敗のみ `Err`。
+        pub fn new() -> Result<Self, Error> {
+            Self::build(crate::runtime::EvalLimits::default())
+        }
+
+        /// `Runtime.evaluate` のタイムアウトを短くして構築する（時間のかかる上限テスト用）。
+        pub fn with_eval_timeout(timeout: std::time::Duration) -> Result<Self, Error> {
+            Self::build(crate::runtime::EvalLimits::default().with_timeout(timeout))
+        }
+
+        fn build(limits: crate::runtime::EvalLimits) -> Result<Self, Error> {
+            let nav =
+                PageNavigate::new(FetchOptions::new().with_allow_private_network_access(true))?;
+            let d = Dispatcher::from_handlers(vec![
+                ("Page.navigate", Box::new(nav)),
+                (
+                    "Page.createIsolatedWorld",
+                    Box::new(crate::runtime::PageCreateIsolatedWorld),
+                ),
+                (
+                    "Runtime.enable",
+                    Box::new(crate::playwright_compat::RuntimeEnable),
+                ),
+                (
+                    "Runtime.evaluate",
+                    Box::new(crate::runtime::RuntimeEvaluate::new(limits)),
+                ),
+                (
+                    "Runtime.releaseObject",
+                    Box::new(crate::runtime::RuntimeReleaseObject),
+                ),
+            ])
+            .map_err(|_| Error::InvalidInput {
+                message: "dispatcher".to_owned(),
+            })?;
+            Ok(Self(d))
+        }
+
+        /// 1 リクエストを処理し、送出順（応答前イベント → 応答 → イベント列）の JSON フレームを返す。
         pub async fn dispatch(&self, state: &Arc<CdpState>, text: &str) -> Vec<String> {
             self.0.dispatch_on(state, None, text).await.into_frames()
         }

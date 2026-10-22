@@ -806,7 +806,7 @@ impl CommandHandler for LogEnable {
 /// 止めたターゲットは [`RuntimeRunIfWaitingForDebugger`] の再開時に告知する）。
 ///
 /// 差異（`REPAIR-3`）: `consoleAPICalled` は送らない。main world の contextId は告知するが、
-/// 評価（`Runtime.evaluate` 等）は未実装で CDP エラーになる（#1218）。実際の状態変更であり
+/// そこへの評価（`Runtime.evaluate` の main world・`contextId` 省略）は仕様として固定文言の CDP エラーになる（評価できるのは isolated world。`runtime/evaluate.rs`・#1218）。実際の状態変更であり
 /// 検出回避の一律成功ではない（`SEC-2`・`CDP-6`）。検証は [`enable_session_domain`] と同じ順。
 pub(crate) struct RuntimeEnable;
 

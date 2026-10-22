@@ -841,7 +841,6 @@ impl TargetRegistry {
     }
 
     /// contextId を現在の世代に照らして解決する（評価系 #1218 が使う。他セッションの id は未知扱い）。
-    #[allow(dead_code)]
     pub(crate) fn resolve_context(
         &self,
         sid: &SessionId,
@@ -851,6 +850,29 @@ impl TargetRegistry {
         self.lock()
             .exec_contexts
             .resolve(sid, context_id, current_generation)
+    }
+
+    /// 評価ヘルパーの epoch を払い出す（評価系 #1218。registry 全体で単調増加）。
+    pub(crate) fn allocate_helper_epoch(&self) -> Result<u64, ContextError> {
+        self.lock().exec_contexts.allocate_helper_epoch()
+    }
+
+    /// 評価ヘルパーの注入結果を記録する（未記録なら書き、記録済みなら既存の値を返す。#1218）。
+    pub(crate) fn record_helper_epoch(
+        &self,
+        sid: &SessionId,
+        context_id: u64,
+        current_generation: NavigationGeneration,
+        epoch: u64,
+    ) -> Result<u64, crate::runtime::ContextLookupError> {
+        self.lock()
+            .exec_contexts
+            .record_helper_epoch(sid, context_id, current_generation, epoch)
+    }
+
+    /// contextId を失効させる（評価コンテキストの再起動・ヘルパー喪失時。#1218）。
+    pub(crate) fn invalidate_context(&self, sid: &SessionId, context_id: u64) -> bool {
+        self.lock().exec_contexts.invalidate(sid, context_id)
     }
 
     /// 実行コンテキストの件数（テスト用）。
