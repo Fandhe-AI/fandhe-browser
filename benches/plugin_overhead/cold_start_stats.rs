@@ -1,7 +1,7 @@
 //! cold start 計測値の型・統計・TSV 整形（TASK-95.2・Issue #376・`PLUG-3`・`MS-9`）。
 //!
 //! 計測手順（I/O）を持つ `cold_start.rs`、bench main（`plugin_overhead.rs`）、ユニットテスト
-//! （`cold_start_tests.rs`）から使う純関数群。TASK-95.4 が同じ値を TASK-10 形式へ流せるよう
+//! （`cold_start_tests.rs`）から使う純関数群。`report.rs`（TASK-95.4）が同じ値を TASK-10 形式へ流せるよう
 //! （REPAIR-4）、計測値の型と整形を分けている。外部入力を扱わないが、添字アクセスと `unwrap` は使わない。
 
 use std::fmt;

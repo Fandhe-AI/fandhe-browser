@@ -2,7 +2,7 @@
 //! （TASK-95.1・Issue #375・`PLUG-3`・`MS-9`）。
 //!
 //! 実行: `make measure-plugin-overhead`（mcp の release ビルド後に
-//! `cargo bench -p fandhe-browser-ai --bench plugin_overhead -- [--metric idle-rss|cold-start] [--samples N] [--trials N] ...`）。
+//! `cargo bench -p fandhe-browser-ai --bench plugin_overhead -- [--metric idle-rss|cold-start|call-latency|all] [--format tsv|jsonl] [--samples N] [--trials N] ...`）。
 //! 詳細な手法・単位・PoC-15 との差は `benches/plugin_overhead/README.md`。
 //!
 //! 指標: `idle-rss`（既定）・`cold-start`・`call-latency`。
@@ -20,7 +20,8 @@
 //!
 //! 将来仕様（REPAIR-3）: cli が引数（ポート・プロファイル）を持ったら in-process ホストを実バイナリへ
 //! 切り替える（TASK-47・`CLI-1`）。
-//! TASK-10 形式のレポート化は TASK-95.4 が担う。
+//! TASK-10 形式のレポート化（TASK-95.4・Issue #378）: `--format jsonl` で指標ごとに 1 行の JSON Lines を
+//! stdout へ出す（整形は `report.rs`）。`--metric all` で 3 指標を固定順に計測する。
 
 #[cfg(unix)]
 #[path = "../crates/fandhe-browser-ai/benches/mcp_envelope/app_host.rs"]
@@ -53,12 +54,15 @@ mod mcp_client;
 #[path = "plugin_overhead/options.rs"]
 mod options;
 #[cfg(unix)]
+#[path = "plugin_overhead/report.rs"]
+mod report;
+#[cfg(unix)]
 #[path = "plugin_overhead/rss.rs"]
 mod rss;
 
 #[cfg(unix)]
 fn run() -> Result<(), String> {
-    use options::Metric;
+    use options::{Format, Metric};
 
     let args: Vec<String> = std::env::args().skip(1).collect();
     let opts = options::Options::parse(&args)?;
@@ -67,39 +71,66 @@ fn run() -> Result<(), String> {
         env_bin.as_deref(),
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")),
     )?;
+    let t = &fandhe_browser_ai::plugin_api::PLUG3_TARGETS;
+    // jsonl では全指標を計測し終えて整形に成功してから 1 回だけ出す（部分的なレポートを残さない）。
+    let mut idle = None;
+    let mut cold = None;
+    let mut call = None;
     for metric in &opts.metrics {
         match metric {
             Metric::IdleRss => {
                 let m = idle_rss::measure(&bin, &opts)?;
-                let target =
-                    fandhe_browser_ai::plugin_api::PLUG3_TARGETS.idle_rss_increase_max_bytes();
-                println!(
-                    "{}",
-                    rss::render_idle_rss(&m, target).map_err(|e| e.to_string())?
-                );
+                if opts.format == Format::Tsv {
+                    println!(
+                        "{}",
+                        rss::render_idle_rss(&m, t.idle_rss_increase_max_bytes())
+                            .map_err(|e| e.to_string())?
+                    );
+                }
+                idle = Some(m);
             }
             Metric::ColdStart => {
                 let m = cold_start::measure(&bin, &opts)?;
-                let target = fandhe_browser_ai::plugin_api::PLUG3_TARGETS.cold_start_max_ms();
-                println!(
-                    "{}",
-                    cold_start_stats::render_cold_start(&m, target).map_err(|e| e.to_string())?
-                );
+                if opts.format == Format::Tsv {
+                    println!(
+                        "{}",
+                        cold_start_stats::render_cold_start(&m, t.cold_start_max_ms())
+                            .map_err(|e| e.to_string())?
+                    );
+                }
+                cold = Some(m);
             }
             Metric::CallLatency => {
                 let m = call_latency::measure(&bin, &opts)?;
-                let t = &fandhe_browser_ai::plugin_api::PLUG3_TARGETS;
-                println!(
-                    "{}",
-                    call_latency_stats::render_call_latency(
-                        &m,
-                        t.call_latency_p50_max_ms(),
-                        t.call_latency_p95_max_ms()
-                    )
-                    .map_err(|e| e.to_string())?
-                );
+                if opts.format == Format::Tsv {
+                    println!(
+                        "{}",
+                        call_latency_stats::render_call_latency(
+                            &m,
+                            t.call_latency_p50_max_ms(),
+                            t.call_latency_p95_max_ms()
+                        )
+                        .map_err(|e| e.to_string())?
+                    );
+                }
+                call = Some(m);
             }
         }
+    }
+    if opts.format == Format::Jsonl {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|_| "system clock is before the unix epoch".to_string())?;
+        let ts = u64::try_from(now.as_millis()).map_err(|_| "timestamp overflow".to_string())?;
+        let targets = report::Targets {
+            idle_rss_increase_max_bytes: t.idle_rss_increase_max_bytes(),
+            cold_start_max_ms: t.cold_start_max_ms(),
+            call_latency_p50_max_ms: t.call_latency_p50_max_ms(),
+            call_latency_p95_max_ms: t.call_latency_p95_max_ms(),
+        };
+        let out = report::render_jsonl(idle.as_ref(), cold.as_ref(), call.as_ref(), &targets, ts)
+            .map_err(|e| e.to_string())?;
+        print!("{out}");
     }
     Ok(())
 }

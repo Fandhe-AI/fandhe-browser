@@ -187,3 +187,8 @@ path = "../../benches/plugin_overhead/e2e_tests.rs"
 [[test]]
 name = "plugin_overhead_call_latency"
 path = "../../benches/plugin_overhead/call_latency_tests.rs"
+
+# JSON Lines レポート整形・--format / --metric all 引数のユニットテスト（PLUG-3・TASK-95.4・Issue #378）。依存は増やさない。
+[[test]]
+name = "plugin_overhead_report"
+path = "../../benches/plugin_overhead/report_tests.rs"
