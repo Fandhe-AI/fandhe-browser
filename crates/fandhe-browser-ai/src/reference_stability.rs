@@ -390,6 +390,9 @@ fn reidentify_after(
         .ok()
         .is_some_and(|m| match m.as_slice() {
             [id] => !holders.iter().any(|h| h.node == *id),
+            // セレクタが 0 件（対象自体が DOM から消えた）場合も、同名要素の追加と相殺されて
+            // 残った要素が元の ref を引き継ぎ得るため、対象の消失として扱う。
+            [] => true,
             _ => false,
         });
     match candidates.as_slice() {
@@ -956,6 +959,26 @@ fn aisnap_10_hidden_target_with_added_sibling_same_count_is_ambiguous() {
             }
         ),
         "{result:?}"
+    );
+}
+
+/// AISNAP-10・Issue #1221: 対象自体が DOM から削除され、同名要素の追加でグループ件数が相殺
+/// されても、残った先頭要素が元の ref を引き継いで `Stable` にならず `Ambiguous`。
+#[test]
+fn aisnap_10_removed_target_with_added_sibling_same_count_is_ambiguous() {
+    let before = page("<button class=\"target\">Go</button><button>Go</button>");
+    let after = page("<button>Go</button><button>Go</button>");
+    let result = check_reidentification(&StabilityCase {
+        before_html: &before,
+        after_html: &after,
+        selector: ".target",
+    });
+    assert_eq!(
+        result,
+        Reidentification::Ambiguous {
+            side: Side::After,
+            count: 1
+        }
     );
 }
 
