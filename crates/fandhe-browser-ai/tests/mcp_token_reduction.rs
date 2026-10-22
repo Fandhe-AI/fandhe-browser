@@ -112,7 +112,7 @@ fn assert_plug4(summary: &ReductionSummary) -> TestResult<()> {
 const PINNED: [(&str, usize, usize, bool); 5] = [
     ("example-minimal", 103, 77, false),
     ("wikipedia-article", 56482, 33177, false),
-    ("hn-list", 10220, 11246, false),
+    ("hn-list", 10220, 11316, false),
     ("login-form", 284, 174, false),
     ("mdn-docs", 19005, 25200, false),
 ];
@@ -459,11 +459,11 @@ fn plug4_mcp_token_reduction_report_prints_markdown() -> TestResult<()> {
     for needle in [
         "| example-minimal | 103 | 77 | 25.2 | false |",
         "| wikipedia-article | 56482 | 33177 | 41.3 | false |",
-        "| hn-list | 10220 | 11246 | -10.0 | false |",
+        "| hn-list | 10220 | 11316 | -10.7 | false |",
         "| login-form | 284 | 174 | 38.7 | false |",
         "| mdn-docs | 19005 | 25200 | -32.6 | false |",
-        "| 5 | 12.5 | -32.6 | 41.3 |",
-        "| 84.0 | 12.5 | Shortfall | 71.5 |",
+        "| 5 | 12.4 | -32.6 | 41.3 |",
+        "| 84.0 | 12.4 | Shortfall | 71.6 |",
     ] {
         assert!(report.contains(needle), "missing row: {needle}\n{report}");
     }

@@ -27,7 +27,7 @@
 | ---- | ------------- | -------------- | ------------ | --------- |
 | example-minimal | 103 | 77 | 25.2 | false |
 | wikipedia-article | 56482 | 33177 | 41.3 | false |
-| hn-list | 10220 | 11246 | -10.0 | false |
+| hn-list | 10220 | 11316 | -10.7 | false |
 | login-form | 284 | 174 | 38.7 | false |
 | mdn-docs | 19005 | 25200 | -32.6 | false |
 
@@ -35,17 +35,17 @@
 
 | pages | meanReductionPct | minReductionPct | maxReductionPct | medianSnapshotTokens |
 | ----- | ---------------- | --------------- | --------------- | -------------------- |
-| 5 | 12.5 | -32.6 | 41.3 | 11246.0 |
+| 5 | 12.4 | -32.6 | 41.3 | 11316.0 |
 
 ### PLUG-4 verdict
 
 | thresholdPct | meanPct | verdict | gapPts |
 | ------------ | ------- | ------- | ------ |
-| 84.0 | 12.5 | Shortfall | 71.5 |
+| 84.0 | 12.4 | Shortfall | 71.6 |
 
 ## 所見
 
-- 平均削減率は -75.7%（`5786055`、TASK-23.3 より前）から 12.5% に変わった。`hn-list`・`mdn-docs` は依然として負（snapshot が生 HTML より大きい。現行ホストが JSON ツリーのエンベロープを返すため）。84.0% には届いていない。達成可否の判断はしない（#387）。TASK-23 全体の対照表は [TASK-23 再測定レポート](./token-reduction-remeasurement-report.md) を参照
+- 平均削減率は -75.7%（`5786055`、TASK-23.3 より前）から 12.4% に変わった。`hn-list`・`mdn-docs` は依然として負（snapshot が生 HTML より大きい。現行ホストが JSON ツリーのエンベロープを返すため）。84.0% には届いていない。達成可否の判断はしない（#387）。TASK-23 全体の対照表は [TASK-23 再測定レポート](./token-reduction-remeasurement-report.md) を参照
 - 合成フィクスチャのため、PoC-15 の実ページ（87.8%）とは厳密に比較できない
 - TASK-23.6 以降、`hn-list` の snapshot は truncated ではない（フル name の 120 文字打ち切りが出力から消えたため）
 
@@ -70,7 +70,7 @@
 | ---- | ------------- | -------------- | ------------ | --------- | ------------------ | ------------ |
 | example-minimal | 103 | 77 | 25.2 | false | 103 | Skipped(NoScriptElement) |
 | wikipedia-article | 56482 | 33177 | 41.3 | false | 56482 | Skipped(NoScriptElement) |
-| hn-list | 10220 | 11246 | -10.0 | false | 10220 | Skipped(NoScriptElement) |
+| hn-list | 10220 | 11316 | -10.7 | false | 10220 | Skipped(NoScriptElement) |
 | login-form | 284 | 174 | 38.7 | false | 283 | Executed |
 | mdn-docs | 19005 | 25200 | -32.6 | false | 19005 | Skipped(NoScriptElement) |
 
@@ -78,7 +78,7 @@
 
 | pages | meanReductionPct | minReductionPct | maxReductionPct | medianSnapshotTokens | 84.0% との差（pt・表示のみ） |
 | ----- | ---------------- | --------------- | --------------- | -------------------- | ---------------------------- |
-| 5 | 12.5 | -32.6 | 41.3 | 11246.0 | 71.5 |
+| 5 | 12.4 | -32.6 | 41.3 | 11316.0 | 71.6 |
 
 ### SPA 風フィクスチャ（テスト内蔵・JS が見出し・リスト・フォームを描画）
 

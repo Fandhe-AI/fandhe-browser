@@ -101,7 +101,7 @@
 //! - いずれかの name が打ち切られた場合（文字数上限・子孫走査の上限・構築全体で共有する
 //!   走査予算）も `Snapshot::truncated` を立てる。
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::fmt;
 
 use fandhe_browser_core::dom::{Children, Document, NodeId};
@@ -820,7 +820,7 @@ pub(crate) struct RefHolder {
     pub(crate) role: String,
     /// 区別子付与後（Issue #1221）の出力 name。
     pub(crate) name: String,
-    /// 区別子付与前・切り詰め前の name。重複グループのキー（`role`＋この値）で、出力 name を
+    /// 区別子付与前の表示 name（残余縮約後）。重複グループのキー（`role`＋この値）で、出力 name を
     /// 逆解析せずに同グループの件数を比較するために保持する（`name` は base を切り詰めうる）。
     pub(crate) group_name: String,
     pub(crate) r#ref: String,
@@ -872,9 +872,6 @@ fn build_snapshot_inner(
         full_truncated: false,
         dom: None,
     }];
-    // ref → (role, ref 発行時の出力 name)。区別子付与（`disambiguate`）の重複判定キーで、
-    // `RefHolder` と同じ定義（残余縮約前の name）を非テストビルドでも保持する。
-    let mut ref_keys: HashMap<String, (String, String)> = HashMap::new();
     // 折り畳んだ要素（テストの RefHolder から除外するため）。
     #[cfg(test)]
     let mut collapsed_ids: HashSet<NodeId> = HashSet::new();
@@ -927,18 +924,15 @@ fn build_snapshot_inner(
                     if let Some(sink) = sink.as_deref_mut() {
                         sink.retain(|h| !collapsed_ids.contains(&h.node));
                     }
-                    let outcome = apply_disambiguation(&mut done.node, &ref_keys);
+                    let outcome = apply_disambiguation(&mut done.node);
                     truncated |= outcome.truncated;
                     #[cfg(test)]
                     if let Some(sink) = sink.as_deref_mut() {
-                        let numbers: HashMap<&str, usize> = outcome
-                            .renamed
-                            .iter()
-                            .map(|(r, n)| (r.as_str(), *n))
-                            .collect();
+                        // holder は木と同じ文字列（残余縮約・区別子付与後）を持つ。
                         for h in sink.iter_mut() {
-                            if let Some(&n) = numbers.get(h.r#ref.as_str()) {
-                                h.name = super::disambiguate::suffixed_name(&h.name, n).name;
+                            if let Some((base, full)) = outcome.names.get(h.r#ref.as_str()) {
+                                h.group_name = base.clone();
+                                h.name = full.clone();
                             }
                         }
                     }
@@ -1118,10 +1112,6 @@ fn build_snapshot_inner(
         // ref は変わらない（AISNAP-10）。
         if emit {
             node.r#ref = Some(elem_ref.to_ref_string());
-            ref_keys.insert(
-                elem_ref.to_ref_string(),
-                (role.to_string(), out_name.clone()),
-            );
             #[cfg(test)]
             if let Some(sink) = sink.as_deref_mut() {
                 sink.push(RefHolder {
@@ -1152,9 +1142,6 @@ fn build_snapshot_inner(
                         .map(|r| r.row),
                 );
             }
-            for h in &headers {
-                ref_keys.insert(h.elem_ref.to_ref_string(), (h.role.clone(), h.name.clone()));
-            }
             #[cfg(test)]
             if let Some(sink) = sink.as_deref_mut() {
                 for h in &headers {
@@ -1172,9 +1159,6 @@ fn build_snapshot_inner(
             for (r, plan) in compressed.rows.into_iter().zip(plans.iter()) {
                 let (controls, controls_truncated) =
                     build_row_controls(doc, &index, &mut refs, elem_ref, plan, &mut truncated)?;
-                for c in &controls {
-                    ref_keys.insert(c.r#ref.clone(), (c.role.clone(), c.name.clone()));
-                }
                 #[cfg(test)]
                 if let Some(sink) = sink.as_deref_mut() {
                     for ((id, _), c) in plan.kept.iter().zip(controls.iter()) {
@@ -2737,5 +2721,71 @@ mod tests {
             .collect();
         assert_eq!(node_names, holder_names);
         assert_eq!(holder_names.get(1).map(|x| x.1.as_str()), Some("alpha #2"));
+    }
+
+    /// 縮約後の表示名で採番する検証用の文書。tabindex 付き table 行は interactive で ref を持ち、
+    /// 子リンクが内容を全部表示するため row の name は空へ縮む。
+    fn shrinking_rows_doc() -> fandhe_browser_core::dom::Document {
+        let html = "<body><table>\
+            <tr tabindex=\"0\"><td><a href=\"/a\">alpha</a></td></tr>\
+            <tr tabindex=\"0\"><td><a href=\"/b\">beta</a></td></tr>\
+            <tr tabindex=\"0\"><td><a href=\"/c\">beta</a></td></tr>\
+            </table></body>";
+        parse_document(html, &ParseOptions::default())
+            .expect("parse")
+            .document
+    }
+
+    fn ref_items(n: &Node, out: &mut Vec<(String, String, String)>) {
+        if let Some(r) = &n.r#ref {
+            out.push((r.clone(), n.role.clone(), n.name.clone()));
+        }
+        for c in &n.children {
+            ref_items(c, out);
+        }
+    }
+
+    /// AISNAP-10・TASK-17（#1221）: 残余縮約後に区別子が付く row でも、holder の name は
+    /// snapshot の name と同じ文字列になる。
+    #[test]
+    fn aisnap_10_holder_name_matches_tree_after_residual_shrink() {
+        let doc = shrinking_rows_doc();
+        let (s, holders) = super::build_snapshot_with_holders(&doc).expect("build");
+        let mut items = Vec::new();
+        ref_items(&s.tree, &mut items);
+        let rows: Vec<(String, String)> = items
+            .iter()
+            .filter(|(_, role, _)| role == "row")
+            .map(|(r, _, n)| (r.clone(), n.clone()))
+            .collect();
+        assert_eq!(rows.len(), 3);
+        for (r, n) in &rows {
+            let h = holders.iter().find(|h| &h.r#ref == r).expect("holder");
+            assert_eq!(&h.name, n);
+        }
+    }
+
+    /// AISNAP-10・TASK-17（#1221）: 縮めると同じ表示名になる別グループでも、出力の
+    /// `(role, name)` は重複せず通し番号が振られる。
+    #[test]
+    fn aisnap_10_suffixes_do_not_collide_across_residual_groups() {
+        let doc = shrinking_rows_doc();
+        let (s, _) = super::build_snapshot_with_holders(&doc).expect("build");
+        let mut items = Vec::new();
+        ref_items(&s.tree, &mut items);
+        let rows: Vec<String> = items
+            .iter()
+            .filter(|(_, role, _)| role == "row")
+            .map(|(_, _, n)| n.clone())
+            .collect();
+        assert_eq!(rows, vec!["", "#2", "#3"]);
+        let mut keys: Vec<(&str, &str)> = items
+            .iter()
+            .map(|(_, role, n)| (role.as_str(), n.as_str()))
+            .collect();
+        keys.sort();
+        let before = keys.len();
+        keys.dedup();
+        assert_eq!(keys.len(), before);
     }
 }

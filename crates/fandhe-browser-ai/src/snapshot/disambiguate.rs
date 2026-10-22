@@ -47,6 +47,9 @@ pub(super) struct DisambiguationOutcome {
     pub(super) renamed: Vec<(String, usize)>,
     /// base の切り詰めが起きたか（`Snapshot::truncated` へ伝える）。
     pub(super) truncated: bool,
+    /// 全 ref 保持要素の `ref → (区別子付与前の表示 name, 最終的な表示 name)`。
+    /// holder の name を木の name と同じ文字列に揃えるために使う。
+    pub(super) names: HashMap<String, (String, String)>,
 }
 
 /// 文書順の入力から、2 件目以降の要素の `ref → 出現番号` を返す純関数。O(要素数)。
@@ -119,20 +122,15 @@ fn walk_ref_items(tree: &mut Node, f: &mut impl FnMut(&str, &str, &mut String)) 
     }
 }
 
-/// 確定した木へ区別子を付ける。`keys` は `ref → (role, ref 発行時の出力 name)`。
+/// 確定した木へ区別子を付ける。
 ///
-/// `keys` に無い ref（到達しない想定）は、現在の role・name をキーとして使う安全側の扱い。
-pub(super) fn apply_disambiguation(
-    tree: &mut Node,
-    keys: &HashMap<String, (String, String)>,
-) -> DisambiguationOutcome {
+/// 重複判定の採番キーは `(role, 木に現れている name)` で、残余縮約（TASK-23.6）後の
+/// エージェントに見える name を使う。縮約で同じ表示名になった別々の要素も 1 グループとして
+/// 通し番号を振るので、出力に `(role, name)` の重複が残らない。
+pub(super) fn apply_disambiguation(tree: &mut Node) -> DisambiguationOutcome {
     let mut collected: Vec<(String, String, String)> = Vec::new();
     walk_ref_items(tree, &mut |role, r, name| {
-        let (k_role, k_name) = match keys.get(r) {
-            Some((kr, kn)) => (kr.clone(), kn.clone()),
-            None => (role.to_string(), name.clone()),
-        };
-        collected.push((r.to_string(), k_role, k_name));
+        collected.push((r.to_string(), role.to_string(), name.clone()));
     });
     let entries: Vec<RefEntry<'_>> = collected
         .iter()
@@ -144,16 +142,15 @@ pub(super) fn apply_disambiguation(
         .collect();
     let numbers = disambiguate_names(&entries);
     let mut outcome = DisambiguationOutcome::default();
-    if numbers.is_empty() {
-        return outcome;
-    }
     walk_ref_items(tree, &mut |_role, r, name| {
+        let base = name.clone();
         if let Some(&n) = numbers.get(r) {
             let s = suffixed_name(name, n);
             outcome.truncated |= s.truncated;
             *name = s.name;
             outcome.renamed.push((r.to_string(), n));
         }
+        outcome.names.insert(r.to_string(), (base, name.clone()));
     });
     outcome
 }
@@ -175,15 +172,6 @@ mod tests {
         n
     }
 
-    fn keys_of(tree: &Node) -> HashMap<String, (String, String)> {
-        let mut t = tree.clone();
-        let mut m = HashMap::new();
-        walk_ref_items(&mut t, &mut |role, r, name| {
-            m.insert(r.to_string(), (role.to_string(), name.clone()));
-        });
-        m
-    }
-
     /// AISNAP-10・TASK-17（#1221）: 先頭は素の name、2 件目以降に ` #n`。ref は不変。
     #[test]
     fn aisnap_10_three_same_keys_get_occurrence_suffix() {
@@ -192,8 +180,7 @@ mod tests {
             link("alpha", "e1-2"),
             link("alpha", "e1-3"),
         ]);
-        let keys = keys_of(&t);
-        let out = apply_disambiguation(&mut t, &keys);
+        let out = apply_disambiguation(&mut t);
         let names: Vec<_> = t.children.iter().map(|c| c.name.as_str()).collect();
         assert_eq!(names, vec!["alpha", "alpha #2", "alpha #3"]);
         let refs: Vec<_> = t
@@ -215,8 +202,7 @@ mod tests {
         let mut b = Node::new("button", "alpha");
         b.r#ref = Some("e2".into());
         let mut t = root(vec![link("alpha", "e1"), b]);
-        let keys = keys_of(&t);
-        apply_disambiguation(&mut t, &keys);
+        apply_disambiguation(&mut t);
         assert_eq!(t.children[0].name, "alpha");
         assert_eq!(t.children[1].name, "alpha");
     }
@@ -225,7 +211,7 @@ mod tests {
     #[test]
     fn aisnap_10_nodes_without_ref_are_ignored() {
         let mut t = root(vec![Node::new("link", "alpha"), Node::new("link", "alpha")]);
-        apply_disambiguation(&mut t, &HashMap::new());
+        apply_disambiguation(&mut t);
         assert_eq!(t.children[0].name, "alpha");
         assert_eq!(t.children[1].name, "alpha");
     }
@@ -240,8 +226,7 @@ mod tests {
         table.table = Some(TableSummary::new(vec![header], vec![row], 0));
         table.children = vec![link("alpha", "k1")];
         let mut t = root(vec![table]);
-        let keys = keys_of(&t);
-        apply_disambiguation(&mut t, &keys);
+        apply_disambiguation(&mut t);
         let tbl = &t.children[0];
         let ts = tbl.table.as_ref().expect("table");
         assert_eq!(tbl.name, "alpha");
@@ -254,8 +239,7 @@ mod tests {
     #[test]
     fn aisnap_10_empty_name_gets_bare_suffix() {
         let mut t = root(vec![link("", "e1"), link("", "e1-2")]);
-        let keys = keys_of(&t);
-        apply_disambiguation(&mut t, &keys);
+        apply_disambiguation(&mut t);
         assert_eq!(t.children[0].name, "");
         assert_eq!(t.children[1].name, "#2");
     }
@@ -282,8 +266,7 @@ mod tests {
     fn aisnap_10_only_name_changes() {
         let mut t = root(vec![link("alpha", "e1"), link("alpha", "e1-2")]);
         let before = t.clone();
-        let keys = keys_of(&t);
-        apply_disambiguation(&mut t, &keys);
+        apply_disambiguation(&mut t);
         let mut after = t.clone();
         after.children[1].name = "alpha".into();
         assert_eq!(after, before);
