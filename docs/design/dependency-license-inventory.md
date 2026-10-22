@@ -101,7 +101,7 @@ Issue #866（TASK-78.3）の結果を要約する。再実測はしていない�
 
 ## 棚卸しの対象外
 
-- `OSS-7` / TASK-103 の npm 由来データ（caniuse-lite・web-features・WPT）は cargo-deny / cargo-about の対象外で、手動レビューで扱う。
+- `OSS-7` / TASK-103 の npm 由来データ（caniuse-lite・web-features・WPT）は cargo-deny / cargo-about の対象外で、手動レビューで扱う（記録は [data-license-review.md](data-license-review.md)）。
 - `NOTICE` 第 2 節末尾の未整備事項（Servo ホストが静的リンクする HarfBuzz と SpiderMonkey 由来の third-party 部品、Servo ホストの LICENSE-CARGO-DEPENDENCIES）は別 Issue で扱う。
 
 ## 結論
