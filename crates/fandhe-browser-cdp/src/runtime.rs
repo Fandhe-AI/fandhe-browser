@@ -26,7 +26,7 @@
 //! - 文書 × セッションあたりの isolated world は [`MAX_ISOLATED_WORLDS_PER_DOCUMENT_SESSION`] まで。
 //!   同じ名前の `Page.createIsolatedWorld` は既存の contextId を返し、イベントは再送しない。
 //! - `uniqueId` は contextId から作る不透明な文字列（`ctx-<id>`）で、Chrome の書式を模さない（`SEC-2`）。
-//! - `origin` は確定 URL から導いた実値（`about:blank` は空文字。core の `url_origin`）。
+//! - `origin` は確定 URL から導いた実値（`about:blank` 等の不透明・解析失敗は空文字。core の `url_origin`）。
 //!
 //! # 差異・スタブ（`REPAIR-3`）
 //!
@@ -397,6 +397,15 @@ impl ExecutionContextTable {
     }
 }
 
+/// core の [`fandhe_browser_core::UrlOrigin`] を CDP の `origin` 文字列へ変換する
+/// （tuple はそのまま、不透明・解析失敗は空文字）。
+pub(crate) fn origin_string(url: &str) -> String {
+    match fandhe_browser_core::url_origin(url) {
+        fandhe_browser_core::UrlOrigin::Tuple(s) => s,
+        _ => String::new(),
+    }
+}
+
 /// `Runtime.executionContextCreated` を作る。`origin` は確定 URL から導いた値（`about:blank` は空）。
 /// `session_id` は呼び出し側（`Dispatcher`）が補完するため `None`。
 pub(crate) fn context_created_event(view: &ContextView, origin: &str) -> CdpEvent {
@@ -456,6 +465,9 @@ pub(crate) fn current_document_events(
     let Some(nav) = state.navigations().get(&tid) else {
         return Vec::new();
     };
+    // 世代確認から登録・イベント構築までを遷移の開始・確定と同じゲートで直列化する
+    // （確認後に別接続の `Page.navigate` が始まっても旧世代の contextId を作らない。`CDP-2`）。
+    let _gate = crate::page::lock_gate(state.commit_gate());
     let before = nav.current_generation();
     let doc = nav.latest();
     let after = nav.current_generation();
@@ -468,7 +480,7 @@ pub(crate) fn current_document_events(
     let Ok(views) = registry.document_contexts(sid, after, include_init_worlds) else {
         return Vec::new();
     };
-    let origin = fandhe_browser_core::url_origin(doc.url());
+    let origin = origin_string(doc.url());
     views
         .iter()
         .map(|v| context_created_event(v, &origin))
@@ -551,6 +563,9 @@ impl CommandHandler for PageCreateIsolatedWorld {
                 .navigations()
                 .get(&tid)
                 .ok_or(CdpError::TARGET_DOCUMENT_UNAVAILABLE)?;
+            // 文書確認から登録・イベント構築までを `Page.navigate` の世代払い出し・確定と同じゲートで
+            // 直列化する（確認後に遷移が始まっても旧世代の contextId を返さない。`CDP-2`）。
+            let _gate = crate::page::lock_gate(state.commit_gate());
             let before = nav.current_generation();
             let doc = nav.latest();
             let after = nav.current_generation();
@@ -565,10 +580,7 @@ impl CommandHandler for PageCreateIsolatedWorld {
                 .map_err(ContextError::to_cdp)?;
             let mut out = HandlerOutput::result(json!({ "executionContextId": created.view.id }));
             if created.announce {
-                let mut ev = context_created_event(
-                    &created.view,
-                    &fandhe_browser_core::url_origin(doc.url()),
-                );
+                let mut ev = context_created_event(&created.view, &origin_string(doc.url()));
                 ev.session_id = Some(sid.clone());
                 out = out.with_pre_event(ev);
             }

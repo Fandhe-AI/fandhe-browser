@@ -196,7 +196,7 @@ pub(crate) struct CommittedNavigation {
 /// 結果確定の直列化と完了順の採番を行うゲート。確定は同期処理のため `await` を跨がない。
 pub(crate) type CommitGate = Mutex<u64>;
 
-fn lock_gate(gate: &CommitGate) -> std::sync::MutexGuard<'_, u64> {
+pub(crate) fn lock_gate(gate: &CommitGate) -> std::sync::MutexGuard<'_, u64> {
     gate.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
@@ -512,7 +512,6 @@ pub(crate) struct PageNavigate {
     /// 以下の `gate`・`published` はハンドラ（= ディスパッチャ）単位で、遷移状態表は `CdpState` 単位。
     /// ディスパッチャは `browser_websocket_config` で 1 回だけ作る前提。
     /// 結果確定の直列化と完了順の採番。
-    gate: CommitGate,
     /// 共有状態へ最後にミラーした内容の記録。ターゲット表の更新・ミラーを 1 つの
     /// 同期境界（このロック）で行い、古い遷移が新しい結果を巻き戻さないようにする。
     published: Mutex<Published>,
@@ -623,7 +622,6 @@ impl PageNavigate {
     pub fn new(options: FetchOptions) -> Result<Self, Error> {
         Ok(Self {
             fetcher: Fetcher::new(options)?,
-            gate: Mutex::new(0),
             published: Mutex::new(Published {
                 seq: 0,
                 mirrored: None,
@@ -707,7 +705,7 @@ impl CommandHandler for PageNavigate {
                         &self.fetcher,
                         &nav,
                         url,
-                        &self.gate,
+                        ctx.state.commit_gate(),
                         ctx.state.app_state().page_scripts(),
                         ctx.state.app_state().script_contexts(),
                     )
@@ -727,7 +725,7 @@ impl CommandHandler for PageNavigate {
                         // 共有状態との食い違いを作らないため。
                         // 世代確認から URL 更新・ミラーまでは `gate` を保持し、同一ターゲットの後続遷移の
                         // 開始（`navigate_gated` の世代払い出し）と排他にする（`CDP-1`）。
-                        let _gate = lock_gate(&self.gate);
+                        let _gate = lock_gate(ctx.state.commit_gate());
                         if nav.current_generation() == c.generation
                             && let Some(r) = &c.result
                         {
@@ -773,7 +771,7 @@ impl CommandHandler for PageNavigate {
                     {
                         // 上の確認と URL 更新の間に同一ターゲットの後続遷移が開始しないよう、
                         // `gate` を保持したうえで世代を再確認する（`CDP-1`）。
-                        let _gate = lock_gate(&self.gate);
+                        let _gate = lock_gate(ctx.state.commit_gate());
                         if nav.current_generation() != g {
                             return Ok(HandlerOutput::result(json!({
                                 "frameId": tid.as_str(),
@@ -822,13 +820,13 @@ impl CommandHandler for PageNavigate {
                         &self.published,
                         app_nav,
                         ctx.state.registry(),
-                        &self.gate,
+                        ctx.state.commit_gate(),
                     ));
                     let out = navigate_gated(
                         &self.fetcher,
                         app_nav,
                         url,
-                        &self.gate,
+                        ctx.state.commit_gate(),
                         ctx.state.app_state().page_scripts(),
                         ctx.state.app_state().script_contexts(),
                     )
@@ -847,7 +845,7 @@ impl CommandHandler for PageNavigate {
                         // 現在の遷移（世代一致・結果保持）のイベントが落ちて待機中のクライアントが
                         // 止まる。追い越された遷移（世代不一致）は `gate` を保持して確認し、送出しない。
                         {
-                            let _gate = lock_gate(&self.gate);
+                            let _gate = lock_gate(ctx.state.commit_gate());
                             if app_nav.current_generation() == c.generation && c.result.is_some() {
                                 navigated = Some(c.url.clone());
                                 recheck_shared = Some(c.generation);
@@ -922,7 +920,7 @@ impl CommandHandler for PageNavigate {
                 }
             }
             if let Some(url) = navigated {
-                let _gate = lock_gate(&self.gate);
+                let _gate = lock_gate(ctx.state.commit_gate());
                 let target_alive = match (&target_id, ctx.session_id) {
                     (Some(tid), Some(sid)) => {
                         let registry = ctx.state.registry();
@@ -950,7 +948,7 @@ impl CommandHandler for PageNavigate {
                                 registry.is_domain_enabled(sid, SessionDomain::Runtime);
                             let views = registry.announce_navigation(tid, g, Some(sid));
                             runtime_on.then(|| {
-                                let origin = fandhe_browser_core::url_origin(&url);
+                                let origin = crate::runtime::origin_string(&url);
                                 views
                                     .iter()
                                     .map(|v| context_created_event(v, &origin))
@@ -2339,7 +2337,7 @@ mod tests {
                 &h.published,
                 st.app_state().navigation(),
                 st.registry(),
-                &h.gate,
+                st.commit_gate(),
             );
             for (id, sid, body) in [(1, &sa, "x"), (2, &sb, "y")] {
                 let u = format!("http://127.0.0.1:{}/", serve("200 OK", body));
@@ -2383,7 +2381,7 @@ mod tests {
                     &h.published,
                     st.app_state().navigation(),
                     st.registry(),
-                    &h.gate,
+                    st.commit_gate(),
                 );
                 let u = format!("http://127.0.0.1:{}/", serve("200 OK", "x"));
                 let req = json!({"id": 1, "method": "Page.navigate",

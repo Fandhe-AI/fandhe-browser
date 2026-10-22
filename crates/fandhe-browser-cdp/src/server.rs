@@ -60,6 +60,9 @@ pub struct CdpState {
     method_log: ReceivedMethodLog,
     /// 接続スコープの状態（自動 attach のセッション所有・ダウンロード設定。`CDP-2`・`CDP-7`）。
     conn_scoped: ConnectionScoped,
+    /// 遷移の結果確定・世代払い出しと、実行コンテキストの文書確認〜登録を直列化するゲート
+    /// （`Page.navigate` と `Page.createIsolatedWorld`・`Runtime.enable` が共有。`CDP-2`・TASK-44.6）。
+    commit_gate: crate::page::CommitGate,
 }
 
 impl CdpState {
@@ -77,6 +80,7 @@ impl CdpState {
             browser_id,
             registry: TargetRegistry::new(),
             navigations,
+            commit_gate: std::sync::Mutex::new(0),
             dom_issued: IssuedDocuments::new(),
             method_log: ReceivedMethodLog::new(),
             conn_scoped: ConnectionScoped::new(),
@@ -163,6 +167,11 @@ impl CdpState {
     /// nodeId 払い出し済み文書の記録（crate 内部専用。`CDP-1`）。
     pub(crate) fn dom_issued(&self) -> &IssuedDocuments {
         &self.dom_issued
+    }
+
+    /// 遷移確定と実行コンテキスト登録の共通ゲート（crate 内部専用。`CDP-1`・`CDP-2`）。
+    pub(crate) fn commit_gate(&self) -> &crate::page::CommitGate {
+        &self.commit_gate
     }
 
     /// ターゲット別の遷移状態表（crate 内部専用。`CDP-1`）。

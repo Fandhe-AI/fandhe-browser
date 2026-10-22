@@ -944,23 +944,34 @@ fn reject_disallowed_scheme(url: &Url) -> Result<()> {
     }
 }
 
-/// 確定 URL から `executionContextCreated.origin` 用の origin 文字列を導く（cdp の実行コンテキスト表が
-/// 呼ぶ。`CDP-2`・TASK-44.6）。
+/// [`url_origin`] の結果。origin の状態を区別する（`REPAIR-4`。将来の拡張に備え `non_exhaustive`）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum UrlOrigin {
+    /// tuple origin（`http`・`https` 等）。`ascii_serialization`（既定ポートは省略・host は小文字）。
+    Tuple(String),
+    /// 不透明 origin（`about:blank`・`data:` 等）。
+    Opaque,
+    /// URL として解析できない。
+    ParseError,
+}
+
+/// 確定 URL から origin を導く（cdp の実行コンテキスト表が呼ぶ。`CDP-2`・TASK-44.6）。
 ///
-/// scheme・host・port だけを返し、path・query・fragment・userinfo は含めない。tuple origin
-/// （`http`・`https` 等）は `ascii_serialization`（既定ポートは省略・host は小文字）、
-/// 不透明 origin（`about:blank`・`data:` 等）と解析失敗は空文字を返す（偽の origin を作らない）。
-pub fn url_origin(url: &str) -> String {
+/// scheme・host・port だけを [`UrlOrigin::Tuple`] に入れ、path・query・fragment・userinfo は含めない。
+/// 不透明 origin は [`UrlOrigin::Opaque`]、解析失敗は [`UrlOrigin::ParseError`]（偽の origin を作らない）。
+/// CDP 用の文字列化（不透明・失敗は空文字）は利用側が行う。
+pub fn url_origin(url: &str) -> UrlOrigin {
     match Url::parse(url) {
         Ok(u) => {
             let origin = u.origin();
             if origin.is_tuple() {
-                origin.ascii_serialization()
+                UrlOrigin::Tuple(origin.ascii_serialization())
             } else {
-                String::new()
+                UrlOrigin::Opaque
             }
         }
-        Err(_) => String::new(),
+        Err(_) => UrlOrigin::ParseError,
     }
 }
 
@@ -1177,18 +1188,20 @@ impl FetchResponse {
 
 #[cfg(test)]
 mod tests {
-    /// `CDP-2`・TASK-44.6: origin は scheme・host・port のみで、不透明・不正は空文字。
+    /// `CDP-2`・TASK-44.6: origin は scheme・host・port のみ。不透明と解析失敗は区別する。
     #[test]
-    fn cdp2_url_origin_is_tuple_origin_or_empty() {
+    fn cdp2_url_origin_distinguishes_tuple_opaque_and_parse_error() {
+        use super::UrlOrigin::{Opaque, ParseError, Tuple};
+        let t = |s: &str| Tuple(s.to_string());
         let cases = [
-            ("http://a.example:8080/x?y#z", "http://a.example:8080"),
-            ("https://A.example/", "https://a.example"),
-            ("https://u:p@a.example:443/p", "https://a.example"),
-            ("http://127.0.0.1:3000/", "http://127.0.0.1:3000"),
-            ("about:blank", ""),
-            ("data:text/html,x", ""),
-            ("not a url", ""),
-            ("", ""),
+            ("http://a.example:8080/x?y#z", t("http://a.example:8080")),
+            ("https://A.example/", t("https://a.example")),
+            ("https://u:p@a.example:443/p", t("https://a.example")),
+            ("http://127.0.0.1:3000/", t("http://127.0.0.1:3000")),
+            ("about:blank", Opaque),
+            ("data:text/html,x", Opaque),
+            ("not a url", ParseError),
+            ("", ParseError),
         ];
         for (input, want) in cases {
             assert_eq!(super::url_origin(input), want, "{input}");

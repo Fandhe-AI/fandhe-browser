@@ -147,7 +147,8 @@ pub use event_loop::{
     EventLoopLimits, MAX_TIMER_DELAY_MS,
 };
 pub use fetch::{
-    FetchOptions, FetchResponse, Fetcher, USER_AGENT, check_network_target_url, url_origin,
+    FetchOptions, FetchResponse, Fetcher, USER_AGENT, UrlOrigin, check_network_target_url,
+    url_origin,
 };
 // js crate のワーカー入口をそのまま再エクスポートする（ラッパーを挟まない）。ラッパーで
 // マーカー設定時にも `None` を返すと fail-closed が崩れるため（security.md・`JS-2`・#513）。
