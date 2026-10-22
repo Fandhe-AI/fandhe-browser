@@ -383,7 +383,20 @@ fn reidentify_after(
             }
         }
     }
+    // 件数が同じでも、セレクタが指す対象が変化後の Snapshot から省略された（要素は在るが ref を
+    // 持たない）のに、同名の別要素が元の ref を引き継ぐなら、消失と同名要素追加の相殺であり
+    // 別要素の同一視になる。`Stable` にせず `Ambiguous` で検出する。
+    let target_omitted = query_selector_all_str(&doc, doc.root(), selector)
+        .ok()
+        .is_some_and(|m| match m.as_slice() {
+            [id] => !holders.iter().any(|h| h.node == *id),
+            _ => false,
+        });
     match candidates.as_slice() {
+        [one] if one.r#ref == b_ref && target_omitted => Reidentification::Ambiguous {
+            side: Side::After,
+            count: 1,
+        },
         [one] if one.r#ref == b_ref => Reidentification::Stable {
             role: b_role,
             name: b_name,
@@ -919,6 +932,30 @@ fn aisnap_10_duplicate_removed_target_is_ambiguous() {
             side: Side::After,
             count: 1
         }
+    );
+}
+
+/// AISNAP-10・Issue #1221: 対象の消失と同名要素の追加が相殺され、グループ件数が同じでも
+/// 対象が Snapshot から消えたなら `Stable` にせず `Ambiguous`。
+#[test]
+fn aisnap_10_hidden_target_with_added_sibling_same_count_is_ambiguous() {
+    let before = page("<button class=\"target\">Go</button><button>Go</button>");
+    let after =
+        page("<button class=\"target\" hidden>Go</button><button>Go</button><button>Go</button>");
+    let result = check_reidentification(&StabilityCase {
+        before_html: &before,
+        after_html: &after,
+        selector: ".target",
+    });
+    assert!(
+        matches!(
+            result,
+            Reidentification::Ambiguous {
+                side: Side::After,
+                ..
+            }
+        ),
+        "{result:?}"
     );
 }
 
