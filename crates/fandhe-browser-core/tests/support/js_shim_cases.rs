@@ -3744,7 +3744,7 @@ fn class_list_cases(engine: &str) {
     eprintln!("case: JS-5 classList (#1236)");
     let mut p = setup(engine, None);
     let pre = "var e = document.createElement('div'); e.setAttribute('class','a a b'); var L = e.classList; ";
-    let cases: [(&str, &str); 16] = [
+    let cases: [(&str, &str); 17] = [
         ("String(e.classList === e.classList)", "true"),
         // 引数変換が class を変更する場合は変換後の集合で判定する（receiver 検証 → 引数変換 → 属性読み取り）
         (
@@ -3772,7 +3772,7 @@ fn class_list_cases(engine: &str) {
         ),
         (
             "var r = ''; try { L.toggle() } catch (x) { r += x.name } try { L.contains() } catch (x) { r += x.name } try { L.item() } catch (x) { r += x.name } r + '|' + e.getAttribute('class') + '|' + L.toggle(undefined) + '|' + e.getAttribute('class')",
-            "TypeErrorTypeErrorTypeError|a b|true|a b undefined",
+            "TypeErrorTypeErrorTypeError|a a b|true|a b undefined",
         ),
         ("e.className = 'p q'; String(L.length)", "2"),
         (
