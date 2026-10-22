@@ -161,13 +161,21 @@ resolve_dumpbin() {
   return 1
 }
 
+# to_dumpbin_path <path>: dumpbin へ渡すパス表記を返す。cygpath があれば Windows 形式（cygpath -w）、なければそのまま。
+# run_dumpbin と自己テストの期待値が同じ変換を共有し、食い違いを防ぐ。
+to_dumpbin_path() {
+  if command -v cygpath >/dev/null 2>&1; then
+    cygpath -w "$1"
+  else
+    printf '%s\n' "$1"
+  fi
+}
+
 # run_dumpbin <dumpbin> <binary>: dumpbin -nologo -dependents の出力を返す。
 # Git Bash の引数パス変換（/dependents 等）を避けるためダッシュ形式で呼び、変換も無効化する。
 run_dumpbin() {
-  local db="$1" bin="$2" winbin="$2"
-  if command -v cygpath >/dev/null 2>&1; then
-    winbin="$(cygpath -w "${bin}")"
-  fi
+  local db="$1" bin="$2" winbin
+  winbin="$(to_dumpbin_path "${bin}")"
   MSYS2_ARG_CONV_EXCL='*' MSYS_NO_PATHCONV=1 "${db}" -nologo -dependents "${winbin}" 2>&1
 }
 
@@ -328,7 +336,16 @@ FAKE
   expect "enforce: outside exits 1" 1 "${rc}"
   case "${out}" in *"result=outside"*) echo "ok: enforce reports result=outside" ;; *) echo "FAIL: enforce output: ${out}" >&2; fails=$((fails + 1)) ;; esac
   case "${out}" in *"CRT DLL(s) found"*) echo "ok: CRT warning emitted" ;; *) echo "FAIL: no CRT warning: ${out}" >&2; fails=$((fails + 1)) ;; esac
-  expect "dumpbin args: dash-style options" "-nologo -dependents ${tmp}/target" "$(cat "${tmp}/args.log")"
+  expect "dumpbin args: dash-style options" "-nologo -dependents $(to_dumpbin_path "${tmp}/target")" "$(cat "${tmp}/args.log")"
+  # Windows 形式パス変換の契約: 偽 cygpath（-w の結果に W: を前置）が PATH にあるとき、dumpbin へ変換後のパスが渡る。
+  mkdir -p "${tmp}/fakebin"
+  cat >"${tmp}/fakebin/cygpath" <<'FAKECYG'
+#!/bin/sh
+printf 'W:%s\n' "$2"
+FAKECYG
+  chmod +x "${tmp}/fakebin/cygpath"
+  PATH="${tmp}/fakebin:${PATH}" DUMPBIN="${tmp}/fake-dumpbin" bash "${BASH_SOURCE[0]}" --mode record --allowlist "${tmp}/ok.txt" "${tmp}/target" >/dev/null 2>&1 || true
+  expect "dumpbin args: cygpath -w converted path" "-nologo -dependents W:${tmp}/target" "$(cat "${tmp}/args.log")"
   out="$(DUMPBIN="${tmp}/fake-dumpbin" bash "${BASH_SOURCE[0]}" --mode record --allowlist "${tmp}/ok.txt" "${tmp}/target" 2>&1)" && rc=0 || rc=$?
   expect "record: outside exits 0" 0 "${rc}"
   case "${out}" in
