@@ -1,7 +1,7 @@
 //! `plugin_overhead` ベンチの引数解析（TASK-95.1・Issue #375・`PLUG-3`）。
 //!
 //! `plugin_overhead.rs` の main が `cargo bench ... -- <args>` の引数を渡す。純関数で I/O を持たず、
-//! 資源枯渇を防ぐため回数・待ち時間に上限を設ける。`--metric` は指標の拡張点（cold start は TASK-95.2 で追加済み、レイテンシは TASK-95.3）。
+//! 資源枯渇を防ぐため回数・待ち時間に上限を設ける。`--metric` は指標の拡張点（cold start は TASK-95.2、レイテンシは TASK-95.3、`all` と `--format` は TASK-95.4）。
 
 /// 計測する指標。`idle-rss`（TASK-95.1）・`cold-start`（TASK-95.2）・`call-latency`（TASK-95.3）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -9,6 +9,13 @@ pub enum Metric {
     IdleRss,
     ColdStart,
     CallLatency,
+}
+
+/// 出力形式。`tsv`（既定・指標ごとの人間向け表）と `jsonl`（TASK-95.4・TASK-10 形式の単一レポート）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Format {
+    Tsv,
+    Jsonl,
 }
 
 /// 解析済みの引数。
@@ -22,6 +29,8 @@ pub struct Options {
     pub interval_ms: u64,
     /// `call-latency` の計測呼び出し回数（既定 30 は `PLUG-3` の n=30）。
     pub calls: usize,
+    /// 出力形式（`--format`。既定 `tsv`）。
+    pub format: Format,
 }
 
 fn int_arg<T: std::str::FromStr + PartialOrd>(
@@ -48,6 +57,7 @@ impl Options {
         let mut settle_ms = 800u64;
         let mut interval_ms = 200u64;
         let mut calls = 30usize;
+        let mut format = Format::Tsv;
         let mut it = args.iter();
         while let Some(a) = it.next() {
             match a.as_str() {
@@ -69,8 +79,22 @@ impl Options {
                             metrics.push(Metric::CallLatency);
                         }
                     }
+                    // `all` は 3 指標を固定順（idle-rss → cold-start → call-latency）で足す（TASK-95.4）。
+                    Some("all") => {
+                        for m in [Metric::IdleRss, Metric::ColdStart, Metric::CallLatency] {
+                            if !metrics.contains(&m) {
+                                metrics.push(m);
+                            }
+                        }
+                    }
                     Some(_) => return Err("unknown metric".to_string()),
                     None => return Err("--metric requires a value".to_string()),
+                },
+                "--format" => match it.next().map(String::as_str) {
+                    Some("tsv") => format = Format::Tsv,
+                    Some("jsonl") => format = Format::Jsonl,
+                    Some(_) => return Err("unknown format".to_string()),
+                    None => return Err("--format requires a value".to_string()),
                 },
                 "--samples" => samples = int_arg("--samples", it.next(), 1, 20)?,
                 "--trials" => trials = int_arg("--trials", it.next(), 1, 20)?,
@@ -90,6 +114,7 @@ impl Options {
             settle_ms,
             interval_ms,
             calls,
+            format,
         })
     }
 }
