@@ -34,7 +34,7 @@ Playwright のソースは長く引用せず、関数名と要約に留める。
 | `newContext()` | 成功（`acceptDownloads:false` 指定時。TASK-43.3d・#909 で到達）。`Target.createBrowserContext`（`disposeOnDetach:true`）と `browserContextId` 付き `Browser.setDownloadBehavior`（`deny` + `eventsEnabled:true`）が成功する（後述「段階 2b の実施結果」） | A: seq 10〜14 |
 | `newPage()` | 成功（`connectOverCDP(noDefaults:true)`・`newContext({acceptDownloads:false, viewport:null})` 指定時。TASK-43.3n・#1042 で到達を確認。後述「到達結果（TASK-43.3n）」）。`Browser.getWindowForTarget` は `-32601` のまま残るが `newPage()` は失敗しない（`Page.createIsolatedWorld` は TASK-44.6・#1217 で実装済み。評価器が無効な構成ではエラー。cli 既定〔V8〕では TASK-44.9・#1220 で有効） | A: seq 15〜41 |
 | `goto`（ローカル fixture） | 成功（TASK-44.3・TASK-44.4 で確認。後述「テスト結果レポート（TASK-44.4）」） | A |
-| `selector`（`#target`） | 失敗（TASK-44.9・#1220 の再実測で `StageTimeout` は解消。#1237 で core が `*` に対応し `locator.count` は通るようになった。#1242 で `CustomEvent` と要素の `dispatchEvent` を補い `CustomEvent is not defined` は解消したが、続く `locator.textContent` が `TypeError: Cannot read properties of undefined (reading 'length')` で失敗する。後述「再実測（#1242）」） | A |
+| `selector`（`#target`） | 成功（#1245 で `Element.attributes` を補い、5 段階すべてに到達。経過: TASK-44.9・#1220 で `StageTimeout` を解消、#1237 で `*` に対応、#1242 で `CustomEvent` を追加。後述「再実測（#1245）」） | A |
 
 `-32601` は未実装メソッドへ成功を捏造しない `CDP-6`・`SEC-2` の方針どおりの挙動で、バグではない。
 
