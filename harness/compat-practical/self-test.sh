@@ -747,5 +747,108 @@ expect_eq "$(jq -cS . "$SCRIPT_DIR/results/matrix.json" | tr -d '\r')" \
   "$(jq -cS . "$REAL_OUT" | tr -d '\r')" "committed matrix.json equals make_matrix output"
 expect_exit "make_matrix real validate-only" 0 bash "$MAKE_MATRIX" --validate-only
 
+# --- aggregate_by_type.sh（TASK-72.1・COMPAT-1）---
+AGG="$SCRIPT_DIR/aggregate_by_type.sh"
+AG="$WORK/agg"
+mkdir -p "$AG"
+cat >"$AG/m.json" <<'JSON'
+[
+  {"id":"a1","cat":"static","fandhe_browser_core":true,"chromium":true},
+  {"id":"a2","cat":"static","fandhe_browser_core":true,"chromium":true},
+  {"id":"a3","cat":"static","fandhe_browser_core":false,"chromium":true},
+  {"id":"b1","cat":"spa","fandhe_browser_core":true,"chromium":false},
+  {"id":"d1","cat":"form","fandhe_browser_core":false,"chromium":true},
+  {"id":"c1","cat":"lazy","fandhe_browser_core":true,"chromium":true},
+  {"id":"e1","cat":"table","fandhe_browser_core":false,"chromium":false},
+  {"id":"e2","cat":"table","fandhe_browser_core":false,"chromium":true},
+  {"id":"e3","cat":"table","fandhe_browser_core":true,"chromium":true},
+  {"id":"m1","cat":"misc","fandhe_browser_core":true,"chromium":true}
+]
+JSON
+expect_exit "aggregate synthetic" 0 bash "$AGG" --matrix "$AG/m.json"
+EXPECTED_AGG="type=a cat=static role=target core=2/3 rate=66.7% chromium=3/3 rate=100.0%
+type=b cat=spa role=target core=1/1 rate=100.0% chromium=0/1 rate=0.0%
+type=d cat=form role=target core=0/1 rate=0.0% chromium=1/1 rate=100.0%
+type=c cat=lazy role=reference core=1/1 rate=100.0% chromium=1/1 rate=100.0%
+type=e cat=table role=reference core=1/3 rate=33.3% chromium=2/3 rate=66.7%
+type=- cat=misc role=unmapped core=1/1 rate=100.0% chromium=1/1 rate=100.0%
+overall core=6/10 rate=60.0% chromium=8/10 rate=80.0%"
+expect_eq "$LAST_OUTPUT" "$EXPECTED_AGG" "aggregate synthetic lines and order"
+expect_eq "$(ls -A "$AG" | grep -c '^\.aggregate\.' || true)" "0" "aggregate without --out leaves no temp file"
+expect_eq "$([ -e "$AG/out.json" ] && echo exists || echo absent)" "absent" "aggregate without --out writes nothing"
+expect_exit "aggregate --out" 0 bash "$AGG" --matrix "$AG/m.json" --out "$AG/out.json"
+expect_eq "$(jq -r '.schema_version' "$AG/out.json")" "1" "aggregate out schema_version"
+expect_eq "$(jq -r '.key' "$AG/out.json")" "fandhe_browser_core" "aggregate out key"
+expect_eq "$(jq -r '.types | length' "$AG/out.json")" "6" "aggregate out types count"
+expect_eq "$(jq -r '[.types[].core.rate_percent | type] | unique | join(",")' "$AG/out.json")" "string" "aggregate out rate_percent is string"
+expect_eq "$(jq -r '.types[0] | keys | join(",")' "$AG/out.json")" "cat,chromium,core,role,type" "aggregate out type keys"
+expect_eq "$(jq -r '.overall.core.rate_percent' "$AG/out.json")" "60.0" "aggregate out overall"
+expect_eq "$(jq -r '.matrix_sha256' "$AG/out.json")" "$(sha256_of "$AG/m.json")" "aggregate out matrix_sha256"
+expect_eq "$(ls -A "$AG" | grep -c '^\.aggregate\.' || true)" "0" "aggregate --out leaves no temp file"
+
+# chromium の一部欠落は存在件数で集計し、全欠落は null
+jq 'map(if .id == "a1" or .id == "m1" then del(.chromium) else . end)' "$AG/m.json" >"$AG/partial.json"
+expect_exit "aggregate partial chromium" 0 bash "$AGG" --matrix "$AG/partial.json" --out "$AG/partial_out.json"
+expect_eq "$(jq -r '.types[0].chromium.total' "$AG/partial_out.json")" "2" "aggregate chromium total counts present entries"
+jq 'map(del(.chromium))' "$AG/m.json" >"$AG/nochrom.json"
+expect_exit "aggregate no chromium" 0 bash "$AGG" --matrix "$AG/nochrom.json" --out "$AG/nochrom_out.json"
+expect_eq "$(jq -c '.overall.chromium' "$AG/nochrom_out.json")" "null" "aggregate chromium null when absent"
+expect_exit "aggregate --key chromium" 0 bash "$AGG" --matrix "$AG/m.json" --key chromium
+expect_contains "$LAST_OUTPUT" "overall core=8/10 rate=80.0%" "aggregate --key chromium aggregates chromium values"
+
+# 0 件の参考類型は total 0・rate n/a（exit 0）
+jq 'map(select(.cat != "lazy"))' "$AG/m.json" >"$AG/nolazy.json"
+expect_exit "aggregate empty reference type" 0 bash "$AGG" --matrix "$AG/nolazy.json"
+expect_contains "$LAST_OUTPUT" "type=c cat=lazy role=reference core=0/0 rate=n/a chromium=n/a" "aggregate empty reference type line"
+
+# 異常系（exit 2・既存の --out を壊さない）
+echo 'previous aggregate' >"$AG/keep.json"
+agg_expect_fail() { # $1=name $2=matrix file
+  expect_exit "aggregate $1" 2 bash "$AGG" --matrix "$2" --out "$AG/keep.json"
+  expect_eq "$(cat "$AG/keep.json")" "previous aggregate" "aggregate $1 keeps existing --out"
+}
+agg_expect_fail "missing file" "$AG/nonexistent.json"
+head -c 1048577 /dev/zero | tr '\0' ' ' >"$AG/big.json"
+agg_expect_fail "oversized file" "$AG/big.json"
+echo '[{' >"$AG/bad.json"
+agg_expect_fail "invalid json" "$AG/bad.json"
+echo '[] []' >"$AG/two.json"
+agg_expect_fail "two documents" "$AG/two.json"
+echo '{"a":1}' >"$AG/obj.json"
+agg_expect_fail "non-array" "$AG/obj.json"
+echo '[]' >"$AG/empty.json"
+agg_expect_fail "empty array" "$AG/empty.json"
+jq '. + [1]' "$AG/m.json" >"$AG/nonobj.json"
+agg_expect_fail "non-object entry" "$AG/nonobj.json"
+jq '. + [{"id":"a1","cat":"static","fandhe_browser_core":true}]' "$AG/m.json" >"$AG/dup.json"
+agg_expect_fail "duplicate id" "$AG/dup.json"
+jq '. + [{"id":"x1","cat":"a\nb","fandhe_browser_core":true}]' "$AG/m.json" >"$AG/nlcat.json"
+agg_expect_fail "newline cat" "$AG/nlcat.json"
+jq '. + [{"id":"x1","cat":"","fandhe_browser_core":true}]' "$AG/m.json" >"$AG/emptycat.json"
+agg_expect_fail "empty cat" "$AG/emptycat.json"
+jq 'map(if .id == "a1" then .fandhe_browser_core = "yes" else . end)' "$AG/m.json" >"$AG/nonbool.json"
+agg_expect_fail "non-boolean key field" "$AG/nonbool.json"
+jq 'map(if .id == "a1" then .chromium = 1 else . end)' "$AG/m.json" >"$AG/nonboolc.json"
+agg_expect_fail "non-boolean chromium" "$AG/nonboolc.json"
+for c in static spa form; do
+  jq --arg c "$c" 'map(select(.cat != $c))' "$AG/m.json" >"$AG/no_$c.json"
+  agg_expect_fail "no $c entries" "$AG/no_$c.json"
+done
+expect_exit "aggregate invalid --key" 2 bash "$AGG" --matrix "$AG/m.json" --key 'a b'
+expect_exit "aggregate unknown argument" 2 bash "$AGG" --bogus
+expect_exit "aggregate missing value" 2 bash "$AGG" --matrix
+
+# 実入力: 件数は再計測で変わるためハードコードせず、jq による独立の再集計と突き合わせる
+REAL_MATRIX="$SCRIPT_DIR/results/matrix.json"
+expect_exit "aggregate real matrix" 0 bash "$AGG" --out "$AG/real.json"
+expect_eq "$(jq '[.types[].core.total] | add' "$AG/real.json")" "$(jq length "$REAL_MATRIX")" "aggregate real type totals sum to matrix length"
+expect_eq "$(jq '.overall.core.total' "$AG/real.json")" "$(jq length "$REAL_MATRIX")" "aggregate real overall total equals matrix length"
+for c in static spa form lazy table; do
+  expect_eq "$(jq -c --arg c "$c" '.types[] | select(.cat == $c) | [.core.passed, .core.total, .chromium.passed, .chromium.total]' "$AG/real.json")" \
+    "$(jq -c --arg c "$c" 'map(select(.cat == $c)) | [([.[] | select(.fandhe_browser_core)] | length), length, ([.[] | select(.chromium)] | length), length]' "$REAL_MATRIX")" \
+    "aggregate real $c matches independent recount"
+done
+expect_eq "$(jq -c '[.types[] | select(.role != "unmapped") | .type]' "$AG/real.json")" '["a","b","d","c","e"]' "aggregate real type order"
+
 echo "cases=$CASES failures=$FAILURES"
 [ "$FAILURES" -eq 0 ]

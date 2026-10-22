@@ -8,6 +8,7 @@ spec 対応: TASK-71.1・TASK-71.2 / MS-6 / `MEAS-4`（関連 `COMPAT-4`・`JS-2
 | ---- | ---- |
 | #311（TASK-71.2） | 22 タスクの実行スクリプト `run_core.sh`（本 README「run_core.sh」節） |
 | #312（TASK-71.3） | Chromium 実測との突合・`results/matrix.json` 生成（本 README「make_matrix.sh」節。生成スクリプトに加え、実測から生成した `results/matrix.json` をコミット済みで、回帰ゲートは有効。#920） |
+| #315（TASK-72.1） | 類型別動作率集計 `aggregate_by_type.sh`（本 README「aggregate_by_type.sh」節） |
 | #313（TASK-71.4） | 測定レポート `REPORT.md`（JS 有効の再計測と b5・d2・d3 の解消確認） |
 
 ## ファイル
@@ -17,6 +18,7 @@ spec 対応: TASK-71.1・TASK-71.2 / MS-6 / `MEAS-4`（関連 `COMPAT-4`・`JS-2
 | `tasks.json` | 22 タスク定義 |
 | `lib.sh` | 共通関数 `resolve_bin`（実行対象バイナリの解決と検証）・`sha256_of` |
 | `make_matrix.sh` | core 実測と Chromium 参照データを `id` で突合し動作率マトリクスを生成（TASK-71.3） |
+| `aggregate_by_type.sh` | `results/matrix.json` を類型 (a)〜(e) 別に集計し成功数・全体数・動作率を出力（TASK-72.1。判定はしない） |
 | `reference/chromium_results.json` | PoC-9 の Chromium（Playwright）実測の転記（22 件。出所は「make_matrix.sh」節） |
 | `access_check.sh` | tasks.json の検証と、22 サイトへの到達可否の記録（curl） |
 | `run_core.sh` | 22 タスクを `fandhe-browser` の CDP サーバーで実行し結果を JSONL へ記録（TASK-71.2） |
@@ -126,6 +128,23 @@ spec 対応: TASK-71.3 / MS-6 / `COMPAT-4`（関連 `COMPAT-1`・`MEAS-4`・`REP
 - `--validate-only`: 検証と突合までで、ファイルは書かない（CI で実行）
 - 終了コード: `0` 生成・検証完了（動作率が低くても 0。判定はゲートの `check-matrix.sh` の役割）、`1` 書き込み失敗、`2` 入力・使用エラー。書き込みは一時ファイル経由の置換で、失敗時に既存の `--out` を壊さない
 - 類型の対応（PoC-9 の a〜e）: a=`static`・b=`spa`・c=`lazy`・d=`form`・e=`table`。`id` の頭文字と一致する
+
+## aggregate_by_type.sh
+
+```bash
+bash harness/compat-practical/aggregate_by_type.sh [--matrix P] [--key NAME] [--out P]
+```
+
+spec 対応: TASK-72.1 / MS-6 / `COMPAT-1`（関連 `COMPAT-4`・`MEAS-4`・`REPAIR-3`）。
+
+- 入力: `results/matrix.json`（既定。`--matrix` で変更）。`--key` は集計する boolean フィールド名（既定 `fandhe_browser_core`。`^[A-Za-z0-9_]+$`）
+- 類型の対応: a=`static`・b=`spa`・d=`form`（目標類型）、c=`lazy`・e=`table`（参考値）。表に無い `cat` は `type=-`・`role=unmapped` として末尾に参考出力する。並びは a・b・d・c・e・unmapped・overall
+- 出力（stdout・1 行 1 区分）: `type=a cat=static role=target core=<成功>/<全体> rate=<率>% chromium=<成功>/<全体> rate=<率>%`。chromium は `chromium` フィールドを持つ要素だけで数え、1 件も無ければ `n/a`。全体 0 件の類型は `rate=n/a`
+- 動作率は整数演算で小数 1 桁に四捨五入した文字列（例 17/22 → `77.3`）
+- `--out P`: 指定時のみ集計 JSON（`schema_version`・`key`・`matrix_sha256`・`types`・`overall`）を一時ファイル経由で書く。絶対パス・ホスト名は含めない
+- 入力検証（fail-closed・終了コード 2）: サイズ 1 MiB 以下・要素数 10000 以下・単一 JSON 配列・`id` / `cat` の文字種と `id` 重複なし・`--key` と `chromium` が boolean・目標類型 (a)(b)(d) の `cat` が各 1 件以上
+- 終了コード: `0` 集計完了（率の高低によらない）、`1` `--out` の書き込み失敗、`2` 入力・使用エラー
+- 70% の達成判定はしない（ゲートは `check-matrix.sh`、考察は TASK-72.2 の `type-report.md`）。ハーネスの他スクリプトと同じく bash + jq とし、CI の `self-test.sh` 経路（3 OS）に収めた
 
 ### Chromium 参照データの出所
 
