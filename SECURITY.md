@@ -1,8 +1,8 @@
 # Security Policy
 
-fandhe-browser の脆弱性の報告手順と対応方針を定める。正式な報告窓口は未確定で、確定後に本書へ反映する。
+fandhe-browser の脆弱性の報告手順と対応方針を定める。
 
-spec 対応: `OSS-5`（`04-behavior/oss-licensing.md`）/ TASK-79（79.4）/ MS-7。
+spec 対応: `OSS-5`（`04-behavior/oss-licensing.md`）/ TASK-79（79.4・79.h1）/ MS-7。
 
 ## 対象バージョン
 
@@ -13,7 +13,7 @@ spec 対応: `OSS-5`（`04-behavior/oss-licensing.md`）/ TASK-79（79.4）/ MS-
 ## 脆弱性の報告手順
 
 1. 公開の Issue・PR・Discussions・コミットメッセージに脆弱性の詳細を書かない
-2. 現時点で利用できる非公開の経路は GitHub の private vulnerability reporting。リポジトリの Security タブの「Report a vulnerability」から送る
+2. 正式な報告窓口は GitHub の Private Vulnerability Reporting。リポジトリの Security タブの「Report a vulnerability」から送る
    （<https://github.com/Fandhe-AI/fandhe-browser/security/advisories/new>）
 3. 次の情報を含める
    - 対象のコミット SHA
@@ -31,14 +31,14 @@ spec 対応: `OSS-5`（`04-behavior/oss-licensing.md`）/ TASK-79（79.4）/ MS-
 
 ## 報告窓口
 
-正式な連絡先は未確定。TASK-79（79.h1）で確定し、本書へ反映する予定。確定までは上記の private vulnerability reporting を使う。
+正式な報告窓口は GitHub の Private Vulnerability Reporting とする。手順は上記「脆弱性の報告手順」を参照する。メールアドレス等の別の連絡先は置かない。
 
 ## 対応方針
 
-以下は暫定の目安であり、保証（SLA）ではない。TASK-79（79.h1）の方針確定にあわせて見直す。
+以下は目安であり、保証（SLA）ではない。
 
-| 段階 | 暫定の目安 |
-| ---- | ---------- |
+| 段階 | 目安 |
+| ---- | ---- |
 | 受領確認 | 報告から 7 日以内 |
 | 初期評価（再現可否・深刻度の一次判断）の連絡 | 受領確認から 14 日以内 |
 | 進捗連絡 | 対応完了まで少なくとも 30 日ごと |

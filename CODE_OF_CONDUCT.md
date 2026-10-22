@@ -86,11 +86,11 @@
 
 本節は fandhe-browser が追加した補足であり、Contributor Covenant の本文ではない。
 
-spec 対応: `OSS-5`（`04-behavior/oss-licensing.md`）/ `TASK-79`（79.3）/ `MS-7`。
+spec 対応: `OSS-5`（`04-behavior/oss-licensing.md`）/ `TASK-79`（79.3・79.h1）/ `MS-7`。
 
 ### 出典・ライセンス
 
-* 採用テンプレート: Contributor Covenant 2.1 日本語訳（暫定。採用テンプレートの確定は TASK-79（79.h1）で行う）
+* 採用テンプレート: Contributor Covenant 2.1 日本語訳
 * 取得元（コミット固定）: <https://raw.githubusercontent.com/EthicalSource/contributor_covenant/7255a28d23d5bc296de2e4e4e9bb5ee1126f1345/content/version/2/1/code_of_conduct.ja.md>
 * 公式サイト（日本語訳）: <https://www.contributor-covenant.org/ja/version/2/1/code_of_conduct/code_of_conduct.md>
 * 英語原文: <https://www.contributor-covenant.org/version/2/1/code_of_conduct/>
@@ -106,7 +106,8 @@ spec 対応: `OSS-5`（`04-behavior/oss-licensing.md`）/ `TASK-79`（79.3）/ `
 
 ### 報告窓口
 
-報告窓口の連絡先は **未確定** であり、TASK-79（79.h1）で確定して本ドキュメントへ反映する予定。確定までの間は次の点に注意する。
+専用の連絡先（メールアドレス等）は置かない。次のとおり対応する。
 
-* 当事者が特定される内容を公開の Issue・PR に書かない
+* 当事者が特定される内容・詳細は、公開の Issue・PR に書かない
+* 詳細を伏せた Issue を作成し、メンテナーに連絡を求める（その後のやりとりの方法はメンテナーが案内する）
 * GitHub 上の迷惑行為は [GitHub の報告機能](https://docs.github.com/ja/communities/maintaining-your-safety-on-github/reporting-abuse-or-spam)でも報告できる

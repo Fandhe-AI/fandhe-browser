@@ -2,7 +2,7 @@
 
 fandhe-browser への貢献手順（開発環境構築・ローカル検証・コミット / PR 手順・コーディング規約）をまとめる。
 
-spec 対応: `OSS-5`（`04-behavior/oss-licensing.md`）/ `TASK-79`（79.2）/ `MS-7`。
+spec 対応: `OSS-5`（`04-behavior/oss-licensing.md`）/ `TASK-79`（79.2・79.h1）/ `MS-7`。
 
 仕様・ビヘイビア定義の SSOT は private リポジトリ [fandhe-browser-spec](https://github.com/Fandhe-AI/fandhe-browser-spec)（`docs/spec` submodule の `04-behavior/`）にある。外部からの貢献者は `docs/spec` を取得できない場合があるが、ビルド・テストは `docs/spec` 抜きで成立する。本ドキュメント中のビヘイビア ID は SSOT を参照するための ID であり、内容の要約はここには含めない。spec 本文に残る旧称 `rust-browser` は `fandhe-browser` に読み替える。
 
@@ -104,10 +104,12 @@ clippy 警告は 0 件を維持する。テストの skip・ignore やアサー�
 
 ## DCO / CLA
 
-DCO（Developer Certificate of Origin）/ CLA（Contributor License Agreement）の要否は **未確定**。TASK-79（79.h1）で確定し、本ドキュメントへ反映する予定。それまでは要否のどちらも断定しない。
+DCO（Developer Certificate of Origin）への署名（`Signed-off-by`）も、CLA（Contributor License Agreement）も求めない。
+
+特に明示しない限り、貢献として提出した内容は、Apache License 2.0 の第 5 条（Submission of Contributions）に従い、追加の条項なしに上記「ライセンス」の MIT OR Apache-2.0 のデュアルライセンスで提供されたものとみなす。
 
 ## 脆弱性報告・行動規範
 
 - セキュリティ上の脆弱性は公開 Issue では報告しない
-- 脆弱性の報告手順・対応方針は [SECURITY.md](./SECURITY.md) を参照する（正式な報告窓口の連絡先は TASK-79（79.h1）で確定する）
-- 行動規範は [CODE_OF_CONDUCT.md](./CODE_OF_CONDUCT.md) を参照する（報告窓口の連絡先は TASK-79（79.h1）で確定する）
+- 脆弱性の報告手順・対応方針は [SECURITY.md](./SECURITY.md) を参照する。報告は GitHub の Private Vulnerability Reporting（リポジトリの Security タブの「Report a vulnerability」）で受け付ける
+- 行動規範は [CODE_OF_CONDUCT.md](./CODE_OF_CONDUCT.md) を参照する。専用の連絡先は置かず、詳細を伏せた Issue でメンテナーに連絡を求める（「報告窓口」節を参照）
