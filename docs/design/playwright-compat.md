@@ -32,7 +32,7 @@ Playwright のソースは長く引用せず、関数名と要約に留める。
 | `connectOverCDP(http://…)` | 成功（`noDefaults:true` 指定時。TASK-43.3g・#942 で到達）。`Browser.getVersion`・`Target.setAutoAttach`（`waitForDebuggerOnStart:true` は受理）・`Target.getTargetInfo` が成功する。指定なしの既定オプションでは接続直後の `Browser.setDownloadBehavior`（`allowAndName`）が `-32602` で拒否され通らない（後述「段階 2g」） | A（現行 head での再取得）: seq 1〜9 |
 | `connectOverCDP(ws://…)` | 未実行（http 経由が成功するため、収集ハーネスの ws 直接の再試行は行われない） | A |
 | `newContext()` | 成功（`acceptDownloads:false` 指定時。TASK-43.3d・#909 で到達）。`Target.createBrowserContext`（`disposeOnDetach:true`）と `browserContextId` 付き `Browser.setDownloadBehavior`（`deny` + `eventsEnabled:true`）が成功する（後述「段階 2b の実施結果」） | A: seq 10〜14 |
-| `newPage()` | 成功（`connectOverCDP(noDefaults:true)`・`newContext({acceptDownloads:false, viewport:null})` 指定時。TASK-43.3n・#1042 で到達を確認。後述「到達結果（TASK-43.3n）」）。`Page.createIsolatedWorld`・`Browser.getWindowForTarget` は `-32601` のまま残るが `newPage()` は失敗しない | A: seq 15〜41 |
+| `newPage()` | 成功（`connectOverCDP(noDefaults:true)`・`newContext({acceptDownloads:false, viewport:null})` 指定時。TASK-43.3n・#1042 で到達を確認。後述「到達結果（TASK-43.3n）」）。`Browser.getWindowForTarget` は `-32601` のまま残るが `newPage()` は失敗しない（`Page.createIsolatedWorld` は TASK-44.6・#1217 で実装済み。評価器が無効な構成ではエラー） | A: seq 15〜41 |
 | `goto`（ローカル fixture） | 成功（TASK-44.3・TASK-44.4 で確認。後述「テスト結果レポート（TASK-44.4）」） | A |
 | `selector`（`#target`） | 失敗（`StageTimeout` 10 秒。Runtime ドメイン未実装。後述「テスト結果レポート（TASK-44.4）」） | A |
 
@@ -373,8 +373,12 @@ id 9（`Page.getFrameTree`）は `frameTree.frame = {id:"main", loaderId:"2", ur
 
 - フラグは `target.rs` の `Tables.domains_enabled`（`SessionDomain` ごとの bool）に置く（Issue 記載の `conn_state.rs` から外れる。理由は段階 3a と同じ。
   `page_enabled` は #1039 との衝突を避けるため変更せず別持ちにした）。セッション削除と同じロックで消え、件数は `MAX_SESSIONS` 以下。
-- **イベントは送らない**（`REPAIR-3`）。`Runtime.executionContextCreated`・`consoleAPICalled` は `Runtime.evaluate` 等が未実装で、使えない
-  `context.id` を見せると偽の応答になるため送らない（実行コンテキストのモデルは TASK-44）。`Network.*`（`requestWillBeSent`・`responseReceived`・
+- **`Runtime.executionContextCreated` は評価器が有効なときだけ送る**（TASK-44.6・#1217。`REPAIR-3`）。core の評価器（`ScriptContextHandle`）が
+  無効な構成では 0 件のまま（使えない `context.id` を見せると偽の応答になるため）。有効な構成では、`Runtime.enable` の初回（確定文書があるとき）・
+  `Runtime.runIfWaitingForDebugger` の再開時・`Page.navigate` の確定時に、main と `Page.addScriptToEvaluateOnNewDocument` の `worldName`
+  の isolated world を告知する（遷移時は `Runtime.executionContextsCleared` → `Page.frameNavigated` → created → `Page.loadEventFired`）。
+  main world の評価（`Runtime.evaluate`）は未実装で CDP エラーになる（#1218）。`Page.createIsolatedWorld` は有効な構成で contextId を返し、
+  無効な構成では `-32000 execution contexts unavailable`。`consoleAPICalled` は送らない。`Network.*`（`requestWillBeSent`・`responseReceived`・
   `loadingFinished`・`loadingFailed`）と `Log.entryAdded` も送らない（後続 issue で追跡）。「イベントが来ない」ために生じる待ち（`page.evaluate` 等）は TASK-44 の課題。
 - 3 メソッドのフラグは fetch・ヘッダ・UA・`navigator` を何も変えない（`SEC-2`）。`*.disable`・`Network.setUserAgentOverride`・
   `Emulation.setUserAgentOverride` は `-32601` のまま。

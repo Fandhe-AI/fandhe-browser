@@ -15,7 +15,7 @@
 //! 以下は未実装で、実装済みを装う公開 API・ダミー実装は置かない
 //! （`code-comment-style.md`・REPAIR-3）。
 //!
-//! - JSON-RPC ディスパッチャ（`protocol.rs`。TASK-42.1）は実装済みで、組込みメソッドは `Page.navigate`（TASK-42.2）・`DOM.getDocument`（TASK-42.4。`sessionId` 付きはターゲット別の確定文書を返す。#658）・`DOM.querySelector`（TASK-42.5。#243）・`DOM.requestChildNodes`（#657）・`Browser.getVersion`（TASK-43.3a。`CDP-2`）・`Target.getTargetInfo`（TASK-43.3b。`CDP-2`）・`Target.setAutoAttach`・`Browser.setDownloadBehavior`（TASK-43.3c。`CDP-2`。前者は既存ターゲットへの自動 attach と `Target.attachedToTarget` 送出まで、後者は設定の検証と保持のみでダウンロード実行系は未実装。`browserContextId` 付きは context 単位で保持）・`Target.createBrowserContext`（TASK-43.3d・#909。`disposeOnDetach:true` のみ受理し接続切断で破棄。`Target.disposeBrowserContext` は未実装）・`Target.closeTarget`（TASK-43.3h・#1028。既定 context か接続所有 context のページを閉じ、自接続の `Target.detachedFromTarget` を送出。`Target.targetDestroyed` は `Target.setDiscoverTargets` 未実装のため未送出）
+//! - JSON-RPC ディスパッチャ（`protocol.rs`。TASK-42.1）は実装済みで、組込みメソッドは `Page.navigate`（TASK-42.2）・`DOM.getDocument`（TASK-42.4。`sessionId` 付きはターゲット別の確定文書を返す。#658）・`DOM.querySelector`（TASK-42.5。#243）・`DOM.requestChildNodes`（#657）・`Browser.getVersion`（TASK-43.3a。`CDP-2`）・`Target.getTargetInfo`（TASK-43.3b。`CDP-2`）・`Target.setAutoAttach`・`Browser.setDownloadBehavior`（TASK-43.3c。`CDP-2`。前者は既存ターゲットへの自動 attach と `Target.attachedToTarget` 送出まで、後者は設定の検証と保持のみでダウンロード実行系は未実装。`browserContextId` 付きは context 単位で保持）・`Target.createBrowserContext`（TASK-43.3d・#909。`disposeOnDetach:true` のみ受理し接続切断で破棄。`Target.disposeBrowserContext` は未実装）・`Target.closeTarget`（TASK-43.3h・#1028。既定 context か接続所有 context のページを閉じ、自接続の `Target.detachedFromTarget` を送出。`Target.targetDestroyed` は `Target.setDiscoverTargets` 未実装のため未送出）・`Page.createIsolatedWorld` と `Runtime.executionContextCreated`（TASK-44.6・#1217。評価器が有効なときだけ。`runtime.rs`。評価系は #1218 以降）
 //! - 個別 CDP メソッドのハンドラ（`CDP-1`/`CDP-5`/`CDP-7`、`TASK-42.2`〜`42.5`、`MS-4`）
 //!
 //! 未実装メソッドの応答方針（`-32601` を返し成功を捏造しない）と受信ログは TASK-42.6（`CDP-6`・`SEC-2`）で
@@ -29,6 +29,7 @@ mod navigation;
 mod page;
 mod playwright_compat;
 mod protocol;
+mod runtime;
 pub mod server;
 pub mod target;
 mod ws;

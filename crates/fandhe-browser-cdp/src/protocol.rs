@@ -8,7 +8,7 @@
 //!
 //! 公開入口は無く crate 内部専用。後続タスクは [`builtin_handlers`] へメソッドを
 //! 追加するだけでよい（`Page.navigate` は 42.2 で登録済み、イベント送出は 42.3 で実装済み、
-//! `DOM.getDocument`・`DOM.querySelector` は 42.4・42.5、`DOM.requestChildNodes` は #657、`Browser.getVersion` は TASK-43.3a、`Target.getTargetInfo` は TASK-43.3b、`Target.setAutoAttach`・`Browser.setDownloadBehavior` は TASK-43.3c、`Target.createBrowserContext` は TASK-43.3d、`Target.closeTarget` は TASK-43.3h、`Target.createTarget`・`Runtime.runIfWaitingForDebugger` は TASK-43.3e、`Page.enable`・`Page.getFrameTree` は TASK-43.3i、`Log.enable`・`Runtime.enable`・`Network.enable` は TASK-43.3j、`Page.setLifecycleEventsEnabled` は TASK-43.3k、`Emulation.setFocusEmulationEnabled`・`Emulation.setEmulatedMedia` は TASK-43.3m で登録済み）。
+//! `DOM.getDocument`・`DOM.querySelector` は 42.4・42.5、`DOM.requestChildNodes` は #657、`Browser.getVersion` は TASK-43.3a、`Target.getTargetInfo` は TASK-43.3b、`Target.setAutoAttach`・`Browser.setDownloadBehavior` は TASK-43.3c、`Target.createBrowserContext` は TASK-43.3d、`Target.closeTarget` は TASK-43.3h、`Target.createTarget`・`Runtime.runIfWaitingForDebugger` は TASK-43.3e、`Page.enable`・`Page.getFrameTree` は TASK-43.3i、`Log.enable`・`Runtime.enable`・`Network.enable` は TASK-43.3j、`Page.setLifecycleEventsEnabled` は TASK-43.3k、`Emulation.setFocusEmulationEnabled`・`Emulation.setEmulatedMedia` は TASK-43.3m、`Page.createIsolatedWorld` は TASK-44.6（#1217）で登録済み）。
 //!
 //! # 入力の扱い
 //!
@@ -22,7 +22,7 @@
 //!
 //! [`builtin_handlers`] には `Page.navigate`（TASK-42.2）・`DOM.getDocument`（TASK-42.4）・
 //! `DOM.querySelector`（TASK-42.5）・`DOM.requestChildNodes`（#657）・
-//! `Browser.getVersion`（TASK-43.3a・`CDP-2`）・`Target.getTargetInfo`（TASK-43.3b・`CDP-2`）・`Target.setAutoAttach`・`Browser.setDownloadBehavior`（TASK-43.3c・`CDP-2`）・`Target.createBrowserContext`（TASK-43.3d・`CDP-2`）・`Target.closeTarget`（TASK-43.3h・`CDP-2`）・`Target.createTarget`・`Runtime.runIfWaitingForDebugger`（TASK-43.3e・#910・`CDP-2`）・`Page.enable`・`Page.getFrameTree`（TASK-43.3i・#1037・`CDP-2`）・`Log.enable`・`Runtime.enable`・`Network.enable`（TASK-43.3j・#1038・`CDP-2`）・`Page.setLifecycleEventsEnabled`（TASK-43.3k・#1039・`CDP-2`）・`Emulation.setFocusEmulationEnabled`・`Emulation.setEmulatedMedia`（TASK-43.3m・#1041・`CDP-2`）のみ登録済みで、
+//! `Browser.getVersion`（TASK-43.3a・`CDP-2`）・`Target.getTargetInfo`（TASK-43.3b・`CDP-2`）・`Target.setAutoAttach`・`Browser.setDownloadBehavior`（TASK-43.3c・`CDP-2`）・`Target.createBrowserContext`（TASK-43.3d・`CDP-2`）・`Target.closeTarget`（TASK-43.3h・`CDP-2`）・`Target.createTarget`・`Runtime.runIfWaitingForDebugger`（TASK-43.3e・#910・`CDP-2`）・`Page.enable`・`Page.getFrameTree`（TASK-43.3i・#1037・`CDP-2`）・`Log.enable`・`Runtime.enable`・`Network.enable`（TASK-43.3j・#1038・`CDP-2`）・`Page.setLifecycleEventsEnabled`（TASK-43.3k・#1039・`CDP-2`）・`Emulation.setFocusEmulationEnabled`・`Emulation.setEmulatedMedia`（TASK-43.3m・#1041・`CDP-2`）・`Page.createIsolatedWorld`（TASK-44.6・#1217・`CDP-2`）のみ登録済みで、
 //! それ以外のメソッドは JSON-RPC の「method not implemented」（`-32601`）エラーを返す。
 //! 汎用の空 success フォールバック（PoC-5 の暫定挙動）は採らない。理由は次のとおり。
 //!
@@ -111,6 +111,15 @@ impl CdpError {
     pub const INIT_SCRIPT_LIMIT_EXCEEDED: Self = Self::new(-32000, "too many init scripts");
     /// `worldName` が長すぎる（`Page.addScriptToEvaluateOnNewDocument`。`CDP-7`）。
     pub const WORLD_NAME_TOO_LONG: Self = Self::new(-32000, "world name too long");
+    /// 評価器（core の `ScriptContextHandle`）が無効で、実行コンテキストを作れない（`Page.createIsolatedWorld`。
+    /// 使えない contextId を渡さず明示エラーにする。`REPAIR-3`・`SEC-2`・TASK-44.6）。
+    pub const EXECUTION_CONTEXTS_UNAVAILABLE: Self =
+        Self::new(-32000, "execution contexts unavailable");
+    /// 異なる `worldName` の数、または文書 × セッションあたりの isolated world 数が上限に達した
+    /// （`Page.addScriptToEvaluateOnNewDocument`・`Page.createIsolatedWorld`。`CDP-7`）。
+    pub const TOO_MANY_WORLDS: Self = Self::new(-32000, "too many worlds");
+    /// 古い世代（現在の文書でない）の contextId が評価に使われた（評価系 #1218 が使う。`CDP-2`）。
+    pub const EXECUTION_CONTEXT_STALE: Self = Self::new(-32000, "execution context is not current");
     /// 指定 nodeId が現在の文書の採番表に無い（形式は正しいが対象が無い。`DOM.querySelector`。`CDP-1`）。
     pub const NODE_NOT_FOUND: Self = Self::new(-32000, "node not found");
     /// nodeId の払い出し記録が件数上限に達した（`DOM.getDocument`。他クライアントの記録を
@@ -458,6 +467,10 @@ pub(crate) fn builtin_handlers_with(fetch: FetchOptions) -> Result<HandlerTable,
         (
             "Emulation.setEmulatedMedia",
             Box::new(crate::playwright_compat::EmulationSetEmulatedMedia),
+        ),
+        (
+            "Page.createIsolatedWorld",
+            Box::new(crate::runtime::PageCreateIsolatedWorld),
         ),
         ("Log.enable", Box::new(crate::playwright_compat::LogEnable)),
         (

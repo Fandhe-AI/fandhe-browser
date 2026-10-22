@@ -944,6 +944,37 @@ fn reject_disallowed_scheme(url: &Url) -> Result<()> {
     }
 }
 
+/// [`url_origin`] の結果。origin の状態を区別する（`REPAIR-4`。将来の拡張に備え `non_exhaustive`）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum UrlOrigin {
+    /// tuple origin（`http`・`https` 等）。`ascii_serialization`（既定ポートは省略・host は小文字）。
+    Tuple(String),
+    /// 不透明 origin（`about:blank`・`data:` 等）。
+    Opaque,
+    /// URL として解析できない。
+    ParseError,
+}
+
+/// 確定 URL から origin を導く（cdp の実行コンテキスト表が呼ぶ。`CDP-2`・TASK-44.6）。
+///
+/// scheme・host・port だけを [`UrlOrigin::Tuple`] に入れ、path・query・fragment・userinfo は含めない。
+/// 不透明 origin は [`UrlOrigin::Opaque`]、解析失敗は [`UrlOrigin::ParseError`]（偽の origin を作らない）。
+/// CDP 用の文字列化（不透明・失敗は空文字）は利用側が行う。
+pub fn url_origin(url: &str) -> UrlOrigin {
+    match Url::parse(url) {
+        Ok(u) => {
+            let origin = u.origin();
+            if origin.is_tuple() {
+                UrlOrigin::Tuple(origin.ascii_serialization())
+            } else {
+                UrlOrigin::Opaque
+            }
+        }
+        Err(_) => UrlOrigin::ParseError,
+    }
+}
+
 /// `url` の host が IP リテラルの場合に取り出す。ホスト名（DNS 名）の場合は
 /// `None`（[`SafeResolver`] が DNS 解決時に検証するため、ここでは扱わない）。
 ///
@@ -1157,6 +1188,26 @@ impl FetchResponse {
 
 #[cfg(test)]
 mod tests {
+    /// `CDP-2`・TASK-44.6: origin は scheme・host・port のみ。不透明と解析失敗は区別する。
+    #[test]
+    fn cdp2_url_origin_distinguishes_tuple_opaque_and_parse_error() {
+        use super::UrlOrigin::{Opaque, ParseError, Tuple};
+        let t = |s: &str| Tuple(s.to_string());
+        let cases = [
+            ("http://a.example:8080/x?y#z", t("http://a.example:8080")),
+            ("https://A.example/", t("https://a.example")),
+            ("https://u:p@a.example:443/p", t("https://a.example")),
+            ("http://127.0.0.1:3000/", t("http://127.0.0.1:3000")),
+            ("about:blank", Opaque),
+            ("data:text/html,x", Opaque),
+            ("not a url", ParseError),
+            ("", ParseError),
+        ];
+        for (input, want) in cases {
+            assert_eq!(super::url_origin(input), want, "{input}");
+        }
+    }
+
     /// `JS-5`・`SEC-2`: UA は固定書式で、実ブラウザを装う語を含まない。
     #[test]
     fn js_5_user_agent_is_honest_and_single_sourced() {
