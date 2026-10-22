@@ -40,6 +40,7 @@ use crate::render::{
     BoundingBox, DisabledRenderer, ElementRef, ElementVisibility, PageRef, RenderError, Renderer,
     Screenshot, ScreenshotOptions,
 };
+use crate::script_context::ScriptContextHandle;
 
 /// 直近のナビゲート結果（最終 URL と HTML）。
 ///
@@ -378,6 +379,7 @@ pub struct AppState {
     profile: Arc<Profile>,
     render: RenderGate,
     page_scripts: PageScriptHandle,
+    script_contexts: ScriptContextHandle,
 }
 
 impl AppState {
@@ -390,6 +392,8 @@ impl AppState {
             render: RenderGate::new(renderer),
             // 既定は無効（スレッドも子プロセスも作らない。`JS-1`）。有効化は `with_page_scripts`。
             page_scripts: PageScriptHandle::disabled(),
+            // 既定は無効（スレッドも子プロセスも作らない。`PERF-7`）。有効化は `with_script_contexts`。
+            script_contexts: ScriptContextHandle::disabled(),
         }
     }
 
@@ -405,6 +409,20 @@ impl AppState {
     /// （`CdpState::app_state()` 経由。TASK-112・#785）が使う。
     pub fn page_scripts(&self) -> &PageScriptHandle {
         &self.page_scripts
+    }
+
+    /// 確定文書の上で保持する評価コンテキストのハンドルを差し替える（TASK-44.5・`CDP-2`・`JS-1`）。
+    /// cli が `[js] engine` から構築したハンドルを起動時に 1 度だけ渡す（配線は #1220）。
+    #[must_use]
+    pub fn with_script_contexts(mut self, handle: ScriptContextHandle) -> Self {
+        self.script_contexts = handle;
+        self
+    }
+
+    /// 評価コンテキストのハンドルを返す。cdp の Runtime ドメイン（#1217〜#1219）が
+    /// `CdpState::app_state()` 経由で使う。
+    pub fn script_contexts(&self) -> &ScriptContextHandle {
+        &self.script_contexts
     }
 
     /// 描画ハンドルに [`DisabledRenderer`]（常に `RenderingDisabled` を返す）を使って構築する。
@@ -471,6 +489,10 @@ impl fmt::Debug for AppState {
             .field("profile_root", &self.profile.root())
             .field("generation", &self.navigation.current_generation().get())
             .field("page_scripts_enabled", &self.page_scripts.is_enabled())
+            .field(
+                "script_contexts_enabled",
+                &self.script_contexts.is_enabled(),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -881,6 +903,7 @@ mod tests {
     #[test]
     fn state_types_are_send_sync() {
         assert_send_sync::<AppState>();
+        assert_send_sync::<ScriptContextHandle>();
         assert_send_sync::<NavigationState>();
         assert_send_sync::<NavigationResult>();
         assert_send_sync::<StateError>();

@@ -44,6 +44,7 @@ mod app_state {
     };
     use fandhe_browser_core::{
         AppState, Config, NavigationResult, PageScriptExecutor, PageScriptHandle,
+        ScriptContextHandle,
     };
     use fandhe_browser_profile::Profile;
     use std::path::PathBuf;
@@ -236,5 +237,27 @@ mod app_state {
         assert!(state.page_scripts().is_enabled());
         assert_eq!(state.page_scripts().stats().worker_spawns(), 0);
         assert!(format!("{state:?}").contains("page_scripts_enabled: true"));
+    }
+    /// TASK-44.5（`JS-1`・`PERF-7`）: 既定の `AppState` は無効な評価コンテキストを持ち、スレッドを起動しない。
+    #[test]
+    fn perf7_default_app_state_has_disabled_script_contexts() {
+        let dir = TempDir::new();
+        let state = AppState::with_disabled_renderer(open(&dir));
+        assert!(!state.script_contexts().is_enabled());
+        assert_eq!(state.script_contexts().stats().worker_spawns(), 0);
+        assert!(format!("{state:?}").contains("script_contexts_enabled: false"));
+    }
+
+    /// TASK-44.5（`CDP-2`）: `with_script_contexts` で渡したハンドルが `AppState` から見え、構築だけでは
+    /// ワーカーを起動しない。エンジンなし・生成不能の構成では無効のまま（成功を装わない）。
+    #[test]
+    fn cdp2_with_script_contexts_exposes_the_given_handle() {
+        let dir = TempDir::new();
+        let handle = ScriptContextHandle::new(Config::default().js());
+        let expected = handle.is_enabled();
+        let state = AppState::with_disabled_renderer(open(&dir)).with_script_contexts(handle);
+        assert_eq!(state.script_contexts().is_enabled(), expected);
+        assert_eq!(state.script_contexts().stats().worker_spawns(), 0);
+        assert!(format!("{state:?}").contains(&format!("script_contexts_enabled: {expected}")));
     }
 }
