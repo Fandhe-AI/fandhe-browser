@@ -544,6 +544,7 @@ pub fn run(engine: &str) {
     create_element_ns_cases(engine);
     get_elements_by_tag_name_cases(engine);
     parent_node_cases(engine);
+    is_equal_node_cases(engine);
     style_sheet_cases(engine);
 
     eprintln!("case: JS-5 disabled runtime does not pretend to install");
@@ -560,6 +561,64 @@ fn window_cases(engine: &str) {
     check(&mut p, "window === self && self === globalThis", "true");
     check(&mut p, "window.document === document", "true");
     check(&mut p, "typeof window", "object");
+
+    eprintln!("case: JS-5 matchMedia is a fixed-value stub (#1227・SEC-2)");
+    check(&mut p, "typeof window.matchMedia", "function");
+    check(
+        &mut p,
+        "matchMedia('(prefers-color-scheme: dark)').matches",
+        "false",
+    );
+    // 環境で評価していない証拠: 実ブラウザで常に真になるクエリも false。
+    check(&mut p, "matchMedia('all').matches", "false");
+    check(&mut p, "matchMedia('(min-width: 1px)').matches", "false");
+    check(
+        &mut p,
+        "matchMedia('(max-width: 600px)').media",
+        "(max-width: 600px)",
+    );
+    check(&mut p, "matchMedia(1).media", "1");
+    check(
+        &mut p,
+        "var called = 0; var mq = matchMedia('x'); var fn1 = function () { called++; }; \
+         var r = [mq.addListener(fn1), mq.addEventListener('change', fn1), mq.removeListener(fn1)]; \
+         r.map(String).join(',') + '|' + called + '|' + mq.onchange",
+        "undefined,undefined,undefined|0|null",
+    );
+    check(
+        &mut p,
+        "try { matchMedia(); 'ok' } catch (e) { 'threw' }",
+        "threw",
+    );
+    check(
+        &mut p,
+        "try { new MediaQueryList(); 'ok' } catch (e) { 'threw' }",
+        "threw",
+    );
+    check(
+        &mut p,
+        "typeof window.innerWidth + '|' + typeof screen",
+        "undefined|undefined",
+    );
+
+    eprintln!("case: JS-5 IntersectionObserver is inert and performance.now is monotonic (#1227)");
+    check(
+        &mut p,
+        "var io = 0; var o = new IntersectionObserver(function () { io++; }); \
+         o.observe(document.body); o.disconnect(); \
+         String(o.root) + '|' + o.rootMargin + '|' + o.thresholds.join(',') + '|' + o.takeRecords().length + '|' + io",
+        "null|0px 0px 0px 0px|0|0|0",
+    );
+    check(
+        &mut p,
+        "try { new IntersectionObserver(1); 'ok' } catch (e) { 'threw' }",
+        "threw",
+    );
+    check(
+        &mut p,
+        "var t0 = performance.now(); typeof t0 + '|' + (t0 >= 0) + '|' + (performance.now() >= t0)",
+        "number|true|true",
+    );
 
     eprintln!("case: JS-5 location defaults to about:blank");
     check(&mut p, "document.URL", "about:blank");
@@ -3554,6 +3613,52 @@ fn parent_node_cases(engine: &str) {
         "try { Object.getOwnPropertyDescriptor(Node.prototype, 'parentNode').get.call({}); 'ok' } catch (e) { 'threw' }",
         "threw",
     );
+}
+
+/// `Node.prototype.isEqualNode`（#1227・`JS-5`）。
+fn is_equal_node_cases(engine: &str) {
+    eprintln!("case: JS-5 isEqualNode (#1227)");
+    let mut p = setup(engine, None);
+    let pre = "var a = document.createElement('div'); var b = document.createElement('div'); ";
+    let cases: [(&str, &str); 10] = [
+        (
+            "a.setAttribute('x','1'); a.setAttribute('y','2'); b.setAttribute('y','2'); b.setAttribute('x','1'); a.isEqualNode(b)",
+            "true",
+        ),
+        (
+            "a.setAttribute('x','1'); b.setAttribute('x','2'); a.isEqualNode(b)",
+            "false",
+        ),
+        ("a.setAttribute('x','1'); a.isEqualNode(b)", "false"),
+        (
+            "a.textContent = 'p'; b.textContent = 'q'; a.isEqualNode(b)",
+            "false",
+        ),
+        (
+            "a.innerHTML = '<i></i><i></i>'; b.innerHTML = '<i></i>'; a.isEqualNode(b)",
+            "false",
+        ),
+        (
+            "a.innerHTML = '<p id=k>t<b>u</b></p>'; b.innerHTML = '<p id=k>t<b>u</b></p>'; a.isEqualNode(b)",
+            "true",
+        ),
+        ("a.isEqualNode(document.createElement('span'))", "false"),
+        (
+            "document.isEqualNode(document) + '|' + a.isEqualNode(a) + '|' + a.isEqualNode(null)",
+            "true|true|false",
+        ),
+        (
+            "try { a.isEqualNode({}); 'ok' } catch (e) { 'threw' }",
+            "threw",
+        ),
+        (
+            "try { Node.prototype.isEqualNode.call({}, a); 'ok' } catch (e) { 'threw' }",
+            "threw",
+        ),
+    ];
+    for (body, want) in cases {
+        check(&mut p, &format!("{pre}{body}"), want);
+    }
 }
 
 /// `Element.prototype.sheet` / `document.styleSheets`（#1202・`JS-5`・`JS-6`・`REPAIR-3`）。
