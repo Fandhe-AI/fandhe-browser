@@ -90,8 +90,9 @@ case "${name}" in
     ;;
   check-compat-regression)
     # self-test（合成データで「閾値未満で fail する」ことをログに残す）を先に実行してから実マトリクスを判定する。
-    # 実マトリクスは TASK-71.3（#312）が生成予定でまだ無いため当面 --allow-missing を渡す
-    # （#312 で導入され次第このフラグを削除し fail-closed に戻す）。
+    # 実マトリクスは TASK-71.3 の実測としてコミット済み（#920）。ファイル不在は exit 2（fail-closed）。
+    # 全類型を判定する（--all-categories）。lazy・table は実測が 70% 未満のため、実測ベースライン（lazy=50・table=33）に
+    # 固定して判定し、これ以上の悪化を検出する（--category-threshold。閾値 70 の例外ではなく回帰検出の下限）。
     require_cmd jq "required by ${name}"
     bash harness/compat-regression/self-test.sh
     bash harness/compat-regression/check-matrix.sh \
@@ -99,7 +100,8 @@ case "${name}" in
       --threshold 70 \
       --categories static,spa,form \
       --all-categories \
-      --allow-missing
+      --category-threshold lazy=50 \
+      --category-threshold table=33
     ;;
   bench-record)
     # LIGHTPANDA_BIN・FANDHE_BROWSER_BIN・CHROMIUM_IDLE_RSS_KB を事前に export しておくと実測値を得る

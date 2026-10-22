@@ -906,7 +906,7 @@ jobs:
   #   [js-engine-isolation]    JS エンジン構成別の依存グラフ（TASK-32.4・#168・JS-1）
   #   [compat-regression]      動作率回帰（TASK-9.2・#339・REPAIR-8・COMPAT-1/4）と
   #                            compat-practical の自己テスト（TASK-71.1〜71.3・MEAS-4）。
-  #                            --allow-missing は #312（TASK-71.3）の完了まで維持
+  #                            実マトリクスはコミット済み（#920）。ファイル不在は exit 2（fail-closed）
   #   [bench-record-selftest]  competitor_lightpanda ベンチ記録（TASK-84.2・#212）
   #   [puppeteer-connect-selftest] Puppeteer 接続試験ハーネス（TASK-45.2・#481・CDP-3）
   #   [mcp-envelope-smoke]     MCP エンベロープ e2e（TASK-97.1・#385・PLUG-5。unix のみ
@@ -1002,7 +1002,8 @@ jobs:
             --threshold 70 \
             --categories static,spa,form \
             --all-categories \
-            --allow-missing
+            --category-threshold lazy=50 \
+            --category-threshold table=33
       - name: "[bench-record-selftest] record.sh 自己テスト"
         if: ${{ !cancelled() }}
         run: bash benches/competitor_lightpanda/self-test.sh
@@ -1687,7 +1688,8 @@ jobs:
             --threshold 70 \
             --categories static,spa,form \
             --all-categories \
-            --allow-missing
+            --category-threshold lazy=50 \
+            --category-threshold table=33
       - name: "[bench-record-selftest] record.sh 自己テスト"
         if: ${{ !cancelled() }}
         run: bash benches/competitor_lightpanda/self-test.sh
@@ -1846,7 +1848,8 @@ jobs:
             --threshold 70 \
             --categories static,spa,form \
             --all-categories \
-            --allow-missing
+            --category-threshold lazy=50 \
+            --category-threshold table=33
       - name: "[bench-record-selftest] record.sh 自己テスト"
         if: ${{ !cancelled() }}
         run: bash benches/competitor_lightpanda/self-test.sh

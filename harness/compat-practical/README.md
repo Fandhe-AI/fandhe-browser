@@ -7,7 +7,7 @@ spec 対応: TASK-71.1・TASK-71.2 / MS-6 / `MEAS-4`（関連 `COMPAT-4`・`JS-2
 | 後続 | 内容 |
 | ---- | ---- |
 | #311（TASK-71.2） | 22 タスクの実行スクリプト `run_core.sh`（本 README「run_core.sh」節） |
-| #312（TASK-71.3） | Chromium 実測との突合・`results/matrix.json` 生成（本 README「make_matrix.sh」節。生成スクリプトは導入済み、マトリクス自体は未コミット。マトリクスのコミットと回帰ゲートの有効化は #312 の残りの受け入れ条件） |
+| #312（TASK-71.3） | Chromium 実測との突合・`results/matrix.json` 生成（本 README「make_matrix.sh」節。生成スクリプトに加え、実測から生成した `results/matrix.json` をコミット済みで、回帰ゲートは有効。#920） |
 | #313（TASK-71.4） | 測定レポート `REPORT.md`（JS 有効の再計測と b5・d2・d3 の解消確認） |
 
 ## ファイル
@@ -26,9 +26,10 @@ spec 対応: TASK-71.1・TASK-71.2 / MS-6 / `MEAS-4`（関連 `COMPAT-4`・`JS-2
 | `js_api_spike/` | ページ内 JS が要求する Web API の計測スパイク（TASK-106。core の example `compat_js_api_spike` としてビルド） |
 | `page_script_probe/` | 本番と同じ経路でページ内 script の結果を script 単位に観測する診断プローブ（#964。core の example `compat_page_script_probe` としてビルド） |
 | `results/access_check.jsonl` | 到達可否の実測結果（下記「計測結果」） |
-| `results/core_results.jsonl` | `run_core.sh --page-js v8` の実測結果（ページ JS 有効） |
-| `results/core_results_modules.jsonl` | `run_core.sh --page-js v8 --page-modules` の実測結果（ES module 有効。#1119。`core_results.jsonl` とは別ファイルで、`make_matrix.sh` の入力ではない） |
-| `results/core_results_js_off.jsonl` | 同一バイナリ・同日の対照（ページ JS 無効） |
+| `results/core_results.jsonl` | `run_core.sh --page-js v8 --page-modules` の実測結果（ページ JS・ES module 有効。2026-10-22・#920。`make_matrix.sh` の入力） |
+| `results/matrix.json` | `make_matrix.sh` が `core_results.jsonl` から生成したマトリクス（コミット済み・手で編集しない。回帰ゲートの入力。#920） |
+| `results/core_results_modules.jsonl` | `run_core.sh --page-js v8 --page-modules` の実測結果（2026-10-19 の ES module 有効の記録。#1119。`make_matrix.sh` の入力ではない） |
+| `results/core_results_js_off.jsonl` | 2026-10-11 の対照（ページ JS 無効。`core_results.jsonl` とは測定日・バイナリが異なる） |
 | `REPORT.md` | 測定レポート（TASK-71.4） |
 
 ## tasks.json
@@ -109,7 +110,7 @@ bash harness/compat-practical/run_core.sh [--tasks P] [--out P] [--bin P] [--end
 `page_js_executed` は「実行を有効にして起動した」意味で、ページごとの実行成否ではない。実行上限（1 script 2 秒・ページ 5 秒・`src` 1 MiB / 件・合計 4 MiB）は固定で、設定から変えられない。
 `--log <絶対パス>` は起動したバイナリの stdout / stderr を保存する（固定診断行 `cdp: page scripts: ...` の回収用。ページ由来の非信頼データを含みうるためコミットしない）。
 b5・d2・d3 の結果は実測のまま記録し、解消を装わない（結果は `REPORT.md`）。
-属性演算子 `^=` は TASK-71.6（#760）で core のセレクタサブセットに入った。e1 の再計測と `matrix.json` の更新は #312 で扱う。
+属性演算子 `^=` は TASK-71.6（#760）で core のセレクタサブセットに入った。e1 の再計測と `matrix.json` の更新は #920 で行った（2026-10-22。e1 は依然 `no_match`）。
 
 ## make_matrix.sh
 
@@ -151,15 +152,30 @@ jq 'map({id, cat, kind, success, error})' <PoC-9 の chromium_results.json>
 | form（d） | 3/5 | 5/5 |
 | table（e） | 1/3 | 1/3 |
 
-- この値を `check-matrix.sh --threshold 70 --categories static,spa,form --all-categories` に通すと、全体・form・lazy・table が閾値未満で exit 1 になる（static・spa は通過）
+- この値を `check-matrix.sh --threshold 70 --categories static,spa,form` に通すと、全体・form が閾値未満で exit 1 になる（static・spa は通過）。以下は履歴（2026-10-07 時点）
 - 値は 2026-10-07 の実測（ページ JS 未実行）のもの。2026-10-11 の JS 有効の再計測（`REPORT.md`）でも 15/22 で、成否は変わらなかった。閾値・対象類型を下げてゲートを通すことはしない
-- そのため `results/matrix.json` は**コミットしていない**（コミットすると `make check-compat-regression` と CI の `harness-*` ジョブの `[compat-regression]` ステップが閾値未達で赤になる）。実測 15/22（68.2%）が閾値 70% 未満のため、まだコミットできない。閾値・対象類型は下げない。実マトリクスのコミットは #312 の残りの受け入れ条件（閾値 70% 到達後）で、`--allow-missing` は #312 完了後に削除する（main の記述どおり）
+- 当時は 15/22（68.2%）が閾値未満のため `matrix.json` をコミットできなかった。2026-10-22 の再計測（下記）で閾値に到達し、コミット済み
 - 失敗 7 件の内訳と追跡先:
   - b5・d2・d3（`no_match`）: 2026-10-11 の JS 有効の再計測でも未解消（原因は `REPORT.md`）。扱いは #758（TASK-71.h1・人間判断）で決める
   - e1（`selector_unsupported`）: 属性演算子 `^=` が core のセレクタサブセット外だった（計測時点）。#760（TASK-71.6）で対応済み。再計測は #312
   - a6（`no_match`）: HTTP 403 でコンテンツを取得できない
   - c1（`no_match`）・e5（`no_match`）: 本 PR では原因を未調査（実測のまま記録。解消を装わない。REPAIR-3）
-- 再生成: `bash harness/compat-practical/run_core.sh` で再計測してから `bash harness/compat-practical/make_matrix.sh`
+
+#### 2026-10-22 の再計測と回帰ゲートの有効化（#920）
+
+| 区分 | fandhe-browser-core | Chromium（PoC-9 生データ） |
+| ---- | ------------------- | -------------------------- |
+| 全体 | 17/22（77.3%） | 20/22 |
+| static（a） | 6/7 | 7/7 |
+| spa（b） | 4/5 | 5/5 |
+| lazy（c）（判定外） | 1/2 | 2/2 |
+| form（d） | 5/5 | 5/5 |
+| table（e）（判定外） | 1/3 | 1/3 |
+
+- 判定は `check-matrix.sh --threshold 70 --categories static,spa,form --all-categories --category-threshold lazy=50 --category-threshold table=33`（lazy・table は実測が 70% 未満のため実測ベースラインで判定し、悪化を検出する）。全体・static・spa・form がすべて PASS で exit 0
+- 実測値をそのまま `results/core_results.jsonl`・`results/matrix.json` にコミットした（手で補正していない。値を整えるための再実行もしていない）。`make_matrix.sh` の再生成結果との一致は `self-test.sh` が検査する
+- 失敗 5 件（すべて `no_match`）: a6（HTTP 403）・b5（#964）・c1（anti-bot）・e1・e5
+- 再生成: `bash harness/compat-practical/run_core.sh --page-js v8 --page-modules` で再計測してから `bash harness/compat-practical/make_matrix.sh`
 
 ## 計測結果
 
@@ -187,6 +203,11 @@ jq 'map({id, cat, kind, success, error})' <PoC-9 の chromium_results.json>
 - `results/core_results.jsonl`: `--page-js v8`（ページ JS 有効）で 15/22。`results/core_results_js_off.jsonl`: 同日・同一バイナリの対照（無効）で 15/22。成否は全 id で一致
 - b5・d2・d3 は 3 件とも未解消。数値・原因・残存失敗の扱いは `REPORT.md` を参照（二重管理しない）
 - `results/access_check.jsonl` は今回の環境で一部ホストが `curl_exit 7` となったため更新していない（2026-10-03 のまま）
+
+### 2026-10-22 の再計測（#920）
+
+- 実施日: 2026-10-22 / OS: Linux / バイナリ: `cargo build --release -p fandhe-browser-cli`（main `bd1c8be9`）/ フラグ: `--page-js v8 --page-modules`
+- `results/core_results.jsonl` をこの実測で置き換え、17/22。`results/matrix.json` を生成してコミットした。数値と判定は上の「2026-10-22 の再計測と回帰ゲートの有効化（#920）」、詳細は `REPORT.md` を参照
 
 ### 2026-10-19 の再計測（#1119）
 

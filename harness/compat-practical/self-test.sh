@@ -742,6 +742,9 @@ expect_eq "$(jq -c '[.[].fandhe_browser_core]' "$REAL_OUT")" \
 expect_eq "$(jq -c '[.[].chromium]' "$REAL_OUT")" \
   "$(jq -c '[.[].success]' "$SCRIPT_DIR/reference/chromium_results.json")" "real matrix chromium equals reference success"
 expect_eq "$(jq -c '[.[].cat]' "$REAL_OUT")" "$(jq -c '[.[].cat]' "$TASKS")" "real matrix cat follows tasks.json"
+# コミット済み results/matrix.json は make_matrix.sh の再生成結果と一致する（手書き・改ざんの検出。REPAIR-3・#920）
+expect_eq "$(jq -cS . "$SCRIPT_DIR/results/matrix.json" | tr -d '\r')" \
+  "$(jq -cS . "$REAL_OUT" | tr -d '\r')" "committed matrix.json equals make_matrix output"
 expect_exit "make_matrix real validate-only" 0 bash "$MAKE_MATRIX" --validate-only
 
 echo "cases=$CASES failures=$FAILURES"
