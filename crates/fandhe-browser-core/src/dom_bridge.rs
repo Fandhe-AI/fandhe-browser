@@ -60,7 +60,7 @@
 //!   `history.back` / `forward` / `go` によるページ内履歴の移動と `popstate` の配送は shim 内で
 //!   実装済み（#1177・`JS-5`。取得・遷移はしない）。`go(0)`（再読み込み）と、移動を実行できなかった
 //!   場合だけが `ignoreLocationChange` で診断に残る。
-//! - #771 のスパイクで判明する追加操作（`parentNode` 等）は後続 issue で足す。
+//! - #771 のスパイクで判明する追加操作は後続 issue で足す（`parentNode`・子 / 兄弟の走査は追加済み。#1203・#1241）。
 
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
@@ -406,6 +406,22 @@ enum DomOp {
     ElementLocalName,
     /// 文書ルート直下の最初の要素（`document.documentElement` 用。#1236・JS-5）。
     DocumentElement,
+    /// 最初の子（`firstChild` の土台。Text・Comment を含む Node 単位。#1241・JS-5）。読み取り専用。
+    FirstChild,
+    /// 最後の子（`lastChild` の土台。#1241・JS-5）。読み取り専用。
+    LastChild,
+    /// 次の兄弟（`nextSibling` の土台。O(親の子数)。#1241・JS-5）。読み取り専用。
+    NextSibling,
+    /// 前の兄弟（`previousSibling` の土台。O(親の子数)。#1241・JS-5）。読み取り専用。
+    PreviousSibling,
+    /// 子の ID 列を 10 進のカンマ区切りで返す（`childNodes` の土台。`querySelectorAll` と同じ契約で
+    /// 応答は上限に従う。#1241・JS-5・JS-6）。子が無ければ空文字。
+    ChildNodes,
+    /// DOM の `nodeType` 数値（Element 1・Text 3・PI 7・Comment 8・Document 9・Doctype 10・
+    /// DocumentFragment 11。dom.js のラッパー型の選択用。#1241・JS-5）。読み取り専用。
+    NodeType,
+    /// Doctype の名前（`DocumentType.name`）。Doctype 以外は null。#1241・JS-5。
+    DoctypeName,
 }
 
 impl DomOp {
@@ -467,6 +483,13 @@ impl DomOp {
             "htmlLocalName" => Self::HtmlLocalName,
             "elementLocalName" => Self::ElementLocalName,
             "documentElement" => Self::DocumentElement,
+            "firstChild" => Self::FirstChild,
+            "lastChild" => Self::LastChild,
+            "nextSibling" => Self::NextSibling,
+            "previousSibling" => Self::PreviousSibling,
+            "childNodes" => Self::ChildNodes,
+            "nodeType" => Self::NodeType,
+            "doctypeName" => Self::DoctypeName,
             "mutationObserverLimit" => Self::MutationObserverLimit,
             "mutationOptionsIgnored" => Self::MutationOptionsIgnored,
             "urlParse" => Self::UrlParse,
@@ -532,6 +555,13 @@ impl DomOp {
             Self::HtmlLocalName => "htmlLocalName",
             Self::ElementLocalName => "elementLocalName",
             Self::DocumentElement => "documentElement",
+            Self::FirstChild => "firstChild",
+            Self::LastChild => "lastChild",
+            Self::NextSibling => "nextSibling",
+            Self::PreviousSibling => "previousSibling",
+            Self::ChildNodes => "childNodes",
+            Self::NodeType => "nodeType",
+            Self::DoctypeName => "doctypeName",
             Self::MutationObserverLimit => "mutationObserverLimit",
             Self::MutationOptionsIgnored => "mutationOptionsIgnored",
             Self::UrlParse => "urlParse",
@@ -576,6 +606,13 @@ impl DomOp {
             | Self::ParentNode
             | Self::HtmlLocalName
             | Self::ElementLocalName
+            | Self::FirstChild
+            | Self::LastChild
+            | Self::NextSibling
+            | Self::PreviousSibling
+            | Self::ChildNodes
+            | Self::NodeType
+            | Self::DoctypeName
             | Self::NetCancel => 1,
             Self::CreateElementNs
             | Self::QuerySelector
@@ -1220,6 +1257,64 @@ fn execute(
                 .children(root)
                 .find(|&c| page.document.is_element(c));
             page.encode_optional(found)
+        }
+        // 子・兄弟の走査（#1241・JS-5。React のハイドレーションが `firstChild` / `nextSibling` で辿る）。
+        // 読み取り専用。兄弟は O(親の子数) で、呼び出し回数は op 数の上限（JS-6）で抑える。
+        DomOp::FirstChild => {
+            let node = page.node_arg(op, args, 1)?;
+            page.encode_optional(page.document.first_child(node))
+        }
+        DomOp::LastChild => {
+            let node = page.node_arg(op, args, 1)?;
+            page.encode_optional(page.document.last_child(node))
+        }
+        DomOp::NextSibling => {
+            let node = page.node_arg(op, args, 1)?;
+            page.encode_optional(page.document.next_sibling(node))
+        }
+        DomOp::PreviousSibling => {
+            let node = page.node_arg(op, args, 1)?;
+            page.encode_optional(page.document.prev_sibling(node))
+        }
+        // 子の ID 列。応答上限（JS-6）を超えたら Err（`encode_id_list` が打ち切る）。
+        DomOp::ChildNodes => {
+            let node = page.node_arg(op, args, 1)?;
+            // 各 ID は 2 バイト以上（桁 + 区切り）のため、応答上限から導く件数 + 1 件で打ち切る。
+            // 超過分は encode_id_list が ResponseTooLarge にするので、全件 Vec は確保しない。
+            let max_results = limits.max_response_bytes / 2 + 1;
+            let ids: Vec<NodeId> = page
+                .document
+                .children(node)
+                .take(max_results.saturating_add(1))
+                .collect();
+            encode_id_list(page.generation, ids, limits)
+        }
+        DomOp::NodeType => {
+            let node = page.node_arg(op, args, 1)?;
+            let ty = match page.document.node_data(node) {
+                Some(NodeData::Element { .. }) => 1.0,
+                Some(NodeData::Text { .. }) => 3.0,
+                Some(NodeData::ProcessingInstruction { .. }) => 7.0,
+                Some(NodeData::Comment { .. }) => 8.0,
+                Some(NodeData::Document) => 9.0,
+                Some(NodeData::Doctype { .. }) => 10.0,
+                Some(NodeData::DocumentFragment) => 11.0,
+                None => {
+                    return Err(DomBridgeError::TypeMismatch {
+                        operation: op.name(),
+                        index: 1,
+                        expected: "a live node id",
+                    });
+                }
+            };
+            Ok(JsValue::Number(ty))
+        }
+        DomOp::DoctypeName => {
+            let node = page.node_arg(op, args, 1)?;
+            if let Some(NodeData::Doctype { name, .. }) = page.document.node_data(node) {
+                return string_response(name.clone(), limits);
+            }
+            Ok(JsValue::Null)
         }
         DomOp::TimerCallbackError => {
             let name = string_arg(op, args, 1, limits)?;
@@ -1989,6 +2084,12 @@ mod tests {
     fn bridge_with(limits: DomBridgeLimits) -> DomBridge {
         let b = DomBridge::new(limits);
         b.attach(parse(HTML)).expect("attach");
+        b
+    }
+
+    fn bridge_with_html(html: &str, limits: DomBridgeLimits) -> DomBridge {
+        let b = DomBridge::new(limits);
+        b.attach(parse(html)).expect("attach");
         b
     }
 
@@ -3270,6 +3371,112 @@ mod tests {
         call(&b, &[s("parentNode"), n(1e12)]).expect_err("invalid id");
         call(&b, &[s("parentNode"), s("1")]).expect_err("type");
         call(&b, &[s("parentNode")]).expect_err("arity");
+    }
+
+    const TRAVERSAL_HTML: &str =
+        "<!DOCTYPE html><html><head></head><body><!--c-->t<p>x</p></body></html>";
+
+    /// JS-5・#1241: 子・兄弟の走査 op は Text・Comment を含む Node 単位で順序どおりに返し、端と
+    /// 切り離しノードは null、`childNodes` は ID 列（子なしは空文字）、不正入力はエラー。
+    #[test]
+    fn js_5_child_traversal_ops() {
+        let b = bridge_with_html(TRAVERSAL_HTML, DomBridgeLimits::default());
+        let root = num(call(&b, &[s("documentRoot")]));
+        let body = num(call(&b, &[s("body")]));
+        let get = |op: &str, x: f64| call(&b, &[s(op), n(x)]).expect("ok");
+        let doctype = num(Ok(get("firstChild", root)));
+        let html = num(Ok(get("nextSibling", doctype)));
+        assert_eq!(get("lastChild", root), JsValue::Number(html));
+        assert_eq!(get("previousSibling", html), JsValue::Number(doctype));
+        assert_eq!(get("previousSibling", doctype), JsValue::Null);
+        assert_eq!(get("nextSibling", html), JsValue::Null);
+        let comment = num(Ok(get("firstChild", body)));
+        let text_node = num(Ok(get("nextSibling", comment)));
+        let p = num(Ok(get("nextSibling", text_node)));
+        assert_eq!(get("lastChild", body), JsValue::Number(p));
+        assert_eq!(get("nextSibling", p), JsValue::Null);
+        assert_eq!(get("previousSibling", p), JsValue::Number(text_node));
+        let ids = text(Ok(get("childNodes", body)));
+        assert_eq!(
+            ids,
+            format!("{},{},{}", comment as u64, text_node as u64, p as u64)
+        );
+        let x = num(Ok(get("firstChild", p)));
+        assert_eq!(text(Ok(get("childNodes", p))), format!("{}", x as u64));
+        assert_eq!(text(Ok(get("childNodes", x))), "");
+        assert_eq!(get("firstChild", x), JsValue::Null);
+        assert_eq!(get("lastChild", x), JsValue::Null);
+        let loose = num(call(&b, &[s("createElement"), s("p")]));
+        assert_eq!(get("nextSibling", loose), JsValue::Null);
+        assert_eq!(get("previousSibling", loose), JsValue::Null);
+        for op in [
+            "firstChild",
+            "lastChild",
+            "nextSibling",
+            "previousSibling",
+            "childNodes",
+            "nodeType",
+            "doctypeName",
+        ] {
+            call(&b, &[s(op), n(1e12)]).expect_err("invalid id");
+            call(&b, &[s(op), s("1")]).expect_err("type");
+            call(&b, &[s(op)]).expect_err("arity");
+            call(&b, &[s(op), n(body), n(body)]).expect_err("arity");
+        }
+    }
+
+    /// JS-5・#1241: `nodeType` は DOM の数値、`doctypeName` は Doctype の名前（それ以外は null）。
+    #[test]
+    fn js_5_node_type_and_doctype_name_ops() {
+        let b = bridge_with_html(TRAVERSAL_HTML, DomBridgeLimits::default());
+        let root = num(call(&b, &[s("documentRoot")]));
+        let body = num(call(&b, &[s("body")]));
+        let get = |op: &str, x: f64| call(&b, &[s(op), n(x)]).expect("ok");
+        let doctype = num(Ok(get("firstChild", root)));
+        let comment = num(Ok(get("firstChild", body)));
+        let text_node = num(Ok(get("nextSibling", comment)));
+        assert_eq!(get("nodeType", doctype), JsValue::Number(10.0));
+        assert_eq!(get("nodeType", body), JsValue::Number(1.0));
+        assert_eq!(get("nodeType", comment), JsValue::Number(8.0));
+        assert_eq!(get("nodeType", text_node), JsValue::Number(3.0));
+        assert_eq!(get("nodeType", root), JsValue::Number(9.0));
+        assert_eq!(
+            get("doctypeName", doctype),
+            JsValue::String("html".to_owned())
+        );
+        assert_eq!(get("doctypeName", body), JsValue::Null);
+        assert_eq!(get("doctypeName", text_node), JsValue::Null);
+    }
+
+    /// JS-6・#1241: `childNodes` の応答が上限を超えたらエラーにする。
+    #[test]
+    fn js_6_child_nodes_response_is_bounded() {
+        let b = bridge_with_html(
+            TRAVERSAL_HTML,
+            DomBridgeLimits {
+                max_response_bytes: 4,
+                ..DomBridgeLimits::default()
+            },
+        );
+        let body = num(call(&b, &[s("body")]));
+        let err = call(&b, &[s("childNodes"), n(body)]).expect_err("超過");
+        assert!(matches!(err, DomBridgeError::ResponseTooLarge { .. }));
+    }
+
+    /// JS-6・#1241: 子が非常に多くても `childNodes` は上限超過で ResponseTooLarge になる。
+    #[test]
+    fn js_6_child_nodes_many_children_stays_bounded() {
+        let html = format!("<body>{}</body>", "<i></i>".repeat(5000));
+        let b = bridge_with_html(
+            &html,
+            DomBridgeLimits {
+                max_response_bytes: 8,
+                ..DomBridgeLimits::default()
+            },
+        );
+        let body = num(call(&b, &[s("body")]));
+        let err = call(&b, &[s("childNodes"), n(body)]).expect_err("超過");
+        assert!(matches!(err, DomBridgeError::ResponseTooLarge { .. }));
     }
 
     /// JS-5: `isFocusable` は接続した input で true、div・切り離した要素で false、不正入力はエラー。

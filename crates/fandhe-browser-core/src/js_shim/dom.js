@@ -37,9 +37,14 @@
 // - parentNode / parentElement は簡略版（#1203）: op `parentNode` が返す親（Element か文書）だけを
 //   読み取り専用で返し、親が DocumentFragment なら null（ラッパー型が無い。REPAIR-3）。
 // - isEqualNode（#1227）は標準どおりの比較。Comment・Doctype のラッパーは無いが、子としては比較に含まれる。
-// - childNodes / firstChild / lastChild / nextSibling /
-//   previousSibling / nodeValue / namespaceURI / isConnected / contains /
-//   compareDocumentPosition / attributes（属性の列挙）。対応する op が無く未定義のまま。
+// - childNodes / firstChild / lastChild / nextSibling / previousSibling / nodeValue / data / length /
+//   hasChildNodes は実装済み（#1241。React のハイドレーションが辿る）。Text・Comment・Doctype を含む Node 単位で、
+//   ラッパー型は op `nodeType` で選ぶ。簡略版（REPAIR-3）: childNodes は live でない静的な Array（item() つき）で
+//   呼ぶたびに別の配列になる。ラッパー型を持たない ProcessingInstruction・DocumentFragment に当たると TypeError
+//   （HTML パースでは到達しない）。DocumentType の publicId / systemId・splitText 等の CharacterData の編集メソッド・
+//   MutationRecord の previousSibling（常に null）は未実装。
+// - namespaceURI / isConnected / contains / compareDocumentPosition / attributes（属性の列挙）。
+//   対応する op が無く未定義のまま。
 // - HTMLElement・HTMLIFrameElement は名前だけ（instanceof / typeof 判定が通るため。常に false。
 //   `new` は Illegal constructor。継承は Element ← HTMLElement ← HTMLIFrameElement）。他の
 //   サブクラスは未定義のまま（#1168・#1184）。要素名を返す op（`elementLocalName`）は追加済みだがラッパーは常に Element で作る。将来は HTML
@@ -68,7 +73,7 @@
 //   伝播・`tabIndex` IDL 属性・autofocus・レンダリングに基づく判定。focus / blur は仕様では
 //   HTMLOrSVGElement の mixin だがラッパーがすべて Element のため Element.prototype に置く。
 // - `Element.prototype.sheet` / `document.styleSheets` は stylesheet.js が担う（#1202）。
-// - Comment / DocumentFragment のラッパー（nodeType 定数のみ。DOCUMENT_POSITION_* も未定義）。
+// - DocumentFragment のラッパー（nodeType 定数のみ。DOCUMENT_POSITION_* も未定義）。Comment・DocumentType は #1241 で追加。
 // - window / location / navigator / console は js_shim の別ソース（#779）。
 (function (global) {
     'use strict';
@@ -136,11 +141,30 @@
         constructor: { value: HTMLIFrameElement, writable: true, configurable: true }
     });
 
-    function Text(token) {
+    // 文字データを持つノード（Text・Comment の親。#1241・JS-5）。
+    function CharacterData(token) {
         Node.call(this, token);
     }
-    Text.prototype = Object.create(Node.prototype, {
+    CharacterData.prototype = Object.create(Node.prototype, {
+        constructor: { value: CharacterData, writable: true, configurable: true }
+    });
+    function Text(token) {
+        CharacterData.call(this, token);
+    }
+    Text.prototype = Object.create(CharacterData.prototype, {
         constructor: { value: Text, writable: true, configurable: true }
+    });
+    function Comment(token) {
+        CharacterData.call(this, token);
+    }
+    Comment.prototype = Object.create(CharacterData.prototype, {
+        constructor: { value: Comment, writable: true, configurable: true }
+    });
+    function DocumentType(token) {
+        Node.call(this, token);
+    }
+    DocumentType.prototype = Object.create(Node.prototype, {
+        constructor: { value: DocumentType, writable: true, configurable: true }
     });
 
     function Document(token) {
@@ -174,7 +198,7 @@
 
     // MutationObserver への変更通知フック（observers.js が setSink で登録。未登録は null）。
     var mutationSink = null;
-    var textProtoIsPrototypeOf = Function.prototype.call.bind(Object.prototype.isPrototypeOf, Text.prototype);
+    var textProtoIsPrototypeOf = Function.prototype.call.bind(Object.prototype.isPrototypeOf, CharacterData.prototype);
 
     // op 成功後に呼ぶ。フックの例外は握りつぶす（DOM 操作は既に成功している）。
     function notifyMutation(kind, target, info) {
@@ -221,6 +245,9 @@
     define(Text.prototype, 'nodeType', constGetter('nodeType', 3));
     define(Document.prototype, 'nodeType', constGetter('nodeType', 9));
     define(Text.prototype, 'nodeName', constGetter('nodeName', '#text'));
+    define(Comment.prototype, 'nodeType', constGetter('nodeType', 8));
+    define(Comment.prototype, 'nodeName', constGetter('nodeName', '#comment'));
+    define(DocumentType.prototype, 'nodeType', constGetter('nodeType', 10));
     define(Document.prototype, 'nodeName', constGetter('nodeName', '#document'));
 
     // 文書は 1 つだけなので ownerDocument は install 時の document ラッパー（op 不要）。
@@ -237,6 +264,8 @@
     }
     define(Element.prototype, 'ownerDocument', ownerDocumentGetter(false));
     define(Text.prototype, 'ownerDocument', ownerDocumentGetter(false));
+    define(Comment.prototype, 'ownerDocument', ownerDocumentGetter(false));
+    define(DocumentType.prototype, 'ownerDocument', ownerDocumentGetter(false));
     define(Document.prototype, 'ownerDocument', ownerDocumentGetter(true));
 
     // --- Node ---
@@ -323,6 +352,126 @@
             return parent === documentWrapper ? null : parent;
         }
     });
+    // --- 子・兄弟の走査（#1241・JS-5。React のハイドレーションが firstChild / nextSibling で辿る）---
+    // ID から型に合うラッパーを返す。キャッシュ済みならそれ、無ければ op `nodeType` で種別を引く（初回だけ）。
+    // HTML パーサーが作る種類（Element・Text・Comment・Document・Doctype）に null を返さない（子が無いように
+    // 見せることは成功を装うことになるため）。ラッパー型が無い PI・DocumentFragment は TypeError（REPAIR-3）。
+    function wrapNode(id) {
+        if (id === null || id === undefined) {
+            return null;
+        }
+        var cached = wrappers.get(id);
+        if (cached !== undefined) {
+            return cached;
+        }
+        var type = op('nodeType', id);
+        if (type === 1) { return wrap(id, Element); }
+        if (type === 3) { return wrap(id, Text); }
+        if (type === 8) { return wrap(id, Comment); }
+        if (type === 9) { return wrap(id, Document); }
+        if (type === 10) { return wrap(id, DocumentType); }
+        throw new TypeError('Unsupported node type: ' + type);
+    }
+    function traversalGetter(opName) {
+        return {
+            get: function () {
+                if (!ids.has(this)) {
+                    throw new TypeError("Illegal invocation");
+                }
+                return wrapNode(op(opName, ids.get(this)));
+            }
+        };
+    }
+    define(Node.prototype, 'firstChild', traversalGetter('firstChild'));
+    define(Node.prototype, 'lastChild', traversalGetter('lastChild'));
+    define(Node.prototype, 'nextSibling', traversalGetter('nextSibling'));
+    define(Node.prototype, 'previousSibling', traversalGetter('previousSibling'));
+    // 簡略版（REPAIR-3）: live でない静的な Array（item() つき）。呼ぶたびに新しい配列になる。
+    define(Node.prototype, 'childNodes', {
+        get: function () {
+            if (!ids.has(this)) {
+                throw new TypeError("Illegal invocation");
+            }
+            var joined = op('childNodes', ids.get(this));
+            var list = [];
+            if (joined !== '') {
+                var parts = joined.split(',');
+                for (var i = 0; i < parts.length; i++) {
+                    list.push(wrapNode(Number(parts[i])));
+                }
+            }
+            Object.defineProperty(list, 'item', {
+                value: function item(index) {
+                    var n = Number(index);
+                    var found = n >= 0 && n < list.length ? list[Math.floor(n)] : null;
+                    return found === undefined ? null : found;
+                },
+                writable: true,
+                configurable: true,
+                enumerable: false
+            });
+            return list;
+        }
+    });
+    define(Node.prototype, 'hasChildNodes', {
+        writable: true,
+        value: function hasChildNodes() {
+            return op('firstChild', idOf(this, 'hasChildNodes')) !== null;
+        }
+    });
+    // nodeValue / data: Text・Comment は内容、それ以外は null（代入は何もしない。DOM 標準どおり）。
+    // nodeValue は nullable DOMString のため null・undefined とも空文字列。data は DOMString のため
+    // undefined は文字列 "undefined" になる（nullable 指定は呼び出し側が渡す）。
+    function characterDataSetter(self, value, nullable) {
+        var text = (value === null || (nullable && value === undefined)) ? '' : String(value);
+        op('setTextContent', idOf(self, 'data'), text);
+        revalidateFocus();
+        notifyMutation('characterData', self, null);
+    }
+    define(Node.prototype, 'nodeValue', {
+        get: function () {
+            if (!ids.has(this)) {
+                throw new TypeError("Illegal invocation");
+            }
+            return null;
+        },
+        set: function (value) {
+            if (!ids.has(this)) {
+                throw new TypeError("Illegal invocation");
+            }
+        }
+    });
+    function characterDataValue(name, nullable) {
+        return {
+            get: function () {
+                return op('getTextContent', idOf(this, name));
+            },
+            set: function (value) {
+                characterDataSetter(this, value, nullable);
+            }
+        };
+    }
+    define(CharacterData.prototype, 'nodeValue', characterDataValue('nodeValue', true));
+    define(CharacterData.prototype, 'data', characterDataValue('data'));
+    define(CharacterData.prototype, 'length', {
+        get: function () {
+            return op('getTextContent', idOf(this, 'length')).length;
+        }
+    });
+    // DocumentType.name / nodeName（op `doctypeName`。ラッパーごとにキャッシュ）。publicId / systemId は未実装。
+    var doctypeNames = new WeakMap();
+    function doctypeNameOf(self) {
+        var cached = doctypeNames.get(self);
+        if (cached === undefined) {
+            var v = op('doctypeName', idOf(self, 'name'));
+            cached = typeof v === 'string' ? v : '';
+            doctypeNames.set(self, cached);
+        }
+        return cached;
+    }
+    define(DocumentType.prototype, 'name', { get: function () { return doctypeNameOf(this); } });
+    define(DocumentType.prototype, 'nodeName', { get: function () { return doctypeNameOf(this); } });
+
     define(Node.prototype, 'textContent', {
         get: function () {
             return op('getTextContent', idOf(this, 'textContent'));
@@ -1104,7 +1253,10 @@
     expose('Element', Element);
     expose('HTMLElement', HTMLElement);
     expose('HTMLIFrameElement', HTMLIFrameElement);
+    expose('CharacterData', CharacterData);
     expose('Text', Text);
+    expose('Comment', Comment);
+    expose('DocumentType', DocumentType);
     expose('Document', Document);
     documentWrapper = wrap(op('documentRoot'), Document);
     expose('document', documentWrapper);

@@ -544,6 +544,7 @@ pub fn run(engine: &str) {
     create_element_ns_cases(engine);
     get_elements_by_tag_name_cases(engine);
     parent_node_cases(engine);
+    child_traversal_cases(engine);
     is_equal_node_cases(engine);
     element_name_cases(engine);
     document_element_cases(engine);
@@ -2049,7 +2050,7 @@ fn node_cases(engine: &str) {
     check(
         &mut p,
         "String('localName' in document.body) + '|' + String('childNodes' in document.body)",
-        "true|false",
+        "true|true",
     );
     check(
         &mut p,
@@ -4097,5 +4098,124 @@ fn style_sheet_cases(engine: &str) {
         "var q = document.createElement('style'); document.head.appendChild(q); \
          q.sheet.insertRule('.r{}', 0) + '|' + document.styleSheets.length",
         "0|3",
+    );
+}
+
+/// JS-5・REPAIR-3・#1241: `childNodes` / `firstChild` / `lastChild` / `nextSibling` / `previousSibling` /
+/// `nodeValue` / `data`。React のハイドレーションが SSR 済み DOM を Text・Comment 込みで辿る。
+fn child_traversal_cases(engine: &str) {
+    eprintln!("case: JS-5 child traversal over Doctype / Comment / Text / Element (#1241)");
+    let mut p = setup_html(
+        engine,
+        "<!DOCTYPE html><html><head></head><body><!--$--><div id=\"a\">x<b>y</b>z</div><!--/$--><script>s</script></body></html>",
+        None,
+    );
+    check(
+        &mut p,
+        "var dt = document.firstChild; dt.nodeType + '|' + dt.nodeName + '|' + dt.name + '|' + document.childNodes.length",
+        "10|html|html|2",
+    );
+    check(
+        &mut p,
+        "String(document.lastChild === document.documentElement) + '|' + (dt.nextSibling === document.documentElement) + '|' + (dt.previousSibling === null)",
+        "true|true|true",
+    );
+    check(
+        &mut p,
+        "var c0 = document.body.firstChild; c0.nodeType + '|' + c0.nodeName + '|' + c0.data + '|' + c0.nodeValue + '|' + c0.length",
+        "8|#comment|$|$|1",
+    );
+    check(
+        &mut p,
+        "var a = document.getElementById('a'); String(c0.nextSibling === a) + '|' + (c0.previousSibling === null) + '|' + (a.previousSibling === c0)",
+        "true|true|true",
+    );
+    check(
+        &mut p,
+        "a.childNodes.length + '|' + a.firstChild.nodeType + '|' + a.firstChild.nodeValue + '|' + a.firstChild.nextSibling.tagName + '|' + a.lastChild.data",
+        "3|3|x|B|z",
+    );
+    check(
+        &mut p,
+        "String(a.lastChild.previousSibling.previousSibling === a.firstChild) + '|' + (a.childNodes.item(1) === a.childNodes[1]) + '|' + a.childNodes.item(9) + '|' + (a.childNodes[2] === a.lastChild)",
+        "true|true|null|true",
+    );
+    check(
+        &mut p,
+        "var tail = a.nextSibling; tail.nodeType + '|' + tail.data + '|' + (tail.nextSibling === document.body.lastChild) + '|' + document.body.lastChild.tagName + '|' + (document.body.lastChild.nextSibling === null)",
+        "8|/$|true|SCRIPT|true",
+    );
+    check(
+        &mut p,
+        "String(a.firstChild instanceof Text) + '|' + (a.firstChild instanceof CharacterData) + '|' + (a.firstChild instanceof Node) + '|' + (c0 instanceof Comment) + '|' + (c0 instanceof CharacterData) + '|' + (c0 instanceof Text) + '|' + (dt instanceof DocumentType) + '|' + (dt instanceof Node)",
+        "true|true|true|true|true|false|true|true",
+    );
+    check(
+        &mut p,
+        "String(a.nodeValue) + '|' + document.nodeValue + '|' + a.hasChildNodes() + '|' + a.firstChild.hasChildNodes() + '|' + document.createElement('i').hasChildNodes()",
+        "null|null|true|false|false",
+    );
+    check(
+        &mut p,
+        "typeof Comment + '|' + typeof CharacterData + '|' + typeof DocumentType + '|' + (function () { try { new Comment(); return 'no'; } catch (e) { return e instanceof TypeError ? 'TypeError' : 'other'; } })()",
+        "function|function|function|TypeError",
+    );
+    check(
+        &mut p,
+        "try { Object.getOwnPropertyDescriptor(Node.prototype, 'firstChild').get.call({}); 'no' } \
+         catch (e) { e instanceof TypeError ? 'TypeError' : 'other' }",
+        "TypeError",
+    );
+
+    eprintln!("case: JS-5 nodeValue / data setters write character data only (#1241)");
+    check(
+        &mut p,
+        "a.firstChild.nodeValue = 'X'; a.lastChild.data = null; 'done'",
+        "done",
+    );
+    check(
+        &mut p,
+        "a.firstChild.data + '|' + JSON.stringify(a.lastChild.data) + '|' + a.childNodes.length",
+        "X|\"\"|3",
+    );
+    check(&mut p, "c0.data = '$!'; c0.nodeValue", "$!");
+    assert!(p.html().contains("<!--$!-->"), "html: {}", p.html());
+    assert!(
+        p.html().contains("<div id=\"a\">X<b>y</b></div>"),
+        "html: {}",
+        p.html()
+    );
+    check(
+        &mut p,
+        "a.nodeValue = 'q'; a.childNodes.length + '|' + a.firstChild.data",
+        "3|X",
+    );
+    check(
+        &mut p,
+        "a.firstChild.nodeValue = undefined; var nv = JSON.stringify(a.firstChild.data); \
+         a.firstChild.data = undefined; nv + '|' + a.firstChild.data",
+        "\"\"|undefined",
+    );
+
+    eprintln!("case: JS-5 characterData mutation on Comment is observed (#1241)");
+    check(
+        &mut p,
+        "var seen = []; var mo = new MutationObserver(function (r) { \
+           for (var i = 0; i < r.length; i++) seen.push(r[i].type); }); \
+         mo.observe(c0, { characterData: true }); c0.data = 'm'; __fandheRunMicrotasks(); seen.join(',')",
+        "characterData",
+    );
+
+    eprintln!("case: JS-5 traversal follows appendChild / removeChild (#1241)");
+    check(
+        &mut p,
+        "var t = document.createTextNode('new'); a.appendChild(t); \
+         String(a.lastChild === t) + '|' + (t.previousSibling === a.childNodes[2]) + '|' + a.childNodes.length",
+        "true|true|4",
+    );
+    check(
+        &mut p,
+        "a.removeChild(t); String(t.nextSibling) + '|' + t.previousSibling + '|' + a.childNodes.length",
+        "null|null|3",
     );
 }
