@@ -49,7 +49,7 @@ const MAX_LINE_BYTES: usize = 64 * 1024;
 /// `Emulation.setFocusEmulationEnabled`・`Emulation.setEmulatedMedia`（43.3m・#1041）は Playwright 既定値だけを受理して保持し
 /// `{}` を返す（保持値は読まれない。`REPAIR-3`）。収集は `newContext({viewport:null})` で行うため `Browser.getWindowForTarget`・
 /// `Emulation.setDeviceMetricsOverride` は送られない。`getFrameTree` の `frame.id` は targetId に一致し（43.3o・#1050）、
-/// `newPage()` は成功する。直後に送られる `Page.createIsolatedWorld` は未実装（`-32601`）だが、`newPage()` は応答を待たず、
+/// `newPage()` は成功する。直後に送られる `Page.createIsolatedWorld` は実装済み（TASK-44.6・#1217。評価器が無効な構成ではエラー）だが、`newPage()` は応答を待たず、
 /// トレースには応答が記録されない（`Target.closeTarget` も送られない）。
 ///
 /// 注意: `Browser.getVersion` の応答に `CARGO_PKG_VERSION` が入るため、workspace の版を上げたら
@@ -390,12 +390,13 @@ async fn cdp2_playwright_trace_replay_matches_recorded_responses() {
             json!({"id": 16, "sessionId": sid, "result": {}}),
             // 止めたセッションの `Runtime.runIfWaitingForDebugger` は実際に再開して `{}`。
             json!({"id": 17, "sessionId": sid, "result": {}}),
-            // `Page.createIsolatedWorld` は未実装（`-32601`。トレースでは `newPage()` が応答を待たず未記録）。
-            json!({"id": 18, "sessionId": sid, "error": {"code": -32601, "message": "method not implemented"}}),
+            // `Page.createIsolatedWorld` は実装済みだが、このテストの `AppState` は評価器が無効のため
+            // 使えない contextId を返さずエラー（TASK-44.6・#1217。トレースでは `newPage()` が応答を待たず未記録）。
+            json!({"id": 18, "sessionId": sid, "error": {"code": -32000, "message": "execution contexts unavailable"}}),
         ]
     );
     assert!(!artifacts.exists(), "downloadPath must not be created");
-    // 記録は `Page.createIsolatedWorld`（未実装で `-32601`）の応答より前に終わるため、最後の 1 件だけ記録に無い。
+    // 記録は `Page.createIsolatedWorld`（評価器が無効でエラー）の応答より前に終わるため、最後の 1 件だけ記録に無い。
     assert_eq!(
         replayed.get(..recvs.len()),
         Some(recvs.as_slice()),
@@ -420,7 +421,7 @@ async fn cdp2_playwright_trace_replay_matches_recorded_responses() {
             ("Log.enable", 1, 0),
             ("Network.enable", 1, 0),
             ("Page.addScriptToEvaluateOnNewDocument", 1, 0),
-            ("Page.createIsolatedWorld", 0, 1),
+            ("Page.createIsolatedWorld", 1, 0),
             ("Page.enable", 1, 0),
             ("Page.getFrameTree", 1, 0),
             ("Page.setLifecycleEventsEnabled", 1, 0),
@@ -707,7 +708,7 @@ fn reach_report(recs: &[Value]) -> ReachReport {
 /// `failed` が空なのは、収集オプション `newContext({viewport:null})`（TASK-43.3m）により
 /// `Browser.getWindowForTarget` が送られないため（許容条件の「`-32601` のみ」より厳しい）。
 /// `getWindowForTarget` は実体が無く値を作ると偽になるため、方針どおり `-32601` のまま残す（`SEC-2`・`CDP-6`）。
-/// 直後に送られる `Page.createIsolatedWorld` も未実装（`-32601`）だが、`newPage()` は応答を待たない。
+/// 直後に送られる `Page.createIsolatedWorld` は評価器が無効だとエラーになるが、`newPage()` は応答を待たない。
 /// そのため応答は記録されない場合がある（収集のたびに入ることがある競合。記録済みトレースには無い）。
 /// 失敗時のクリーンアップ（`Target.closeTarget` 送信・`Target.detachedFromTarget` 受信）と、
 /// 初期 `about:blank` の `Page.frameNavigated`・`Page.lifecycleEvent` が無いまま成功することも固定する

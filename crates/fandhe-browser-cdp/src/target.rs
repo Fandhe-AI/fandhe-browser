@@ -17,7 +17,10 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
+use fandhe_browser_core::NavigationGeneration;
+
 use crate::conn_state::DownloadSettings;
+use crate::runtime::{ContextError, ContextView, ExecutionContextTable};
 
 /// 同時に保持できるターゲット数の上限（無制限確保による DoS の防止）。
 pub const MAX_TARGETS: usize = 64;
@@ -33,6 +36,11 @@ pub const MAX_URL_LEN: usize = 8192;
 pub(crate) const MAX_WORLD_NAME_LEN: usize = 256;
 /// 1 セッションあたりの `Page.addScriptToEvaluateOnNewDocument` 登録数の上限（`CDP-7`）。
 pub(crate) const MAX_INIT_SCRIPTS_PER_SESSION: u32 = 64;
+/// 1 セッションが `worldName` として保持できる異なる非空の名前数の上限（`CDP-7`）。遷移のたびに
+/// 自動で作る isolated world の数になるため、文書 × セッションあたりの world 上限と同じ値にして、
+/// 自動作成が上限超過で黙って欠けないようにする（fail-closed。TASK-44.6）。
+pub(crate) const MAX_WORLD_NAMES_PER_SESSION: usize =
+    crate::runtime::MAX_ISOLATED_WORLDS_PER_DOCUMENT_SESSION;
 
 /// cdp 状態型の操作エラー。表は失敗時に変更されない。
 ///
@@ -82,6 +90,11 @@ pub enum CdpStateError {
         /// 上限値（バイト）。
         limit: usize,
     },
+    /// セッションが保持する異なる `worldName` の数が上限（[`MAX_WORLD_NAMES_PER_SESSION`]）に達している。
+    TooManyWorlds {
+        /// 上限値。
+        limit: usize,
+    },
 }
 
 impl fmt::Display for CdpStateError {
@@ -107,6 +120,7 @@ impl fmt::Display for CdpStateError {
             Self::WorldNameTooLong { limit } => {
                 write!(f, "world name too long (limit {limit} bytes)")
             }
+            Self::TooManyWorlds { limit } => write!(f, "too many worlds (limit {limit})"),
         }
     }
 }
@@ -120,6 +134,7 @@ fn drop_session_state(t: &mut Tables, sid: &SessionId) {
     t.lifecycle_events_enabled.remove(sid);
     t.domains_enabled.remove(sid);
     t.init_scripts.remove(sid);
+    t.exec_contexts.remove_session(sid);
     t.child_auto_attach.remove(sid);
     t.emulation.remove(sid);
 }
@@ -278,7 +293,8 @@ pub(crate) enum SessionDomain {
     Network,
 }
 
-/// ドメインごとの有効フラグ。イベント送出は未実装で、現時点では印を持つだけ（`REPAIR-3`）。
+/// ドメインごとの有効フラグ。`Runtime` は実行コンテキストの告知ゲート（TASK-44.6・#1217）。`Log`・`Network` は
+/// イベント送出が未実装で、現時点では印を持つだけ（`REPAIR-3`）。
 #[derive(Debug, Clone, Copy, Default)]
 struct SessionDomains {
     log: bool,
@@ -321,10 +337,14 @@ struct Tables {
     /// 消す。件数は `MAX_SESSIONS` 以下（`CDP-7`）。
     emulation: HashMap<SessionId, SessionEmulation>,
     /// セッションごとの `Page.addScriptToEvaluateOnNewDocument` 登録数（43.3l・#1040・`CDP-2`）。
-    /// `source` は常に空で `Page.removeScriptToEvaluateOnNewDocument` も未実装のため、件数だけを持つ。
-    /// 将来は登録内容（world 名・source）を持ちページ JS 実行と繋ぐ（`JS-4`・TASK-112・`REPAIR-3`）。
+    /// `source` は常に空で `Page.removeScriptToEvaluateOnNewDocument` も未実装のため、件数と非空の `worldName`
+    /// （遷移のたびに isolated world を作る。TASK-44.6・#1217）だけを持つ。将来は source を持ちページ JS 実行と
+    /// 繋ぐ（`JS-4`・TASK-112・`REPAIR-3`）。
     /// 寿命は `sessions` と同じ。件数は `MAX_SESSIONS` × 上限以下（`CDP-7`）。
-    init_scripts: HashMap<SessionId, u32>,
+    init_scripts: HashMap<SessionId, InitScripts>,
+    /// 実行コンテキストの表（TASK-44.6・#1217・`CDP-2`）。エントリは必ずセッションに属し、
+    /// `drop_session_state` で消える。件数は `MAX_SESSIONS` × (main 1 + isolated 8) 以下（`CDP-7`）。
+    exec_contexts: ExecutionContextTable,
     /// init script identifier の連番（registry 全体。初期値 1。枯渇時は `IdExhausted`）。
     next_init_script: u64,
     /// セッション付き `Target.setAutoAttach` の状態（値は `waitForDebuggerOnStart`。43.3l・#1040）。
@@ -333,6 +353,15 @@ struct Tables {
     next_target: u64,
     next_session: u64,
     next_context: u64,
+}
+
+/// セッションごとの `Page.addScriptToEvaluateOnNewDocument` 登録の保持値（`CDP-2`・`CDP-7`）。
+#[derive(Debug, Clone, Default)]
+struct InitScripts {
+    /// 登録数。
+    count: u32,
+    /// 登録された非空の `worldName`（重複なし・登録順。遷移のたびにその名前の isolated world を作る）。
+    world_names: Vec<String>,
 }
 
 /// セッションごとの Emulation 保持値（43.3m・#1041・`CDP-2`）。
@@ -345,6 +374,15 @@ pub(crate) struct SessionEmulation {
     pub(crate) focus: Option<bool>,
     /// `setEmulatedMedia` で既定値を受理済みか。
     pub(crate) media_default: bool,
+}
+
+/// [`TargetRegistry::create_isolated_world`] の結果（将来の拡張に備え構造体。`REPAIR-4`）。
+#[derive(Debug, Clone)]
+pub(crate) struct CreatedWorld {
+    /// 作成または再利用したコンテキスト。
+    pub(crate) view: ContextView,
+    /// `Runtime.executionContextCreated` を送るべきか（新規作成かつ Runtime 有効）。
+    pub(crate) announce: bool,
 }
 
 /// ターゲット表とセッション表。単一 `Mutex` で保護し、
@@ -383,6 +421,7 @@ impl TargetRegistry {
                 domains_enabled: HashMap::new(),
                 emulation: HashMap::new(),
                 init_scripts: HashMap::new(),
+                exec_contexts: ExecutionContextTable::new(),
                 next_init_script: 1,
                 child_auto_attach: HashMap::new(),
                 next_target,
@@ -646,23 +685,26 @@ impl TargetRegistry {
     }
 
     /// セッションに `Log`・`Runtime`・`Network` のいずれかの有効印を付ける（冪等。43.3j・#1038・`CDP-2`）。
+    /// 今回の呼び出しで新たに有効化したら `true`、既に有効なら `false`（`Runtime.enable` が初回のときだけ
+    /// 実行コンテキストを告知するために使う。TASK-44.6・#1217）。
     ///
     /// 存在確認と設定を 1 回のロックで行う。置き場所の理由は [`Self::enable_page`] と同じ。
     pub(crate) fn enable_domain(
         &self,
         sid: &SessionId,
         d: SessionDomain,
-    ) -> Result<(), CdpStateError> {
+    ) -> Result<bool, CdpStateError> {
         let mut t = self.lock();
         if !t.sessions.contains_key(sid) {
             return Err(CdpStateError::UnknownSession);
         }
-        *t.domains_enabled.entry(sid.clone()).or_default().slot(d) = true;
-        Ok(())
+        let slot = t.domains_enabled.entry(sid.clone()).or_default().slot(d);
+        let newly = !*slot;
+        *slot = true;
+        Ok(newly)
     }
 
-    /// ドメインが有効か。本番コードでは読む箇所がない（イベント送出の実装時に読む）。
-    #[cfg(test)]
+    /// ドメインが有効か（`Runtime` はイベント送出のゲート。TASK-44.6・#1217）。
     pub(crate) fn is_domain_enabled(&self, sid: &SessionId, d: SessionDomain) -> bool {
         self.lock()
             .domains_enabled
@@ -671,27 +713,166 @@ impl TargetRegistry {
     }
 
     /// セッションに空 source の init script を 1 件登録し、identifier（registry 全体の連番）を返す
-    /// （43.3l・#1040・`CDP-2`）。
+    /// （43.3l・#1040・`CDP-2`）。`world` が非空なら `worldName` として保持する（重複は 1 件。遷移のたびに
+    /// その名前の isolated world を作る。TASK-44.6・#1217）。空文字・`None` は main world の意味で保持しない。
     ///
-    /// 存在確認・上限検査・採番を 1 回のロックで行い、失敗時は件数も連番も変えない。source は常に空で
-    /// 実行されない。identifier を接続スコープでなく registry 全体にするのは、採番を原子的にし
-    /// 同一接続での再登録が別 identifier になることを保証するため。
-    pub(crate) fn add_init_script(&self, sid: &SessionId) -> Result<u64, CdpStateError> {
+    /// 存在確認・件数上限・異なる名前数の上限・採番を 1 回のロックで行い、失敗時は件数も名前も連番も
+    /// 変えない。source は常に空で実行されない。identifier を接続スコープでなく registry 全体にするのは、
+    /// 採番を原子的にし同一接続での再登録が別 identifier になることを保証するため。
+    pub(crate) fn add_init_script(
+        &self,
+        sid: &SessionId,
+        world: Option<&str>,
+    ) -> Result<u64, CdpStateError> {
         let mut t = self.lock();
         if !t.sessions.contains_key(sid) {
             return Err(CdpStateError::UnknownSession);
         }
-        let count = t.init_scripts.get(sid).copied().unwrap_or(0);
+        let (count, names) = t
+            .init_scripts
+            .get(sid)
+            .map_or((0, 0), |e| (e.count, e.world_names.len()));
         if count >= MAX_INIT_SCRIPTS_PER_SESSION {
             return Err(CdpStateError::TooManyInitScripts {
                 limit: MAX_INIT_SCRIPTS_PER_SESSION,
             });
         }
+        // 空文字・`None` は main world の意味で保持しない。既に保持中の名前も増やさない。
+        let new_world = world.filter(|w| {
+            !w.is_empty()
+                && !t
+                    .init_scripts
+                    .get(sid)
+                    .is_some_and(|e| e.world_names.iter().any(|n| n == w))
+        });
+        if new_world.is_some() && names >= MAX_WORLD_NAMES_PER_SESSION {
+            return Err(CdpStateError::TooManyWorlds {
+                limit: MAX_WORLD_NAMES_PER_SESSION,
+            });
+        }
         let n = t.next_init_script;
         let next = n.checked_add(1).ok_or(CdpStateError::IdExhausted)?;
         t.next_init_script = next;
-        t.init_scripts.insert(sid.clone(), count.saturating_add(1));
+        let entry = t.init_scripts.entry(sid.clone()).or_default();
+        entry.count = entry.count.saturating_add(1);
+        if let Some(w) = new_world {
+            entry.world_names.push(w.to_owned());
+        }
         Ok(n)
+    }
+
+    /// セッションの現在の文書について、main と（`include_init_worlds` なら）保持中の `worldName` の
+    /// isolated world を揃えて返す（無ければ作る）。評価器が有効で Runtime が有効なセッションの
+    /// 告知（`Runtime.enable`・再開時）で使う。古い世代のエントリは全セッション分消える。
+    /// 呼び出し側がゲート（評価器・Runtime 有効・確定文書）を確認する（TASK-44.6・#1217・`CDP-2`）。
+    pub(crate) fn document_contexts(
+        &self,
+        sid: &SessionId,
+        generation: NavigationGeneration,
+        include_init_worlds: bool,
+    ) -> Result<Vec<ContextView>, ContextError> {
+        let mut t = self.lock();
+        let tid = t
+            .sessions
+            .get(sid)
+            .cloned()
+            .ok_or(ContextError::UnknownSession)?;
+        let names = if include_init_worlds {
+            t.init_scripts
+                .get(sid)
+                .map(|e| e.world_names.clone())
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        t.exec_contexts
+            .ensure_document(sid, &tid, generation, &names)
+    }
+
+    /// `Page.navigate` の確定で、`tid` の古い世代のコンテキストを全セッション分消し、`requester` が
+    /// そのターゲットのセッションで Runtime 有効なら新しい世代の main と保持中の各 `worldName` を作って
+    /// 返す（それ以外は空）。作成に失敗（上限・枯渇）しても遷移は失敗させず、告知を省く（TASK-44.6・#1217）。
+    /// 評価器が無効なときは呼ばない（エントリを作らない）。
+    pub(crate) fn announce_navigation(
+        &self,
+        tid: &TargetId,
+        generation: NavigationGeneration,
+        requester: Option<&SessionId>,
+    ) -> Vec<ContextView> {
+        let mut t = self.lock();
+        let eligible = requester.filter(|s| {
+            t.sessions.get(*s) == Some(tid) && t.domains_enabled.get(*s).is_some_and(|d| d.runtime)
+        });
+        let Some(sid) = eligible else {
+            let _ = t.exec_contexts.prune_target(tid, generation);
+            return Vec::new();
+        };
+        let names = t
+            .init_scripts
+            .get(sid)
+            .map(|e| e.world_names.clone())
+            .unwrap_or_default();
+        t.exec_contexts
+            .ensure_document(sid, tid, generation, &names)
+            .unwrap_or_default()
+    }
+
+    /// `Page.createIsolatedWorld` の本体。`sid` が `tid` のセッションであることを確認し、名前付き
+    /// isolated world を作る（同名は再利用）。`announce` は「新規作成かつ Runtime 有効」でイベントを送る印。
+    pub(crate) fn create_isolated_world(
+        &self,
+        sid: &SessionId,
+        tid: &TargetId,
+        generation: NavigationGeneration,
+        name: &str,
+    ) -> Result<CreatedWorld, ContextError> {
+        let mut t = self.lock();
+        if t.sessions.get(sid) != Some(tid) {
+            return Err(ContextError::UnknownSession);
+        }
+        let runtime = t.domains_enabled.get(sid).is_some_and(|d| d.runtime);
+        let (view, created) = t
+            .exec_contexts
+            .create_isolated(sid, tid, generation, name)?;
+        Ok(CreatedWorld {
+            view,
+            announce: created && runtime,
+        })
+    }
+
+    /// contextId を現在の世代に照らして解決する（評価系 #1218 が使う。他セッションの id は未知扱い）。
+    #[allow(dead_code)]
+    pub(crate) fn resolve_context(
+        &self,
+        sid: &SessionId,
+        context_id: u64,
+        current_generation: NavigationGeneration,
+    ) -> Result<ContextView, crate::runtime::ContextLookupError> {
+        self.lock()
+            .exec_contexts
+            .resolve(sid, context_id, current_generation)
+    }
+
+    /// 実行コンテキストの件数（テスト用）。
+    #[cfg(test)]
+    pub(crate) fn exec_context_count(&self) -> usize {
+        self.lock().exec_contexts.len()
+    }
+
+    /// 次の contextId を指定して作る（枯渇のテスト用）。
+    #[cfg(test)]
+    pub(crate) fn set_next_context_id_for_test(&self, next: u64) {
+        self.lock().exec_contexts = ExecutionContextTable::with_next_id(next);
+    }
+
+    /// セッションが保持する `worldName`（テスト用）。
+    #[cfg(test)]
+    pub(crate) fn init_world_names(&self, sid: &SessionId) -> Vec<String> {
+        self.lock()
+            .init_scripts
+            .get(sid)
+            .map(|e| e.world_names.clone())
+            .unwrap_or_default()
     }
 
     /// セッション付き `Target.setAutoAttach` の状態を設定する（`Some(wait)` で設定、`None` で解除。
@@ -725,7 +906,7 @@ impl TargetRegistry {
     /// セッションの init script 登録数（テスト用）。
     #[cfg(test)]
     pub(crate) fn init_script_count(&self, sid: &SessionId) -> u32 {
-        self.lock().init_scripts.get(sid).copied().unwrap_or(0)
+        self.lock().init_scripts.get(sid).map_or(0, |e| e.count)
     }
 
     /// セッションの attach 先ターゲットを返す。
@@ -1385,12 +1566,12 @@ mod tests {
         let r = TargetRegistry::new();
         let t = r.create_target(TargetKind::Page, "about:blank").unwrap();
         let s = r.attach(&t).unwrap();
-        assert_eq!(r.add_init_script(&s), Ok(1));
-        assert_eq!(r.add_init_script(&s), Ok(2));
+        assert_eq!(r.add_init_script(&s, None), Ok(1));
+        assert_eq!(r.add_init_script(&s, None), Ok(2));
         assert_eq!(r.init_script_count(&s), 2);
         let ghost = SessionId::parse("ghost").unwrap();
         assert_eq!(
-            r.add_init_script(&ghost),
+            r.add_init_script(&ghost, None),
             Err(CdpStateError::UnknownSession)
         );
     }
@@ -1402,10 +1583,10 @@ mod tests {
         let s = r.attach(&t).unwrap();
         let other = r.attach(&t).unwrap();
         for i in 0..MAX_INIT_SCRIPTS_PER_SESSION {
-            assert_eq!(r.add_init_script(&s), Ok(u64::from(i) + 1));
+            assert_eq!(r.add_init_script(&s, None), Ok(u64::from(i) + 1));
         }
         assert_eq!(
-            r.add_init_script(&s),
+            r.add_init_script(&s, None),
             Err(CdpStateError::TooManyInitScripts {
                 limit: MAX_INIT_SCRIPTS_PER_SESSION
             })
@@ -1413,7 +1594,7 @@ mod tests {
         assert_eq!(r.init_script_count(&s), MAX_INIT_SCRIPTS_PER_SESSION);
         // 失敗では連番が進まず、別セッションには影響しない。
         assert_eq!(
-            r.add_init_script(&other),
+            r.add_init_script(&other, None),
             Ok(u64::from(MAX_INIT_SCRIPTS_PER_SESSION) + 1)
         );
     }
@@ -1442,13 +1623,13 @@ mod tests {
         let r = TargetRegistry::new();
         let t1 = r.create_target(TargetKind::Page, "about:blank").unwrap();
         let s1 = r.attach(&t1).unwrap();
-        r.add_init_script(&s1).unwrap();
+        r.add_init_script(&s1, None).unwrap();
         r.set_child_auto_attach(&s1, Some(true)).unwrap();
         r.detach(&s1).unwrap();
         assert_eq!(r.init_script_count(&s1), 0);
         assert_eq!(r.child_auto_attach(&s1), None);
         let s1b = r.attach(&t1).unwrap();
-        r.add_init_script(&s1b).unwrap();
+        r.add_init_script(&s1b, None).unwrap();
         r.set_child_auto_attach(&s1b, Some(false)).unwrap();
         r.close_target(&t1).unwrap();
         assert_eq!(r.init_script_count(&s1b), 0);
@@ -1457,7 +1638,7 @@ mod tests {
         let (_t3, s3) = r
             .create_target_attached(Some(&c), TargetKind::Page, "about:blank", false)
             .unwrap();
-        r.add_init_script(&s3).unwrap();
+        r.add_init_script(&s3, None).unwrap();
         r.set_child_auto_attach(&s3, Some(true)).unwrap();
         r.dispose_browser_context(&c).unwrap();
         assert_eq!(r.init_script_count(&s3), 0);

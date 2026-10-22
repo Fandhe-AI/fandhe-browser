@@ -71,11 +71,12 @@ impl CdpState {
 
     /// ブラウザ ID を指定して構築する（テスト・cli からの注入用）。
     pub fn with_browser_id(app: Arc<AppState>, browser_id: BrowserId) -> Self {
+        let navigations = TargetNavigations::new(app.script_contexts().clone());
         Self {
             app,
             browser_id,
             registry: TargetRegistry::new(),
-            navigations: TargetNavigations::new(),
+            navigations,
             dom_issued: IssuedDocuments::new(),
             method_log: ReceivedMethodLog::new(),
             conn_scoped: ConnectionScoped::new(),
@@ -105,6 +106,15 @@ impl CdpState {
         }
         // 切断した接続が止めていたターゲットを再開する（永久停止を残さない。`CDP-7`・#910）。
         self.resume_orphaned_paused();
+        // context の破棄で消えたターゲットの遷移状態と評価コンテキストの scope を即時に解放する
+        // （core の追跡 scope 数を「生存ターゲット数 + 共有状態 1」以下に保つ。`CDP-7`・#1217）。
+        self.navigations.prune(&self.registry);
+    }
+
+    /// 評価器（core の `ScriptContextHandle`）が有効か。実行コンテキストの告知・
+    /// `Page.createIsolatedWorld` のゲート（無効なら偽の contextId を見せない。TASK-44.6・#1217）。
+    pub(crate) fn evaluator_enabled(&self) -> bool {
+        self.app.script_contexts().is_enabled()
     }
 
     /// 止めたセッションが外れた（detach・切断）ターゲットの初期 `about:blank` 読み込みを行う

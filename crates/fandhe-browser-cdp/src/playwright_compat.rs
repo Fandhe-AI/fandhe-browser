@@ -426,7 +426,9 @@ impl CommandHandler for TargetCreateTarget {
 /// `Runtime.runIfWaitingForDebugger`（`CDP-2`・`SEC-2`・`REPAIR-3`・TASK-43.3e・#910）。
 ///
 /// `waitForDebuggerOnStart` で止めたターゲットを、止めたセッション自身が再開する。再開で初期
-/// `about:blank` 文書を確定し `{}` を返す。止まっていないターゲットのセッションへは、Chromium と同じく
+/// `about:blank` 文書を確定し `{}` を返す。評価器が有効でセッションが `Runtime.enable` 済みなら、
+/// 確定した初期文書の `Runtime.executionContextCreated`（main と保持中の `worldName`）を同伴する
+/// （TASK-44.6・#1217。止めたセッションが離脱した場合の再開は告知先が無いので送らない）。止まっていないターゲットのセッションへは、Chromium と同じく
 /// 何もせず `{}`（実際の no-op であり、ここでの成功は検出回避等の一律成功ではない）。`sessionId` 必須
 /// （無ければ `UNSUPPORTED_PARAMS`）、未知・閉じたセッションは `INVALID_PARAMS`。
 /// 止めたセッションが外れた場合の再開は `CdpState::resume_orphaned_paused`。
@@ -445,10 +447,19 @@ impl CommandHandler for RuntimeRunIfWaitingForDebugger {
             if registry.session_target(sid).is_none() {
                 return Err(CdpError::INVALID_PARAMS);
             }
+            let mut out = HandlerOutput::result(json!({}));
             if let Some(tid) = registry.resume_by_session(sid) {
                 state.navigations().commit_initial_blank(registry, &tid);
+                // 再開で確定した初期文書の main と保持中の `worldName` を告知する（前の文書は無いので
+                // cleared は送らない）。Playwright の順序（`Runtime.enable` → `addScript(worldName)` →
+                // 本メソッド）では、ここで utility world が先に告知される（TASK-44.6・#1217）。
+                if registry.is_domain_enabled(sid, SessionDomain::Runtime) {
+                    for ev in crate::runtime::current_document_events(state, sid, true) {
+                        out = out.with_event(ev);
+                    }
+                }
             }
-            Ok(HandlerOutput::result(json!({})))
+            Ok(out)
         })
     }
 }
@@ -546,8 +557,12 @@ impl CommandHandler for PageSetLifecycleEventsEnabled {
 ///
 /// 応答は `{"identifier": "<10 進連番>"}` だけでイベントは送らない。identifier は registry 全体の連番
 /// （接続スコープより広いが、採番を原子的にでき同一接続での再登録が別 identifier になる。セッション ID と
-/// 同じ性質で新しい情報漏えいは無い）。`worldName` は保持しない。止めたターゲットでも受理する。
-/// 差異（`REPAIR-3`）: 登録内容は件数だけを持ち、`Page.removeScriptToEvaluateOnNewDocument` は未実装。
+/// 同じ性質で新しい情報漏えいは無い）。止めたターゲットでも受理する。
+///
+/// 非空の `worldName` はセッションごとに重複なしで保持し（`Page.navigate` の確定・`Runtime.runIfWaitingForDebugger`
+/// の再開時に、その名前の isolated world を `Runtime.executionContextCreated` で告知する。TASK-44.6・#1217）、
+/// 異なる名前は 8 件まで（超過は `-32000`・状態は不変。`CDP-7`）。空文字・省略は main world の意味で保持しない。
+/// 差異（`REPAIR-3`）: 登録内容は件数と `worldName` だけを持ち、`Page.removeScriptToEvaluateOnNewDocument` は未実装。
 /// 将来仕様はページ JS 実行と繋いだ新文書での実行（`JS-4`・TASK-112）。UA・ヘッダ・`navigator` には触れない。
 pub(crate) struct PageAddScriptToEvaluateOnNewDocument;
 
@@ -570,6 +585,7 @@ impl CommandHandler for PageAddScriptToEvaluateOnNewDocument {
             if !source.is_empty() {
                 return Err(CdpError::UNSUPPORTED_PARAMS);
             }
+            let mut world: Option<&str> = None;
             if let Some(w) = obj.get("worldName") {
                 let w = w.as_str().ok_or(CdpError::INVALID_PARAMS)?;
                 if w.contains('\0') {
@@ -578,15 +594,17 @@ impl CommandHandler for PageAddScriptToEvaluateOnNewDocument {
                 if w.len() > crate::target::MAX_WORLD_NAME_LEN {
                     return Err(CdpError::WORLD_NAME_TOO_LONG);
                 }
+                world = Some(w);
             }
             let id = ctx
                 .state
                 .registry()
-                .add_init_script(sid)
+                .add_init_script(sid, world)
                 .map_err(|e| match e {
                     crate::target::CdpStateError::TooManyInitScripts { .. } => {
                         CdpError::INIT_SCRIPT_LIMIT_EXCEEDED
                     }
+                    crate::target::CdpStateError::TooManyWorlds { .. } => CdpError::TOO_MANY_WORLDS,
                     crate::target::CdpStateError::IdExhausted => CdpError::SERVER_ERROR,
                     _ => CdpError::INVALID_PARAMS,
                 })?;
@@ -779,12 +797,17 @@ impl CommandHandler for LogEnable {
     }
 }
 
-/// `Runtime.enable`（`CDP-2`・TASK-43.3j・#1038）。
+/// `Runtime.enable`（`CDP-2`・TASK-43.3j・#1038・TASK-44.6・#1217）。
 ///
-/// セッションに有効フラグを立てて `{}` を返す（冪等）。差異（`REPAIR-3`）: `Runtime.executionContextCreated`・
-/// `consoleAPICalled` は送らない。`Runtime.evaluate` 等が未実装で、使えない `context.id` を見せると
-/// 偽の応答になるため。将来仕様は実行コンテキストのモデルを作ったうえでの送出（TASK-44）。
-/// 実際の状態変更であり検出回避の一律成功ではない（`SEC-2`・`CDP-6`）。検証は [`enable_session_domain`]。
+/// セッションに有効フラグを立てて `{}` を返す（冪等）。評価器（core の `ScriptContextHandle`）が有効で、
+/// 今回の呼び出しで**初めて**有効化され、ターゲットが止まっておらず確定文書がある場合に限り、現在の文書の
+/// main と作成済みの isolated world を `Runtime.executionContextCreated` として同伴する（`runtime.rs`）。
+/// 2 回目以降・評価器が無効・止めたターゲット（文書なし）では 0 件（偽の `context.id` を見せない。
+/// 止めたターゲットは [`RuntimeRunIfWaitingForDebugger`] の再開時に告知する）。
+///
+/// 差異（`REPAIR-3`）: `consoleAPICalled` は送らない。main world の contextId は告知するが、
+/// 評価（`Runtime.evaluate` 等）は未実装で CDP エラーになる（#1218）。実際の状態変更であり
+/// 検出回避の一律成功ではない（`SEC-2`・`CDP-6`）。検証は [`enable_session_domain`] と同じ順。
 pub(crate) struct RuntimeEnable;
 
 impl CommandHandler for RuntimeEnable {
@@ -793,7 +816,25 @@ impl CommandHandler for RuntimeEnable {
         ctx: CommandContext<'a>,
         params: &'a Value,
     ) -> BoxFuture<'a, Result<HandlerOutput, CdpError>> {
-        Box::pin(async move { enable_session_domain(ctx, params, SessionDomain::Runtime) })
+        Box::pin(async move {
+            let sid = ctx.session_id.ok_or(CdpError::UNSUPPORTED_PARAMS)?;
+            let obj = params.as_object().ok_or(CdpError::INVALID_PARAMS)?;
+            if !obj.is_empty() {
+                return Err(CdpError::UNSUPPORTED_PARAMS);
+            }
+            let newly = ctx
+                .state
+                .registry()
+                .enable_domain(sid, SessionDomain::Runtime)
+                .map_err(|_| CdpError::INVALID_PARAMS)?;
+            let mut out = HandlerOutput::result(json!({}));
+            if newly {
+                for ev in crate::runtime::current_document_events(ctx.state, sid, false) {
+                    out = out.with_event(ev);
+                }
+            }
+            Ok(out)
+        })
     }
 }
 
@@ -2959,17 +3000,6 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn cdp2_runtime_enable_does_not_emit_execution_context_created() {
-            let dir = TempDir::new();
-            let st = state(&dir);
-            let c = open_conn(&st, 1);
-            let sid = attached_session(&st, c).await;
-            let f = call(&st, Some(c), &sreq(2, "Runtime.enable", &sid, "{}")).await;
-            assert_eq!(f, vec![json!({"id":2,"sessionId":sid,"result":{}})]);
-            assert!(f.iter().all(|v| v.get("method").is_none()));
-        }
-
-        #[tokio::test]
         async fn cdp2_enables_accepted_on_paused_target_before_resume() {
             let dir = TempDir::new();
             let st = state(&dir);
@@ -2995,6 +3025,8 @@ mod tests {
             }
         }
 
+        /// 評価器が無効な構成（`state` の既定）では、`Runtime.enable` 後でも Runtime イベントは出ない
+        /// （有効な構成の順序は `runtime.rs` の `dispatch_tests`。TASK-44.6・#1217）。
         #[tokio::test]
         async fn cdp2_navigate_after_enables_emits_only_page_events() {
             let dir = TempDir::new();
