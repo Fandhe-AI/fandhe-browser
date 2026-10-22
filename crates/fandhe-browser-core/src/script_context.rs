@@ -30,18 +30,32 @@
 //!   だけ有効（`create_engine` は子プロセスを起動しない）。macOS の boa のように生成が失敗する構成は
 //!   無効（`is_enabled() == false`）になり、評価は [`ScriptContextError::Unavailable`]。
 //!   `[js] execute_page_scripts` はこのハンドルを左右しない。
-//! - **世代（`CDP-2`）**: scope ごとに「見た中で最新の世代」を記録する。`begin_generation(scope, g)` は
-//!   最新を `g` に更新し、その scope の古い世代のコンテキストを破棄する。`evaluate` で `key.generation`
-//!   が最新より古ければ [`ScriptContextError::NotFound`]、新しければ古い世代を破棄して更新する。
-//!   同じ世代で未作成のキーは上限内で新規作成する。`release_scope` は scope のコンテキストをすべて破棄し
-//!   記録も消す。release 後に同じ scope へ評価を送らないのは呼び出し側の契約（送られた場合は上限内で
-//!   新規作成になる）。通知と評価は同じ FIFO を通るため、送った順に処理される。
-//!   通知の保留が 1024 件を超える場合は黙って捨てず `LimitExceeded` を返す（他 scope の
-//!   コンテキストは巻き込まない）。世代の記録は `release_scope` でだけ消す（LRU・コンテキストの有無では
-//!   消さない。消すと古い世代の評価が通ってしまう）。記録を持つ scope 数は 1024 までで、上限に達した
-//!   状態で新しい scope の `begin_generation` / `evaluate` が来たら
-//!   [`ScriptContextLimit::TrackedScopes`] で拒否する（既知の scope は上限に関係なく受け付ける。
-//!   release で空きができる）。
+//! - **世代（`CDP-2`）**: scope ごとに「受け付けた中で最新の世代」と記録の incarnation（記録を作るたびに
+//!   振る番号）をハンドル内の 1 つのロックの中に持つ。記録は `begin_generation` / `release_scope` /
+//!   `evaluate` の受理の時点でそのロックの中で確定し、各メソッドが戻った時点で反映済みになる
+//!   （ワーカーのキューを経由しない。ワーカーは記録を読むだけで書かない）。
+//!   - `begin_generation(scope, g)` は最新を `g` に更新する。`evaluate` は受理時に `key.generation` が
+//!     最新より古ければ [`ScriptContextError::NotFound`]（初回 poll で Ready）、新しければ最新を更新する。
+//!   - 評価は 2 回照合する。受理時（上記）と実行直前で、実行直前は「記録が無い（release 済み）・
+//!     作り直されている（incarnation が違う）・最新がキーの世代より新しい」のどれかなら `NotFound`。
+//!   - **順序の契約**: 呼び出しはロックを取った順に線形化され、評価は実行時点の記録で判定する。
+//!     そのため受理済みでまだ走っていない評価も、あとから来た begin（より新しい世代）・release・
+//!     より新しい世代の evaluate によって `NotFound` になる（送った順の FIFO ではない）。実行中の
+//!     評価は打ち切らず結果を返し、そのあとでコンテキストを破棄する。
+//!   - コンテキストの破棄はワーカーのスレッドで行い、「記録と合わないもの」を次のループで破棄する。
+//!     begin / release はワーカーが居れば起こす（実行中の評価があればそれが終わったあと）。
+//!     [`ScriptContextHandle::stats`] の `live_contexts` は一時的に破棄前の数を含み得る。
+//!   - ワーカーが panic しても記録は失われない（失われるのは待ち行列と実行中の評価で、
+//!     `Terminated` になる）。
+//!   - 同じ世代で未作成のキーは上限内で新規作成する。`release_scope` は記録を消し、その scope の
+//!     コンテキストをすべて破棄させる。release 後に同じ scope へ評価を送らないのは呼び出し側の契約
+//!     （送られた場合は新しい記録の下で上限内に新規作成になる。`NavigationScope` はプロセス内で
+//!     一意なため実際に起きるのは契約違反だけ）。
+//!   - 世代の記録は `release_scope` でだけ消す（LRU・コンテキストの有無では消さない。消すと古い世代の
+//!     評価が通ってしまう）。記録を持つ scope 数は 1024 までで、上限に達した状態で新しい scope の
+//!     `begin_generation` / `evaluate` が来たら [`ScriptContextLimit::TrackedScopes`] で拒否する
+//!     （既知の scope は上限に関係なく受け付ける。release で空きができる）。判定と登録は同じロックの
+//!     中で行うため、並行しても上限を超えない。通知は待ち行列に積まないので通知の件数上限は無い。
 //! - **上限（`JS-6`）**: 生きているコンテキスト数は全体 [`DEFAULT_MAX_LIVE_SCRIPT_CONTEXTS`]・scope
 //!   あたり [`DEFAULT_MAX_SCRIPT_CONTEXTS_PER_SCOPE`]。待ち行列は [`DEFAULT_SCRIPT_CONTEXT_QUEUE_CAPACITY`]
 //!   件（評価のみ数える。実行中を除く）で、超過は待たせず `LimitExceeded`。ソースは
@@ -77,7 +91,7 @@
 //!   ビルドと panic 以外の失敗）。
 //! - 上限値の設定ファイルからの読み込みは未対応（定数とオプション型で持つ。新しい設定キーは足さない）。
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
@@ -125,7 +139,7 @@ const WORKER_THREAD_NAME: &str = "fandhe-browser-script-ctx";
 /// 世代の記録を持つ scope 数の上限。記録は `release_scope` でだけ消す（LRU 等では消さない）ため、
 /// 上限に達した状態で新しい scope の `begin_generation` / `evaluate` が来たら
 /// [`ScriptContextLimit::TrackedScopes`] で拒否する（古い世代を受け付け直さない。`CDP-2`・`JS-6`）。
-/// 既知の scope への通知・評価は上限に関係なく受け付ける。保留通知の件数の上限にも使う。
+/// 既知の scope への通知・評価は上限に関係なく受け付ける。判定は記録の登録と同じロックの中で行う。
 const MAX_TRACKED_SCOPES: usize = 1024;
 
 /// js crate が全破棄経路に付けることを保証する文言（`ensure_discarded_phrase`・Issue #527）。
@@ -592,46 +606,22 @@ impl Drop for JobTicket {
     }
 }
 
-/// 待ち行列の要素。
-enum Task {
-    Evaluate(EvalJob),
-    BeginGeneration {
-        scope: NavigationScope,
-        generation: NavigationGeneration,
-        /// 評価の `id` と共通の採番による到着順（待ち行列と保留を合わせて FIFO にするための印）。
-        seq: u64,
-    },
-    ReleaseScope {
-        scope: NavigationScope,
-        seq: u64,
-    },
-}
-
-impl Task {
-    /// 到着順の印（評価は `id`）。
-    fn seq(&self) -> u64 {
-        match self {
-            Task::Evaluate(j) => j.id,
-            Task::BeginGeneration { seq, .. } | Task::ReleaseScope { seq, .. } => *seq,
-        }
-    }
-}
-
-/// `notify` が受け取る通知の種類（到着順の印は `notify` がロック内で振る）。
-enum NoticeKind {
-    Begin {
-        scope: NavigationScope,
-        generation: NavigationGeneration,
-    },
-    Release {
-        scope: NavigationScope,
-    },
+/// scope 1 つ分の世代記録（ハンドル側の `Mutex` の中にだけある。ワーカーは書かない）。
+#[derive(Clone, Copy)]
+struct ScopeRecord {
+    /// 受け付けた中で最新の世代（begin / evaluate の受理時に大きい方へ更新。下げない）。
+    latest: NavigationGeneration,
+    /// 記録を作るたびに振る番号。release で記録が消え、あとで同じ scope が再登録されたときに、
+    /// 前の記録の下で作ったコンテキストや受理済みの評価を見分けるために使う。
+    incarnation: u64,
 }
 
 struct EvalJob {
-    /// 評価・通知で共通の採番による到着順の印。
+    /// 評価の識別子（`ScriptEvalFuture` の drop が待ち行列から外すのに使う）。
     id: u64,
     key: ScriptContextKey,
+    /// 受理時の記録の incarnation。実行直前に記録と照合する（`State::is_current`）。
+    incarnation: u64,
     document: Arc<NavigationResult>,
     source: String,
     opts: ScriptEvalOptions,
@@ -643,128 +633,92 @@ struct EvalJob {
 ///
 /// `JsRuntime` は `!Send` のため、キー → ランタイムの表はここに置かずワーカースレッドのスタックに
 /// 置く（置くと `Inner` が `Send + Sync` でなくなる）。ここにあるのは `Send` な写しと記録だけ。
+/// 世代の記録（`scopes`）を書き換えるのは、ハンドル側の `begin_generation` / `release_scope` /
+/// `evaluate` の受理だけで、いずれもロックの中で確定する。ワーカーは `scopes` を読むだけ。
 struct State {
-    queue: VecDeque<Task>,
+    /// 評価だけを積む（通知は積まない。`CDP-2`）。
+    queue: VecDeque<EvalJob>,
     worker_alive: bool,
     worker_spawns: u64,
     /// ハンドルが破棄された。ワーカーは次のループで終了する。
     shutdown: bool,
+    /// `EvalJob::id` の採番。
     next_id: u64,
+    /// `ScopeRecord::incarnation` の採番。
+    next_incarnation: u64,
     /// 生きているコンテキスト数の写し（`stats()` 用。ワーカーが更新する）。
     live_contexts: usize,
-    /// scope ごとに見た最新の世代。ワーカーがアイドル終了・panic で消えても失われないよう共有側に置く。
-    latest: HashMap<NavigationScope, NavigationGeneration>,
-    /// 世代の記録を持つ（受け付け済みの）scope。`release_scope` の受理でだけ減る。通知・評価の受理時に
-    /// 同期的に数え、上限（`MAX_TRACKED_SCOPES`）で新しい scope を拒否する。
-    known: HashSet<NavigationScope>,
-    /// 待ち行列が満杯で積めなかった通知（世代変更・解放）を到着順に持つ。ワーカーは待ち行列の先頭と
-    /// この先頭のうち `seq` が小さい方を先に処理するため、評価・通知とも常に到着順（FIFO）で適用される。
-    /// 件数が上限（`MAX_TRACKED_SCOPES`）に達したら、黙って捨てず呼び出し側へ `LimitExceeded` を返す
-    /// （無関係な scope のコンテキストは巻き込まない）。ワーカーが必ず消化する。
-    overflow: VecDeque<Task>,
+    /// scope ごとの世代記録。キーがある scope が追跡中で、上限は `scopes.len()`。ワーカーがアイドル終了・
+    /// panic で消えても失われない（`release_scope` でだけ消す）。
+    scopes: HashMap<NavigationScope, ScopeRecord>,
 }
 
 impl State {
-    fn has_pending(&self) -> bool {
-        !self.overflow.is_empty()
+    fn new() -> Self {
+        Self {
+            queue: VecDeque::new(),
+            worker_alive: false,
+            worker_spawns: 0,
+            shutdown: false,
+            next_id: 0,
+            next_incarnation: 0,
+            live_contexts: 0,
+            scopes: HashMap::new(),
+        }
     }
 
-    /// scope を受け付け済みにする。新しく加えたら `Ok(true)`、既知なら `Ok(false)`。
-    /// 上限に達していて新しい scope なら拒否する。
-    fn admit(&mut self, scope: NavigationScope) -> Result<bool, ScriptContextError> {
-        if self.known.contains(&scope) {
-            return Ok(false);
+    /// 受理時の判定: 記録があり、最新の世代がキーの世代より新しいか。
+    fn is_stale(&self, key: ScriptContextKey) -> bool {
+        self.scopes
+            .get(&key.scope)
+            .is_some_and(|r| r.latest > key.generation)
+    }
+
+    /// scope を登録または更新し、その incarnation を返す。新しい scope で上限に達していれば
+    /// [`ScriptContextLimit::TrackedScopes`] で拒否する。既知の scope は上限に関係なく大きい方の世代へ更新する。
+    fn track(
+        &mut self,
+        scope: NavigationScope,
+        generation: NavigationGeneration,
+    ) -> Result<u64, ScriptContextError> {
+        if let Some(r) = self.scopes.get_mut(&scope) {
+            if r.latest < generation {
+                r.latest = generation;
+            }
+            return Ok(r.incarnation);
         }
-        if self.known.len() >= MAX_TRACKED_SCOPES {
+        if self.scopes.len() >= MAX_TRACKED_SCOPES {
             return Err(ScriptContextError::LimitExceeded {
                 limit: ScriptContextLimit::TrackedScopes {
                     limit: MAX_TRACKED_SCOPES,
                 },
             });
         }
-        self.known.insert(scope);
-        Ok(true)
+        let incarnation = self.next_incarnation;
+        self.next_incarnation = incarnation.wrapping_add(1);
+        self.scopes.insert(
+            scope,
+            ScopeRecord {
+                latest: generation,
+                incarnation,
+            },
+        );
+        Ok(incarnation)
     }
 
-    /// 次の到着順の位置の印を払い出す（評価の `id` と共通）。
-    fn alloc_seq(&mut self) -> u64 {
-        let seq = self.next_id;
-        self.next_id = self.next_id.wrapping_add(1);
-        seq
+    /// 実行直前の照合と、コンテキストを残すかどうかの判定に共通で使う。記録が無い（release 済み）・
+    /// incarnation が違う・世代が最新と違う、のどれかなら偽。
+    fn is_current(&self, key: ScriptContextKey, incarnation: u64) -> bool {
+        self.scopes
+            .get(&key.scope)
+            .is_some_and(|r| r.incarnation == incarnation && r.latest == key.generation)
     }
 
-    /// 待ち行列と保留の先頭のうち到着順が早い方を取り出す（ワーカーが呼ぶ。`CDP-2`）。
-    fn pop_next(&mut self) -> Option<Task> {
-        let from_overflow = match (self.queue.front(), self.overflow.front()) {
-            (None, None) => return None,
-            (Some(_), None) => false,
-            (None, Some(_)) => true,
-            (Some(q), Some(o)) => o.seq() < q.seq(),
-        };
-        if from_overflow {
-            self.overflow.pop_front()
-        } else {
-            self.queue.pop_front()
-        }
-    }
-
-    /// 満杯時の通知を保留へ積む。保留が上限なら黙って捨てず `LimitExceeded` を返す
-    /// （呼び出し側が知らないまま古い世代で評価が通る・解放が失われることを防ぐ。`CDP-2`）。
-    /// 評価は別の待ち行列に積まれ、保留の通知の間に評価が入りうるため、保留同士は畳み込まない
-    /// （畳み込むと先に受理した評価が `NotFound` になる・後続の解放が失われる。`CDP-2`）。
-    fn defer(&mut self, task: Task) -> Result<(), ScriptContextError> {
-        if self.overflow.len() >= MAX_TRACKED_SCOPES {
-            return Err(notification_limit_error());
-        }
-        self.overflow.push_back(task);
-        Ok(())
-    }
-
-    fn queued_evals(&self) -> usize {
-        self.queue
-            .iter()
-            .filter(|t| matches!(t, Task::Evaluate(_)))
-            .count()
-    }
-
-    /// 待ち行列にある通知（世代変更・解放）の件数。
-    fn queued_notifications(&self) -> usize {
-        self.queue.len() - self.queued_evals()
-    }
-
-    /// 待ち行列の末尾が同一 scope の世代通知のときだけ、その世代を大きい方へ更新して真を返す。
-    /// 評価など順序境界を越えて前方の通知を書き換えない（送った順に処理する契約）。
-    fn coalesce_begin(&mut self, scope: NavigationScope, generation: NavigationGeneration) -> bool {
-        if let Some(Task::BeginGeneration {
-            scope: s,
-            generation: g,
-            ..
-        }) = self.queue.back_mut()
-            && *s == scope
-        {
-            if *g < generation {
-                *g = generation;
-            }
-            return true;
-        }
-        false
-    }
-
-    /// `scope` の最新世代を `generation` に更新する（より古い値では下げない。記録は消さない）。
-    fn note_latest(&mut self, scope: NavigationScope, generation: NavigationGeneration) {
-        let entry = self.latest.entry(scope).or_insert(generation);
-        if *entry < generation {
-            *entry = generation;
-        }
-    }
-}
-
-/// 保留の通知が上限に達したときのエラー。
-fn notification_limit_error() -> ScriptContextError {
-    ScriptContextError::LimitExceeded {
-        limit: ScriptContextLimit::Queue {
-            capacity: MAX_TRACKED_SCOPES,
-        },
+    /// 評価の識別子を払い出す。
+    fn alloc_job_id(&mut self) -> u64 {
+        let id = self.next_id;
+        self.next_id = id.wrapping_add(1);
+        id
     }
 }
 
@@ -860,17 +814,7 @@ impl ScriptContextHandle {
                 config,
                 queue_capacity: options.queue_capacity,
                 shared: Arc::new(Shared {
-                    state: Mutex::new(State {
-                        queue: VecDeque::new(),
-                        worker_alive: false,
-                        worker_spawns: 0,
-                        shutdown: false,
-                        next_id: 0,
-                        live_contexts: 0,
-                        latest: HashMap::new(),
-                        known: HashSet::new(),
-                        overflow: VecDeque::new(),
-                    }),
+                    state: Mutex::new(State::new()),
                     wake: Condvar::new(),
                 }),
             })),
@@ -903,108 +847,57 @@ impl ScriptContextHandle {
             worker_running: st.worker_alive,
             worker_spawns: st.worker_spawns,
             live_contexts: st.live_contexts,
-            queued: st.queued_evals(),
+            queued: st.queue.len(),
         }
     }
 
-    /// 遷移の開始を通知する（非同期）。`scope` の最新世代を `generation` に更新し、その scope の
-    /// 古い世代のコンテキストを破棄する（cdp の遷移経路〔#1217〕が世代の払い出し直後に呼ぶ。
-    /// `PageScriptHandle::begin_generation` と同じ名前）。ワーカーが居なければコンテキストも無いため、
-    /// スレッドは起動せず記録だけ更新する（`PERF-7`）。
+    /// 遷移の開始を通知する。`scope` の最新世代を `generation` に更新し、その scope の古い世代の
+    /// コンテキストを破棄させる（cdp の遷移経路〔#1217〕が世代の払い出し直後に呼ぶ。
+    /// `PageScriptHandle::begin_generation` と同じ名前）。
     ///
-    /// 通知の保留が上限に達して受け付けられないときは [`ScriptContextError::LimitExceeded`] を返す
-    /// （黙って捨てない。呼び出し側は世代の払い出しを巻き戻すか対象を閉じること）。
+    /// 世代の記録はこの呼び出しの中でロックを取って確定する。戻った時点で、以後に受理する古い世代の
+    /// 評価は [`ScriptContextError::NotFound`] になり、受理済みでまだ走っていない古い世代の評価も
+    /// 実行直前の照合で `NotFound` になる（`CDP-2`）。コンテキストの破棄だけが非同期で、ワーカーが
+    /// 居れば起こして破棄させる。ワーカーが居なければコンテキストも無いため、スレッドは起動せず
+    /// 記録だけ更新する（`PERF-7`）。
+    ///
+    /// 返しうるエラーは、新しい scope で追跡上限に達したときの [`ScriptContextLimit::TrackedScopes`] だけ
+    /// （呼び出し側は世代の払い出しを巻き戻すか対象を閉じること）。
     pub fn begin_generation(
         &self,
         scope: NavigationScope,
         generation: NavigationGeneration,
     ) -> Result<(), ScriptContextError> {
-        self.notify(NoticeKind::Begin { scope, generation })
-    }
-
-    /// `scope` のコンテキストをすべて破棄し、世代の記録も消す（非同期。ターゲットのクローズ時に
-    /// cdp が呼ぶ）。release 後に同じ scope へ評価を送らないのは呼び出し側の契約で、送られた場合は
-    /// 上限内で新規作成になる。
-    ///
-    /// 保留が上限に達して受け付けられないときは [`ScriptContextError::LimitExceeded`] を返す。
-    pub fn release_scope(&self, scope: NavigationScope) -> Result<(), ScriptContextError> {
-        self.notify(NoticeKind::Release { scope })
-    }
-
-    fn notify(&self, kind: NoticeKind) -> Result<(), ScriptContextError> {
-        let Some(inner) = self.inner.as_ref() else {
-            return Ok(());
-        };
-        // 受け付け済みの scope の集合は、通知の受理時に同期的に更新する（上限の判定のため）。
-        let (scope, newly, was_known) = {
-            let mut st = inner.shared.lock();
-            match kind {
-                NoticeKind::Begin { scope, .. } => (scope, st.admit(scope)?, false),
-                NoticeKind::Release { scope } => (scope, false, st.known.remove(&scope)),
-            }
-        };
-        let result = self.notify_admitted(kind);
-        if result.is_err() {
-            // 受理されなかった通知で集合を変えたままにしない。
-            let mut st = inner.shared.lock();
-            if newly {
-                st.known.remove(&scope);
-            }
-            if was_known {
-                st.known.insert(scope);
-            }
-        }
-        result
-    }
-
-    fn notify_admitted(&self, kind: NoticeKind) -> Result<(), ScriptContextError> {
         let Some(inner) = self.inner.as_ref() else {
             return Ok(());
         };
         let mut st = inner.shared.lock();
-        if st.worker_alive {
-            let seq = st.alloc_seq();
-            let task = match kind {
-                NoticeKind::Begin { scope, generation } => Task::BeginGeneration {
-                    scope,
-                    generation,
-                    seq,
-                },
-                NoticeKind::Release { scope } => Task::ReleaseScope { scope, seq },
-            };
-            // 通知にも評価と同じ上限を課す（`JS-6`。評価実行中に通知を連投されても無制限に増やさない）。
-            // 上限内なら FIFO で積む。上限に達したら有界な保留（`overflow`）へ到着順で積み、ワーカーが
-            // 待ち行列と保留を `seq` で突き合わせて到着順に適用する。保留が残る間は新しい通知も保留へ
-            // 積み、待ち行列の通知が保留より先に並ぶ逆転を作らない（`CDP-2`）。
-            if !st.has_pending() {
-                if st.queued_notifications() < inner.queue_capacity {
-                    st.queue.push_back(task);
-                    drop(st);
-                    inner.shared.wake.notify_all();
-                    return Ok(());
-                }
-                // 満杯でも、末尾が同一 scope の世代通知なら間に何も無いので畳み込める。
-                if let Task::BeginGeneration {
-                    scope, generation, ..
-                } = task
-                    && st.coalesce_begin(scope, generation)
-                {
-                    return Ok(());
-                }
-            }
-            let deferred = st.defer(task);
-            drop(st);
+        st.track(scope, generation)?;
+        let wake = st.worker_alive;
+        drop(st);
+        if wake {
             inner.shared.wake.notify_all();
-            return deferred;
         }
-        // ワーカーが居ない間はコンテキストも無い（ガードが写しを 0 に戻す）。記録だけ直接更新する。
-        match kind {
-            NoticeKind::Begin { scope, generation } => {
-                st.note_latest(scope, generation);
-            }
-            NoticeKind::Release { scope } => {
-                st.latest.remove(&scope);
-            }
+        Ok(())
+    }
+
+    /// `scope` の世代の記録を消し、そのコンテキストをすべて破棄させる（ターゲットのクローズ時に
+    /// cdp が呼ぶ）。
+    ///
+    /// 戻った時点で記録は消えている。待ち行列にある同じ scope の評価は実行直前の照合で
+    /// [`ScriptContextError::NotFound`] になる（実行中のものは完了まで走り、そのあとでコンテキストを
+    /// 破棄する）。release 後に同じ scope へ評価を送らないのは呼び出し側の契約で、送られた場合は
+    /// 新しい記録の下で上限内に新規作成になる。現状は常に `Ok` を返す（`Result` は将来の拡張のため）。
+    pub fn release_scope(&self, scope: NavigationScope) -> Result<(), ScriptContextError> {
+        let Some(inner) = self.inner.as_ref() else {
+            return Ok(());
+        };
+        let mut st = inner.shared.lock();
+        st.scopes.remove(&scope);
+        let wake = st.worker_alive;
+        drop(st);
+        if wake {
+            inner.shared.wake.notify_all();
         }
         Ok(())
     }
@@ -1012,8 +905,9 @@ impl ScriptContextHandle {
     /// `document` の上で `source` を評価する要求を出す。結果は [`ScriptEvalOutput`]（JS 評価結果の文字列を持つ）。
     ///
     /// `document` は `key` が未作成のときだけ使う（既存のキーでは無視する。モジュール doc）。
-    /// 即時に決まる結果（無効・ソース超過・待ち行列の満杯・スレッド生成失敗）は呼び出した時点で
-    /// 同期に決め、初回 poll で必ず Ready になる。`source` は加工せずエンジンへ渡す。
+    /// 即時に決まる結果（無効・ソース超過・世代が古い・待ち行列の満杯・追跡上限・スレッド生成失敗）は
+    /// 呼び出した時点で同期に決め、初回 poll で必ず Ready になる。受理（世代の記録の更新と待ち行列への
+    /// 追加）は 1 つのロックの中で行う。`source` は加工せずエンジンへ渡す。
     pub fn evaluate(
         &self,
         key: ScriptContextKey,
@@ -1039,24 +933,31 @@ impl ScriptContextHandle {
         }
         let source = source.to_owned();
         let shared = &inner.shared;
+        // 世代の判定・追跡上限・待ち行列への追加は 1 つのクリティカルセクションで行う。
+        // 並行する begin / release / evaluate はロックを取った順に線形化される（`CDP-2`）。
         let mut st = shared.lock();
-        if st.queued_evals() >= inner.queue_capacity {
+        if st.is_stale(key) {
+            return ScriptEvalFuture::ready(Err(ScriptContextError::NotFound));
+        }
+        if st.queue.len() >= inner.queue_capacity {
             return ScriptEvalFuture::ready(Err(ScriptContextError::LimitExceeded {
                 limit: ScriptContextLimit::Queue {
                     capacity: inner.queue_capacity,
                 },
             }));
         }
-        let newly_admitted = match st.admit(key.scope) {
-            Ok(n) => n,
+        // 受理できなかったときに記録を元へ戻すための控え。
+        let prev = st.scopes.get(&key.scope).copied();
+        let incarnation = match st.track(key.scope, key.generation) {
+            Ok(i) => i,
             Err(e) => return ScriptEvalFuture::ready(Err(e)),
         };
-        let id = st.next_id;
-        st.next_id = st.next_id.wrapping_add(1);
+        let id = st.alloc_job_id();
         let state = JobState::new();
-        st.queue.push_back(Task::Evaluate(EvalJob {
+        st.queue.push_back(EvalJob {
             id,
             key,
+            incarnation,
             document,
             source,
             opts: *opts,
@@ -1064,7 +965,7 @@ impl ScriptContextHandle {
             ticket: JobTicket {
                 state: Arc::clone(&state),
             },
-        }));
+        });
 
         if !st.worker_alive {
             if spawn_worker(
@@ -1074,10 +975,16 @@ impl ScriptContextHandle {
             )
             .is_err()
             {
-                // 積んだ要求を取り消す（券の Drop が書く Terminated ではなく失敗理由を返す）。
+                // 積んだ要求を取り消し（券の Drop が書く Terminated ではなく失敗理由を返す）、記録も戻す。
+                // ロックを持ったままなので、ほかの呼び出しの登録を巻き込まない。
                 st.queue.pop_back();
-                if newly_admitted {
-                    st.known.remove(&key.scope);
+                match prev {
+                    Some(r) => {
+                        st.scopes.insert(key.scope, r);
+                    }
+                    None => {
+                        st.scopes.remove(&key.scope);
+                    }
                 }
                 return ScriptEvalFuture::ready(Err(ScriptContextError::Unavailable {
                     reason: UnavailableReason::SpawnFailed,
@@ -1163,8 +1070,7 @@ impl Drop for ScriptEvalFuture {
         if let FutureKind::Pending { state, shared, id } = &self.kind {
             state.abandoned.store(true, Ordering::SeqCst);
             let mut st = shared.lock();
-            st.queue
-                .retain(|t| !matches!(t, Task::Evaluate(j) if j.id == *id));
+            st.queue.retain(|j| j.id != *id);
         }
     }
 }
@@ -1187,6 +1093,10 @@ fn spawn_worker(
 /// 待っている要求を `Terminated` で解決する。戻さないと panic 後に幻の件数が残り、以後の評価が
 /// すべて上限超過になる。`Drop` 内では panic し得る操作を使わない。
 ///
+/// 世代の記録（`State::scopes`）はハンドル側が持つため、ここでは触れない。受理済みの
+/// `begin_generation` / `release_scope` はワーカーが落ちても失われず、次の評価の受理時に古い世代を
+/// 拒否できる（`CDP-2`）。失われるのは待ち行列の評価と実行中の評価（`Terminated`）だけ。
+///
 /// アイドル終了の `worker_alive = false` からこの Drop までの隙間に別スレッドが新ワーカーを起動し得る。
 /// そのため自分の世代（`generation`）が最新のときだけ後始末し、新しい世代が居れば何もしない
 /// （新ワーカーの待ち行列・生存フラグ・件数を壊さない）。
@@ -1203,8 +1113,6 @@ impl Drop for WorkerGuard {
         }
         st.worker_alive = false;
         st.live_contexts = 0;
-        // コンテキストはこのワーカーと共に破棄されるため、保留の通知は不要になる。
-        st.overflow.clear();
         // 券の Drop が Terminated を書く。
         st.queue.clear();
     }
@@ -1214,6 +1122,9 @@ impl Drop for WorkerGuard {
 struct Ctx {
     runtime: JsRuntime,
     _bridge: DomBridge,
+    /// 作成時に受理した評価の incarnation。記録と照合して、release 済み・再登録済みの scope の
+    /// コンテキストを見分ける（`State::is_current`）。
+    incarnation: u64,
 }
 
 type CtxTable = HashMap<ScriptContextKey, Ctx>;
@@ -1230,16 +1141,27 @@ fn worker_main(shared: &Arc<Shared>, config: &WorkerConfig, generation: u64) {
     };
     let mut contexts: CtxTable = HashMap::new();
     loop {
-        let task = {
+        let (doomed, next) = {
             let mut st = shared.lock();
             loop {
                 if st.shutdown {
                     return;
                 }
-                if let Some(t) = st.pop_next() {
-                    break t;
+                // 記録と合わないコンテキスト（世代が古い・release 済み・作り直し済み）を破棄対象にする。
+                let doomed: Vec<ScriptContextKey> = contexts
+                    .iter()
+                    .filter(|(k, c)| !st.is_current(**k, c.incarnation))
+                    .map(|(k, _)| *k)
+                    .collect();
+                // 実行直前の照合は、破棄対象の決定と同じロックのスナップショットで行う。
+                let next = st.queue.pop_front().map(|j| {
+                    let current = st.is_current(j.key, j.incarnation);
+                    (j, current)
+                });
+                if !doomed.is_empty() || next.is_some() {
+                    break (doomed, next);
                 }
-                if contexts.is_empty() && !st.has_pending() {
+                if contexts.is_empty() {
                     // 同じロック内で停止状態にする（取りこぼし防止）。
                     st.worker_alive = false;
                     return;
@@ -1247,78 +1169,60 @@ fn worker_main(shared: &Arc<Shared>, config: &WorkerConfig, generation: u64) {
                 st = shared.wake.wait(st).unwrap_or_else(PoisonError::into_inner);
             }
         };
-        match task {
-            Task::BeginGeneration {
-                scope, generation, ..
-            } => {
-                shared.lock().note_latest(scope, generation);
-                contexts.retain(|k, _| k.scope != scope || k.generation >= generation);
-                sync_live(shared, &contexts);
+        // ロックの外・このワーカーのスレッド上で破棄する（`JsRuntime` は `!Send`。子プロセスの
+        // kill / wait を含むためロックを持ったまま行わない）。
+        if !doomed.is_empty() {
+            for k in &doomed {
+                contexts.remove(k);
             }
-            Task::ReleaseScope { scope, .. } => {
-                contexts.retain(|k, _| k.scope != scope);
-                let mut st = shared.lock();
-                st.latest.remove(&scope);
-                st.live_contexts = contexts.len();
-            }
-            Task::Evaluate(job) => {
-                let EvalJob {
-                    key,
-                    document,
-                    source,
-                    opts,
-                    state,
-                    ticket,
-                    ..
-                } = job;
-                if !state.is_abandoned() {
-                    let result = handle_evaluate(
-                        shared,
-                        config,
-                        &mut contexts,
-                        key,
-                        &document,
-                        &source,
-                        &opts,
-                    );
-                    state.complete(result);
-                }
-                drop(ticket);
-            }
+            sync_live(shared, &contexts);
         }
+        let Some((job, current)) = next else {
+            continue;
+        };
+        let EvalJob {
+            key,
+            incarnation,
+            document,
+            source,
+            opts,
+            state,
+            ticket,
+            ..
+        } = job;
+        if !state.is_abandoned() {
+            let result = if current {
+                handle_evaluate(
+                    shared,
+                    config,
+                    &mut contexts,
+                    key,
+                    incarnation,
+                    &document,
+                    &source,
+                    &opts,
+                )
+            } else {
+                Err(ScriptContextError::NotFound)
+            };
+            state.complete(result);
+        }
+        drop(ticket);
     }
 }
 
-/// 世代の判定・コンテキストの作成・評価を行う（ワーカースレッド上）。
+/// コンテキストの作成・評価を行う（ワーカースレッド上）。世代の照合は呼び出し元のループが済ませている。
+#[allow(clippy::too_many_arguments)]
 fn handle_evaluate(
     shared: &Shared,
     config: &WorkerConfig,
     contexts: &mut CtxTable,
     key: ScriptContextKey,
+    incarnation: u64,
     document: &NavigationResult,
     source: &str,
     opts: &ScriptEvalOptions,
 ) -> EvalResult {
-    // 世代の判定。FIFO で取り出した時点で行うので、通知との順序が保たれる。
-    let stale = {
-        let mut st = shared.lock();
-        match st.latest.get(&key.scope).copied() {
-            Some(g) if g > key.generation => true,
-            _ => {
-                st.note_latest(key.scope, key.generation);
-                false
-            }
-        }
-    };
-    if stale {
-        return Err(ScriptContextError::NotFound);
-    }
-    let before = contexts.len();
-    contexts.retain(|k, _| k.scope != key.scope || k.generation >= key.generation);
-    if contexts.len() != before {
-        sync_live(shared, contexts);
-    }
-
     if !contexts.contains_key(&key) {
         if contexts.len() >= config.max_live {
             return Err(ScriptContextError::LimitExceeded {
@@ -1335,7 +1239,7 @@ fn handle_evaluate(
                 },
             });
         }
-        let ctx = build_context(config, document, opts)?;
+        let ctx = build_context(config, incarnation, document, opts)?;
         contexts.insert(key, ctx);
         sync_live(shared, contexts);
     }
@@ -1358,6 +1262,7 @@ fn handle_evaluate(
 /// コンテキストを作る（ここで子プロセスが起動する）。
 fn build_context(
     config: &WorkerConfig,
+    incarnation: u64,
     document: &NavigationResult,
     opts: &ScriptEvalOptions,
 ) -> Result<Ctx, ScriptContextError> {
@@ -1380,6 +1285,7 @@ fn build_context(
         Ok(_) => Ok(Ctx {
             runtime,
             _bridge: bridge,
+            incarnation,
         }),
         Err(crate::Error::JsEvaluation(e)) => Err(match restart_cause(&e) {
             Some(cause) => ScriptContextError::EngineRestarted { cause },

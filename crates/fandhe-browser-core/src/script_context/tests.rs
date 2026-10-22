@@ -89,6 +89,17 @@ impl JsEngine for FakeEngine {
                 }
                 Ok(JsValue::String("unblocked".to_string()))
             }
+            "block-panic" => {
+                self.probe.blocked.fetch_add(1, Ordering::SeqCst);
+                let (lock, cv) = &self.probe.gate;
+                let mut open = lock.lock().unwrap();
+                while !*open {
+                    open = cv.wait(open).unwrap();
+                }
+                // ゲートの Mutex を poison させないよう、panic の前にガードを手放す。
+                drop(open);
+                panic!("injected eval panic");
+            }
             other => Ok(JsValue::String(other.to_string())),
         }
     }
@@ -132,6 +143,33 @@ fn block_on<F: Future>(f: F) -> F::Output {
         .build()
         .expect("tokio runtime")
         .block_on(f)
+}
+
+/// 1 回だけ poll する（`Waker::noop`）。受理の時点で決まる結果を初回 poll で確かめるのに使う。
+fn poll_once(f: &mut Pin<Box<ScriptEvalFuture>>) -> Poll<EvalResult> {
+    let mut cx = Context::from_waker(Waker::noop());
+    f.as_mut().poll(&mut cx)
+}
+
+/// future の完了を待って結果文字列にする。
+fn finish(f: impl Future<Output = EvalResult>) -> Result<String, ScriptContextError> {
+    block_on(f).map(ScriptEvalOutput::into_value)
+}
+
+/// ハンドル内の scope の世代記録（非公開の項目を直接見る）。
+fn record(h: &ScriptContextHandle, scope: NavigationScope) -> Option<ScopeRecord> {
+    let inner = h.inner.as_ref().expect("enabled");
+    inner.shared.lock().scopes.get(&scope).copied()
+}
+
+fn latest(h: &ScriptContextHandle, scope: NavigationScope) -> Option<NavigationGeneration> {
+    record(h, scope).map(|r| r.latest)
+}
+
+/// 追跡中の scope 数。
+fn tracked(h: &ScriptContextHandle) -> usize {
+    let inner = h.inner.as_ref().expect("enabled");
+    inner.shared.lock().scopes.len()
 }
 
 fn wait_until(what: &str, cond: impl Fn() -> bool) {
@@ -538,8 +576,9 @@ fn js_1_evaluation_failed_is_truncated_and_not_echoed_in_display() {
     assert_eq!(h.stats().live_contexts(), 1);
 }
 
-/// `JS-6`: 評価実行中に通知を連投しても、待ち行列の通知は上限（待ち行列容量）を超えて増えない。
-/// 積めなかった通知は到着順の保留へ入り（上限超過は `LimitExceeded`）、古い世代の評価は `NotFound` になる。
+/// `JS-6`・`CDP-2`: ワーカーが評価で止まっている間に通知を連投しても何も溜まらない（記録は
+/// 受理時に確定し、待ち行列は評価だけ）。知らない scope への release は追跡枠も使わず、
+/// 生存 scope のコンテキスト（カウンタ）は保たれ、古い世代の評価は `NotFound` になる。
 #[test]
 fn js_6_notification_flood_is_bounded_and_still_marks_stale() {
     let probe = Arc::new(Probe::default());
@@ -547,45 +586,30 @@ fn js_6_notification_flood_is_bounded_and_still_marks_stale() {
         &probe,
         ScriptContextOptions::default().with_queue_capacity(2),
     );
-    let t = Target::new();
-    let g1 = t.next_generation();
-    let key = ScriptContextKey::new(t.scope(), g1, 1);
-    let opts = ScriptEvalOptions::default();
-    let running = h.evaluate(key, doc(), "block", &opts);
+    let busy = Target::new();
+    let busy_key = ScriptContextKey::new(busy.scope(), busy.next_generation(), 1);
+    assert_eq!(eval(&h, busy_key, "count"), Ok("1".to_string()));
+    let running = h.evaluate(busy_key, doc(), "block", &ScriptEvalOptions::default());
     wait_until("worker is blocked", || {
         probe.blocked.load(Ordering::SeqCst) == 1
     });
+    let t = Target::new();
+    let g1 = t.next_generation();
+    let key = ScriptContextKey::new(t.scope(), g1, 1);
+    assert_eq!(h.begin_generation(t.scope(), g1), Ok(()));
     let mut newest = g1;
-    let mut rejected = None;
     for _ in 0..1000 {
         let g = t.next_generation();
-        if let Err(e) = h.begin_generation(t.scope(), g) {
-            rejected = Some(e);
-            break;
-        }
+        assert_eq!(h.begin_generation(t.scope(), g), Ok(()));
         newest = g;
-        if let Err(e) = h.release_scope(Target::new().scope()) {
-            rejected = Some(e);
-            break;
-        }
+        assert_eq!(h.release_scope(Target::new().scope()), Ok(()));
     }
-    // 到着順を保つため保留は件数で有界（1024）。超過は黙って捨てず `LimitExceeded` で返る。
-    assert_eq!(
-        rejected,
-        Some(ScriptContextError::LimitExceeded {
-            limit: ScriptContextLimit::Queue { capacity: 1024 }
-        })
-    );
-    let notes = {
-        let inner = h.inner.as_ref().expect("enabled");
-        inner.shared.lock().queued_notifications()
-    };
-    assert_eq!(notes, 2);
+    assert_eq!(h.stats().queued(), 0);
+    assert_eq!(tracked(&h), 2);
     probe.open_gate();
-    assert_eq!(
-        block_on(running).map(ScriptEvalOutput::into_value),
-        Ok("unblocked".to_string())
-    );
+    assert_eq!(finish(running), Ok("unblocked".to_string()));
+    // 生存 scope のコンテキストは破棄されていない。
+    assert_eq!(eval(&h, busy_key, "count"), Ok("2".to_string()));
     assert_eq!(eval(&h, key, "count"), Err(ScriptContextError::NotFound));
     let fresh = ScriptContextKey::new(t.scope(), newest, 1);
     assert_eq!(eval(&h, fresh, "count"), Ok("1".to_string()));
@@ -778,15 +802,12 @@ fn cdp_2_stale_worker_guard_does_not_clobber_newer_worker() {
     assert_eq!(probe.factory_calls.load(Ordering::SeqCst), 1);
 }
 
-/// `CDP-2`・`JS-6`: 通知の待ち行列が満杯でも `release_scope` の解放要求は失われず、
-/// ワーカーがコンテキスト（エンジン）を必ず破棄する。
+/// `CDP-2`・`JS-6`: ワーカーが評価で止まっている間の `release_scope` は、戻った時点で記録が消えており、
+/// 通知が失われずワーカーが次のループでコンテキスト（エンジン）を破棄する。
 #[test]
-fn cdp_2_release_scope_is_not_lost_when_notification_queue_is_full() {
+fn cdp_2_release_scope_during_busy_worker_drops_context() {
     let probe = Arc::new(Probe::default());
-    let h = handle_with(
-        &probe,
-        ScriptContextOptions::default().with_queue_capacity(1),
-    );
+    let h = handle_with(&probe, ScriptContextOptions::default());
     let closing = Target::new();
     let busy = Target::new();
     let closing_key = ScriptContextKey::new(closing.scope(), closing.next_generation(), 1);
@@ -796,74 +817,26 @@ fn cdp_2_release_scope_is_not_lost_when_notification_queue_is_full() {
     wait_until("worker is blocked", || {
         probe.blocked.load(Ordering::SeqCst) == 1
     });
-    // 通知の待ち行列（容量 1）を無関係な解放で埋めてから、本命の解放を送る。
-    h.release_scope(Target::new().scope()).expect("notify");
-    h.release_scope(closing.scope()).expect("notify");
+    assert_eq!(h.release_scope(closing.scope()), Ok(()));
+    assert!(record(&h, closing.scope()).is_none());
     probe.open_gate();
-    assert_eq!(
-        block_on(running).map(ScriptEvalOutput::into_value),
-        Ok("unblocked".to_string())
-    );
+    assert_eq!(finish(running), Ok("unblocked".to_string()));
     wait_until("closed scope's context is dropped", || {
         h.stats().live_contexts() == 1
     });
     assert_eq!(probe.engine_drops.load(Ordering::SeqCst), 1);
 }
 
-/// 通知と評価は送った順に処理する。満杯時の世代通知の畳み込みは、評価を飛び越えて
-/// 先に積んだ世代通知を書き換えない（先に受理した評価が `NotFound` にならない）。
+/// `CDP-2`（R3-b）: 受理済みでまだ走っていない評価は、あとから来た begin（より新しい世代）で
+/// 実行直前の照合に落ち `NotFound` になる。その世代のコンテキストは作られない。
 #[test]
-fn cdp_2_begin_generation_coalescing_does_not_cross_an_evaluate() {
+fn cdp_2_queued_evaluate_superseded_by_later_begin_is_not_found() {
     let probe = Arc::new(Probe::default());
-    let h = handle_with(
-        &probe,
-        ScriptContextOptions::default().with_queue_capacity(1),
-    );
+    let h = handle_with(&probe, ScriptContextOptions::default());
     let t = Target::new();
     let g1 = t.next_generation();
-    let opts = ScriptEvalOptions::default();
-    let running = h.evaluate(
-        ScriptContextKey::new(t.scope(), g1, 1),
-        doc(),
-        "block",
-        &opts,
-    );
-    wait_until("worker is blocked", || {
-        probe.blocked.load(Ordering::SeqCst) == 1
-    });
     let g2 = t.next_generation();
-    h.begin_generation(t.scope(), g2).expect("notify");
-    let e2 = h.evaluate(ScriptContextKey::new(t.scope(), g2, 1), doc(), "e2", &opts);
     let g3 = t.next_generation();
-    h.begin_generation(t.scope(), g3).expect("notify");
-    probe.open_gate();
-    assert_eq!(
-        block_on(running).map(ScriptEvalOutput::into_value),
-        Ok("unblocked".to_string())
-    );
-    assert_eq!(
-        block_on(e2).map(ScriptEvalOutput::into_value),
-        Ok("e2".to_string())
-    );
-    // g3 の通知は評価の後に適用され、g2 のコンテキストは破棄される。
-    wait_until("g2 context is dropped", || h.stats().live_contexts() == 0);
-    assert_eq!(
-        eval(&h, ScriptContextKey::new(t.scope(), g2, 1), "count"),
-        Err(ScriptContextError::NotFound)
-    );
-}
-
-/// 通知と評価は送った順に処理する。先に受理した世代通知（g2）は、後続の評価（g1）より前に
-/// 適用される。後続の世代通知（g3）を統合しても g2 を評価の後ろへ動かさない（g1 は `NotFound`）。
-#[test]
-fn cdp_2_earlier_begin_generation_applies_before_later_evaluate_after_coalescing() {
-    let probe = Arc::new(Probe::default());
-    let h = handle_with(
-        &probe,
-        ScriptContextOptions::default().with_queue_capacity(1),
-    );
-    let t = Target::new();
-    let g1 = t.next_generation();
     let busy = Target::new();
     let opts = ScriptEvalOptions::default();
     let running = h.evaluate(
@@ -875,111 +848,51 @@ fn cdp_2_earlier_begin_generation_applies_before_later_evaluate_after_coalescing
     wait_until("worker is blocked", || {
         probe.blocked.load(Ordering::SeqCst) == 1
     });
-    // 通知の待ち行列（容量 1）を別 scope の通知で埋める。
-    h.release_scope(Target::new().scope()).expect("notify");
-    let g2 = t.next_generation();
-    h.begin_generation(t.scope(), g2).expect("notify");
     let e1 = h.evaluate(ScriptContextKey::new(t.scope(), g1, 1), doc(), "e1", &opts);
-    let g3 = t.next_generation();
-    h.begin_generation(t.scope(), g3).expect("notify");
+    assert_eq!(latest(&h, t.scope()), Some(g1));
+    assert_eq!(h.begin_generation(t.scope(), g2), Ok(()));
+    let e2 = h.evaluate(ScriptContextKey::new(t.scope(), g2, 1), doc(), "e2", &opts);
+    assert_eq!(h.begin_generation(t.scope(), g3), Ok(()));
+    assert_eq!(latest(&h, t.scope()), Some(g3));
     probe.open_gate();
-    assert_eq!(
-        block_on(running).map(ScriptEvalOutput::into_value),
-        Ok("unblocked".to_string())
-    );
-    assert_eq!(
-        block_on(e1).map(ScriptEvalOutput::into_value),
-        Err(ScriptContextError::NotFound)
-    );
+    assert_eq!(finish(running), Ok("unblocked".to_string()));
+    assert_eq!(finish(e1), Err(ScriptContextError::NotFound));
+    assert_eq!(finish(e2), Err(ScriptContextError::NotFound));
+    // busy の 1 件だけが作られ、t のコンテキストは作られていない。
+    assert_eq!(probe.factory_calls.load(Ordering::SeqCst), 1);
 }
 
-/// `CDP-2`・`JS-6`: 解放の保留が上限に達したら黙って捨てずエラーを返し、
-/// 解放を要求していない生存 scope のコンテキストは破棄しない。
+/// `CDP-2`（R3-a）: `begin_generation` が `Ok` で戻ったあとの古い世代の評価は、ワーカーを使わず
+/// 受理の時点（初回 poll）で `NotFound` になる。
 #[test]
-fn cdp_2_release_overflow_returns_error_and_keeps_live_contexts() {
+fn cdp_2_begin_returned_ok_rejects_older_evaluate_at_admission() {
     let probe = Arc::new(Probe::default());
-    let h = handle_with(
-        &probe,
-        ScriptContextOptions::default().with_queue_capacity(1),
-    );
-    let live = Target::new();
-    let live_key = ScriptContextKey::new(live.scope(), live.next_generation(), 1);
-    assert_eq!(eval(&h, live_key, "count"), Ok("1".to_string()));
-    let busy = Target::new();
-    let busy_key = ScriptContextKey::new(busy.scope(), busy.next_generation(), 1);
-    let running = h.evaluate(busy_key, doc(), "block", &ScriptEvalOptions::default());
-    wait_until("worker is blocked", || {
-        probe.blocked.load(Ordering::SeqCst) == 1
-    });
-    // 待ち行列（容量 1）を埋め、以後の解放は保留へ入る。
-    h.release_scope(Target::new().scope()).expect("queued");
-    let mut rejected = None;
-    for _ in 0..(MAX_TRACKED_SCOPES + 1) {
-        if let Err(e) = h.release_scope(Target::new().scope()) {
-            rejected = Some(e);
-            break;
-        }
-    }
-    assert_eq!(
-        rejected,
-        Some(ScriptContextError::LimitExceeded {
-            limit: ScriptContextLimit::Queue {
-                capacity: MAX_TRACKED_SCOPES
-            }
-        })
-    );
-    probe.open_gate();
-    assert_eq!(
-        block_on(running).map(ScriptEvalOutput::into_value),
-        Ok("unblocked".to_string())
-    );
-    // 生存 scope のコンテキスト（カウンタ）は保たれる。
-    assert_eq!(eval(&h, live_key, "count"), Ok("2".to_string()));
-}
-
-/// `CDP-2`・`JS-6`: 世代通知の保留が上限に達したら黙って捨てずエラーを返す。
-#[test]
-fn cdp_2_begin_overflow_returns_error() {
-    let probe = Arc::new(Probe::default());
-    let h = handle_with(
-        &probe,
-        ScriptContextOptions::default().with_queue_capacity(1),
-    );
-    let busy = Target::new();
-    let busy_key = ScriptContextKey::new(busy.scope(), busy.next_generation(), 1);
-    let running = h.evaluate(busy_key, doc(), "block", &ScriptEvalOptions::default());
-    wait_until("worker is blocked", || {
-        probe.blocked.load(Ordering::SeqCst) == 1
-    });
-    let first = Target::new();
-    h.begin_generation(first.scope(), first.next_generation())
-        .expect("queued");
-    let mut rejected = None;
-    for _ in 0..(MAX_TRACKED_SCOPES + 1) {
-        let t = Target::new();
-        if let Err(e) = h.begin_generation(t.scope(), t.next_generation()) {
-            rejected = Some(e);
-            break;
-        }
-    }
-    assert!(matches!(
-        rejected,
-        Some(ScriptContextError::LimitExceeded { .. })
+    let h = handle_with(&probe, ScriptContextOptions::default());
+    let t = Target::new();
+    let g1 = t.next_generation();
+    let g2 = t.next_generation();
+    assert_eq!(h.begin_generation(t.scope(), g2), Ok(()));
+    assert_eq!(latest(&h, t.scope()), Some(g2));
+    let mut f = Box::pin(h.evaluate(
+        ScriptContextKey::new(t.scope(), g1, 1),
+        doc(),
+        "x",
+        &ScriptEvalOptions::default(),
     ));
-    probe.open_gate();
-    let _ = block_on(running);
+    match poll_once(&mut f) {
+        Poll::Ready(Err(ScriptContextError::NotFound)) => {}
+        other => panic!("expected an immediate NotFound, got {other:?}"),
+    }
+    assert_eq!(h.stats().worker_spawns(), 0);
+    assert_eq!(probe.factory_calls.load(Ordering::SeqCst), 0);
 }
 
-/// `CDP-2`・`JS-6`: 待ち行列にある世代通知（begin）の後で、満杯のため保留へ回った解放（release）は
-/// 到着順のまま適用される。release が先に走り、後から begin が記録を書き戻して解放済み scope が
-/// 「最新世代 g2 の live な scope」に見えてしまう逆転を起こさない。
+/// `CDP-2`: 待ち行列にある世代通知（begin）のあとの release は、記録を残さず（release が最後に適用された
+/// 扱い）、コンテキストを破棄する。記録は呼び出しの時点で決まるため、到着順が入れ替わらない。
 #[test]
-fn cdp_2_overflowed_release_applies_after_queued_begin_in_arrival_order() {
+fn cdp_2_begin_then_release_while_busy_leaves_no_record() {
     let probe = Arc::new(Probe::default());
-    let h = handle_with(
-        &probe,
-        ScriptContextOptions::default().with_queue_capacity(1),
-    );
+    let h = handle_with(&probe, ScriptContextOptions::default());
     let t = Target::new();
     let g1 = t.next_generation();
     let key = ScriptContextKey::new(t.scope(), g1, 1);
@@ -995,70 +908,23 @@ fn cdp_2_overflowed_release_applies_after_queued_begin_in_arrival_order() {
         probe.blocked.load(Ordering::SeqCst) == 1
     });
     let g2 = t.next_generation();
-    // begin は待ち行列（容量 1）へ、続く release は満杯で保留へ入る。
-    h.begin_generation(t.scope(), g2).expect("queued");
-    h.release_scope(t.scope()).expect("overflowed");
+    assert_eq!(h.begin_generation(t.scope(), g2), Ok(()));
+    assert_eq!(h.release_scope(t.scope()), Ok(()));
+    assert!(record(&h, t.scope()).is_none());
     probe.open_gate();
-    assert_eq!(
-        block_on(running).map(ScriptEvalOutput::into_value),
-        Ok("unblocked".to_string())
-    );
+    assert_eq!(finish(running), Ok("unblocked".to_string()));
     wait_until("t's context is dropped", || h.stats().live_contexts() == 1);
     assert_eq!(probe.engine_drops.load(Ordering::SeqCst), 1);
-    // release が最後に適用されたので世代の記録は残らず、g1 は stale 扱い（NotFound）にならない。
-    // （逆転していれば記録が g2 に書き戻され、g1 の評価は NotFound になる。）
+    // 記録は残っていないので、g1 は stale 扱い（NotFound）にならず新規作成になる。
     assert_eq!(eval(&h, key, "count"), Ok("1".to_string()));
 }
 
-/// 保留中の通知は、間に評価が入っても畳み込まれない（`CDP-2`）。
-/// 保留が残る状態で begin(g2) → evaluate(g2) → begin(g3) を送っても、evaluate(g2) は Ok になる。
+/// `CDP-2`（R3-c）: release をはさんで受理された評価は実行直前の照合で `NotFound` になり、
+/// 2 回目の release のあとに記録が残らない。
 #[test]
-fn cdp_2_overflowed_begins_are_not_coalesced_across_an_evaluate() {
+fn cdp_2_release_between_admission_and_run_is_not_found_and_leaves_no_record() {
     let probe = Arc::new(Probe::default());
-    let h = handle_with(
-        &probe,
-        ScriptContextOptions::default().with_queue_capacity(1),
-    );
-    let t = Target::new();
-    let g1 = t.next_generation();
-    let busy = Target::new();
-    let opts = ScriptEvalOptions::default();
-    let running = h.evaluate(
-        ScriptContextKey::new(busy.scope(), busy.next_generation(), 1),
-        doc(),
-        "block",
-        &opts,
-    );
-    wait_until("worker is blocked", || {
-        probe.blocked.load(Ordering::SeqCst) == 1
-    });
-    // 待ち行列を埋め、以後の通知を保留へ回す。
-    h.release_scope(Target::new().scope()).expect("queued");
-    let g2 = t.next_generation();
-    h.begin_generation(t.scope(), g1).expect("overflowed");
-    h.begin_generation(t.scope(), g2).expect("overflowed");
-    let e2 = h.evaluate(ScriptContextKey::new(t.scope(), g2, 1), doc(), "e2", &opts);
-    let g3 = t.next_generation();
-    h.begin_generation(t.scope(), g3).expect("overflowed");
-    probe.open_gate();
-    assert_eq!(
-        block_on(running).map(ScriptEvalOutput::into_value),
-        Ok("unblocked".to_string())
-    );
-    assert_eq!(
-        block_on(e2).map(ScriptEvalOutput::into_value),
-        Ok("e2".to_string())
-    );
-}
-
-/// 保留中の解放は、間に評価を挟んだ 2 回目も適用される（`CDP-2`）。
-#[test]
-fn cdp_2_overflowed_releases_around_an_evaluate_are_both_applied() {
-    let probe = Arc::new(Probe::default());
-    let h = handle_with(
-        &probe,
-        ScriptContextOptions::default().with_queue_capacity(1),
-    );
+    let h = handle_with(&probe, ScriptContextOptions::default());
     let t = Target::new();
     let key = ScriptContextKey::new(t.scope(), t.next_generation(), 1);
     let busy = Target::new();
@@ -1072,24 +938,358 @@ fn cdp_2_overflowed_releases_around_an_evaluate_are_both_applied() {
     wait_until("worker is blocked", || {
         probe.blocked.load(Ordering::SeqCst) == 1
     });
-    h.release_scope(Target::new().scope()).expect("queued");
-    h.release_scope(t.scope()).expect("overflowed");
-    // 解放の後に作られたコンテキストを、2 回目の解放が破棄する。
+    assert_eq!(h.release_scope(t.scope()), Ok(()));
     let e = h.evaluate(key, doc(), "e", &opts);
-    h.release_scope(t.scope()).expect("overflowed");
+    assert_eq!(tracked(&h), 2);
+    assert_eq!(h.release_scope(t.scope()), Ok(()));
+    assert!(record(&h, t.scope()).is_none());
+    probe.open_gate();
+    assert_eq!(finish(running), Ok("unblocked".to_string()));
+    assert_eq!(finish(e), Err(ScriptContextError::NotFound));
+    assert_eq!(tracked(&h), 1);
+    assert_eq!(h.stats().live_contexts(), 1);
+    assert_eq!(probe.factory_calls.load(Ordering::SeqCst), 1);
+}
+
+/// `CDP-2`（R3-d）: release のあとに同じキーで受理した評価は、release 前のコンテキストを再利用せず
+/// （incarnation が違う）、新しいコンテキストで走る。
+#[test]
+fn cdp_2_release_then_readmit_same_key_does_not_reuse_context() {
+    let probe = Arc::new(Probe::default());
+    let h = handle_with(&probe, ScriptContextOptions::default());
+    let t = Target::new();
+    let key = ScriptContextKey::new(t.scope(), t.next_generation(), 1);
+    assert_eq!(eval(&h, key, "count"), Ok("1".to_string()));
+    let busy = Target::new();
+    let opts = ScriptEvalOptions::default();
+    let running = h.evaluate(
+        ScriptContextKey::new(busy.scope(), busy.next_generation(), 1),
+        doc(),
+        "block",
+        &opts,
+    );
+    wait_until("worker is blocked", || {
+        probe.blocked.load(Ordering::SeqCst) == 1
+    });
+    assert_eq!(h.release_scope(t.scope()), Ok(()));
+    let e = h.evaluate(key, doc(), "count", &opts);
+    probe.open_gate();
+    assert_eq!(finish(running), Ok("unblocked".to_string()));
+    assert_eq!(finish(e), Ok("1".to_string()));
+    assert_eq!(probe.engine_drops.load(Ordering::SeqCst), 1);
+    assert_eq!(probe.factory_calls.load(Ordering::SeqCst), 3);
+}
+
+/// `JS-6`: 破棄待ち（記録と合わない）コンテキストは全体上限に数えない。ワーカーは破棄してから作る。
+#[test]
+fn js_6_doomed_contexts_do_not_count_toward_live_limit() {
+    let probe = Arc::new(Probe::default());
+    let h = handle_with(&probe, ScriptContextOptions::default());
+    let targets: Vec<Target> = (0..5).map(|_| Target::new()).collect();
+    let gens: Vec<NavigationGeneration> = targets.iter().map(Target::next_generation).collect();
+    for (t, g) in targets.iter().zip(&gens).take(4) {
+        for world in 1..=4 {
+            let key = ScriptContextKey::new(t.scope(), *g, world);
+            assert_eq!(eval(&h, key, "ok"), Ok("ok".to_string()));
+        }
+    }
+    assert_eq!(h.stats().live_contexts(), 16);
+    let g2 = targets[0].next_generation();
+    assert_eq!(h.begin_generation(targets[0].scope(), g2), Ok(()));
+    let fifth = ScriptContextKey::new(targets[4].scope(), gens[4], 1);
+    assert_eq!(eval(&h, fifth, "ok"), Ok("ok".to_string()));
+    wait_until("doomed contexts dropped", || {
+        h.stats().live_contexts() == 13
+    });
+    assert_eq!(probe.engine_drops.load(Ordering::SeqCst), 4);
+}
+
+/// `CDP-2`・`JS-6`: 追跡上限の純粋な状態遷移（スレッドを使わない）。上限・満杯時の既知 scope の更新・
+/// release での空き・再登録での incarnation・`is_current` / `is_stale` の真理値。
+#[test]
+fn state_track_limit_incarnation_and_is_current() {
+    let gt = Target::new();
+    let g1 = gt.next_generation();
+    let g2 = gt.next_generation();
+    let scopes: Vec<NavigationScope> = (0..=MAX_TRACKED_SCOPES)
+        .map(|_| Target::new().scope())
+        .collect();
+    let key = |scope, g| ScriptContextKey::new(scope, g, 1);
+    let mut st = State::new();
+    for (i, s) in scopes.iter().take(MAX_TRACKED_SCOPES).enumerate() {
+        assert_eq!(st.track(*s, g1), Ok(i as u64));
+    }
+    let limit = ScriptContextError::LimitExceeded {
+        limit: ScriptContextLimit::TrackedScopes { limit: 1024 },
+    };
+    assert_eq!(st.track(scopes[1024], g1), Err(limit));
+    assert_eq!(st.scopes.len(), 1024);
+
+    // 満杯でも既知の scope は更新できる。小さい世代では下げない。
+    assert_eq!(st.track(scopes[0], g2), Ok(0));
+    assert_eq!(st.track(scopes[0], g1), Ok(0));
+    assert!(st.is_current(key(scopes[0], g2), 0));
+    assert!(!st.is_current(key(scopes[0], g1), 0));
+    assert!(!st.is_current(key(scopes[0], g2), 7));
+    assert!(st.is_stale(key(scopes[0], g1)));
+    assert!(!st.is_stale(key(scopes[0], g2)));
+    // 記録の無い scope は stale でも current でもない。
+    assert!(!st.is_stale(key(scopes[1024], g1)));
+    assert!(!st.is_current(key(scopes[1024], g1), 0));
+
+    // release で空き、再登録で incarnation が変わる。
+    st.scopes.remove(&scopes[0]);
+    assert!(!st.is_current(key(scopes[0], g2), 0));
+    assert_eq!(st.track(scopes[1024], g1), Ok(1024));
+    st.scopes.remove(&scopes[1]);
+    assert_eq!(st.track(scopes[0], g1), Ok(1025));
+    assert!(!st.is_current(key(scopes[0], g1), 0));
+    assert!(st.is_current(key(scopes[0], g1), 1025));
+}
+
+/// `CDP-2`（codex P1-1）: 別々の `Clone` ハンドルから並行に begin / release を繰り返しても、
+/// 記録と追跡数が食い違わず、上限が正確に効く。
+#[test]
+fn cdp_2_concurrent_clone_handles_begin_release_leave_no_record() {
+    let probe = Arc::new(Probe::default());
+    let h = handle_with(&probe, ScriptContextOptions::default());
+    let shared = Arc::new(Target::new());
+    let barrier = Arc::new(std::sync::Barrier::new(8));
+    let joins: Vec<_> = (0..8)
+        .map(|i| {
+            let h = h.clone();
+            let shared = Arc::clone(&shared);
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                let own = Target::new();
+                barrier.wait();
+                for _ in 0..500 {
+                    let g = own.next_generation();
+                    assert_eq!(h.begin_generation(own.scope(), g), Ok(()));
+                    if i < 2 {
+                        let sg = shared.next_generation();
+                        assert_eq!(h.begin_generation(shared.scope(), sg), Ok(()));
+                    }
+                    assert_eq!(h.release_scope(own.scope()), Ok(()));
+                    if i < 2 {
+                        assert_eq!(h.release_scope(shared.scope()), Ok(()));
+                    }
+                }
+                own.scope()
+            })
+        })
+        .collect();
+    let owns: Vec<NavigationScope> = joins
+        .into_iter()
+        .map(|j| j.join().expect("thread"))
+        .collect();
+    // 共有 scope は最後の順序が実行ごとに違うため、ここで確定的に閉じる。
+    assert_eq!(h.release_scope(shared.scope()), Ok(()));
+    for s in owns {
+        assert!(record(&h, s).is_none());
+    }
+    assert_eq!(tracked(&h), 0);
+    // 食い違いがあれば、ここで上限が効かない（または早く効く）。
+    for _ in 0..MAX_TRACKED_SCOPES {
+        let t = Target::new();
+        assert_eq!(h.begin_generation(t.scope(), t.next_generation()), Ok(()));
+    }
+    let t = Target::new();
+    assert_eq!(
+        h.begin_generation(t.scope(), t.next_generation()),
+        Err(ScriptContextError::LimitExceeded {
+            limit: ScriptContextLimit::TrackedScopes { limit: 1024 }
+        })
+    );
+}
+
+/// `CDP-2`・`JS-6`（codex P1-1）: 並行する begin / evaluate が新しい scope を登録しても、
+/// 追跡数は上限（1024）を超えず、受理数は空き枠と一致する。
+#[test]
+fn cdp_2_tracked_scope_limit_holds_under_concurrency() {
+    let probe = Arc::new(Probe::default());
+    let h = handle_with(
+        &probe,
+        ScriptContextOptions::default().with_queue_capacity(4096),
+    );
+    let busy = Target::new();
+    let running = h.evaluate(
+        ScriptContextKey::new(busy.scope(), busy.next_generation(), 1),
+        doc(),
+        "block",
+        &ScriptEvalOptions::default(),
+    );
+    wait_until("worker is blocked", || {
+        probe.blocked.load(Ordering::SeqCst) == 1
+    });
+    let barrier = Arc::new(std::sync::Barrier::new(8));
+    let joins: Vec<_> = (0..8)
+        .map(|_| {
+            let h = h.clone();
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                let tracked_limit = ScriptContextError::LimitExceeded {
+                    limit: ScriptContextLimit::TrackedScopes { limit: 1024 },
+                };
+                let mut accepted = 0usize;
+                let mut pending = Vec::new();
+                barrier.wait();
+                for n in 0..200 {
+                    let t = Target::new();
+                    let g = t.next_generation();
+                    if n % 2 == 0 {
+                        match h.begin_generation(t.scope(), g) {
+                            Ok(()) => accepted += 1,
+                            Err(e) => assert_eq!(e, tracked_limit),
+                        }
+                    } else {
+                        let mut f = Box::pin(h.evaluate(
+                            ScriptContextKey::new(t.scope(), g, 1),
+                            doc(),
+                            "q",
+                            &ScriptEvalOptions::default(),
+                        ));
+                        match poll_once(&mut f) {
+                            Poll::Pending => {
+                                accepted += 1;
+                                pending.push(f);
+                            }
+                            Poll::Ready(Err(e)) => assert_eq!(e, tracked_limit),
+                            Poll::Ready(Ok(_)) => panic!("evaluation cannot finish while blocked"),
+                        }
+                    }
+                }
+                (accepted, pending)
+            })
+        })
+        .collect();
+    let mut accepted = 0;
+    let mut futures = Vec::new();
+    for j in joins {
+        let (a, p) = j.join().expect("thread");
+        accepted += a;
+        futures.extend(p);
+    }
+    assert_eq!(accepted, MAX_TRACKED_SCOPES - 1);
+    assert_eq!(tracked(&h), MAX_TRACKED_SCOPES);
+    drop(futures);
+    probe.open_gate();
+    assert_eq!(finish(running), Ok("unblocked".to_string()));
+}
+
+/// `CDP-2`（codex P1-2）: 評価の実行中に受理した begin は、ワーカーが panic しても失われず、
+/// 古い世代の評価は受理の時点で `NotFound` のままになる。
+#[test]
+fn cdp_2_begin_during_running_eval_survives_worker_panic() {
+    let probe = Arc::new(Probe::default());
+    let h = handle_with(&probe, ScriptContextOptions::default());
+    let t = Target::new();
+    let g1 = t.next_generation();
+    let g2 = t.next_generation();
+    let opts = ScriptEvalOptions::default();
+    let running = h.evaluate(
+        ScriptContextKey::new(t.scope(), g1, 1),
+        doc(),
+        "block-panic",
+        &opts,
+    );
+    wait_until("worker is blocked", || {
+        probe.blocked.load(Ordering::SeqCst) == 1
+    });
+    assert_eq!(h.begin_generation(t.scope(), g2), Ok(()));
+    assert_eq!(latest(&h, t.scope()), Some(g2));
+    let mut q = Box::pin(h.evaluate(ScriptContextKey::new(t.scope(), g2, 1), doc(), "q", &opts));
+    assert!(matches!(poll_once(&mut q), Poll::Pending));
+    probe.open_gate();
+    let terminated = Err(ScriptContextError::Unavailable {
+        reason: UnavailableReason::Terminated,
+    });
+    assert_eq!(finish(running), terminated);
+    assert_eq!(finish(q), terminated);
+    wait_until("worker guard ran", || !h.stats().worker_running());
+    assert_eq!(latest(&h, t.scope()), Some(g2));
+    let mut old =
+        Box::pin(h.evaluate(ScriptContextKey::new(t.scope(), g1, 1), doc(), "old", &opts));
+    match poll_once(&mut old) {
+        Poll::Ready(Err(ScriptContextError::NotFound)) => {}
+        other => panic!("expected an immediate NotFound, got {other:?}"),
+    }
+    assert_eq!(
+        eval(&h, ScriptContextKey::new(t.scope(), g2, 1), "count"),
+        Ok("1".to_string())
+    );
+    assert_eq!(h.stats().worker_spawns(), 2);
+}
+
+/// `CDP-2`（codex P1-2）: 評価の実行中に受理した release も、ワーカーが panic しても失われない
+/// （記録は無いまま。次の評価は新規作成になる）。
+#[test]
+fn cdp_2_release_during_running_eval_survives_worker_panic() {
+    let probe = Arc::new(Probe::default());
+    let h = handle_with(&probe, ScriptContextOptions::default());
+    let t = Target::new();
+    let g1 = t.next_generation();
+    let key = ScriptContextKey::new(t.scope(), g1, 1);
+    let running = h.evaluate(key, doc(), "block-panic", &ScriptEvalOptions::default());
+    wait_until("worker is blocked", || {
+        probe.blocked.load(Ordering::SeqCst) == 1
+    });
+    assert_eq!(h.release_scope(t.scope()), Ok(()));
+    assert!(record(&h, t.scope()).is_none());
     probe.open_gate();
     assert_eq!(
-        block_on(running).map(ScriptEvalOutput::into_value),
-        Ok("unblocked".to_string())
+        finish(running),
+        Err(ScriptContextError::Unavailable {
+            reason: UnavailableReason::Terminated
+        })
     );
-    assert_eq!(
-        block_on(e).map(ScriptEvalOutput::into_value),
-        Ok("e".to_string())
-    );
-    wait_until("t's context is dropped by the second release", || {
-        h.stats().live_contexts() == 1
-    });
-    assert_eq!(probe.engine_drops.load(Ordering::SeqCst), 1);
+    wait_until("worker guard ran", || !h.stats().worker_running());
+    assert!(record(&h, t.scope()).is_none());
+    assert_eq!(eval(&h, key, "count"), Ok("1".to_string()));
+    assert_eq!(h.stats().worker_spawns(), 2);
+}
+
+/// `CDP-2`（Bugbot High・R3-e）: 並行する呼び出しでも、スレッド内の送信順（begin が `Ok` で戻る →
+/// 古い世代の評価）は必ず守られ、古い評価は常に `NotFound` になる。
+#[test]
+fn cdp_2_concurrent_begin_then_older_evaluate_is_always_not_found() {
+    let probe = Arc::new(Probe::default());
+    let h = handle_with(&probe, ScriptContextOptions::default());
+    let barrier = Arc::new(std::sync::Barrier::new(4));
+    let joins: Vec<_> = (0..4)
+        .map(|_| {
+            let h = h.clone();
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                let own = Target::new();
+                barrier.wait();
+                for n in 0..200 {
+                    let g_old = own.next_generation();
+                    let g_new = own.next_generation();
+                    assert_eq!(h.begin_generation(own.scope(), g_new), Ok(()));
+                    let mut f = Box::pin(h.evaluate(
+                        ScriptContextKey::new(own.scope(), g_old, 1),
+                        doc(),
+                        "x",
+                        &ScriptEvalOptions::default(),
+                    ));
+                    match poll_once(&mut f) {
+                        Poll::Ready(Err(ScriptContextError::NotFound)) => {}
+                        other => panic!("expected an immediate NotFound, got {other:?}"),
+                    }
+                    if n % 10 == 0 {
+                        assert_eq!(
+                            eval(&h, ScriptContextKey::new(own.scope(), g_new, 1), "count"),
+                            Ok("1".to_string())
+                        );
+                    }
+                }
+            })
+        })
+        .collect();
+    for j in joins {
+        j.join().expect("thread");
+    }
 }
 
 /// `CDP-2`: 未解放の scope の世代記録は、別の scope が大量に通知されても消えない。
