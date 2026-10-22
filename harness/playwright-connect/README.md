@@ -70,8 +70,9 @@ skip せず、理由と導入手順（`PLAYWRIGHT_INSTALL_HINT`）つきの `Har
 - 評価コンテキスト（TASK-44.9・#1220）: 実ケースは cli 本番と同じ `ScriptContextHandle::new(&JsConfig::default())` を
   テストサーバーへ渡す。`run.sh` は `--features test-support,js-v8` で実行し、評価器が無効なら（feature の付け忘れ）
   起動前に panic する。成功は完了マーカー行 `playwright_flow: real playwright case passed (1 case)` がちょうど 1 件のときだけ。
-- セレクタ段階: 実行コンテキストは成立し `StageTimeout` は解消した。core が `*` に対応した（#1237）ため `locator.count` は通るが、
-  続く `locator.textContent` が `CustomEvent is not defined` で失敗する（js_shim の未提供 API。後続で追跡）。
-  結果は `docs/design/playwright-compat.md` の「再実測（#1237）」を参照。
+- セレクタ段階: 実行コンテキストは成立し `StageTimeout` は解消した。core が `*` に対応した（#1237）ため `locator.count` は通り、js_shim に `CustomEvent` と要素の
+  `dispatchEvent` を補った（#1242）ため `CustomEvent is not defined` は解消した。続く `locator.textContent` は
+  `TypeError: Cannot read properties of undefined (reading 'length')` で失敗する（原因は未特定。後続で追跡）。
+  結果は `docs/design/playwright-compat.md` の「再実測（#1242）」を参照。
 
 `Profile::open` は Windows でも `%LOCALAPPDATA%` 配下なら成功するため、`playwright_flow.rs` は 3 OS 共通（#955）。

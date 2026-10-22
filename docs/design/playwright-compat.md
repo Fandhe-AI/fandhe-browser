@@ -34,7 +34,7 @@ Playwright のソースは長く引用せず、関数名と要約に留める。
 | `newContext()` | 成功（`acceptDownloads:false` 指定時。TASK-43.3d・#909 で到達）。`Target.createBrowserContext`（`disposeOnDetach:true`）と `browserContextId` 付き `Browser.setDownloadBehavior`（`deny` + `eventsEnabled:true`）が成功する（後述「段階 2b の実施結果」） | A: seq 10〜14 |
 | `newPage()` | 成功（`connectOverCDP(noDefaults:true)`・`newContext({acceptDownloads:false, viewport:null})` 指定時。TASK-43.3n・#1042 で到達を確認。後述「到達結果（TASK-43.3n）」）。`Browser.getWindowForTarget` は `-32601` のまま残るが `newPage()` は失敗しない（`Page.createIsolatedWorld` は TASK-44.6・#1217 で実装済み。評価器が無効な構成ではエラー。cli 既定〔V8〕では TASK-44.9・#1220 で有効） | A: seq 15〜41 |
 | `goto`（ローカル fixture） | 成功（TASK-44.3・TASK-44.4 で確認。後述「テスト結果レポート（TASK-44.4）」） | A |
-| `selector`（`#target`） | 失敗（TASK-44.9・#1220 の再実測で `StageTimeout` は解消。#1237 で core が `*` に対応し `locator.count` は通るようになったが、続く `locator.textContent` が `CustomEvent is not defined` で失敗する。後述「再実測（#1237）」） | A |
+| `selector`（`#target`） | 失敗（TASK-44.9・#1220 の再実測で `StageTimeout` は解消。#1237 で core が `*` に対応し `locator.count` は通るようになった。#1242 で `CustomEvent` と要素の `dispatchEvent` を補い `CustomEvent is not defined` は解消したが、続く `locator.textContent` が `TypeError: Cannot read properties of undefined (reading 'length')` で失敗する。後述「再実測（#1242）」） | A |
 
 `-32601` は未実装メソッドへ成功を捏造しない `CDP-6`・`SEC-2` の方針どおりの挙動で、バグではない。
 
@@ -668,6 +668,42 @@ TASK-43.3o（#1050）の取り込み後に再取得した同梱トレース（3 
 
 - #250 の受入基準（セレクタで要素を取得すること）は未達（5/5 には届いていない）。`CustomEvent` の提供（js_shim）を後続の課題として追跡する。skip・期待値の弱体化・成功フォールバックは入れていない（`CDP-6`・`SEC-2`）
 - さらに先で別の未対応 API が出る可能性がある。出た時点で同じ手順で記録する
+
+#### 再現手順
+
+`make test-playwright-connect`（前節と同じ）。
+
+### 再実測（#1242。実測 A）
+
+`CDP-2`（関連: `JS-5`・`REPAIR-3`・`SEC-2`）・TASK-44・MS-4。js_shim（`events.js`）に `CustomEvent`（コンストラクタ・`detail`・`initCustomEvent`。`Event` を継承）と、要素（`Node.prototype`）の `dispatchEvent` を加えて `selector` 段階を再実測した。要素の `dispatchEvent` は対象要素の上の capture → 非 capture だけに配り、`bubbles` が true でも祖先・document・window へは伝播しない（木に沿った伝播は未実装。`REPAIR-3`）。`isTrusted` は常に false。
+
+要素の `dispatchEvent` を足した理由は、playwright-core 1.63.0 の `markTargetElements`（`locator.textContent` が `markTargets: "first"` で呼ぶ）が `new CustomEvent(...)` を作って `element.dispatchEvent(...)` を呼ぶことをソースの読解で確認したため（推定。プロトコルトレースでの確定は未実施）。`CustomEvent` のみを足した中間状態は単独では実測していない（2 件を同時に補った）。
+
+#### 実測条件
+
+| 項目 | 値 |
+| ---- | -- |
+| 基準コミット | main の `e673e41a` に #1242 の変更を載せたもの |
+| 実測日 | 2026-10-22 |
+| playwright-core | 1.63.0（出典: `scripts/versions.sh`） |
+| node | v24.21.0 |
+| エンジン / feature | V8 / `test-support,js-v8` |
+
+#### 5 段階の到達結果
+
+| 段階 | 結果 | 失敗内容 |
+| ---- | ---- | -------- |
+| `connect` | 成功 | なし |
+| `newContext` | 成功 | なし |
+| `newPage` | 成功 | なし |
+| `goto` | 成功 | なし |
+| `selector` | 失敗 | `locator.textContent: TypeError: Cannot read properties of undefined (reading 'length')`（call log: `waiting for locator('#target').first()`） |
+
+`CustomEvent is not defined` は解消した。失敗は別の `TypeError` に移ったが、どの式で `undefined` の `length` を読んだかは未特定（ページ内の注入スクリプトか Playwright 側かも未確定）。参考として、注入スクリプトの `_refreshListeners` は `document` 上の `__playwright_mark_target__` リスナーで `event.composedPath()[0]` を読むが、`Event.composedPath` は未実装で、要素上の `dispatchEvent` は document へ伝播しない。これらが原因かどうかは未検証。
+
+#### 扱い・未達の明示
+
+- #250・#1062 の受入基準（セレクタで要素を取得すること）は未達（5/5 には届いていない）。close の判断はオーナーに残す。次の阻害要因（上記 `TypeError` の原因特定。`composedPath`・木に沿った伝播・nth セレクタ周辺が候補）は別 Issue の候補で、本 Issue では追わない（計画の「1〜2 件まで」の範囲を超えるため）。skip・期待値の弱体化・成功フォールバックは入れていない（`CDP-6`・`SEC-2`）
 
 #### 再現手順
 
