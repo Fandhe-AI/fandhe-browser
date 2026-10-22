@@ -64,3 +64,10 @@ required-features = ["js-v8", "test-support"]
 name = "runtime_evaluate_boa"
 harness = false
 required-features = ["js-boa", "test-support"]
+
+# TASK-44.9・Issue #1220・`CDP-2`: Playwright 接続試験の実行基盤。実ケース（`test-support` +
+# エンジン feature）が V8 の JS ワーカー役を兼ねるため独自 `main`（`harness = false`）。
+# 自己テスト群を feature なしの `cargo test --workspace` から外さないよう `required-features` は付けない。
+[[test]]
+name = "playwright_flow"
+harness = false

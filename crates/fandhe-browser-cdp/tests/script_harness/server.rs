@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use fandhe_backend_core::server::Server;
 use fandhe_browser_cdp::{CdpState, endpoints};
-use fandhe_browser_core::AppState;
+use fandhe_browser_core::{AppState, ScriptContextHandle};
 use fandhe_browser_profile::Profile;
 use serde_json::Value;
 
@@ -128,7 +128,7 @@ impl Drop for TestServer {
 /// ランタイムで動かす（workspace の tokio は `rt-multi-thread` を持たず、feature 追加は
 /// 依存変更になるため行わない）。スレッドは [`TestServer`] の drop で停止・終了を待つ。
 pub fn start_server() -> TestServer {
-    start_server_with(endpoints)
+    start_server_with(endpoints, ScriptContextHandle::disabled())
 }
 
 /// [`start_server`] のループバック許可版（`Page.navigate` が `127.0.0.1` の fixture へ届く。
@@ -136,17 +136,34 @@ pub fn start_server() -> TestServer {
 #[cfg(feature = "test-support")]
 #[allow(dead_code)] // 取り込むテストバイナリごとに使う項目が異なる（未使用は当該バイナリのみ）
 pub fn start_server_allowing_loopback() -> TestServer {
-    start_server_with(fandhe_browser_cdp::test_support::endpoints_allowing_loopback)
+    start_server_with(
+        fandhe_browser_cdp::test_support::endpoints_allowing_loopback,
+        ScriptContextHandle::disabled(),
+    )
+}
+
+/// [`start_server_allowing_loopback`] に評価コンテキスト（`Page.createIsolatedWorld`・`Runtime.*` の
+/// ゲート）を渡す版。cli 本番が `AppState` へ配線するのと同じ入口で、実 Playwright の
+/// セレクタ段階（utility world への注入スクリプト評価）を通すために使う
+/// （TASK-44.9・#1220・`CDP-2`）。本番の `endpoints()` は内部アドレスを拒否する。
+#[cfg(feature = "test-support")]
+#[allow(dead_code)] // 取り込むテストバイナリごとに使う項目が異なる（未使用は当該バイナリのみ）
+pub fn start_server_allowing_loopback_with_scripts(scripts: ScriptContextHandle) -> TestServer {
+    start_server_with(
+        fandhe_browser_cdp::test_support::endpoints_allowing_loopback,
+        scripts,
+    )
 }
 
 fn start_server_with(
     build: fn(
         &Arc<CdpState>,
     ) -> Result<fandhe_browser_cdp::CdpEndpoints, fandhe_browser_cdp::WsConfigError>,
+    scripts: ScriptContextHandle,
 ) -> TestServer {
     let dir = TempDir::new();
     let profile = Arc::new(Profile::open(&dir.0).expect("profile open"));
-    let app = Arc::new(AppState::with_disabled_renderer(profile));
+    let app = Arc::new(AppState::with_disabled_renderer(profile).with_script_contexts(scripts));
     let st = Arc::new(CdpState::new(app));
     let state = Arc::clone(&st);
     let stop = Arc::new(StopSignal::default());
