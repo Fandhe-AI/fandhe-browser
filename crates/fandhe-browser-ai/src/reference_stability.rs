@@ -312,6 +312,23 @@ fn group_position(holders: &[RefHolder], target: &RefHolder) -> (usize, usize) {
     (pos, size)
 }
 
+/// セレクタが位置・構造に依存する疑似クラス（`:first-of-type`・`:nth-child` 等）を含むか。
+/// 引用符内（属性値）の `:` は無視する。保守的に、引用符外の `:` があれば真とする。
+/// 実装は core のセレクタが対応する疑似クラス（`:not`）に限らず、全疑似クラスを対象にする。
+fn has_structural_pseudo(selector: &str) -> bool {
+    let mut quote: Option<char> = None;
+    for c in selector.chars() {
+        match (quote, c) {
+            (Some(q), c) if c == q => quote = None,
+            (Some(_), _) => {}
+            (None, '"' | '\'') => quote = Some(c),
+            (None, ':') => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
 /// 変化後のグループの件数だけを返す（キーは変化前の対象のグループ）。
 fn group_size(holders: &[RefHolder], target: &RefHolder) -> usize {
     holders
@@ -371,10 +388,13 @@ fn reidentify_after(
             };
         }
         if after_size > 0 && after_size != before_size {
-            let same_place = match resolved {
-                Some(h) => group_position(&holders, h).0 == before_pos,
-                None => false,
-            };
+            // 構造セレクタ（疑似クラス）は挿入された別要素にも同じ位置で一致するため、一致位置を
+            // 対象の同一性の根拠にしない。id・class・属性で絞るセレクタだけを根拠にする。
+            let same_place = !has_structural_pseudo(selector)
+                && match resolved {
+                    Some(h) => group_position(&holders, h).0 == before_pos,
+                    None => false,
+                };
             if !same_place {
                 return Reidentification::Ambiguous {
                     side: Side::After,
@@ -897,6 +917,31 @@ fn aisnap_10_unique_selector_but_duplicate_signature_after_is_ambiguous() {
             side: Side::After,
             count: 2
         }
+    );
+}
+
+/// AISNAP-10・Issue #1221: 構造セレクタ（疑似クラス `:not` 等）は挿入された別要素にも同じ位置で
+/// 一致しうるため、一致位置を同一性の根拠にしない。ここでは元の対象に class が付き、挿入された
+/// 先頭の `Go` が `button:not(.z)` に一致する（前後とも位置 0）。`Stable` ではなく `Ambiguous`。
+/// なお `:first-of-type` 等は core のセレクタ実装が未対応（Unsupported）で `TargetNotFound`。
+#[test]
+fn aisnap_10_structural_selector_insert_before_is_ambiguous() {
+    let before = page("<button>Go</button>");
+    let after = page("<button>Go</button><button class=\"z\">Go</button>");
+    let result = check_reidentification(&StabilityCase {
+        before_html: &before,
+        after_html: &after,
+        selector: "button:not(.z)",
+    });
+    assert!(
+        matches!(
+            &result,
+            Reidentification::Ambiguous {
+                side: Side::After,
+                count: 2
+            }
+        ),
+        "{result:?}"
     );
 }
 
