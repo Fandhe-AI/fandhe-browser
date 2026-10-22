@@ -3,18 +3,21 @@
 //!
 //! I/O を持たない純関数のみを対象とするため全 OS で動く。期待値は固定入力・固定時刻に対する逐語の具体値。
 
-// 計測値の型だけを使うため、取り込んだ stats モジュールの他の関数は未使用になる（bench main が使う）。
-#![allow(dead_code)]
-
+// 取り込む各モジュールは bench main 用の関数・型を含み、本テストは計測値の型と整形関数だけを使う。
+// 未使用になる項目の抑止は、取り込みモジュール単位（理由付き）に限定する。
 #[path = "call_latency_stats.rs"]
+#[allow(dead_code, reason = "bench main 用の項目が本テストでは未使用になる")]
 mod call_latency_stats;
 #[path = "cold_start_stats.rs"]
+#[allow(dead_code, reason = "bench main 用の項目が本テストでは未使用になる")]
 mod cold_start_stats;
 #[path = "options.rs"]
+#[allow(dead_code, reason = "bench main 用の項目が本テストでは未使用になる")]
 mod options;
 #[path = "report.rs"]
 mod report;
 #[path = "rss.rs"]
+#[allow(dead_code, reason = "bench main 用の項目が本テストでは未使用になる")]
 mod rss;
 
 use call_latency_stats::CallLatencyMeasurement;
