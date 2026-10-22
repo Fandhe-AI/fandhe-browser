@@ -381,8 +381,23 @@
     return INTERNAL_ERROR;
   }
 
-  // v が native Promise なら待機スロットを払い出してその番号を返す。そうでなければ 0。
-  // 退避した Promise.prototype.then は IsPromise でない値に TypeError を投げるため、それで判定する。
+  // v が Promise か（組込みの brand を使う判定。then は呼ばない）。
+  // 識別と反応登録の失敗を分けるための判定で、登録の例外を「非 Promise」の根拠にしない（`REPAIR-3`）。
+  function isPromiseValue(v) {
+    try {
+      return tagOf(v) === "Promise" && v instanceof Promise;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  // 反応登録が投げた例外（Promise と判定できたのに then が失敗したとき。constructor・Symbol.species の
+  // 解決が投げる場合など）。呼び出し側が exceptionDetails 付きの例外封筒にする。
+  var thenError;
+  var THEN_FAILED = -1;
+
+  // v が native Promise なら待機スロットを払い出してその番号を返す。Promise でなければ 0。
+  // Promise と判定できたのに反応登録が失敗したら thenError に記録して THEN_FAILED を返す。
   // 反応は記録だけを行い、遅れて決着してもスロットが無ければ何も復活させない（レコードは閉じ込める）。
   function track(v) {
     var rec = objCreate(null);
@@ -404,7 +419,9 @@
         }
       ]);
     } catch (e) {
-      return 0;
+      if (!isPromiseValue(v)) return 0;
+      thenError = e;
+      return THEN_FAILED;
     }
     if (slotCount >= maxAwaiting || nextSlot > MAX_HANDLE) throw HANDLE_LIMIT;
     var n = nextSlot;
@@ -424,6 +441,11 @@
   function finishCall(v, p) {
     if (p.awaitPromise === true) {
       var n = track(v);
+      if (n === THEN_FAILED) {
+        var te = thenError;
+        thenError = undefined;
+        return commit(render(te, true, false));
+      }
       if (n > 0) {
         return commit('{"kind":"awaiting","slot":' + StringCtor(n) + "}");
       }

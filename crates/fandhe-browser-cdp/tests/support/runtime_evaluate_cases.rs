@@ -1071,6 +1071,41 @@ async fn await_promise(engine: &str) {
         .await;
     assert_eq!(ro(&f)["subtype"], "promise", "{f}");
 
+    // Promise と判定できるのに then の反応登録が投げる場合（constructor = null で species 解決が
+    // TypeError）は、成功を装わず exceptionDetails 付きのエラー応答にする（CDP-6・REPAIR-3）。
+    let broken = "function () { var p = Promise.resolve(42); p.constructor = null; return p; }";
+    let f = c
+        .callf(
+            &p,
+            json!({"functionDeclaration": broken, "objectId": h, "awaitPromise": true}),
+        )
+        .await;
+    assert_eq!(
+        f["result"]["exceptionDetails"]["text"], "uncaught exception",
+        "{f}"
+    );
+    assert_eq!(f["result"]["result"]["subtype"], "error", "{f}");
+    assert!(
+        f["result"]["result"]["description"]
+            .as_str()
+            .is_some_and(|d| d.starts_with("TypeError: ")),
+        "{f}"
+    );
+    let f = c
+        .call(
+            &p,
+            "Runtime.evaluate",
+            json!({"expression": "(() => { const p = Promise.resolve(42); p.constructor = null; return p; })()", "contextId": ctx, "awaitPromise": true}),
+        )
+        .await
+        .pop()
+        .expect("frame");
+    assert_eq!(
+        f["result"]["exceptionDetails"]["text"], "uncaught exception",
+        "{f}"
+    );
+    assert_eq!(f["result"]["result"]["subtype"], "error", "{f}");
+
     // native Promise の決着（エンジンごとの実測値。REPAIR-3: call_function_on.rs の差異節に記録）。
     for (name, decl) in [
         ("resolved", "function () { return Promise.resolve(42); }"),
