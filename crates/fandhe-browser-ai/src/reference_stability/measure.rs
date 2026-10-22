@@ -405,7 +405,6 @@ fn aisnap_10_measure_break_rate() {
         .iter()
         .map(|r| (r.def.id.as_str(), r.verdict))
         .collect();
-    let amb = Verdict::Broken(BreakKind::Ambiguous);
     let st = Verdict::Stable;
     assert_eq!(
         verdicts,
@@ -416,18 +415,18 @@ fn aisnap_10_measure_break_rate() {
             ("04-checkbox-first", st),
             ("05-number-input", st),
             ("06-quote-text", st),
-            ("07-quote-tag-link", amb),
+            ("07-quote-tag-link", st),
             ("08-hn-first-title", st),
             ("09-hn-more-link", st),
             ("10-ec-price", st),
             ("11-ec-product-link", st),
-            ("12-table-header-cell", amb),
+            ("12-table-header-cell", st),
             ("13-table-data-cell", Verdict::Excluded),
             ("14-python-download-link", st),
             ("15-wiki-language-link", st),
             ("16-login-password", st),
             ("17-hn-second-title", st),
-            ("18-quotes-author-link", amb),
+            ("18-quotes-author-link", st),
             ("19-quotes-login-link", st),
         ]
     );
@@ -448,18 +447,18 @@ fn aisnap_10_measure_break_rate() {
             ("04-checkbox-first", 1, Same),
             ("05-number-input", 1, Same),
             ("06-quote-text", 1, Same),
-            ("07-quote-tag-link", 2, Same),
+            ("07-quote-tag-link", 1, Same),
             ("08-hn-first-title", 1, Same),
             ("09-hn-more-link", 1, Same),
             ("10-ec-price", 1, Same),
             ("11-ec-product-link", 1, Same),
-            ("12-table-header-cell", 2, Same),
+            ("12-table-header-cell", 1, Same),
             ("13-table-data-cell", 0, NoRefBefore),
             ("14-python-download-link", 1, Same),
             ("15-wiki-language-link", 1, Same),
             ("16-login-password", 1, Same),
             ("17-hn-second-title", 1, Same),
-            ("18-quotes-author-link", 10, Same),
+            ("18-quotes-author-link", 1, Same),
             ("19-quotes-login-link", 1, Same),
         ]
     );
@@ -476,21 +475,21 @@ fn aisnap_10_measure_break_rate() {
         all,
         Summary {
             measured: 18,
-            broken: 3,
+            broken: 0,
             excluded: 1
         }
     );
-    assert_eq!(percent(all.broken, all.measured).as_deref(), Ok("16.7"));
+    assert_eq!(percent(all.broken, all.measured).as_deref(), Ok("0.0"));
     let poc = summarize(rows.iter().filter(|r| r.def.poc_case.is_some()));
     assert_eq!(
         poc,
         Summary {
             measured: 14,
-            broken: 2,
+            broken: 0,
             excluded: 1
         }
     );
-    assert_eq!(percent(poc.broken, poc.measured).as_deref(), Ok("14.3"));
+    assert_eq!(percent(poc.broken, poc.measured).as_deref(), Ok("0.0"));
 }
 
 /// AISNAP-10・TASK-17.3・Issue #112: ref 同一性ベースの診断値（判定ヘルパーのシグネチャ一意性

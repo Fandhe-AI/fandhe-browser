@@ -563,8 +563,9 @@ fn aisnap_10_removed_after_is_missing_after() {
 }
 
 /// AISNAP-10・TASK-17.1・Issue #110: 対象が hidden で除外されたうえ同名の別要素が加わる場合、
-/// 変化後は role+name の候補（b・c の 2 件）で判定し、どちらかの ref を対象のものとして
-/// 代用せず `Ambiguous` にする（案 Y。変化後のセレクタは判定に使わない）。
+/// 変化後は role+name の候補で判定し、b の ref を対象 a のものとして代用しない（`Stable` にしない）。
+/// 区別子 ` #n`（#1221）により変化後の候補は b（素の `Go`）1 件になり、ref が変わったため
+/// `RefChanged`（以前は同名 2 件で `Ambiguous`）。
 #[test]
 fn aisnap_10_hidden_target_does_not_borrow_sibling_ref() {
     let before = page("<button id=\"a\">Go</button><button id=\"b\">Go</button>");
@@ -576,11 +577,16 @@ fn aisnap_10_hidden_target_does_not_borrow_sibling_ref() {
         after_html: &after,
         selector: "#a",
     });
+    let (before_ref, after_ref) = match &result {
+        Reidentification::RefChanged { before, after } => (before.clone(), after.clone()),
+        other => panic!("expected RefChanged, got {other:?}"),
+    };
+    assert_ne!(before_ref, after_ref);
     assert_eq!(
         result,
-        Reidentification::Ambiguous {
-            side: Side::After,
-            count: 2,
+        Reidentification::RefChanged {
+            before: before_ref,
+            after: after_ref,
         }
     );
 }
@@ -765,10 +771,14 @@ fn aisnap_10_depth_boundary_is_exact() {
     );
 }
 
-/// AISNAP-10・TASK-17.1・Issue #110: 同 role・name の要素が前方に挿入され、セレクタの
-/// 先頭一致が別要素になりうる変化は `Stable` にしない。
+/// AISNAP-10・TASK-17.1・Issue #110・#1221: 同 role・name の要素が前方に挿入される変化。
+/// 区別子 ` #n` は出現順で付くため、挿入された先頭の `Go` が素の name と元の ref（`-n` なし）を
+/// 得て、元の要素は `Go #2`（ref `-2`）になる。変化後の素の `Go` は 1 件で ref も一致するため
+/// `Stable` と判定される（誤って別要素を同一視する）。契約を変えない限り解消できない限界
+/// （`docs/design/reference-disambiguation.md`「契約を変えない限り解消できないケース」。ref の
+/// `-n` と同じ原理）。判断は #113（owner:human）。
 #[test]
-fn aisnap_10_same_signature_inserted_before_is_ambiguous() {
+fn aisnap_10_same_signature_inserted_before_is_known_limit() {
     let before = page("<button>Go</button>");
     let after = page("<button class=\"x\">Go</button><button>Go</button>");
     let result = check_reidentification(&StabilityCase {
@@ -778,17 +788,19 @@ fn aisnap_10_same_signature_inserted_before_is_ambiguous() {
     });
     assert_eq!(
         result,
-        Reidentification::Ambiguous {
-            side: Side::After,
-            count: 2
+        Reidentification::Stable {
+            role: "button".into(),
+            name: "Go".into(),
+            r#ref: "e9ddb5239".into(),
         }
     );
 }
 
 /// AISNAP-10・TASK-17.1・Issue #110: 変化後はセレクタではなく role+name の候補で判定するため、
-/// `#go` で一意に選べても同 role+name の別要素が増えれば `Ambiguous` になる（案 Y）。
+/// `#go` で一意に選べても同 role+name の別要素が先頭に増えると、区別子（#1221）で対象は
+/// `Go #2`（ref `-2`）になり、素の `Go` は別要素。対象の ref が変わるため `RefChanged`。
 #[test]
-fn aisnap_10_unique_selector_but_duplicate_signature_after_is_ambiguous() {
+fn aisnap_10_unique_selector_but_duplicate_signature_after_is_ref_changed() {
     let before = page("<button id=\"go\">Go</button>");
     let after = page("<button class=\"x\">Go</button><button id=\"go\">Go</button>");
     let result = check_reidentification(&StabilityCase {
@@ -798,9 +810,9 @@ fn aisnap_10_unique_selector_but_duplicate_signature_after_is_ambiguous() {
     });
     assert_eq!(
         result,
-        Reidentification::Ambiguous {
-            side: Side::After,
-            count: 2
+        Reidentification::RefChanged {
+            before: "ee727a43f".into(),
+            after: "e9ddb5239".into(),
         }
     );
 }

@@ -110,7 +110,7 @@ use super::state::is_html_element_named;
 ///
 /// 外部入力（HTML の属性値・テキスト）から無制限に文字列を組み立てない
 /// ための上限（security.md「不安全な設計」対策）。
-const MAX_NAME_CHARS: usize = 120;
+pub(super) const MAX_NAME_CHARS: usize = 120;
 
 /// データ葉（価格・本文 span・引用）の値テキストの文字数上限（`AISNAP-3`・`AISNAP-11`・
 /// TASK-17・Issue #833）。通常の name 上限（[`MAX_NAME_CHARS`]）だと長い引用本文が欠けるため、

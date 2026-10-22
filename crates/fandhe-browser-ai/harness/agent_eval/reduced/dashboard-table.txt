@@ -4,14 +4,14 @@
   - table [e4554730d]
     header: columnheader "Last Name" [e09112452] | columnheader "First Name" [e24cb8d2c] | columnheader "Email" [efbc5aa84] | columnheader "Due" [e64ce3e81] | columnheader "Web Site" [e27fd6dc3] | columnheader "Action" [ed8a07991]
     Beta | Gamma | user1@example.com | $13.00 | http://www.example.com/site1 | edit delete {link "edit"=ed42c6b3d, link "delete"=e5cfbb88d}
-    Gamma | Zeta | user2@example.com | $26.07 | http://www.example.com/site2 | edit delete {link "edit"=ed42c6b3d-2, link "delete"=e5cfbb88d-2}
-    Delta | Lambda | user3@example.com | $39.14 | http://www.example.com/site3 | edit delete {link "edit"=ed42c6b3d-3, link "delete"=e5cfbb88d-3}
-    Epsilon | River | user4@example.com | $52.21 | http://www.example.com/site4 | edit delete {link "edit"=ed42c6b3d-4, link "delete"=e5cfbb88d-4}
+    Gamma | Zeta | user2@example.com | $26.07 | http://www.example.com/site2 | edit delete {link "edit #2"=ed42c6b3d-2, link "delete #2"=e5cfbb88d-2}
+    Delta | Lambda | user3@example.com | $39.14 | http://www.example.com/site3 | edit delete {link "edit #3"=ed42c6b3d-3, link "delete #3"=e5cfbb88d-3}
+    Epsilon | River | user4@example.com | $52.21 | http://www.example.com/site4 | edit delete {link "edit #4"=ed42c6b3d-4, link "delete #4"=e5cfbb88d-4}
   - heading "Example 2" [e6514488a]
-  - table [e3b61da43]
-    header: columnheader "Last Name" [eebfd9833] | columnheader "First Name" [eabdc010a] | columnheader "Email" [e7050d7a1] | columnheader "Due" [e6320e571] | columnheader "Web Site" [eb3ba1bf3] | columnheader "Action" [e511bfd67]
-    Sigma | Omega | user9@example.com | $117.00 | http://www.example.com/site9 | edit delete {link "edit"=edb08fdd8, link "delete"=ea0053642}
-    Omega | Garden | user10@example.com | $130.07 | http://www.example.com/site10 | edit delete {link "edit"=edb08fdd8-2, link "delete"=ea0053642-2}
-    River | Bridge | user11@example.com | $143.14 | http://www.example.com/site11 | edit delete {link "edit"=edb08fdd8-3, link "delete"=ea0053642-3}
-    Stone | Pattern | user12@example.com | $156.21 | http://www.example.com/site12 | edit delete {link "edit"=edb08fdd8-4, link "delete"=ea0053642-4}
+  - table "#2" [e3b61da43]
+    header: columnheader "Last Name #2" [eebfd9833] | columnheader "First Name #2" [eabdc010a] | columnheader "Email #2" [e7050d7a1] | columnheader "Due #2" [e6320e571] | columnheader "Web Site #2" [eb3ba1bf3] | columnheader "Action #2" [e511bfd67]
+    Sigma | Omega | user9@example.com | $117.00 | http://www.example.com/site9 | edit delete {link "edit #5"=edb08fdd8, link "delete #5"=ea0053642}
+    Omega | Garden | user10@example.com | $130.07 | http://www.example.com/site10 | edit delete {link "edit #6"=edb08fdd8-2, link "delete #6"=ea0053642-2}
+    River | Bridge | user11@example.com | $143.14 | http://www.example.com/site11 | edit delete {link "edit #7"=edb08fdd8-3, link "delete #7"=ea0053642-3}
+    Stone | Pattern | user12@example.com | $156.21 | http://www.example.com/site12 | edit delete {link "edit #8"=edb08fdd8-4, link "delete #8"=ea0053642-4}
   - link "Example Test Site" [e124daae3]

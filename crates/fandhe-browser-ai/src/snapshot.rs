@@ -58,6 +58,7 @@
 //!   結合テスト `tests/snapshot.rs`）
 
 pub mod build;
+mod disambiguate;
 pub mod element_ref;
 pub mod name;
 pub mod role;

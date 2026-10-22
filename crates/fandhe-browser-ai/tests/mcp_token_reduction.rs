@@ -10,7 +10,7 @@
 //! コミット済みレポートとの同期は `plug4_committed_report_contains_rendered_block` が検査する。
 //! 再利用が要る場合は判定を `benches/token_reduction/` へ移す。
 //!
-//! 実データの現状: 平均削減率は 84.0% に届いていない（約 14.2%）。PLUG-4 の前提は PoC-5 の
+//! 実データの現状: 平均削減率は 84.0% に届いていない（約 12.5%）。PLUG-4 の前提は PoC-5 の
 //! フラット形式だが、現行ホストは JSON ツリーのエンベロープを返し生 HTML より大きいため
 //! （PLUG-5・TASK-97・AISNAP-6 の論点）。実データの verdict は未達のまま固定して事実を記録し
 //! （REPAIR-3）、合否ロジックは合成データで境界値まで検証する。
@@ -111,10 +111,10 @@ fn assert_plug4(summary: &ReductionSummary) -> TestResult<()> {
 /// （PLUG-4・PLUG-5 側の論点）。
 const PINNED: [(&str, usize, usize, bool); 5] = [
     ("example-minimal", 103, 77, false),
-    ("wikipedia-article", 56482, 32160, false),
-    ("hn-list", 10220, 10797, false),
+    ("wikipedia-article", 56482, 33177, false),
+    ("hn-list", 10220, 11246, false),
     ("login-form", 284, 174, false),
-    ("mdn-docs", 19005, 24753, false),
+    ("mdn-docs", 19005, 25200, false),
 ];
 
 /// 代表 5 サイト（`PLUG-4` の列挙順）。
@@ -415,7 +415,7 @@ fn plug4_threshold_nan_is_shortfall() -> TestResult<()> {
     Ok(())
 }
 
-/// `PLUG-4`: 実データの現状 verdict（84.0% 未達・平均約 14.2%）を固定する。
+/// `PLUG-4`: 実データの現状 verdict（84.0% 未達・平均約 12.5%）を固定する。
 ///
 /// これは PLUG-4 未達の事実の記録であり、達成を装うものではない（REPAIR-3）。snapshot の出力形式
 /// が縮んで verdict が `Met` に変わったら、本テストを `assert_plug4(&summary)?` による本ゲートに
@@ -458,12 +458,12 @@ fn plug4_mcp_token_reduction_report_prints_markdown() -> TestResult<()> {
     println!("{report}");
     for needle in [
         "| example-minimal | 103 | 77 | 25.2 | false |",
-        "| wikipedia-article | 56482 | 32160 | 43.1 | false |",
-        "| hn-list | 10220 | 10797 | -5.6 | false |",
+        "| wikipedia-article | 56482 | 33177 | 41.3 | false |",
+        "| hn-list | 10220 | 11246 | -10.0 | false |",
         "| login-form | 284 | 174 | 38.7 | false |",
-        "| mdn-docs | 19005 | 24753 | -30.2 | false |",
-        "| 5 | 14.2 | -30.2 | 43.1 |",
-        "| 84.0 | 14.2 | Shortfall | 69.8 |",
+        "| mdn-docs | 19005 | 25200 | -32.6 | false |",
+        "| 5 | 12.5 | -32.6 | 41.3 |",
+        "| 84.0 | 12.5 | Shortfall | 71.5 |",
     ] {
         assert!(report.contains(needle), "missing row: {needle}\n{report}");
     }

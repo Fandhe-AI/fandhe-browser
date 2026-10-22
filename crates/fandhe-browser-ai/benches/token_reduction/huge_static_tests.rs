@@ -35,11 +35,11 @@ fn huge_static_measured_with_concrete_values() {
     assert_eq!(r.name, HUGE_STATIC_FIXTURE);
     assert_eq!(r.bytes, 237_689);
     assert_eq!(r.raw_html_tokens, 56_482);
-    assert_eq!(r.snapshot_tokens, 20_931);
+    assert_eq!(r.snapshot_tokens, 21_948);
     assert_eq!(r.raw_dom_tokens, 55_917);
     assert!(!r.snapshot_truncated);
-    assert!((r.reduction_vs_raw_dom_pct - 62.6).abs() < 0.05);
-    assert!((r.reduction_vs_raw_html_pct - 62.9).abs() < 0.05);
+    assert!((r.reduction_vs_raw_dom_pct - 60.7).abs() < 0.05);
+    assert!((r.reduction_vs_raw_html_pct - 61.1).abs() < 0.05);
     let expected = (1.0 - r.snapshot_tokens as f64 / r.raw_dom_tokens as f64) * 100.0;
     assert!((r.reduction_vs_raw_dom_pct - expected).abs() < 1e-9);
     assert!(r.raw_dom_tokens > 0 && r.raw_dom_tokens <= r.raw_html_tokens);

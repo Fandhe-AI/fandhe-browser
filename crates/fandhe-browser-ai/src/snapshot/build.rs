@@ -94,11 +94,14 @@
 //!   既知の制約（REPAIR-3）: `select` の選択中 option テキストは親の残余と option ノードの両方に
 //!   出ることがある。圧縮表の省略行（`truncated_rows`）は残余に含めない。区切り記号だけの残余
 //!   （`| |` 等）は除去しない。`heading`・`columnheader` と子リンクの重複は未対応。
+//! - 同じ `(role, name)` の ref 保持要素は、木の確定後に文書順の 2 件目以降の name へ
+//!   ` #2`・` #3`… を付ける（`disambiguate` モジュール。`AISNAP-10`・TASK-17・Issue #1221）。
+//!   ref と accname は不変。ページ由来 name との衝突解消は未対応（Issue #1222。REPAIR-3）。
 //! - 深さが [`MAX_TREE_DEPTH`] を超えるサブツリーは省略し `Snapshot::truncated` を立てる。
 //! - いずれかの name が打ち切られた場合（文字数上限・子孫走査の上限・構築全体で共有する
 //!   走査予算）も `Snapshot::truncated` を立てる。
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 use fandhe_browser_core::dom::{Children, Document, NodeId};
@@ -111,6 +114,7 @@ use crate::compress_table::{
 use crate::data_leaf::{DataLeafKind, classify_data_leaf};
 use crate::retention::priority_candidates;
 
+use super::disambiguate::apply_disambiguation;
 use super::element_ref::{ElementRef, ElementSignature, RefAllocator, RefError};
 use super::name::{
     MAX_TOTAL_CONTENT_STEPS, NameIndex, NameSource, SKIPPED_SUBTREES, compute_adjacent_text_name,
@@ -814,6 +818,7 @@ pub(crate) struct RefHolder {
     /// ref を発行した DOM 要素（通常ノード・圧縮表のヘッダセル・行内コントロール）。
     pub(crate) node: NodeId,
     pub(crate) role: String,
+    /// 区別子付与後（Issue #1221）の出力 name。
     pub(crate) name: String,
     pub(crate) r#ref: String,
 }
@@ -864,6 +869,9 @@ fn build_snapshot_inner(
         full_truncated: false,
         dom: None,
     }];
+    // ref → (role, ref 発行時の出力 name)。区別子付与（`disambiguate`）の重複判定キーで、
+    // `RefHolder` と同じ定義（残余縮約前の name）を非テストビルドでも保持する。
+    let mut ref_keys: HashMap<String, (String, String)> = HashMap::new();
     // 折り畳んだ要素（テストの RefHolder から除外するため）。
     #[cfg(test)]
     let mut collapsed_ids: HashSet<NodeId> = HashSet::new();
@@ -915,6 +923,21 @@ fn build_snapshot_inner(
                     #[cfg(test)]
                     if let Some(sink) = sink.as_deref_mut() {
                         sink.retain(|h| !collapsed_ids.contains(&h.node));
+                    }
+                    let outcome = apply_disambiguation(&mut done.node, &ref_keys);
+                    truncated |= outcome.truncated;
+                    #[cfg(test)]
+                    if let Some(sink) = sink.as_deref_mut() {
+                        let numbers: HashMap<&str, usize> = outcome
+                            .renamed
+                            .iter()
+                            .map(|(r, n)| (r.as_str(), *n))
+                            .collect();
+                        for h in sink.iter_mut() {
+                            if let Some(&n) = numbers.get(h.r#ref.as_str()) {
+                                h.name = super::disambiguate::suffixed_name(&h.name, n).name;
+                            }
+                        }
                     }
                     return Ok(Snapshot::new(done.node).with_truncated(truncated));
                 }
@@ -1092,6 +1115,10 @@ fn build_snapshot_inner(
         // ref は変わらない（AISNAP-10）。
         if emit {
             node.r#ref = Some(elem_ref.to_ref_string());
+            ref_keys.insert(
+                elem_ref.to_ref_string(),
+                (role.to_string(), out_name.clone()),
+            );
             #[cfg(test)]
             if let Some(sink) = sink.as_deref_mut() {
                 sink.push(RefHolder {
@@ -1121,6 +1148,9 @@ fn build_snapshot_inner(
                         .map(|r| r.row),
                 );
             }
+            for h in &headers {
+                ref_keys.insert(h.elem_ref.to_ref_string(), (h.role.clone(), h.name.clone()));
+            }
             #[cfg(test)]
             if let Some(sink) = sink.as_deref_mut() {
                 for h in &headers {
@@ -1137,6 +1167,9 @@ fn build_snapshot_inner(
             for (r, plan) in compressed.rows.into_iter().zip(plans.iter()) {
                 let (controls, controls_truncated) =
                     build_row_controls(doc, &index, &mut refs, elem_ref, plan, &mut truncated)?;
+                for c in &controls {
+                    ref_keys.insert(c.r#ref.clone(), (c.role.clone(), c.name.clone()));
+                }
                 #[cfg(test)]
                 if let Some(sink) = sink.as_deref_mut() {
                     for ((id, _), c) in plan.kept.iter().zip(controls.iter()) {
@@ -1300,7 +1333,7 @@ mod tests {
             .collect();
         assert_eq!(
             top,
-            vec![("generic", "Box"), ("generic", ""), ("generic", "")]
+            vec![("generic", "Box"), ("generic", ""), ("generic", "#2")]
         );
         assert_eq!(child(child(&s.tree, 0), 0).name, "B");
     }
@@ -1637,7 +1670,7 @@ mod tests {
                 ("checkbox", "c", true),
                 ("generic", "", true), // div[onclick]
                 ("combobox", "s", true),
-                ("generic", "", true),    // option
+                ("generic", "#2", true),  // option
                 ("generic", "9.9", true), // p.price_color（データ葉。値が name。TASK-17）
             ]
         );
@@ -2642,5 +2675,61 @@ mod tests {
         let idx: Vec<usize> = table.folded_rows.iter().map(|r| r.index).collect();
         assert_eq!(idx, vec![0, 2]);
         assert!(all_nodes(&s.tree).iter().any(|n| n.role == "cell"));
+    }
+
+    /// AISNAP-10・TASK-17（#1221）: 同じ role・name のリンクは 2 件目以降に ` #n`。ref は不変。
+    #[test]
+    fn aisnap_10_duplicate_links_get_occurrence_suffix() {
+        let s = snap(
+            "<body><a href=\"/x\">alpha</a><a href=\"/y\">alpha</a><a href=\"/z\">alpha</a>\
+             <button>alpha</button></body>",
+        );
+        let got: Vec<(&str, &str)> = s
+            .tree
+            .children
+            .iter()
+            .map(|n| (n.role.as_str(), n.name.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("link", "alpha"),
+                ("link", "alpha #2"),
+                ("link", "alpha #3"),
+                ("button", "alpha")
+            ]
+        );
+        let refs: Vec<&str> = s
+            .tree
+            .children
+            .iter()
+            .filter_map(|n| n.r#ref.as_deref())
+            .collect();
+        assert_eq!(refs.len(), 4);
+        let unique: std::collections::HashSet<&&str> = refs.iter().collect();
+        assert_eq!(unique.len(), 4);
+    }
+
+    /// AISNAP-10・TASK-17（#1221）: テスト用 holder の name は出力ノードの name と同期する。
+    #[test]
+    fn aisnap_10_holders_follow_disambiguated_names() {
+        let parsed = parse_document(
+            "<body><a href=\"/x\">alpha</a><a href=\"/y\">alpha</a></body>",
+            &ParseOptions::default(),
+        )
+        .expect("parse");
+        let (s, holders) = super::build_snapshot_with_holders(&parsed.document).expect("build");
+        let node_names: Vec<(String, String)> = s
+            .tree
+            .children
+            .iter()
+            .filter_map(|n| n.r#ref.clone().map(|r| (r, n.name.clone())))
+            .collect();
+        let holder_names: Vec<(String, String)> = holders
+            .iter()
+            .map(|h| (h.r#ref.clone(), h.name.clone()))
+            .collect();
+        assert_eq!(node_names, holder_names);
+        assert_eq!(holder_names.get(1).map(|x| x.1.as_str()), Some("alpha #2"));
     }
 }

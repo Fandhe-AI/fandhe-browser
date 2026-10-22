@@ -228,8 +228,22 @@ fn value_annotations(doc: &Document, entries: &[FlatEntry]) -> BTreeMap<String, 
 
 /// `- generic [ref]` 形式の行（名前なし）へ値注釈を挿入する。該当しない行はそのまま返す。
 fn annotate_line(line: &str, notes: &BTreeMap<String, (String, String)>) -> String {
-    let Some(rest) = line.trim_start().strip_prefix("- generic [") else {
-        return line.to_owned();
+    // 名前なしの generic は、同じ role・name の重複への区別子（#1221）で `"#2"` のような
+    // 区別子だけの name になる。これも名前なしとして扱い、補う本文に置き換える。
+    let trimmed = line.trim_start();
+    let rest = match trimmed.strip_prefix("- generic [") {
+        Some(rest) => rest,
+        None => match trimmed
+            .strip_prefix("- generic \"#")
+            .and_then(|r| r.split_once("\" ["))
+        {
+            Some((digits, rest))
+                if !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit()) =>
+            {
+                rest
+            }
+            _ => return line.to_owned(),
+        },
     };
     let Some(end) = rest.find(']') else {
         return line.to_owned();

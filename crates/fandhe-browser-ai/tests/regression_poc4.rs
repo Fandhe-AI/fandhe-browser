@@ -548,12 +548,24 @@ fn aisnap_13_nav_04_dashboard_action_links_keep_distinct_refs() {
         .collect();
     assert_eq!(tables.len(), 2, "圧縮された表は 2 つ");
     let mut refs: Vec<&str> = Vec::new();
+    let mut occurrence = 0usize;
     for t in &tables {
         assert_eq!(t.rows.len(), 4);
         for row in &t.rows {
+            // 同 role・name の操作リンクは文書順に出現順の区別子 ` #n`（#1221）が付く
+            // （先頭だけ素の name。表をまたいで通し番号）。
+            occurrence += 1;
+            let (edit, delete) = if occurrence == 1 {
+                ("edit".to_string(), "delete".to_string())
+            } else {
+                (
+                    format!("edit #{occurrence}"),
+                    format!("delete #{occurrence}"),
+                )
+            };
             assert_eq!(
                 control_pairs(row),
-                vec![("link", "edit"), ("link", "delete")]
+                vec![("link", edit.as_str()), ("link", delete.as_str())]
             );
             assert!(!row.controls_truncated);
             refs.extend(row.controls.iter().map(|c| c.r#ref.as_str()));

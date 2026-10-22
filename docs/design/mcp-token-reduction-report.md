@@ -26,26 +26,26 @@
 | site | rawHtmlTokens | snapshotTokens | reductionPct | truncated |
 | ---- | ------------- | -------------- | ------------ | --------- |
 | example-minimal | 103 | 77 | 25.2 | false |
-| wikipedia-article | 56482 | 32160 | 43.1 | false |
-| hn-list | 10220 | 10797 | -5.6 | false |
+| wikipedia-article | 56482 | 33177 | 41.3 | false |
+| hn-list | 10220 | 11246 | -10.0 | false |
 | login-form | 284 | 174 | 38.7 | false |
-| mdn-docs | 19005 | 24753 | -30.2 | false |
+| mdn-docs | 19005 | 25200 | -32.6 | false |
 
 ### Summary
 
 | pages | meanReductionPct | minReductionPct | maxReductionPct | medianSnapshotTokens |
 | ----- | ---------------- | --------------- | --------------- | -------------------- |
-| 5 | 14.2 | -30.2 | 43.1 | 10797.0 |
+| 5 | 12.5 | -32.6 | 41.3 | 11246.0 |
 
 ### PLUG-4 verdict
 
 | thresholdPct | meanPct | verdict | gapPts |
 | ------------ | ------- | ------- | ------ |
-| 84.0 | 14.2 | Shortfall | 69.8 |
+| 84.0 | 12.5 | Shortfall | 71.5 |
 
 ## 所見
 
-- 平均削減率は -75.7%（`5786055`、TASK-23.3 より前）から 14.2% に変わった。`hn-list`・`mdn-docs` は依然として負（snapshot が生 HTML より大きい。現行ホストが JSON ツリーのエンベロープを返すため）。84.0% には届いていない。達成可否の判断はしない（#387）。TASK-23 全体の対照表は [TASK-23 再測定レポート](./token-reduction-remeasurement-report.md) を参照
+- 平均削減率は -75.7%（`5786055`、TASK-23.3 より前）から 12.5% に変わった。`hn-list`・`mdn-docs` は依然として負（snapshot が生 HTML より大きい。現行ホストが JSON ツリーのエンベロープを返すため）。84.0% には届いていない。達成可否の判断はしない（#387）。TASK-23 全体の対照表は [TASK-23 再測定レポート](./token-reduction-remeasurement-report.md) を参照
 - 合成フィクスチャのため、PoC-15 の実ページ（87.8%）とは厳密に比較できない
 - TASK-23.6 以降、`hn-list` の snapshot は truncated ではない（フル name の 120 文字打ち切りが出力から消えたため）
 
@@ -69,16 +69,16 @@
 | site | rawHtmlTokens | snapshotTokens | reductionPct | truncated | executedHtmlTokens | script stage |
 | ---- | ------------- | -------------- | ------------ | --------- | ------------------ | ------------ |
 | example-minimal | 103 | 77 | 25.2 | false | 103 | Skipped(NoScriptElement) |
-| wikipedia-article | 56482 | 32160 | 43.1 | false | 56482 | Skipped(NoScriptElement) |
-| hn-list | 10220 | 10797 | -5.6 | false | 10220 | Skipped(NoScriptElement) |
+| wikipedia-article | 56482 | 33177 | 41.3 | false | 56482 | Skipped(NoScriptElement) |
+| hn-list | 10220 | 11246 | -10.0 | false | 10220 | Skipped(NoScriptElement) |
 | login-form | 284 | 174 | 38.7 | false | 283 | Executed |
-| mdn-docs | 19005 | 24753 | -30.2 | false | 19005 | Skipped(NoScriptElement) |
+| mdn-docs | 19005 | 25200 | -32.6 | false | 19005 | Skipped(NoScriptElement) |
 
 ### JS 有効時: 集計
 
 | pages | meanReductionPct | minReductionPct | maxReductionPct | medianSnapshotTokens | 84.0% との差（pt・表示のみ） |
 | ----- | ---------------- | --------------- | --------------- | -------------------- | ---------------------------- |
-| 5 | 14.2 | -30.2 | 43.1 | 10797.0 | 69.8 |
+| 5 | 12.5 | -32.6 | 41.3 | 11246.0 | 71.5 |
 
 ### SPA 風フィクスチャ（テスト内蔵・JS が見出し・リスト・フォームを描画）
 
@@ -89,6 +89,6 @@
 ### 所見
 
 - 5 サイトの snapshot は、有効時も既定オフと同一（トークン数・truncated・`login-form` を含むバイト列）。`<script` を持つのは `login-form` のみで、`<script src>` は loopback のためアクターの `Fetcher` が接続前に拒否し（`SrcFetchFailed`・`DisallowedAddress`）、JS は 1 行も実行されない。他 4 サイトは `Skipped(NoScriptElement)`。再シリアライズ由来の差も出なかった
-- 平均 14.2% は既定オフと同じで、84.0% 未達のまま。原因は JS 実行ではなく、応答が JSON ツリーのエンベロープであること（上の「所見」と同じ）。しきい値は変更していない
+- 平均 12.5% は既定オフと同じで、84.0% 未達のまま。原因は JS 実行ではなく、応答が JSON ツリーのエンベロープであること（上の「所見」と同じ）。しきい値は変更していない
 - 描画を伴うページでは snapshot が JS 描画分だけ増える（SPA 風フィクスチャで 76 → 251 トークン）。これは取得対象が実行後 DOM になる `JS-4` の意図どおりの挙動
 - 例外メッセージ・console 出力・スクリプト本文は AI 向け出力（snapshot 本文・MCP テキスト）に混入しない。静的要素の `ref` は JS 実行の有無で一致し、再読み出し・再ナビゲーションでもバイト一致する（`AISNAP-6`・`AISNAP-10`）
