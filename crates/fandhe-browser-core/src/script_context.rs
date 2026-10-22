@@ -1212,6 +1212,8 @@ fn worker_main(shared: &Arc<Shared>, config: &WorkerConfig, generation: u64) {
 }
 
 /// コンテキストの作成・評価を行う（ワーカースレッド上）。世代の照合は呼び出し元のループが済ませている。
+// 理由: ワーカーのループが分解した EvalJob の各部とワーカー固有の状態（contexts・config）を
+// 借用のまま渡すため。構造体へまとめ直すと EvalJob の分解と二重管理になる。
 #[allow(clippy::too_many_arguments)]
 fn handle_evaluate(
     shared: &Shared,
