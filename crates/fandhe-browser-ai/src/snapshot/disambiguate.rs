@@ -9,15 +9,18 @@
 //!
 //! # 既知の制約（REPAIR-3。将来仕様は後続 Issue）
 //!
-//! - ページ由来の name と区別子付き name の衝突（元から `alpha #2` がある等）の解消は未対応
-//!   （Issue #1222）。base の切り詰めで新たに衝突する場合も同じ。
+//! - ページ由来の name と区別子付き name の衝突（元から `alpha #2` がある等）や、base の切り詰めで
+//!   生じる別グループとの衝突は、次の番号へ進めて解消する（Issue #1222）。番号は飛ぶことがある。
+//!   試行は 1 要素あたり [`MAX_SUFFIX_ATTEMPTS`] 回までで、使い切った要素は区別子を付けず base の
+//!   まま残す（成功を装わない fail-closed）。先頭の要素が素の base なので `(role, name)` の重複が
+//!   確実に残り、`reference_stability` が判定表 A1 の `Ambiguous` として検出する。
 //! - 同じ `(role, name)` の要素が対象より前に挿入されると出現番号がずれ、別要素が素の name と元の
 //!   ref を得る。この変化は `reference_stability` が、順序を決める集合（同グループ・同 ref
 //!   ファミリ）が変わる変化として `Ambiguous` で検出し、`Stable` にはしない（誤同定を成功として
 //!   固定しない。判定表 A4）。`id`・`href` 等で ref が出現順に依存しない対象は `Stable`（A2）。
 //! - 重複時の [`super::Node::name`] はアクセシブルネームそのものではなくなる（出力 name の補完）。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use super::name::{MAX_DATA_LEAF_VALUE_CHARS, MAX_NAME_CHARS};
 use super::{MAX_TREE_DEPTH, Node};
@@ -43,8 +46,11 @@ pub(super) struct SuffixedName {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 #[non_exhaustive]
 pub(super) struct DisambiguationOutcome {
-    /// 区別子を付けた要素の `(ref, 出現番号)`（文書順）。
+    /// 区別子を付けた要素の `(ref, 割り当てた番号)`（文書順。番号は衝突を飛ばすため出現順と限らない）。
     pub(super) renamed: Vec<(String, usize)>,
+    /// 試行上限を超えて区別子を付けられなかった要素の ref（文書順）。name は base のままで、
+    /// 出力に `(role, name)` の重複が残る（`reference_stability` が A1 で検出する）。
+    pub(super) unresolved: Vec<String>,
     /// base の切り詰めが起きたか（`Snapshot::truncated` へ伝える）。
     pub(super) truncated: bool,
     /// 全 ref 保持要素の `ref → (区別子付与前の表示 name, 最終的な表示 name)`。
@@ -52,15 +58,89 @@ pub(super) struct DisambiguationOutcome {
     pub(super) names: HashMap<String, (String, String)>,
 }
 
-/// 文書順の入力から、2 件目以降の要素の `ref → 出現番号` を返す純関数。O(要素数)。
-pub(super) fn disambiguate_names(entries: &[RefEntry<'_>]) -> HashMap<String, usize> {
-    let mut counts: HashMap<(&str, &str), usize> = HashMap::new();
-    let mut out = HashMap::new();
+/// 区別子の試行回数の上限（1 要素あたり）。
+///
+/// 解消に失敗するのは、同じ role で literal の `base #k`…`base #(k+63)` が連続してページに
+/// あるときだけで、実ページでは想定しない（`benches/fixtures` の 17 ページで衝突 0 件）。
+/// 一方で HTML 由来の name で試行回数を増やせるため、計算量の上限として必要になる。
+/// 使い切ったグループは後続要素を試行せず未解消とし（同じ `(グループ, 番号)` を再試行しない）、
+/// 全体の試行回数を要素数に対してほぼ線形（要素数 + グループ数 × 上限）に抑える。
+/// 候補文字列も [`suffixed_name`] で最大 300 char に頭打ちになる。出現番号の桁数増も抑える。
+pub(crate) const MAX_SUFFIX_ATTEMPTS: usize = 64;
+
+/// [`assign_suffixes`] が割り当てた区別子 1 件。
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub(super) struct Assignment {
+    /// 実際に使った番号（衝突を飛ばすため出現順と一致するとは限らない）。
+    pub(super) number: usize,
+    /// 区別子付きの最終 name。
+    pub(super) name: String,
+    /// base の切り詰めが起きたか。
+    pub(super) truncated: bool,
+}
+
+/// [`assign_suffixes`] の結果。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub(super) struct SuffixAssignments {
+    /// 区別子を付けた要素の `ref → 割り当て`。
+    pub(super) assigned: HashMap<String, Assignment>,
+    /// 試行上限を超えて区別子を付けられなかった要素の ref（文書順）。name は base のまま。
+    pub(super) unresolved: Vec<String>,
+}
+
+/// 文書順の入力から、同じ `(role, name)` の 2 件目以降へ衝突しない区別子を割り当てる純関数。
+///
+/// 割り当て前に全要素の元の `(role, name)` を使用済みにするため、ページ由来の name が後ろに
+/// あっても衝突を検出する。グループごとに番号は単調増加で、割り当てた最終 name も使用済みに
+/// 加える（切り詰めで生じる別グループとの衝突を捕まえる）。上限は [`MAX_SUFFIX_ATTEMPTS`]。
+pub(super) fn assign_suffixes(entries: &[RefEntry<'_>]) -> SuffixAssignments {
+    let mut taken: HashSet<(&str, String)> = entries
+        .iter()
+        .map(|e| (e.role, e.name.to_string()))
+        .collect();
+    // グループ → 次に試す番号（None は上限を使い切った）。
+    let mut groups: HashMap<(&str, &str), Option<usize>> = HashMap::new();
+    let mut out = SuffixAssignments::default();
     for e in entries {
-        let n = counts.entry((e.role, e.name)).or_insert(0);
-        *n += 1;
-        if *n >= 2 {
-            out.insert(e.r#ref.to_string(), *n);
+        let Some(slot) = groups.get_mut(&(e.role, e.name)) else {
+            // グループの先頭は素の name のまま。
+            groups.insert((e.role, e.name), Some(2));
+            continue;
+        };
+        let Some(start) = *slot else {
+            out.unresolved.push(e.r#ref.to_string());
+            continue;
+        };
+        let mut found = None;
+        for i in 0..MAX_SUFFIX_ATTEMPTS {
+            let Some(k) = start.checked_add(i) else {
+                break;
+            };
+            let s = suffixed_name(e.name, k);
+            if !taken.contains(&(e.role, s.name.clone())) {
+                found = Some((k, s));
+                break;
+            }
+        }
+        match found {
+            Some((k, s)) => {
+                taken.insert((e.role, s.name.clone()));
+                *slot = k.checked_add(1);
+                out.assigned.insert(
+                    e.r#ref.to_string(),
+                    Assignment {
+                        number: k,
+                        name: s.name,
+                        truncated: s.truncated,
+                    },
+                );
+            }
+            None => {
+                *slot = None;
+                out.unresolved.push(e.r#ref.to_string());
+            }
         }
     }
     out
@@ -126,7 +206,8 @@ fn walk_ref_items(tree: &mut Node, f: &mut impl FnMut(&str, &str, &mut String)) 
 ///
 /// 重複判定の採番キーは `(role, 木に現れている name)` で、残余縮約（TASK-23.6）後の
 /// エージェントに見える name を使う。縮約で同じ表示名になった別々の要素も 1 グループとして
-/// 通し番号を振るので、出力に `(role, name)` の重複が残らない。
+/// 通し番号を振る。衝突は [`assign_suffixes`] が次の番号へ進めて解消し、上限超過の要素だけ
+/// 重複が残る（`unresolved`）。
 pub(super) fn apply_disambiguation(tree: &mut Node) -> DisambiguationOutcome {
     let mut collected: Vec<(String, String, String)> = Vec::new();
     walk_ref_items(tree, &mut |role, r, name| {
@@ -140,15 +221,17 @@ pub(super) fn apply_disambiguation(tree: &mut Node) -> DisambiguationOutcome {
             name,
         })
         .collect();
-    let numbers = disambiguate_names(&entries);
-    let mut outcome = DisambiguationOutcome::default();
+    let assignments = assign_suffixes(&entries);
+    let mut outcome = DisambiguationOutcome {
+        unresolved: assignments.unresolved.clone(),
+        ..Default::default()
+    };
     walk_ref_items(tree, &mut |_role, r, name| {
         let base = name.clone();
-        if let Some(&n) = numbers.get(r) {
-            let s = suffixed_name(name, n);
-            outcome.truncated |= s.truncated;
-            *name = s.name;
-            outcome.renamed.push((r.to_string(), n));
+        if let Some(a) = assignments.assigned.get(r) {
+            outcome.truncated |= a.truncated;
+            name.clone_from(&a.name);
+            outcome.renamed.push((r.to_string(), a.number));
         }
         outcome.names.insert(r.to_string(), (base, name.clone()));
     });
@@ -270,5 +353,167 @@ mod tests {
         let mut after = t.clone();
         after.children[1].name = "alpha".into();
         assert_eq!(after, before);
+    }
+
+    fn names(t: &Node) -> Vec<&str> {
+        t.children.iter().map(|c| c.name.as_str()).collect()
+    }
+
+    fn unique_role_names(t: &Node) -> bool {
+        let mut seen = HashSet::new();
+        t.children
+            .iter()
+            .all(|c| seen.insert((c.role.clone(), c.name.clone())))
+    }
+
+    /// AISNAP-10・TASK-17（#1222）: literal `alpha #2` が後ろにあっても区別子は次の番号へ進む。
+    #[test]
+    fn aisnap_10_literal_after_duplicate_is_skipped() {
+        let mut t = root(vec![
+            link("alpha", "e1"),
+            link("alpha", "e1-2"),
+            link("alpha #2", "e9"),
+        ]);
+        let out = apply_disambiguation(&mut t);
+        assert_eq!(names(&t), vec!["alpha", "alpha #3", "alpha #2"]);
+        assert_eq!(out.renamed, vec![("e1-2".to_string(), 3)]);
+        assert!(out.unresolved.is_empty());
+    }
+
+    /// AISNAP-10・TASK-17（#1222）: literal が先に出る場合。
+    #[test]
+    fn aisnap_10_literal_before_duplicate_is_skipped() {
+        let mut t = root(vec![
+            link("alpha #2", "e9"),
+            link("alpha", "e1"),
+            link("alpha", "e1-2"),
+        ]);
+        apply_disambiguation(&mut t);
+        assert_eq!(names(&t), vec!["alpha #2", "alpha", "alpha #3"]);
+    }
+
+    /// AISNAP-10・TASK-17（#1222）: 複数 literal と単調カウンタ。
+    #[test]
+    fn aisnap_10_multiple_literals_monotonic_counter() {
+        let mut t = root(vec![
+            link("alpha", "e1"),
+            link("alpha #2", "e8"),
+            link("alpha", "e1-2"),
+            link("alpha #4", "e9"),
+            link("alpha", "e1-3"),
+        ]);
+        apply_disambiguation(&mut t);
+        assert_eq!(
+            names(&t),
+            vec!["alpha", "alpha #2", "alpha #3", "alpha #4", "alpha #5"]
+        );
+    }
+
+    /// AISNAP-10・TASK-17（#1222）: role が違う literal は衝突しない。
+    #[test]
+    fn aisnap_10_literal_of_other_role_does_not_collide() {
+        let mut b = Node::new("button", "alpha #2");
+        b.r#ref = Some("e9".into());
+        let mut t = root(vec![link("alpha", "e1"), link("alpha", "e1-2"), b]);
+        apply_disambiguation(&mut t);
+        assert_eq!(names(&t), vec!["alpha", "alpha #2", "alpha #2"]);
+    }
+
+    /// AISNAP-10・TASK-17（#1222）: literal 自体が重複していても出力は一意。
+    #[test]
+    fn aisnap_10_duplicated_literals_stay_unique() {
+        let mut t = root(vec![
+            link("alpha", "e1"),
+            link("alpha", "e1-2"),
+            link("alpha #2", "e8"),
+            link("alpha #2", "e8-2"),
+        ]);
+        apply_disambiguation(&mut t);
+        assert_eq!(
+            names(&t),
+            vec!["alpha", "alpha #3", "alpha #2", "alpha #2 #2"]
+        );
+        assert!(unique_role_names(&t));
+    }
+
+    /// AISNAP-10・TASK-17（#1222）: 空 name と literal `#2`。
+    #[test]
+    fn aisnap_10_empty_name_collides_with_literal() {
+        let mut t = root(vec![link("", "e1"), link("", "e1-2"), link("#2", "e9")]);
+        apply_disambiguation(&mut t);
+        assert_eq!(names(&t), vec!["", "#3", "#2"]);
+    }
+
+    /// AISNAP-10・TASK-17（#1222）: 切り詰めで生じる別グループとの衝突も次の番号へ進める。
+    #[test]
+    fn aisnap_10_truncated_collision_advances() {
+        let a = "あ".repeat(120);
+        let lit = suffixed_name(&a, 2).name;
+        let mut t = root(vec![link(&a, "e1"), link(&a, "e1-2"), link(&lit, "e9")]);
+        let out = apply_disambiguation(&mut t);
+        assert_eq!(t.children[1].name, suffixed_name(&a, 3).name);
+        assert!(out.truncated);
+        assert!(unique_role_names(&t));
+    }
+
+    /// AISNAP-10・TASK-17（#1222）: ヘッダ・行内コントロールの区別子も literal と衝突しない。
+    #[test]
+    fn aisnap_10_header_and_control_skip_literal() {
+        let mut table = link("alpha", "t0");
+        let header = HeaderCell::new("link", "alpha", "h1".to_string());
+        let ctl = RowControl::new("link", "alpha", "c1".to_string());
+        let row = TableRow::new("r".to_string(), false).with_controls(vec![ctl]);
+        table.table = Some(TableSummary::new(vec![header], vec![row], 0));
+        table.children = vec![link("alpha #2", "k1")];
+        let mut t = root(vec![table]);
+        apply_disambiguation(&mut t);
+        let tbl = &t.children[0];
+        let ts = tbl.table.as_ref().expect("table");
+        assert_eq!(ts.header[0].name, "alpha #3");
+        assert_eq!(ts.rows[0].controls[0].name, "alpha #4");
+        assert_eq!(tbl.children[0].name, "alpha #2");
+    }
+
+    fn literal_run(from: usize, count: usize) -> Vec<Node> {
+        (from..from + count)
+            .map(|k| link(&format!("alpha #{k}"), &format!("L{k}")))
+            .collect()
+    }
+
+    /// AISNAP-10・TASK-17（#1222）: 上限ちょうど手前の literal 列までは解消できる。
+    #[test]
+    fn aisnap_10_attempt_limit_boundary_resolves() {
+        let k = MAX_SUFFIX_ATTEMPTS;
+        let mut kids = vec![link("alpha", "e1"), link("alpha", "e1-2")];
+        kids.extend(literal_run(2, k - 1));
+        let mut t = root(kids);
+        let out = apply_disambiguation(&mut t);
+        assert_eq!(t.children[1].name, format!("alpha #{}", k + 1));
+        assert!(out.unresolved.is_empty());
+        assert!(unique_role_names(&t));
+    }
+
+    /// AISNAP-10・TASK-17（#1222）: 上限を超えたら区別子を付けず未解消（fail-closed）。
+    #[test]
+    fn aisnap_10_attempt_limit_exceeded_is_unresolved() {
+        let k = MAX_SUFFIX_ATTEMPTS;
+        let mut kids = vec![
+            link("alpha", "e1"),
+            link("alpha", "e1-2"),
+            link("alpha", "e1-3"),
+        ];
+        kids.extend(literal_run(2, k));
+        let mut t = root(kids);
+        let out = apply_disambiguation(&mut t);
+        assert_eq!(t.children[1].name, "alpha");
+        assert_eq!(t.children[2].name, "alpha");
+        assert_eq!(out.unresolved, vec!["e1-2".to_string(), "e1-3".to_string()]);
+        assert!(out.renamed.is_empty());
+        assert_eq!(
+            out.names["e1-2"],
+            ("alpha".to_string(), "alpha".to_string())
+        );
+        let dup = t.children.iter().filter(|c| c.name == "alpha").count();
+        assert_eq!(dup, 3);
     }
 }

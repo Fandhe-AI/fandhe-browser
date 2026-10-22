@@ -324,7 +324,7 @@ fn decide(t: Target, f: Facts) -> Reidentification {
         r#ref: t.r#ref,
     };
     match f.lookup {
-        // 行 A1: ページ由来の name との衝突（#1222）。fail-closed
+        // 行 A1: 区別子の衝突解消が試行上限（#1222）を超えて残った同名の重複。fail-closed
         Lookup::ManyByName(k) => ambiguous(k),
         Lookup::Agree => {
             if f.ref_order_independent {
@@ -1459,23 +1459,59 @@ fn aisnap_10_positional_ref_display_change_is_ambiguous() {
     );
 }
 
-/// AISNAP-10・Issue #1221（修正 #1228）・判定表 A1: ページ由来の name `Go #2` が区別子付きの
-/// name と衝突する場合（#1222）は、取り違えうる 2 件として `Ambiguous`（fail-closed）。
+/// AISNAP-10・Issue #1222・判定表 A1: ページ由来の name `Go #2` と衝突する場合は次の番号
+/// `Go #3` へ進み、対象は一意に再特定できる（`Stable`）。
 #[test]
-fn aisnap_10_literal_suffix_collision_is_ambiguous() {
+fn aisnap_10_literal_suffix_collision_resolves_to_next_number() {
     let html = page("<button>Go</button><button id=\"t\">Go</button><button>Go #2</button>");
     let result = check_reidentification(&StabilityCase {
         before_html: &html,
         after_html: &html,
         selector: "#t",
     });
+    match result {
+        Reidentification::Stable { role, name, .. } => {
+            assert_eq!(role, "button");
+            assert_eq!(name, "Go #3");
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+/// AISNAP-10・Issue #1222・判定表 A1: literal の `Go #2`…が上限分続くと解消できず、
+/// 重複が残って `Ambiguous`（fail-closed）。直前の長さ（上限 - 1 件）なら解消して `Stable`。
+#[test]
+fn aisnap_10_collision_beyond_attempt_limit_is_ambiguous() {
+    let k = crate::snapshot::MAX_SUFFIX_ATTEMPTS;
+    let build = |n: usize| {
+        let lits: String = (2..2 + n)
+            .map(|i| format!("<button>Go #{i}</button>"))
+            .collect();
+        page(&format!(
+            "<button>Go</button><button id=\"t\">Go</button>{lits}"
+        ))
+    };
+    let over = build(k);
     assert_eq!(
-        result,
+        check_reidentification(&StabilityCase {
+            before_html: &over,
+            after_html: &over,
+            selector: "#t",
+        }),
         Reidentification::Ambiguous {
             side: Side::After,
             count: 2
         }
     );
+    let ok = build(k - 1);
+    match check_reidentification(&StabilityCase {
+        before_html: &ok,
+        after_html: &ok,
+        selector: "#t",
+    }) {
+        Reidentification::Stable { name, .. } => assert_eq!(name, format!("Go #{}", k + 1)),
+        other => panic!("{other:?}"),
+    }
 }
 
 fn target(role: &str, name: &str, group: &str, r: &str) -> Target {
@@ -1659,7 +1695,7 @@ fn aisnap_10_ref_family_key_strips_only_occurrence_suffix() {
 }
 
 /// AISNAP-10・Issue #1221（修正 #1228）・TASK-17.2: `benches/fixtures` の全ページで、変化なし
-/// （前後が同じ holder 列）の各 ref 保持要素の判定は、ページ由来の name 衝突（行 A1）を除き
+/// （前後が同じ holder 列）の各 ref 保持要素の判定は、衝突解消（#1222）により
 /// すべて `Stable` になる。
 #[test]
 fn aisnap_10_unchanged_fixtures_are_stable_for_every_holder() {
@@ -1685,9 +1721,6 @@ fn aisnap_10_unchanged_fixtures_are_stable_for_every_holder() {
                 r#ref: h.r#ref.clone(),
             };
             let f = observe(&t, &holders, &holders);
-            if matches!(f.lookup, Lookup::ManyByName(_)) {
-                continue;
-            }
             let result = decide(t.clone(), f);
             let expected = Reidentification::Stable {
                 role: t.role.clone(),
