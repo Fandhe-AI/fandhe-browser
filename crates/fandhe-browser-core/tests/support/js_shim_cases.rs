@@ -3770,6 +3770,10 @@ fn class_list_cases(engine: &str) {
             "L.toggle('a', true) + '|' + L.toggle('x', false) + '|' + e.getAttribute('class')",
             "true|false|a a b",
         ),
+        (
+            "var r = ''; try { L.toggle() } catch (x) { r += x.name } try { L.contains() } catch (x) { r += x.name } try { L.item() } catch (x) { r += x.name } r + '|' + e.getAttribute('class') + '|' + L.toggle(undefined) + '|' + e.getAttribute('class')",
+            "TypeErrorTypeErrorTypeError|a b|true|a b undefined",
+        ),
         ("e.className = 'p q'; String(L.length)", "2"),
         (
             "var n = document.createElement('p'); n.classList.remove('x'); String(n.hasAttribute('class'))",

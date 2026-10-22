@@ -557,6 +557,9 @@
         writable: true,
         value: function item(index) {
             var el = tokenListOwner(this);
+            if (arguments.length < 1) {
+                throw new TypeError("Failed to execute 'item' on 'DOMTokenList': 1 argument required, but only 0 present.");
+            }
             // 引数変換（valueOf が class を変更し得る）を属性読み取りより先に行う
             var i = Number(index) >>> 0;
             var tokens = readTokens(el).tokens;
@@ -567,6 +570,9 @@
         writable: true,
         value: function contains(token) {
             var el = tokenListOwner(this);
+            if (arguments.length < 1) {
+                throw new TypeError("Failed to execute 'contains' on 'DOMTokenList': 1 argument required, but only 0 present.");
+            }
             // 引数変換（toString が class を変更し得る）を属性読み取りより先に行う
             var t = String(token);
             return indexOfToken(readTokens(el).tokens, t) !== -1;
@@ -615,6 +621,9 @@
         writable: true,
         value: function toggle(token, force) {
             var el = tokenListOwner(this);
+            if (arguments.length < 1) {
+                throw new TypeError("Failed to execute 'toggle' on 'DOMTokenList': 1 argument required, but only 0 present.");
+            }
             var t = String(token);
             checkToken(t);
             var state = readTokens(el);
