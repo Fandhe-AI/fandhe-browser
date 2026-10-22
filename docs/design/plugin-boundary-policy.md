@@ -1,6 +1,6 @@
 # プラグイン境界ポリシー
 
-対応 `TASK-93`（93.1・93.2・93.3）/ `MS-9` / ビヘイビア `PLUG-1`（[spec-reference](../../.claude/rules/spec-reference.md)）。
+対応 `TASK-93`（93.1・93.2・93.3・93.h1）/ `MS-9` / ビヘイビア `PLUG-1`（[spec-reference](../../.claude/rules/spec-reference.md)）。
 
 ## 目的
 
@@ -34,7 +34,7 @@ spec 本文中の旧称 `rust-browser` は `fandhe-browser` に読み替える�
 
 - `ldd`・`readelf -d` の `NEEDED`・`otool -L`・`dumpbin /dependents` が検出するのはロード時の動的リンクである。`dlopen` / `LoadLibrary` による実行時ロードは別の機構で、これらでは検出できない
 - CI 検査（Linux は #362 で実装済み。macOS・Windows は後続の #364・#365）が担うのは前者である。後者は本ポリシーとレビュー（`AGENTS.md` のレビュー観点「プラグイン境界」・[security](../../.claude/rules/security.md)）で防ぐ。CI 検査が `dlopen` まで網羅するものとは扱わない
-- コンテナ配布物（musl・`scratch`）は動的リンク 0 件が前提である（`CTR-4`）。ネイティブ配布物（`*-linux-gnu`・`*-apple-darwin`・`*-pc-windows-msvc`）は OS のシステムライブラリへの動的リンクが避けられず、その扱いは判断待ち（#363）である。本ドキュメントでは決めない
+- コンテナ配布物（musl・`scratch`）は動的リンク 0 件が前提である（`CTR-4`）。ネイティブ配布物（`*-linux-gnu`・`*-apple-darwin`・`*-pc-windows-msvc`）は OS のシステムライブラリへの動的リンクが避けられず、その扱いは #363 のオーナー判断で許可リスト方式に決まった（「3 OS ネイティブ配布物の動的リンク方針」）
 
 ## 本リポジトリでの現状
 
@@ -76,7 +76,64 @@ cargo tree --offline --locked --workspace --all-features --target all -e normal 
 - 実行方法は `make check-static-link`（Linux のみ・要 musl ターゲットと `musl-tools`）。musl 三つ組で `fandhe-browser-cli` の既定（V8）と軽量（`--no-default-features --features js-boa`）を release ビルドして検査する。V8 prebuilt の SHA-256 ピンは `docker/release-build.sh` の値を使う。`make ci` には含めない
 - CI では `harness-ubuntu` の `[static-link]` ステップが実行する。ビルド先は `target/` の外で、cache には入れない
 - 出荷物そのものの関門は従来どおり `docker/Dockerfile.release` の `verify-*` ステージで、同じ正本スクリプトを呼ぶ。軽量コンテナの Docker ビルドは boa 系 crate のライセンス文書不足で `verify-lite` に到達しない（`docs/design/container-size-measurement.md`）ため、軽量の検査は cargo 直ビルド経路が担う
-- 対象外: `*-linux-gnu` のネイティブ配布物（方針は #363 待ち）。`dlopen` による実行時ロード（レビューで防ぐ）
+- 対象外: `*-linux-gnu` のネイティブ配布物（方針は「3 OS ネイティブ配布物の動的リンク方針」で決定済み・検査は未実装。担当 Issue は未起票）。`dlopen` による実行時ロード（レビューで防ぐ）
+
+## 3 OS ネイティブ配布物の動的リンク方針
+
+対応 `TASK-93`（93.h1）/ `PLUG-1`。Issue #363（オーナー判断 2026-10-12）・#916。確認日 2026-10-22、基準コミット `8373eaf1`（`origin/main`）。
+
+### 決定事項
+
+| 配布物 | 方式 | 検査手段 | 担当 Issue | 状態 |
+| ------ | ---- | -------- | ---------- | ---- |
+| `*-linux-musl`（コンテナ） | 動的リンク 0 件 | `readelf -d`・`ldd` | #362 | 実装済み（前節） |
+| `*-linux-gnu`（ネイティブ） | 許可リスト | `readelf -d`・`ldd` | 未起票 | 方針のみ決定・検査は未実装 |
+| `*-apple-darwin` | 許可リスト | `otool -L` | #364 | 方針のみ決定・検査は未実装 |
+| `*-pc-windows-msvc` | 許可リスト（`+crt-static` 前提） | `dumpbin /dependents` | #365 | 方針のみ決定・検査は未実装 |
+
+- ネイティブ 3 OS は OS のシステムライブラリへの動的リンクが避けられないため、許可リスト方式を採る。許可リストに無い依存（第三者共有ライブラリ・`dylib` プラグイン等）を検出したら失敗させる方針である
+- OS 外のパス（macOS の `@rpath`・`@loader_path`・`/usr/local`・`/opt/homebrew` 等）は許可しない
+
+### Windows の `+crt-static`
+
+- Windows は `-C target-feature=+crt-static` で CRT を静的化し、許可リストを OS 標準 DLL のみにする（VC++ 再頒布可能パッケージに依存しない）
+- 根拠は 2 点
+  - `v8 =152.2.0` の `build.rs` は、msvc で `crt-static` が有効なら `libcpmt`（静的）、無効なら `msvcprt`（dylib）をリンクする。静的化で C++ ランタイム DLL 依存を外せる（本リポで読める一次資料）
+  - 固定版 `v8` の prebuilt が静的 CRT（`/MT`）でビルドされている（#363 のオーナー記述。本リポでのリンク可否は未検証）
+- 現時点では未設定である（`.cargo/config.toml` は無い）。Windows ターゲット限定の設定方法・リンク確認・サイズ差の記録は #917 が担う（`REPAIR-3`）
+
+### 暫定許可リスト案（実測前の案であり確定値ではない）
+
+出典の区分は (S) spec `TASK-93` の例示、(V) `v8` の `build.rs`、(D) OS バインディングを持つ依存（`reqwest` 経由の `rustls-platform-verifier`・`security-framework` 等）、(R) Rust std の link 指定。実際に現れるかは実測で確定する。
+
+| OS | ライブラリ | 出典 |
+| -- | ---------- | ---- |
+| `*-linux-gnu` | `libc.so.6`・`libm.so.6`・`libgcc_s.so.1` | S |
+| `*-linux-gnu` | 動的ローダー（`ld-linux-x86-64.so.2`・`ld-linux-aarch64.so.1`。`INTERP` にも現れる） | S |
+| `*-linux-gnu` | `libpthread.so.0`・`libdl.so.2`・`librt.so.1`（glibc 2.34 未満で分離。新しい glibc では `libc` に統合され現れない可能性） | R |
+| `*-apple-darwin` | `/usr/lib/libSystem.B.dylib` | S・R |
+| `*-apple-darwin` | `Security.framework`・`CoreFoundation.framework` | D |
+| `*-pc-windows-msvc` | `kernel32.dll` | S・R |
+| `*-pc-windows-msvc` | `ntdll.dll`・`ws2_32.dll`・`advapi32.dll`・`userenv.dll`・`bcryptprimitives.dll`・`api-ms-win-core-synch-l1-2-0.dll` | R |
+| `*-pc-windows-msvc` | `winmm.dll`・`dbghelp.dll` | V |
+| `*-pc-windows-msvc` | 証明書ストア系（`crypt32.dll` 等。名前は実測で確定） | D |
+
+- `libstdc++` は含めない。`v8` の既定 feature `use_custom_libcxx` が有効で、`build.rs` は `stdc++` を dylib 指定しない
+- macOS の `libc++.1.dylib` も期待リストに入れない（同じく dylib 指定が出ない）。現れた場合は実測で扱いを判断する
+- Windows で許可しないもの（`+crt-static` で外れる想定）: `vcruntime140.dll`・`msvcp140.dll`・`ucrtbase.dll`・`api-ms-win-crt-*.dll`
+
+### 確定手順
+
+1. #364・#365 の検査を、記録のみ（許可リスト外があっても失敗させない）で CI に導入する
+2. main・`workflow_dispatch` の 3 OS 実行で実測値を集める
+3. 実測値で許可リストを確定し、本節の「実測前の案」を外す
+4. 検査を fail-closed に切り替える
+
+記録のみの期間は [ci](../../.claude/rules/ci.md) の fail-closed 原則に対する、オーナー判断（#363）に基づく期間限定の例外である。切り替え条件は「許可リストの確定」で、テストの弱体化として恒久化しない。
+
+### 検査の範囲
+
+検査が見るのはロード時の動的リンクのみである。`dlopen`・`LoadLibrary` による実行時ロードは検出対象外で、本ポリシーとレビューで防ぐ（「ロード時動的リンクと実行時ロードの区別」）。
 
 ## feature と配布プロファイルの対応
 
@@ -97,7 +154,7 @@ cargo tree --offline --locked --workspace --all-features --target all -e normal 
 - 軽量は `--no-default-features` が必須。`--features js-boa` だけでは両エンジン同梱になり `CTR-1` に反する
 - 同梱していないエンジンを設定で指定すると設定エラーで起動せず、別エンジンへのフォールバックはしない（`JS-1`「設定ファイルとの関係・エラー挙動」）
 - 軽量コンテナは現時点で main からビルドできない。`scripts/gen-cargo-licenses.sh` が boa 系 9 crate のライセンス文書不足で fail-closed するため（[container-size-measurement.md](container-size-measurement.md)「限界・残課題」）。表の「軽量」は feature 構成の定義であり、配布可能な状態を示すものではない（`REPAIR-3`）
-- ネイティブ配布物の配布経路は未整備（`release.yml` は `workflow_dispatch` 限定でバイナリ配布を行わない）。動的リンク方針は #363 の判断待ち
+- ネイティブ配布物の配布経路は未整備（`release.yml` は `workflow_dispatch` 限定でバイナリ配布を行わない）。動的リンク方針は「3 OS ネイティブ配布物の動的リンク方針」で決定済み
 - サイズの出典は [js-binary-size-report.md](js-binary-size-report.md)（#368 の release プロファイル変更前の値）と [container-size-measurement.md](container-size-measurement.md)（lite は由来不明イメージによる暫定値）。数値は本表に転記しない
 
 ### 表 B: feature 別の一覧
@@ -127,10 +184,12 @@ cargo tree --offline --locked --workspace --all-features --target all -e normal 
 | Issue | 内容 | 状態 |
 | ----- | ---- | ---- |
 | #361 | feature と配布プロファイルの対応表（`TASK-93.2`） | 作成済み（「feature と配布プロファイルの対応」） |
-| #363 | 3 OS ネイティブ配布物の動的リンク方針（人間判断） | 判断待ち |
+| #363 | 3 OS ネイティブ配布物の動的リンク方針（人間判断） | 判断済み（オーナー判断 2026-10-12）。記録は #916 |
+| #916 | 上記方針の記録（`TASK-93.h1`） | 作成済み（「3 OS ネイティブ配布物の動的リンク方針」） |
+| #917 | Windows の `+crt-static` 設定とリンク確認 | 未実装 |
 | #362 | Linux 向け動的リンクなし検査スクリプト（`TASK-93.3`） | 実装済み（「Linux（musl）配布バイナリの動的リンクなし検査」） |
-| #364 | macOS 向け動的リンク検査スクリプト（`TASK-93.4`） | 未実装 |
-| #365 | Windows 向け動的リンク検査スクリプト（`TASK-93.5`） | 未実装 |
+| #364 | macOS 向け動的リンク検査スクリプト（`TASK-93.4`） | 未実装（記録のみで導入し、実測後に fail-closed 化） |
+| #365 | Windows 向け動的リンク検査スクリプト（`TASK-93.5`） | 未実装（記録のみで導入し、実測後に fail-closed 化） |
 
 親 Issue は #359（`TASK-93`）。
 
@@ -141,6 +200,7 @@ cargo tree --offline --locked --workspace --all-features --target all -e normal 
 - PoC-15 の実測は macOS ローカルのみ。3 OS 横断の確認は XOS 系へ申し送り済み
 - 本ドキュメントは新規の実測を含まない
 - 動的リンクの CI による機械検査は Linux（musl）のみ実装済みで、macOS・Windows は未実装である（#364・#365）
+- 3 OS ネイティブの許可リストは実測前の暫定案である。`+crt-static` は方針として採用済みだが未設定で、本リポでのリンク可否は未検証である（#917）。`*-linux-gnu` ネイティブの検査を担う Issue は未起票である
 
 ## 関連
 
@@ -149,4 +209,5 @@ cargo tree --offline --locked --workspace --all-features --target all -e normal 
 - [render-feature-gate.md](render-feature-gate.md): `rendering` feature gate
 - [security](../../.claude/rules/security.md)・`AGENTS.md`: プラグイン境界のレビュー観点
 - [js-binary-size-report.md](js-binary-size-report.md)・[container-size-measurement.md](container-size-measurement.md): エンジン構成別・コンテナのサイズ計測
+- Issue #363（動的リンク方針の判断）・#916（その記録）・#917（Windows `+crt-static`）
 - Issue #359（親）・#360（本ドキュメント）・#361（対応表）・#362〜#365
