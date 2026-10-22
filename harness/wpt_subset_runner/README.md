@@ -17,7 +17,7 @@ WPT（web-platform-tests）サブセット実行基盤の入力となる選定�
 - `harness` 分類（`testharness` / `reftest` / `other`）は選定スクリプトの出力ではなく、後から付与されたもの
 - PoC 時点の `executionStatus`（JS 未実装による実行不能の記述）は現状と異なるため移植していない。
   実行状態・合否・実行不能理由はこのファイルではなくレポート（#276・#277）が出力する
-- reftest・other を実行対象外とする方針は人間判断（#279）の事項のため、定義は 257 件すべてを中立に保つ
+- reftest・other の実行対象外方針は #279 で承認済み（2026-10-10）だが、定義は 257 件すべてを中立に保つ
 
 ## スキーマ契約
 
@@ -160,19 +160,59 @@ TSV → 実行 → `WptReport` → JSON の経路を通し、合否とレポー�
 
 ## 実行不能項目の記録（TASK-101.5・#277・PLUG-10・MS-8）
 
-`report` モジュールが、実行できない 2 群の理由と確度を JSON セクションとして書き出す
+`report` モジュールが、実行できない項目の理由と確度を JSON セクションとして書き出す
 （`UnrunnableReport::to_json`）。#276 の `WptReport` が `"unrunnable"` キーへそのまま埋め込む。
 このセクションのキー名は固定する。
 
 | 理由コード | 対象 | 確度（`basis`） | 件数 |
 | ---------- | ---- | --------------- | ---- |
 | `reftest-comparison-not-implemented` | reftest（本ハーネスが描画比較を未実装。同一ブラウザーでの比較自体は原理上可能） | `confirmed` | 88 |
-| `unverified-likely-unrunnable` | other（内容未検証・実行できない可能性が高い） | `speculative` | 17 |
+| `crashtest-requires-rendering` | other の crashtest（読み込みとレイアウト完了でクラッシュしないことが条件。レイアウト・描画が要る） | `confirmed` | 9 |
+| `reftest-link-comparison-not-implemented` | other だが内容上は `rel=match` を持つ reftest | `confirmed` | 6 |
+| `visual-test-requires-human-judgment` | other の visual（描画結果を人が判定） | `confirmed` | 1 |
+| `manual-test-requires-interaction` | other の manual（人の操作と目視が要る） | `confirmed` | 1 |
+| `unverified-likely-unrunnable` | other のうち分類表に無いもの（内容未検証の受け皿。実サブセットでは 0 件） | `speculative` | 0 |
 
-- 出力は `schemaVersion`・`total`・`byReason[]`（`reason`・`basis`・`harness`・`description`・`count`・`files`）。0 件の理由も必ず出す
+- 出力は `schemaVersion`・`total`・`byReason[]`（`reason`・`basis`・`harness`・`description`・`count`・`files`）。0 件の理由も必ず出す。
+  `byReason[]` の要素は上表の宣言順で固定（`schemaVersion` は 1 のまま）
 - ファイルは昇順で、出力は決定的。件数上限は 10,000
-- 記録するのは理由だけで、対象外にする方針の承認は人間担当の #279（TASK-101.h1）が決める
+- 記録するのは理由と根拠。reftest・other を実行対象外にする方針は #279（TASK-101.h1）で承認済み（2026-10-10）
 - JSON は手書きで出力し、`wpt-subset.json` はライブラリでは読まない（依存を追加しないため。テストだけが読む）
+
+### other 17 件の分類（#811・TASK-101・PLUG-10）
+
+固定リビジョン（`wpt-subset.json` の `source.wptRevision`。WPT の `MANIFEST.json` ではなくファイル内容）から判定した。
+基準は次のとおり。
+
+- ファイル名が `-crash` で終わる、または `crashtests/` 配下: crashtest（レイアウト・描画エンジンが要る）
+- `<link rel=match>` を持つ: 内容上の reftest（参照ページとの描画比較が要る）
+- ファイル名が `-manual` で終わる: manual（人の操作と目視が要る）
+- `testharness.js` も match リンクも無く、参照と同じ出力なら合格と書かれたもの: visual（人が判定）
+
+17 件のうち `testharness.js` を読み込むものは 0 件で、本ハーネス（DOM・レイアウト・描画なし）で実行できるものは無い。
+crashtest を「パースして panic しなかったので合格」と数えると偽の合格になる（REPAIR-3）ため、実行可能には数えない。
+
+| file（`css/` 配下は `css/` 省略） | 種別 | 根拠（必要な機能） | 理由コード |
+| --------------------------------- | ---- | ------------------ | ---------- |
+| `css-grid/abspos/absolute-positioning-grid-container-parent-002.html` | visual | match リンクなし。grid レイアウトとフォント描画の目視比較 | `visual-test-requires-human-judgment` |
+| `css-grid/abspos/abspos-in-flexbox-in-grid-crash.html` | crashtest | flex・grid・abspos の入れ子のレイアウト | `crashtest-requires-rendering` |
+| `css-backgrounds/animations/background-color-animation-backdrop-infinite-duration-crash.html` | crashtest | `dialog.showModal()`・Web Animations・`::backdrop` | `crashtest-requires-rendering` |
+| `css-backgrounds/animations/background-color-animation-field-crash.html` | crashtest | CSS animation・system color の描画 | `crashtest-requires-rendering` |
+| `css-backgrounds/animations/background-color-animation-non-empty-no-draw-crash.html` | crashtest | CSS animation・opacity の描画 | `crashtest-requires-rendering` |
+| `css-text/altering-dom-crash.html` | crashtest | DOM 変更・行分割レイアウト | `crashtest-requires-rendering` |
+| `css-text/boundary-shaping/boundary-shaping-001.html`〜`004.html`（4 件） | reftest（内容上） | `rel=match`・合字のテキストシェイピング | `reftest-link-comparison-not-implemented` |
+| `css-ui/accent-color-invalidation-currentcolor.html` | reftest（内容上） | `rel=match`・`reftest-wait`・checkbox の描画 | `reftest-link-comparison-not-implemented` |
+| `css-ui/accent-color-parent-currentcolor.html` | reftest（内容上） | `rel=match`・checkbox の `accent-color` の描画 | `reftest-link-comparison-not-implemented` |
+| `css-overflow/chrome-480554290-crash.html` | crashtest | `::scroll-marker`・`content-visibility` | `crashtest-requires-rendering` |
+| `css-scroll-snap/crashtests/fractional-covering-area-crash.html` | crashtest | scroll-snap・巨大寸法のレイアウト | `crashtest-requires-rendering` |
+| `css-display/display-contents-001-crash.html` | crashtest | `display: contents`・table-cell の再レイアウト | `crashtest-requires-rendering` |
+| `css-variables/missing-closing-nested-fallback-crash.html` | crashtest | 閉じ括弧の欠けた `var()` のスタイル計算・描画 | `crashtest-requires-rendering` |
+| `html/webappapis/animation-frames/cancel-handle-manual.html` | manual | ボタン操作・`requestAnimationFrame` の動きの目視 | `manual-test-requires-interaction` |
+
+- 集計: crashtest 9・内容上の reftest 6・visual 1・manual 1 = 17。実行可能 0 件のため、分母（`executed`）は 152 のまま変わらない
+  （`wpt-subset.json` の 257 件の定義も中立のまま変えない。テストで 257 / 105 / 152 を固定）
+- 内容上の reftest 6 件も定義上は `other` のため、理由コードの `harness` は `other` と出す（`reftest` と報告しない）
+- 再検討の条件: 内容上の reftest・visual はレンダリング層（TASK-38）の成立後。crashtest はレイアウトを持つ実行経路ができてから。manual は自動化の対象外
 
 ## 合格率集計・レポート（TASK-101.4・#276・PLUG-10・MS-8）
 
