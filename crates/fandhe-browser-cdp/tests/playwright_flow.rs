@@ -7,10 +7,18 @@
 //!
 //! 実 Playwright を使う `cdp2_real_playwright_goto_and_selector`（TASK-44.3・#478。
 //! connect → newContext → newPage → goto → selector の 5 段階。feature `test-support` 限定で、
-//! ループバック fixture への `Page.navigate` を許す入口を使う）だけは導入が必要なため
-//! `#[ignore]` とし、`make test-playwright-connect`（`harness/playwright-connect/run.sh`）が
-//! `--features test-support --ignored --exact` で明示実行する（0 件実行は失敗）。未導入での実行は
-//! skip せず [`HarnessError::ToolUnavailable`] で panic する（成功を装わない）。
+//! ループバック fixture への `Page.navigate` を許す入口を使う）は導入が必要なため、引数に
+//! ケース名を渡したときだけ実行する。`make test-playwright-connect`
+//! （`harness/playwright-connect/run.sh`）が `--features test-support,js-v8` で明示実行し、
+//! 成功時の完了マーカー行 [`REAL_CASE_MARKER`] が 1 件でなければ失敗とする（0 件実行は失敗）。
+//! 未導入での実行は skip せず [`HarnessError::ToolUnavailable`] で panic する（成功を装わない）。
+//!
+//! 独自 `main`（`harness = false`）である理由（TASK-44.9・#1220）: 実ケースは評価コンテキスト
+//! （`ScriptContextHandle`。cli 本番と同じ配線）を有効にするため、V8 の JS ワーカー役を兼ねる必要が
+//! あり、`main` の先頭で `run_js_worker_if_requested` を呼ぶ。引数の契約は、ケース名
+//! `cdp2_real_playwright_goto_and_selector` があれば実ケースのみ、無ければ自己テスト群
+//! （`--ignored`・`--exact` 等の libtest 由来の引数は無視）。環境変数 `FANDHE_FAKE_PLAYWRIGHT_MODE` が
+//! あれば偽スクリプトの子として振る舞う。
 //! セレクタ段階の期待値（テキスト・属性）は `harness/playwright-connect/stages.mjs` の
 //! `FIXTURE_EXPECT` と同じ値で、不一致は JS 側の `SelectorMismatch` として段階失敗になる。
 //!
@@ -21,10 +29,11 @@ mod script_harness;
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
+use std::process::ExitCode;
 use std::time::Duration;
 
 #[cfg(feature = "test-support")]
-use script_harness::start_server_allowing_loopback;
+use script_harness::start_server_allowing_loopback_with_scripts;
 use script_harness::{
     FIXTURE_URL_ENV, FixtureRoute, HarnessError, PLAYWRIGHT_INSTALL_HINT,
     PLAYWRIGHT_MODULE_DIR_ENV, ScriptCommand, ScriptError, ScriptOutcome, StageResult, StageStatus,
@@ -36,17 +45,17 @@ use script_harness::{
 #[cfg(feature = "test-support")]
 const FIXTURE_HTML: &str = r#"<!doctype html><html><head><title>fixture</title></head><body><p id="target" data-role="greeting">Hello fixture</p></body></html>"#;
 
+/// 実ケースの名前（`run.sh` が引数で指定する）。
+const REAL_CASE: &str = "cdp2_real_playwright_goto_and_selector";
+/// 実ケース成功時に stdout へ 1 行出す完了マーカー（`run.sh` が `grep` で 1 件であることを検査する）。
+#[cfg(feature = "test-support")]
+const REAL_CASE_MARKER: &str = "playwright_flow: real playwright case passed (1 case)";
+
 const MODE_ENV: &str = "FANDHE_FAKE_PLAYWRIGHT_MODE";
 const D: Duration = Duration::from_secs(60);
 
-/// 偽スクリプトの子側入口。`MODE_ENV` が無ければ何もしない（通常実行では no-op）。
-#[test]
-fn fake_playwright_child_entry() {
-    let Ok(mode) = std::env::var(MODE_ENV) else {
-        return;
-    };
-    // libtest は `test <name> ... ` を改行なしで出すため、結果行が行頭に来るよう改行を挟む。
-    println!();
+/// 偽スクリプトの子側入口。`MODE_ENV` が設定されているとき `main` が呼び、終了コードで終わる。
+fn fake_playwright_child_entry(mode: String) -> ! {
     let ep = std::env::var(script_harness::ENDPOINT_ENV).unwrap_or_default();
     let fx = std::env::var(FIXTURE_URL_ENV).unwrap_or_default();
     match mode.as_str() {
@@ -80,14 +89,7 @@ fn fake(mode: &str, fixture_url: Option<String>) -> ScriptCommand {
     }
     ScriptCommand {
         program: std::env::current_exe().expect("current_exe"),
-        args: [
-            "fake_playwright_child_entry",
-            "--exact",
-            "--test-threads=1",
-            "--nocapture",
-        ]
-        .map(String::from)
-        .to_vec(),
+        args: vec![],
         envs,
         cwd: None,
     }
@@ -115,7 +117,6 @@ fn stage(name: &str, status: StageStatus, error: Option<(&str, &str)>) -> StageR
 }
 
 /// CDP-2: スクリプトへ HTTP エンドポイントと fixture URL が環境変数で渡る。
-#[test]
 fn cdp2_passes_http_endpoint_and_fixture_url_to_script() {
     let server = start_server();
     let fixture = start_fixture_server(vec![FixtureRoute::html("/page", "<p>x</p>")]);
@@ -135,7 +136,6 @@ fn cdp2_passes_http_endpoint_and_fixture_url_to_script() {
 }
 
 /// CDP-2: connect / newContext / newPage / goto / selector の段階別成功結果を回収できる。
-#[test]
 fn cdp2_collects_staged_success() {
     let out = run_script(&fake("staged_ok", None), "http://127.0.0.1:1", D);
     assert_eq!(
@@ -156,7 +156,6 @@ fn cdp2_collects_staged_success() {
 }
 
 /// CDP-2: 失敗段階のエラー名・メッセージと未到達段階を回収できる。
-#[test]
 fn cdp2_collects_failure_with_error() {
     let err = ("Error", "Browser.setDownloadBehavior failed");
     let out = run_script(&fake("staged_fail", None), "http://127.0.0.1:1", D);
@@ -181,7 +180,6 @@ fn cdp2_collects_failure_with_error() {
 }
 
 /// CDP-2・TASK-44.3: セレクタ段階の期待値不一致（期待値と実測値を含むエラー）を回収できる。
-#[test]
 fn cdp2_collects_selector_mismatch() {
     let err = ("SelectorMismatch", "expected text Hello fixture got Bye");
     let out = run_script(&fake("selector_mismatch", None), "http://127.0.0.1:1", D);
@@ -206,7 +204,6 @@ fn cdp2_collects_selector_mismatch() {
 }
 
 /// CDP-2: fixture サーバーは定義済みルートの本文を返し、到達パスを記録する。
-#[test]
 fn cdp2_fixture_server_serves_body_and_records_hits() {
     let fixture = start_fixture_server(vec![FixtureRoute::html("/a", "<h1>hi</h1>")]);
     let ok = http_get(fixture.addr, "/a");
@@ -231,7 +228,6 @@ fn unavailable(reason: &str) -> HarnessError {
 }
 
 /// CDP-2: 導入先が未指定なら skip せず理由付きで明示的に失敗する。
-#[test]
 fn cdp2_preflight_fails_explicitly_without_module_dir() {
     assert_eq!(
         preflight_playwright(None, Path::new("."), "1.63.0").unwrap_err(),
@@ -240,7 +236,6 @@ fn cdp2_preflight_fails_explicitly_without_module_dir() {
 }
 
 /// CDP-2: 導入先に playwright-core が無ければ理由付きで失敗する。
-#[test]
 fn cdp2_preflight_fails_explicitly_when_not_installed() {
     let dir = TempDir::new();
     assert_eq!(
@@ -256,7 +251,6 @@ fn install_fake_package(dir: &Path, package_json: &str) {
 }
 
 /// CDP-2: 期待版と異なる版は理由付きで失敗する（版の取り違えを成功扱いにしない）。
-#[test]
 fn cdp2_preflight_fails_explicitly_on_version_mismatch() {
     let dir = TempDir::new();
     install_fake_package(&dir.0, r#"{"name":"playwright-core","version":"1.62.0"}"#);
@@ -273,7 +267,6 @@ fn cdp2_preflight_fails_explicitly_on_version_mismatch() {
 }
 
 /// CDP-2: 版が一致すれば `node connect.mjs`（導入先を環境変数で渡す）の起動定義を返す。
-#[test]
 fn cdp2_preflight_returns_command_when_version_matches() {
     let dir = TempDir::new();
     install_fake_package(&dir.0, r#"{"name":"playwright-core","version":"1.63.0"}"#);
@@ -301,7 +294,6 @@ fn cdp2_preflight_returns_command_when_version_matches() {
 /// 既知の回避オプション（noDefaults / acceptDownloads:false / viewport:null。`stages.mjs`）前提。
 /// 導入が必要なため `make test-playwright-connect` が `--ignored --exact` で明示実行する。
 #[cfg(feature = "test-support")]
-#[test]
 #[ignore = "requires playwright-core; run via `make test-playwright-connect`"]
 fn cdp2_real_playwright_goto_and_selector() {
     let module_dir = std::env::var_os(PLAYWRIGHT_MODULE_DIR_ENV).map(PathBuf::from);
@@ -312,7 +304,15 @@ fn cdp2_real_playwright_goto_and_selector() {
     let mut cmd = preflight_playwright(module_dir.as_deref(), &harness_dir, &version)
         .unwrap_or_else(|e| panic!("playwright is unavailable (not skipping): {e:?}"));
 
-    let server = start_server_allowing_loopback();
+    // 評価コンテキストは cli 本番と同じ `ScriptContextHandle::new(JsConfig)` で作る。無効なら
+    // feature の付け忘れを `StageTimeout` として見過ごさないよう、起動前に明示的に失敗させる。
+    let scripts =
+        fandhe_browser_core::ScriptContextHandle::new(&fandhe_browser_core::JsConfig::default());
+    assert!(
+        scripts.is_enabled(),
+        "evaluator is disabled; build with --features js-v8 (or js-boa)"
+    );
+    let server = start_server_allowing_loopback_with_scripts(scripts);
     let fixture = start_fixture_server(vec![FixtureRoute::html("/index.html", FIXTURE_HTML)]);
     cmd.envs
         .push((FIXTURE_URL_ENV.to_string(), fixture.url("/index.html")));
@@ -339,4 +339,73 @@ fn cdp2_real_playwright_goto_and_selector() {
         "fixture was not fetched: {:?}",
         fixture.hits()
     );
+    println!("{REAL_CASE_MARKER}");
+}
+
+/// 自己テスト群。各ケースは panic で失敗させる（プロセスが非 0 で終わる）。
+fn self_tests() -> Vec<(&'static str, fn())> {
+    vec![
+        (
+            "cdp2_passes_http_endpoint_and_fixture_url_to_script",
+            cdp2_passes_http_endpoint_and_fixture_url_to_script,
+        ),
+        ("cdp2_collects_staged_success", cdp2_collects_staged_success),
+        (
+            "cdp2_collects_failure_with_error",
+            cdp2_collects_failure_with_error,
+        ),
+        (
+            "cdp2_collects_selector_mismatch",
+            cdp2_collects_selector_mismatch,
+        ),
+        (
+            "cdp2_fixture_server_serves_body_and_records_hits",
+            cdp2_fixture_server_serves_body_and_records_hits,
+        ),
+        (
+            "cdp2_preflight_fails_explicitly_without_module_dir",
+            cdp2_preflight_fails_explicitly_without_module_dir,
+        ),
+        (
+            "cdp2_preflight_fails_explicitly_when_not_installed",
+            cdp2_preflight_fails_explicitly_when_not_installed,
+        ),
+        (
+            "cdp2_preflight_fails_explicitly_on_version_mismatch",
+            cdp2_preflight_fails_explicitly_on_version_mismatch,
+        ),
+        (
+            "cdp2_preflight_returns_command_when_version_matches",
+            cdp2_preflight_returns_command_when_version_matches,
+        ),
+    ]
+}
+
+/// 入口（`harness = false`）。順序: JS ワーカー → 偽スクリプトの子 → 実ケース → 自己テスト群。
+fn main() -> ExitCode {
+    if let Some(code) = fandhe_browser_core::run_js_worker_if_requested() {
+        return code;
+    }
+    if let Ok(mode) = std::env::var(MODE_ENV) {
+        fake_playwright_child_entry(mode);
+    }
+    if std::env::args().skip(1).any(|a| a == REAL_CASE) {
+        #[cfg(feature = "test-support")]
+        {
+            cdp2_real_playwright_goto_and_selector();
+            return ExitCode::SUCCESS;
+        }
+        #[cfg(not(feature = "test-support"))]
+        {
+            eprintln!("error: {REAL_CASE} requires --features test-support");
+            return ExitCode::FAILURE;
+        }
+    }
+    let cases = self_tests();
+    for (name, case) in &cases {
+        println!("case: {name}");
+        case();
+    }
+    println!("playwright_flow: {} self-test cases passed", cases.len());
+    ExitCode::SUCCESS
 }
