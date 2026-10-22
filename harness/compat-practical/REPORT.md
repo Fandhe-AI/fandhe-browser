@@ -1417,6 +1417,33 @@ spec 対応: TASK-71 / MS-6 / `COMPAT-1`・`JS-5`・`JS-6`・`SEC-2`・`REPAIR-3
 
 `cargo build --release -p fandhe-browser-core --features js-v8 --example compat_page_script_probe` のあと probe を実行し、`run_core.sh` は b1 のみのタスク定義で 2 回実行する。
 
+## react.dev（b1）の tagName・documentElement・classList 補完後の再測定（#1236）
+
+### 実装の要点
+
+- `Element.tagName`・`localName`・`nodeName` を公開した（op `elementLocalName` を追加。HTML 名前空間の要素の tagName・nodeName は大文字）。`JS-5`
+- `document.documentElement`（op `documentElement`）と、最小限の `Element.classList`（`add`・`remove`・`contains`・`toggle`・`length`・`item`）を追加した。未実装のメソッドは `dom.js` 冒頭に列挙している。`REPAIR-3`
+- 識別面（`navigator.platform` 等）は増やしていない。`SEC-2`
+
+### 結果（v8・module 有効・2 回）
+
+| 項目 | 値 |
+| ---- | -- |
+| run_core.sh の b1 | `success=false`・`reason=no_match`（2 回とも同じ） |
+| probe の `h1_initial` / `h1_after` | 2 / 0 |
+| `abort` | `virtual_time`（120 秒タイマーの残りで、DOM の確定には影響しない） |
+
+- 解消した例外: `tagName` の TypeError と、テーマ script の `documentElement.classList.remove` の不足。
+- 残った例外:
+  - 同じテーマ script の `navigator.platform` の `includes` 読み取り（`undefined`）。識別面を増やすため追加しない（`SEC-2`。判断事項）。
+  - React error #418（ハイドレーション不一致）。
+  - main chunk の `Cannot read properties of undefined (reading 'length')`。
+- 次の候補: React のハイドレーションが辿る `firstChild`・`nextSibling`・`childNodes` は未公開で、#418 の原因である可能性が高い。子をたどる op 群が要るため別 Issue が適当。
+
+### 制約
+
+- 結果ファイルはコミットしていない。結論・全体動作率・マトリクスは書き換えない（#919・#920 の担当）。
+
 ## b5（Trello）の原因特定（#964）
 
 spec 対応: TASK-71 / MS-6 / `MEAS-4`・`COMPAT-1`・`COMPAT-4`・`JS-4`・`JS-6`・`SEC-2`・`REPAIR-3`。関連 Issue: #918・#758・#309。

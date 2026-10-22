@@ -545,6 +545,9 @@ pub fn run(engine: &str) {
     get_elements_by_tag_name_cases(engine);
     parent_node_cases(engine);
     is_equal_node_cases(engine);
+    element_name_cases(engine);
+    document_element_cases(engine);
+    class_list_cases(engine);
     style_sheet_cases(engine);
 
     eprintln!("case: JS-5 disabled runtime does not pretend to install");
@@ -2045,8 +2048,8 @@ fn node_cases(engine: &str) {
     check(&mut p, "String(document.ownerDocument)", "null");
     check(
         &mut p,
-        "String('tagName' in document.body) + '|' + String('childNodes' in document.body)",
-        "false|false",
+        "String('localName' in document.body) + '|' + String('childNodes' in document.body)",
+        "true|false",
     );
     check(
         &mut p,
@@ -3665,6 +3668,149 @@ fn is_equal_node_cases(engine: &str) {
             "try { Node.prototype.isEqualNode.call({}, a); 'ok' } catch (e) { 'threw' }",
             "threw",
         ),
+    ];
+    for (body, want) in cases {
+        check(&mut p, &format!("{pre}{body}"), want);
+    }
+}
+
+/// `tagName` / `localName` / `nodeName`（#1236・`JS-5`・`REPAIR-3`）。
+fn element_name_cases(engine: &str) {
+    const SVG: &str = "http://www.w3.org/2000/svg";
+    eprintln!("case: JS-5 tagName / localName / nodeName (#1236)");
+    let mut p = setup(engine, None);
+    let cases: [(String, &str); 8] = [
+        (
+            "var e = document.createElement('INPUT'); e.tagName + '|' + e.localName + '|' + e.nodeName".to_string(),
+            "INPUT|input|INPUT",
+        ),
+        ("document.querySelector('div').tagName".to_string(), "DIV"),
+        (
+            format!("var c = document.createElementNS('{SVG}','clipPath'); c.tagName + '|' + c.localName + '|' + c.nodeName"),
+            "clipPath|clipPath|clipPath",
+        ),
+        (
+            "document.body.innerHTML = '<svg><foreignObject id=f></foreignObject></svg>'; var f = document.getElementById('f'); f.tagName + '|' + f.localName".to_string(),
+            "foreignObject|foreignObject",
+        ),
+        (
+            "document.createTextNode('t').nodeName + '|' + document.nodeName".to_string(),
+            "#text|#document",
+        ),
+        (
+            "String.prototype.toUpperCase = function(){return 'x'}; document.createElement('p').tagName".to_string(),
+            "P",
+        ),
+        (
+            "try { Object.getOwnPropertyDescriptor(Element.prototype,'tagName').get.call({}); 'ok' } catch (e) { 'threw' }".to_string(),
+            "threw",
+        ),
+        (
+            "String(document.createElement('meta').tagName.toLowerCase() === 'meta')".to_string(),
+            "true",
+        ),
+    ];
+    for (body, want) in &cases {
+        check(&mut p, body, want);
+    }
+}
+
+/// `document.documentElement`（#1236・`JS-5`）。
+fn document_element_cases(engine: &str) {
+    eprintln!("case: JS-5 documentElement (#1236)");
+    let mut p = setup(engine, None);
+    let cases: [(&str, &str); 4] = [
+        (
+            "String(document.documentElement === document.querySelector('html'))",
+            "true",
+        ),
+        ("document.documentElement.tagName", "HTML"),
+        (
+            "String(document.documentElement.parentNode === document) + '|' + String(document.documentElement === document.documentElement)",
+            "true|true",
+        ),
+        (
+            "var before = document.documentElement; try { document.documentElement = null } catch (e) {} String(document.documentElement === before)",
+            "true",
+        ),
+    ];
+    for (body, want) in cases {
+        check(&mut p, body, want);
+    }
+}
+
+/// `Element.prototype.classList`（#1236・`JS-5`・`REPAIR-3`）。
+fn class_list_cases(engine: &str) {
+    eprintln!("case: JS-5 classList (#1236)");
+    let mut p = setup(engine, None);
+    let pre = "var e = document.createElement('div'); e.setAttribute('class','a a b'); var L = e.classList; ";
+    let cases: [(&str, &str); 20] = [
+        ("String(e.classList === e.classList)", "true"),
+        // BigInt は unsigned long 変換で TypeError（Number() では受理されてしまう）
+        (
+            "var r; try { L.item(1n); r = 'no-throw' } catch (x) { r = x.name } r",
+            "TypeError",
+        ),
+        // 引数変換が class を変更する場合は変換後の集合で判定する（receiver 検証 → 引数変換 → 属性読み取り）
+        (
+            "e.className = 'a'; String(L.contains({ toString: function () { e.className = 'b'; return 'b'; } }))",
+            "true",
+        ),
+        (
+            "e.className = 'a'; String(L.item({ valueOf: function () { e.className = 'x y'; return 1; } }))",
+            "y",
+        ),
+        (
+            "L.length + '|' + L.item(0) + L.item(1) + '|' + L.item(5)",
+            "2|ab|null",
+        ),
+        ("L.add('c','a'); e.getAttribute('class')", "a b c"),
+        ("L.add('c'); L.remove('a'); e.getAttribute('class')", "b c"),
+        ("L.contains('b') + '|' + L.contains('z')", "true|false"),
+        (
+            "L.toggle('b') + '|' + e.getAttribute('class') + '|' + L.toggle('d') + '|' + e.getAttribute('class')",
+            "false|a|true|a d",
+        ),
+        (
+            "L.toggle('a', true) + '|' + L.toggle('x', false) + '|' + e.getAttribute('class')",
+            "true|false|a a b",
+        ),
+        (
+            "var r = ''; try { L.toggle() } catch (x) { r += x.name } try { L.contains() } catch (x) { r += x.name } try { L.item() } catch (x) { r += x.name } r + '|' + e.getAttribute('class') + '|' + L.toggle(undefined) + '|' + e.getAttribute('class')",
+            "TypeErrorTypeErrorTypeError|a a b|true|a b undefined",
+        ),
+        // 全引数の DOMString 変換が済んでからトークン検証する（後続引数の toString が class を変更する）
+        (
+            "var r = ''; try { L.add('', { toString: function () { e.className = 'changed'; return 'x'; } }) } catch (x) { r += x.name } r + '|' + e.getAttribute('class')",
+            "TypeError|changed",
+        ),
+        // Symbol は TypeError（文字列化しない）
+        (
+            "var r = ''; try { L.add(Symbol('x')) } catch (x) { r += x.name } try { L.contains(Symbol('x')) } catch (x) { r += x.name } try { L.toggle(Symbol('x')) } catch (x) { r += x.name } try { L.remove(Symbol('x')) } catch (x) { r += x.name } r + '|' + e.getAttribute('class')",
+            "TypeErrorTypeErrorTypeErrorTypeError|a a b",
+        ),
+        ("e.className = 'p q'; String(L.length)", "2"),
+        (
+            "var n = document.createElement('p'); n.classList.remove('x'); String(n.hasAttribute('class'))",
+            "false",
+        ),
+        (
+            "var r = ''; try { L.add('') } catch (x) { r += x.name } try { L.add('a b') } catch (x) { r += x.name } r + '|' + e.getAttribute('class')",
+            "TypeErrorTypeError|a a b",
+        ),
+        (
+            "var h = document.documentElement; h.classList.add('dark'); h.classList.remove('dark'); h.getAttribute('class')",
+            "",
+        ),
+        (
+            "var recs = 0; var mo = new MutationObserver(function(r){ recs += r.length }); mo.observe(e, {attributes:true}); L.add('x'); var q = mo.takeRecords(); q.length + '|' + q[0].attributeName",
+            "1|class",
+        ),
+        (
+            "try { Object.getOwnPropertyDescriptor(Element.prototype,'classList').get.call({}); 'ok' } catch (x) { 'threw' }",
+            "threw",
+        ),
+        ("typeof navigator.platform", "undefined"),
     ];
     for (body, want) in cases {
         check(&mut p, &format!("{pre}{body}"), want);

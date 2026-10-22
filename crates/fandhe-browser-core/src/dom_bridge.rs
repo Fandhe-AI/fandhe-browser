@@ -401,6 +401,11 @@ enum DomOp {
     UrlParse,
     /// HTML 名前空間の要素の local name を返す（#1186。dom.js の IDL 属性の種別判定用）。
     HtmlLocalName,
+    /// 要素の local name を大文字小文字を保ったまま返す（#1236。dom.js の `tagName` / `localName` /
+    /// `nodeName` 用。名前空間を問わない）。要素以外は null。
+    ElementLocalName,
+    /// 文書ルート直下の最初の要素（`document.documentElement` 用。#1236・JS-5）。
+    DocumentElement,
 }
 
 impl DomOp {
@@ -460,6 +465,8 @@ impl DomOp {
             "parentNode" => Self::ParentNode,
             "isFocusable" => Self::IsFocusable,
             "htmlLocalName" => Self::HtmlLocalName,
+            "elementLocalName" => Self::ElementLocalName,
+            "documentElement" => Self::DocumentElement,
             "mutationObserverLimit" => Self::MutationObserverLimit,
             "mutationOptionsIgnored" => Self::MutationOptionsIgnored,
             "urlParse" => Self::UrlParse,
@@ -523,6 +530,8 @@ impl DomOp {
             Self::ParentNode => "parentNode",
             Self::IsFocusable => "isFocusable",
             Self::HtmlLocalName => "htmlLocalName",
+            Self::ElementLocalName => "elementLocalName",
+            Self::DocumentElement => "documentElement",
             Self::MutationObserverLimit => "mutationObserverLimit",
             Self::MutationOptionsIgnored => "mutationOptionsIgnored",
             Self::UrlParse => "urlParse",
@@ -535,6 +544,7 @@ impl DomOp {
             Self::DocumentRoot
             | Self::Body
             | Self::Head
+            | Self::DocumentElement
             | Self::ReadyState
             | Self::CurrentScript
             | Self::NavigatorUserAgent
@@ -565,6 +575,7 @@ impl DomOp {
             | Self::IsFocusable
             | Self::ParentNode
             | Self::HtmlLocalName
+            | Self::ElementLocalName
             | Self::NetCancel => 1,
             Self::CreateElementNs
             | Self::QuerySelector
@@ -1188,6 +1199,27 @@ fn execute(
                 return string_response(name.to_string(), limits);
             }
             Ok(JsValue::Null)
+        }
+        // 要素の local name（大文字小文字を保つ。SVG の `clipPath` 等）。名前空間を問わず、要素以外は
+        // null（#1236・JS-5）。読み取り専用で、応答は上限（JS-6）に従う。
+        DomOp::ElementLocalName => {
+            let node = page.node_arg(op, args, 1)?;
+            if page.document.is_element(node)
+                && let Some(name) = page.document.local_name(node)
+            {
+                return string_response(name.to_string(), limits);
+            }
+            Ok(JsValue::Null)
+        }
+        // 文書ルート直下の最初の要素の子（DOM 標準の document element。名前空間は問わない。#1236・JS-5）。
+        // 読み取り専用で、走査は文書ルートの直下の子だけ。
+        DomOp::DocumentElement => {
+            let root = page.document.root();
+            let found = page
+                .document
+                .children(root)
+                .find(|&c| page.document.is_element(c));
+            page.encode_optional(found)
         }
         DomOp::TimerCallbackError => {
             let name = string_arg(op, args, 1, limits)?;
@@ -3288,6 +3320,46 @@ mod tests {
         call(&b, &[s("htmlLocalName"), s("1")]).expect_err("type");
         call(&b, &[s("htmlLocalName")]).expect_err("arity");
         call(&b, &[s("htmlLocalName"), n(input), n(input)]).expect_err("arity");
+    }
+
+    /// JS-5: `elementLocalName` は名前空間を問わず大文字小文字を保った名前を返し、要素以外は null（#1236）。
+    #[test]
+    fn js_5_element_local_name_op() {
+        let b = bridge();
+        let body = num(call(&b, &[s("body")]));
+        let root = num(call(&b, &[s("documentRoot")]));
+        let input = num(call(&b, &[s("createElement"), s("INPUT")]));
+        let text = num(call(&b, &[s("createTextNode"), s("t")]));
+        let name = |x: f64| call(&b, &[s("elementLocalName"), n(x)]).expect("ok");
+        assert_eq!(name(input), JsValue::String("input".to_string()));
+        assert_eq!(name(text), JsValue::Null);
+        assert_eq!(name(root), JsValue::Null);
+        call(
+            &b,
+            &[
+                s("setInnerHTML"),
+                n(body),
+                s("<svg><foreignObject id=\"f\"></foreignObject></svg>"),
+            ],
+        )
+        .expect("svg");
+        let f = num(call(&b, &[s("getElementById"), s("f")]));
+        assert_eq!(name(f), JsValue::String("foreignObject".to_string()));
+        call(&b, &[s("elementLocalName"), n(1e12)]).expect_err("invalid id");
+        call(&b, &[s("elementLocalName"), s("1")]).expect_err("type");
+        call(&b, &[s("elementLocalName")]).expect_err("arity");
+        call(&b, &[s("elementLocalName"), n(input), n(input)]).expect_err("arity");
+    }
+
+    /// JS-5: `documentElement` は `<html>` 要素の ID を返し、余分な引数はエラー（#1236）。
+    #[test]
+    fn js_5_document_element_op() {
+        let b = bridge();
+        let root = num(call(&b, &[s("documentRoot")]));
+        let de = num(call(&b, &[s("documentElement")]));
+        let html = num(call(&b, &[s("querySelector"), n(root), s("html")]));
+        assert_eq!(de, html);
+        call(&b, &[s("documentElement"), n(1.0)]).expect_err("arity");
     }
 
     /// JS-5 / JS-6 / REPAIR-3 (#1192): `createElementNS` は HTML・SVG の名前空間だけを受け、
