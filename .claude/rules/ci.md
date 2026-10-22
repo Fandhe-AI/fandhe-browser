@@ -70,16 +70,14 @@ cargo test --workspace
 - ライセンス検査は `rust-lint` ジョブの `cargo deny check advisories bans licenses sources` で行う（[licensing](./licensing.md)）。Servo ホストは同ジョブの `scripts/deny.sh servo-host` ステップ（servo 時。`servo-host/deny.toml`。OSS-2・OSS-3）
 - 対象サイト群の動作率回帰チェック（`REPAIR-8`・`COMPAT-1`・`COMPAT-4`。TASK-9.2）:
   `make check-compat-regression`（CI では `harness-*` ジョブの `[compat-regression]` ステップ）が
-  `harness/compat-regression/check-matrix.sh` で全体・`--categories` 指定の類型
-  （static/spa/form。存在必須として明示列挙）に加え `--all-categories` で
-  マトリクス内に実在する全ての類型（`cat` は `^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`
-  に一致する文字列に限る。lazy・table 等も含む）の動作率が閾値 70% 以上かを
-  判定する。実マトリクス `harness/compat-practical/results/matrix.json`
-  （TASK-71.3・Issue #312 が生成予定）が未導入の間は `--allow-missing` を渡し、
-  ファイル不在時は `::warning::` を出して通過させる。#312 の完了後は
-  `--allow-missing` を外し fail-closed（ファイル不在は exit 2）に戻す。
+  `harness/compat-regression/check-matrix.sh --threshold 70 --categories static,spa,form` で
+  全体と static/spa/form（存在必須として明示列挙）の動作率が閾値 70% 以上かを判定する。
+  lazy・table は実測が 70% 未満のため判定対象に含めていない（閾値は緩めていない。含める基準変更は人間判断が必要なため別 Issue で扱う）。
+  実マトリクス `harness/compat-practical/results/matrix.json` は実測（`run_core.sh`）から
+  `make_matrix.sh` で生成してコミット済み（TASK-71.3・#920）。`--allow-missing` は渡さず、
+  ファイル不在は exit 2（fail-closed）。手編集せず、再計測して再生成する
   スキーマ契約・終了コードは `harness/compat-regression/README.md` を参照
-- 実マトリクスの生成スクリプト `harness/compat-practical/make_matrix.sh`（TASK-71.3・Issue #312。`core_results.jsonl` と PoC-9 の Chromium 参照データ `reference/chromium_results.json` を `id` で突合。CI では `--validate-only` で入力の整合のみ検査。詳細は `harness/compat-practical/README.md`）
+- コミット済み実マトリクスの生成スクリプト `harness/compat-practical/make_matrix.sh`（TASK-71.3・Issue #312・#920。`core_results.jsonl` と PoC-9 の Chromium 参照データ `reference/chromium_results.json` を `id` で突合。CI では `--validate-only` で入力の整合のみ検査。詳細は `harness/compat-practical/README.md`）
 - 実測ハーネス compat-practical の自己テスト（`MEAS-4`。TASK-71.1・TASK-71.2・TASK-71.3）は `make check-compat-practical`（`make ci` に含む。要 jq・node 22 以降）。CI では `harness-*` ジョブの `[compat-regression]` ステップ内で `harness/compat-practical/self-test.sh` を実行する。`run_core.sh` の自己テストは偽 CDP サーバー（`fake_cdp_server.mjs`）のみを使い、実バイナリ・ネットワークへは出ない
 - 許可外ライセンス（GPL/AGPL/LGPL/MPL-2.0・ライセンス未記載）を持つ canary を `cargo deny` が reject することを `make check-deny-license-reject` で検証する（TASK-9.1・REPAIR-8）
 - コンテナ同時起動の集約メモリ測定スクリプトのオフライン自己テスト（`CTR-3`・`CTR-7`・`MEAS-6`。TASK-67・#929）は `make check-container-memory`（`make ci` に含む。要 jq・Linux のみ）。CI では `harness-ubuntu` の `[container-memory-selftest]` ステップが `harness/container-memory/self-test.sh` を実行する。偽 docker シムと偽の cgroup / proc / meminfo を使い、実 docker・実測は行わない。測定対象がホストの cgroup v2・`/proc` で Linux 固有のため ubuntu のみ（`[static-link]` と同じ。3 OS 共通の検査を特定 OS だけ飛ばすものではない）。実測（`make measure-container-memory`）は専用マシンで人間が実行し、`make ci` と CI には含めない

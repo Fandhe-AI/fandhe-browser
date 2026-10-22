@@ -106,10 +106,10 @@ fi
 
 if [ ! -f "$MATRIX" ]; then
   if [ "$ALLOW_MISSING" -eq 1 ]; then
-    # 実マトリクス（harness/compat-practical/results/matrix.json）は TASK-71.3（#312）
-    # が生成予定でまだ存在しない。#312 がマトリクスをコミットしたらこのフラグを
-    # ci.yml・Makefile から削除し、fail-closed（無フラグ時と同じ exit 2）へ戻す。
-    echo "::warning::compat matrix not found at $MATRIX; regression gate inactive until TASK-71.3 (#312) lands"
+    # 汎用の暫定運用オプション。実マトリクス（harness/compat-practical/results/matrix.json）は
+    # TASK-71.3 の実測としてコミット済み（#920）のため、ci.yml・scripts/harness.sh は
+    # このフラグを渡さず、ファイル不在は exit 2（fail-closed）になる。
+    echo "::warning::compat matrix not found at $MATRIX; regression gate inactive"
     exit 0
   fi
   echo "error: matrix file not found at $MATRIX" >&2

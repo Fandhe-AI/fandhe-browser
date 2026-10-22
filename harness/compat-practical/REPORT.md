@@ -4,7 +4,7 @@ spec 対応: TASK-71（71.4）/ MS-6 / `COMPAT-4`・`JS-2`・`MEAS-4`（関連 `
 関連 Issue: #313・#309・#312・#758・#770。
 
 本書は測定結果の記録である。`COMPAT-4` の達成判定は TASK-74（人間担当）が行う。
-数値はすべてコミット済みの JSONL（`results/core_results.jsonl`・`results/core_results_js_off.jsonl`）から `jq` で導出した（「再現手順」参照）。
+数値はすべてコミット済みの JSONL から `jq` で導出した（「再現手順」参照）。2026-10-11 の値（15/22）の入力だった `results/core_results.jsonl` は #920 で 2026-10-22 の実測に置き換えており、当時の内容はコミット履歴（`3896e99d` 時点）から再現できる。
 
 ## 結論
 
@@ -1629,10 +1629,38 @@ Chromium 側（コミットしていない）は `mktemp -d` の中に `playwrig
 
 ## 回帰ゲートとマトリクスの状況
 
-- `results/matrix.json` は**コミットしていない**。scratch で `make_matrix.sh` から生成し `check-matrix.sh --threshold 70 --categories static,spa,form --all-categories` を実行した結果は次のとおりで、コミットすると CI の回帰ゲートが赤になるため見送った
-  - 全体 15/22 は閾値未満（FAIL）、form（3/5）・lazy（1/2）・table（1/3）も閾値未満（FAIL）。static・spa は PASS
-  - lazy は c1（anti-bot）が残る限り 1/2 = 50% で、JS の成否に関係なく `--all-categories` を通らない
-- CI は `--allow-missing` のまま変更していない。`matrix.json` のコミットと `--allow-missing` の削除は #312 の残作業で、対象類型・閾値の扱いはオーナー判断（#759 は not planned で close 済み）
+- `results/matrix.json` は #920 で**コミットした**。`make_matrix.sh` が `results/core_results.jsonl`（2026-10-22 の実測）から生成した内容そのままで、手で編集していない
+- 判定は `check-matrix.sh --threshold 70 --categories static,spa,form`（lazy・table は実測が 70% 未満のため判定対象に含めない）。CI の `[compat-regression]` と `make check-compat-regression` から `--allow-missing` を外し、ファイル不在は exit 2（fail-closed）にした
+- 閾値 70・類型別の上書きなし。`tasks.json`・セレクタ・UA・実行上限・タイムアウトは変えていない
+
+## 22 タスク再測定と回帰ゲートの有効化（#920）
+
+TASK-71.3 / MS-6 / `COMPAT-1`・`COMPAT-4`・`REPAIR-8`・`MEAS-4`（関連 `REPAIR-3`・`SEC-2`）。
+
+### 測定条件
+
+- 実施日 2026-10-22 / OS: Linux / main `bd1c8be9` の `cargo build --release -p fandhe-browser-cli`
+- `bash harness/compat-practical/run_core.sh --page-js v8 --page-modules`（既定の `--task-timeout 45`・`--total-timeout 1200`）。有効な 1 回の実測で、回し直していない
+- メタ行: `page_js_executed=true`・`page_js_engine="v8"`・`page_modules_executed=true`
+
+### 結果
+
+| 区分 | fandhe-browser-core | Chromium（PoC-9 生データ） | 判定 |
+| ---- | ------------------- | -------------------------- | ---- |
+| 全体 | 17/22（77.3%） | 20/22 | PASS |
+| static | 6/7（85.7%） | 7/7 | PASS |
+| spa | 4/5（80.0%） | 5/5 | PASS |
+| form | 5/5（100%） | 5/5 | PASS |
+| lazy | 1/2 | 2/2 | 判定外 |
+| table | 1/3 | 1/3 | 判定外 |
+
+- 2026-10-11 の 15/22 から、b1（react.dev。#1227・#1236・#1241 の補修後）と d2・d3（ES module 有効）が成功に変わった。失敗は a6（HTTP 403）・b5（#964）・c1（anti-bot）・e1・e5 の 5 件（すべて `no_match`）
+- a6・c1 は UA 等を変えて通すことはしない（`SEC-2`）
+
+### 制約
+
+- 単一環境（Linux）・単一時点の 1 回の測定で、ばらつきは評価していない。b1 は 2026-10-21 の通し実測で揺れた経緯があり、今回の 1 回では安定性を評価できない
+- `COMPAT-4` の達成判定は TASK-74（人間担当）の範囲で、本書では判定しない
 
 ## 制約
 
@@ -1652,7 +1680,7 @@ bash harness/compat-practical/run_core.sh --page-js v8 --log /abs/path/run.log
 # 集計
 jq -s '[.[] | select(.type=="result" and .success==true)] | length' harness/compat-practical/results/core_results.jsonl
 jq -c 'select(.type=="meta") | [.page_js_executed,.page_js_engine]' harness/compat-practical/results/core_results.jsonl
-# マトリクス（コミットしない）
+# マトリクス（コミット済み results/matrix.json。再生成して判定）
 bash harness/compat-practical/make_matrix.sh --out /abs/path/matrix.json
-bash harness/compat-regression/check-matrix.sh --matrix /abs/path/matrix.json --threshold 70 --categories static,spa,form --all-categories
+bash harness/compat-regression/check-matrix.sh --matrix /abs/path/matrix.json --threshold 70 --categories static,spa,form
 ```
