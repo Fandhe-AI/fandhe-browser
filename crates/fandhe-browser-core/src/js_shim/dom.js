@@ -22,13 +22,18 @@
 //   フックの例外は DOM 操作の結果に影響させない。
 //
 // 未実装（REPAIR-3。後続 issue / #779 で追加）:
-// - bridge のエラーはエンジンの例外（Error）のまま伝わる。DOMException への写像は未対応。
+// - bridge のエラーはエンジンの例外（Error）のまま伝わる。DOMException への写像は未対応
+//   （classList のトークン検証の例外も DOMException ではなく TypeError。#1236）。
+// - classList（#1236）は DOMTokenList の最小実装（add・remove・contains・toggle・length・item）。
+//   value・toString・replace・supports・forEach / entries / keys / values / Symbol.iterator・添字アクセス・
+//   グローバル `DOMTokenList` は未実装（成功を装わない）。
 // - getElementsByTagName は簡略版（#1200）: live でない静的な Array で HTMLCollection（item / namedItem）
 //   ではない。照合は要素の名前空間ごと（HTML は小文字化・それ以外は大文字小文字を区別）。
 //   getElementsByTagNameNS・getElementsByClassName は未実装。
 // - NodeList / HTMLCollection 互換（querySelectorAll は素の Array を返す）。
-// - Element の tagName / localName / nodeName（HTML 要素名を返す op `htmlLocalName` は IDL 属性の
-//   種別判定に使うが、IDL プロパティとしては未公開。サイトの分岐が変わり得るため。装わない）。
+// - Element の tagName / localName / nodeName は実装済み（#1236）。op `elementLocalName` と
+//   `htmlLocalName` から求め、HTML 名前空間の要素の tagName・nodeName は大文字。接頭辞付きの要素は
+//   作られないため qualified name は local name と一致する。
 // - parentNode / parentElement は簡略版（#1203）: op `parentNode` が返す親（Element か文書）だけを
 //   読み取り専用で返し、親が DocumentFragment なら null（ラッパー型が無い。REPAIR-3）。
 // - isEqualNode（#1227）は標準どおりの比較。Comment・Doctype のラッパーは無いが、子としては比較に含まれる。
@@ -37,11 +42,11 @@
 //   compareDocumentPosition / attributes（属性の列挙）。対応する op が無く未定義のまま。
 // - HTMLElement・HTMLIFrameElement は名前だけ（instanceof / typeof 判定が通るため。常に false。
 //   `new` は Illegal constructor。継承は Element ← HTMLElement ← HTMLIFrameElement）。他の
-//   サブクラスは未定義のまま（#1168・#1184）。将来は要素名・名前空間を返す op を足し、HTML
+//   サブクラスは未定義のまま（#1168・#1184）。要素名を返す op（`elementLocalName`）は追加済みだがラッパーは常に Element で作る。将来は HTML
 //   名前空間の要素を HTMLElement のインスタンスにする（REPAIR-3）。
 // - createElementNS は HTML・SVG の名前空間だけを扱う簡略版（#1192）。HTML 名前空間では名前を
 //   小文字化する（仕様は大文字小文字を保つ。差異）。MathML・null・その他の名前空間と接頭辞付きの名前
-//   （`svg:rect`）は例外になる（成功を装わない）。`namespaceURI` / `prefix` / `localName` / `tagName`
+//   （`svg:rect`）は例外になる（成功を装わない）。`namespaceURI` / `prefix`
 //   の IDL、`SVGElement` などの SVG 側のクラス、`setAttributeNS` / `getAttributeNS` は未実装。
 // - IDL 属性の反映（#1176・#1186）は簡略版。反映するのは `name`・`type`（全要素。`type` の getter は
 //   input を列挙値へ正規化し既定 "text"、button は既定 "submit"）、`id`・`className`（全要素。SVG の
@@ -436,6 +441,211 @@
     function isAsciiSpace(c) {
         return c === 0x20 || c === 0x09 || c === 0x0A || c === 0x0C || c === 0x0D;
     }
+
+    // --- tagName / localName / nodeName（#1236・JS-5）---
+    // Next.js の head 更新処理が `e.tagName.toLowerCase()` を読む。値は op `elementLocalName`（名前空間を
+    // 問わず大文字小文字を保つ local name）と `htmlLocalName`（HTML 名前空間か）から求め、ラッパーごとに
+    // キャッシュする（ノード ID に対し不変。max_ops_per_page を消費し続けないため）。HTML 名前空間の
+    // 要素の tagName は ASCII 大文字、それ以外は local name のまま。本実装では接頭辞付きの要素は作られない
+    // （パーサーは接頭辞を付けず、createElementNS は接頭辞付きの名前を拒否する）ため、qualified name は
+    // local name と一致する。
+    function asciiUpper(str) {
+        var out = '';
+        for (var i = 0; i < str.length; i++) {
+            var c = sCharCodeAt(str, i);
+            out += c >= 97 && c <= 122 ? fromCharCode(c - 32) : sCharAt(str, i);
+        }
+        return out;
+    }
+    var elementNames = new WeakMap();
+    function elementNameOf(self, member) {
+        var cached = elementNames.get(self);
+        if (cached === undefined) {
+            var id = idOf(self, member);
+            var local = op('elementLocalName', id);
+            local = typeof local === 'string' ? local : '';
+            var html = op('htmlLocalName', id);
+            cached = { local: local, tag: typeof html === 'string' ? asciiUpper(local) : local };
+            elementNames.set(self, cached);
+        }
+        return cached;
+    }
+    define(Element.prototype, 'tagName', {
+        get: function () { return elementNameOf(this, 'tagName').tag; }
+    });
+    define(Element.prototype, 'nodeName', {
+        get: function () { return elementNameOf(this, 'nodeName').tag; }
+    });
+    define(Element.prototype, 'localName', {
+        get: function () { return elementNameOf(this, 'localName').local; }
+    });
+
+    // --- classList（#1236・JS-5・REPAIR-3）---
+    // DOMTokenList 風の最小実装。`class` 属性を毎回読み（live）、ASCII 空白で区切って重複を除いた集合
+    // として扱い、更新は `storeAttribute` で直接保存する（ページが差し替え得る setAttribute / className /
+    // String.prototype.split には頼らない）。属性が無く結果が空なら何もしない（空の class を作らない）。
+    // 未実装（実装済みを装わない）: value・toString・replace・supports・forEach / entries / keys / values /
+    // Symbol.iterator・添字アクセス（classList[0]）・グローバル `DOMTokenList`・DOMException
+    // （トークン検証の例外は TypeError）。
+    function parseTokens(str) {
+        var out = [];
+        var cur = '';
+        for (var i = 0; i <= str.length; i++) {
+            var c = i < str.length ? sCharCodeAt(str, i) : 0x20;
+            if (isAsciiSpace(c)) {
+                if (cur !== '') {
+                    var dup = false;
+                    for (var j = 0; j < out.length; j++) {
+                        if (out[j] === cur) { dup = true; break; }
+                    }
+                    if (!dup) { out[out.length] = cur; }
+                    cur = '';
+                }
+            } else {
+                cur += sCharAt(str, i);
+            }
+        }
+        return out;
+    }
+    function serializeTokens(tokens) {
+        var out = '';
+        for (var i = 0; i < tokens.length; i++) {
+            out += (i === 0 ? '' : ' ') + tokens[i];
+        }
+        return out;
+    }
+    function checkToken(token) {
+        if (token === '') {
+            throw new TypeError('The token provided must not be empty.');
+        }
+        for (var i = 0; i < token.length; i++) {
+            if (isAsciiSpace(sCharCodeAt(token, i))) {
+                throw new TypeError('The token provided contains HTML space characters, which are not valid in tokens.');
+            }
+        }
+    }
+    var classListOwner = new WeakMap();
+    var classListOf = new WeakMap();
+    var DOMTokenListProto = {};
+    function tokenListOwner(list) {
+        var el = classListOwner.get(list);
+        if (el === undefined) {
+            throw new TypeError('Illegal invocation');
+        }
+        return el;
+    }
+    function readTokens(el) {
+        var v = readAttribute(el, 'classList', 'class');
+        return { had: v !== null, tokens: parseTokens(v === null ? '' : v) };
+    }
+    function writeTokens(el, state, tokens) {
+        if (!state.had && tokens.length === 0) {
+            return;
+        }
+        storeAttribute(el, 'class', serializeTokens(tokens));
+    }
+    function indexOfToken(tokens, t) {
+        for (var i = 0; i < tokens.length; i++) {
+            if (tokens[i] === t) { return i; }
+        }
+        return -1;
+    }
+    define(DOMTokenListProto, 'length', {
+        get: function () { return readTokens(tokenListOwner(this)).tokens.length; }
+    });
+    define(DOMTokenListProto, 'item', {
+        writable: true,
+        value: function item(index) {
+            var tokens = readTokens(tokenListOwner(this)).tokens;
+            var i = Number(index) >>> 0;
+            return i < tokens.length ? tokens[i] : null;
+        }
+    });
+    define(DOMTokenListProto, 'contains', {
+        writable: true,
+        value: function contains(token) {
+            return indexOfToken(readTokens(tokenListOwner(this)).tokens, String(token)) !== -1;
+        }
+    });
+    define(DOMTokenListProto, 'add', {
+        writable: true,
+        value: function add() {
+            var el = tokenListOwner(this);
+            var given = [];
+            for (var i = 0; i < arguments.length; i++) {
+                var t = String(arguments[i]);
+                checkToken(t);
+                given[given.length] = t;
+            }
+            var state = readTokens(el);
+            for (var k = 0; k < given.length; k++) {
+                if (indexOfToken(state.tokens, given[k]) === -1) {
+                    state.tokens[state.tokens.length] = given[k];
+                }
+            }
+            writeTokens(el, state, state.tokens);
+        }
+    });
+    define(DOMTokenListProto, 'remove', {
+        writable: true,
+        value: function remove() {
+            var el = tokenListOwner(this);
+            var given = [];
+            for (var i = 0; i < arguments.length; i++) {
+                var t = String(arguments[i]);
+                checkToken(t);
+                given[given.length] = t;
+            }
+            var state = readTokens(el);
+            var kept = [];
+            for (var k = 0; k < state.tokens.length; k++) {
+                if (indexOfToken(given, state.tokens[k]) === -1) {
+                    kept[kept.length] = state.tokens[k];
+                }
+            }
+            writeTokens(el, state, kept);
+        }
+    });
+    define(DOMTokenListProto, 'toggle', {
+        writable: true,
+        value: function toggle(token, force) {
+            var el = tokenListOwner(this);
+            var t = String(token);
+            checkToken(t);
+            var state = readTokens(el);
+            var at = indexOfToken(state.tokens, t);
+            var hasForce = arguments.length > 1 && force !== undefined;
+            if (at !== -1) {
+                if (hasForce && force) {
+                    return true;
+                }
+                var kept = [];
+                for (var k = 0; k < state.tokens.length; k++) {
+                    if (k !== at) { kept[kept.length] = state.tokens[k]; }
+                }
+                writeTokens(el, state, kept);
+                return false;
+            }
+            if (hasForce && !force) {
+                return false;
+            }
+            state.tokens[state.tokens.length] = t;
+            writeTokens(el, state, state.tokens);
+            return true;
+        }
+    });
+    define(Element.prototype, 'classList', {
+        get: function () {
+            idOf(this, 'classList');
+            var list = classListOf.get(this);
+            if (list === undefined) {
+                list = Object.create(DOMTokenListProto);
+                classListOwner.set(list, this);
+                classListOf.set(this, list);
+            }
+            return list;
+        }
+    });
     // 仕様の option の text 値: ASCII 空白の連続を 1 つの U+0020 に畳み、前後を除去する。
     function stripCollapseWhitespace(str) {
         var out = '';
@@ -791,6 +1001,12 @@
     define(Document.prototype, 'head', {
         get: function () {
             return wrap(op('head'), Element);
+        }
+    });
+    // documentElement: 文書ルート直下の最初の要素（body / head と同じ層。#1236）。setter なし。
+    define(Document.prototype, 'documentElement', {
+        get: function () {
+            return wrap(op('documentElement'), Element);
         }
     });
     define(Document.prototype, 'readyState', {
