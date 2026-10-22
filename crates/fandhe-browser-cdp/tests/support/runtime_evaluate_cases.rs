@@ -233,6 +233,8 @@ pub fn run(engine: &str) {
     rt.block_on(gating(engine));
     eprintln!("case: envelope hardening");
     rt.block_on(hardening(engine));
+    eprintln!("case: lone surrogates");
+    rt.block_on(lone_surrogates(engine));
     eprintln!("case: releaseObject");
     rt.block_on(release_object(engine));
     eprintln!("case: handle limit");
@@ -380,6 +382,44 @@ async fn objects(engine: &str) {
 
 /// 封筒の JSON 化がユーザー定義の `toJSON` に影響されないこと、説明文・className の切り詰めが
 /// サロゲートペアを分断しないこと（`SEC-2`・`CDP-2`）。
+/// 単独サロゲートは封筒を壊さず U+FFFD に置換される（キー・値・入れ子・例外の説明を含む）。
+async fn lone_surrogates(engine: &str) {
+    let mut c = Cdp::new(engine);
+    let (p, ctx) = c.ready().await;
+    let f = c.eval(&p, ctx, "'\\ud800'", false).await;
+    assert_eq!(ro(&f), &json!({"type":"string","value":"\u{FFFD}"}));
+    let f = c.eval(&p, ctx, "'a\\udc00b'", false).await;
+    assert_eq!(ro(&f), &json!({"type":"string","value":"a\u{FFFD}b"}));
+    // 正しいペアは保たれる。
+    let f = c.eval(&p, ctx, "'\\ud83d\\ude00'", false).await;
+    assert_eq!(ro(&f)["value"], "\u{1F600}");
+    // 文字列中の「バックスラッシュ + ud800」という文字列はそのまま。
+    let f = c.eval(&p, ctx, "'\\\\ud800'", false).await;
+    assert_eq!(ro(&f)["value"], "\\ud800");
+    let f = c.eval(&p, ctx, "new Error('\\ud800')", false).await;
+    assert_eq!(ro(&f)["description"], "Error: \u{FFFD}");
+    let f = c.eval(&p, ctx, "throw new Error('\\ud800')", false).await;
+    assert_eq!(
+        f["result"]["exceptionDetails"]["exception"]["description"],
+        "Error: \u{FFFD}"
+    );
+    let f = c
+        .eval(
+            &p,
+            ctx,
+            "({'\\ud800k': '\\udc00', n: [{x: 'z\\ud800'}]})",
+            true,
+        )
+        .await;
+    assert_eq!(
+        ro(&f)["value"],
+        json!({"\u{FFFD}k": "\u{FFFD}", "n": [{"x": "z\u{FFFD}"}]})
+    );
+    // 直後の評価も正常（ヘルパーの状態が壊れていない）。
+    let f = c.eval(&p, ctx, "1+1", false).await;
+    assert_eq!(ro(&f), &json!({"type":"number","value":2}));
+}
+
 async fn hardening(engine: &str) {
     let mut c = Cdp::new(engine);
     let (p, ctx) = c.ready().await;

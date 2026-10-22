@@ -77,11 +77,89 @@
     return apply(strSlice, t, [0, end]);
   }
 
+  // 単独サロゲートを U+FFFD に置換する（封筒の JSON 文字列に対して作用する。キー・値・入れ子を問わない）。
+  // JSON.stringify（well-formed）は単独サロゲートを `\\udXXX` で出力するが Rust 側（serde_json）が
+  // 受理しないため、ここで `\\ufffd` へ正規化する。エンジンが生の単独サロゲートを出す場合も同様。
+  // 置換後の長さは元以下（上限検査を壊さない）。エスケープ済みバックスラッシュ（`\\\\`）は 2 文字で飛ばす。
+  function hexVal(t, i) {
+    var c = apply(charCodeAt, t, [i]);
+    if (c >= 48 && c <= 57) return c - 48;
+    if (c >= 97 && c <= 102) return c - 87;
+    if (c >= 65 && c <= 70) return c - 55;
+    return -1;
+  }
+  // t[i..i+6) が `\uXXXX` ならコードユニット、そうでなければ -1。
+  function escUnit(t, i) {
+    if (i + 6 > t.length) return -1;
+    if (apply(charCodeAt, t, [i]) !== 92 || apply(charCodeAt, t, [i + 1]) !== 117) return -1;
+    var n = 0;
+    for (var k = 2; k < 6; k++) {
+      var h = hexVal(t, i + k);
+      if (h < 0) return -1;
+      n = n * 16 + h;
+    }
+    return n;
+  }
+  function wellFormed(t) {
+    var out = "";
+    var from = 0;
+    var i = 0;
+    var len = t.length;
+    while (i < len) {
+      var c = apply(charCodeAt, t, [i]);
+      if (c === 92) {
+        var u = escUnit(t, i);
+        if (u >= 0xd800 && u <= 0xdbff) {
+          var u2 = escUnit(t, i + 6);
+          if (u2 >= 0xdc00 && u2 <= 0xdfff) {
+            i = i + 12;
+            continue;
+          }
+          out = out + apply(strSlice, t, [from, i]) + "\\ufffd";
+          i = i + 6;
+          from = i;
+          continue;
+        }
+        if (u >= 0xdc00 && u <= 0xdfff) {
+          out = out + apply(strSlice, t, [from, i]) + "\\ufffd";
+          i = i + 6;
+          from = i;
+          continue;
+        }
+        i = i + (u >= 0 ? 6 : 2);
+        continue;
+      }
+      if (c >= 0xd800 && c <= 0xdbff) {
+        var d = i + 1 < len ? apply(charCodeAt, t, [i + 1]) : 0;
+        if (d >= 0xdc00 && d <= 0xdfff) {
+          i = i + 2;
+          continue;
+        }
+        out = out + apply(strSlice, t, [from, i]) + "\ufffd";
+        i = i + 1;
+        from = i;
+        continue;
+      }
+      if (c >= 0xdc00 && c <= 0xdfff) {
+        out = out + apply(strSlice, t, [from, i]) + "\ufffd";
+        i = i + 1;
+        from = i;
+        continue;
+      }
+      i = i + 1;
+    }
+    if (from === 0) return t;
+    return out + apply(strSlice, t, [from, len]);
+  }
+
   // 払い出したハンドルのうち、クライアントへ通知できなかったものを回収する。
   // 1 回の評価で払い出す id は連番で連続するため、開始位置（evalStart）から nextHandle 未満までを
   // 数値だけで走査して回収する。通常の配列を使わないので、ユーザーが Array.prototype に
   // setter を仕込んでも記録の欠落・件数のずれは起きない（`SEC-2`・リソース上限）。
   var evalStart = 1;
+  // 直近の評価が払い出した範囲 [lastFrom, lastTo)。Rust 側が封筒を使えなかったときの discard 用。
+  var lastFrom = 1;
+  var lastTo = 1;
   function rollback() {
     for (var i = evalStart; i < nextHandle; i++) {
       if (apply(mapDelete, handles, [i]) === true) {
@@ -279,13 +357,37 @@
       } else {
         out = finish(mk({ kind: "value", result: remote(v) }));
       }
+      out = wellFormed(out);
+      lastFrom = evalStart;
+      lastTo = nextHandle;
       evalStart = nextHandle;
       return out;
     } catch (e) {
       rollback();
+      lastFrom = nextHandle;
+      lastTo = nextHandle;
       if (e === HANDLE_LIMIT) return '{"kind":"handleLimit"}';
       if (e === NOT_SERIALIZABLE) return '{"kind":"notSerializable"}';
       if (e === TOO_LARGE) return '{"kind":"resultTooLarge"}';
+      return INTERNAL_ERROR;
+    }
+  }
+
+  // 直近の評価が払い出したハンドルを回収する（Rust 側が結果を返せなかったとき。冪等）。
+  function discard(text) {
+    try {
+      var p = jsonParse(text);
+      if (p.epoch !== epoch) return RESET;
+      var n = 0;
+      for (var i = lastFrom; i < lastTo; i++) {
+        if (apply(mapDelete, handles, [i]) === true) {
+          handleCount = handleCount - 1;
+          n = n + 1;
+        }
+      }
+      lastFrom = lastTo;
+      return finish(mk({ kind: "released", found: n > 0 }));
+    } catch (e) {
       return INTERNAL_ERROR;
     }
   }
@@ -309,7 +411,7 @@
   if (typeof __fandheCdpHelper === "object" && __fandheCdpHelper !== null) {
     return '{"kind":"installed","epoch":' + StringCtor(__fandheCdpHelper.epoch) + "}";
   }
-  var api = freeze({ epoch: epoch, evaluate: evaluate, release: release });
+  var api = freeze({ epoch: epoch, evaluate: evaluate, release: release, discard: discard });
   defineProperty(G, "__fandheCdpHelper", {
     value: api,
     writable: false,

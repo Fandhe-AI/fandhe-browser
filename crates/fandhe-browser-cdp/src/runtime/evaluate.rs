@@ -179,6 +179,11 @@ fn evaluate_source(epoch: u64, expression: &str, return_by_value: bool) -> Strin
     )
 }
 
+/// 直近の評価が払い出したハンドルの回収ソース（返却できない結果のハンドルを残さない。`SEC-2`）。
+fn discard_source(epoch: u64) -> String {
+    helper_call_source("discard", &json!({ "epoch": epoch }))
+}
+
 /// ハンドルの解放ソース。
 fn release_source(epoch: u64, handle: u64) -> String {
     helper_call_source("release", &json!({ "epoch": epoch, "handle": handle }))
@@ -646,7 +651,7 @@ impl CommandHandler for RuntimeEvaluate {
                         return Err(err);
                     }
                 };
-            match parse_envelope(&text)? {
+            let outcome: Result<HandlerOutput, CdpError> = (|| match parse_envelope(&text)? {
                 Envelope::Value { result } => Ok(HandlerOutput::result(
                     json!({ "result": remote_object(&result, view.id)? }),
                 )),
@@ -673,7 +678,20 @@ impl CommandHandler for RuntimeEvaluate {
                 Envelope::InternalError
                 | Envelope::Installed { .. }
                 | Envelope::Released { .. } => Err(CdpError::SERVER_ERROR),
+            })();
+            if matches!(&outcome, Err(CdpError::SERVER_ERROR)) {
+                // 解析・検証に失敗した結果はクライアントへ通知できないため、確保済みハンドルを回収する
+                // （ベストエフォート。回収自体の失敗は元のエラーを優先する）。
+                let _ = run_script(
+                    state,
+                    key,
+                    &located.doc,
+                    &discard_source(epoch),
+                    self.limits.timeout,
+                )
+                .await;
             }
+            outcome
         })
     }
 }
