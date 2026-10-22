@@ -1219,6 +1219,7 @@ mod tests {
                         target: tid.clone(),
                         generation: g,
                         world,
+                        helper_epoch: None,
                     },
                     "http://example.test",
                 )

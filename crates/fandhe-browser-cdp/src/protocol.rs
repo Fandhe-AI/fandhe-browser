@@ -22,7 +22,7 @@
 //!
 //! [`builtin_handlers`] には `Page.navigate`（TASK-42.2）・`DOM.getDocument`（TASK-42.4）・
 //! `DOM.querySelector`（TASK-42.5）・`DOM.requestChildNodes`（#657）・
-//! `Browser.getVersion`（TASK-43.3a・`CDP-2`）・`Target.getTargetInfo`（TASK-43.3b・`CDP-2`）・`Target.setAutoAttach`・`Browser.setDownloadBehavior`（TASK-43.3c・`CDP-2`）・`Target.createBrowserContext`（TASK-43.3d・`CDP-2`）・`Target.closeTarget`（TASK-43.3h・`CDP-2`）・`Target.createTarget`・`Runtime.runIfWaitingForDebugger`（TASK-43.3e・#910・`CDP-2`）・`Page.enable`・`Page.getFrameTree`（TASK-43.3i・#1037・`CDP-2`）・`Log.enable`・`Runtime.enable`・`Network.enable`（TASK-43.3j・#1038・`CDP-2`）・`Page.setLifecycleEventsEnabled`（TASK-43.3k・#1039・`CDP-2`）・`Emulation.setFocusEmulationEnabled`・`Emulation.setEmulatedMedia`（TASK-43.3m・#1041・`CDP-2`）・`Page.createIsolatedWorld`（TASK-44.6・#1217・`CDP-2`）のみ登録済みで、
+//! `Browser.getVersion`（TASK-43.3a・`CDP-2`）・`Target.getTargetInfo`（TASK-43.3b・`CDP-2`）・`Target.setAutoAttach`・`Browser.setDownloadBehavior`（TASK-43.3c・`CDP-2`）・`Target.createBrowserContext`（TASK-43.3d・`CDP-2`）・`Target.closeTarget`（TASK-43.3h・`CDP-2`）・`Target.createTarget`・`Runtime.runIfWaitingForDebugger`（TASK-43.3e・#910・`CDP-2`）・`Page.enable`・`Page.getFrameTree`（TASK-43.3i・#1037・`CDP-2`）・`Log.enable`・`Runtime.enable`・`Network.enable`（TASK-43.3j・#1038・`CDP-2`）・`Page.setLifecycleEventsEnabled`（TASK-43.3k・#1039・`CDP-2`）・`Emulation.setFocusEmulationEnabled`・`Emulation.setEmulatedMedia`（TASK-43.3m・#1041・`CDP-2`）・`Page.createIsolatedWorld`（TASK-44.6・#1217・`CDP-2`）・`Runtime.evaluate`・`Runtime.releaseObject`（TASK-44.7・#1218・`CDP-2`）のみ登録済みで、
 //! それ以外のメソッドは JSON-RPC の「method not implemented」（`-32601`）エラーを返す。
 //! 汎用の空 success フォールバック（PoC-5 の暫定挙動）は採らない。理由は次のとおり。
 //!
@@ -120,6 +120,29 @@ impl CdpError {
     pub const TOO_MANY_WORLDS: Self = Self::new(-32000, "too many worlds");
     /// 古い世代（現在の文書でない）の contextId が評価に使われた（評価系 #1218 が使う。`CDP-2`）。
     pub const EXECUTION_CONTEXT_STALE: Self = Self::new(-32000, "execution context is not current");
+    /// `Runtime.evaluate` の `expression`（または評価用に包んだソース）が上限を超えた（`CDP-7`・`SEC-2`。
+    /// 評価器を起動しない。TASK-44.7・#1218）。
+    pub const EXPRESSION_TOO_LARGE: Self = Self::new(-32000, "expression too large");
+    /// main world（既定コンテキスト）への評価は未対応（`Runtime.evaluate`。成功を装わず固定文言で拒否する。
+    /// `REPAIR-3`・TASK-44.7・#1218）。
+    pub const MAIN_WORLD_EVALUATION_UNSUPPORTED: Self =
+        Self::new(-32000, "evaluation in the main world is not supported");
+    /// 評価が時間切れになった（JS の例外ではない。`CDP-7`・#1218）。
+    pub const EVALUATION_TIMED_OUT: Self = Self::new(-32000, "evaluation timed out");
+    /// 評価が資源上限（ヒープ・コンテキスト数・待ち行列）に達した（JS の例外ではない。`CDP-7`・#1218）。
+    pub const EVALUATION_RESOURCE_LIMIT: Self =
+        Self::new(-32000, "evaluation resource limit exceeded");
+    /// 評価結果が大きすぎる（`CDP-7`・#1218）。
+    pub const EVALUATION_RESULT_TOO_LARGE: Self = Self::new(-32000, "evaluation result too large");
+    /// コンテキスト内のリモートオブジェクト（ハンドル）数が上限に達した（`CDP-7`・#1218）。
+    pub const TOO_MANY_REMOTE_OBJECTS: Self = Self::new(-32000, "too many remote objects");
+    /// `objectId` が指す値が無い（未知・他セッション・解放済みを区別しない。`Runtime.releaseObject`・#1218）。
+    pub const REMOTE_OBJECT_NOT_FOUND: Self = Self::new(-32000, "remote object not found");
+    /// `returnByValue` で値にできない（循環参照・関数・symbol 等。`REPAIR-3`・#1218）。
+    pub const VALUE_NOT_SERIALIZABLE: Self =
+        Self::new(-32000, "value could not be returned by value");
+    /// 評価コンテキストが作り直された（タイムアウト後の再起動等）ため、contextId を失効させた（#1218）。
+    pub const EXECUTION_CONTEXT_RESET: Self = Self::new(-32000, "execution context was reset");
     /// 指定 nodeId が現在の文書の採番表に無い（形式は正しいが対象が無い。`DOM.querySelector`。`CDP-1`）。
     pub const NODE_NOT_FOUND: Self = Self::new(-32000, "node not found");
     /// nodeId の払い出し記録が件数上限に達した（`DOM.getDocument`。他クライアントの記録を
@@ -402,7 +425,7 @@ type HandlerTable = Vec<(&'static str, Box<dyn CommandHandler>)>;
 
 /// 組込みハンドラ表。`Page.navigate`（TASK-42.2）・`DOM.getDocument`（TASK-42.4）・
 /// `DOM.querySelector`（TASK-42.5）・`DOM.requestChildNodes`（#657）・`Browser.getVersion`（TASK-43.3a）・
-/// `Target.getTargetInfo`（TASK-43.3b）・`Target.setAutoAttach`・`Browser.setDownloadBehavior`（TASK-43.3c。実体に接続済み）・`Target.createBrowserContext`（TASK-43.3d）・`Target.closeTarget`（TASK-43.3h）・`Target.createTarget`・`Runtime.runIfWaitingForDebugger`（TASK-43.3e）・`Page.enable`・`Page.getFrameTree`（TASK-43.3i・#1037）・`Log.enable`・`Runtime.enable`・`Network.enable`（TASK-43.3j・#1038）・`Page.setLifecycleEventsEnabled`（TASK-43.3k・#1039）・`Page.addScriptToEvaluateOnNewDocument`（空 source のみ。TASK-43.3l・#1040）・`Emulation.setFocusEmulationEnabled`・`Emulation.setEmulatedMedia`（TASK-43.3m・#1041）を登録済み（`CDP-1`・`CDP-2`）。
+/// `Target.getTargetInfo`（TASK-43.3b）・`Target.setAutoAttach`・`Browser.setDownloadBehavior`（TASK-43.3c。実体に接続済み）・`Target.createBrowserContext`（TASK-43.3d）・`Target.closeTarget`（TASK-43.3h）・`Target.createTarget`・`Runtime.runIfWaitingForDebugger`（TASK-43.3e）・`Page.enable`・`Page.getFrameTree`（TASK-43.3i・#1037）・`Log.enable`・`Runtime.enable`・`Network.enable`（TASK-43.3j・#1038）・`Page.setLifecycleEventsEnabled`（TASK-43.3k・#1039）・`Page.addScriptToEvaluateOnNewDocument`（空 source のみ。TASK-43.3l・#1040）・`Emulation.setFocusEmulationEnabled`・`Emulation.setEmulatedMedia`（TASK-43.3m・#1041）・`Page.createIsolatedWorld`（TASK-44.6・#1217）・`Runtime.evaluate`・`Runtime.releaseObject`（TASK-44.7・#1218。isolated world のみ）を登録済み（`CDP-1`・`CDP-2`）。
 ///
 /// `Page.navigate` は既定の `FetchOptions`（内部アドレス拒否）で `Fetcher` を構築する。
 pub(crate) fn builtin_handlers() -> Result<HandlerTable, DispatcherError> {
@@ -471,6 +494,16 @@ pub(crate) fn builtin_handlers_with(fetch: FetchOptions) -> Result<HandlerTable,
         (
             "Page.createIsolatedWorld",
             Box::new(crate::runtime::PageCreateIsolatedWorld),
+        ),
+        (
+            "Runtime.evaluate",
+            Box::new(crate::runtime::RuntimeEvaluate::new(
+                crate::runtime::EvalLimits::default(),
+            )),
+        ),
+        (
+            "Runtime.releaseObject",
+            Box::new(crate::runtime::RuntimeReleaseObject),
         ),
         ("Log.enable", Box::new(crate::playwright_compat::LogEnable)),
         (
@@ -1035,6 +1068,8 @@ mod tests {
             for (i, m) in [
                 "Target.disposeBrowserContext",
                 "Target.attachToTarget",
+                "Runtime.getProperties",
+                "Runtime.releaseObjectGroup",
                 "Emulation.setUserAgentOverride",
                 "Network.setUserAgentOverride",
                 "Emulation.setDeviceMetricsOverride",

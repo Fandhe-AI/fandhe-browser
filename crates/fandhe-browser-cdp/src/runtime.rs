@@ -5,9 +5,10 @@
 //! world（`Page.createIsolatedWorld` / `Page.addScriptToEvaluateOnNewDocument` の `worldName`）を
 //! 把握し、揃うまで `selector` 段階を待つ。本モジュールは、その contextId の表
 //! （[`ExecutionContextTable`]）・イベントの組み立て（[`context_created_event`]・
-//! [`contexts_cleared_event`]）・`Page.createIsolatedWorld` ハンドラを持つ。評価そのもの
-//! （`Runtime.evaluate`・`callFunctionOn`）は #1218・#1219 の範囲で、本モジュールは評価に使う
-//! 照合 API（[`ExecutionContextTable::resolve`]）までを用意する。
+//! [`contexts_cleared_event`]）・`Page.createIsolatedWorld` ハンドラを持つ。評価系の
+//! `Runtime.evaluate`・`Runtime.releaseObject`（TASK-44.7・#1218）は子モジュール `evaluate` が持ち、
+//! contextId の照合（[`ExecutionContextTable::resolve`]）・評価ヘルパーの注入記録（epoch）・失効を本表が提供する。
+//! `Runtime.callFunctionOn`・`awaitPromise` は #1219 の範囲。
 //!
 //! # 構成と呼び出し元
 //!
@@ -30,7 +31,15 @@
 //!
 //! # 差異・スタブ（`REPAIR-3`）
 //!
-//! - main world は告知するが、評価（`Runtime.evaluate` 等）は未実装で CDP エラーになる（#1218）。
+//! - main world は告知するが、そこへの評価（`Runtime.evaluate` の `contextId` 省略・main の contextId）は
+//!   仕様として固定文言の CDP エラー（`MAIN_WORLD_EVALUATION_UNSUPPORTED`）にする（#1218）。評価できるのは
+//!   isolated world（utility world 等）だけで、main world のページ JS 状態は別の実行系にある。
+//! - 評価の再起動（boa のタイムアウト・子プロセスの異常終了等で core が `EngineRestarted` を返したとき）は
+//!   隠さず、その contextId を表から失効させて固定文言のエラーを返す（黙って再注入しない。`objectId` は
+//!   `<contextId>.<n>` でハンドル番号が 1 から振り直されるため、同じ contextId で作り直すと古い `objectId`
+//!   が別の値を指してしまう）。回復は次の遷移または `Page.createIsolatedWorld`（新しい id）。
+//!   `Runtime.executionContextDestroyed` は送らない。失効させた contextId の core 側コンテキストは、
+//!   世代が替わるまで scope あたり 4 枠の 1 つを占め得る（上限到達時は `EVALUATION_RESOURCE_LIMIT`）。
 //! - `Runtime.executionContextDestroyed` は送らず、遷移時は `Runtime.executionContextsCleared` で代える。
 //! - イベントは要求したセッションにだけ送る（`Page.frameNavigated` と同じ）。同じターゲットの他セッションには
 //!   届かず、そのセッションの古い世代のエントリは遷移の確定時に表から消える。
@@ -40,6 +49,10 @@ use std::collections::BTreeMap;
 
 use fandhe_browser_core::NavigationGeneration;
 use serde_json::{Value, json};
+
+mod evaluate;
+
+pub(crate) use evaluate::{EvalLimits, RuntimeEvaluate, RuntimeReleaseObject};
 
 use crate::page::main_frame_id;
 use crate::protocol::{
@@ -70,6 +83,8 @@ struct ContextEntry {
     generation: NavigationGeneration,
     world: World,
     session: SessionId,
+    /// 評価ヘルパー（`evaluate::helper.js`）を注入済みなら、その epoch（#1218）。
+    helper_epoch: Option<u64>,
 }
 
 /// 表から取り出した読み取り用の値（将来の拡張に備え構造体にする。`REPAIR-4`）。
@@ -83,6 +98,8 @@ pub(crate) struct ContextView {
     pub(crate) generation: NavigationGeneration,
     /// world 種別。
     pub(crate) world: World,
+    /// 評価ヘルパーを注入済みなら、その epoch（未注入は `None`。#1218）。
+    pub(crate) helper_epoch: Option<u64>,
 }
 
 /// 表の操作エラー。表は失敗時に変更されない。
@@ -120,8 +137,7 @@ pub(crate) enum ContextLookupError {
 }
 
 impl ContextLookupError {
-    /// CDP エラーへの写像（`#1218` の評価系が使う）。
-    #[allow(dead_code)]
+    /// CDP エラーへの写像（評価系 `Runtime.evaluate`〔#1218〕が使う）。
     pub(crate) fn to_cdp(self) -> CdpError {
         match self {
             Self::UnknownContext => CdpError::INVALID_PARAMS,
@@ -134,6 +150,8 @@ impl ContextLookupError {
 #[derive(Debug)]
 pub(crate) struct ExecutionContextTable {
     next_id: u64,
+    /// 評価ヘルパーの注入ごとに払い出す epoch（1 から単調増加・再利用しない。#1218）。
+    next_epoch: u64,
     /// id 昇順で走査できるよう `BTreeMap`（イベント順を決定的にする）。
     entries: BTreeMap<u64, ContextEntry>,
 }
@@ -154,6 +172,7 @@ impl ExecutionContextTable {
     pub(crate) fn with_next_id(next_id: u64) -> Self {
         Self {
             next_id,
+            next_epoch: 1,
             entries: BTreeMap::new(),
         }
     }
@@ -249,6 +268,7 @@ impl ExecutionContextTable {
                 generation,
                 world,
                 session: sid.clone(),
+                helper_epoch: None,
             },
         );
         Ok(id)
@@ -322,6 +342,7 @@ impl ExecutionContextTable {
                     target: tid.clone(),
                     generation,
                     world,
+                    helper_epoch: None,
                 },
                 false,
             ));
@@ -336,6 +357,7 @@ impl ExecutionContextTable {
                 target: tid.clone(),
                 generation,
                 world,
+                helper_epoch: None,
             },
             true,
         ))
@@ -357,6 +379,7 @@ impl ExecutionContextTable {
                 target: e.target.clone(),
                 generation: e.generation,
                 world: e.world.clone(),
+                helper_epoch: e.helper_epoch,
             })
             .collect();
         // BTreeMap は id 昇順。main を先頭へ寄せる（安定ソート）。
@@ -371,7 +394,6 @@ impl ExecutionContextTable {
 
     /// contextId を現在の世代に照らして解決する（評価系 #1218 が使う）。他セッションの contextId は
     /// `UnknownContext`。世代が違えばエントリを消して `Stale`。
-    #[allow(dead_code)]
     pub(crate) fn resolve(
         &mut self,
         sid: &SessionId,
@@ -393,7 +415,50 @@ impl ExecutionContextTable {
             target: e.target.clone(),
             generation: e.generation,
             world: e.world.clone(),
+            helper_epoch: e.helper_epoch,
         })
+    }
+
+    /// 評価ヘルパーの epoch を 1 つ払い出す（1 から。JS の安全整数 2^53−1 を超える前に checked 演算で
+    /// 検査し、枯渇したら `IdExhausted`。wrap しない）。
+    pub(crate) fn allocate_helper_epoch(&mut self) -> Result<u64, ContextError> {
+        if self.next_epoch > MAX_CONTEXT_ID {
+            return Err(ContextError::IdExhausted);
+        }
+        let e = self.next_epoch;
+        self.next_epoch = e.checked_add(1).ok_or(ContextError::IdExhausted)?;
+        Ok(e)
+    }
+
+    /// 評価ヘルパーの注入結果（epoch）を記録する。未記録なら `epoch` を書き、記録済みなら既存の値を
+    /// 変えずに返す（並行した初回評価の冪等性）。照合は [`Self::resolve`] と同じ（他セッションは
+    /// `UnknownContext`、世代違いはエントリを消して `Stale`）。
+    pub(crate) fn record_helper_epoch(
+        &mut self,
+        sid: &SessionId,
+        context_id: u64,
+        current_generation: NavigationGeneration,
+        epoch: u64,
+    ) -> Result<u64, ContextLookupError> {
+        self.resolve(sid, context_id, current_generation)?;
+        let Some(e) = self.entries.get_mut(&context_id) else {
+            return Err(ContextLookupError::UnknownContext);
+        };
+        Ok(*e.helper_epoch.get_or_insert(epoch))
+    }
+
+    /// contextId を失効させる（評価コンテキストが作り直された・ヘルパーが失われたとき。他セッションの
+    /// contextId は消さない）。消したら `true`。
+    pub(crate) fn invalidate(&mut self, sid: &SessionId, context_id: u64) -> bool {
+        if self
+            .entries
+            .get(&context_id)
+            .is_some_and(|e| &e.session == sid)
+        {
+            self.entries.remove(&context_id);
+            return true;
+        }
+        false
     }
 }
 
@@ -758,6 +823,7 @@ mod tests {
             target: tid("T1"),
             generation: generation(1),
             world: World::Main,
+            helper_epoch: None,
         };
         let ev = context_created_event(&view, "http://127.0.0.1:80");
         assert_eq!(ev.method, "Runtime.executionContextCreated");
@@ -790,6 +856,61 @@ mod tests {
             contexts_cleared_event().method,
             "Runtime.executionContextsCleared"
         );
+    }
+
+    #[test]
+    fn cdp7_helper_epochs_are_monotonic_and_exhaust_without_wrapping() {
+        let mut t = ExecutionContextTable::new();
+        assert_eq!(t.allocate_helper_epoch(), Ok(1));
+        assert_eq!(t.allocate_helper_epoch(), Ok(2));
+        t.next_epoch = MAX_CONTEXT_ID;
+        assert_eq!(t.allocate_helper_epoch(), Ok(MAX_CONTEXT_ID));
+        assert_eq!(t.allocate_helper_epoch(), Err(ContextError::IdExhausted));
+        assert_eq!(t.allocate_helper_epoch(), Err(ContextError::IdExhausted));
+    }
+
+    #[test]
+    fn cdp2_record_helper_epoch_keeps_first_value_and_checks_owner() {
+        let mut t = ExecutionContextTable::new();
+        let (s, a, g1, g2) = (sid("S1"), tid("T1"), generation(1), generation(2));
+        let v = t.create_isolated(&s, &a, g1, "u").map(|(v, _)| v).unwrap();
+        assert_eq!(v.helper_epoch, None);
+        assert_eq!(t.record_helper_epoch(&s, v.id, g1, 5), Ok(5));
+        // 記録済みなら既存の値を返し、上書きしない。
+        assert_eq!(t.record_helper_epoch(&s, v.id, g1, 9), Ok(5));
+        assert_eq!(t.resolve(&s, v.id, g1).unwrap().helper_epoch, Some(5));
+        assert_eq!(t.views_for(&s, &a, g1)[0].helper_epoch, Some(5));
+        // 他セッション・未知の id・世代違いは拒否する。
+        assert_eq!(
+            t.record_helper_epoch(&sid("S2"), v.id, g1, 7),
+            Err(ContextLookupError::UnknownContext)
+        );
+        assert_eq!(
+            t.record_helper_epoch(&s, 999, g1, 7),
+            Err(ContextLookupError::UnknownContext)
+        );
+        assert_eq!(
+            t.record_helper_epoch(&s, v.id, g2, 7),
+            Err(ContextLookupError::Stale)
+        );
+    }
+
+    #[test]
+    fn cdp2_invalidate_removes_only_the_owners_context() {
+        let mut t = ExecutionContextTable::new();
+        let (s, a, g) = (sid("S1"), tid("T1"), generation(1));
+        let v = t.create_isolated(&s, &a, g, "u").map(|(v, _)| v).unwrap();
+        assert!(!t.invalidate(&sid("S2"), v.id));
+        assert_eq!(t.len(), 1);
+        assert!(t.invalidate(&s, v.id));
+        assert!(!t.invalidate(&s, v.id));
+        assert_eq!(
+            t.resolve(&s, v.id, g),
+            Err(ContextLookupError::UnknownContext)
+        );
+        // 失効させた id は再利用されない。
+        let (v2, _) = t.create_isolated(&s, &a, g, "u").unwrap();
+        assert_eq!(v2.id, v.id + 1);
     }
 
     #[test]
