@@ -292,9 +292,9 @@ fn cdp2_preflight_returns_command_when_version_matches() {
 /// （テキスト・属性が具体値と一致）まで全段階成功する。fixture はループバックのため、
 /// ループバック取得を許す `test-support` の入口でサーバーを起動する（本番の `endpoints()` は拒否）。
 /// 既知の回避オプション（noDefaults / acceptDownloads:false / viewport:null。`stages.mjs`）前提。
-/// 導入が必要なため `make test-playwright-connect` が `--ignored --exact` で明示実行する。
+/// 導入が必要なため `make test-playwright-connect`（`run.sh`）がケース名を引数で渡して明示実行し、
+/// 完了マーカー行 [`REAL_CASE_MARKER`] がちょうど 1 件のときだけ成功とする（独自 `main`）。
 #[cfg(feature = "test-support")]
-#[ignore = "requires playwright-core; run via `make test-playwright-connect`"]
 fn cdp2_real_playwright_goto_and_selector() {
     let module_dir = std::env::var_os(PLAYWRIGHT_MODULE_DIR_ENV).map(PathBuf::from);
     let version = std::env::var("FANDHE_PLAYWRIGHT_VERSION")
