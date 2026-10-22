@@ -545,6 +545,7 @@ pub fn run(engine: &str) {
     get_elements_by_tag_name_cases(engine);
     parent_node_cases(engine);
     child_traversal_cases(engine);
+    attributes_cases(engine);
     is_equal_node_cases(engine);
     element_name_cases(engine);
     document_element_cases(engine);
@@ -4098,6 +4099,68 @@ fn style_sheet_cases(engine: &str) {
         "var q = document.createElement('style'); document.head.appendChild(q); \
          q.sheet.insertRule('.r{}', 0) + '|' + document.styleSheets.length",
         "0|3",
+    );
+}
+
+/// JS-5・REPAIR-3・#1245: `Element.attributes`（静的スナップショット）と `Attr`。Playwright の
+/// `previewNode` が `element.attributes.length` を辿って落ちていた。
+fn attributes_cases(engine: &str) {
+    eprintln!("case: JS-5 Element.attributes / Attr (#1245)");
+    let mut p = setup_html(
+        engine,
+        "<!DOCTYPE html><html><head></head><body><p id=\"t\" data-role=\"greeting\">x</p><svg id=\"s\" viewBox=\"0 0 1 1\"></svg><script>s</script></body></html>",
+        None,
+    );
+    check(
+        &mut p,
+        "var a = document.getElementById('t'); a.attributes.length + '|' + a.attributes[0].name + '=' + a.attributes[0].value + '|' + a.attributes.item(1).name + '|' + a.attributes.item(9)",
+        "2|id=t|data-role|null",
+    );
+    check(
+        &mut p,
+        "a.attributes.getNamedItem('DATA-ROLE').value + '|' + a.attributes.getNamedItem('x')",
+        "greeting|null",
+    );
+    check(
+        &mut p,
+        "var at = a.attributes[0]; at.nodeType + '|' + at.specified + '|' + (at.ownerElement === a) + '|' + (at instanceof Node) + '|' + at.nodeName + '|' + at.textContent",
+        "2|true|true|false|id|t",
+    );
+    check(
+        &mut p,
+        "var m = a.attributes; a.setAttribute('z','1'); m.length + '|' + a.attributes.length + '|' + a.attributes[2].name",
+        "2|3|z",
+    );
+    check(
+        &mut p,
+        "a.removeAttribute('id'); a.attributes.length + '|' + a.attributes[0].name",
+        "2|data-role",
+    );
+    check(
+        &mut p,
+        "var sv = document.getElementById('s'); sv.attributes[1].name + '|' + sv.attributes.getNamedItem('viewbox') + '|' + sv.attributes.getNamedItem('viewBox').value",
+        "viewBox|null|0 0 1 1",
+    );
+    check(
+        &mut p,
+        "String('attributes' in document.body) + '|' + ('attributes' in document)",
+        "true|false",
+    );
+    // Playwright InjectedScript.previewNode 相当のループ。
+    check(
+        &mut p,
+        "var q = document.createElement('p'); q.setAttribute('id','t'); q.setAttribute('data-role','greeting'); var out = ''; for (var i = 0; i < q.attributes.length; i++) { out += ' ' + q.attributes[i].name + '=\"' + q.attributes[i].value + '\"'; } out",
+        " id=\"t\" data-role=\"greeting\"",
+    );
+    check(
+        &mut p,
+        "try { Object.getOwnPropertyDescriptor(Element.prototype,'attributes').get.call({}); 'ok' } catch (e) { e instanceof TypeError ? 'TypeError' : 'other' }",
+        "TypeError",
+    );
+    check(
+        &mut p,
+        "try { new (a.attributes[0].constructor)(); 'ok' } catch (e) { 'threw' }",
+        "threw",
     );
 }
 

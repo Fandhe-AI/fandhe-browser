@@ -422,6 +422,14 @@ enum DomOp {
     NodeType,
     /// Doctype の名前（`DocumentType.name`）。Doctype 以外は null。#1241・JS-5。
     DoctypeName,
+    /// 要素の属性数（`Element.attributes.length` の土台。Playwright の `previewNode` が辿る。
+    /// #1245・JS-5）。要素以外は TypeMismatch。読み取り専用。
+    AttributeCount,
+    /// `index` 番目の属性の qualified name（prefix があれば `prefix:local`。大文字小文字は保持。
+    /// 範囲外は null。#1245・JS-5・JS-6）。読み取り専用。
+    AttributeNameAt,
+    /// `index` 番目の属性の値（範囲外は null。#1245・JS-5・JS-6）。読み取り専用。
+    AttributeValueAt,
 }
 
 impl DomOp {
@@ -490,6 +498,9 @@ impl DomOp {
             "childNodes" => Self::ChildNodes,
             "nodeType" => Self::NodeType,
             "doctypeName" => Self::DoctypeName,
+            "attributeCount" => Self::AttributeCount,
+            "attributeNameAt" => Self::AttributeNameAt,
+            "attributeValueAt" => Self::AttributeValueAt,
             "mutationObserverLimit" => Self::MutationObserverLimit,
             "mutationOptionsIgnored" => Self::MutationOptionsIgnored,
             "urlParse" => Self::UrlParse,
@@ -562,6 +573,9 @@ impl DomOp {
             Self::ChildNodes => "childNodes",
             Self::NodeType => "nodeType",
             Self::DoctypeName => "doctypeName",
+            Self::AttributeCount => "attributeCount",
+            Self::AttributeNameAt => "attributeNameAt",
+            Self::AttributeValueAt => "attributeValueAt",
             Self::MutationObserverLimit => "mutationObserverLimit",
             Self::MutationOptionsIgnored => "mutationOptionsIgnored",
             Self::UrlParse => "urlParse",
@@ -613,6 +627,7 @@ impl DomOp {
             | Self::ChildNodes
             | Self::NodeType
             | Self::DoctypeName
+            | Self::AttributeCount
             | Self::NetCancel => 1,
             Self::CreateElementNs
             | Self::QuerySelector
@@ -629,6 +644,8 @@ impl DomOp {
             | Self::TimerOrigin
             | Self::IsInclusiveAncestor
             | Self::IsEqualNode
+            | Self::AttributeNameAt
+            | Self::AttributeValueAt
             | Self::UrlParse => 2,
             Self::InsertBefore | Self::SetAttribute | Self::ConsoleMessage => 3,
             Self::TimerCallbackError
@@ -843,6 +860,24 @@ fn decode_net_id(value: Option<&JsValue>) -> Option<u32> {
         }
         _ => None,
     }
+}
+
+/// 非負整数の添字引数（`attributeNameAt` 等。#1245）。有限・非負・整数・2^53 未満のみ受け付ける。
+fn index_arg(op: DomOp, args: &[JsValue], index: usize) -> Result<usize, DomBridgeError> {
+    let mismatch = || DomBridgeError::TypeMismatch {
+        operation: op.name(),
+        index,
+        expected: "a non-negative integer index",
+    };
+    let Some(JsValue::Number(n)) = args.get(index.saturating_sub(1)) else {
+        return Err(mismatch());
+    };
+    let n = *n;
+    if !n.is_finite() || n < 0.0 || n.fract() != 0.0 || n >= MAX_SAFE_INTEGER_EXCLUSIVE {
+        return Err(mismatch());
+    }
+    // 上の検証で 0 以上 2^53 未満の整数。usize に収まらなければ範囲外扱い（mismatch）。
+    usize::try_from(n as u64).map_err(|_| mismatch())
 }
 
 fn string_arg<'a>(
@@ -1288,6 +1323,51 @@ fn execute(
                 .take(max_results.saturating_add(1))
                 .collect();
             encode_id_list(page.generation, ids, limits)
+        }
+        // 属性の列挙（#1245・JS-5。`Element.attributes` の土台）。読み取り専用で、順序はソース順
+        // （`setAttribute` で足した属性は末尾）。名前・値は確保前に応答上限（JS-6）を検査する。
+        DomOp::AttributeCount => {
+            let node = page.node_arg(op, args, 1)?;
+            if !page.document.is_element(node) {
+                return Err(DomBridgeError::TypeMismatch {
+                    operation: op.name(),
+                    index: 1,
+                    expected: "an element node id",
+                });
+            }
+            Ok(JsValue::Number(page.document.attributes(node).len() as f64))
+        }
+        DomOp::AttributeNameAt | DomOp::AttributeValueAt => {
+            let node = page.node_arg(op, args, 1)?;
+            if !page.document.is_element(node) {
+                return Err(DomBridgeError::TypeMismatch {
+                    operation: op.name(),
+                    index: 1,
+                    expected: "an element node id",
+                });
+            }
+            let index = index_arg(op, args, 2)?;
+            let Some(attr) = page.document.attributes(node).get(index) else {
+                return Ok(JsValue::Null);
+            };
+            if op == DomOp::AttributeNameAt {
+                let local: &str = &attr.name.local;
+                // 文字列を確保する前に、prefix・区切り・local の合計バイト数で応答上限を検証する。
+                let prefix_len = attr
+                    .name
+                    .prefix
+                    .as_ref()
+                    .map_or(0, |p| p.len().saturating_add(1));
+                check_response_len(prefix_len.saturating_add(local.len()), limits)?;
+                let qualified = match &attr.name.prefix {
+                    Some(prefix) => format!("{}:{local}", &**prefix),
+                    None => local.to_string(),
+                };
+                string_response(qualified, limits)
+            } else {
+                check_response_len(attr.value.len(), limits)?;
+                Ok(JsValue::String(attr.value.clone()))
+            }
         }
         DomOp::NodeType => {
             let node = page.node_arg(op, args, 1)?;
@@ -3477,6 +3557,112 @@ mod tests {
         let body = num(call(&b, &[s("body")]));
         let err = call(&b, &[s("childNodes"), n(body)]).expect_err("超過");
         assert!(matches!(err, DomBridgeError::ResponseTooLarge { .. }));
+    }
+
+    const ATTR_HTML: &str = "<body><p id=\"target\" data-role=\"greeting\">x</p>\
+        <svg viewBox=\"0 0 1 1\"><a xlink:href=\"u\"></a></svg></body>";
+
+    /// JS-5・#1245: 属性の数・名前・値を順序どおりに返し、範囲外の index は null、SVG の大文字小文字と
+    /// prefix 付き属性（`xlink:href`）を保つ。
+    #[test]
+    fn js_5_attribute_enumeration_ops() {
+        let b = bridge_with_html(ATTR_HTML, DomBridgeLimits::default());
+        let p = num(call(&b, &[s("getElementById"), s("target")]));
+        let get = |op: &str, x: f64, i: f64| call(&b, &[s(op), n(x), n(i)]).expect("ok");
+        assert_eq!(
+            call(&b, &[s("attributeCount"), n(p)]).expect("ok"),
+            JsValue::Number(2.0)
+        );
+        assert_eq!(
+            get("attributeNameAt", p, 0.0),
+            JsValue::String("id".to_owned())
+        );
+        assert_eq!(
+            get("attributeValueAt", p, 1.0),
+            JsValue::String("greeting".to_owned())
+        );
+        assert_eq!(get("attributeNameAt", p, 2.0), JsValue::Null);
+        assert_eq!(get("attributeValueAt", p, 2.0), JsValue::Null);
+        let body = num(call(&b, &[s("body")]));
+        let svg = num(call(&b, &[s("querySelector"), n(body), s("svg")]));
+        assert_eq!(
+            get("attributeNameAt", svg, 0.0),
+            JsValue::String("viewBox".to_owned())
+        );
+        let a = num(call(&b, &[s("querySelector"), n(svg), s("a")]));
+        assert_eq!(
+            get("attributeNameAt", a, 0.0),
+            JsValue::String("xlink:href".to_owned())
+        );
+        // setAttribute で足した属性は末尾に並ぶ。
+        call(&b, &[s("setAttribute"), n(p), s("z"), s("1")]).expect("set");
+        assert_eq!(
+            call(&b, &[s("attributeCount"), n(p)]).expect("ok"),
+            JsValue::Number(3.0)
+        );
+        assert_eq!(
+            get("attributeNameAt", p, 2.0),
+            JsValue::String("z".to_owned())
+        );
+    }
+
+    /// JS-5・#1245: 属性 op の不正入力（要素以外・不正な index・arity）はエラー。
+    #[test]
+    fn js_5_attribute_ops_reject_bad_input() {
+        let b = bridge_with_html(ATTR_HTML, DomBridgeLimits::default());
+        let p = num(call(&b, &[s("getElementById"), s("target")]));
+        let root = num(call(&b, &[s("documentRoot")]));
+        let text_node = num(call(&b, &[s("createTextNode"), s("t")]));
+        call(&b, &[s("attributeCount"), n(root)]).expect_err("document");
+        call(&b, &[s("attributeCount"), n(text_node)]).expect_err("text");
+        call(&b, &[s("attributeCount"), n(1e12)]).expect_err("invalid id");
+        call(&b, &[s("attributeCount")]).expect_err("arity");
+        call(&b, &[s("attributeCount"), n(p), n(0.0)]).expect_err("arity");
+        for op in ["attributeNameAt", "attributeValueAt"] {
+            call(&b, &[s(op), n(text_node), n(0.0)]).expect_err("text");
+            for bad in [n(-1.0), n(0.5), n(f64::NAN), n(f64::INFINITY), s("0")] {
+                let err = call(&b, &[s(op), n(p), bad]).expect_err("bad index");
+                assert!(matches!(err, DomBridgeError::TypeMismatch { .. }));
+            }
+            call(&b, &[s(op), n(p)]).expect_err("arity");
+            call(&b, &[s(op), n(p), n(0.0), n(0.0)]).expect_err("arity");
+        }
+    }
+
+    /// JS-6・#1245: 属性値・名前が応答上限を超えたら ResponseTooLarge。
+    #[test]
+    fn js_6_attribute_response_is_bounded() {
+        let b = bridge_with_html(
+            "<body><p id=\"target\" title=\"0123456789\"></p></body>",
+            DomBridgeLimits {
+                max_response_bytes: 4,
+                ..DomBridgeLimits::default()
+            },
+        );
+        let p = num(call(&b, &[s("getElementById"), s("target")]));
+        let err = call(&b, &[s("attributeValueAt"), n(p), n(1.0)]).expect_err("超過");
+        assert!(matches!(err, DomBridgeError::ResponseTooLarge { .. }));
+    }
+
+    /// JS-6・#1245: 上限を超える属性名（prefix 付き含む）は文字列確保前に ResponseTooLarge。
+    #[test]
+    fn js_6_attribute_name_is_bounded_before_allocation() {
+        let b = bridge_with_html(
+            ATTR_HTML,
+            DomBridgeLimits {
+                max_response_bytes: 4,
+                ..DomBridgeLimits::default()
+            },
+        );
+        let body = num(call(&b, &[s("body")]));
+        let svg = num(call(&b, &[s("querySelector"), n(body), s("svg")]));
+        let a = num(call(&b, &[s("querySelector"), n(svg), s("a")]));
+        // "xlink:href" は 10 バイトで上限 4 を超える。
+        let err = call(&b, &[s("attributeNameAt"), n(a), n(0.0)]).expect_err("超過");
+        assert!(matches!(
+            err,
+            DomBridgeError::ResponseTooLarge { len: 10, limit: 4 }
+        ));
     }
 
     /// JS-5: `isFocusable` は接続した input で true、div・切り離した要素で false、不正入力はエラー。
