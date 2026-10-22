@@ -524,6 +524,24 @@
             }
         }
     }
+    // Web IDL の DOMString 変換。String(v) と違い Symbol は TypeError で拒否する。
+    function toDOMString(v) {
+        if (typeof v === 'symbol') {
+            throw new TypeError('Cannot convert a Symbol value to a string');
+        }
+        return String(v);
+    }
+    // 全引数を DOMString に変換し終えてからトークン検証する（変換中の toString が class を変え得るため）。
+    function convertTokens(args) {
+        var given = [];
+        for (var i = 0; i < args.length; i++) {
+            given[given.length] = toDOMString(args[i]);
+        }
+        for (var j = 0; j < given.length; j++) {
+            checkToken(given[j]);
+        }
+        return given;
+    }
     var classListOwner = new WeakMap();
     var classListOf = new WeakMap();
     var DOMTokenListProto = {};
@@ -574,7 +592,7 @@
                 throw new TypeError("Failed to execute 'contains' on 'DOMTokenList': 1 argument required, but only 0 present.");
             }
             // 引数変換（toString が class を変更し得る）を属性読み取りより先に行う
-            var t = String(token);
+            var t = toDOMString(token);
             return indexOfToken(readTokens(el).tokens, t) !== -1;
         }
     });
@@ -582,12 +600,7 @@
         writable: true,
         value: function add() {
             var el = tokenListOwner(this);
-            var given = [];
-            for (var i = 0; i < arguments.length; i++) {
-                var t = String(arguments[i]);
-                checkToken(t);
-                given[given.length] = t;
-            }
+            var given = convertTokens(arguments);
             var state = readTokens(el);
             for (var k = 0; k < given.length; k++) {
                 if (indexOfToken(state.tokens, given[k]) === -1) {
@@ -601,12 +614,7 @@
         writable: true,
         value: function remove() {
             var el = tokenListOwner(this);
-            var given = [];
-            for (var i = 0; i < arguments.length; i++) {
-                var t = String(arguments[i]);
-                checkToken(t);
-                given[given.length] = t;
-            }
+            var given = convertTokens(arguments);
             var state = readTokens(el);
             var kept = [];
             for (var k = 0; k < state.tokens.length; k++) {
@@ -624,7 +632,7 @@
             if (arguments.length < 1) {
                 throw new TypeError("Failed to execute 'toggle' on 'DOMTokenList': 1 argument required, but only 0 present.");
             }
-            var t = String(token);
+            var t = toDOMString(token);
             checkToken(t);
             var state = readTokens(el);
             var at = indexOfToken(state.tokens, t);
