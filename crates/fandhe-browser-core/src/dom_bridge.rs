@@ -1279,7 +1279,14 @@ fn execute(
         // 子の ID 列。応答上限（JS-6）を超えたら Err（`encode_id_list` が打ち切る）。
         DomOp::ChildNodes => {
             let node = page.node_arg(op, args, 1)?;
-            let ids: Vec<NodeId> = page.document.children(node).collect();
+            // 各 ID は 2 バイト以上（桁 + 区切り）のため、応答上限から導く件数 + 1 件で打ち切る。
+            // 超過分は encode_id_list が ResponseTooLarge にするので、全件 Vec は確保しない。
+            let max_results = limits.max_response_bytes / 2 + 1;
+            let ids: Vec<NodeId> = page
+                .document
+                .children(node)
+                .take(max_results.saturating_add(1))
+                .collect();
             encode_id_list(page.generation, ids, limits)
         }
         DomOp::NodeType => {
@@ -3448,6 +3455,22 @@ mod tests {
             TRAVERSAL_HTML,
             DomBridgeLimits {
                 max_response_bytes: 4,
+                ..DomBridgeLimits::default()
+            },
+        );
+        let body = num(call(&b, &[s("body")]));
+        let err = call(&b, &[s("childNodes"), n(body)]).expect_err("超過");
+        assert!(matches!(err, DomBridgeError::ResponseTooLarge { .. }));
+    }
+
+    /// JS-6・#1241: 子が非常に多くても `childNodes` は上限超過で ResponseTooLarge になる。
+    #[test]
+    fn js_6_child_nodes_many_children_stays_bounded() {
+        let html = format!("<body>{}</body>", "<i></i>".repeat(5000));
+        let b = bridge_with_html(
+            &html,
+            DomBridgeLimits {
+                max_response_bytes: 8,
                 ..DomBridgeLimits::default()
             },
         );
