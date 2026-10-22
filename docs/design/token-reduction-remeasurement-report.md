@@ -143,7 +143,7 @@
 
 - ページ別の増分率は 0.0〜10.4%（見込みは 0〜12%）で、見込みの範囲内。増分の合計は +3896 トークン
 - 中央値の増分は +61（見込みは約 +62）で、ほぼ一致した
-- 全ページで実測の増分は見込み以下（同値のページは quotes-list・ssr-next-prerendered）。差が大きいのは reddit-list（-180）、mdn-docs（-149）、hn-list（-95）、wikipedia-article（-47）
+- 全ページで実測の増分は見込み以下（同値のページは quotes-list・ssr-next-prerendered のほか、増分 0 で見込みも +0 の checkboxes-form・example-minimal・inputs-form・large-table・login-form）。差が大きいのは reddit-list（-180）、mdn-docs（-149）、hn-list（-95）、wikipedia-article（-47）
 - 増分の大きいページは reddit-list（+1514）、wikipedia-article（+1017）、hn-list（+548）、mdn-docs（+447）で、増分合計の 90% 以上を占める。重複の多いページに集中している
 - 設計表のベース値は区別子付与直前の値と一部ずれていた箇所があり（設計時点の記録のため書き換えない）、本節の「前」は `99f0f4c8` の実測値
 - 空 name の 2 件目以降に `#n` が付く分も上記の増分に含まれる（#1228 で対象外にした設計判断は未決で、ここでは記録にとどめる）
