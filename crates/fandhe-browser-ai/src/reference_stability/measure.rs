@@ -7,6 +7,10 @@
 //! 値が変わる改修（TASK-15 / TASK-16 等）が入るとテストが落ち、レポート
 //! （`docs/design/reference-stability-report.md`）の更新を強制する。
 //!
+//! 現在の期待値は出現順の区別子（#1221・#1228）の付与後の実測で、#1223 でレポートへ記録し直した。
+//! 候補数 `after_candidates` は区別子を付けた後の出力 name（`RefHolder::name`）で数え、
+//! 基底 name（`RefHolder::group_name`）では数えない。
+//!
 //! 配置: 判定ヘルパーと `build_snapshot_with_holders` が crate 内 `#[cfg(test)]` のため、
 //! spec 記載の `tests/reference_stability.rs`（結合テスト）ではなく crate 内の子モジュールに置く。
 //!
@@ -82,7 +86,7 @@ struct Row {
     identity: RefIdentity,
     role: String,
     name: String,
-    /// 変化後の同一 role+name 候補数（ref 保持要素）。
+    /// 変化後の同一 role+name 候補数（ref 保持要素）。name は区別子の付与後の出力 name で比較する。
     after_candidates: usize,
 }
 
@@ -393,7 +397,7 @@ fn aisnap_10_classify_mapping() {
     assert!(classify(&R::TargetNotFound { side: Side::Before }, true).is_err());
 }
 
-/// AISNAP-10・TASK-17.3・Issue #112（受入基準）: 全ケースの判定結果と破損率（%）を具体値で固定し
+/// AISNAP-10・TASK-17.3・Issue #112・#1221・#1223（受入基準）: 全ケースの判定結果と破損率（%）を具体値で固定し
 /// 出力する。`cargo test -p fandhe-browser-ai --lib reference_stability -- --nocapture` で表示。
 /// 10% 閾値は assert しない（達成可否の判断は #113）。
 #[test]
