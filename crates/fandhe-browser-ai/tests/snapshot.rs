@@ -578,7 +578,8 @@ fn aisnap_2_link_and_button_rows_are_compressed_with_controls() {
     );
     assert_eq!(
         control_shapes(t.rows.get(1).expect("2 行目")),
-        vec![("link", "詳細", false), ("button", "削除", true)]
+        // 2 行目は同 role・name の重複なので出現順の区別子 ` #2`（#1221）が付く。
+        vec![("link", "詳細 #2", false), ("button", "削除 #2", true)]
     );
     assert!(t.rows.iter().all(|r| !r.controls_truncated));
     // 行文字列は従来どおりセル文字列で、control の ref は全て形式が正しい。

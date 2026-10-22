@@ -354,6 +354,20 @@ fn boundary_separated_text(doc: &Document, dom: NodeId) -> String {
     raw.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// 同じ role・name の重複へ付く区別子（` #n`。name が空なら `#n`。`AISNAP-10`・#1221）を除く。
+fn strip_disambiguator(name: &str) -> &str {
+    let Some((head, tail)) = name.rsplit_once('#') else {
+        return name;
+    };
+    if tail.is_empty() || !tail.chars().all(|c| c.is_ascii_digit()) {
+        return name;
+    }
+    if head.is_empty() {
+        return head;
+    }
+    head.strip_suffix(' ').unwrap_or(name)
+}
+
 /// Snapshot ノードの name が DOM 側のフル name と対応するか。
 ///
 /// TASK-23.6（`AISNAP-1`）: 子を持つ row・cell・gridcell の出力 name は子孫ノードに出ない
@@ -364,7 +378,9 @@ fn boundary_separated_text(doc: &Document, dom: NodeId) -> String {
 /// TASK-17（#833）: accname が空の価格・地の文・引用のデータ葉は、出力 name が子孫テキストの
 /// 空白折り畳み値になる（`dom` が要素）。
 fn name_matches(doc: &Document, dom: NodeId, role: &str, n: &Node, full_name: &str) -> bool {
-    if n.name == full_name {
+    // 区別子（#1221）は accname ではないので比較から除く。
+    let nname = strip_disambiguator(&n.name);
+    if nname == full_name {
         return true;
     }
     if full_name.is_empty()
@@ -374,7 +390,7 @@ fn name_matches(doc: &Document, dom: NodeId, role: &str, n: &Node, full_name: &s
         )
     {
         let value = boundary_separated_text(doc, dom);
-        return !value.is_empty() && n.name == value;
+        return !value.is_empty() && nname == value;
     }
     // TASK-17（#834）: accname が空の checkbox・radio は、出力 name が直後の兄弟テキスト
     // （コメントは読み飛ばし、要素で止まる）の空白折り畳み値になる。
@@ -390,13 +406,13 @@ fn name_matches(doc: &Document, dom: NodeId, role: &str, n: &Node, full_name: &s
             sibling = doc.next_sibling(s);
         }
         let value = text.split_whitespace().collect::<Vec<_>>().join(" ");
-        return !value.is_empty() && n.name == value;
+        return !value.is_empty() && nname == value;
     }
     matches!(role, "row" | "cell" | "gridcell")
         && !n.children.is_empty()
         && RESIDUAL_NAMES
             .iter()
-            .any(|(full, residual)| *full == full_name && *residual == n.name)
+            .any(|(full, residual)| *full == full_name && *residual == nname)
 }
 
 /// DOM 要素と Snapshot の通常ノードを文書順で対応付ける（折り畳み対応。TASK-23.3）。
@@ -492,7 +508,11 @@ fn map_to_snapshot<'a>(doc: &Document, snapshot: &'a Snapshot, target: NodeId) -
             "対応付けの name が一致する: {:?} vs {full_name:?}",
             n.name
         ),
-        _ => assert_eq!(item.name(), full_name, "対応付けの name が一致する"),
+        _ => assert_eq!(
+            strip_disambiguator(item.name()),
+            full_name,
+            "対応付けの name が一致する"
+        ),
     }
     assert_eq!(
         item.data_leaf(),
@@ -700,9 +720,9 @@ fn aisnap_3_data_tasks_rely_on_data_leaf() {
     let th_node = map_to_snapshot(&doc, &snapshot, th);
     let decoy_node = map_to_snapshot(&doc, &snapshot, decoy);
     assert_eq!(
-        (th_node.role(), th_node.name()),
-        (decoy_node.role(), decoy_node.name()),
-        "対象とディストラクタは role・name が同じ"
+        (th_node.role(), strip_disambiguator(th_node.name())),
+        (decoy_node.role(), strip_disambiguator(decoy_node.name())),
+        "対象とディストラクタは区別子（#1221）を除けば role・name が同じ"
     );
     assert_ne!(th_node.r#ref(), decoy_node.r#ref(), "別ノード");
     assert_eq!(decoy_node.data_leaf(), None);
@@ -718,7 +738,7 @@ fn aisnap_3_data_tasks_rely_on_data_leaf() {
     );
     let by_data_leaf = nodes
         .iter()
-        .find(|n| is_table_heading(**n) && n.name() == "Last Name")
+        .find(|n| is_table_heading(**n) && strip_disambiguator(n.name()) == "Last Name")
         .expect("data_leaf 併用の一致がある");
     assert_eq!(
         by_data_leaf.r#ref(),

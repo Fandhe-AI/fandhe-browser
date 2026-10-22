@@ -94,6 +94,9 @@
 //!   既知の制約（REPAIR-3）: `select` の選択中 option テキストは親の残余と option ノードの両方に
 //!   出ることがある。圧縮表の省略行（`truncated_rows`）は残余に含めない。区切り記号だけの残余
 //!   （`| |` 等）は除去しない。`heading`・`columnheader` と子リンクの重複は未対応。
+//! - 同じ `(role, name)` の ref 保持要素は、木の確定後に文書順の 2 件目以降の name へ
+//!   ` #2`・` #3`… を付ける（`disambiguate` モジュール。`AISNAP-10`・TASK-17・Issue #1221）。
+//!   ref と accname は不変。ページ由来 name との衝突解消は未対応（Issue #1222。REPAIR-3）。
 //! - 深さが [`MAX_TREE_DEPTH`] を超えるサブツリーは省略し `Snapshot::truncated` を立てる。
 //! - いずれかの name が打ち切られた場合（文字数上限・子孫走査の上限・構築全体で共有する
 //!   走査予算）も `Snapshot::truncated` を立てる。
@@ -111,6 +114,7 @@ use crate::compress_table::{
 use crate::data_leaf::{DataLeafKind, classify_data_leaf};
 use crate::retention::priority_candidates;
 
+use super::disambiguate::apply_disambiguation;
 use super::element_ref::{ElementRef, ElementSignature, RefAllocator, RefError};
 use super::name::{
     MAX_TOTAL_CONTENT_STEPS, NameIndex, NameSource, SKIPPED_SUBTREES, compute_adjacent_text_name,
@@ -814,7 +818,11 @@ pub(crate) struct RefHolder {
     /// ref を発行した DOM 要素（通常ノード・圧縮表のヘッダセル・行内コントロール）。
     pub(crate) node: NodeId,
     pub(crate) role: String,
+    /// 区別子付与後（Issue #1221）の出力 name。
     pub(crate) name: String,
+    /// 区別子付与前の表示 name（残余縮約後）。重複グループのキー（`role`＋この値）で、出力 name を
+    /// 逆解析せずに同グループの件数を比較するために保持する（`name` は base を切り詰めうる）。
+    pub(crate) group_name: String,
     pub(crate) r#ref: String,
 }
 
@@ -915,6 +923,18 @@ fn build_snapshot_inner(
                     #[cfg(test)]
                     if let Some(sink) = sink.as_deref_mut() {
                         sink.retain(|h| !collapsed_ids.contains(&h.node));
+                    }
+                    let outcome = apply_disambiguation(&mut done.node);
+                    truncated |= outcome.truncated;
+                    #[cfg(test)]
+                    if let Some(sink) = sink.as_deref_mut() {
+                        // holder は木と同じ文字列（残余縮約・区別子付与後）を持つ。
+                        for h in sink.iter_mut() {
+                            if let Some((base, full)) = outcome.names.get(h.r#ref.as_str()) {
+                                h.group_name = base.clone();
+                                h.name = full.clone();
+                            }
+                        }
                     }
                     return Ok(Snapshot::new(done.node).with_truncated(truncated));
                 }
@@ -1097,6 +1117,7 @@ fn build_snapshot_inner(
                 sink.push(RefHolder {
                     node: child,
                     role: role.to_string(),
+                    group_name: out_name.clone(),
                     name: out_name,
                     r#ref: elem_ref.to_ref_string(),
                 });
@@ -1128,6 +1149,7 @@ fn build_snapshot_inner(
                         node: h.cell,
                         role: h.role.clone(),
                         name: h.name.clone(),
+                        group_name: h.name.clone(),
                         r#ref: h.elem_ref.to_ref_string(),
                     });
                 }
@@ -1144,6 +1166,7 @@ fn build_snapshot_inner(
                             node: *id,
                             role: c.role.clone(),
                             name: c.name.clone(),
+                            group_name: c.name.clone(),
                             r#ref: c.r#ref.clone(),
                         });
                     }
@@ -1300,7 +1323,7 @@ mod tests {
             .collect();
         assert_eq!(
             top,
-            vec![("generic", "Box"), ("generic", ""), ("generic", "")]
+            vec![("generic", "Box"), ("generic", ""), ("generic", "#2")]
         );
         assert_eq!(child(child(&s.tree, 0), 0).name, "B");
     }
@@ -1637,7 +1660,7 @@ mod tests {
                 ("checkbox", "c", true),
                 ("generic", "", true), // div[onclick]
                 ("combobox", "s", true),
-                ("generic", "", true),    // option
+                ("generic", "#2", true),  // option
                 ("generic", "9.9", true), // p.price_color（データ葉。値が name。TASK-17）
             ]
         );
@@ -2642,5 +2665,127 @@ mod tests {
         let idx: Vec<usize> = table.folded_rows.iter().map(|r| r.index).collect();
         assert_eq!(idx, vec![0, 2]);
         assert!(all_nodes(&s.tree).iter().any(|n| n.role == "cell"));
+    }
+
+    /// AISNAP-10・TASK-17（#1221）: 同じ role・name のリンクは 2 件目以降に ` #n`。ref は不変。
+    #[test]
+    fn aisnap_10_duplicate_links_get_occurrence_suffix() {
+        let s = snap(
+            "<body><a href=\"/x\">alpha</a><a href=\"/y\">alpha</a><a href=\"/z\">alpha</a>\
+             <button>alpha</button></body>",
+        );
+        let got: Vec<(&str, &str)> = s
+            .tree
+            .children
+            .iter()
+            .map(|n| (n.role.as_str(), n.name.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("link", "alpha"),
+                ("link", "alpha #2"),
+                ("link", "alpha #3"),
+                ("button", "alpha")
+            ]
+        );
+        let refs: Vec<&str> = s
+            .tree
+            .children
+            .iter()
+            .filter_map(|n| n.r#ref.as_deref())
+            .collect();
+        assert_eq!(refs.len(), 4);
+        let unique: std::collections::HashSet<&&str> = refs.iter().collect();
+        assert_eq!(unique.len(), 4);
+    }
+
+    /// AISNAP-10・TASK-17（#1221）: テスト用 holder の name は出力ノードの name と同期する。
+    #[test]
+    fn aisnap_10_holders_follow_disambiguated_names() {
+        let parsed = parse_document(
+            "<body><a href=\"/x\">alpha</a><a href=\"/y\">alpha</a></body>",
+            &ParseOptions::default(),
+        )
+        .expect("parse");
+        let (s, holders) = super::build_snapshot_with_holders(&parsed.document).expect("build");
+        let node_names: Vec<(String, String)> = s
+            .tree
+            .children
+            .iter()
+            .filter_map(|n| n.r#ref.clone().map(|r| (r, n.name.clone())))
+            .collect();
+        let holder_names: Vec<(String, String)> = holders
+            .iter()
+            .map(|h| (h.r#ref.clone(), h.name.clone()))
+            .collect();
+        assert_eq!(node_names, holder_names);
+        assert_eq!(holder_names.get(1).map(|x| x.1.as_str()), Some("alpha #2"));
+    }
+
+    /// 縮約後の表示名で採番する検証用の文書。tabindex 付き table 行は interactive で ref を持ち、
+    /// 子リンクが内容を全部表示するため row の name は空へ縮む。
+    fn shrinking_rows_doc() -> fandhe_browser_core::dom::Document {
+        let html = "<body><table>\
+            <tr tabindex=\"0\"><td><a href=\"/a\">alpha</a></td></tr>\
+            <tr tabindex=\"0\"><td><a href=\"/b\">beta</a></td></tr>\
+            <tr tabindex=\"0\"><td><a href=\"/c\">beta</a></td></tr>\
+            </table></body>";
+        parse_document(html, &ParseOptions::default())
+            .expect("parse")
+            .document
+    }
+
+    fn ref_items(n: &Node, out: &mut Vec<(String, String, String)>) {
+        if let Some(r) = &n.r#ref {
+            out.push((r.clone(), n.role.clone(), n.name.clone()));
+        }
+        for c in &n.children {
+            ref_items(c, out);
+        }
+    }
+
+    /// AISNAP-10・TASK-17（#1221）: 残余縮約後に区別子が付く row でも、holder の name は
+    /// snapshot の name と同じ文字列になる。
+    #[test]
+    fn aisnap_10_holder_name_matches_tree_after_residual_shrink() {
+        let doc = shrinking_rows_doc();
+        let (s, holders) = super::build_snapshot_with_holders(&doc).expect("build");
+        let mut items = Vec::new();
+        ref_items(&s.tree, &mut items);
+        let rows: Vec<(String, String)> = items
+            .iter()
+            .filter(|(_, role, _)| role == "row")
+            .map(|(r, _, n)| (r.clone(), n.clone()))
+            .collect();
+        assert_eq!(rows.len(), 3);
+        for (r, n) in &rows {
+            let h = holders.iter().find(|h| &h.r#ref == r).expect("holder");
+            assert_eq!(&h.name, n);
+        }
+    }
+
+    /// AISNAP-10・TASK-17（#1221）: 縮めると同じ表示名になる別グループでも、出力の
+    /// `(role, name)` は重複せず通し番号が振られる。
+    #[test]
+    fn aisnap_10_suffixes_do_not_collide_across_residual_groups() {
+        let doc = shrinking_rows_doc();
+        let (s, _) = super::build_snapshot_with_holders(&doc).expect("build");
+        let mut items = Vec::new();
+        ref_items(&s.tree, &mut items);
+        let rows: Vec<String> = items
+            .iter()
+            .filter(|(_, role, _)| role == "row")
+            .map(|(_, _, n)| n.clone())
+            .collect();
+        assert_eq!(rows, vec!["", "#2", "#3"]);
+        let mut keys: Vec<(&str, &str)> = items
+            .iter()
+            .map(|(_, role, n)| (role.as_str(), n.as_str()))
+            .collect();
+        keys.sort();
+        let before = keys.len();
+        keys.dedup();
+        assert_eq!(keys.len(), before);
     }
 }

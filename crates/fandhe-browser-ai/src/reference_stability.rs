@@ -20,10 +20,12 @@
 //!   [`Reidentification::NotInSnapshot`] で返す
 //!
 //! 判定モデル: セレクタは「変化前の対象」を定めるためだけに使い、変化前に 1 要素にだけ一致する
-//! 必要がある。変化前の ref は対象 DOM ノードに対して Snapshot が発行したものを使う。変化後は
-//! 変化前の role+name シグネチャで Snapshot 上の ref 保持要素を探し、候補の一意性と ref の
-//! 一致で安定・ref 変化・曖昧を判定する（セレクタで一意に選べても候補が複数なら曖昧）。候補が
-//! 0 件のときだけ、名前変更と消失・省略の区別に変化後のセレクタを診断用に使う。
+//! 必要がある（[`locate_in`]）。変化後の判定は、変化前の対象 [`Target`] と前後の [`RefHolder`]
+//! 列だけから観測値 [`Facts`] を求め（[`observe`]）、判定表（[`decide`]。`docs/design/
+//! reference-disambiguation.md` の「判定表」A1〜A9）で結果を決める。変化後の DOM・セレクタ・位置は
+//! 使わない（`check_reidentification` は変化後の `Document` を保持しない）。区別子 ` #n` と ref の
+//! 出現番号 `-n` は出現順で決まるため、順序を決める集合が変わる変化は `Ambiguous` にする。
+//! 名前の変更（accname の変化）は消失と区別できず `MissingAfter`（#1228）。
 //!
 //! 破損率の算出と測定出力は子モジュール `measure`（TASK-17.3・#112）が担う。フィクスチャは
 //! すべて静的なダミー値で、外部通信をしない。
@@ -42,8 +44,9 @@ use fandhe_browser_core::query::query_selector_all_str;
 struct StabilityCase<'a> {
     before_html: &'a str,
     after_html: &'a str,
-    /// 対象要素の CSS セレクタ。前後それぞれで 1 要素にだけ一致することを求める
-    /// （複数一致は先頭一致で別要素を追う恐れがあるため `Ambiguous` にする）。
+    /// 変化前の対象要素の CSS セレクタ。変化前の HTML で 1 要素にだけ一致することを求める
+    /// （複数一致は先頭一致で別要素を追う恐れがあるため `Ambiguous` にする）。変化後の HTML では
+    /// 評価しない（変化後は role+name・ref と holder 列だけで判定する。AISNAP-10）。
     selector: &'a str,
 }
 
@@ -110,7 +113,7 @@ fn parse(html: &str) -> Document {
 /// 対象要素の Snapshot 上の扱い。
 enum Placement {
     /// 対象 DOM ノードに対応する ref がある。
-    Ref(String),
+    Ref(Target),
     /// 省略された（hidden・深さ上限・保持上限）。
     Omitted(OmissionCause),
     /// 設計上 ref を持たない要素（圧縮表のデータセル等）。
@@ -204,18 +207,179 @@ fn omission_by_position(doc: &Document, id: NodeId) -> Option<OmissionCause> {
     (depth > MAX_TREE_DEPTH).then_some(OmissionCause::DepthLimit)
 }
 
-/// セレクタが一意に一致する要素を特定し、その DOM ノードに対して Snapshot が発行した ref を返す。
+/// 変化前の対象 T（判定表の入力。AISNAP-10）。変化後の判定は T と前後の [`RefHolder`] 列だけで
+/// 行い、変化後の DOM・セレクタ・位置は使わない。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Target {
+    role: String,
+    /// 区別子付与後の出力 name。変化後の照合（role+name による再特定）に使う。
+    name: String,
+    /// 区別子付与前の基底 name。出現順を決める集合 `(role, group_name)` のキーにだけ使う。
+    group_name: String,
+    r#ref: String,
+}
+
+/// 変化後の role+name 照合と ref 照合の分類（判定表の L1〜L5。上から順に評価し、必ず 1 つに決まる）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Lookup {
+    /// L1: 同じ role+name の保持要素が 2 件以上ある。
+    ManyByName(usize),
+    /// L2: 変化前の ref を持つ保持要素があり、その role+name が T と同じ。
+    Agree,
+    /// L3: role+name の候補が 1 件で、変化前の ref はどこにも無い。
+    OneByNameRefGone { after_ref: String },
+    /// L4: 変化前の ref を持つ保持要素 Z があるが、Z の role+name は T と違う。
+    RefElsewhere {
+        role: String,
+        name: String,
+        group_name: String,
+    },
+    /// L5: role+name の候補も変化前の ref も無い。
+    Gone,
+}
+
+/// 判定表の観測値。すべて前後の holder 列だけから求める（[`observe`]）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Facts {
+    lookup: Lookup,
+    /// ref が出現順に依存しない（`-n` が無く、ref ファミリが前後とも 1 件）。
+    ref_order_independent: bool,
+    /// 出現順を決める集合（グループ `(role, group_name)` と ref ファミリ）が前後で同じ。
+    context_unchanged: bool,
+    /// 変化後のグループ `(role, group_name)` の件数。
+    group_after: usize,
+    /// 変化後の ref ファミリの件数。
+    family_after: usize,
+}
+
+/// ref から出現番号の接尾辞 `-<数字>` だけを除いたキー（ダイジェスト＋variant）。`v<n>` や
+/// 延長した hex は ref の同一性の一部なので残す。同じキーの保持要素が ref ファミリ。
+fn ref_family_key(r: &str) -> &str {
+    match r.rsplit_once('-') {
+        Some((head, tail)) if !tail.is_empty() && tail.bytes().all(|b| b.is_ascii_digit()) => head,
+        _ => r,
+    }
+}
+
+/// 変化前後の holder 列から判定表の観測値を求める。DOM もセレクタも受け取らない。
+fn observe(t: &Target, before: &[RefHolder], after: &[RefHolder]) -> Facts {
+    let by_name: Vec<&RefHolder> = after
+        .iter()
+        .filter(|h| h.role == t.role && h.name == t.name)
+        .collect();
+    let by_ref = after.iter().find(|h| h.r#ref == t.r#ref);
+    let lookup = if by_name.len() >= 2 {
+        Lookup::ManyByName(by_name.len())
+    } else if by_ref.is_some_and(|z| z.role == t.role && z.name == t.name) {
+        Lookup::Agree
+    } else if let (None, [one]) = (by_ref, by_name.as_slice()) {
+        Lookup::OneByNameRefGone {
+            after_ref: one.r#ref.clone(),
+        }
+    } else if let Some(z) = by_ref {
+        Lookup::RefElsewhere {
+            role: z.role.clone(),
+            name: z.name.clone(),
+            group_name: z.group_name.clone(),
+        }
+    } else {
+        Lookup::Gone
+    };
+
+    let family = ref_family_key(&t.r#ref);
+    let in_family = |hs: &[RefHolder]| -> Vec<(String, String, String)> {
+        hs.iter()
+            .filter(|h| ref_family_key(&h.r#ref) == family)
+            .map(|h| (h.r#ref.clone(), h.role.clone(), h.group_name.clone()))
+            .collect()
+    };
+    let in_group = |hs: &[RefHolder]| -> Vec<String> {
+        hs.iter()
+            .filter(|h| h.role == t.role && h.group_name == t.group_name)
+            .map(|h| h.r#ref.clone())
+            .collect()
+    };
+    let (family_before, family_after) = (in_family(before), in_family(after));
+    let group_after = in_group(after);
+    Facts {
+        lookup,
+        ref_order_independent: family == t.r#ref
+            && family_before.len() == 1
+            && family_after.len() == 1,
+        context_unchanged: in_group(before) == group_after && family_before == family_after,
+        group_after: group_after.len(),
+        family_after: family_after.len(),
+    }
+}
+
+/// 判定表（変化後）。1 アームが 1 行に対応する。`count` は常に 1 以上。
+fn decide(t: Target, f: Facts) -> Reidentification {
+    let ambiguous = |count: usize| Reidentification::Ambiguous {
+        side: Side::After,
+        count: count.max(1),
+    };
+    let stable = |t: Target| Reidentification::Stable {
+        role: t.role,
+        name: t.name,
+        r#ref: t.r#ref,
+    };
+    match f.lookup {
+        // 行 A1: ページ由来の name との衝突（#1222）。fail-closed
+        Lookup::ManyByName(k) => ambiguous(k),
+        Lookup::Agree => {
+            if f.ref_order_independent {
+                // 行 A2: 順序に依存しない ref が同じ要素を指し、role・name も一致する
+                stable(t)
+            } else if f.context_unchanged {
+                // 行 A3: 出現順で決まる同一性だが、順序を決める集合が変わっていない
+                stable(t)
+            } else {
+                // 行 A4: 順序の集合が変わり、別要素が番号を引き継いだ可能性を否定できない
+                ambiguous(f.group_after)
+            }
+        }
+        // 行 A5: role+name の候補の ref が変わった（観測事実だけを述べる）
+        Lookup::OneByNameRefGone { after_ref } => Reidentification::RefChanged {
+            before: t.r#ref,
+            after: after_ref,
+        },
+        Lookup::RefElsewhere {
+            role,
+            name,
+            group_name,
+        } => {
+            if role == t.role && group_name == t.group_name {
+                // 行 A6: 基底は同じで、区別子 #n がずれただけ（順序の問題）
+                ambiguous(f.group_after)
+            } else if f.ref_order_independent {
+                // 行 A7: 順序に依存しない ref で特定した対象の表示 name が変わった
+                Reidentification::SignatureChanged {
+                    before: (t.role, t.name),
+                    after: (role, name),
+                }
+            } else {
+                // 行 A8: ref が順序に依存し、Z が対象だと確かめられない
+                ambiguous(f.family_after)
+            }
+        }
+        // 行 A9: 候補も ref も無い（名前変更と消失は区別しない）
+        Lookup::Gone => Reidentification::MissingAfter {
+            role: t.role,
+            name: t.name,
+        },
+    }
+}
+
+/// セレクタが一意に一致する要素を特定し、その DOM ノードに対して Snapshot が発行した ref を返す
+/// （変化前の対象を定める。判定表 B1〜B7）。
 ///
 /// 対応づけ: 対象がまず hidden・深さ上限で省略されるかを DOM から判定する（省略なら別要素の
 /// ref を探さない）。省略されない場合は、`build_snapshot` が記録した ref 発行要素
 /// （[`RefHolder`]）から対象の `NodeId` で直接引く。role・name も記録された Snapshot 自身の結果を
 /// 使い、再計算しない。記録に無い要素（圧縮表のデータセル・行内コントロールの保持上限で落ちた
 /// 要素等）は Snapshot が名前を算出していないため、名前は予算なしの索引で参考値として求める。
-fn locate(html: &str, selector: &str) -> Located {
-    let doc = parse(html);
-    let (_snapshot, holders) =
-        build_snapshot_with_holders(&doc).expect("フィクスチャの構築は成功する");
-    let Ok(matches) = query_selector_all_str(&doc, doc.root(), selector) else {
+fn locate_in(doc: &Document, holders: &[RefHolder], selector: &str) -> Located {
+    let Ok(matches) = query_selector_all_str(doc, doc.root(), selector) else {
         return Located::NotFound;
     };
     let id = match matches.as_slice() {
@@ -223,7 +387,7 @@ fn locate(html: &str, selector: &str) -> Located {
         [one] => *one,
         many => return Located::Multiple(many.len()),
     };
-    let Some(role) = compute_role(&doc, id) else {
+    let Some(role) = compute_role(doc, id) else {
         return Located::NoRole;
     };
     let role = role.as_str().to_string();
@@ -231,12 +395,17 @@ fn locate(html: &str, selector: &str) -> Located {
         return Located::Found {
             role: holder.role.clone(),
             name: holder.name.clone(),
-            placement: Placement::Ref(holder.r#ref.clone()),
+            placement: Placement::Ref(Target {
+                role: holder.role.clone(),
+                name: holder.name.clone(),
+                group_name: holder.group_name.clone(),
+                r#ref: holder.r#ref.clone(),
+            }),
         };
     }
-    let index = NameIndex::build(&doc);
-    let name = compute_name_with_index(&doc, &index, id).text;
-    let placement = if let Some(cause) = omission_by_position(&doc, id) {
+    let index = NameIndex::build(doc);
+    let name = compute_name_with_index(doc, &index, id).text;
+    let placement = if let Some(cause) = omission_by_position(doc, id) {
         Placement::Omitted(cause)
     } else if INTERACTIVE_ROLES.contains(&role.as_str()) {
         // 記録に無い操作要素は保持上限による省略として扱う（Snapshot が ref を発行していない）。
@@ -251,20 +420,43 @@ fn locate(html: &str, selector: &str) -> Located {
     }
 }
 
+/// HTML をパースして Snapshot を構築し、ref 保持要素の記録だけを返す（Document は返さない）。
+fn holders_of(html: &str) -> Vec<RefHolder> {
+    let doc = parse(html);
+    build_snapshot_with_holders(&doc)
+        .expect("フィクスチャの構築は成功する")
+        .1
+}
+
+/// [`locate_in`] の HTML 版（measure 用）。
+fn locate(html: &str, selector: &str) -> Located {
+    let doc = parse(html);
+    let (_snapshot, holders) =
+        build_snapshot_with_holders(&doc).expect("フィクスチャの構築は成功する");
+    locate_in(&doc, &holders, selector)
+}
+
 /// 変化前後の HTML で対象を role+name により再特定し、ref の一致まで判定する。
 ///
 /// ケース定義の誤りとして扱うのは変化前の不一致（`TargetNotFound { Before }`）だけで、
-/// 変化後に対象が消えた・一意に決まらないものは参照破損として集計対象に残す。
+/// 変化後に対象が消えた・一意に決まらないものは参照破損として集計対象に残す。変化前の HTML は
+/// 1 回だけパース・構築してセレクタで対象を定め、変化後は holder 列だけを取り出す。変化後の
+/// `Document` を保持しないため、変化後に DOM・セレクタを使えないことが型の上で保たれる。
 fn check_reidentification(case: &StabilityCase<'_>) -> Reidentification {
-    let before = locate(case.before_html, case.selector);
-    let (b_role, b_name, b_ref) = match before {
+    let before_doc = parse(case.before_html);
+    let (_snapshot, before_holders) =
+        build_snapshot_with_holders(&before_doc).expect("フィクスチャの構築は成功する");
+    let target = match locate_in(&before_doc, &before_holders, case.selector) {
+        // 行 B1
         Located::NotFound => return Reidentification::TargetNotFound { side: Side::Before },
+        // 行 B2
         Located::Multiple(count) => {
             return Reidentification::Ambiguous {
                 side: Side::Before,
                 count,
             };
         }
+        // 行 B3
         Located::NoRole => {
             return Reidentification::NotInSnapshot {
                 role: String::new(),
@@ -276,74 +468,21 @@ fn check_reidentification(case: &StabilityCase<'_>) -> Reidentification {
             name,
             placement,
         } => match placement {
-            Placement::Ref(r) => (role, name, r),
+            // 行 B4
+            Placement::Ref(t) => t,
+            // 行 B7
             Placement::NoRefByDesign => {
                 return Reidentification::NotInSnapshot { role, name };
             }
+            // 行 B5・B6
             Placement::Omitted(cause) => {
                 return Reidentification::OmittedFromSnapshot { role, name, cause };
             }
         },
     };
-    reidentify_after(case.after_html, case.selector, b_role, b_name, b_ref)
-}
-
-/// 変化後の HTML で、変化前の対象の role+name シグネチャを持つ Snapshot 上の候補を探して判定する
-/// （`AISNAP-10`）。候補は `build_snapshot` が ref を発行した要素（[`RefHolder`]）のうち
-/// role・name が一致するもの。変化後のセレクタは安定・曖昧・破損の判定には使わない。
-///
-/// - 候補 1 件で ref 一致 → `Stable`、ref 不一致 → `RefChanged`
-/// - 候補複数 → `Ambiguous`（セレクタで一意に選べても曖昧として検出する）
-/// - 候補 0 件 → 「名前が変わった」か「消えた・省略された」かの区別だけに、変化後のセレクタを
-///   診断用の補助情報として使う。セレクタが 1 要素に一致し、それが別の role+name で ref を
-///   持っていれば `SignatureChanged`、それ以外は `MissingAfter`
-fn reidentify_after(
-    html: &str,
-    selector: &str,
-    b_role: String,
-    b_name: String,
-    b_ref: String,
-) -> Reidentification {
-    let doc = parse(html);
-    let (_, holders) = build_snapshot_with_holders(&doc).expect("フィクスチャの構築は成功する");
-    let candidates: Vec<&RefHolder> = holders
-        .iter()
-        .filter(|h| h.role == b_role && h.name == b_name)
-        .collect();
-    match candidates.as_slice() {
-        [one] if one.r#ref == b_ref => Reidentification::Stable {
-            role: b_role,
-            name: b_name,
-            r#ref: b_ref,
-        },
-        [one] => Reidentification::RefChanged {
-            before: b_ref,
-            after: one.r#ref.clone(),
-        },
-        [] => {
-            // 診断用: セレクタが一意に指す要素が別シグネチャで ref を持つなら名前変更とみなす。
-            let renamed = query_selector_all_str(&doc, doc.root(), selector)
-                .ok()
-                .and_then(|m| match m.as_slice() {
-                    [id] => holders.iter().find(|h| h.node == *id),
-                    _ => None,
-                });
-            match renamed {
-                Some(h) => Reidentification::SignatureChanged {
-                    before: (b_role, b_name),
-                    after: (h.role.clone(), h.name.clone()),
-                },
-                None => Reidentification::MissingAfter {
-                    role: b_role,
-                    name: b_name,
-                },
-            }
-        }
-        many => Reidentification::Ambiguous {
-            side: Side::After,
-            count: many.len(),
-        },
-    }
+    let after_holders = holders_of(case.after_html);
+    let facts = observe(&target, &before_holders, &after_holders);
+    decide(target, facts)
 }
 
 fn page(body: &str) -> String {
@@ -416,9 +555,11 @@ fn aisnap_10_changed_id_is_detected_as_ref_changed() {
     );
 }
 
-/// AISNAP-10・TASK-17.1・Issue #110: 名前が変わると `SignatureChanged` になる。
+/// AISNAP-10・TASK-17.1・Issue #110: accname が変わる名前変更は ref も変わる。変化後にセレクタを
+/// 使わない契約（判定表 A9）では消失と区別できず、`MissingAfter` で返す
+/// （`SignatureChanged` は accname が同じで表示 name だけが変わる場合。`adjacent_text_change_*`）。
 #[test]
-fn aisnap_10_renamed_target_is_signature_changed() {
+fn aisnap_10_renamed_target_is_missing_after() {
     let before = page("<button id=\"go\">Go</button>");
     let after = page("<button id=\"go\">Stop</button>");
     let result = check_reidentification(&StabilityCase {
@@ -428,9 +569,9 @@ fn aisnap_10_renamed_target_is_signature_changed() {
     });
     assert_eq!(
         result,
-        Reidentification::SignatureChanged {
-            before: ("button".into(), "Go".into()),
-            after: ("button".into(), "Stop".into()),
+        Reidentification::MissingAfter {
+            role: "button".into(),
+            name: "Go".into(),
         }
     );
 }
@@ -563,8 +704,9 @@ fn aisnap_10_removed_after_is_missing_after() {
 }
 
 /// AISNAP-10・TASK-17.1・Issue #110: 対象が hidden で除外されたうえ同名の別要素が加わる場合、
-/// 変化後は role+name の候補（b・c の 2 件）で判定し、どちらかの ref を対象のものとして
-/// 代用せず `Ambiguous` にする（案 Y。変化後のセレクタは判定に使わない）。
+/// 変化後は role+name の候補で判定し、b の ref を対象 a のものとして代用しない（`Stable` にしない）。
+/// 区別子 ` #n`（#1221）により変化後の候補は b（素の `Go`）1 件になり、ref が変わったため
+/// `RefChanged`（以前は同名 2 件で `Ambiguous`）。
 #[test]
 fn aisnap_10_hidden_target_does_not_borrow_sibling_ref() {
     let before = page("<button id=\"a\">Go</button><button id=\"b\">Go</button>");
@@ -576,11 +718,16 @@ fn aisnap_10_hidden_target_does_not_borrow_sibling_ref() {
         after_html: &after,
         selector: "#a",
     });
+    let (before_ref, after_ref) = match &result {
+        Reidentification::RefChanged { before, after } => (before.clone(), after.clone()),
+        other => panic!("expected RefChanged, got {other:?}"),
+    };
+    assert_ne!(before_ref, after_ref);
     assert_eq!(
         result,
-        Reidentification::Ambiguous {
-            side: Side::After,
-            count: 2,
+        Reidentification::RefChanged {
+            before: before_ref,
+            after: after_ref,
         }
     );
 }
@@ -765,8 +912,9 @@ fn aisnap_10_depth_boundary_is_exact() {
     );
 }
 
-/// AISNAP-10・TASK-17.1・Issue #110: 同 role・name の要素が前方に挿入され、セレクタの
-/// 先頭一致が別要素になりうる変化は `Stable` にしない。
+/// AISNAP-10・TASK-17.1・Issue #110・#1221: 同 role・name の要素が前方に挿入される変化は
+/// `Stable` にしない。区別子 ` #n` は出現順で付くため、挿入された先頭の `Go` が素の name と元の
+/// ref を得てしまうが、同 role・base name の要素が増えた変化として `Ambiguous` で検出する。
 #[test]
 fn aisnap_10_same_signature_inserted_before_is_ambiguous() {
     let before = page("<button>Go</button>");
@@ -786,7 +934,7 @@ fn aisnap_10_same_signature_inserted_before_is_ambiguous() {
 }
 
 /// AISNAP-10・TASK-17.1・Issue #110: 変化後はセレクタではなく role+name の候補で判定するため、
-/// `#go` で一意に選べても同 role+name の別要素が増えれば `Ambiguous` になる（案 Y）。
+/// `#go` で一意に選べても同 role+name の別要素が増えれば `Ambiguous` になる（案 Y。#1221 後も維持）。
 #[test]
 fn aisnap_10_unique_selector_but_duplicate_signature_after_is_ambiguous() {
     let before = page("<button id=\"go\">Go</button>");
@@ -795,6 +943,203 @@ fn aisnap_10_unique_selector_but_duplicate_signature_after_is_ambiguous() {
         before_html: &before,
         after_html: &after,
         selector: "#go",
+    });
+    assert_eq!(
+        result,
+        Reidentification::Ambiguous {
+            side: Side::After,
+            count: 2
+        }
+    );
+}
+
+/// AISNAP-10・Issue #1221: 構造セレクタ（疑似クラス `:not` 等）は挿入された別要素にも同じ位置で
+/// 一致しうるため、一致位置を同一性の根拠にしない。ここでは元の対象に class が付き、挿入された
+/// 先頭の `Go` が `button:not(.z)` に一致する（前後とも位置 0）。`Stable` ではなく `Ambiguous`。
+/// なお `:first-of-type` 等は core のセレクタ実装が未対応（Unsupported）で `TargetNotFound`。
+#[test]
+fn aisnap_10_structural_selector_insert_before_is_ambiguous() {
+    let before = page("<button>Go</button>");
+    let after = page("<button>Go</button><button class=\"z\">Go</button>");
+    let result = check_reidentification(&StabilityCase {
+        before_html: &before,
+        after_html: &after,
+        selector: "button:not(.z)",
+    });
+    assert_eq!(
+        result,
+        Reidentification::Ambiguous {
+            side: Side::After,
+            count: 2
+        }
+    );
+}
+
+/// AISNAP-10・Issue #1221・判定表 A4: 識別属性の無い対象の後ろへ同名要素が追加される変化は
+/// `Ambiguous`。変化後の holder 列は「前方に同名要素が挿入された」場合と同じで、契約の範囲
+/// （role・name・ref・holder 列）では区別できない（オーナー承認済みの安全側の限界。#113）。
+#[test]
+fn aisnap_10_same_signature_appended_after_is_ambiguous() {
+    let before = page("<button class=\"target\">Go</button>");
+    let after = page("<button class=\"target\">Go</button><button>Go</button>");
+    let result = check_reidentification(&StabilityCase {
+        before_html: &before,
+        after_html: &after,
+        selector: ".target",
+    });
+    assert_eq!(
+        result,
+        Reidentification::Ambiguous {
+            side: Side::After,
+            count: 2
+        }
+    );
+}
+
+/// AISNAP-10・Issue #1221: 重複が減って対象自身が消え、残った別要素が素の name と先頭の ref を
+/// 引き継ぐ場合は `Stable` にせず `Ambiguous`。
+#[test]
+fn aisnap_10_duplicate_removed_target_is_ambiguous() {
+    let before = page("<button class=\"target\">Go</button><button>Go</button>");
+    let after = page("<button>Go</button>");
+    let result = check_reidentification(&StabilityCase {
+        before_html: &before,
+        after_html: &after,
+        selector: ".target",
+    });
+    assert_eq!(
+        result,
+        Reidentification::Ambiguous {
+            side: Side::After,
+            count: 1
+        }
+    );
+}
+
+/// AISNAP-10・Issue #1221・判定表 A3（既知の限界）: 対象が hidden で省略され、同名の要素が
+/// 1 件加わって件数が同じになる変化は `Stable` になる。変化後の holder 列が「変化のないページ」
+/// （`Go`・`Go #2` の 2 件）と同じで、契約の範囲では検出できない。オーナー承認済みの限界。
+#[test]
+fn aisnap_10_hidden_target_with_added_sibling_same_count_is_known_limit() {
+    let before = page("<button class=\"target\">Go</button><button>Go</button>");
+    let after =
+        page("<button class=\"target\" hidden>Go</button><button>Go</button><button>Go</button>");
+    let result = check_reidentification(&StabilityCase {
+        before_html: &before,
+        after_html: &after,
+        selector: ".target",
+    });
+    assert_eq!(
+        result,
+        Reidentification::Stable {
+            role: "button".into(),
+            name: "Go".into(),
+            r#ref: "e9ddb5239".into(),
+        }
+    );
+}
+
+/// AISNAP-10・Issue #1221・判定表 A3: 変化前のセレクタが変化後に 0 件でも、role+name と ref が
+/// 維持される対象は `Stable`（class だけの変更を参照破損にしない）。
+#[test]
+fn aisnap_10_class_only_change_keeps_stable() {
+    let before = page("<button class=\"target\">Go</button>");
+    let after = page("<button>Go</button>");
+    let result = check_reidentification(&StabilityCase {
+        before_html: &before,
+        after_html: &after,
+        selector: ".target",
+    });
+    assert_eq!(
+        result,
+        Reidentification::Stable {
+            role: "button".into(),
+            name: "Go".into(),
+            r#ref: "e9ddb5239".into(),
+        }
+    );
+}
+
+/// AISNAP-10・Issue #1221・判定表 A3: 同名ボタンが並ぶ中で対象が class を失うだけの変化は、
+/// 変化前後の HTML が `hidden_target_with_added_sibling_same_count_is_known_limit` と同じ形の
+/// holder 列になり、どの判定関数でも `Stable` か `Ambiguous` の一方にしか決められない。
+/// 4284bb6f（Ambiguous）と eb6c9ad3（Stable）の往復を止めるため `Stable` に固定する
+/// （順序を決める集合が変わっていない）。
+#[test]
+fn aisnap_10_class_only_change_among_duplicates_same_count_is_stable() {
+    let before = page("<button class=\"target\">Go</button><button>Go</button>");
+    let after = page("<button>Go</button><button>Go</button>");
+    let result = check_reidentification(&StabilityCase {
+        before_html: &before,
+        after_html: &after,
+        selector: ".target",
+    });
+    assert_eq!(
+        result,
+        Reidentification::Stable {
+            role: "button".into(),
+            name: "Go".into(),
+            r#ref: "e9ddb5239".into(),
+        }
+    );
+}
+
+/// AISNAP-10・Issue #1221: 対象が実際に消え、同名の別要素だけが残る（グループ件数が減る）場合は
+/// `Ambiguous`。
+#[test]
+fn aisnap_10_removed_target_with_remaining_same_name_is_ambiguous() {
+    let before = page("<button class=\"target\">Go</button><button>Go</button><button>Go</button>");
+    let after = page("<button>Go</button><button>Go</button>");
+    let result = check_reidentification(&StabilityCase {
+        before_html: &before,
+        after_html: &after,
+        selector: ".target",
+    });
+    assert_eq!(
+        result,
+        Reidentification::Ambiguous {
+            side: Side::After,
+            count: 2
+        }
+    );
+}
+
+/// AISNAP-10・Issue #1221: name が上限（120 文字）で区別子付きの表示 name が切り詰められても、
+/// 切り詰め前のグループキーで件数を比較するので、前方挿入は `Ambiguous`。
+#[test]
+fn aisnap_10_truncated_name_group_insert_before_is_ambiguous() {
+    let long = "a".repeat(120);
+    let before = page(&format!("<button id=\"t\">{long}</button>"));
+    let after = page(&format!(
+        "<button>{long}</button><button id=\"t\">{long}</button>"
+    ));
+    let result = check_reidentification(&StabilityCase {
+        before_html: &before,
+        after_html: &after,
+        selector: "#t",
+    });
+    assert_eq!(
+        result,
+        Reidentification::Ambiguous {
+            side: Side::After,
+            count: 2
+        }
+    );
+}
+
+/// AISNAP-10・Issue #1221・判定表 A4: 対象が名前変更で別グループへ移り、元の name の同名要素が
+/// 増えた場合。変化後の holder 列は「`Stop` と `Go` 2 件を追加し対象はそのまま」の場合と同じで、
+/// 変化後にセレクタを使わない契約では区別できないため `Ambiguous`（先頭の別ボタンを `Stable`
+/// にしない）。
+#[test]
+fn aisnap_10_renamed_into_other_group_is_ambiguous() {
+    let before = page("<button class=\"target\">Go</button>");
+    let after =
+        page("<button class=\"target\">Stop</button><button>Go</button><button>Go</button>");
+    let result = check_reidentification(&StabilityCase {
+        before_html: &before,
+        after_html: &after,
+        selector: ".target",
     });
     assert_eq!(
         result,
@@ -922,4 +1267,437 @@ fn aisnap_10_compressed_cell_with_same_signature_holder_is_not_in_snapshot() {
             name: "row59".into(),
         }
     );
+}
+
+/// AISNAP-10・Issue #1221（修正 #1228）: 変化後に対象と別のセレクタ一致先へ class が移っても、
+/// 変化後はセレクタを使わないので、role+name と ref が維持されている対象は `Stable`（判定表 A2。
+/// codex P1 の指摘）。
+#[test]
+fn aisnap_10_selector_moved_to_other_element_keeps_stable() {
+    let before = page("<button class=\"target\">Go</button><button>Stop</button>");
+    let after = page("<button>Go</button><button class=\"target\">Stop</button>");
+    let result = check_reidentification(&StabilityCase {
+        before_html: &before,
+        after_html: &after,
+        selector: ".target",
+    });
+    assert_eq!(
+        result,
+        Reidentification::Stable {
+            role: "button".into(),
+            name: "Go".into(),
+            r#ref: "e9ddb5239".into(),
+        }
+    );
+}
+
+/// AISNAP-10・Issue #1221（修正 #1228）・判定表 A4: 属性セレクタでも変化後の位置を根拠にせず、
+/// 後ろへの同名追加は `Ambiguous`（構造セレクタ以外でも穴が無いこと）。
+#[test]
+fn aisnap_10_attribute_selector_insert_is_ambiguous() {
+    let before = page("<button data-k=\"t\">Go</button>");
+    let after = page("<button data-k=\"t\">Go</button><button data-k=\"u\">Go</button>");
+    let result = check_reidentification(&StabilityCase {
+        before_html: &before,
+        after_html: &after,
+        selector: "[data-k=\"t\"]",
+    });
+    assert_eq!(
+        result,
+        Reidentification::Ambiguous {
+            side: Side::After,
+            count: 2
+        }
+    );
+}
+
+/// AISNAP-10・Issue #1221（修正 #1228）・判定表 A2: `id` を持つ対象は ref が出現順に依存しない
+/// ので、後ろに同名要素が増えても `Stable`。
+#[test]
+fn aisnap_10_discriminated_target_appended_after_is_stable() {
+    let before = page("<button id=\"t\">Go</button>");
+    let after = page("<button id=\"t\">Go</button><button>Go</button>");
+    let result = check_reidentification(&StabilityCase {
+        before_html: &before,
+        after_html: &after,
+        selector: "#t",
+    });
+    assert_eq!(
+        result,
+        Reidentification::Stable {
+            role: "button".into(),
+            name: "Go".into(),
+            r#ref: "e51bd2d70".into(),
+        }
+    );
+}
+
+/// AISNAP-10・Issue #1221（修正 #1228）・判定表 A3: 重複グループが変わらない無関係な変化
+/// （先頭への段落追加）では、1 件目も 2 件目（`Go #2`）も `Stable`。
+#[test]
+fn aisnap_10_duplicates_unrelated_change_is_stable() {
+    let before = page("<button class=\"t\">Go</button><button>Go</button>");
+    let after = page("<p>note</p><button class=\"t\">Go</button><button>Go</button>");
+    let first = check_reidentification(&StabilityCase {
+        before_html: &before,
+        after_html: &after,
+        selector: ".t",
+    });
+    assert_eq!(
+        first,
+        Reidentification::Stable {
+            role: "button".into(),
+            name: "Go".into(),
+            r#ref: "e9ddb5239".into(),
+        }
+    );
+    let before = page("<button>Go</button><button class=\"t\">Go</button>");
+    let after = page("<p>note</p><button>Go</button><button class=\"t\">Go</button>");
+    let second = check_reidentification(&StabilityCase {
+        before_html: &before,
+        after_html: &after,
+        selector: ".t",
+    });
+    assert_eq!(
+        second,
+        Reidentification::Stable {
+            role: "button".into(),
+            name: "Go #2".into(),
+            r#ref: "e9ddb5239-2".into(),
+        }
+    );
+}
+
+/// AISNAP-10・Issue #1221（修正 #1228）・判定表 A4: 対象が hidden になり、別の識別属性を持つ
+/// 同名要素が加わって、同じ件数の同名グループが残る変化は検出できる（#4 の検出可能な版）。
+#[test]
+fn aisnap_10_hidden_target_replaced_by_distinct_ref_is_ambiguous() {
+    let before = page("<button class=\"target\">Go</button><button>Go</button>");
+    let after = page(
+        "<button class=\"target\" hidden>Go</button><button>Go</button><button id=\"n\">Go</button>",
+    );
+    let result = check_reidentification(&StabilityCase {
+        before_html: &before,
+        after_html: &after,
+        selector: ".target",
+    });
+    assert_eq!(
+        result,
+        Reidentification::Ambiguous {
+            side: Side::After,
+            count: 2
+        }
+    );
+}
+
+/// AISNAP-10・Issue #1221（修正 #1228）・判定表 A6: 前の同名要素が消えて `id` 付き対象の区別子
+/// `#2` が外れても、ref は同じ要素を指す。基底が同じで #n がずれただけなので `Ambiguous`。
+#[test]
+fn aisnap_10_suffix_shift_with_ref_kept_is_ambiguous() {
+    let before = page("<button>Go</button><button id=\"t\">Go</button>");
+    let after = page("<button id=\"t\">Go</button>");
+    let result = check_reidentification(&StabilityCase {
+        before_html: &before,
+        after_html: &after,
+        selector: "#t",
+    });
+    assert_eq!(
+        result,
+        Reidentification::Ambiguous {
+            side: Side::After,
+            count: 1
+        }
+    );
+}
+
+/// AISNAP-10・Issue #1221（修正 #1228）・判定表 A7: accname が同じで隣接テキストだけが変わる
+/// 変化は、順序に依存しない ref（`id`）で特定できるので `SignatureChanged`。
+#[test]
+fn aisnap_10_adjacent_text_change_is_signature_changed() {
+    let before = page("<input type=\"checkbox\" id=\"c\"> checkbox 1");
+    let after = page("<input type=\"checkbox\" id=\"c\"> checkbox one");
+    let names = |html: &str| -> Vec<String> {
+        holders_of(html)
+            .into_iter()
+            .filter(|h| h.role == "checkbox")
+            .map(|h| h.name)
+            .collect()
+    };
+    assert_eq!(names(&before), vec!["checkbox 1".to_string()]);
+    assert_eq!(names(&after), vec!["checkbox one".to_string()]);
+    let result = check_reidentification(&StabilityCase {
+        before_html: &before,
+        after_html: &after,
+        selector: "#c",
+    });
+    assert_eq!(
+        result,
+        Reidentification::SignatureChanged {
+            before: ("checkbox".into(), "checkbox 1".into()),
+            after: ("checkbox".into(), "checkbox one".into()),
+        }
+    );
+}
+
+/// AISNAP-10・Issue #1221（修正 #1228）・判定表 A8: 出現順に依存する ref（識別属性なしの重複）の
+/// 要素で表示 name だけが変わる場合、ref を持つ別要素が対象だと確かめられず `Ambiguous`。
+#[test]
+fn aisnap_10_positional_ref_display_change_is_ambiguous() {
+    let before = page("<input type=\"checkbox\" class=\"t\"> a<br><input type=\"checkbox\"> b");
+    let after = page("<input type=\"checkbox\" class=\"t\"> c<br><input type=\"checkbox\"> b");
+    let result = check_reidentification(&StabilityCase {
+        before_html: &before,
+        after_html: &after,
+        selector: ".t",
+    });
+    assert_eq!(
+        result,
+        Reidentification::Ambiguous {
+            side: Side::After,
+            count: 2
+        }
+    );
+}
+
+/// AISNAP-10・Issue #1221（修正 #1228）・判定表 A1: ページ由来の name `Go #2` が区別子付きの
+/// name と衝突する場合（#1222）は、取り違えうる 2 件として `Ambiguous`（fail-closed）。
+#[test]
+fn aisnap_10_literal_suffix_collision_is_ambiguous() {
+    let html = page("<button>Go</button><button id=\"t\">Go</button><button>Go #2</button>");
+    let result = check_reidentification(&StabilityCase {
+        before_html: &html,
+        after_html: &html,
+        selector: "#t",
+    });
+    assert_eq!(
+        result,
+        Reidentification::Ambiguous {
+            side: Side::After,
+            count: 2
+        }
+    );
+}
+
+fn target(role: &str, name: &str, group: &str, r: &str) -> Target {
+    Target {
+        role: role.into(),
+        name: name.into(),
+        group_name: group.into(),
+        r#ref: r.into(),
+    }
+}
+
+fn facts(lookup: Lookup, oi: bool, same: bool, group: usize, family: usize) -> Facts {
+    Facts {
+        lookup,
+        ref_order_independent: oi,
+        context_unchanged: same,
+        group_after: group,
+        family_after: family,
+    }
+}
+
+fn elsewhere(role: &str, name: &str, group: &str) -> Lookup {
+    Lookup::RefElsewhere {
+        role: role.into(),
+        name: name.into(),
+        group_name: group.into(),
+    }
+}
+
+fn stable_go() -> Reidentification {
+    Reidentification::Stable {
+        role: "button".into(),
+        name: "Go".into(),
+        r#ref: "eabc".into(),
+    }
+}
+
+/// AISNAP-10・Issue #1221（修正 #1228）: 判定表の変化後の行 A1〜A9 を `Facts` から直接検証する。
+#[test]
+fn aisnap_10_decide_table_rows() {
+    let t = || target("button", "Go", "Go", "eabc");
+    let amb = |count| Reidentification::Ambiguous {
+        side: Side::After,
+        count,
+    };
+    // 行 A1
+    assert_eq!(
+        decide(t(), facts(Lookup::ManyByName(3), true, true, 3, 1)),
+        amb(3)
+    );
+    // 行 A2（context_unchanged に関係なく Stable）
+    assert_eq!(
+        decide(t(), facts(Lookup::Agree, true, false, 2, 1)),
+        stable_go()
+    );
+    // 行 A3
+    assert_eq!(
+        decide(t(), facts(Lookup::Agree, false, true, 2, 2)),
+        stable_go()
+    );
+    // 行 A4
+    assert_eq!(
+        decide(t(), facts(Lookup::Agree, false, false, 2, 2)),
+        amb(2)
+    );
+    // 行 A5
+    assert_eq!(
+        decide(
+            t(),
+            facts(
+                Lookup::OneByNameRefGone {
+                    after_ref: "eold".into()
+                },
+                true,
+                true,
+                1,
+                1
+            )
+        ),
+        Reidentification::RefChanged {
+            before: "eabc".into(),
+            after: "eold".into()
+        }
+    );
+    // 行 A6
+    assert_eq!(
+        decide(
+            t(),
+            facts(elsewhere("button", "Go #2", "Go"), true, false, 2, 1)
+        ),
+        amb(2)
+    );
+    // 行 A7
+    assert_eq!(
+        decide(
+            t(),
+            facts(elsewhere("button", "Stop", "Stop"), true, true, 1, 1)
+        ),
+        Reidentification::SignatureChanged {
+            before: ("button".into(), "Go".into()),
+            after: ("button".into(), "Stop".into()),
+        }
+    );
+    // 行 A8
+    assert_eq!(
+        decide(
+            t(),
+            facts(elsewhere("button", "Stop", "Stop"), false, true, 1, 2)
+        ),
+        amb(2)
+    );
+    // 行 A9
+    assert_eq!(
+        decide(t(), facts(Lookup::Gone, true, true, 0, 0)),
+        Reidentification::MissingAfter {
+            role: "button".into(),
+            name: "Go".into()
+        }
+    );
+}
+
+/// AISNAP-10・Issue #1221（修正 #1228）: 順序に依存する ref（`-n` 付き）の `Agree` は A2 ではなく
+/// A3・A4 になり、`Ambiguous` の件数は 0 にならない。
+#[test]
+fn aisnap_10_decide_positional_ref_and_count_floor() {
+    let t = target("button", "Go #2", "Go", "eabc-2");
+    let f = observe(
+        &t,
+        &[
+            holder("button", "Go", "Go", "eabc"),
+            holder("button", "Go #2", "Go", "eabc-2"),
+        ],
+        &[holder("button", "Go #2", "Go", "eabc-2")],
+    );
+    assert_eq!(f.lookup, Lookup::Agree);
+    assert!(!f.ref_order_independent);
+    assert!(!f.context_unchanged);
+    assert_eq!(
+        decide(t, f),
+        Reidentification::Ambiguous {
+            side: Side::After,
+            count: 1
+        }
+    );
+    // 件数 0 でも `Ambiguous` の count は 1 以上（行 A4・A6・A8）。
+    let t = || target("button", "Go", "Go", "eabc");
+    for f in [
+        facts(Lookup::Agree, false, false, 0, 0),
+        facts(elsewhere("button", "Go #2", "Go"), true, false, 0, 0),
+        facts(elsewhere("link", "x", "x"), false, false, 0, 0),
+    ] {
+        assert_eq!(
+            decide(t(), f),
+            Reidentification::Ambiguous {
+                side: Side::After,
+                count: 1
+            }
+        );
+    }
+}
+
+fn holder(role: &str, name: &str, group: &str, r: &str) -> RefHolder {
+    RefHolder {
+        node: parse("").root(),
+        role: role.into(),
+        name: name.into(),
+        group_name: group.into(),
+        r#ref: r.into(),
+    }
+}
+
+/// AISNAP-10・Issue #1221（修正 #1228）: ref ファミリのキーは末尾の `-<数字>` だけを除く。
+#[test]
+fn aisnap_10_ref_family_key_strips_only_occurrence_suffix() {
+    assert_eq!(ref_family_key("e1a2b3c4d5"), "e1a2b3c4d5");
+    assert_eq!(ref_family_key("e1a2b3c4d5-12"), "e1a2b3c4d5");
+    assert_eq!(ref_family_key("e1a2b3c4d5v2-3"), "e1a2b3c4d5v2");
+    assert_eq!(ref_family_key("e1a2b3c4d5v2"), "e1a2b3c4d5v2");
+    assert_eq!(ref_family_key("e1a2-"), "e1a2-");
+    assert_eq!(ref_family_key("e1a2-x"), "e1a2-x");
+}
+
+/// AISNAP-10・Issue #1221（修正 #1228）・TASK-17.2: `benches/fixtures` の全ページで、変化なし
+/// （前後が同じ holder 列）の各 ref 保持要素の判定は、ページ由来の name 衝突（行 A1）を除き
+/// すべて `Stable` になる。
+#[test]
+fn aisnap_10_unchanged_fixtures_are_stable_for_every_holder() {
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("benches")
+        .join("fixtures");
+    let mut names: Vec<String> = std::fs::read_dir(&dir)
+        .expect("フィクスチャディレクトリは読める")
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.ends_with(".html"))
+        .collect();
+    names.sort();
+    assert_eq!(names.len(), 17, "{names:?}");
+    let mut failures: Vec<String> = Vec::new();
+    for n in &names {
+        let holders = holders_of(&fixture(n));
+        for h in &holders {
+            let t = Target {
+                role: h.role.clone(),
+                name: h.name.clone(),
+                group_name: h.group_name.clone(),
+                r#ref: h.r#ref.clone(),
+            };
+            let f = observe(&t, &holders, &holders);
+            if matches!(f.lookup, Lookup::ManyByName(_)) {
+                continue;
+            }
+            let result = decide(t.clone(), f);
+            let expected = Reidentification::Stable {
+                role: t.role.clone(),
+                name: t.name.clone(),
+                r#ref: t.r#ref.clone(),
+            };
+            if result != expected {
+                failures.push(format!("{n}: {t:?} -> {result:?}"));
+            }
+        }
+    }
+    assert_eq!(failures, Vec::<String>::new());
 }

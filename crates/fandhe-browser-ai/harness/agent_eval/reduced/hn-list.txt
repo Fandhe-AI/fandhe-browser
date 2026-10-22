@@ -6,7 +6,7 @@
           - table
             - rowgroup
               - row
-                - cell [e30067c12]
+                - cell "#2" [e30067c12]
                   - link [e6f926085]
                 - cell "| | | | | |" [e916595c8]
                   - link "News Board" [eb6ae1216]
@@ -17,23 +17,23 @@
                   - link "show" [e6482971e]
                   - link "jobs" [e0b89104e]
                   - link "submit" [e27c7aef1]
-                - cell [e24e88a8b]
+                - cell "#3" [e24e88a8b]
                   - link "login" [e83c77161]
       - row
       - row
-        - cell [ebc6bcb75]
+        - cell "#4" [ebc6bcb75]
           - table
             - rowgroup
               - row
                 - cell "1." [e9ada0c0d]
-                - cell [ee8d735f6]
-                  - link [e21e5443a]
+                - cell "#5" [ee8d735f6]
+                  - link "#2" [e21e5443a]
                     - generic "upvote"
                 - cell "( )" [edfc125f5]
                   - link "Compass pattern beta anchor lantern sigma ribbon" [e2613221b]
                   - link "example.com" [e02212aa9]
               - row
-                - cell [ee3b29860]
+                - cell "#6" [ee3b29860]
                 - cell "20 points by | |" [e0c934869]
                   - link "member0" [e4b2b2f2e]
                   - generic "2025-01-01T00:00:00"
@@ -43,501 +43,501 @@
               - row
               - row
                 - cell "2." [e7cd1c558]
-                - cell [e7782f9c9]
-                  - link [e78e3ac7c]
+                - cell "#7" [e7782f9c9]
+                  - link "#3" [e78e3ac7c]
                     - generic "upvote"
-                - cell "( )" [e947b1e6a]
+                - cell "( ) #2" [e947b1e6a]
                   - link "Valley stream thread ribbon bridge prism ribbon" [ec1dfbe95]
-                  - link "example.com" [e63e129d1]
+                  - link "example.com #2" [e63e129d1]
               - row
-                - cell [ec0478337]
+                - cell "#8" [ec0478337]
                 - cell "27 points by | |" [e50221117]
                   - link "member1" [e6bebb195]
                   - generic "2025-01-01T00:00:00"
                     - link "2 hours ago" [e8321157f]
-                  - link "hide" [e7f1c0fae]
+                  - link "hide #2" [e7f1c0fae]
                   - link "5 comments" [e530f1175]
               - row
               - row
                 - cell "3." [e0ee9b130]
-                - cell [e44ed09ea]
-                  - link [e26526269]
+                - cell "#9" [e44ed09ea]
+                  - link "#4" [e26526269]
                     - generic "upvote"
-                - cell "( )" [e5d72909a]
+                - cell "( ) #3" [e5d72909a]
                   - link "Kappa gradient kappa zeta thunder surface orbit" [e51c8192b]
-                  - link "example.com" [e7d7597a5]
+                  - link "example.com #3" [e7d7597a5]
               - row
-                - cell [e87d3fa08]
+                - cell "#10" [e87d3fa08]
                 - cell "34 points by | |" [e0ccee55c]
                   - link "member2" [efc0d9a4b]
                   - generic "2025-01-01T00:00:00"
                     - link "3 hours ago" [ed65828cb]
-                  - link "hide" [e8dc64ecf]
+                  - link "hide #3" [e8dc64ecf]
                   - link "10 comments" [e783f8bf4]
               - row
               - row
                 - cell "4." [e69b4b829]
-                - cell [ec7b19643]
-                  - link [e75164d76]
+                - cell "#11" [ec7b19643]
+                  - link "#5" [e75164d76]
                     - generic "upvote"
-                - cell "( )" [ebe8b7703]
+                - cell "( ) #4" [ebe8b7703]
                   - link "Market thunder anchor window bridge market canvas" [efe770e3c]
-                  - link "example.com" [e72308631]
+                  - link "example.com #4" [e72308631]
               - row
-                - cell [e86891d42]
+                - cell "#12" [e86891d42]
                 - cell "41 points by | |" [ea4896188]
                   - link "member3" [e2a427517]
                   - generic "2025-01-01T00:00:00"
                     - link "4 hours ago" [e8b410792]
-                  - link "hide" [e98f80ba0]
+                  - link "hide #4" [e98f80ba0]
                   - link "15 comments" [ee213fd2c]
               - row
               - row
                 - cell "5." [ead0059e5]
-                - cell [e3848db4a]
-                  - link [e7c4d342a]
+                - cell "#13" [e3848db4a]
+                  - link "#6" [e7c4d342a]
                     - generic "upvote"
-                - cell "( )" [effc53746]
+                - cell "( ) #5" [effc53746]
                   - link "System beta garden buffer thunder delta canvas" [ec0e37ab3]
-                  - link "example.com" [ef7d28d8a]
+                  - link "example.com #5" [ef7d28d8a]
               - row
-                - cell [ef44b04e1]
+                - cell "#14" [ef44b04e1]
                 - cell "48 points by | |" [e7ec1090a]
                   - link "member4" [e09b6453f]
                   - generic "2025-01-01T00:00:00"
                     - link "5 hours ago" [e556e3ac2]
-                  - link "hide" [e716b4d98]
+                  - link "hide #5" [e716b4d98]
                   - link "20 comments" [e00f4b1a4]
               - row
               - row
                 - cell "6." [e71a7d527]
-                - cell [e709b93cd]
-                  - link [ee45f8898]
+                - cell "#15" [e709b93cd]
+                  - link "#7" [ee45f8898]
                     - generic "upvote"
-                - cell "( )" [eef4f29a0]
+                - cell "( ) #6" [eef4f29a0]
                   - link "Vector kappa canvas channel bridge meadow canvas" [e7d0ebfa8]
-                  - link "example.com" [e210444ab]
+                  - link "example.com #6" [e210444ab]
               - row
-                - cell [e0eddcbfb]
+                - cell "#16" [e0eddcbfb]
                 - cell "55 points by | |" [eea9465e0]
                   - link "member5" [e1deac81e]
                   - generic "2025-01-01T00:00:00"
                     - link "6 hours ago" [e3e7a9d76]
-                  - link "hide" [ed8a0f2ae]
+                  - link "hide #6" [ed8a0f2ae]
                   - link "25 comments" [ed8f29de3]
               - row
               - row
                 - cell "7." [e4e65b935]
-                - cell [efd7c97c5]
-                  - link [ee0943091]
+                - cell "#17" [efd7c97c5]
+                  - link "#8" [ee0943091]
                     - generic "upvote"
-                - cell "( )" [e8e4985e2]
+                - cell "( ) #7" [e8e4985e2]
                   - link "Meadow market pattern orbit orbit buffer lantern" [ec31ca863]
-                  - link "example.com" [e1cf13dd8]
+                  - link "example.com #7" [e1cf13dd8]
               - row
-                - cell [edcdf57a1]
+                - cell "#18" [edcdf57a1]
                 - cell "62 points by | |" [e5f4fce48]
                   - link "member6" [e7b80ab09]
                   - generic "2025-01-01T00:00:00"
                     - link "7 hours ago" [ee4f9edbf]
-                  - link "hide" [ebdeb7739]
+                  - link "hide #7" [ebdeb7739]
                   - link "30 comments" [e04225843]
               - row
               - row
                 - cell "8." [e4a2659df]
-                - cell [eea96ab07]
-                  - link [ea0fe42c2]
+                - cell "#19" [eea96ab07]
+                  - link "#9" [ea0fe42c2]
                     - generic "upvote"
-                - cell "( )" [e74f8277c]
+                - cell "( ) #8" [e74f8277c]
                   - link "Prism system alpha epsilon network river lantern" [e01b966ae]
-                  - link "example.com" [edc3537b3]
+                  - link "example.com #8" [edc3537b3]
               - row
-                - cell [e6e51e61f]
+                - cell "#20" [e6e51e61f]
                 - cell "69 points by | |" [e45edf76c]
                   - link "member7" [edc4fba7e]
                   - generic "2025-01-01T00:00:00"
                     - link "8 hours ago" [e580179bf]
-                  - link "hide" [ec30f6137]
+                  - link "hide #8" [ec30f6137]
                   - link "35 comments" [e7d517e79]
               - row
               - row
                 - cell "9." [ef03978ae]
-                - cell [ef28cf674]
-                  - link [e3c03059b]
+                - cell "#21" [ef28cf674]
+                  - link "#10" [e3c03059b]
                     - generic "upvote"
-                - cell "( )" [e9b7a65e1]
+                - cell "( ) #9" [e9b7a65e1]
                   - link "Epsilon matrix engine garden orbit prism lantern" [e3a485304]
-                  - link "example.com" [eb065ff77]
+                  - link "example.com #9" [eb065ff77]
               - row
-                - cell [e08376744]
+                - cell "#22" [e08376744]
                 - cell "76 points by | |" [ed5b07a50]
                   - link "member8" [e44c35a02]
                   - generic "2025-01-01T00:00:00"
                     - link "9 hours ago" [e75ace809]
-                  - link "hide" [e0d738bf3]
+                  - link "hide #9" [e0d738bf3]
                   - link "40 comments" [ee7fa3eb8]
               - row
               - row
                 - cell "10." [ea47f53d0]
-                - cell [ec73a594f]
-                  - link [eb6b35502]
+                - cell "#23" [ec73a594f]
+                  - link "#11" [eb6b35502]
                     - generic "upvote"
-                - cell "( )" [e1315ad3a]
+                - cell "( ) #10" [e1315ad3a]
                   - link "River harbor zeta module network surface anchor" [ebc409bef]
-                  - link "example.com" [e2b7d8423]
+                  - link "example.com #10" [e2b7d8423]
               - row
-                - cell [ed3cf664d]
+                - cell "#24" [ed3cf664d]
                 - cell "83 points by | |" [e4a6abccb]
                   - link "member9" [eee20ff67]
                   - generic "2025-01-01T00:00:00"
                     - link "10 hours ago" [eb73edeea]
-                  - link "hide" [e7a00dfa2]
+                  - link "hide #10" [e7a00dfa2]
                   - link "45 comments" [eafb88f95]
               - row
               - row
                 - cell "11." [e583dcdd0]
-                - cell [ec2fb87a5]
-                  - link [ec20db911]
+                - cell "#25" [ec2fb87a5]
+                  - link "#12" [ec20db911]
                     - generic "upvote"
-                - cell "( )" [e6717c686]
+                - cell "( ) #11" [e6717c686]
                   - link "Pattern ribbon channel surface ribbon signal anchor" [e55f05c77]
-                  - link "example.com" [e5360811d]
+                  - link "example.com #11" [e5360811d]
               - row
-                - cell [ea310692d]
+                - cell "#26" [ea310692d]
                 - cell "90 points by | |" [e0800c63d]
                   - link "member10" [ecb9e476b]
                   - generic "2025-01-01T00:00:00"
                     - link "11 hours ago" [ed984b3e2]
-                  - link "hide" [e60f352f8]
+                  - link "hide #11" [e60f352f8]
                   - link "50 comments" [e70fe1dfc]
               - row
               - row
                 - cell "12." [ebff34519]
-                - cell [e69b4e99d]
-                  - link [effa743cd]
+                - cell "#27" [e69b4e99d]
+                  - link "#13" [effa743cd]
                     - generic "upvote"
-                - cell "( )" [eec7b3703]
+                - cell "( ) #12" [eec7b3703]
                   - link "Stream delta garden thunder record zeta anchor" [e8b395a0e]
-                  - link "example.com" [edb540c02]
+                  - link "example.com #12" [edb540c02]
               - row
-                - cell [ebce1ca8e]
+                - cell "#28" [ebce1ca8e]
                 - cell "97 points by | |" [e434ad042]
                   - link "member11" [e5f499d5e]
                   - generic "2025-01-01T00:00:00"
                     - link "12 hours ago" [e6260fd85]
-                  - link "hide" [e842436b0]
+                  - link "hide #12" [e842436b0]
                   - link "55 comments" [ea0628559]
               - row
               - row
                 - cell "13." [ed25d3e6c]
-                - cell [e43a6bd4e]
-                  - link [e34a8a6a0]
+                - cell "#29" [e43a6bd4e]
+                  - link "#14" [e34a8a6a0]
                     - generic "upvote"
-                - cell "( )" [ecfc07ec7]
+                - cell "( ) #13" [ecfc07ec7]
                   - link "Gradient river compass gamma ribbon meadow layer" [e5626d3aa]
-                  - link "example.com" [e81550533]
+                  - link "example.com #13" [e81550533]
               - row
-                - cell [ec397b622]
+                - cell "#30" [ec397b622]
                 - cell "104 points by | |" [e16ae9789]
                   - link "member12" [e25257a76]
                   - generic "2025-01-01T00:00:00"
-                    - link "1 hours ago" [e07a68965]
-                  - link "hide" [ed56a5ae4]
+                    - link "1 hours ago #2" [e07a68965]
+                  - link "hide #13" [ed56a5ae4]
                   - link "60 comments" [e80fa6000]
               - row
               - row
                 - cell "14." [e7c3f2bce]
-                - cell [ed0645e50]
-                  - link [e2eb21eb4]
+                - cell "#31" [ed0645e50]
+                  - link "#15" [e2eb21eb4]
                     - generic "upvote"
-                - cell "( )" [e064f0a96]
+                - cell "( ) #14" [e064f0a96]
                   - link "Orbit signal pattern river record cursor layer" [e725767fb]
-                  - link "example.com" [ef6f81f94]
+                  - link "example.com #14" [ef6f81f94]
               - row
-                - cell [eff86fb3f]
+                - cell "#32" [eff86fb3f]
                 - cell "111 points by | |" [e19df4a3e]
                   - link "member13" [e5b7a1806]
                   - generic "2025-01-01T00:00:00"
-                    - link "2 hours ago" [ee9d6c46c]
-                  - link "hide" [ec59bb749]
+                    - link "2 hours ago #2" [ee9d6c46c]
+                  - link "hide #14" [ec59bb749]
                   - link "65 comments" [e0d207913]
               - row
               - row
                 - cell "15." [e82584366]
-                - cell [e6099851f]
-                  - link [efbd74ac1]
+                - cell "#33" [e6099851f]
+                  - link "#16" [efbd74ac1]
                     - generic "upvote"
-                - cell "( )" [eea04c001]
+                - cell "( ) #15" [eea04c001]
                   - link "Alpha stream summit record valley river layer" [e886f8554]
-                  - link "example.com" [edfb13ac4]
+                  - link "example.com #15" [edfb13ac4]
               - row
-                - cell [e79a24710]
+                - cell "#34" [e79a24710]
                 - cell "118 points by | |" [e3503be8d]
                   - link "member14" [ecb623a99]
                   - generic "2025-01-01T00:00:00"
-                    - link "3 hours ago" [eb797f5e1]
-                  - link "hide" [e98fc11f7]
+                    - link "3 hours ago #2" [eb797f5e1]
+                  - link "hide #15" [e98fc11f7]
                   - link "70 comments" [e427e8506]
               - row
               - row
                 - cell "16." [e6e941422]
-                - cell [e17184b27]
-                  - link [e6b3e7958]
+                - cell "#35" [e17184b27]
+                  - link "#17" [e6b3e7958]
                     - generic "upvote"
-                - cell "( )" [e79a8d5f7]
+                - cell "( ) #16" [e79a8d5f7]
                   - link "Lambda layer stream matrix module valley surface" [e6abd88df]
-                  - link "example.com" [ef9b81dd5]
+                  - link "example.com #16" [ef9b81dd5]
               - row
-                - cell [ea656b525]
+                - cell "#36" [ea656b525]
                 - cell "125 points by | |" [e4c543d0b]
                   - link "member15" [ee458cbdd]
                   - generic "2025-01-01T00:00:00"
-                    - link "4 hours ago" [e95bd3751]
-                  - link "hide" [e65142944]
+                    - link "4 hours ago #2" [e95bd3751]
+                  - link "hide #16" [e65142944]
                   - link "75 comments" [e037b4049]
               - row
               - row
                 - cell "17." [eb93f8624]
-                - cell [ec768c0d1]
-                  - link [ee977a26d]
+                - cell "#37" [ec768c0d1]
+                  - link "#18" [ee977a26d]
                     - generic "upvote"
-                - cell "( )" [e3855dc52]
+                - cell "( ) #17" [e3855dc52]
                   - link "Bridge lantern theta compass valley surface vector" [ec9a55a7e]
-                  - link "example.com" [e648fa299]
+                  - link "example.com #17" [e648fa299]
               - row
-                - cell [e4ec04172]
+                - cell "#38" [e4ec04172]
                 - cell "132 points by | |" [e6843a0a8]
                   - link "member16" [e6382bdc3]
                   - generic "2025-01-01T00:00:00"
-                    - link "5 hours ago" [e220f8d33]
-                  - link "hide" [e1a625641]
+                    - link "5 hours ago #2" [e220f8d33]
+                  - link "hide #17" [e1a625641]
                   - link "80 comments" [e2fd44422]
               - row
               - row
                 - cell "18." [eb64ad90b]
-                - cell [e92c06f33]
-                  - link [e1b72aac0]
+                - cell "#39" [e92c06f33]
+                  - link "#19" [e1b72aac0]
                     - generic "upvote"
-                - cell "( )" [e6e869628]
+                - cell "( ) #18" [e6e869628]
                   - link "Cursor valley layer beta module network vector" [e75069772]
-                  - link "example.com" [ec712680c]
+                  - link "example.com #18" [ec712680c]
               - row
-                - cell [e1e94c309]
+                - cell "#40" [e1e94c309]
                 - cell "139 points by | |" [e8ce80278]
                   - link "member17" [e27747117]
                   - generic "2025-01-01T00:00:00"
-                    - link "6 hours ago" [e83ef020b]
-                  - link "hide" [eb1263416]
+                    - link "6 hours ago #2" [e83ef020b]
+                  - link "hide #18" [eb1263416]
                   - link "85 comments" [eb8028531]
               - row
               - row
                 - cell "19." [e459e25b7]
-                - cell [e1ab03a96]
-                  - link [e43264aee]
+                - cell "#41" [e1ab03a96]
+                  - link "#20" [e43264aee]
                     - generic "upvote"
-                - cell "( )" [ed1c26874]
+                - cell "( ) #19" [ed1c26874]
                   - link "Matrix zeta stone sigma summit zeta engine" [e9ede364a]
-                  - link "example.com" [eccd01e5d]
+                  - link "example.com #19" [eccd01e5d]
               - row
-                - cell [e57b8908d]
+                - cell "#42" [e57b8908d]
                 - cell "146 points by | |" [ed86977bd]
                   - link "member18" [e88032c88]
                   - generic "2025-01-01T00:00:00"
-                    - link "7 hours ago" [e390a170d]
-                  - link "hide" [e9c586e15]
-                  - link "0 comments" [e5969c38b]
+                    - link "7 hours ago #2" [e390a170d]
+                  - link "hide #19" [e9c586e15]
+                  - link "0 comments #2" [e5969c38b]
               - row
               - row
                 - cell "20." [ea7525a7b]
-                - cell [ef5eaa8ce]
-                  - link [ef8646878]
+                - cell "#43" [ef5eaa8ce]
+                  - link "#21" [ef8646878]
                     - generic "upvote"
-                - cell "( )" [e41bf3e2c]
+                - cell "( ) #20" [e41bf3e2c]
                   - link "Lantern garden lantern network buffer compass stream" [e270b82e6]
-                  - link "example.com" [e95db05c6]
+                  - link "example.com #20" [e95db05c6]
               - row
-                - cell [eafa39143]
+                - cell "#44" [eafa39143]
                 - cell "153 points by | |" [e5792d13e]
                   - link "member19" [ed54e4873]
                   - generic "2025-01-01T00:00:00"
-                    - link "8 hours ago" [e325eb522]
-                  - link "hide" [e70ac081f]
-                  - link "5 comments" [e72a432e0]
+                    - link "8 hours ago #2" [e325eb522]
+                  - link "hide #20" [e70ac081f]
+                  - link "5 comments #2" [e72a432e0]
               - row
               - row
                 - cell "21." [efd2448d5]
-                - cell [e88fd57fa]
-                  - link [e623c66e9]
+                - cell "#45" [e88fd57fa]
+                  - link "#22" [e623c66e9]
                     - generic "upvote"
-                - cell "( )" [e802c54ea]
+                - cell "( ) #21" [e802c54ea]
                   - link "Valley pattern network engine alpha thread stream" [e4d868b5a]
-                  - link "example.com" [eb5946420]
+                  - link "example.com #21" [eb5946420]
               - row
-                - cell [ef889f105]
+                - cell "#46" [ef889f105]
                 - cell "160 points by | |" [e038400d0]
                   - link "member20" [e20e2e5ff]
                   - generic "2025-01-01T00:00:00"
-                    - link "9 hours ago" [eb9df67cf]
-                  - link "hide" [e95045eaa]
-                  - link "10 comments" [eb8b2e400]
+                    - link "9 hours ago #2" [eb9df67cf]
+                  - link "hide #21" [e95045eaa]
+                  - link "10 comments #2" [eb8b2e400]
               - row
               - row
                 - cell "22." [e84ada5ef]
-                - cell [e8f924a88]
-                  - link [e2728344e]
+                - cell "#47" [e8f924a88]
+                  - link "#23" [e2728344e]
                     - generic "upvote"
-                - cell "( )" [e90910246]
+                - cell "( ) #22" [e90910246]
                   - link "Zeta engine valley meadow buffer river cursor" [e6b970833]
-                  - link "example.com" [e146ff4d0]
+                  - link "example.com #22" [e146ff4d0]
               - row
-                - cell [e8b2d3dd5]
+                - cell "#48" [e8b2d3dd5]
                 - cell "167 points by | |" [e82d559b8]
                   - link "member21" [effde22da]
                   - generic "2025-01-01T00:00:00"
-                    - link "10 hours ago" [e0cf600f9]
-                  - link "hide" [eec402b4a]
-                  - link "15 comments" [e180af63c]
+                    - link "10 hours ago #2" [e0cf600f9]
+                  - link "hide #22" [eec402b4a]
+                  - link "15 comments #2" [e180af63c]
               - row
               - row
                 - cell "23." [e53443cfe]
-                - cell [ee490dc96]
-                  - link [ebcfcc58e]
+                - cell "#49" [ee490dc96]
+                  - link "#24" [ebcfcc58e]
                     - generic "upvote"
-                - cell "( )" [e310e5e30]
+                - cell "( ) #23" [e310e5e30]
                   - link "Stone gradient cursor valley alpha valley module" [ef7c30771]
-                  - link "example.com" [ec52cc3f9]
+                  - link "example.com #23" [ec52cc3f9]
               - row
-                - cell [e43406e1f]
+                - cell "#50" [e43406e1f]
                 - cell "174 points by | |" [e8a5237d0]
                   - link "member22" [e49821587]
                   - generic "2025-01-01T00:00:00"
-                    - link "11 hours ago" [e966de5d4]
-                  - link "hide" [ef73aae54]
-                  - link "20 comments" [e5af55f08]
+                    - link "11 hours ago #2" [e966de5d4]
+                  - link "hide #23" [ef73aae54]
+                  - link "20 comments #2" [e5af55f08]
               - row
               - row
                 - cell "24." [e18dfc103]
-                - cell [e99296483]
-                  - link [ef2a56288]
+                - cell "#51" [e99296483]
+                  - link "#25" [ef2a56288]
                     - generic "upvote"
-                - cell "( )" [e6ee7908c]
+                - cell "( ) #24" [e6ee7908c]
                   - link "Record orbit zeta lambda stream channel module" [ece4d252f]
-                  - link "example.com" [e5bc2d193]
+                  - link "example.com #24" [e5bc2d193]
               - row
-                - cell [e3d5f6b32]
+                - cell "#52" [e3d5f6b32]
                 - cell "181 points by | |" [e25aa6d8e]
                   - link "member23" [e8af8cfc9]
                   - generic "2025-01-01T00:00:00"
-                    - link "12 hours ago" [e475eb64a]
-                  - link "hide" [ec8878a34]
-                  - link "25 comments" [e01d04ee2]
+                    - link "12 hours ago #2" [e475eb64a]
+                  - link "hide #24" [ec8878a34]
+                  - link "25 comments #2" [e01d04ee2]
               - row
               - row
                 - cell "25." [ec6c227ca]
-                - cell [e4287da52]
-                  - link [eec16ef04]
+                - cell "#53" [e4287da52]
+                  - link "#26" [eec16ef04]
                     - generic "upvote"
-                - cell "( )" [e80ce19d8]
+                - cell "( ) #25" [e80ce19d8]
                   - link "Thread beta channel signal gamma record system" [e8ba137ca]
-                  - link "example.com" [e32590170]
+                  - link "example.com #25" [e32590170]
               - row
-                - cell [effd048cd]
+                - cell "#54" [effd048cd]
                 - cell "188 points by | |" [e42e34df6]
                   - link "member24" [e834c8205]
                   - generic "2025-01-01T00:00:00"
-                    - link "1 hours ago" [e8aa8ccc4]
-                  - link "hide" [e98376be2]
-                  - link "30 comments" [ece483053]
+                    - link "1 hours ago #3" [e8aa8ccc4]
+                  - link "hide #25" [e98376be2]
+                  - link "30 comments #2" [ece483053]
               - row
               - row
                 - cell "26." [ef686b4f8]
-                - cell [e9c7d1ed1]
-                  - link [e8c5a9608]
+                - cell "#55" [e9c7d1ed1]
+                  - link "#27" [e8c5a9608]
                     - generic "upvote"
-                - cell "( )" [e3b33827c]
+                - cell "( ) #26" [e3b33827c]
                   - link "Anchor sigma river vector stream zeta system" [e75571d8b]
-                  - link "example.com" [eacee8108]
+                  - link "example.com #26" [eacee8108]
               - row
-                - cell [e360a42e9]
+                - cell "#56" [e360a42e9]
                 - cell "195 points by | |" [e9c711293]
                   - link "member25" [e427703cf]
                   - generic "2025-01-01T00:00:00"
-                    - link "2 hours ago" [e9450676f]
-                  - link "hide" [e70b95309]
-                  - link "35 comments" [edd5c3747]
+                    - link "2 hours ago #3" [e9450676f]
+                  - link "hide #26" [e70b95309]
+                  - link "35 comments #2" [edd5c3747]
               - row
               - row
                 - cell "27." [eff6d7626]
-                - cell [e3a87b730]
-                  - link [e9e9e4d15]
+                - cell "#57" [e3a87b730]
+                  - link "#28" [e9e9e4d15]
                     - generic "upvote"
-                - cell "( )" [e3be51f5b]
+                - cell "( ) #27" [e3be51f5b]
                   - link "Orbit bridge compass meadow gamma thunder pattern" [e988b3f93]
-                  - link "example.com" [e3dd134f4]
+                  - link "example.com #27" [e3dd134f4]
               - row
-                - cell [e88142f8e]
+                - cell "#58" [e88142f8e]
                 - cell "202 points by | |" [eeda5bf56]
                   - link "member26" [ef0c03201]
                   - generic "2025-01-01T00:00:00"
-                    - link "3 hours ago" [e9027bbf0]
-                  - link "hide" [e9c31da1b]
-                  - link "40 comments" [e9e928312]
+                    - link "3 hours ago #3" [e9027bbf0]
+                  - link "hide #27" [e9c31da1b]
+                  - link "40 comments #2" [e9e928312]
               - row
               - row
                 - cell "28." [ed9596bce]
-                - cell [eb295a832]
-                  - link [e2d69cae2]
+                - cell "#59" [eb295a832]
+                  - link "#29" [e2d69cae2]
                     - generic "upvote"
-                - cell "( )" [e2f087973]
+                - cell "( ) #28" [e2f087973]
                   - link "Delta cursor signal valley engine thread network" [e7be774c7]
-                  - link "example.com" [e2e163462]
+                  - link "example.com #28" [e2e163462]
               - row
-                - cell [e197cc384]
+                - cell "#60" [e197cc384]
                 - cell "209 points by | |" [e3a96ed89]
                   - link "member27" [e9107bbeb]
                   - generic "2025-01-01T00:00:00"
-                    - link "4 hours ago" [e24dcf524]
-                  - link "hide" [ea985f88f]
-                  - link "45 comments" [e0e9f305d]
+                    - link "4 hours ago #3" [e24dcf524]
+                  - link "hide #28" [ea985f88f]
+                  - link "45 comments #2" [e0e9f305d]
               - row
               - row
                 - cell "29." [e1ec3a355]
-                - cell [e745a8add]
-                  - link [ed6b9219c]
+                - cell "#61" [e745a8add]
+                  - link "#30" [ed6b9219c]
                     - generic "upvote"
-                - cell "( )" [e30f9e4d0]
+                - cell "( ) #29" [e30f9e4d0]
                   - link "Sigma surface summit lambda epsilon window network" [e48797bab]
-                  - link "example.com" [e7344ee0c]
+                  - link "example.com #29" [e7344ee0c]
               - row
-                - cell [efd146bb6]
+                - cell "#62" [efd146bb6]
                 - cell "216 points by | |" [edb70af4f]
                   - link "member28" [e0889df10]
                   - generic "2025-01-01T00:00:00"
-                    - link "5 hours ago" [e7564f89d]
-                  - link "hide" [e376ae374]
-                  - link "50 comments" [e625d70ff]
+                    - link "5 hours ago #3" [e7564f89d]
+                  - link "hide #29" [e376ae374]
+                  - link "50 comments #2" [e625d70ff]
               - row
               - row
                 - cell "30." [e8dd61b84]
-                - cell [e00b168d2]
-                  - link [e9b91b924]
+                - cell "#63" [e00b168d2]
+                  - link "#31" [e9b91b924]
                     - generic "upvote"
-                - cell "( )" [e7ac887bb]
+                - cell "( ) #30" [e7ac887bb]
                   - link "Signal compass stream signal engine beta bridge" [ecdf2d398]
-                  - link "example.com" [ee555201a]
+                  - link "example.com #30" [ee555201a]
               - row
-                - cell [e96e6735c]
+                - cell "#64" [e96e6735c]
                 - cell "223 points by | |" [e228bd513]
                   - link "member29" [e2723d118]
                   - generic "2025-01-01T00:00:00"
-                    - link "6 hours ago" [eeaefe296]
-                  - link "hide" [e483fbb5f]
-                  - link "55 comments" [ebe4fd80a]
+                    - link "6 hours ago #3" [eeaefe296]
+                  - link "hide #30" [e483fbb5f]
+                  - link "55 comments #2" [ebe4fd80a]
               - row
               - row
               - row
-                - cell [ec5b6a4e2]
-                - cell [e4b78df3f]
+                - cell "#65" [ec5b6a4e2]
+                - cell "#66" [e4b78df3f]
                   - link "More" [e57968550]
       - row
         - cell "| | | | Search:" [e349b9edb]

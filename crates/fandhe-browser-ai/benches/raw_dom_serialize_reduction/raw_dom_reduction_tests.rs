@@ -144,7 +144,7 @@ fn aisnap15_real_fixtures_formula_and_order() {
 const EXPECTED: [(&str, usize, usize, f64); 3] = [
     ("example-minimal.html", 52, 32, 38.5),
     ("login-form.html", 233, 106, 54.5),
-    ("wikipedia-article.html", 55_917, 20_931, 62.6),
+    ("wikipedia-article.html", 55_917, 21_948, 60.7),
 ];
 
 #[test]
@@ -159,8 +159,8 @@ fn aisnap15_real_fixtures_pinned_values_and_summary() {
     }
     let s = summarize(&rows).expect("summary");
     assert_eq!(s.pages, 17);
-    assert!((s.mean_reduction_pct - 38.5).abs() < 0.05, "{s:?}");
-    assert!((s.min_reduction_pct - -37.5).abs() < 0.05);
+    assert!((s.mean_reduction_pct - 36.3).abs() < 0.05, "{s:?}");
+    assert!((s.min_reduction_pct - -40.9).abs() < 0.05);
     assert!((s.max_reduction_pct - 69.3).abs() < 0.05);
 }
 
