@@ -146,7 +146,10 @@ pub use event_loop::{
     DEFAULT_MAX_REGISTERED_TIMERS, DEFAULT_MAX_TIMER_FIRES, DEFAULT_MAX_VIRTUAL_TIME,
     EventLoopLimits, MAX_TIMER_DELAY_MS,
 };
-pub use fetch::{FetchOptions, FetchResponse, Fetcher, USER_AGENT, check_network_target_url};
+pub use fetch::{
+    FetchOptions, FetchResponse, Fetcher, USER_AGENT, UrlOrigin, check_network_target_url,
+    url_origin,
+};
 // js crate のワーカー入口をそのまま再エクスポートする（ラッパーを挟まない）。ラッパーで
 // マーカー設定時にも `None` を返すと fail-closed が崩れるため（security.md・`JS-2`・#513）。
 pub use fandhe_browser_js::run_js_worker_if_requested;

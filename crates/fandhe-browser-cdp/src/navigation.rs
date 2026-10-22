@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::sync::{Arc, Mutex, PoisonError};
 
-use fandhe_browser_core::NavigationState;
+use fandhe_browser_core::{NavigationScope, NavigationState, ScriptContextHandle};
 
 use crate::target::{TargetId, TargetRegistry};
 
@@ -46,13 +46,53 @@ fn initial_blank_loader_id() -> Option<String> {
 /// 別ターゲットへの `Page.navigate` が他ターゲットの HTML・URL を上書きしないよう分離する。
 pub(crate) struct TargetNavigations {
     inner: Mutex<HashMap<TargetId, Arc<NavigationState>>>,
+    /// 評価コンテキストのハンドル（`AppState::script_contexts()` の clone）。表からターゲットの状態を
+    /// 外すたびに、その scope の世代記録とコンテキストを `release_scope` で解放する
+    /// （core の追跡 scope 数が上限に達しないようにする。`CDP-7`・TASK-44.6・#1217）。
+    script_contexts: ScriptContextHandle,
 }
 
 impl TargetNavigations {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(script_contexts: ScriptContextHandle) -> Self {
         Self {
             inner: Mutex::new(HashMap::new()),
+            script_contexts,
         }
+    }
+
+    /// 表から外した状態の scope を解放する。ロック（registry・本表）を手放してから呼ぶ。
+    fn release_all(&self, removed: Vec<Arc<NavigationState>>) {
+        for nav in removed {
+            self.release_scope(nav.scope());
+        }
+    }
+
+    /// `scope` の評価コンテキストを解放する（常に `Ok` の API。失敗しても遷移系は止めない）。
+    pub(crate) fn release_scope(&self, scope: NavigationScope) {
+        let _ = self.script_contexts.release_scope(scope);
+    }
+
+    /// 閉じたターゲットの状態を表から外して解放する（`CdpState::release_connection` の末尾から呼び、
+    /// コンテキストの破棄で消えたターゲットの scope を即時に解放する）。
+    pub(crate) fn prune(&self, registry: &TargetRegistry) {
+        let removed = {
+            let mut m = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+            Self::drain_closed(&mut m, registry)
+        };
+        self.release_all(removed);
+    }
+
+    /// 閉じたターゲットの状態を取り除いて返す（ロックは呼び出し側が保持）。
+    fn drain_closed(
+        m: &mut HashMap<TargetId, Arc<NavigationState>>,
+        registry: &TargetRegistry,
+    ) -> Vec<Arc<NavigationState>> {
+        let closed: Vec<TargetId> = m
+            .keys()
+            .filter(|id| registry.target(id).is_none())
+            .cloned()
+            .collect();
+        closed.iter().filter_map(|id| m.remove(id)).collect()
     }
 
     /// 閉じたターゲットの状態を破棄したうえで、`tid` の状態を返す（なければ作る）。
@@ -64,15 +104,21 @@ impl TargetNavigations {
         registry: &TargetRegistry,
         tid: &TargetId,
     ) -> Arc<NavigationState> {
-        let mut m = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
-        m.retain(|id, _| registry.target(id).is_some());
-        if registry.target(tid).is_none() {
-            return Arc::new(NavigationState::new());
-        }
-        Arc::clone(
-            m.entry(tid.clone())
-                .or_insert_with(|| Arc::new(NavigationState::new())),
-        )
+        let (removed, state) = {
+            let mut m = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+            let removed = Self::drain_closed(&mut m, registry);
+            let state = if registry.target(tid).is_none() {
+                Arc::new(NavigationState::new())
+            } else {
+                Arc::clone(
+                    m.entry(tid.clone())
+                        .or_insert_with(|| Arc::new(NavigationState::new())),
+                )
+            };
+            (removed, state)
+        };
+        self.release_all(removed);
+        state
     }
 
     /// 新規ターゲットの初期 `about:blank` 文書を確定する（`Target.createTarget`・`Runtime.runIfWaitingForDebugger`
@@ -81,18 +127,24 @@ impl TargetNavigations {
     /// 登録済みのターゲットで、遷移状態がまだ無いときだけ確定して `true` を返す。既に状態がある
     /// （`Page.navigate` が先に走った等）・未登録のターゲットは何もせず `false`（遷移を中断しない。表にも入れない）。
     pub(crate) fn commit_initial_blank(&self, registry: &TargetRegistry, tid: &TargetId) -> bool {
-        let mut m = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
-        m.retain(|id, _| registry.target(id).is_some());
-        if registry.target(tid).is_none() || m.contains_key(tid) {
-            return false;
-        }
-        match new_committed_blank_state() {
-            Some(nav) => {
-                m.insert(tid.clone(), Arc::new(nav));
-                true
-            }
-            None => false,
-        }
+        let (removed, committed) = {
+            let mut m = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+            let removed = Self::drain_closed(&mut m, registry);
+            let committed = if registry.target(tid).is_none() || m.contains_key(tid) {
+                false
+            } else {
+                match new_committed_blank_state() {
+                    Some(nav) => {
+                        m.insert(tid.clone(), Arc::new(nav));
+                        true
+                    }
+                    None => false,
+                }
+            };
+            (removed, committed)
+        };
+        self.release_all(removed);
+        committed
     }
 
     /// `tid` のメインフレームの現在状態を読み取り専用で返す（`Page.getFrameTree`。43.3i・#1037・`CDP-2`）。
@@ -124,10 +176,23 @@ impl TargetNavigations {
         m.get(tid).map(Arc::clone)
     }
 
-    /// 閉じられたターゲットの状態を破棄する。
+    /// 閉じられたターゲットの状態を破棄し、その scope を解放する。
     pub(crate) fn forget(&self, tid: &TargetId) {
-        let mut m = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
-        m.remove(tid);
+        let removed = {
+            let mut m = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+            m.remove(tid)
+        };
+        if let Some(nav) = removed {
+            self.release_scope(nav.scope());
+        }
+    }
+
+    /// [`Self::forget`] に加え、表に載っていない（切り離された）状態 `detached` の scope も解放する。
+    /// 遷移中にターゲットが閉じられた場合、`get_or_create` が返した状態が表に無く `forget` では
+    /// scope が残るため（`navigate_gated` が世代を記録済み）。
+    pub(crate) fn forget_with(&self, tid: &TargetId, detached: &NavigationState) {
+        self.forget(tid);
+        self.release_scope(detached.scope());
     }
 
     /// 保持しているターゲット数。
@@ -157,7 +222,7 @@ mod tests {
     fn cdp2_commit_initial_blank_commits_once_and_skips_unknown_or_existing() {
         let reg = TargetRegistry::new();
         let t = reg.create_target(TargetKind::Page, "about:blank").unwrap();
-        let n = TargetNavigations::new();
+        let n = TargetNavigations::new(ScriptContextHandle::disabled());
         assert!(n.commit_initial_blank(&reg, &t));
         assert!(n.get(&t).unwrap().latest().is_some());
         // 2 回目は何もしない。
@@ -177,7 +242,7 @@ mod tests {
     fn cdp1_get_does_not_create_and_get_or_create_is_stable() {
         let reg = TargetRegistry::new();
         let t = reg.create_target(TargetKind::Page, "about:blank").unwrap();
-        let n = TargetNavigations::new();
+        let n = TargetNavigations::new(ScriptContextHandle::disabled());
         assert!(n.get(&t).is_none());
         assert_eq!(n.len(), 0);
         let a = n.get_or_create(&reg, &t);
@@ -192,7 +257,7 @@ mod tests {
         let reg = TargetRegistry::new();
         let t1 = reg.create_target(TargetKind::Page, "about:blank").unwrap();
         let t2 = reg.create_target(TargetKind::Page, "about:blank").unwrap();
-        let n = TargetNavigations::new();
+        let n = TargetNavigations::new(ScriptContextHandle::disabled());
         n.get_or_create(&reg, &t1);
         n.get_or_create(&reg, &t2);
         assert_eq!(n.len(), 2);
@@ -208,7 +273,7 @@ mod tests {
         let reg = TargetRegistry::new();
         let t = reg.create_target(TargetKind::Page, "about:blank").unwrap();
         reg.close_target(&t).unwrap();
-        let n = TargetNavigations::new();
+        let n = TargetNavigations::new(ScriptContextHandle::disabled());
         let _detached = n.get_or_create(&reg, &t);
         assert_eq!(n.len(), 0);
         assert!(n.get(&t).is_none());
@@ -217,7 +282,7 @@ mod tests {
     #[test]
     fn sec2_len_is_bounded_by_max_targets_across_churn() {
         let reg = TargetRegistry::new();
-        let n = TargetNavigations::new();
+        let n = TargetNavigations::new(ScriptContextHandle::disabled());
         for _ in 0..3 {
             let ids: Vec<TargetId> = (0..MAX_TARGETS)
                 .map(|_| reg.create_target(TargetKind::Page, "about:blank").unwrap())
@@ -239,7 +304,7 @@ mod tests {
     fn cdp2_initial_blank_loader_id_matches_commit_initial_blank() {
         let reg = TargetRegistry::new();
         let t = reg.create_target(TargetKind::Page, "about:blank").unwrap();
-        let n = TargetNavigations::new();
+        let n = TargetNavigations::new(ScriptContextHandle::disabled());
         assert!(n.commit_initial_blank(&reg, &t));
         let committed = format!("{:x}", n.get(&t).unwrap().current_generation().get());
         assert_eq!(committed, "2");
@@ -251,7 +316,7 @@ mod tests {
         use fandhe_browser_core::NavigationResult;
         let reg = TargetRegistry::new();
         let t = reg.create_target(TargetKind::Page, "about:blank").unwrap();
-        let n = TargetNavigations::new();
+        let n = TargetNavigations::new(ScriptContextHandle::disabled());
         // 状態なし（止めたターゲット相当）。状態は作らない。
         let snap = n.frame_snapshot(&reg, &t).unwrap();
         assert_eq!(
@@ -287,7 +352,7 @@ mod tests {
 
     #[test]
     fn cdp1_debug_shows_count_only() {
-        let n = TargetNavigations::new();
+        let n = TargetNavigations::new(ScriptContextHandle::disabled());
         assert_eq!(format!("{n:?}"), "TargetNavigations { targets: 0 }");
     }
 }

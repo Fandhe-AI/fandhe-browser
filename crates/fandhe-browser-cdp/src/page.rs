@@ -12,6 +12,10 @@
 //! - イベントは確定した遷移（結果が公開されたもの）に限り `Page.frameNavigated` →
 //!   `Page.loadEventFired` を送出する（TASK-42.3・#241）。失敗・中断・追い越された遷移では
 //!   送出しない。残るスタブは [`navigation_events`] を参照。
+//! - 評価器（core の `ScriptContextHandle`）が有効で、要求セッションが `Runtime.enable` 済みなら、確定時に
+//!   `Runtime.executionContextsCleared` を `frameNavigated` の前、`Runtime.executionContextCreated`
+//!   （main と `worldName` の isolated world）を後ろに挟む（TASK-44.6・#1217。順序は [`navigation_events`]）。
+//!   無効な構成・`Runtime` 無効のセッションでは従来どおり `frameNavigated` → `loadEventFired` のみ。
 //! - HTML は `FetchResponse::body_text_lossy`（UTF-8 lossy）で文字列化する簡易実装。
 //!   文字コード判定は `CORE-5`・TASK-25 で置き換える。
 //! - メインフレームの frame ID は、ターゲットあり（`sessionId` 付き）なら targetId と同じ値
@@ -59,14 +63,15 @@ use std::time::Instant;
 use fandhe_browser_core::{
     ActorFailureKind, Error, FetchOptions, Fetcher, NavigationGeneration, NavigationResult,
     NavigationState, PageRunRequest, PageScriptError, PageScriptHandle, PageScriptOutcome,
-    PageScriptSkipReason, StateError,
+    PageScriptSkipReason, ScriptContextError, ScriptContextHandle, StateError,
 };
 use serde_json::{Value, json};
 
 use crate::protocol::{
     BoxFuture, CdpError, CdpEvent, CommandContext, CommandHandler, HandlerOutput,
 };
-use crate::target::{CdpStateError, MAX_URL_LEN, TargetId, TargetRegistry};
+use crate::runtime::{context_created_event, contexts_cleared_event};
+use crate::target::{CdpStateError, MAX_URL_LEN, SessionDomain, TargetId, TargetRegistry};
 
 /// ターゲットを持たないブラウザレベルの `Page.navigate`（`sessionId` なし）が使うフォールバックの frame ID。
 /// ターゲットありの場合のメインフレームの frame ID は targetId（[`main_frame_id`]。`CDP-2`・TASK-43.3o・#1050）。
@@ -191,7 +196,7 @@ pub(crate) struct CommittedNavigation {
 /// 結果確定の直列化と完了順の採番を行うゲート。確定は同期処理のため `await` を跨がない。
 pub(crate) type CommitGate = Mutex<u64>;
 
-fn lock_gate(gate: &CommitGate) -> std::sync::MutexGuard<'_, u64> {
+pub(crate) fn lock_gate(gate: &CommitGate) -> std::sync::MutexGuard<'_, u64> {
     gate.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
@@ -256,7 +261,10 @@ fn lifecycle_event(
 ///
 /// 順序の正本はここ。`lifecycle` が偽なら `frameNavigated` → `loadEventFired`。真（`Page.enable` 済みかつ
 /// lifecycle 有効のセッション。43.3k・#1039）なら `lifecycle{init}` → `frameNavigated` → `loadEventFired` →
-/// `lifecycle{load}`。`init` は `load` より前、`load` は `frameNavigated` より後でなければならない
+/// `lifecycle{load}`。`runtime` が `Some`（評価器が有効で、要求セッションが `Runtime.enable` 済み。
+/// TASK-44.6・#1217）なら、`frameNavigated` の前に `Runtime.executionContextsCleared`、後に渡された
+/// `Runtime.executionContextCreated` 列（main → isolated）を挟み、`loadEventFired` はその後に置く
+/// （Playwright が新文書のコンテキストを `load` 前に揃える前提のため）。`None` なら従来の列のまま。`init` は `load` より前、`load` は `frameNavigated` より後でなければならない
 /// （Playwright は新文書の commit で lifecycle をクリアし、Puppeteer は `init` で集合をリセットするため。
 /// ソース読解による推定で未実測）。`timestamp` は 3 イベントで同じ値。
 ///
@@ -277,8 +285,9 @@ fn navigation_events(
     url: &str,
     timestamp: f64,
     lifecycle: bool,
+    runtime: Option<&[CdpEvent]>,
 ) -> Vec<CdpEvent> {
-    let mut events = Vec::with_capacity(4);
+    let mut events = Vec::with_capacity(5 + runtime.map_or(0, <[CdpEvent]>::len));
     if lifecycle {
         events.push(lifecycle_event(
             frame_id,
@@ -287,26 +296,30 @@ fn navigation_events(
             timestamp,
         ));
     }
-    events.extend([
-        CdpEvent {
-            method: "Page.frameNavigated",
-            params: json!({
-                "frame": {
-                    "id": frame_id,
-                    "loaderId": loader_id,
-                    "url": url,
-                    "mimeType": MAIN_FRAME_MIME_TYPE,
-                },
-                "type": "Navigation",
-            }),
-            session_id: None,
-        },
-        CdpEvent {
-            method: "Page.loadEventFired",
-            params: json!({ "timestamp": timestamp }),
-            session_id: None,
-        },
-    ]);
+    if runtime.is_some() {
+        events.push(contexts_cleared_event());
+    }
+    events.push(CdpEvent {
+        method: "Page.frameNavigated",
+        params: json!({
+            "frame": {
+                "id": frame_id,
+                "loaderId": loader_id,
+                "url": url,
+                "mimeType": MAIN_FRAME_MIME_TYPE,
+            },
+            "type": "Navigation",
+        }),
+        session_id: None,
+    });
+    if let Some(created) = runtime {
+        events.extend(created.iter().cloned());
+    }
+    events.push(CdpEvent {
+        method: "Page.loadEventFired",
+        params: json!({ "timestamp": timestamp }),
+        session_id: None,
+    });
     if lifecycle {
         events.push(lifecycle_event(
             frame_id,
@@ -320,6 +333,15 @@ fn navigation_events(
 
 fn state_error(_: StateError) -> CdpError {
     CdpError::SERVER_ERROR
+}
+
+/// 評価コンテキストへの世代通知の結果を、遷移の失敗文言へ畳む（`CDP-7`・TASK-44.6・#1217）。
+///
+/// 失敗は core の追跡 scope 数の上限（`TrackedScopes`）だけで、無視すると古い世代のコンテキストが
+/// 残る（`CDP-2`）ため fail-closed で遷移を失敗として扱う。文言は `fetch_error_text` と同じく固定表の
+/// 値で、入力を反映しない。`None` なら通知に成功。
+fn script_contexts_failure(result: Result<(), ScriptContextError>) -> Option<&'static str> {
+    result.err().map(|_| "net::ERR_INSUFFICIENT_RESOURCES")
 }
 
 /// `url` へ遷移し、`nav` の直近結果を更新する。ハンドラ本体（`Page.navigate`）の中核で、
@@ -339,6 +361,7 @@ pub(crate) async fn navigate(
         url,
         &Mutex::new(0),
         &PageScriptHandle::disabled(),
+        &ScriptContextHandle::disabled(),
     )
     .await
 }
@@ -350,6 +373,7 @@ pub(crate) async fn navigate_gated(
     url: &str,
     gate: &CommitGate,
     page_scripts: &PageScriptHandle,
+    script_contexts: &ScriptContextHandle,
 ) -> Result<NavigateOutcome, CdpError> {
     // 共有状態を変更する前に URL の形式・scheme を検証する。不正 URL や `file:` で
     // 保存済みの URL / HTML を失わせない（`about:blank` は下で個別に扱う）。
@@ -382,6 +406,14 @@ pub(crate) async fn navigate_gated(
         began: Some(generation),
         script: ScriptStage::NotAttempted,
     };
+    // 評価コンテキスト（`Runtime.evaluate` の世代別コンテキスト）も同じ世代で失効させる。失敗は取得の
+    // 失敗と同じ後処理（直近結果の無効化・URL を試行 URL へ）に乗せる。
+    if let Some(text) =
+        script_contexts_failure(script_contexts.begin_generation(nav.scope(), generation))
+    {
+        outcome.error_text = Some(text);
+        return Ok(outcome);
+    }
 
     if url == "about:blank" {
         // clear_navigation は成功時に自身で世代を 1 つ進める。返す `loaderId` は進めた後の
@@ -480,7 +512,6 @@ pub(crate) struct PageNavigate {
     /// 以下の `gate`・`published` はハンドラ（= ディスパッチャ）単位で、遷移状態表は `CdpState` 単位。
     /// ディスパッチャは `browser_websocket_config` で 1 回だけ作る前提。
     /// 結果確定の直列化と完了順の採番。
-    gate: CommitGate,
     /// 共有状態へ最後にミラーした内容の記録。ターゲット表の更新・ミラーを 1 つの
     /// 同期境界（このロック）で行い、古い遷移が新しい結果を巻き戻さないようにする。
     published: Mutex<Published>,
@@ -591,7 +622,6 @@ impl PageNavigate {
     pub fn new(options: FetchOptions) -> Result<Self, Error> {
         Ok(Self {
             fetcher: Fetcher::new(options)?,
-            gate: Mutex::new(0),
             published: Mutex::new(Published {
                 seq: 0,
                 mirrored: None,
@@ -641,6 +671,8 @@ impl CommandHandler for PageNavigate {
             let mut navigated: Option<String> = None;
             // ターゲット遷移の送出直前の世代再確認用（遷移状態と確定時の世代）。
             let mut recheck: Option<(Arc<NavigationState>, NavigationGeneration)> = None;
+            // ターゲット遷移で確定した文書の世代（実行コンテキストの登録に使う。TASK-44.6）。
+            let mut committed_generation: Option<NavigationGeneration> = None;
             // ブラウザレベル遷移の送出直前の世代再確認用（共有状態 `app_nav` の確定時の世代）。
             let mut recheck_shared: Option<NavigationGeneration> = None;
             // ブラウザレベル遷移の進行中記録。確定・公開後もイベント送出が済むまで保持する。
@@ -673,8 +705,9 @@ impl CommandHandler for PageNavigate {
                         &self.fetcher,
                         &nav,
                         url,
-                        &self.gate,
+                        ctx.state.commit_gate(),
                         ctx.state.app_state().page_scripts(),
+                        ctx.state.app_state().script_contexts(),
                     )
                     .await?;
                     // ターゲット表の更新と共有状態へのミラーを 1 つのロック内で行う。
@@ -684,7 +717,7 @@ impl CommandHandler for PageNavigate {
                         .unwrap_or_else(PoisonError::into_inner);
                     if registry.target(tid).is_none() {
                         // 取得中にターゲットが閉じられた。状態を破棄し、内容は公開しない。
-                        ctx.state.navigations().forget(tid);
+                        ctx.state.navigations().forget_with(tid, &nav);
                     } else if let Some(c) = &out.committed {
                         // 後続の遷移に追い越されていない場合に限り、確定 URL を反映する（`CDP-1`）。
                         // 確定直後に別遷移が始まって結果を保持できなかった（`result` が `None`）場合は
@@ -692,7 +725,7 @@ impl CommandHandler for PageNavigate {
                         // 共有状態との食い違いを作らないため。
                         // 世代確認から URL 更新・ミラーまでは `gate` を保持し、同一ターゲットの後続遷移の
                         // 開始（`navigate_gated` の世代払い出し）と排他にする（`CDP-1`）。
-                        let _gate = lock_gate(&self.gate);
+                        let _gate = lock_gate(ctx.state.commit_gate());
                         if nav.current_generation() == c.generation
                             && let Some(r) = &c.result
                         {
@@ -700,6 +733,7 @@ impl CommandHandler for PageNavigate {
                                 Ok(()) => {
                                     navigated = Some(c.url.clone());
                                     recheck = Some((Arc::clone(&nav), c.generation));
+                                    committed_generation = Some(c.generation);
                                     // 今回確定した結果だけを、完了順が新しい場合に限りミラーする。
                                     // ブラウザレベル遷移の進行中などでミラーを見送る場合も、確定順
                                     // （`seq`）は記録する。記録しないと、見送った新しい確定（B）より
@@ -727,7 +761,7 @@ impl CommandHandler for PageNavigate {
                                     }
                                 }
                                 Err(CdpStateError::UnknownTarget) => {
-                                    ctx.state.navigations().forget(tid)
+                                    ctx.state.navigations().forget_with(tid, &nav)
                                 }
                                 Err(_) => return Err(CdpError::SERVER_ERROR),
                             }
@@ -737,7 +771,7 @@ impl CommandHandler for PageNavigate {
                     {
                         // 上の確認と URL 更新の間に同一ターゲットの後続遷移が開始しないよう、
                         // `gate` を保持したうえで世代を再確認する（`CDP-1`）。
-                        let _gate = lock_gate(&self.gate);
+                        let _gate = lock_gate(ctx.state.commit_gate());
                         if nav.current_generation() != g {
                             return Ok(HandlerOutput::result(json!({
                                 "frameId": tid.as_str(),
@@ -756,7 +790,7 @@ impl CommandHandler for PageNavigate {
                         match registry.set_target_url(tid, &stored) {
                             Ok(()) => {}
                             Err(CdpStateError::UnknownTarget) => {
-                                ctx.state.navigations().forget(tid)
+                                ctx.state.navigations().forget_with(tid, &nav)
                             }
                             Err(_) => return Err(CdpError::SERVER_ERROR),
                         }
@@ -786,14 +820,15 @@ impl CommandHandler for PageNavigate {
                         &self.published,
                         app_nav,
                         ctx.state.registry(),
-                        &self.gate,
+                        ctx.state.commit_gate(),
                     ));
                     let out = navigate_gated(
                         &self.fetcher,
                         app_nav,
                         url,
-                        &self.gate,
+                        ctx.state.commit_gate(),
                         ctx.state.app_state().page_scripts(),
+                        ctx.state.app_state().script_contexts(),
                     )
                     .await?;
                     // ブラウザレベル遷移も確定順（`seq`）の管理に含める。実際に確定し、かつ公開済みより
@@ -810,7 +845,7 @@ impl CommandHandler for PageNavigate {
                         // 現在の遷移（世代一致・結果保持）のイベントが落ちて待機中のクライアントが
                         // 止まる。追い越された遷移（世代不一致）は `gate` を保持して確認し、送出しない。
                         {
-                            let _gate = lock_gate(&self.gate);
+                            let _gate = lock_gate(ctx.state.commit_gate());
                             if app_nav.current_generation() == c.generation && c.result.is_some() {
                                 navigated = Some(c.url.clone());
                                 recheck_shared = Some(c.generation);
@@ -885,7 +920,7 @@ impl CommandHandler for PageNavigate {
                 }
             }
             if let Some(url) = navigated {
-                let _gate = lock_gate(&self.gate);
+                let _gate = lock_gate(ctx.state.commit_gate());
                 let target_alive = match (&target_id, ctx.session_id) {
                     (Some(tid), Some(sid)) => {
                         let registry = ctx.state.registry();
@@ -903,12 +938,32 @@ impl CommandHandler for PageNavigate {
                     let lifecycle = ctx
                         .session_id
                         .is_some_and(|sid| ctx.state.registry().lifecycle_events_active(sid));
+                    // 評価器が有効なときだけ、要求セッションの実行コンテキストを新しい世代へ作り替える
+                    // （古い世代は全セッション分消える）。`gate` を保持したままなので、確認済みの世代と
+                    // 食い違わない。Runtime 無効のセッションには cleared も created も送らない。
+                    let runtime_events = match (&target_id, ctx.session_id, committed_generation) {
+                        (Some(tid), Some(sid), Some(g)) if ctx.state.evaluator_enabled() => {
+                            let registry = ctx.state.registry();
+                            let runtime_on =
+                                registry.is_domain_enabled(sid, SessionDomain::Runtime);
+                            let views = registry.announce_navigation(tid, g, Some(sid));
+                            runtime_on.then(|| {
+                                let origin = crate::runtime::origin_string(&url);
+                                views
+                                    .iter()
+                                    .map(|v| context_created_event(v, &origin))
+                                    .collect::<Vec<_>>()
+                            })
+                        }
+                        _ => None,
+                    };
                     for ev in navigation_events(
                         main_frame_id(target_id.as_ref()),
                         &out.loader_id,
                         &url,
                         monotonic_seconds(),
                         lifecycle,
+                        runtime_events.as_deref(),
                     ) {
                         output = output.with_event(ev);
                     }
@@ -922,6 +977,12 @@ impl CommandHandler for PageNavigate {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 無効な評価コンテキストハンドル（future が借用を持ち越すテストのため `'static` で返す）。
+    fn no_script_contexts() -> &'static ScriptContextHandle {
+        static H: OnceLock<ScriptContextHandle> = OnceLock::new();
+        H.get_or_init(ScriptContextHandle::disabled)
+    }
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
     use std::thread;
@@ -1123,6 +1184,7 @@ mod tests {
             "http://example.test/",
             1.5,
             false,
+            None,
         );
         assert_eq!(ev.len(), 2);
         assert_eq!(ev[0].method, "Page.frameNavigated");
@@ -1140,6 +1202,92 @@ mod tests {
         assert!(ev[0].session_id.is_none() && ev[1].session_id.is_none());
     }
 
+    /// `runtime` が `Some` なら `executionContextsCleared` → `frameNavigated` → created 列 → `loadEventFired`
+    /// の順で、lifecycle 真なら `init` が先頭・`load` が末尾（TASK-44.6・#1217・`CDP-2`）。
+    #[test]
+    fn cdp2_navigation_events_with_runtime_order() {
+        use crate::runtime::{ContextView, World};
+        let st = NavigationState::new();
+        let g = st.begin_navigation().unwrap();
+        let tid = TargetId::parse("T1").unwrap();
+        let created: Vec<CdpEvent> = [(5, World::Main), (6, World::Isolated("u".into()))]
+            .into_iter()
+            .map(|(id, world)| {
+                context_created_event(
+                    &ContextView {
+                        id,
+                        target: tid.clone(),
+                        generation: g,
+                        world,
+                    },
+                    "http://example.test",
+                )
+            })
+            .collect();
+        let methods = |lifecycle| -> Vec<&'static str> {
+            navigation_events(
+                "T1",
+                "1",
+                "http://example.test/",
+                1.0,
+                lifecycle,
+                Some(&created),
+            )
+            .iter()
+            .map(|e| e.method)
+            .collect()
+        };
+        assert_eq!(
+            methods(false),
+            [
+                "Runtime.executionContextsCleared",
+                "Page.frameNavigated",
+                "Runtime.executionContextCreated",
+                "Runtime.executionContextCreated",
+                "Page.loadEventFired",
+            ]
+        );
+        assert_eq!(
+            methods(true),
+            [
+                "Page.lifecycleEvent",
+                "Runtime.executionContextsCleared",
+                "Page.frameNavigated",
+                "Runtime.executionContextCreated",
+                "Runtime.executionContextCreated",
+                "Page.loadEventFired",
+                "Page.lifecycleEvent",
+            ]
+        );
+        // Some(空) でも cleared は送る。
+        let empty: Vec<&'static str> =
+            navigation_events("T1", "1", "http://example.test/", 1.0, false, Some(&[]))
+                .iter()
+                .map(|e| e.method)
+                .collect();
+        assert_eq!(
+            empty,
+            [
+                "Runtime.executionContextsCleared",
+                "Page.frameNavigated",
+                "Page.loadEventFired"
+            ]
+        );
+    }
+
+    /// `TrackedScopes` 上限の通知失敗は固定文言の遷移失敗になり、成功は `None`（`CDP-7`・TASK-44.6）。
+    #[test]
+    fn cdp7_script_contexts_failure_maps_to_fixed_navigation_error() {
+        use fandhe_browser_core::ScriptContextLimit;
+        assert_eq!(script_contexts_failure(Ok(())), None);
+        assert_eq!(
+            script_contexts_failure(Err(ScriptContextError::LimitExceeded {
+                limit: ScriptContextLimit::TrackedScopes { limit: 1024 },
+            })),
+            Some("net::ERR_INSUFFICIENT_RESOURCES")
+        );
+    }
+
     /// `lifecycle` 真のとき `init` → `frameNavigated` → `loadEventFired` → `load` の順で、
     /// lifecycle の params が具体値で一致する（TASK-43.3k・`CDP-2`）。
     #[test]
@@ -1150,6 +1298,7 @@ mod tests {
             "http://example.test/",
             2.5,
             true,
+            None,
         );
         let methods: Vec<&str> = ev.iter().map(|e| e.method).collect();
         assert_eq!(
@@ -1253,9 +1402,16 @@ mod tests {
         let nav = NavigationState::new();
         let handle = PageScriptHandle::disabled();
         let url = format!("http://127.0.0.1:{port}/");
-        let out = navigate_gated(&allowed_fetcher(), &nav, &url, &Mutex::new(0), &handle)
-            .await
-            .unwrap();
+        let out = navigate_gated(
+            &allowed_fetcher(),
+            &nav,
+            &url,
+            &Mutex::new(0),
+            &handle,
+            no_script_contexts(),
+        )
+        .await
+        .unwrap();
         assert_eq!(out.script, ScriptStage::NotAttempted);
         assert_eq!(out.error_text, None);
         assert_eq!(nav.latest().unwrap().html(), SCRIPT_PAGE);
@@ -1350,9 +1506,16 @@ mod tests {
             return;
         };
         let url = format!("http://127.0.0.1:{port}/");
-        let out = navigate_gated(&allowed_fetcher(), &nav, &url, &Mutex::new(0), &handle)
-            .await
-            .unwrap();
+        let out = navigate_gated(
+            &allowed_fetcher(),
+            &nav,
+            &url,
+            &Mutex::new(0),
+            &handle,
+            no_script_contexts(),
+        )
+        .await
+        .unwrap();
         assert_eq!(out.error_text, None);
         assert_eq!(
             out.script,
@@ -1374,18 +1537,32 @@ mod tests {
         let gate = Mutex::new(0);
         let port = serve("200 OK", "<p>plain</p>");
         let url = format!("http://127.0.0.1:{port}/");
-        let out = navigate_gated(&allowed_fetcher(), &nav, &url, &gate, &handle)
-            .await
-            .unwrap();
+        let out = navigate_gated(
+            &allowed_fetcher(),
+            &nav,
+            &url,
+            &gate,
+            &handle,
+            no_script_contexts(),
+        )
+        .await
+        .unwrap();
         assert_eq!(
             out.script,
             ScriptStage::Skipped(PageScriptSkipReason::NoScriptElement)
         );
         assert_eq!(nav.latest().unwrap().html(), "<p>plain</p>");
         for u in ["about:blank", "file:///etc/passwd"] {
-            let out = navigate_gated(&allowed_fetcher(), &nav, u, &gate, &handle)
-                .await
-                .unwrap();
+            let out = navigate_gated(
+                &allowed_fetcher(),
+                &nav,
+                u,
+                &gate,
+                &handle,
+                no_script_contexts(),
+            )
+            .await
+            .unwrap();
             assert_eq!(out.script, ScriptStage::NotAttempted, "{u}");
         }
         assert_eq!(handle.stats().worker_spawns(), 0);
@@ -1413,19 +1590,33 @@ mod tests {
         let fetcher = allowed_fetcher();
         let u = |p: u16| format!("http://127.0.0.1:{p}/");
         let url1 = u(p1);
-        let first = navigate_gated(&fetcher, &nav1, &url1, &gate, &handle);
+        let first = navigate_gated(&fetcher, &nav1, &url1, &gate, &handle, no_script_contexts());
         let rest = async {
             until(|| handle.stats().queued() == 1).await;
             // 別ターゲット（`<script>` なし）は待機中でも完了する。
-            let other = navigate_gated(&fetcher, &nav2, &u(p2), &gate, &handle)
-                .await
-                .unwrap();
+            let other = navigate_gated(
+                &fetcher,
+                &nav2,
+                &u(p2),
+                &gate,
+                &handle,
+                no_script_contexts(),
+            )
+            .await
+            .unwrap();
             assert_eq!(other.error_text, None);
             assert_eq!(handle.stats().queued(), 1);
             // 満杯なので `<script>` ありの別遷移は待たされず Busy。
-            let busy = navigate_gated(&fetcher, &nav3, &u(p3), &gate, &handle)
-                .await
-                .unwrap();
+            let busy = navigate_gated(
+                &fetcher,
+                &nav3,
+                &u(p3),
+                &gate,
+                &handle,
+                no_script_contexts(),
+            )
+            .await
+            .unwrap();
             assert_eq!(busy.script, ScriptStage::Failed(ScriptFailure::Busy));
             assert_eq!(nav3.latest().unwrap().html(), "<p>b</p><script>2</script>");
             drop(tx);
@@ -1450,12 +1641,13 @@ mod tests {
         let fetcher = allowed_fetcher();
         let u = |p: u16| format!("http://127.0.0.1:{p}/");
         let url1 = u(p1);
-        let first = navigate_gated(&fetcher, &nav, &url1, &gate, &handle);
+        let first = navigate_gated(&fetcher, &nav, &url1, &gate, &handle, no_script_contexts());
         let rest = async {
             until(|| handle.stats().queued() == 1).await;
-            let second = navigate_gated(&fetcher, &nav, &u(p2), &gate, &handle)
-                .await
-                .unwrap();
+            let second =
+                navigate_gated(&fetcher, &nav, &u(p2), &gate, &handle, no_script_contexts())
+                    .await
+                    .unwrap();
             assert!(second.committed.is_some());
             drop(tx);
         };
@@ -1479,12 +1671,19 @@ mod tests {
         let gate = Mutex::new(0);
         let fetcher = allowed_fetcher();
         let url = format!("http://127.0.0.1:{port}/");
-        let first = navigate_gated(&fetcher, &nav, &url, &gate, &handle);
+        let first = navigate_gated(&fetcher, &nav, &url, &gate, &handle, no_script_contexts());
         let rest = async {
             until(|| handle.stats().queued() == 1).await;
-            let blank = navigate_gated(&fetcher, &nav, "about:blank", &gate, &handle)
-                .await
-                .unwrap();
+            let blank = navigate_gated(
+                &fetcher,
+                &nav,
+                "about:blank",
+                &gate,
+                &handle,
+                no_script_contexts(),
+            )
+            .await
+            .unwrap();
             assert!(blank.committed.is_some());
             // 実行器を解放する前に、古い要求が待ち行列から外れている。
             until(|| handle.stats().queued() == 0).await;
@@ -2138,7 +2337,7 @@ mod tests {
                 &h.published,
                 st.app_state().navigation(),
                 st.registry(),
-                &h.gate,
+                st.commit_gate(),
             );
             for (id, sid, body) in [(1, &sa, "x"), (2, &sb, "y")] {
                 let u = format!("http://127.0.0.1:{}/", serve("200 OK", body));
@@ -2182,7 +2381,7 @@ mod tests {
                     &h.published,
                     st.app_state().navigation(),
                     st.registry(),
-                    &h.gate,
+                    st.commit_gate(),
                 );
                 let u = format!("http://127.0.0.1:{}/", serve("200 OK", "x"));
                 let req = json!({"id": 1, "method": "Page.navigate",
