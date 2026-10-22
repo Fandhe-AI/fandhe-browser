@@ -14,7 +14,7 @@
 - 実行: `cargo test -p fandhe-browser-ai --lib reference_stability -- --nocapture`
 - 実装: `crates/fandhe-browser-ai/src/reference_stability/measure.rs`（crate 内 `#[cfg(test)]` モジュール）
 - 入力: `crates/fandhe-browser-ai/tests/fixtures/stability/` の 19 ケース（合成ページ。実サイトではない）
-- 判定: `check_reidentification`（TASK-17.1）。変化前の ref と role+name を取り、変化後に同じ role+name の ref 保持要素が 1 件で ref も同一なら安定
+- 判定: `check_reidentification`（TASK-17.1）。変化前の ref と role+name を取り、変化後は、変化前の対象と前後の ref 保持要素の列だけで判定する（変化後のセレクタ・DOM・位置は使わない。判定表は [reference-disambiguation.md](./reference-disambiguation.md) の「判定表」）。role・name・ref が同一で、順序に依存する同一性が崩れていなければ安定
 
 ### 集計ルール
 
