@@ -108,7 +108,7 @@ use std::fmt;
 use fandhe_browser_core::dom::{Children, Document, NodeId};
 
 use crate::compress_table::{
-    IrregularReason, TableDetection, assign_header_refs, compress_row_list, compress_rows,
+    IrregularReason, TableDetection, assign_header_refs, compress_row, compress_rows,
     compress_wide_row_list, detect_regular_structure, detect_wide_table, fold_wide_table_rows,
     rows_to_fold,
 };
@@ -1064,24 +1064,20 @@ fn build_snapshot_inner(
             other => (None, other),
         };
         if let Some(structure) = expanded_structure {
-            let fold_rows = rows_to_fold(doc, &structure, |row| {
+            let targets = rows_to_fold(doc, &structure, |row| {
                 subtree_has_lossy(doc, &index, row, true, None)
             });
-            let ids: Vec<NodeId> = fold_rows.iter().map(|&(_, id)| id).collect();
-            let compressed_rows = compress_row_list(doc, structure.kind, &ids);
-            // 40 文字等で打ち切られた行は親 name 側に全文を残すため covered に含めない。
-            covered.extend(
-                ids.iter()
-                    .zip(compressed_rows.iter())
-                    .filter(|(_, r)| !r.truncated)
-                    .map(|(&id, _)| id),
-            );
-            node.folded_rows = compressed_rows
-                .into_iter()
-                .zip(fold_rows.iter())
-                .map(|(r, &(index, _))| FoldedRow::new(index, r.text, r.truncated))
-                .collect();
-            folded.extend(ids);
+            let mut folded_rows = Vec::with_capacity(targets.len());
+            for target in &targets {
+                let row = compress_row(doc, structure.kind, target.node());
+                // 40 文字等で打ち切られた行は親 name 側に全文を残すため covered に含めない。
+                if !row.truncated {
+                    covered.insert(target.node());
+                }
+                folded.insert(target.node());
+                folded_rows.push(FoldedRow::new(target.row_index(), row.text, row.truncated));
+            }
+            node.folded_rows = folded_rows;
         }
         if let Some(structure) = wide {
             let plan =
