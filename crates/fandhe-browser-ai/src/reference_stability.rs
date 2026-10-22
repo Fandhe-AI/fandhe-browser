@@ -285,7 +285,40 @@ fn check_reidentification(case: &StabilityCase<'_>) -> Reidentification {
             }
         },
     };
-    reidentify_after(case.after_html, case.selector, b_role, b_name, b_ref)
+    reidentify_after(
+        case.before_html,
+        case.after_html,
+        case.selector,
+        b_role,
+        b_name,
+        b_ref,
+    )
+}
+
+/// 区別子（` #n`・n は 2 以上。base が空なら `#n`）を除いた base name を返す。
+fn strip_occurrence_suffix(name: &str) -> &str {
+    let Some(i) = name.rfind('#') else {
+        return name;
+    };
+    let (head, tail) = (&name[..i], &name[i + 1..]);
+    let numeric = !tail.is_empty()
+        && tail.bytes().all(|b| b.is_ascii_digit())
+        && tail.parse::<usize>().is_ok_and(|n| n >= 2);
+    if !numeric {
+        return name;
+    }
+    if head.is_empty() {
+        return "";
+    }
+    head.strip_suffix(' ').unwrap_or(name)
+}
+
+/// role が一致し、name が base または base に区別子を付けたものである ref 保持要素の件数。
+fn group_size(holders: &[RefHolder], role: &str, base: &str) -> usize {
+    holders
+        .iter()
+        .filter(|h| h.role == role && strip_occurrence_suffix(&h.name) == base)
+        .count()
 }
 
 /// 変化後の HTML で、変化前の対象の role+name シグネチャを持つ Snapshot 上の候補を探して判定する
@@ -298,6 +331,7 @@ fn check_reidentification(case: &StabilityCase<'_>) -> Reidentification {
 ///   診断用の補助情報として使う。セレクタが 1 要素に一致し、それが別の role+name で ref を
 ///   持っていれば `SignatureChanged`、それ以外は `MissingAfter`
 fn reidentify_after(
+    before_html: &str,
     html: &str,
     selector: &str,
     b_role: String,
@@ -310,6 +344,20 @@ fn reidentify_after(
         .iter()
         .filter(|h| h.role == b_role && h.name == b_name)
         .collect();
+    // 同 role・base name の要素が変化後に増えた場合、出現順の区別子（#1221）では増えた要素が
+    // 前方に入ったときに別要素を同一視しうるため、`Stable` にせず `Ambiguous` で検出する。
+    let base = strip_occurrence_suffix(&b_name);
+    let before_doc = parse(before_html);
+    let before_group = build_snapshot_with_holders(&before_doc)
+        .map(|(_, hs)| group_size(&hs, &b_role, base))
+        .unwrap_or(0);
+    let after_group = group_size(&holders, &b_role, base);
+    if before_group > 0 && after_group > before_group {
+        return Reidentification::Ambiguous {
+            side: Side::After,
+            count: after_group,
+        };
+    }
     match candidates.as_slice() {
         [one] if one.r#ref == b_ref => Reidentification::Stable {
             role: b_role,
@@ -771,14 +819,11 @@ fn aisnap_10_depth_boundary_is_exact() {
     );
 }
 
-/// AISNAP-10・TASK-17.1・Issue #110・#1221: 同 role・name の要素が前方に挿入される変化。
-/// 区別子 ` #n` は出現順で付くため、挿入された先頭の `Go` が素の name と元の ref（`-n` なし）を
-/// 得て、元の要素は `Go #2`（ref `-2`）になる。変化後の素の `Go` は 1 件で ref も一致するため
-/// `Stable` と判定される（誤って別要素を同一視する）。契約を変えない限り解消できない限界
-/// （`docs/design/reference-disambiguation.md`「契約を変えない限り解消できないケース」。ref の
-/// `-n` と同じ原理）。判断は #113（owner:human）。
+/// AISNAP-10・TASK-17.1・Issue #110・#1221: 同 role・name の要素が前方に挿入される変化は
+/// `Stable` にしない。区別子 ` #n` は出現順で付くため、挿入された先頭の `Go` が素の name と元の
+/// ref を得てしまうが、同 role・base name の要素が増えた変化として `Ambiguous` で検出する。
 #[test]
-fn aisnap_10_same_signature_inserted_before_is_known_limit() {
+fn aisnap_10_same_signature_inserted_before_is_ambiguous() {
     let before = page("<button>Go</button>");
     let after = page("<button class=\"x\">Go</button><button>Go</button>");
     let result = check_reidentification(&StabilityCase {
@@ -788,19 +833,17 @@ fn aisnap_10_same_signature_inserted_before_is_known_limit() {
     });
     assert_eq!(
         result,
-        Reidentification::Stable {
-            role: "button".into(),
-            name: "Go".into(),
-            r#ref: "e9ddb5239".into(),
+        Reidentification::Ambiguous {
+            side: Side::After,
+            count: 2
         }
     );
 }
 
 /// AISNAP-10・TASK-17.1・Issue #110: 変化後はセレクタではなく role+name の候補で判定するため、
-/// `#go` で一意に選べても同 role+name の別要素が先頭に増えると、区別子（#1221）で対象は
-/// `Go #2`（ref `-2`）になり、素の `Go` は別要素。対象の ref が変わるため `RefChanged`。
+/// `#go` で一意に選べても同 role+name の別要素が増えれば `Ambiguous` になる（案 Y。#1221 後も維持）。
 #[test]
-fn aisnap_10_unique_selector_but_duplicate_signature_after_is_ref_changed() {
+fn aisnap_10_unique_selector_but_duplicate_signature_after_is_ambiguous() {
     let before = page("<button id=\"go\">Go</button>");
     let after = page("<button class=\"x\">Go</button><button id=\"go\">Go</button>");
     let result = check_reidentification(&StabilityCase {
@@ -810,9 +853,9 @@ fn aisnap_10_unique_selector_but_duplicate_signature_after_is_ref_changed() {
     });
     assert_eq!(
         result,
-        Reidentification::RefChanged {
-            before: "ee727a43f".into(),
-            after: "e9ddb5239".into(),
+        Reidentification::Ambiguous {
+            side: Side::After,
+            count: 2
         }
     );
 }
