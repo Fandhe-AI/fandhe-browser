@@ -699,11 +699,57 @@ TASK-43.3o（#1050）の取り込み後に再取得した同梱トレース（3 
 | `goto` | 成功 | なし |
 | `selector` | 失敗 | `locator.textContent: TypeError: Cannot read properties of undefined (reading 'length')`（call log: `waiting for locator('#target').first()`） |
 
-`CustomEvent is not defined` は解消した。失敗は別の `TypeError` に移ったが、どの式で `undefined` の `length` を読んだかは未特定（ページ内の注入スクリプトか Playwright 側かも未確定）。参考として、注入スクリプトの `_refreshListeners` は `document` 上の `__playwright_mark_target__` リスナーで `event.composedPath()[0]` を読むが、`Event.composedPath` は未実装で、要素上の `dispatchEvent` は document へ伝播しない。これらが原因かどうかは未検証。
+`CustomEvent is not defined` は解消した。失敗は別の `TypeError` に移ったが、どの式で `undefined` の `length` を読んだかは未特定だった（後続の「再実測（#1245）」で `Element.attributes` と判明。当時はページ内の注入スクリプトか Playwright 側かも未確定）。参考として、注入スクリプトの `_refreshListeners` は `document` 上の `__playwright_mark_target__` リスナーで `event.composedPath()[0]` を読むが、`Event.composedPath` は未実装で、要素上の `dispatchEvent` は document へ伝播しない。これらが原因かどうかは未検証。
 
 #### 扱い・未達の明示
 
 - #250・#1062 の受入基準（セレクタで要素を取得すること）は未達（5/5 には届いていない）。close の判断はオーナーに残す。次の阻害要因（上記 `TypeError` の原因特定。`composedPath`・木に沿った伝播・nth セレクタ周辺が候補）は別 Issue の候補で、本 Issue では追わない（計画の「1〜2 件まで」の範囲を超えるため）。skip・期待値の弱体化・成功フォールバックは入れていない（`CDP-6`・`SEC-2`）
+
+#### 再現手順
+
+`make test-playwright-connect`（前節と同じ）。
+
+### 再実測（#1245。実測 A）
+
+`CDP-2`（関連: `JS-5`・`REPAIR-3`・`SEC-2`）・TASK-44・MS-4。#1242 の記録で原因未特定だった `locator.textContent` の `TypeError: Cannot read properties of undefined (reading 'length')` を解消し、`selector` 段階を再実測した。
+
+#### 原因
+
+- 未定義だったのは `Element.prototype.attributes`。呼び出し元は playwright-core 1.63.0 の `Frame.textContent` → `_waitForFunctionOnSelector` → InjectedScript の `previewNode(element)` で、`for (let i = 0; i < element.attributes.length; i++)` が `undefined.length` を読んでいた（fixture の `#target` は `data-role` 属性を持つためループに入る）。`locator.count()` は `previewNode` を呼ばないため通り、`textContent()` だけが落ちた
+- 根拠は `playwright-core@1.63.0` の `lib/coreBundle.js` のソース読解（推定）。修正後の再実測で例外が消え 5 段階が通ったことをもって確認とした（プロトコルトレースでの確定は未実施）
+- #1242 の記録で候補に挙げた `composedPath`・木に沿った伝播・nth セレクタは、この経路の原因ではなかった（要素の `dispatchEvent` が document へ伝播しないため `composedPath` を読むリスナーまで到達しない）
+
+#### 対応
+
+- core の bridge に読み取り専用 op を追加した: `attributeCount`・`attributeNameAt`・`attributeValueAt`（`dom_bridge.rs`。index は有限・非負・整数・2^53 未満を検証し、範囲外は null、名前・値は応答上限 `JS-6` に従う）
+- `dom.js` に `Element.prototype.attributes` を追加した。簡略版（`REPAIR-3`）: live でない静的な Array（`item`・`getNamedItem` つき）で、呼ぶたびに作り直す。`Attr` は読み取り専用で `Node` を継承せず、prefix 付き属性の `localName` は qualified name のまま・`prefix`・`namespaceURI` は null。名前付きプロパティアクセス・`setNamedItem` 等・グローバルの `NamedNodeMap` / `Attr` は未実装
+
+#### 実測条件
+
+| 項目 | 値 |
+| ---- | -- |
+| 基準コミット | main の `bd1c8be9` に #1245 の変更を載せたもの |
+| 実測日 | 2026-10-22 |
+| playwright-core | 1.63.0（出典: `scripts/versions.sh`） |
+| node | v24.21.0 |
+| エンジン / feature | V8 / `test-support,js-v8` |
+
+#### 5 段階の到達結果
+
+| 段階 | 修正前（#1242 の記録） | 修正後 |
+| ---- | ---------------------- | ------ |
+| `connect` | 成功 | 成功 |
+| `newContext` | 成功 | 成功 |
+| `newPage` | 成功 | 成功 |
+| `goto` | 成功 | 成功 |
+| `selector` | 失敗（`TypeError ... reading 'length'`） | 成功 |
+
+成功判定は完了マーカー行 `playwright_flow: real playwright case passed (1 case)` が 1 件であること（`harness/playwright-connect/README.md`）。
+
+#### 扱い・未達の明示
+
+- 5/5 に到達した。#250・#1062 を close するかの判断はオーナーに残す
+- 範囲外として記録のみ: 要素の `dispatchEvent` の木に沿った伝播（capture・bubble が document・window へ届くこと）と `Event.composedPath`、live な `NamedNodeMap`。skip・期待値の弱体化・成功フォールバックは入れていない（`CDP-6`・`SEC-2`）
 
 #### 再現手順
 

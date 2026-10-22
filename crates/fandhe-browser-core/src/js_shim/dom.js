@@ -43,8 +43,12 @@
 //   呼ぶたびに別の配列になる。ラッパー型を持たない ProcessingInstruction・DocumentFragment に当たると TypeError
 //   （HTML パースでは到達しない）。DocumentType の publicId / systemId・splitText 等の CharacterData の編集メソッド・
 //   MutationRecord の previousSibling（常に null）は未実装。
-// - namespaceURI / isConnected / contains / compareDocumentPosition / attributes（属性の列挙）。
-//   対応する op が無く未定義のまま。
+// - Element.attributes は実装済み（#1245。Playwright の previewNode が読む）。簡略版（REPAIR-3）: live でない
+//   静的な Array（item / getNamedItem つき）で、呼ぶたびに作り直す。Attr は読み取り専用で Node を継承せず
+//   （`attr instanceof Node` は false）、prefix 付き属性の localName は qualified name のまま・prefix と
+//   namespaceURI は null。名前付きプロパティアクセス（`attrs.id`）・setNamedItem / removeNamedItem /
+//   getNamedItemNS・Attr.value の代入・グローバルの NamedNodeMap / Attr は未実装。
+// - namespaceURI / isConnected / contains / compareDocumentPosition。対応する op が無く未定義のまま。
 // - HTMLElement・HTMLIFrameElement は名前だけ（instanceof / typeof 判定が通るため。常に false。
 //   `new` は Illegal constructor。継承は Element ← HTMLElement ← HTMLIFrameElement）。他の
 //   サブクラスは未定義のまま（#1168・#1184）。要素名を返す op（`elementLocalName`）は追加済みだがラッパーは常に Element で作る。将来は HTML
@@ -560,6 +564,85 @@
             notifyMutation('attributes', self, { attributeName: removed });
         }
     }
+
+    // --- Element.attributes（#1245・JS-5。Playwright の InjectedScript.previewNode が
+    // `element.attributes.length` を辿るため。locator.textContent() が TypeError になっていた） ---
+    // 簡略版（REPAIR-3）: live でない静的スナップショット（素の Array + item / getNamedItem）。呼ぶたびに
+    // op `attributeCount` / `attributeNameAt` / `attributeValueAt` で組み立て直す。エントリは読み取り専用の
+    // Attr（Node を継承しない。ノード ID を持たないため `attr instanceof Node` は false）。
+    var attrData = new WeakMap();
+    function Attr(token, owner, name, value) {
+        if (token !== TOKEN) {
+            throw new TypeError('Illegal constructor');
+        }
+        attrData.set(this, { owner: owner, name: name, value: value });
+    }
+    function attrGetter(key) {
+        return {
+            get: function () {
+                if (!attrData.has(this)) {
+                    throw new TypeError('Illegal invocation');
+                }
+                return attrData.get(this)[key];
+            }
+        };
+    }
+    define(Attr.prototype, 'name', attrGetter('name'));
+    define(Attr.prototype, 'nodeName', attrGetter('name'));
+    define(Attr.prototype, 'value', attrGetter('value'));
+    define(Attr.prototype, 'nodeValue', attrGetter('value'));
+    define(Attr.prototype, 'textContent', attrGetter('value'));
+    define(Attr.prototype, 'ownerElement', attrGetter('owner'));
+    // 差異: prefix 付きの属性（`xlink:href`）も localName は qualified name と同じ値、prefix・namespaceURI は
+    // null を返す（名前空間の分解は未実装。値を装わず null）。
+    define(Attr.prototype, 'localName', attrGetter('name'));
+    define(Attr.prototype, 'prefix', { get: function () { return null; } });
+    define(Attr.prototype, 'namespaceURI', { get: function () { return null; } });
+    define(Attr.prototype, 'nodeType', { get: function () { return 2; } });
+    define(Attr.prototype, 'specified', { get: function () { return true; } });
+    define(Element.prototype, 'attributes', {
+        get: function () {
+            var id = idOf(this, 'attributes');
+            var count = op('attributeCount', id);
+            var list = [];
+            for (var i = 0; i < count; i++) {
+                var name = op('attributeNameAt', id, i);
+                var value = op('attributeValueAt', id, i);
+                if (typeof name === 'string' && typeof value === 'string') {
+                    list.push(new Attr(TOKEN, this, name, value));
+                }
+            }
+            Object.defineProperty(list, 'item', {
+                value: function item(index) {
+                    var n = Number(index);
+                    var found = n >= 0 && n < list.length ? list[Math.floor(n)] : null;
+                    return found === undefined ? null : found;
+                },
+                writable: true,
+                configurable: true,
+                enumerable: false
+            });
+            // HTML 名前空間の要素は引数を ASCII 小文字化して照合する（DOM 標準の qualified name での取得）。
+            Object.defineProperty(list, 'getNamedItem', {
+                value: function getNamedItem(qualifiedName) {
+                    var q = String(qualifiedName);
+                    if (op('htmlLocalName', id) !== null) {
+                        q = q.replace(/[A-Z]/g, function (c) { return c.toLowerCase(); });
+                    }
+                    for (var j = 0; j < list.length; j++) {
+                        if (attrData.get(list[j]).name === q) {
+                            return list[j];
+                        }
+                    }
+                    return null;
+                },
+                writable: true,
+                configurable: true,
+                enumerable: false
+            });
+            return list;
+        }
+    });
 
     // --- 要素種別ごとの IDL 属性の反映（#1186・JS-5・REPAIR-3・SEC-2）---
     // 種別（HTML 名前空間の local name）は op `htmlLocalName` で 1 度だけ取得してラッパーごとに
