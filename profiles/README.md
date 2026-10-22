@@ -43,7 +43,7 @@ Rust 側の読み込み・照会は `fandhe-browser-core` の `cssom_profile` �
 
 Compatibility data derived from caniuse.com (CC-BY-4.0).
 
-`NOTICE` への正式記載は TASK-103（Issue #395）・`OSS-7` で扱う。
+`NOTICE` 第 4 節に記載済み（TASK-103.1・Issue #395・`OSS-7`）。
 
 ## 生成手順
 
