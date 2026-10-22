@@ -481,10 +481,12 @@ jobs:
   # 順に束ねた（同一 target dir で依存ビルドを共有する）。ステップ名の接頭辞が旧ジョブ:
   #   [default] = rust-ci-default-features（既定 feature・エンジンなし・両エンジン同梱の共通
   #               テスト。TASK-32.4・#168・JS-1。clippy -D warnings は REPAIR-6）
-  #   [js-boa]  = rust-ci-js-boa（軽量ビルド `--no-default-features --features js-boa`。
+  #   [js-boa]  = rust-ci-js-boa（軽量ビルド `--no-default-features --features js-boa,plugin-registry`。
   #               TASK-32.4・#168・JS-1）
   #   [js-v8]   = rust-ci-js-v8（`--features js-v8` 単独で TASK-28 共通コンフォーマンス
   #               テストを V8 に対して検証。TASK-29.7・#158・JS-1）
+  #   [plugin-registry] = ai の `plugin-registry` feature off の clippy・test（2 ルートが 404 に
+  #               なることの確認を含む。PERF-7・TASK-104・#822。ubuntu・macOS と Windows の -default のみ）
   # 各ステップは !cancelled() で独立に走らせ、失敗構成を 1 回の実行で特定できるようにする。
   # cache・CARGO_INCREMENTAL=0・CARGO_PROFILE_DEV_DEBUG は 3 OS 共通（上記 rust-test と同じ）。
   #
@@ -555,13 +557,15 @@ jobs:
         run: cargo test -p fandhe-browser-core --features js-v8 --features js-boa
       - name: "[js-boa] cargo build（cli 軽量ビルド）"
         if: ${{ !cancelled() }}
-        run: cargo build -p fandhe-browser-cli --no-default-features --features js-boa
+        run: cargo build -p fandhe-browser-cli --no-default-features --features js-boa,plugin-registry
       - name: "[js-boa] cargo clippy（cli 軽量ビルド）"
         if: ${{ !cancelled() }}
-        run: cargo clippy -p fandhe-browser-cli --all-targets --no-default-features --features js-boa -- -D warnings
+        run: |
+          cargo clippy -p fandhe-browser-cli --all-targets --no-default-features \
+            --features js-boa,plugin-registry -- -D warnings
       - name: "[js-boa] cargo test（cli 軽量ビルド）"
         if: ${{ !cancelled() }}
-        run: cargo test -p fandhe-browser-cli --no-default-features --features js-boa
+        run: cargo test -p fandhe-browser-cli --no-default-features --features js-boa,plugin-registry
       - name: "[js-boa] cargo clippy（js js-boa）"
         if: ${{ !cancelled() }}
         run: cargo clippy -p fandhe-browser-js --all-targets --features js-boa -- -D warnings
@@ -574,6 +578,12 @@ jobs:
       - name: "[js-boa] cargo check（cli エンジンなし）"
         if: ${{ !cancelled() }}
         run: cargo check -p fandhe-browser-cli --no-default-features
+      - name: "[plugin-registry] cargo clippy（ai 登録機構 off）"
+        if: ${{ !cancelled() }}
+        run: cargo clippy -p fandhe-browser-ai --all-targets --no-default-features -- -D warnings
+      - name: "[plugin-registry] cargo test（ai 登録機構 off）"
+        if: ${{ !cancelled() }}
+        run: cargo test -p fandhe-browser-ai --no-default-features
       - name: "[js-v8] cargo clippy（js js-v8 単独）"
         if: ${{ !cancelled() }}
         run: cargo clippy -p fandhe-browser-js --all-targets --features js-v8 -- -D warnings
@@ -650,13 +660,15 @@ jobs:
         run: cargo test -p fandhe-browser-core --features js-v8 --features js-boa
       - name: "[js-boa] cargo build（cli 軽量ビルド）"
         if: ${{ !cancelled() }}
-        run: cargo build -p fandhe-browser-cli --no-default-features --features js-boa
+        run: cargo build -p fandhe-browser-cli --no-default-features --features js-boa,plugin-registry
       - name: "[js-boa] cargo clippy（cli 軽量ビルド）"
         if: ${{ !cancelled() }}
-        run: cargo clippy -p fandhe-browser-cli --all-targets --no-default-features --features js-boa -- -D warnings
+        run: |
+          cargo clippy -p fandhe-browser-cli --all-targets --no-default-features \
+            --features js-boa,plugin-registry -- -D warnings
       - name: "[js-boa] cargo test（cli 軽量ビルド）"
         if: ${{ !cancelled() }}
-        run: cargo test -p fandhe-browser-cli --no-default-features --features js-boa
+        run: cargo test -p fandhe-browser-cli --no-default-features --features js-boa,plugin-registry
       - name: "[js-boa] cargo clippy（js js-boa）"
         if: ${{ !cancelled() }}
         run: cargo clippy -p fandhe-browser-js --all-targets --features js-boa -- -D warnings
@@ -669,6 +681,12 @@ jobs:
       - name: "[js-boa] cargo check（cli エンジンなし）"
         if: ${{ !cancelled() }}
         run: cargo check -p fandhe-browser-cli --no-default-features
+      - name: "[plugin-registry] cargo clippy（ai 登録機構 off）"
+        if: ${{ !cancelled() }}
+        run: cargo clippy -p fandhe-browser-ai --all-targets --no-default-features -- -D warnings
+      - name: "[plugin-registry] cargo test（ai 登録機構 off）"
+        if: ${{ !cancelled() }}
+        run: cargo test -p fandhe-browser-ai --no-default-features
       - name: "[js-v8] cargo clippy（js js-v8 単独）"
         if: ${{ !cancelled() }}
         run: cargo clippy -p fandhe-browser-js --all-targets --features js-v8 -- -D warnings
@@ -736,6 +754,12 @@ jobs:
       - name: "[js-boa] cargo check（cli エンジンなし）"
         if: ${{ !cancelled() }}
         run: cargo check -p fandhe-browser-cli --no-default-features
+      - name: "[plugin-registry] cargo clippy（ai 登録機構 off）"
+        if: ${{ !cancelled() }}
+        run: cargo clippy -p fandhe-browser-ai --all-targets --no-default-features -- -D warnings
+      - name: "[plugin-registry] cargo test（ai 登録機構 off）"
+        if: ${{ !cancelled() }}
+        run: cargo test -p fandhe-browser-ai --no-default-features
       - name: "[js-v8] cargo clippy（js js-v8 単独）"
         if: ${{ !cancelled() }}
         run: cargo clippy -p fandhe-browser-js --all-targets --features js-v8 -- -D warnings
@@ -864,13 +888,15 @@ jobs:
           restore-keys: rust-${{ runner.os }}-features-boa-v1-${{ steps.toolchain.outputs.cachekey }}-
       - name: "[js-boa] cargo build（cli 軽量ビルド）"
         if: ${{ !cancelled() }}
-        run: cargo build -p fandhe-browser-cli --no-default-features --features js-boa
+        run: cargo build -p fandhe-browser-cli --no-default-features --features js-boa,plugin-registry
       - name: "[js-boa] cargo clippy（cli 軽量ビルド）"
         if: ${{ !cancelled() }}
-        run: cargo clippy -p fandhe-browser-cli --all-targets --no-default-features --features js-boa -- -D warnings
+        run: |
+          cargo clippy -p fandhe-browser-cli --all-targets --no-default-features \
+            --features js-boa,plugin-registry -- -D warnings
       - name: "[js-boa] cargo test（cli 軽量ビルド）"
         if: ${{ !cancelled() }}
-        run: cargo test -p fandhe-browser-cli --no-default-features --features js-boa
+        run: cargo test -p fandhe-browser-cli --no-default-features --features js-boa,plugin-registry
       - name: "[js-boa] cargo clippy（js js-boa）"
         if: ${{ !cancelled() }}
         run: cargo clippy -p fandhe-browser-js --all-targets --features js-boa -- -D warnings

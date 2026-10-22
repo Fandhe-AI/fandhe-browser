@@ -44,7 +44,7 @@ ID から SSOT（`docs/spec` の `04-behavior/`）を参照すること
     loaded の結果は出力しない。根拠は `results[].js_worker`（`confirmed_instances`・`observed_by_sampler`・
     `confirmed_by_reap_counter`）に残る。idle は遷移しないので子は起動せず、確認もしない（警告を出す）
   - `--page-js` のエンジンはバイナリに同梱されたものと一致させる（既定ビルドは V8 のみ。`boa` は
-    `--no-default-features --features js-boa` 等でビルドする）。不一致は起動失敗として、ログ末尾に出る
+    `--no-default-features --features js-boa,plugin-registry` 等でビルドする）。不一致は起動失敗として、ログ末尾に出る
 
 ## 前提
 

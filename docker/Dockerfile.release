@@ -4,7 +4,7 @@
 # musl の静的リンク単一バイナリ（x86_64 必須・aarch64 任意）としてビルドし、scratch イメージに
 # バイナリ・CA 証明書バンドル・ライセンス文書・データディレクトリだけを入れる。
 #   - default: 既定 feature（V8 のみ同梱）。--target 省略時もこちら（最終ステージ）。
-#   - lite:    --no-default-features --features js-boa（boa のみ同梱）。
+#   - lite:    --no-default-features --features js-boa,plugin-registry（boa のみ同梱）。
 # リポジトリルートの開発用 Dockerfile（lint・テスト用）とは別物で、配布には使わない。
 #
 # ビルド: docker build -f docker/Dockerfile.release --target default -t fandhe-browser:default .
@@ -61,7 +61,7 @@ ARG TARGETARCH
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/build/target,id=fandhe-release-target-lite-${TARGETARCH} \
-    docker/release-build.sh "${TARGETARCH}" "--no-default-features --features js-boa" boa_engine
+    docker/release-build.sh "${TARGETARCH}" "--no-default-features --features js-boa,plugin-registry" boa_engine
 
 # 静的リンク検査（CTR-4・決定 5）。docker/verify-static.sh が Alpine 固有の検査を行い、ELF の動的リンク判定は
 # 正本の scripts/check-static-link.sh（TASK-93.3）へ委譲する。

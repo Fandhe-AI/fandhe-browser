@@ -33,8 +33,8 @@ CONFIGS="default boa none"
 config_cargo_args() {
   case "$1" in
     default) echo "" ;;
-    boa) echo "--no-default-features --features js-boa" ;;
-    none) echo "--no-default-features" ;;
+    boa) echo "--no-default-features --features js-boa,plugin-registry" ;;
+    none) echo "--no-default-features --features plugin-registry" ;;
     *) return 1 ;;
   esac
 }
