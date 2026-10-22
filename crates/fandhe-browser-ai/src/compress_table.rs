@@ -524,20 +524,45 @@ pub(crate) fn visible_body_rows(doc: &Document, structure: &RegularStructure) ->
         .collect()
 }
 
+/// 展開表・一覧で 1 行文字列へ畳む 1 行（[`rows_to_fold`] の要素。`AISNAP-12`・TASK-16.4・TASK-4 A-1）。
+///
+/// 呼び出し文脈: `build_snapshot` の展開側が `FoldedRow` を組み立てるときに読む。位置に意味がある
+/// 組 `(usize, NodeId)` の代わりに名前付きフィールドで持ち、保持理由・行数などを足しても
+/// 呼び出し元の分解を壊さないようにする（REPAIR-4）。`#[non_exhaustive]` はその拡張の意図を示す
+/// もので、現在は crate 内限定。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub(crate) struct FoldTarget {
+    row_index: usize,
+    node: NodeId,
+}
+
+impl FoldTarget {
+    /// 表示対象データ行（`visible_body_rows`）の中での 0 始まり index。`FoldedRow::index` になる。
+    pub(crate) fn row_index(&self) -> usize {
+        self.row_index
+    }
+
+    /// 畳む行要素（`tr` / `li`）。
+    pub(crate) fn node(&self) -> NodeId {
+        self.node
+    }
+}
+
 /// 圧縮せず展開する表・一覧で、優先保持（`AISNAP-12`・TASK-16.4・Issue #107）の対象外となり
-/// 1 行文字列へ畳んでよい行を（表示対象データ行の中での index, 行）の組で文書順に返す。
+/// 1 行文字列へ畳んでよい行を [`FoldTarget`] の列として文書順に返す。
 ///
 /// 呼び出し文脈: `build_snapshot` が、操作要素等を含むため `can_compress` で全体を圧縮
 /// できない規則的構造に対して呼ぶ。[`compress_rows`] と同じ予算モデル（先頭確保 →
 /// ページネーション・送信ボタン → 文書順充填）で保持する行を選び、保持されず、かつ
 /// `must_keep` が `false` の行（ref・state・意味的ノードなど畳むと失われる内容を持たない行）
-/// だけを返す。返した行は [`compress_row_list`] で文字列化され、内容は省略されない。
+/// だけを返す。返した行は [`compress_row`] で文字列化され、内容は省略されない。
 /// 表示対象行が [`MAX_TABLE_ROWS`] 以下なら空を返す。
-pub fn rows_to_fold(
+pub(crate) fn rows_to_fold(
     doc: &Document,
     structure: &RegularStructure,
     must_keep: impl Fn(NodeId) -> bool,
-) -> Vec<(usize, NodeId)> {
+) -> Vec<FoldTarget> {
     let visible = visible_body_rows(doc, structure);
     if visible.len() <= MAX_TABLE_ROWS {
         return Vec::new();
@@ -550,7 +575,10 @@ pub fn rows_to_fold(
         .iter()
         .enumerate()
         .filter(|(i, row)| !kept.contains(i) && !must_keep(**row))
-        .map(|(i, row)| (i, *row))
+        .map(|(i, row)| FoldTarget {
+            row_index: i,
+            node: *row,
+        })
         .collect()
 }
 
@@ -573,7 +601,7 @@ pub struct WideTableFold {
 /// - それ以外で優先保持に選ばれた行は `folded`、選ばれなかった行は `omitted`
 /// - 表示対象行が [`MAX_TABLE_ROWS`] 以下なら、`must_keep` でない行はすべて畳む
 ///
-/// [`rows_to_fold`] との違い: 通常表では保持されない行を畳み保持行を展開するが、
+/// `rows_to_fold` との違い: 通常表では保持されない行を畳み保持行を展開するが、
 /// 幅広表は 1 行あたりのトークンが大きいため、保持行を畳み、保持されない行は省略する。
 /// `folded` の index は「畳む行と展開する行（省略行を除く）」を文書順に数えた位置で、
 /// 展開側の行は畳んだ行が使わない index を昇順に占める（`FoldedRow::index` の契約）。
@@ -609,16 +637,23 @@ pub fn fold_wide_table_rows(
 
 /// 明示した行要素の列を 1 行 1 文字列へ圧縮する（文書順を保つ。行の省略はしない）。
 ///
-/// [`compress_rows`] の行文字列化部分を切り出したもの。`build_snapshot` が畳む行
-/// （[`rows_to_fold`]）の文字列化にも使う。
+/// [`compress_rows`] の行文字列化部分を切り出したもの。
 pub fn compress_row_list(
     doc: &Document,
     kind: StructureKind,
     rows: &[NodeId],
 ) -> Vec<CompressedRow> {
     rows.iter()
-        .map(|&row| compress_one_row(doc, kind, row, MAX_COLUMNS))
+        .map(|&row| compress_row(doc, kind, row))
         .collect()
+}
+
+/// 畳む行（`rows_to_fold` の [`FoldTarget`]）を 1 件ずつ 1 行文字列へ圧縮する（`AISNAP-2`・`AISNAP-12`）。
+///
+/// `build_snapshot` の展開側が呼ぶ。[`compress_row_list`] と同じ上限（`MAX_COLUMNS`）を使い、
+/// 行ごとの結果を index と対にして扱えるようにする（旧 `zip` の解消。TASK-4 A-1）。
+pub(crate) fn compress_row(doc: &Document, kind: StructureKind, row: NodeId) -> CompressedRow {
+    compress_one_row(doc, kind, row, MAX_COLUMNS)
 }
 
 /// 幅広表（[`detect_wide_table`]）の行を 1 行 1 文字列へ圧縮する（TASK-23.7）。
@@ -689,7 +724,7 @@ fn compress_one_row(
 ///   充填）。表示対象行が 20 行以下なら全行を文書順で返す。`build_snapshot` 経由では
 ///   リンク・ボタンだけの表・一覧は本関数で圧縮し（行内操作要素は呼び出し側が
 ///   `CompressedRow::row` から別途収集する。Issue #632）、入力欄等を含む表・一覧は全体を
-///   圧縮できない（`can_compress`）ため本関数には渡らず、展開側で [`rows_to_fold`] が同じ
+///   圧縮できない（`can_compress`）ため本関数には渡らず、展開側で `rows_to_fold` が同じ
 ///   予算モデルで畳む行を選ぶ
 /// - 表示対象のデータ行のうち保持されなかった件数を `truncated_rows` に返す
 ///   （非表示行・`tfoot`・ヘッダは数えない。TASK-12.4・Issue #82）
@@ -1204,6 +1239,35 @@ mod tests {
         }
         h.push_str(&format!("<li>{last}</li></ul>"));
         h
+    }
+
+    /// AISNAP-12・TASK-4 A-1: 20 行を超える分が `FoldTarget`（index と行ノード）で返る。
+    #[test]
+    fn aisnap_12_rows_to_fold_returns_fold_targets_beyond_cap() {
+        let (doc, s) = regular_doc(&table_html(25, true), "table");
+        let targets = rows_to_fold(&doc, &s, |_| false);
+        let idx: Vec<usize> = targets.iter().map(|t| t.row_index()).collect();
+        assert_eq!(idx, vec![20, 21, 22, 23, 24]);
+        for t in &targets {
+            assert_eq!(t.node(), s.body_rows[t.row_index()]);
+        }
+    }
+
+    /// AISNAP-12・TASK-4 A-1: `must_keep` の行は畳み対象から外れる。
+    #[test]
+    fn aisnap_12_rows_to_fold_skips_must_keep_row() {
+        let (doc, s) = regular_doc(&table_html(25, true), "table");
+        let keep = s.body_rows[22];
+        let targets = rows_to_fold(&doc, &s, |row| row == keep);
+        let idx: Vec<usize> = targets.iter().map(|t| t.row_index()).collect();
+        assert_eq!(idx, vec![20, 21, 23, 24]);
+    }
+
+    /// AISNAP-12・TASK-4 A-1: 20 行以下なら畳む行はない。
+    #[test]
+    fn aisnap_12_rows_to_fold_empty_within_cap() {
+        let (doc, s) = regular_doc(&table_html(20, true), "table");
+        assert_eq!(rows_to_fold(&doc, &s, |_| false), Vec::<FoldTarget>::new());
     }
 
     fn positions(r: &CompressedRows, s: &RegularStructure) -> Vec<usize> {
