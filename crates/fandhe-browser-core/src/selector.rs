@@ -13,7 +13,8 @@
 //! Issue #35 の依存承認判断で不採用となった。本モジュールは stdlib のみで
 //! セレクタ解析を実装する（dependency-policy.md）。
 //!
-//! 対応する構文（サブセット）: 型セレクタ（`div`）・ID（`#id`）・
+//! 対応する構文（サブセット）: 型セレクタ（`div`）・全称セレクタ（`*`・
+//! Issue #1237）・ID（`#id`）・
 //! クラス（`.class`）・属性の存在（`[a]`）・属性の完全一致
 //! （`[a=v]` / `[a="v"]` / `[a='v']`）・属性の前方一致（`[a^=v]`・
 //! TASK-71.6・#760）・`:not()`（引数は複合セレクタのリスト・入れ子可・
@@ -32,8 +33,8 @@
 //!
 //! ## 本モジュールの範囲外（将来仕様。REPAIR-3: 実装済みを装わない）
 //!
-//! - 対象外の構文（`Error::Unsupported` を返す。サブセット実装）: `*`
-//!   （全称セレクタ）・`:not()` 以外の疑似クラス / 疑似要素（`:`・`::`）・
+//! - 対象外の構文（`Error::Unsupported` を返す。サブセット実装）:
+//!   `:not()` 以外の疑似クラス / 疑似要素（`:`・`::`）・
 //!   `:not()` 内の複雑セレクタ（結合子を含むもの）・隣接 / 一般兄弟
 //!   結合子（`+` / `~`）・名前空間（`|`）・`=` `^=` 以外の属性演算子（`~=` `|=`
 //!   `$=` `*=`）・属性フラグ（`i` / `s`）・エスケープ（`\`）・
@@ -150,11 +151,12 @@ impl ComplexSelector {
 }
 
 /// 型名・ID・クラス・属性セレクタが単一要素にかかる複合セレクタ
-/// （例: `a.link#top[href]`）。型名か単純セレクタのどちらかが
-/// 1 個以上ある（空にはならない）。
+/// （例: `a.link#top[href]`）。型名・全称セレクタ（`*`）・単純セレクタの
+/// いずれかが 1 個以上ある（空にはならない）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompoundSelector {
     type_name: Option<String>,
+    universal: bool,
     simple_selectors: Vec<SimpleSelector>,
 }
 
@@ -167,6 +169,17 @@ impl CompoundSelector {
     /// `foreignObject` のような非 HTML 名前空間の名前は完全一致で比較する。
     pub fn type_name(&self) -> Option<&str> {
         self.type_name.as_deref()
+    }
+
+    /// 全称セレクタ（`*`）が明示された複合セレクタか。
+    ///
+    /// `*` は任意の要素に一致し（`query::compound_matches` は型名なしと同じ扱い）、
+    /// 詳細度への寄与は 0（`cssom::selector`・`CORE-5`）。`type_name` に
+    /// `"*"` を入れると要素名として比較されてしまうため、別フィールドで持つ。
+    /// Playwright の注入スクリプトが `querySelectorAll('*')` を発行する
+    /// ために対応した（TASK-44・Issue #1237）。
+    pub fn is_universal(&self) -> bool {
+        self.universal
     }
 
     /// ID・クラス・属性セレクタの列を参照する。
@@ -491,9 +504,14 @@ fn parse_attribute_value_and_close(cursor: &mut Cursor<'_>) -> Result<String> {
 fn parse_compound_selector(cursor: &mut Cursor<'_>, depth: usize) -> Result<CompoundSelector> {
     let start_offset = cursor.offset();
     let mut type_name = None;
+    let mut universal = false;
     let mut simple_selectors = Vec::new();
 
-    if let Some(c) = cursor.peek()
+    if cursor.peek() == Some('*') {
+        // 全称セレクタ。`*|a` 等の名前空間は後続の `|` が Unsupported になる。
+        cursor.bump();
+        universal = true;
+    } else if let Some(c) = cursor.peek()
         && is_ident_start_or_hyphen(c)
     {
         let ident = parse_ident(cursor)?;
@@ -594,12 +612,13 @@ fn parse_compound_selector(cursor: &mut Cursor<'_>, depth: usize) -> Result<Comp
         }
     }
 
-    if type_name.is_none() && simple_selectors.is_empty() {
+    if type_name.is_none() && !universal && simple_selectors.is_empty() {
         return Err(classify_compound_start_error(cursor, start_offset));
     }
 
     Ok(CompoundSelector {
         type_name,
+        universal,
         simple_selectors,
     })
 }
@@ -667,7 +686,6 @@ fn parse_not_arguments(cursor: &mut Cursor<'_>, depth: usize) -> Result<Vec<Comp
 /// 適切なエラー（`Unsupported` か `InvalidInput` か）を判定する。
 fn classify_compound_start_error(cursor: &Cursor<'_>, start_offset: usize) -> Error {
     match cursor.peek() {
-        Some('*') => unsupported_at(start_offset, "universal selector"),
         Some(':') => unsupported_at(start_offset, "pseudo-class"),
         Some('&') => unsupported_at(start_offset, "nesting"),
         Some('|') => unsupported_at(start_offset, "namespace"),
@@ -745,7 +763,7 @@ fn parse_complex_selector(cursor: &mut Cursor<'_>) -> Result<ComplexSelector> {
 ///
 /// # エラー
 ///
-/// - サブセット外だが CSS として正しい構文（`*`・疑似クラス・兄弟結合子・
+/// - サブセット外だが CSS として正しい構文（疑似クラス・兄弟結合子・
 ///   属性演算子の拡張・エスケープ等）には [`Error::Unsupported`] を返す。
 /// - 空入力・宙に浮いた結合子・未終端の属性/文字列等、構文として不正な
 ///   入力には [`Error::InvalidInput`] を返す。
@@ -812,6 +830,7 @@ mod tests {
         ComplexSelector {
             first: CompoundSelector {
                 type_name: Some(name.to_string()),
+                universal: false,
                 simple_selectors: Vec::new(),
             },
             rest: Vec::new(),
@@ -832,6 +851,7 @@ mod tests {
         let expected = ComplexSelector {
             first: CompoundSelector {
                 type_name: None,
+                universal: false,
                 simple_selectors: vec![SimpleSelector::Id("main".to_string())],
             },
             rest: Vec::new(),
@@ -846,6 +866,7 @@ mod tests {
         let expected = ComplexSelector {
             first: CompoundSelector {
                 type_name: None,
+                universal: false,
                 simple_selectors: vec![SimpleSelector::Class("item".to_string())],
             },
             rest: Vec::new(),
@@ -860,6 +881,7 @@ mod tests {
         let expected = ComplexSelector {
             first: CompoundSelector {
                 type_name: None,
+                universal: false,
                 simple_selectors: vec![SimpleSelector::Attribute(AttributeSelector {
                     name: "href".to_string(),
                     matcher: AttributeMatcher::Exists,
@@ -877,6 +899,7 @@ mod tests {
         let expected = ComplexSelector {
             first: CompoundSelector {
                 type_name: None,
+                universal: false,
                 simple_selectors: vec![SimpleSelector::Attribute(AttributeSelector {
                     name: "type".to_string(),
                     matcher: AttributeMatcher::Equals("text".to_string()),
@@ -895,6 +918,7 @@ mod tests {
         let expected = ComplexSelector {
             first: CompoundSelector {
                 type_name: None,
+                universal: false,
                 simple_selectors: vec![SimpleSelector::Attribute(AttributeSelector {
                     name: "title".to_string(),
                     matcher: AttributeMatcher::Equals("a b".to_string()),
@@ -912,6 +936,7 @@ mod tests {
         let expected = ComplexSelector {
             first: CompoundSelector {
                 type_name: None,
+                universal: false,
                 simple_selectors: vec![SimpleSelector::Attribute(AttributeSelector {
                     name: "data-x".to_string(),
                     matcher: AttributeMatcher::Equals("v".to_string()),
@@ -929,6 +954,7 @@ mod tests {
         let expected = ComplexSelector {
             first: CompoundSelector {
                 type_name: None,
+                universal: false,
                 simple_selectors: vec![SimpleSelector::Attribute(AttributeSelector {
                     name: "a".to_string(),
                     matcher: AttributeMatcher::Equals(String::new()),
@@ -947,6 +973,7 @@ mod tests {
         let expected = ComplexSelector {
             first: CompoundSelector {
                 type_name: Some("a".to_string()),
+                universal: false,
                 simple_selectors: vec![
                     SimpleSelector::Class("link".to_string()),
                     SimpleSelector::Id("top".to_string()),
@@ -970,6 +997,7 @@ mod tests {
         let expected = ComplexSelector {
             first: CompoundSelector {
                 type_name: None,
+                universal: false,
                 simple_selectors: vec![
                     SimpleSelector::Attribute(AttributeSelector {
                         name: "a".to_string(),
@@ -991,12 +1019,14 @@ mod tests {
         let expected = ComplexSelector {
             first: CompoundSelector {
                 type_name: Some("ul".to_string()),
+                universal: false,
                 simple_selectors: Vec::new(),
             },
             rest: vec![(
                 Combinator::Descendant,
                 CompoundSelector {
                     type_name: Some("li".to_string()),
+                    universal: false,
                     simple_selectors: Vec::new(),
                 },
             )],
@@ -1011,12 +1041,14 @@ mod tests {
         let expected = ComplexSelector {
             first: CompoundSelector {
                 type_name: Some("ul".to_string()),
+                universal: false,
                 simple_selectors: Vec::new(),
             },
             rest: vec![(
                 Combinator::Child,
                 CompoundSelector {
                     type_name: Some("li".to_string()),
+                    universal: false,
                     simple_selectors: Vec::new(),
                 },
             )],
@@ -1031,12 +1063,14 @@ mod tests {
         let expected = ComplexSelector {
             first: CompoundSelector {
                 type_name: Some("ul".to_string()),
+                universal: false,
                 simple_selectors: Vec::new(),
             },
             rest: vec![(
                 Combinator::Child,
                 CompoundSelector {
                     type_name: Some("li".to_string()),
+                    universal: false,
                     simple_selectors: Vec::new(),
                 },
             )],
@@ -1052,6 +1086,7 @@ mod tests {
         let expected = ComplexSelector {
             first: CompoundSelector {
                 type_name: Some("div".to_string()),
+                universal: false,
                 simple_selectors: Vec::new(),
             },
             rest: vec![
@@ -1059,6 +1094,7 @@ mod tests {
                     Combinator::Child,
                     CompoundSelector {
                         type_name: Some("ul".to_string()),
+                        universal: false,
                         simple_selectors: Vec::new(),
                     },
                 ),
@@ -1066,6 +1102,7 @@ mod tests {
                     Combinator::Descendant,
                     CompoundSelector {
                         type_name: Some("li".to_string()),
+                        universal: false,
                         simple_selectors: vec![SimpleSelector::Class("item".to_string())],
                     },
                 ),
@@ -1104,6 +1141,7 @@ mod tests {
         let expected = ComplexSelector {
             first: CompoundSelector {
                 type_name: None,
+                universal: false,
                 simple_selectors: vec![SimpleSelector::Attribute(AttributeSelector {
                     name: "HREF".to_string(),
                     matcher: AttributeMatcher::Exists,
@@ -1124,6 +1162,7 @@ mod tests {
         let expected = ComplexSelector {
             first: CompoundSelector {
                 type_name: Some("foreignObject".to_string()),
+                universal: false,
                 simple_selectors: vec![SimpleSelector::Attribute(AttributeSelector {
                     name: "viewBox".to_string(),
                     matcher: AttributeMatcher::Exists,
@@ -1150,6 +1189,7 @@ mod tests {
         let expected = ComplexSelector {
             first: CompoundSelector {
                 type_name: None,
+                universal: false,
                 simple_selectors: vec![SimpleSelector::Class("Foo".to_string())],
             },
             rest: Vec::new(),
@@ -1160,6 +1200,7 @@ mod tests {
         let expected = ComplexSelector {
             first: CompoundSelector {
                 type_name: None,
+                universal: false,
                 simple_selectors: vec![SimpleSelector::Id("Bar".to_string())],
             },
             rest: Vec::new(),
@@ -1174,6 +1215,7 @@ mod tests {
         let expected = ComplexSelector {
             first: CompoundSelector {
                 type_name: None,
+                universal: false,
                 simple_selectors: vec![SimpleSelector::Class("日本語".to_string())],
             },
             rest: Vec::new(),
@@ -1188,6 +1230,7 @@ mod tests {
         let expected = ComplexSelector {
             first: CompoundSelector {
                 type_name: None,
+                universal: false,
                 simple_selectors: vec![SimpleSelector::Class("-foo".to_string())],
             },
             rest: Vec::new(),
@@ -1198,6 +1241,7 @@ mod tests {
         let expected = ComplexSelector {
             first: CompoundSelector {
                 type_name: None,
+                universal: false,
                 simple_selectors: vec![SimpleSelector::Class("--x".to_string())],
             },
             rest: Vec::new(),
@@ -1220,6 +1264,7 @@ mod tests {
             let expected = ComplexSelector {
                 first: CompoundSelector {
                     type_name: type_name.map(str::to_string),
+                    universal: false,
                     simple_selectors: vec![SimpleSelector::Attribute(AttributeSelector {
                         name: "id".to_string(),
                         matcher: AttributeMatcher::Prefix(value.to_string()),
@@ -1235,7 +1280,8 @@ mod tests {
     #[test]
     fn core_1_rejects_unsupported_syntax() {
         let unsupported_inputs = [
-            "*",
+            "*|a",
+            "*|*",
             "a:hover",
             "a::before",
             "a + b",
@@ -1278,6 +1324,11 @@ mod tests {
             "a,,b",
             ",a",
             "a,",
+            "**",
+            "div*",
+            "*div",
+            "#a*",
+            ".a*",
             "#",
             ".",
             "#1",
@@ -1391,9 +1442,58 @@ mod tests {
             "[a=",
             ".#",
             "#.",
+            "*",
+            "**",
+            "*[",
+            "*>",
+            "*|",
         ];
         for input in inputs {
             let _ = parse_selector_list(input);
+        }
+    }
+
+    /// CORE-1: 全称セレクタ `*` を解析できる（Issue #1237・TASK-44）。
+    #[test]
+    fn core_1_parses_universal_selector() {
+        let c = compound_of("*");
+        assert!(c.is_universal());
+        assert_eq!(c.type_name(), None);
+        assert!(c.simple_selectors().is_empty());
+        assert!(compound_of(" * ").is_universal());
+        assert!(!compound_of("div").is_universal());
+
+        let c = compound_of("*.c");
+        assert!(c.is_universal());
+        assert_eq!(c.simple_selectors().len(), 1);
+        for input in ["*#id", "*[a]", "*:not(.x)"] {
+            let c = compound_of(input);
+            assert!(c.is_universal(), "{input}");
+            assert_eq!(c.simple_selectors().len(), 1, "{input}");
+        }
+
+        let list = parse_selector_list("div > *").expect("div > * は解析できるはず");
+        let sel = &list.selectors()[0];
+        assert!(!sel.first().is_universal());
+        assert_eq!(sel.rest().len(), 1);
+        assert!(sel.rest()[0].1.is_universal());
+
+        let list = parse_selector_list("* *").expect("* * は解析できるはず");
+        assert!(list.selectors()[0].first().is_universal());
+        assert!(list.selectors()[0].rest()[0].1.is_universal());
+
+        let list = parse_selector_list("a, *").expect("a, * は解析できるはず");
+        assert_eq!(list.selectors().len(), 2);
+        assert!(list.selectors()[1].first().is_universal());
+
+        // `:not(*)` の引数にも現れる。
+        let c = compound_of(":not(*)");
+        match c.simple_selectors() {
+            [SimpleSelector::PseudoClass(PseudoClass::Not(args))] => {
+                assert_eq!(args.len(), 1);
+                assert!(args[0].is_universal());
+            }
+            other => panic!("unexpected: {other:?}"),
         }
     }
 
@@ -1453,7 +1553,6 @@ mod tests {
             ":not(a b)",
             ":not(a > b)",
             ":not(a + b)",
-            ":not(*)",
             ":not(a:hover)",
         ] {
             let err = parse_selector_list(input).expect_err(input);

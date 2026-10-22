@@ -230,3 +230,17 @@ fn core_5_discarded_rules_do_not_affect_cascade() {
     assert_eq!(flat(&teal), vec![("color", "teal")]);
     assert_eq!(origin(&teal, "color"), rule(1, 0, 0, 1, 1));
 }
+
+/// CORE-5: `*` ルールもカスケードに加わるが、詳細度 (0,0,0) のため型セレクタに負ける（Issue #1237）。
+#[test]
+fn core_5_universal_rule_participates_with_zero_specificity() {
+    let html =
+        "<style>* { color: blue } p { color: red }</style><p id=\"p\">a</p><div id=\"d\">b</div>";
+    let (doc, styles) = load(html);
+    let p = styles_of(&doc, &styles, "p");
+    assert_eq!(flat(&p), vec![("color", "red")]);
+    assert_eq!(origin(&p, "color"), rule(0, 1, 0, 0, 1));
+    let d = styles_of(&doc, &styles, "d");
+    assert_eq!(flat(&d), vec![("color", "blue")]);
+    assert_eq!(origin(&d, "color"), rule(0, 0, 0, 0, 0));
+}

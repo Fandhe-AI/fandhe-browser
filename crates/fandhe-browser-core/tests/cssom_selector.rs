@@ -44,15 +44,7 @@ fn core_5_specificities_from_style_rule() {
 /// CORE-5: 対応外構文は `Error::Unsupported` になり詳細度計算へ到達しない。
 #[test]
 fn core_5_unsupported_syntax_is_err() {
-    for input in [
-        "*",
-        "a:hover",
-        "a::before",
-        "a + b",
-        "a ~ b",
-        "[a$=v]",
-        ".a\\:b",
-    ] {
+    for input in ["a:hover", "a::before", "a + b", "a ~ b", "[a$=v]", ".a\\:b"] {
         match parse_selector_list(input) {
             Err(Error::Unsupported { .. }) => {}
             other => panic!("input {input:?}: expected Unsupported, got {other:?}"),
@@ -68,5 +60,25 @@ fn core_5_invalid_syntax_is_err() {
             Err(Error::InvalidInput { .. }) => {}
             other => panic!("input {input:?}: expected InvalidInput, got {other:?}"),
         }
+    }
+}
+
+/// CORE-5: 全称セレクタ `*` は詳細度に寄与しない（Issue #1237）。
+#[test]
+fn core_5_universal_specificity_is_zero() {
+    let cases: [(&str, Specificity); 5] = [
+        ("*", Specificity::new(0, 0, 0)),
+        ("*.a", Specificity::new(0, 1, 0)),
+        ("* div", Specificity::new(0, 0, 1)),
+        (":not(*)", Specificity::new(0, 0, 0)),
+        ("div > *", Specificity::new(0, 0, 1)),
+    ];
+    for (input, expected) in cases {
+        let list = parse_selector_list(input).expect("must parse");
+        assert_eq!(
+            specificity(&list.selectors()[0]),
+            expected,
+            "input: {input}"
+        );
     }
 }
