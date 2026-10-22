@@ -25,8 +25,9 @@
 //!   ACL を明示設定して任意のパスを許可する第 2 段階は未実装（後続・未判断）。
 //!   ルートまでの各要素・`profile.lock`・データ種別ディレクトリの作成と open は、親の
 //!   ハンドルを起点にした NT API（`win32` モジュール。Issue #950）で行い、パスの再解決で
-//!   配下外に作られる経路は無い。作成前は `canonicalize` による判定で守る。`root_fd`・
-//!   `data_dir_fd` 相当の公開 API と、書き込み系のハンドル基準の操作は Windows に無い（REPAIR-3）
+//!   配下外に作られる経路は無い。作成前は `canonicalize` による判定で守る。ハンドル
+//!   （`root_fd`・`data_dir_fd`）は unix でも crate 内部の実装詳細で公開しない（#839）。
+//!   `create_file_in` 相当の書き込み系のハンドル基準の操作は Windows に無い（REPAIR-3）
 //!
 //! 並行アクセス時のデータ分離はデータディレクトリ分離（`PROF-6`）自体で成立し、
 //! `PROF-2`（`tests/isolation.rs`）・`PROF-3`（`tests/concurrent_isolation.rs`。
@@ -57,14 +58,17 @@
 //! 再解決してしまうと、`open` から `data_dir` 呼び出しまでの間にルートや
 //! サブディレクトリが symlink へ差し替えられた場合、検証済みの実体とは
 //! 別の場所を指してしまう。相対パスを渡した場合は作業ディレクトリの変更
-//! でも参照先が変わり得る）。境界判定やファイル操作は unix 限定の
-//! `Profile::root_fd`・`Profile::data_dir_fd` が返す検証済みハンドルを
-//! 起点に `openat` 系 API で行う契約とする。後続タスク（Cookie・Storage 等
-//! の実データ操作）はこの契約に従う。Windows の `open` は、`canonicalize` による事前判定に加え、
+//! でも参照先が変わり得る）。境界判定やファイル操作は、crate 内で保持する
+//! 検証済みハンドル（`root_fd`・`data_dir_fd`。unix 限定の `pub(crate)`）を
+//! 起点に `openat` 系 API で行う。上位 crate（Cookie・Storage 等の実データ
+//! 操作を担う後続タスク）はハンドルに直接触れず、`Profile::create_file_in`
+//! 系の API を使う（#839・TASK-4 P-2・XOS 系）。`create_file_in` 自体も現状は
+//! unix 限定で、OS 非依存の境界内アクセス API は XOS-7〜XOS-10 の後続課題
+//! （#813）であり未実装。Windows の `open` は、`canonicalize` による事前判定に加え、
 //! ルートまでの各ディレクトリと `profile.lock` を `FILE_SHARE_DELETE` なしで開いて保持し
 //! （`Profile` はルートのディレクトリハンドルと `profile.lock` のハンドルを生存中持つ）、
 //! 改名・削除による別実体への差し替えを防ぐ。ただし保持するハンドルを起点にした
-//! `root_fd`・`data_dir_fd` 相当の公開 API は Windows に無く
+//! 書き込み系 API（`create_file_in` 相当）は Windows に無く
 //! （`open` 内の作成・open はハンドル相対だが、`open` 後に保持するのはルートのハンドルだけ。
 //! データ種別ディレクトリのハンドルは閉じる）、書き込み系のハンドル基準の操作は第 2 段階
 //! （後続。#813）の要件のため、この契約は unix 限定である
@@ -789,8 +793,9 @@ impl Profile {
     ///
     /// このパスを再度 `open`/`symlink_metadata` 等で解決すると、`open` 時に
     /// 検証した実体と異なるものを指す可能性がある（PR #437 P1 レビュー指摘。
-    /// モジュール doc 参照）。境界判定やファイル操作には unix 限定の
-    /// [`Profile::root_fd`] を使う。
+    /// モジュール doc 参照）。crate 外のファイル操作には unix 限定の
+    /// [`Profile::create_file_in`] を使う（crate 内では検証済みの `root_fd` を
+    /// 起点にする。#839）。
     pub fn root(&self) -> &Path {
         &self.root
     }
@@ -800,8 +805,9 @@ impl Profile {
     ///
     /// パスの生成のみを行い、存在確認はしない。このパスを再度解決する
     /// ファイル操作は行わないこと（[`Profile::root`] と同じ理由。PR #437 P1
-    /// レビュー指摘）。境界判定やファイル操作には unix 限定の
-    /// [`Profile::data_dir_fd`] を使う。
+    /// レビュー指摘）。crate 外のファイル操作には unix 限定の
+    /// [`Profile::create_file_in`] を使う（crate 内では `data_dir_fd` を起点に
+    /// する。#839）。
     pub fn data_dir(&self, kind: DataKind) -> PathBuf {
         self.root.join(kind.dir_name())
     }
@@ -809,22 +815,26 @@ impl Profile {
     /// unix 限定: `open` が検証済みのプロファイルルートのディレクトリ
     /// ハンドルを返す。
     ///
-    /// 後続タスク（Cookie・Storage 等の実データ操作）は、このハンドルを
-    /// `openat`/`mkdirat`/`unlinkat` 系 API の `dirfd` として使うことで、
-    /// [`Profile::root`] が返すパスを再解決せずに境界内へアクセスできる
-    /// （PR #437 P1 レビュー指摘）。
+    /// crate 内部の実装詳細（`pub(crate)`）。`create_file_in`・
+    /// `open_verified_regular_file` 等の crate 内のハンドル基準の操作が
+    /// `openat`/`unlinkat` 系 API の `dirfd` として使い、[`Profile::root`] が
+    /// 返すパスを再解決せずに境界内へアクセスするためのもの（PR #437 P1
+    /// レビュー指摘）。上位 crate は `Profile::create_file_in` 系の API を使う。
+    /// 生の `dirfd` を公開すると unix 限定の型が上位 crate に漏れて Windows で
+    /// ビルドできないコードが書けてしまうため、可視性を絞った
+    /// （#839・TASK-4 P-2・XOS 系）。
     #[cfg(unix)]
-    pub fn root_fd(&self) -> BorrowedFd<'_> {
+    pub(crate) fn root_fd(&self) -> BorrowedFd<'_> {
         self.root_fd.as_fd()
     }
 
     /// unix 限定: `open` が検証済みの、指定データ種別ディレクトリのハンドルを
     /// 返す。
     ///
-    /// [`Profile::root_fd`] と同様、後続タスクのファイル操作はこのハンドルを
-    /// `openat` 系 API の `dirfd` として使う契約とする。
+    /// `root_fd` と同様に crate 内部の実装詳細（`pub(crate)`）で、crate 内の
+    /// ハンドル基準の操作が `openat` 系 API の `dirfd` として使う（#839）。
     #[cfg(unix)]
-    pub fn data_dir_fd(&self, kind: DataKind) -> BorrowedFd<'_> {
+    pub(crate) fn data_dir_fd(&self, kind: DataKind) -> BorrowedFd<'_> {
         match kind {
             DataKind::Cookies => self.data_fds.cookies.as_fd(),
             DataKind::Storage => self.data_fds.storage.as_fd(),
@@ -836,7 +846,7 @@ impl Profile {
     /// unix 限定: 指定データ種別ディレクトリ直下に `name` という名前の
     /// ファイルを作成（既存なら開く）する最小のヘルパー。
     ///
-    /// [`Profile::data_dir_fd`] が返すハンドルを起点に `openat` するため、
+    /// crate 内で保持する `data_dir_fd` のハンドルを起点に `openat` するため、
     /// `open` から本呼び出しまでの間にディレクトリが symlink へ差し替え
     /// られていてもリンク先へは作成しない（PR #437 P1 レビュー指摘）。
     /// `OFlags::NOFOLLOW` により、`name` の位置に symlink が存在する場合も
@@ -866,7 +876,7 @@ impl Profile {
     /// 該当すれば拒否する（PR #437 再レビュー Codex P0 指摘: 既存ファイルを
     /// 無条件に信用して書き込むとプロファイル分離が成立しない）。
     ///
-    /// - 所有者 uid が [`Profile::root_fd`]（`open` で検証済みのプロファイル
+    /// - 所有者 uid が `root_fd`（`open` で検証済みのプロファイル
     ///   ルート）の所有者と異なる（`geteuid` は rustix の `process` feature が
     ///   要り依存を増やすため使わず、検証済みルートの所有者との比較で代替
     ///   する）
@@ -910,7 +920,7 @@ impl Profile {
     /// TASK-53（53.2）・#188、MS-3）。値を消費するため、削除後にハンドルを
     /// 使うことはできない。
     ///
-    /// unix では検証済みの [`Profile::root_fd`] を起点に `openat`/`unlinkat` で
+    /// unix では検証済みの `root_fd` を起点に `openat`/`unlinkat` で
     /// 再帰削除し、パス文字列は再解決しない（[`Profile::root`] は表示専用）。
     /// ディレクトリは `NOFOLLOW` で開き、symlink はエントリとして unlink する
     /// だけでリンク先へは触れない。マウントポイントはまたがず（`st_dev` に加え
