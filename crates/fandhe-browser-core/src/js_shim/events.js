@@ -32,6 +32,9 @@
 // - `window.onpopstate` は HTML 仕様どおり、最初に非 null を代入した位置で呼ばれる内部エントリで実現する。
 //   `PopStateEvent` / `onpopstate` は主要ブラウザすべてにある標準 API で、UA・navigator 等の識別面を
 //   変えず、未実装を実装済みに見せる機能検出の偽装にもならない（SEC-2 の確認結果。#1177）。
+// - `CustomEvent`（#1242。Playwright の injected script が `new CustomEvent` で対象要素をマークする）はコンストラクタ・`detail`・
+//   `initCustomEvent` を持つ。主要ブラウザすべてにある標準 API で、UA・navigator 等の識別面を変えず、isTrusted は常に false
+//   （SEC-2 の確認結果）。
 // - ES2015 の範囲に留める（V8 と boa で同一のソースを使うため）。
 //
 // - 要素への配送は、dom.js のフォーカス追跡（#1185）が出す focus / blur を対象要素にだけ例外的に行う
@@ -40,14 +43,14 @@
 // 未実装（REPAIR-3）:
 // - focusin / focusout、FocusEvent / relatedTarget、祖先の capture リスナーへの focus / blur の伝播
 //   （React 17 以降の onFocus / onBlur は root の focusin / focusout を聞くため発火しない）。
-// - 要素の dispatchEvent と、DOM の木に沿った capture / bubble の伝播。要素レベルの addEventListener /
-//   removeEventListener は「保持のみ」のスタブ（#1151。React createRoot が container に約 80 種を登録するため、
-//   TypeError で止まらないよう受け付ける）。ネイティブのイベント源が無く配送はしない。保持件数は 1 要素 1024 件まで。
+// - DOM の木に沿った capture / bubble の伝播。要素の `dispatchEvent`（#1242）は対象要素の上の capture → 非 capture だけに配り、
+//   bubbles が true でも祖先・document・window へは伝播しない。要素レベルの addEventListener /
+//   removeEventListener は保持のみ（#1151。React createRoot が container に約 80 種を登録するため TypeError で止まらないよう受け付ける）。
+//   ネイティブのイベント源（クリック等）は無く、配送は dispatchEvent とフォーカス追跡からのみ。保持件数は 1 要素 1024 件まで。
 // - `window` / `document` / `AbortSignal` は `EventTarget` を継承しない（`instanceof EventTarget` は false）。
 //   `AbortSignal` は abort.js の自前の保持を使い、`dispatchEvent` も持たない（中途半端な継承で保持先が割れるのを避ける）。
 // - `document.dispatchEvent` は bubbles が true なら window へも配るが、capture フェーズは近似しない。
-// - `addEventListener` の `signal` オプション、`Event.timeStamp` / `composedPath` / `cancelBubble` / `returnValue` / `srcElement`、
-//   CustomEvent。
+// - `addEventListener` の `signal` オプション、`Event.timeStamp` / `composedPath` / `cancelBubble` / `returnValue` / `srcElement` / `initEvent`。
 // - onload / onreadystatechange 等の他のイベントハンドラ属性。
 // - readystatechange イベント。
 (function (global) {
@@ -62,6 +65,7 @@
     // nativeOp への own プロパティ `call` 追加の影響を受けないよう、install 時に束縛・退避する。
     var callOp = Function.prototype.call.bind(nativeOp, bridge);
     var defineProperty = Object.defineProperty;
+    var setPrototypeOf = Object.setPrototypeOf;
     // 発火時にページが書き換え得る組み込みメソッドも、install 時に退避して使う（JS-4）。
     // 配列の push / splice / slice / indexOf は使わない（ページが差し替えたり、splice / slice が
     // 参照する Array[Symbol.species] を改変したりしても通知が止まらないよう、添字演算だけで操作する）。
@@ -367,6 +371,60 @@
     // ライフサイクルイベント生成用に install 時の prototype を退避する（ページの Event.prototype 差し替えに影響されない）。
     var eventProto = Event.prototype;
 
+    // ---- CustomEvent（#1242・JS-5） ----
+    // detail は専用の WeakMap に保持し、登録済みであることを brand とする（素の Event には detail を返さない）。
+    var customDetails = new WeakMap();
+    function CustomEvent(type, init) {
+        if (!(this instanceof CustomEvent)) {
+            throw new NativeTypeError("Failed to construct 'CustomEvent': Please use the 'new' operator");
+        }
+        if (arguments.length < 1) {
+            throw new NativeTypeError("Failed to construct 'CustomEvent': 1 argument required");
+        }
+        // Event 部分の検証・初期化（bubbles → cancelable → composed の順に読む）は Event に任せる。
+        fnCall(Event, this, type, init);
+        // 辞書変換の順序どおり、detail は継承元のメンバーの後に 1 回だけ読む。
+        var detail = null;
+        if (init !== undefined && init !== null) {
+            var d = init.detail;
+            detail = d === undefined ? null : d;
+        }
+        fnCall(weakSet, customDetails, this, detail);
+    }
+    setPrototypeOf(CustomEvent, Event);
+    CustomEvent.prototype = createObject(eventProto);
+    function customBrand(self) {
+        if (!isObjectLike(self) || !fnCall(weakHas, customDetails, self)) {
+            throw new NativeTypeError('Illegal invocation');
+        }
+    }
+    defineGetter(CustomEvent.prototype, 'detail', function () {
+        customBrand(this);
+        return fnCall(weakGet, customDetails, this);
+    });
+    // 旧式 API。配送中は何もしない（DOM 標準）。isTrusted は常に false のまま（SEC-2）。
+    defineMethod(CustomEvent.prototype, 'initCustomEvent', function initCustomEvent(type, bubbles, cancelable, detail) {
+        customBrand(this);
+        if (arguments.length < 1) {
+            throw new NativeTypeError("Failed to execute 'initCustomEvent' on 'CustomEvent': 1 argument required");
+        }
+        var t = toTypeString(type);
+        var st = eventState(this);
+        if (st.dispatching) {
+            return;
+        }
+        st.type = t;
+        st.bubbles = !!bubbles;
+        st.cancelable = !!cancelable;
+        st.canceled = false;
+        st.stopped = false;
+        st.immediateStopped = false;
+        st.target = null;
+        fnCall(weakSet, customDetails, this, detail === undefined ? null : detail);
+    });
+    defineTag(CustomEvent.prototype, 'CustomEvent');
+    defineMethod(CustomEvent.prototype, 'constructor', CustomEvent);
+
     // 1 リスナーの呼び出し。例外は microtask 経由で報告し、呼び出し元へ伝えない。
     function invokeEntry(entry, thisArg, event, st) {
         st.inPassive = entry.passive;
@@ -453,7 +511,7 @@
     }
 
     // dom.js のフォーカス追跡（#1185）からの focus / blur を、対象要素にだけ配る。
-    // 要素への dispatchEvent は無く（未実装）、focus / blur はバブリングしないので対象上の配送だけで足りる。
+    // 要素への dispatchEvent は対象上だけに配る近似で、focus / blur はバブリングしないので対象上の配送だけで足りる。
     // 汎用 Event（bubbles / cancelable は false、composed は true、isTrusted は常に false）で作る。
     // ハンドオフは install 中だけ存在し、ここで読んで直ちに削除する（ページ JS の実行前に消える）。
     (function registerFocusSink() {
@@ -509,6 +567,7 @@
     defineTag(EventTarget.prototype, 'EventTarget');
 
     defineProperty(global, 'Event', { value: Event, writable: true, configurable: true, enumerable: false });
+    defineProperty(global, 'CustomEvent', { value: CustomEvent, writable: true, configurable: true, enumerable: false });
     defineProperty(global, 'EventTarget', { value: EventTarget, writable: true, configurable: true, enumerable: false });
 
     // window / document は own メソッド（EventTarget は継承しない。REPAIR-3）。
@@ -560,8 +619,11 @@
     defineProperty(global, 'onpopstate', popstateAccessor);
 
     // 要素レベルは Node.prototype に保持のみのスタブとして定義する（document は上の own プロパティが優先）。
-    // dispatchEvent は意図して定義しない（REPAIR-3）。
+    // dispatchEvent（#1242）は対象要素の上だけに配る。木に沿った capture / bubble の伝播はしない（REPAIR-3）。
     if (nodeProto !== null) {
+        defineMethod(nodeProto, 'dispatchEvent', function dispatchEvent(event) {
+            return dispatchEventImpl(this, event, arguments.length);
+        });
         defineMethod(nodeProto, 'addEventListener', function addEventListener(type, listener, options) {
             addEventListenerImpl(this, type, listener, options);
         });

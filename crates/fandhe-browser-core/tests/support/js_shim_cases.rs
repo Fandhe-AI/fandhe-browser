@@ -2066,14 +2066,29 @@ fn node_cases(engine: &str) {
     p.rt.install_dom_shim(&p.bridge).expect("reinstall");
     check(&mut p, "String(document.body.nodeType)", "1");
 
-    eprintln!("case: JS-5 element addEventListener is accepted but never dispatched (stub)");
+    eprintln!(
+        "case: JS-5 element dispatchEvent delivers on the target only, no propagation (#1242)"
+    );
     check(
         &mut p,
         "var el = document.getElementById('a'); var hit = 0; var fn = function () { hit++; }; \
          el.addEventListener('click', fn, { capture: true, passive: true }); \
          el.addEventListener('click', fn); el.removeEventListener('click', fn); \
          typeof el.addEventListener + '|' + typeof el.dispatchEvent + '|' + hit",
-        "function|undefined|0",
+        "function|function|0",
+    );
+    check(
+        &mut p,
+        "var el2 = document.getElementById('a'); var o = []; var up = 0; \
+         document.addEventListener('k', function () { up++; }); window.addEventListener('k', function () { up++; }); \
+         var l = function (e) { o.push(e.detail + ':' + (e.target === el2) + ':' + (e.currentTarget === el2) + ':' + e.eventPhase); e.preventDefault(); }; \
+         el2.addEventListener('k', l); \
+         var r1 = el2.dispatchEvent(new CustomEvent('k', { detail: 5, cancelable: true, bubbles: true })); \
+         var r2 = el2.dispatchEvent(new CustomEvent('k', { detail: 6 })); \
+         el2.removeEventListener('k', l); el2.dispatchEvent(new CustomEvent('k', { detail: 7 })); \
+         var bad = 'none'; try { Node.prototype.dispatchEvent.call({}, new Event('k')); } catch (x) { bad = x.name; } \
+         o.join(',') + '|' + r1 + '|' + r2 + '|' + up + '|' + bad",
+        "5:true:true:2,6:true:true:2|false|true|0|TypeError",
     );
     check(
         &mut p,
@@ -2770,8 +2785,56 @@ fn event_target_cases(engine: &str) {
     let mut p = setup(engine, None);
     check(
         &mut p,
-        "[typeof Event, typeof EventTarget, typeof PopStateEvent].join('|')",
-        "function|function|function",
+        "[typeof Event, typeof EventTarget, typeof PopStateEvent, typeof CustomEvent].join('|')",
+        "function|function|function|function",
+    );
+
+    eprintln!("case: JS-5 CustomEvent detail / instanceof / initCustomEvent (#1242)");
+    check(
+        &mut p,
+        "var o = {k: 1}; var ce = new CustomEvent('x', {detail: o, bubbles: true}); \
+         [ce.detail === o, ce.type, ce.bubbles, ce.cancelable, ce instanceof Event, ce instanceof CustomEvent, \
+          Object.getPrototypeOf(CustomEvent) === Event, Object.prototype.toString.call(ce), ce.isTrusted].join('|')",
+        "true|x|true|false|true|true|true|[object CustomEvent]|false",
+    );
+    check(
+        &mut p,
+        "[new CustomEvent('x').detail, new CustomEvent('x', {detail: undefined}).detail, new CustomEvent('x', {detail: 0}).detail].map(String).join('|')",
+        "null|null|0",
+    );
+    check(
+        &mut p,
+        "var r = []; \
+         try { CustomEvent('x'); } catch (e) { r.push(e instanceof TypeError); } \
+         try { new CustomEvent(); } catch (e) { r.push(e instanceof TypeError); } \
+         try { Object.getOwnPropertyDescriptor(CustomEvent.prototype, 'detail').get.call(new Event('x')); } catch (e) { r.push(e instanceof TypeError); } \
+         r.join('|')",
+        "true|true|true",
+    );
+    check(
+        &mut p,
+        "var log = []; var init = { get bubbles() { log.push('bubbles'); return false; }, get cancelable() { log.push('cancelable'); return false; }, \
+         get composed() { log.push('composed'); return false; }, get detail() { log.push('detail'); return 1; } }; \
+         new CustomEvent('x', init); log.join(',')",
+        "bubbles,cancelable,composed,detail",
+    );
+    check(
+        &mut p,
+        "var ce = new CustomEvent('a', {detail: 1}); var seen = []; \
+         ce.initCustomEvent('b', true, true, 9); seen.push([ce.type, ce.bubbles, ce.cancelable, ce.detail].join(':')); \
+         var t = new EventTarget(); t.addEventListener('b', function (e) { e.initCustomEvent('c', false, false, 0); seen.push(e.type + ':' + e.detail); }); \
+         t.dispatchEvent(ce); seen.push(ce.type); \
+         try { ce.initCustomEvent(); } catch (e) { seen.push(e instanceof TypeError); } \
+         seen.join('|')",
+        "b:true:true:9|b:9|b|true",
+    );
+    check(
+        &mut p,
+        "var t = new EventTarget(); var d = {n: 1}; var got = []; \
+         t.addEventListener('q', function (e) { got.push(e.detail === d); }); \
+         window.addEventListener('q', function (e) { got.push(e.detail === d && e instanceof CustomEvent); }); \
+         t.dispatchEvent(new CustomEvent('q', {detail: d})); window.dispatchEvent(new CustomEvent('q', {detail: d})); got.join('|')",
+        "true|true",
     );
 
     eprintln!(
