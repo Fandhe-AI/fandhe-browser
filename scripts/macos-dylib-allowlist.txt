@@ -1,0 +1,21 @@
+# macOS 配布バイナリ（*-apple-darwin）が動的リンクしてよい dylib の許可リスト（TASK-93.4・PLUG-1・#364）。
+#
+# 状態: 実測前の暫定案。#363 のオーナー判断（2026-10-12）により、まず記録のみで導入し、
+#   main の実測値を見て内容を確定してから fail-closed へ切り替える。
+#   切り替えは scripts/harness.sh の MACOS_DYLIB_MODE 既定値（record -> enforce）を変えるだけで済む。
+# 正本: このファイルが機械可読の正本。文章版の方針は docs/design/plugin-boundary-policy.md（#916）。
+# 判定は scripts/check-dynamic-link-macos.sh。
+#
+# 書式（1 行 1 エントリ。glob・正規表現は使わない）:
+#   /絶対/パス.dylib   完全一致
+#   /絶対/ディレクトリ/  末尾 / は接頭辞一致（Framework 単位の許可に使う）
+# @rpath・@loader_path・@executable_path 始まりと .. を含むエントリは不正としてエラーにする。
+# 広い接頭辞（/usr/lib/ 全体・/System/ 全体）は、許可リスト外の依存を記録に残すために置かない。
+/usr/lib/libSystem.B.dylib
+/usr/lib/libc++.1.dylib
+/usr/lib/libobjc.A.dylib
+/usr/lib/libiconv.2.dylib
+/usr/lib/libresolv.9.dylib
+/System/Library/Frameworks/CoreFoundation.framework/
+/System/Library/Frameworks/Security.framework/
+/System/Library/Frameworks/SystemConfiguration.framework/

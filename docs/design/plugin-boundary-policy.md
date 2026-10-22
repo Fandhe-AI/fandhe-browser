@@ -33,7 +33,7 @@ spec 本文中の旧称 `rust-browser` は `fandhe-browser` に読み替える�
 ## ロード時動的リンクと実行時ロードの区別
 
 - `ldd`・`readelf -d` の `NEEDED`・`otool -L`・`dumpbin /dependents` が検出するのはロード時の動的リンクである。`dlopen` / `LoadLibrary` による実行時ロードは別の機構で、これらでは検出できない
-- CI 検査（Linux は #362 で実装済み。macOS・Windows は後続の #364・#365）が担うのは前者である。後者は本ポリシーとレビュー（`AGENTS.md` のレビュー観点「プラグイン境界」・[security](../../.claude/rules/security.md)）で防ぐ。CI 検査が `dlopen` まで網羅するものとは扱わない
+- CI 検査（Linux は #362、macOS は #364 で実装済み。Windows は後続の #365）が担うのは前者である。後者は本ポリシーとレビュー（`AGENTS.md` のレビュー観点「プラグイン境界」・[security](../../.claude/rules/security.md)）で防ぐ。CI 検査が `dlopen` まで網羅するものとは扱わない
 - コンテナ配布物（musl・`scratch`）は動的リンク 0 件が前提である（`CTR-4`）。ネイティブ配布物（`*-linux-gnu`・`*-apple-darwin`・`*-pc-windows-msvc`）は OS のシステムライブラリへの動的リンクが避けられず、その扱いは判断待ち（#363）である。本ドキュメントでは決めない
 
 ## 本リポジトリでの現状
@@ -77,6 +77,17 @@ cargo tree --offline --locked --workspace --all-features --target all -e normal 
 - CI では `harness-ubuntu` の `[static-link]` ステップが実行する。ビルド先は `target/` の外で、cache には入れない
 - 出荷物そのものの関門は従来どおり `docker/Dockerfile.release` の `verify-*` ステージで、同じ正本スクリプトを呼ぶ。軽量コンテナの Docker ビルドは boa 系 crate のライセンス文書不足で `verify-lite` に到達しない（`docs/design/container-size-measurement.md`）ため、軽量の検査は cargo 直ビルド経路が担う
 - 対象外: `*-linux-gnu` のネイティブ配布物（方針は #363 待ち）。`dlopen` による実行時ロード（レビューで防ぐ）
+
+## macOS 配布バイナリの動的リンク検査
+
+対応 `TASK-93`（93.4）/ `PLUG-1`。Issue #364。
+
+- 判定の正本は `scripts/check-dynamic-link-macos.sh`。`otool -L` が列挙する依存 dylib を、機械可読の許可リスト `scripts/macos-dylib-allowlist.txt`（完全一致と末尾 `/` の接頭辞一致のみ。`@rpath` 等の相対参照は常に許可リスト外）と照合する。許可リストの中身は実測前の暫定案
+- 3 OS ネイティブ配布物は許可リスト方式とする（#363 のオーナー判断 2026-10-12）。許可リストは実測前に確定せず、まず記録のみで導入し、main の実測値を見て確定してから fail-closed へ切り替える
+- 現状は記録のみ（`--mode record`。`make check-dynamic-link-macos` の既定。`MACOS_DYLIB_MODE=enforce` で fail-closed）。許可リスト外の依存は `::warning::` で記録し、失敗にはしない。非 Mach-O・不在・`otool` の失敗・依存 0 件・許可リストの不正はモードに関係なく NG（fail-closed）
+- 実行方法は `make check-dynamic-link-macos`（macOS のみ。それ以外は skip）。`fandhe-browser-cli` の既定（V8）と軽量を release ビルドして検査し、`make ci` には含めない
+- CI では `harness-macos` の `[dynamic-link-macos]` ステップが実行する（PR では skipped で、main への push と `workflow_dispatch` のみ）。`harness-ubuntu` は合成データの自己テストだけを PR でも回す。ビルド先は `RUNNER_TEMP` で cache には入れない
+- 対象外: `dlopen` による実行時ロード（レビューで防ぐ）。許可リストの確定と fail-closed への切り替えは後続 Issue
 
 ## feature と配布プロファイルの対応
 
@@ -127,9 +138,9 @@ cargo tree --offline --locked --workspace --all-features --target all -e normal 
 | Issue | 内容 | 状態 |
 | ----- | ---- | ---- |
 | #361 | feature と配布プロファイルの対応表（`TASK-93.2`） | 作成済み（「feature と配布プロファイルの対応」） |
-| #363 | 3 OS ネイティブ配布物の動的リンク方針（人間判断） | 判断待ち |
+| #363 | 3 OS ネイティブ配布物の動的リンク方針（人間判断） | 判断済み（2026-10-12。許可リスト方式・実測前は記録のみ） |
 | #362 | Linux 向け動的リンクなし検査スクリプト（`TASK-93.3`） | 実装済み（「Linux（musl）配布バイナリの動的リンクなし検査」） |
-| #364 | macOS 向け動的リンク検査スクリプト（`TASK-93.4`） | 未実装 |
+| #364 | macOS 向け動的リンク検査スクリプト（`TASK-93.4`） | 実装済み・記録のみ（「macOS 配布バイナリの動的リンク検査」。許可リスト確定と fail-closed 化は後続） |
 | #365 | Windows 向け動的リンク検査スクリプト（`TASK-93.5`） | 未実装 |
 
 親 Issue は #359（`TASK-93`）。
@@ -140,7 +151,7 @@ cargo tree --offline --locked --workspace --all-features --target all -e normal 
 - WASM ランタイムのサイズ増分は未実測の目安である
 - PoC-15 の実測は macOS ローカルのみ。3 OS 横断の確認は XOS 系へ申し送り済み
 - 本ドキュメントは新規の実測を含まない
-- 動的リンクの CI による機械検査は Linux（musl）のみ実装済みで、macOS・Windows は未実装である（#364・#365）
+- 動的リンクの CI による機械検査は Linux（musl）と macOS（記録のみ）が実装済みで、Windows は未実装である（#365）
 
 ## 関連
 
