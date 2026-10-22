@@ -420,8 +420,10 @@
         }
     });
     // nodeValue / data: Text・Comment は内容、それ以外は null（代入は何もしない。DOM 標準どおり）。
-    function characterDataSetter(self, value) {
-        var text = value === null ? '' : String(value);
+    // nodeValue は nullable DOMString のため null・undefined とも空文字列。data は DOMString のため
+    // undefined は文字列 "undefined" になる（nullable 指定は呼び出し側が渡す）。
+    function characterDataSetter(self, value, nullable) {
+        var text = (value === null || (nullable && value === undefined)) ? '' : String(value);
         op('setTextContent', idOf(self, 'data'), text);
         revalidateFocus();
         notifyMutation('characterData', self, null);
@@ -439,17 +441,17 @@
             }
         }
     });
-    function characterDataValue(name) {
+    function characterDataValue(name, nullable) {
         return {
             get: function () {
                 return op('getTextContent', idOf(this, name));
             },
             set: function (value) {
-                characterDataSetter(this, value);
+                characterDataSetter(this, value, nullable);
             }
         };
     }
-    define(CharacterData.prototype, 'nodeValue', characterDataValue('nodeValue'));
+    define(CharacterData.prototype, 'nodeValue', characterDataValue('nodeValue', true));
     define(CharacterData.prototype, 'data', characterDataValue('data'));
     define(CharacterData.prototype, 'length', {
         get: function () {

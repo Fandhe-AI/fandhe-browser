@@ -4190,6 +4190,12 @@ fn child_traversal_cases(engine: &str) {
         "a.nodeValue = 'q'; a.childNodes.length + '|' + a.firstChild.data",
         "3|X",
     );
+    check(
+        &mut p,
+        "a.firstChild.nodeValue = undefined; var nv = JSON.stringify(a.firstChild.data); \
+         a.firstChild.data = undefined; nv + '|' + a.firstChild.data",
+        "\"\"|undefined",
+    );
 
     eprintln!("case: JS-5 characterData mutation on Comment is observed (#1241)");
     check(
