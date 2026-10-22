@@ -3744,8 +3744,13 @@ fn class_list_cases(engine: &str) {
     eprintln!("case: JS-5 classList (#1236)");
     let mut p = setup(engine, None);
     let pre = "var e = document.createElement('div'); e.setAttribute('class','a a b'); var L = e.classList; ";
-    let cases: [(&str, &str); 19] = [
+    let cases: [(&str, &str); 20] = [
         ("String(e.classList === e.classList)", "true"),
+        // BigInt は unsigned long 変換で TypeError（Number() では受理されてしまう）
+        (
+            "var r; try { L.item(1n); r = 'no-throw' } catch (x) { r = x.name } r",
+            "TypeError",
+        ),
         // 引数変換が class を変更する場合は変換後の集合で判定する（receiver 検証 → 引数変換 → 属性読み取り）
         (
             "e.className = 'a'; String(L.contains({ toString: function () { e.className = 'b'; return 'b'; } }))",

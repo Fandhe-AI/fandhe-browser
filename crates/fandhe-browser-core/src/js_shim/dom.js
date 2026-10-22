@@ -579,7 +579,7 @@
                 throw new TypeError("Failed to execute 'item' on 'DOMTokenList': 1 argument required, but only 0 present.");
             }
             // 引数変換（valueOf が class を変更し得る）を属性読み取りより先に行う
-            var i = Number(index) >>> 0;
+            var i = +index >>> 0; // 単項 + は BigInt を TypeError にする（Number() は受理してしまう）
             var tokens = readTokens(el).tokens;
             return i < tokens.length ? tokens[i] : null;
         }
