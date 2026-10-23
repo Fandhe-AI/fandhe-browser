@@ -3,6 +3,8 @@
 //! core の [`AppState`] が保持する直近ナビゲート結果から [`Snapshot`]
 //! （`AISNAP-1` 方式 B）を構築し、JSON で返す `GET /ai/snapshot` と、プラグインマニフェストを
 //! 検証してレジストリへ登録する `POST /ai/plugins/register` のルータを提供する。
+//! 後者 2 つのプラグイン系ルートは `plugin-registry` feature（既定 on）で切り替えられ、off では
+//! 404 になる（`PERF-7`・TASK-104・Issue #822）。
 //! [`router`] は bind・アクセス制御（loopback 限定。`SEC-4`）を行わないが、DNS rebinding 対策として
 //! `Host` ヘッダ（localhost / IP リテラルのみ許可）を cdp と共通の core 実装で検証する。cli が
 //! `RouterFactory` として受け取り、cdp のルータと `Router::merge` で合成する
@@ -50,7 +52,9 @@ use fandhe_browser_core::parse::{ParseOptions, parse_document};
 use fandhe_browser_core::{AppState, NavigationState};
 use serde_json::{Map, Value, json};
 
-use crate::plugin_api::{AiState, ManifestError, PluginManifest, PluginRegistry, RegistryError};
+use crate::plugin_api::AiState;
+#[cfg(feature = "plugin-registry")]
+use crate::plugin_api::{ManifestError, PluginManifest, PluginRegistry, RegistryError};
 use crate::snapshot::{CheckedState, DataLeafKind, Node, Snapshot, TableSummary, build_snapshot};
 
 const JSON_CONTENT_TYPE: &str = "application/json; charset=UTF-8";
@@ -94,22 +98,30 @@ pub fn router(app: Arc<AppState>) -> Router {
 ///
 /// snapshot・plugins は Host 検証のみ行う読み取り専用 GET で、CORS 許可ヘッダは付けない。
 /// `/ai/plugins` は `PLUG-2`・TASK-92.4・Issue #356、register は TASK-92.3・Issue #355。
+///
+/// `plugin-registry` feature が off のとき、`/ai/plugins` と `/ai/plugins/register` は
+/// ルートそのものが存在せず 404 になる（空配列や成功を返して実装済みを装わない。`PERF-7`・
+/// TASK-104・Issue #822）。切り替えの実体はルート登録と [`AiState`] のレジストリ保持で、
+/// 静的な初期化処理ではない。
 pub fn router_with_state(state: Arc<AiState>) -> Router {
     let snapshot_state = Arc::clone(&state);
+    #[cfg(feature = "plugin-registry")]
     let plugins_state = Arc::clone(&state);
+    #[cfg(feature = "plugin-registry")]
     let register_state = state;
-    Router::new()
-        .route("GET", "/ai/snapshot", move |head, _body| {
-            // DNS rebinding 対策: cdp の `/json/*` と同じ Host 検証（core の `host` モジュール）を
-            // 応答前に行い、不正な Host には snapshot（直近ページの URL・内容）を渡さない。
-            if let Err(e) = Authority::from_host_header(head.header("host")) {
-                return host_error_response(e);
-            }
-            match snapshot_body(snapshot_state.app().navigation()) {
-                Ok(body) => Response::new(200, body).with_content_type(JSON_CONTENT_TYPE),
-                Err(e) => error_response(e),
-            }
-        })
+    let router = Router::new().route("GET", "/ai/snapshot", move |head, _body| {
+        // DNS rebinding 対策: cdp の `/json/*` と同じ Host 検証（core の `host` モジュール）を
+        // 応答前に行い、不正な Host には snapshot（直近ページの URL・内容）を渡さない。
+        if let Err(e) = Authority::from_host_header(head.header("host")) {
+            return host_error_response(e);
+        }
+        match snapshot_body(snapshot_state.app().navigation()) {
+            Ok(body) => Response::new(200, body).with_content_type(JSON_CONTENT_TYPE),
+            Err(e) => error_response(e),
+        }
+    });
+    #[cfg(feature = "plugin-registry")]
+    let router = router
         .route("GET", "/ai/plugins", move |head, _body| {
             // snapshot と同じ Host 検証で DNS rebinding 経由の列挙を防ぐ。
             if let Err(e) = Authority::from_host_header(head.header("host")) {
@@ -143,7 +155,8 @@ pub fn router_with_state(state: Arc<AiState>) -> Router {
                 }
                 Err(e) => register_error_response(e),
             }
-        })
+        });
+    router
 }
 
 /// 登録済みプラグイン一覧の JSON 本文 `{"plugins":[...]}` を作る純粋部（`PLUG-2`・TASK-92.4）。
@@ -151,6 +164,7 @@ pub fn router_with_state(state: Arc<AiState>) -> Router {
 /// `GET /ai/plugins` ハンドラから呼ばれ、レジストリの登録順を保って各マニフェストを
 /// [`PluginManifest::to_value`](crate::plugin_api::PluginManifest::to_value) で出力する。
 /// `Value` の文字列化は失敗しないため `Result` にしない。
+#[cfg(feature = "plugin-registry")]
 pub fn plugins_body(registry: &PluginRegistry) -> Vec<u8> {
     let plugins: Vec<Value> = registry.list().iter().map(|m| m.to_value()).collect();
     json!({ "plugins": plugins }).to_string().into_bytes()
@@ -159,6 +173,7 @@ pub fn plugins_body(registry: &PluginRegistry) -> Vec<u8> {
 /// プラグイン登録の失敗（`PLUG-2`・TASK-92.3・Issue #355）。マニフェスト検証とレジストリ登録の
 /// 失敗を包み、[`register_error_response`] が HTTP ステータスへ写像する。`Display` は内包エラーの
 /// 固定英語文言で、untrusted な入力値を含めない。
+#[cfg(feature = "plugin-registry")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum RegisterError {
@@ -168,6 +183,7 @@ pub enum RegisterError {
     Registry(RegistryError),
 }
 
+#[cfg(feature = "plugin-registry")]
 impl fmt::Display for RegisterError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -177,14 +193,17 @@ impl fmt::Display for RegisterError {
     }
 }
 
+#[cfg(feature = "plugin-registry")]
 impl std::error::Error for RegisterError {}
 
+#[cfg(feature = "plugin-registry")]
 impl From<ManifestError> for RegisterError {
     fn from(e: ManifestError) -> Self {
         Self::Manifest(e)
     }
 }
 
+#[cfg(feature = "plugin-registry")]
 impl From<RegistryError> for RegisterError {
     fn from(e: RegistryError) -> Self {
         Self::Registry(e)
@@ -193,12 +212,14 @@ impl From<RegistryError> for RegisterError {
 
 /// プラグイン登録の成功結果（`PLUG-2`・TASK-92.3・Issue #355・REPAIR-4）。
 /// 将来のフィールド追加に備え構造体で返す（`#[non_exhaustive]`）。
+#[cfg(feature = "plugin-registry")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct RegisterResult {
     id: String,
 }
 
+#[cfg(feature = "plugin-registry")]
 impl RegisterResult {
     /// 登録したプラグインの id。
     pub fn id(&self) -> &str {
@@ -208,6 +229,7 @@ impl RegisterResult {
 
 /// 本文をマニフェストとして検証しレジストリへ登録する純粋部。成功時は登録結果（id）を返す。
 /// `Profile` に依存せず 3 OS でテストできる。登録は申告値の保持のみ（接続・権限付与はしない）。
+#[cfg(feature = "plugin-registry")]
 pub fn register_plugin(
     registry: &PluginRegistry,
     body: &[u8],
@@ -220,6 +242,7 @@ pub fn register_plugin(
 
 /// 登録失敗を HTTP 応答へ写像する。マニフェスト不正は 400（`TooLarge` も PoC-15 契約に合わせ 400）、
 /// id 重複 409、満杯 429。本文は `{"code","message"}` で入力値を含めない。
+#[cfg(feature = "plugin-registry")]
 fn register_error_response(e: RegisterError) -> Response {
     let (status, code) = match e {
         RegisterError::Manifest(m) => (400, m.code()),
@@ -232,6 +255,7 @@ fn register_error_response(e: RegisterError) -> Response {
 }
 
 /// `{"code","message"}` の固定内容エラー応答。
+#[cfg(feature = "plugin-registry")]
 fn fixed_error_response(status: u16, code: &str, message: &str) -> Response {
     let body = json!({ "code": code, "message": message })
         .to_string()
@@ -240,6 +264,7 @@ fn fixed_error_response(status: u16, code: &str, message: &str) -> Response {
 }
 
 /// `Content-Type` が `application/json`（パラメータ・大文字小文字は不問）か。ヘッダ欠落は偽。
+#[cfg(feature = "plugin-registry")]
 fn is_json_content_type(value: Option<&str>) -> bool {
     value
         .and_then(|v| v.split(';').next())
@@ -582,6 +607,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "plugin-registry")]
     fn registry_with(ids: &[&str]) -> PluginRegistry {
         let r = PluginRegistry::new();
         for id in ids {
@@ -596,12 +622,14 @@ mod tests {
         r
     }
 
+    #[cfg(feature = "plugin-registry")]
     #[test]
     fn plug2_plugins_body_is_empty_array_when_unregistered() {
         let body = plugins_body(&PluginRegistry::new());
         assert_eq!(body, b"{\"plugins\":[]}");
     }
 
+    #[cfg(feature = "plugin-registry")]
     #[test]
     fn plug2_plugins_body_lists_manifests_in_registration_order() {
         let r = PluginRegistry::new();
@@ -632,6 +660,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "plugin-registry")]
     #[test]
     fn plug2_plugins_body_round_trips_through_manifest() {
         let r = registry_with(&["p1", "p2"]);
@@ -647,8 +676,10 @@ mod tests {
 
     // --- PLUG-2・TASK-92.3 ---
 
+    #[cfg(feature = "plugin-registry")]
     const VALID: &str = r#"{"id":"mcp-ref","version":"0.1.0","transport":"stdio","tools":["t"]}"#;
 
+    #[cfg(feature = "plugin-registry")]
     #[test]
     fn plug2_register_plugin_accepts_valid_manifest() {
         let reg = PluginRegistry::new();
@@ -658,6 +689,7 @@ mod tests {
         assert_eq!(reg.list()[0].id(), "mcp-ref");
     }
 
+    #[cfg(feature = "plugin-registry")]
     #[test]
     fn plug2_register_plugin_rejects_invalid_manifests() {
         let reg = PluginRegistry::new();
@@ -682,6 +714,7 @@ mod tests {
         assert_eq!(reg.len(), 0);
     }
 
+    #[cfg(feature = "plugin-registry")]
     #[test]
     fn plug2_register_plugin_rejects_duplicate_and_full() {
         let reg = PluginRegistry::new();
@@ -702,6 +735,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "plugin-registry")]
     #[test]
     fn plug2_register_error_response_maps_status_and_code() {
         for (e, status, code, message) in [
@@ -739,6 +773,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "plugin-registry")]
     #[test]
     fn plug2_is_json_content_type() {
         assert!(is_json_content_type(Some("application/json")));

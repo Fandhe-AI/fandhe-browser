@@ -647,8 +647,11 @@ impl fmt::Debug for PluginRegistry {
 /// （TASK-92.3 の登録・TASK-92.4 の一覧）が使う。1 つの `AiState` は 1 つの `AppState`（= 1 プロファイル）に対応し、グローバル
 /// 共有を持たないためプロファイル間でレジストリは共有されない（`PROF-1`）。`Clone` は実装せず
 /// `Arc` で共有する。
+///
+/// `plugin-registry` feature が off のときはレジストリを保持しない（`PERF-7`・TASK-104・Issue #822）。
 pub struct AiState {
     app: Arc<AppState>,
+    #[cfg(feature = "plugin-registry")]
     plugins: PluginRegistry,
 }
 
@@ -657,6 +660,7 @@ impl AiState {
     pub fn new(app: Arc<AppState>) -> Self {
         Self {
             app,
+            #[cfg(feature = "plugin-registry")]
             plugins: PluginRegistry::new(),
         }
     }
@@ -666,7 +670,8 @@ impl AiState {
         &self.app
     }
 
-    /// プラグインレジストリ。
+    /// プラグインレジストリ（`plugin-registry` feature が on のときだけ存在する）。
+    #[cfg(feature = "plugin-registry")]
     pub fn plugins(&self) -> &PluginRegistry {
         &self.plugins
     }
@@ -674,10 +679,11 @@ impl AiState {
 
 impl fmt::Debug for AiState {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("AiState")
-            .field("app", &self.app)
-            .field("plugins", &self.plugins)
-            .finish()
+        let mut d = f.debug_struct("AiState");
+        d.field("app", &self.app);
+        #[cfg(feature = "plugin-registry")]
+        d.field("plugins", &self.plugins);
+        d.finish()
     }
 }
 

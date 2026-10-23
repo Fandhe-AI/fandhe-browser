@@ -19,19 +19,19 @@ ID から SSOT（`docs/spec` の `04-behavior/`）を参照すること
 
 ## 要判断事項（計測の前提がリポジトリ側に未整備）
 
-1. **プラグイン登録機構の on / off feature が存在しない**: `fandhe-browser-cli` の features は
-   `js-v8`・`js-boa`・`rendering` のみ。`/ai/plugins`・`/ai/plugins/register` は
-   `fandhe_browser_ai::api::router_with_state` 内で常に登録される（`PLUG-2`・TASK-92.3/92.4・#355/#356）。
-   2 構成を作るには別 Issue で builder が feature を実装する必要がある（案: ai crate に
-   `plugin-registry` feature を追加して該当ルートと `AiState` のレジストリ保持を cfg で切り、
-   cli の同名 feature から転送する。off 時は 2 ルートが存在しない形にする）
+1. **プラグイン登録機構の on / off feature（解消済み・#822）**: `fandhe-browser-cli` の `plugin-registry` feature
+   （既定 on）が ai crate の同名 feature へ転送され、`/ai/plugins`・`/ai/plugins/register` のルート登録と
+   `AiState` のレジストリ保持を切り替える（`PLUG-2`・`PERF-7`。off では 2 ルートが存在せず 404）。
+   B（on）は既定ビルド `cargo build --release -p fandhe-browser-cli`、A（off）は
+   `cargo build --release -p fandhe-browser-cli --no-default-features --features js-v8`
+   （JS エンジンは既定と同じ V8 のまま登録機構だけを外す。`--target-dir` を分けて 2 つ作る）
 2. **一発実行コマンド（解消済み・#824）**: 計測対象は `fandhe-browser query --file <fixture> <selector>`
    （`CLI-1`・`PERF-7`。TASK-47.4 の `query` に `--file PATH` を追加）。ローカル HTML を読み、パースし、
    セレクタで照会した結果を stdout に出して終了コード 0 で終わる。`Fetcher`・tokio ランタイム・サーバーは構築しない
    （`core-proto` の `--file` と同じ語彙）。fixture は本ディレクトリの `fixture.html`。読み込み失敗は
    英語のエラーと非 0 の終了コードを返す。URL 経路の SSRF 防御（`file:`・ループバックの拒否）は変えていない。
    注意: この経路はサーバーも `AiState` も構築しないため、#822（`plugin-registry` feature）の on / off の増分が
-   このコマンドで観測できるかは #822 の切り替え方（静的な初期化かルート登録か）による。
+   このコマンドで観測できるとは限らない（#822 の切り替えはルート登録と `AiState` のフィールドで、静的な初期化ではない）。
    測定対象としての妥当性はオーナーが判断する
 3. 絶対値は PoC-9 / PoC-15 の測定方法と一致しない（シェルの fork/exec・終了待ちを含む）。
    基準 2.92ms / 1.96ms との比較は、同一セッション・同一方法で測った A 側（off）を基準にした増分で行う
@@ -39,10 +39,10 @@ ID から SSOT（`docs/spec` の `04-behavior/`）を参照すること
 ## 使い方
 
 ```bash
-# A = プラグイン登録機構 off、B = on（2 構成は feature を切り替えて別々にビルドする。上記要判断事項 1）
+# A = プラグイン登録機構 off、B = on（2 構成は `plugin-registry` feature を切り替えて別々にビルドする。上記要判断事項 1）
 harness/cold-start/measure.sh \
-  --bin-a target/release-off/fandhe-browser --label-a plugin-off \
-  --bin-b target/release-on/fandhe-browser --label-b plugin-on \
+  --bin-a target/release-off/release/fandhe-browser --label-a plugin-off \
+  --bin-b target/release-on/release/fandhe-browser --label-b plugin-on \
   -n 50 --warmup 3 --out result.json \
   -- query --file "$PWD/harness/cold-start/fixture.html" h1
 ```

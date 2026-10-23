@@ -176,7 +176,7 @@ case "${name}" in
           --bin fandhe-browser --target "${triple}" --target-dir "${st_dir}" || { sl_rc=1; continue; }
       else
         cargo build --release --locked -p fandhe-browser-cli --bin fandhe-browser \
-          --target "${triple}" --target-dir "${st_dir}" --no-default-features --features js-boa || { sl_rc=1; continue; }
+          --target "${triple}" --target-dir "${st_dir}" --no-default-features --features js-boa,plugin-registry || { sl_rc=1; continue; }
       fi
       echo "static-link: flavor=${flavor} size=$(stat -c %s "${sl_bin}")"
       bash scripts/check-static-link.sh "${sl_bin}" || sl_rc=1
@@ -209,7 +209,7 @@ case "${name}" in
           --target-dir "${dl_dir}" || { dl_rc=1; continue; }
       else
         cargo build --release --locked -p fandhe-browser-cli --bin fandhe-browser \
-          --target-dir "${dl_dir}" --no-default-features --features js-boa || { dl_rc=1; continue; }
+          --target-dir "${dl_dir}" --no-default-features --features js-boa,plugin-registry || { dl_rc=1; continue; }
       fi
       echo "dynamic-link-macos: flavor=${flavor} size=$(wc -c <"${dl_bin}" | tr -d ' ')"
       bash scripts/check-dynamic-link-macos.sh --mode "${dl_mode}" "${dl_bin}" || dl_rc=1
@@ -244,7 +244,7 @@ case "${name}" in
           --target-dir "${dl_dir}" || { dl_rc=1; continue; }
       else
         cargo build --release --locked -p fandhe-browser-cli --bin fandhe-browser \
-          --target-dir "${dl_dir}" --no-default-features --features js-boa || { dl_rc=1; continue; }
+          --target-dir "${dl_dir}" --no-default-features --features js-boa,plugin-registry || { dl_rc=1; continue; }
       fi
       echo "dynamic-link-windows: flavor=${flavor} size=$(wc -c <"${dl_bin}" | tr -d ' ')"
       bash scripts/check-dynamic-link-windows.sh --mode "${dl_mode}" "${dl_bin}" || dl_rc=1

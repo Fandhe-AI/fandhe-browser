@@ -16,7 +16,9 @@ path = "src/main.rs"
 fandhe-browser-core = { path = "../fandhe-browser-core" }
 fandhe-browser-profile = { path = "../fandhe-browser-profile" }
 fandhe-browser-cdp = { path = "../fandhe-browser-cdp" }
-fandhe-browser-ai = { path = "../fandhe-browser-ai" }
+# `default-features = false` は ai の既定 feature `plugin-registry` を cli の同名 feature 経由でだけ
+# 有効にするため（#822・`PERF-7`）。registry クレートの追加・更新ではなく feature の転送のみ。
+fandhe-browser-ai = { path = "../fandhe-browser-ai", default-features = false }
 # Server・BoundServer（#171 で承認済み）
 fandhe-backend-core = { workspace = true }
 # Router・RouterMergeError（#171 で承認済み）
@@ -35,11 +37,16 @@ fandhe-browser-render = { path = "../fandhe-browser-render" }
 # （core / js に置くと ai・cdp 経由の feature 統合で、軽量ビルドから V8 を外せなくなるため）。
 # ビルド構成の対応:
 #   既定                                          = V8 のみ同梱
-#   --no-default-features --features js-boa       = 軽量（boa。js 側の実装は TASK-32.2・#166 で追加済み）
-#   --no-default-features                         = エンジンなし（JS 実行要求はエラーで、成功を装わない）
+#   --no-default-features --features js-boa,plugin-registry = 軽量（boa。js 側の実装は TASK-32.2・#166 で追加済み。
+#                                                  プラグイン登録機構は配布物の挙動を保つため保持する）
+#   --no-default-features --features js-v8        = 既定からプラグイン登録機構だけを外した構成（cold start 増分計測用。TASK-104・PERF-7・#822）
+#   --no-default-features                         = エンジンなし・プラグイン登録機構なし（JS 実行要求はエラーで、成功を装わない）
+# `plugin-registry` は ai の同名 feature を転送し、`GET /ai/plugins`・`POST /ai/plugins/register` の
+# ルート登録と `AiState` のレジストリ保持を切り替える（off では 404。#822）。
 # `main` 先頭でワーカーフック `run_js_worker_if_requested` を呼ぶ（#514）。ただし実行経路から
 # `create_engine` はまだ呼ばれない（REPAIR-3）。js_stub の置換は #161（TASK-30.3）。
-default = ["js-v8"]
+default = ["js-v8", "plugin-registry"]
+plugin-registry = ["fandhe-browser-ai/plugin-registry"]
 js-v8 = ["fandhe-browser-core/js-v8"]
 js-boa = ["fandhe-browser-core/js-boa"]
 

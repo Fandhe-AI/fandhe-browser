@@ -37,8 +37,8 @@ check "mb locale independent" "42.92" "$(LC_ALL=de_DE.UTF-8 LC_NUMERIC=de_DE.UTF
 check "default expects v8" "v8" "$(config_expected_engines default)"
 check "boa expects boa" "boa" "$(config_expected_engines boa)"
 check "none expects none" "none" "$(config_expected_engines none)"
-check "boa args" "--no-default-features --features js-boa" "$(config_cargo_args boa)"
-check "none args" "--no-default-features" "$(config_cargo_args none)"
+check "boa args" "--no-default-features --features js-boa,plugin-registry" "$(config_cargo_args boa)"
+check "none args" "--no-default-features --features plugin-registry" "$(config_cargo_args none)"
 check "default args empty" "" "$(config_cargo_args default)"
 
 rc() { set +e; "$@" >/dev/null 2>&1; local r=$?; set -e; echo "$r"; }

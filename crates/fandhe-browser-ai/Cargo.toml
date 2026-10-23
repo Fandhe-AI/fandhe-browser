@@ -36,7 +36,11 @@ serde_json = { workspace = true }
 # 検証する結合テスト用の feature。core の同名 feature を転送するだけで、新規依存は増えず
 # 既定ビルドの依存グラフも変わらない（`default = []`。前例: cdp の同名 feature〔TASK-112・#785〕）。
 [features]
-default = []
+# TASK-104（Issue #397・`PERF-7`）の cold start 増分計測のため、`PLUG-2` の 2 ルート
+# （`GET /ai/plugins`・`POST /ai/plugins/register`）と `AiState` のレジストリ保持を切り替える
+# （Issue #822）。既定 on で既存挙動と単体テストは変わらない。新規依存は増えない。
+default = ["plugin-registry"]
+plugin-registry = []
 js-v8 = ["fandhe-browser-core/js-v8"]
 js-boa = ["fandhe-browser-core/js-boa"]
 
@@ -130,6 +134,7 @@ path = "harness/agent_eval/compare_tests.rs"
 name = "mcp_envelope"
 path = "benches/mcp_envelope.rs"
 harness = false
+required-features = ["plugin-registry"]
 
 # JSON-RPC 純関数のユニットテスト（PLUG-5・TASK-97.1）。bench は cargo test で実行されないため別 [[test]]。
 [[test]]
@@ -146,6 +151,7 @@ path = "benches/mcp_envelope/stats_tests.rs"
 [[test]]
 name = "mcp_envelope_e2e"
 path = "benches/mcp_envelope/e2e_tests.rs"
+required-features = ["plugin-registry"]
 
 # TASK-113: JS 実行後 DOM の snapshot と削減率測定への影響を実エンジンで確認する。
 # JS ワーカー役を兼ねるため独自 `main`（`harness = false`）。ケース本体は V8 / boa 共通。
@@ -182,6 +188,7 @@ path = "../../benches/plugin_overhead/cold_start_tests.rs"
 [[test]]
 name = "plugin_overhead_e2e"
 path = "../../benches/plugin_overhead/e2e_tests.rs"
+required-features = ["plugin-registry"]
 
 # 呼び出しレイテンシ計測の純関数・引数解析のユニットテスト（PLUG-3・TASK-95.3）。依存は増やさない。
 [[test]]
@@ -192,3 +199,21 @@ path = "../../benches/plugin_overhead/call_latency_tests.rs"
 [[test]]
 name = "plugin_overhead_report"
 path = "../../benches/plugin_overhead/report_tests.rs"
+
+# 登録 API を叩く統合テストは `plugin-registry` が on のときだけ意味を持つ（off では 404 になる。Issue #822）。
+# 自動検出のテストに `required-features` を付けるため path を明示する。
+[[test]]
+name = "plugin_list"
+path = "tests/plugin_list.rs"
+required-features = ["plugin-registry"]
+
+[[test]]
+name = "plugin_register"
+path = "tests/plugin_register.rs"
+required-features = ["plugin-registry"]
+
+# レジストリ単体テストも `api::plugins_body`・`register_plugin`（feature on 限定）を使うため、全体を feature on に限る。
+[[test]]
+name = "plugin_api"
+path = "tests/plugin_api.rs"
+required-features = ["plugin-registry"]

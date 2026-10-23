@@ -7,7 +7,7 @@
 # ロジックはこのファイルに一本化する（scripts/check-render-isolation.sh と同じ作法）。
 #
 # 検査は 2 本立て（対象は fandhe-browser-cli。feature は cli -> core -> js と連鎖する）:
-#   A. 軽量ビルド（--no-default-features --features js-boa）: v8 が 0 件であること。
+#   A. 軽量ビルド（--no-default-features --features js-boa,plugin-registry）: v8 が 0 件であること。
 #      陽性対照として boa_engine が 1 件以上あること（feature 連鎖が切れて
 #      「エンジンなし」のまま通過する fail-open を防ぐ）
 #   B. エンジンなし（--no-default-features）: v8・boa_engine が 0 件であること
@@ -161,7 +161,7 @@ fi
 
 # 検査 A: 軽量ビルド（js-boa のみ）。標準出力だけを判定対象にする
 LABEL_A="軽量ビルド（js-boa のみ）"
-if ! OUT_A=$(cargo tree -p fandhe-browser-cli --no-default-features --features js-boa -e normal,build,dev --prefix none --format '{p}' ${CARGO_TREE_LOCKED_ARGS[@]+"${CARGO_TREE_LOCKED_ARGS[@]}"}); then
+if ! OUT_A=$(cargo tree -p fandhe-browser-cli --no-default-features --features js-boa,plugin-registry -e normal,build,dev --prefix none --format '{p}' ${CARGO_TREE_LOCKED_ARGS[@]+"${CARGO_TREE_LOCKED_ARGS[@]}"}); then
   echo "NG: cargo tree（${LABEL_A}）の実行に失敗しました" >&2
   STATUS=1
 else

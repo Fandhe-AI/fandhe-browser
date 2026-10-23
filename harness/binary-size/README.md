@@ -157,8 +157,8 @@ Issue #470、既定ビルドの上限ゲートは上記 `check-binary-size.sh`�
 | config | cargo 引数 | features ラベル | 期待エンジン |
 | ------ | ---------- | --------------- | ------------ |
 | `default` | （なし） | `default` | `v8` |
-| `boa` | `--no-default-features --features js-boa` | `no-default-js-boa` | `boa` |
-| `none` | `--no-default-features` | `no-default` | `none` |
+| `boa` | `--no-default-features --features js-boa,plugin-registry` | `no-default-js-boa` | `boa` |
+| `none` | `--no-default-features --features plugin-registry` | `no-default` | `none` |
 
 ### 出力形式の契約
 

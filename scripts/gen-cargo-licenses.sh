@@ -8,7 +8,7 @@
 # 使い方: scripts/gen-cargo-licenses.sh <出力ファイル> <ターゲット三つ組> [cargo-feature-flags]
 #   cargo-feature-flags は cargo に渡す feature フラグ文字列で、空なら既定 feature。
 #   許可するのは `--no-default-features` と `--features <名前[,名前]>` だけ
-#   （例: "--no-default-features --features js-boa" は軽量コンテナ向け。それ以外は exit 2）。
+#   （例: "--no-default-features --features js-boa,plugin-registry" は軽量コンテナ向け。それ以外は exit 2）。
 #   TASK-64.2 で docker/release-build.sh（build-default / build-lite 両ステージ）から呼ぶ形になった。
 #   ワークスペース内の crate（source なし）は本体の
 #   LICENSE-MIT / LICENSE-APACHE でカバーされるため対象外。
