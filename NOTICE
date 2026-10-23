@@ -5,7 +5,7 @@ Copyright (c) the fandhe-browser authors
 (LICENSE-MIT / LICENSE-APACHE)。
 
 本ファイルは、配布物に同梱されるサードパーティ部品の帰属表示である
-(OSS-2 / TASK-76)。ライセンス全文は LICENSE-THIRD-PARTY を参照する。
+(OSS-2 / TASK-76。第 4 節は OSS-7 / TASK-103)。ライセンス全文は LICENSE-THIRD-PARTY を参照する。
 
 --------------------------------------------------------------------------------
 1. Cargo 外で同梱されるネイティブ部品
@@ -114,3 +114,42 @@ Servo ホストの配布物には、本体とは別の LICENSE-CARGO-DEPENDENCIE
 現状は未整備である (REPAIR-3)。`servo-host/Cargo.lock` の外部 crate 509 件のうち
 93 件はパッケージにライセンスファイルを含まず、補完文書の整備が要る。
 scripts/gen-cargo-licenses.sh の Servo ホスト対応と補完文書は別 Issue で扱う。
+
+--------------------------------------------------------------------------------
+4. 埋め込みデータ・テストデータの帰属表示 (Cargo 外。OSS-7 / TASK-103)
+--------------------------------------------------------------------------------
+
+次の 3 データは npm パッケージ・外部リポジトリから取得したデータで、Rust crate として
+Cargo.toml に追加していない。そのため deny.toml (OSS-3) と cargo-deny / cargo-about
+(OSS-4) の棚卸し対象外で、手動レビューで扱う (手動レビューの記録は TASK-103.2・
+Issue #396 で作る)。
+
+| データ | 版 | SPDX | 出典 | 同梱される条件 |
+| ------ | -- | ---- | ---- | -------------- |
+| web-features | 3.39.0 | Apache-2.0 | https://github.com/web-platform-dx/web-features | profiles/chrome.json・profiles/safari.json の元データ。fandhe-browser-core が include_str! で埋め込むため、全ビルド構成のバイナリと既定・軽量コンテナに含まれる |
+| caniuse-lite | 1.0.30001810 | CC-BY-4.0 | https://github.com/browserslist/caniuse-lite (元データ: https://caniuse.com/) | 同上 |
+| web-platform-tests (WPT) | リビジョン 74ca910926d76710943f2a8798817102f69d6e40 | BSD-3-Clause | https://github.com/web-platform-tests/wpt | 配布物に含まれない。harness/wpt_subset_runner/wpt-subset.json にテストのパスの一覧だけを置き、テスト本体は実行時に取得してコミットも配布もしない |
+
+caniuse-lite (CC-BY-4.0) について:
+
+    Compatibility data derived from caniuse.com (CC-BY-4.0).
+    Copyright (C) 2020 Alexis Deveria.
+
+- ライセンス: Creative Commons Attribution 4.0 International
+  (https://creativecommons.org/licenses/by/4.0/)
+- 改変あり: 元データから CSS 機能の対応可否の一部を抜き出し、プロパティから機能への
+  対応を手で補正した (除外と追加の規則は profiles/README.md の「キュレーション記録」)。
+- CC-BY-4.0 はライセンスへの URI の提示で足りるため (第 3 条 (a)(1))、全文は
+  LICENSE-THIRD-PARTY に収録しない。
+
+web-features (Apache-2.0) について:
+
+- Apache-2.0 の全文は LICENSE-APACHE と同じ (コンテナでは /licenses/LICENSE-APACHE)。
+- 上流 (タグ v3.39.0) には NOTICE ファイルが無く、LICENSE.txt に著作権者の記載も無い
+  ため、引き継ぐ NOTICE の文言は無い。
+- 改変あり: CSS 機能の対応可否 (status.support) を抜き出してブラウザ別の JSON に変換した。
+
+WPT (BSD-3-Clause) について:
+
+- Copyright © web-platform-tests contributors。
+- 配布物にテストコードを含まないため、参考として記載する (harness/wpt_subset_runner/README.md)。
