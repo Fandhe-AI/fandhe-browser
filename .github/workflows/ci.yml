@@ -1398,6 +1398,11 @@ jobs:
     env:
       CARGO_INCREMENTAL: "0"
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      # ルート .cargo/config.toml の +crt-static（本体向け。#917）を Servo ホストでは打ち消す。
+      # mozjs_sys は動的 CRT 前提で、静的 CRT ではリンクできない（LNK2019）。`--manifest-path` で
+      # repo ルートから呼ぶため servo-host/.cargo/config.toml は読まれない。環境変数は config の
+      # rustflags より優先され、config の値と結合されない（置換）ので、この 1 件だけが渡る
+      CARGO_ENCODED_RUSTFLAGS: "-Ctarget-feature=-crt-static"
       # 長パス回避のための短い target-dir
       SERVO_HOST_TARGET_DIR: C:\st
       # Servo の Windows 前提の下限（XOS-6）
