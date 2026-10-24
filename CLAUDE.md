@@ -22,7 +22,7 @@ fandhe-browser/
 ├── LICENSE-MIT / LICENSE-APACHE   # デュアルライセンス
 ├── NOTICE                         # サードパーティ帰属表示・MPL 適用範囲（Servo ホストの配布物）。全文は LICENSE-THIRD-PARTY
 ├── rust-toolchain.toml            # stable + rustfmt/clippy（単一真実源）
-├── .cargo/config.toml             # Windows（msvc）限定の `+crt-static`（#917・PLUG-1）。cwd から遡って効くため servo-host/ にも及ぶ
+├── .cargo/config.toml             # Windows（msvc）限定の `+crt-static`（#917・PLUG-1）。cwd から遡って効くため servo-host/ にも及ぶ（`servo-host/.cargo/config.toml` で打ち消す）
 ├── .editorconfig                  # インデント・改行・文字コード規約
 ├── skills-lock.json               # 導入スキルのロックファイル
 ├── Makefile                       # 開発タスク集約の薄い入口（処理の定義は scripts/。`make help`。編集は makefile.md）
@@ -45,6 +45,7 @@ fandhe-browser/
 │   └── fandhe-browser-mcp/        #   MCP 参照プラグイン（別バイナリ。stdio サーバー基盤・起動時のホスト自己申告と navigate・snapshot ツールを実装）
 ├── servo-host/                    # Servo ホスト（別 workspace・別 Cargo.lock・本体 members の外でルート exclude。バイナリ fandhe-browser-servo-host。TASK-38・RENDER-1）
 │   ├── Cargo.toml / Cargo.lock    #   自前の [workspace]（単一 package）。本体と独立
+│   ├── .cargo/config.toml         #   Windows（msvc）の `-crt-static`。ルートの `+crt-static` を cwd が servo-host/ のときだけ打ち消す（mozjs_sys は動的 CRT 前提）。CI は `--manifest-path` で呼ぶため `servo-host-windows` の `CARGO_ENCODED_RUSTFLAGS` が担う
 │   ├── deny.toml                  #   MPL-2.0 等の例外許可はここだけ
 │   ├── about.toml                 #   cargo-about 設定（ホスト用。MPL-2.0 許可）
 │   ├── src/                       #   main・server・engine・page・screenshot・layout

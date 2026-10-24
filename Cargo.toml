@@ -92,7 +92,7 @@ rustls = { version = "=0.23.46", default-features = false, features = [
 # 自体はランタイムを内蔵せず async fn として提供するが、呼び出し元（cdp・
 # CLI 等）は tokio ランタイム上で await する契約とする（reqwest/hyper が
 # tokio 前提のため。呼び出し元がランタイムを保有する）。
-tokio = { version = "=1.53.1", default-features = false, features = [
+tokio = { version = "=1.53.3", default-features = false, features = [
   "rt",
   "macros",
 ] }

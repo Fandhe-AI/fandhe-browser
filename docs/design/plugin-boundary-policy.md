@@ -101,7 +101,7 @@ cargo tree --offline --locked --workspace --all-features --target all -e normal 
   - `v8 =152.2.0` の `build.rs` は、msvc で `crt-static` が有効なら `libcpmt`（静的）、無効なら `msvcprt`（dylib）をリンクする。静的化で C++ ランタイム DLL 依存を外せる（本リポで読める一次資料）
   - 固定版 `v8` の prebuilt が静的 CRT（`/MT`）でビルドされている（#363 のオーナー記述。本リポでのリンク可否は未検証）
 - 設定は `.cargo/config.toml` の `[target.x86_64-pc-windows-msvc]` に `rustflags = ["-C", "target-feature=+crt-static"]` を置く形で行う（#917）。対象ターゲットを限定しており、Linux・macOS には影響しない
-- Cargo は cwd から親へ遡って config を探すため、この設定は別 workspace の `servo-host/` の Windows ビルドにも効く。Servo ホスト配布物へ適用するかの方針は未決定である
+- Cargo は cwd から親へ遡って config を探すため、この設定は別 workspace の `servo-host/` の Windows ビルドにも効く。Servo ホストは動的 CRT 前提の `mozjs_sys` を含み、静的 CRT ではリンクに失敗する（`LNK2019`。main の run 39873075045 以降の `servo-host-windows`）。このため Servo ホストには適用せず、`servo-host/.cargo/config.toml`（cwd が `servo-host/` のとき）と、CI の `servo-host-windows` ジョブの `CARGO_ENCODED_RUSTFLAGS`（`--manifest-path` で呼ぶため前者は読まれない）で `-crt-static` に戻す。Cargo は配列の config を階層間で結合し近い階層を後ろに置く。環境変数の `CARGO_ENCODED_RUSTFLAGS` は config の `rustflags` より優先され置換になる。
 - 設定の追加時点では `workflow_dispatch` での Windows 全ジョブの確認・設定後のサイズ記録は未実施である（`REPAIR-3`）。ベースライン（`+crt-static` なし）は main の push run 39852789445 の `[binary-size]` で 47,247,360 bytes（上限 91,480,000）。設定後の値と run URL は、`gh workflow run ci.yml --ref <branch>` の結果を PR 本文と本節へ追記する
 - リンクできない・テストが落ちる場合は回避策で通さず、設定を main に入れずに #363 で判断する
 

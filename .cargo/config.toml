@@ -5,6 +5,9 @@
 # 根拠と確認方法は docs/design/plugin-boundary-policy.md と docs/setup/windows.md を参照。
 #
 # 注意: Cargo は cwd から親ディレクトリへ遡って config を探すため、この設定は別 workspace の
-# servo-host/ のビルドにも効く。ここには rustflags 以外（source・registries・linker・env 等）を書かない。
+# servo-host/ のビルドにも効く。Servo ホストは動的 CRT 前提（mozjs_sys）のため、servo-host/.cargo/
+# config.toml が -crt-static で打ち消す（cwd が servo-host/ のとき）。repo ルートから --manifest-path で
+# 呼ぶ CI は servo-host-windows ジョブの CARGO_ENCODED_RUSTFLAGS で打ち消す。
+# ここには rustflags 以外（source・registries・linker・env 等）を書かない。
 [target.x86_64-pc-windows-msvc]
 rustflags = ["-C", "target-feature=+crt-static"]

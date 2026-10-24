@@ -1,0 +1,12 @@
+# Servo ホストの Windows（msvc）ビルドでは CRT を動的リンクに戻す（#917・PLUG-1・RENDER-1）。
+#
+# 役割: ルートの .cargo/config.toml は本体の配布バイナリ向けに +crt-static を指定するが、
+# Cargo は cwd から親へ遡って config を探すため、servo-host/ を cwd にしたビルドにも波及する。
+# mozjs_sys 等は動的 CRT（/MD）前提でビルドされ、静的 CRT ではリンクに失敗する（LNK2019）。
+# 配列は階層間で結合され近い階層ほど後ろに並ぶため、ここの -crt-static が最終的に勝つ。
+#
+# 注意: この config は cwd が servo-host/ のときだけ読まれる。`--manifest-path` で repo ルートから
+# 呼ぶ CI（servo-host-windows）では読まれないため、同ジョブが環境変数
+# CARGO_ENCODED_RUSTFLAGS で同じ指定を与える（.github/workflows/ci.yml）。
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=-crt-static"]

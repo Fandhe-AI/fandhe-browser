@@ -213,6 +213,8 @@ self_test() {
   expect "scripts" "rust=true harness=false servo=true" $'scripts/ci-changes.sh'
   expect "rust-toolchain.toml" "rust=true harness=false servo=true" $'rust-toolchain.toml'
   expect ".cargo/config.toml (affects servo-host too)" "rust=true harness=false servo=true" $'.cargo/config.toml'
+  expect "servo-host/.cargo/config.toml is servo only" "rust=false harness=false servo=true" $'servo-host/.cargo/config.toml'
+  expect_native "servo-host/.cargo/config.toml is not native" false $'servo-host/.cargo/config.toml' ""
   expect "empty input runs all (fail-closed)" "rust=true harness=true servo=true" ''
   expect "blank lines only run all" "rust=true harness=true servo=true" $'\n\n'
   local rs=$'crates/fandhe-browser-core/src/lib.rs'

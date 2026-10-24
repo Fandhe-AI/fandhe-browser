@@ -1398,6 +1398,11 @@ jobs:
     env:
       CARGO_INCREMENTAL: "0"
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      # ルート .cargo/config.toml の +crt-static（本体向け。#917）を Servo ホストでは打ち消す。
+      # mozjs_sys は動的 CRT 前提で、静的 CRT ではリンクできない（LNK2019）。`--manifest-path` で
+      # repo ルートから呼ぶため servo-host/.cargo/config.toml は読まれない。環境変数は config の
+      # rustflags より優先され、config の値と結合されない（置換）ので、この 1 件だけが渡る
+      CARGO_ENCODED_RUSTFLAGS: "-Ctarget-feature=-crt-static"
       # 長パス回避のための短い target-dir
       SERVO_HOST_TARGET_DIR: C:\st
       # Servo の Windows 前提の下限（XOS-6）
@@ -1806,7 +1811,10 @@ jobs:
               echo "| --- | ---- | ------- |"
               grep '^dylib:' "$out" | while IFS= read -r line; do
                 bin="$(printf '%s\n' "$line" | sed -nE 's/^dylib: bin=([A-Za-z0-9._+@\/-]{1,64}) .*/\1/p')"
-                path="$(printf '%s\n' "$line" | sed -nE 's/.* path=([A-Za-z0-9._+@\/-]{1,256}) allowed=.*/\1/p')"
+                # macOS の BSD sed は繰り返し指定 {m,n} の n が 255 まで（256 以上は RE error で失敗）。
+                # 許可文字集合は維持し上限だけ 255 にする。255 文字を超える path は一致せず空欄で表示される
+                # （検査自体は script 側が行い、ここは記録用の表示のみ）
+                path="$(printf '%s\n' "$line" | sed -nE 's/.* path=([A-Za-z0-9._+@\/-]{1,255}) allowed=.*/\1/p')"
                 allowed="$(printf '%s\n' "$line" | sed -nE 's/.* allowed=(yes|no)$/\1/p')"
                 echo "| $bin | $path | $allowed |"
               done
