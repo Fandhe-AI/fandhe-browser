@@ -121,8 +121,8 @@ scripts/gen-cargo-licenses.sh の Servo ホスト対応と補完文書は別 Iss
 
 次の 3 データは npm パッケージ・外部リポジトリから取得したデータで、Rust crate として
 Cargo.toml に追加していない。そのため deny.toml (OSS-3) と cargo-deny / cargo-about
-(OSS-4) の棚卸し対象外で、手動レビューで扱う (手動レビューの記録は TASK-103.2・
-Issue #396 で作る)。
+(OSS-4) の棚卸し対象外で、手動レビューで扱う (手動レビューの記録は
+docs/design/data-license-review.md。TASK-103.2・Issue #396・PR #1260)。
 
 | データ | 版 | SPDX | 出典 | 同梱される条件 |
 | ------ | -- | ---- | ---- | -------------- |

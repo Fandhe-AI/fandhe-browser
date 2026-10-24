@@ -5,13 +5,14 @@
 - **マイルストーン**: MS-9
 - **実施日**: 2026-10-22（UTC）
 - **基準コミット**: `d93f480b`（`origin/main`）
-- **状態**: 手動レビュー完了。要判断事項は末尾のとおりオーナーへ報告する。ライセンスの許可判断は Agent が行っておらず、承認は得ていない
+- **状態**: 手動レビュー完了。要判断事項はオーナー判断済み（末尾「判断結果」）
+- **更新**: 2026-10-23（オーナー判断の反映）
 
 ## 目的・前提
 
 `OSS-7` は、段階的互換プロファイル（`PLUG-8`・`PLUG-10`）が使う 3 つのデータを、Cargo の依存ではないため手動レビューで担保すると定めている。本ドキュメントはその手動レビューの記録である（`.claude/rules/licensing.md`「非 Cargo 資産」節の求める手動確認に相当）。
 
-本書は事実の記録に留める。CC-BY-4.0 等の許可・不許可の判断は含まない。
+本書は事実の記録に留める。CC-BY-4.0 等の許可判断はオーナーが行い、末尾「判断結果」に記載する。
 
 ## 対象データ
 
@@ -37,7 +38,7 @@ WPT の補足: テスト本体は `fetch-wpt.sh` が実行時に取得し、`.gi
 | GPL / LGPL / AGPL / MPL 系でないこと | 3 データとも Apache-2.0・CC-BY-4.0・BSD-3-Clause で、該当しない |
 | 出典の記録 | `profiles/*.json` の `sources[]`（name・version・license・url）に web-features・caniuse-lite がある。WPT は `wpt-subset.json` の `source`（`wptSource`・`wptRevision`）にある |
 | CC-BY-4.0 の帰属表記 | JSON の `sources[].attribution` と `profiles/README.md` が同一文言「Compatibility data derived from caniuse.com (CC-BY-4.0)」。JSON の出典表記は `tests/cssom_profile_data.rs` が検査している |
-| NOTICE への記載 | PR #1259（TASK-103.1）で追加予定。本書の基準コミットでは未反映 |
+| NOTICE への記載 | NOTICE 第 4 節に記載済み（PR #1259・TASK-103.1）。基準コミット `d93f480b` では未反映だった |
 | 改変の有無 | 上流データをそのまま同梱せず、`PLUG-8` 用に feature を絞って再構成した派生データ。経緯は `profiles/README.md`「生成手順」に記録がある |
 | 配布物への混入 | プロファイル JSON は全ビルドのバイナリに入る。WPT のテスト本体は入らない |
 
@@ -61,9 +62,10 @@ jq '.source.wptRevision' harness/wpt_subset_runner/wpt-subset.json
 - npm のマニフェスト・ロックファイルを導入するとき
 - WPT のテスト本体を同梱する方針に変えるとき
 
-## 要判断事項
+## 判断結果
 
-オーナーの判断が必要。Agent は決めておらず、承認は得ていない。
+オーナー判断済み（2026-10-23・Issue #394 のコメント）。対象は `OSS-7`・TASK-103・MS-9。
 
-1. spec の `OSS-7`・TASK-103 は 3 データを「いずれも npm パッケージ」としているが、WPT は npm ではなく git から取得している。spec の文言を直すかは spec リポ側の判断
-2. NOTICE の帰属表示（#395・PR #1259）がマージされたら、本書の「NOTICE への記載」を実態に合わせて更新する
+1. **CC-BY-4.0 のデータ同梱を許可**。Cargo 外のデータに限り、`deny.toml` には足さない。CA 証明書バンドル（Issue #63）と同じく、コード依存とは別枠で扱う。条件は NOTICE 第 4 節の帰属表示・ライセンス URI・改変ありの明示を維持すること
+2. **spec の文言は spec リポ側で直す**。`OSS-7`・TASK-103 の「いずれも npm パッケージ」は、WPT が git 取得である実態に合わせて spec リポ側で修正する。fandhe-browser 側の作業ではない
+3. **NOTICE への反映は対応済み**。NOTICE 第 4 節の帰属表示は PR #1259（TASK-103.1・Issue #395）で追加した。本書の「NOTICE への記載」行は同 PR に合わせて更新済み
