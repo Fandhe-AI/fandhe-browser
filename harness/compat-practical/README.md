@@ -12,6 +12,25 @@ spec 対応: TASK-71.1・TASK-71.2 / MS-6 / `MEAS-4`（関連 `COMPAT-4`・`JS-2
 | #316（TASK-72.2） | 類型別の達成判定レポート `type-report.md`（static・spa・form の 70% 達成確認） |
 | #313（TASK-71.4） | 測定レポート `REPORT.md`（JS 有効の再計測と b5・d2・d3 の解消確認） |
 
+## 共通実測環境（TASK-89）
+
+TASK-89 / MS-1 / `MEAS-2`（#68）。本ハーネスを、対象サイト群を使う再測定タスクの共通実測環境とする。
+
+- **対象サイト群（確定した除外後リスト）**: `tasks.json` の 28 タスク。PoC-1 の元カタログ 36 サイトから次の 8 件を除いたもの。各サイトの判定は `docs/design/site-catalog-task70.md`、anti-bot 除外の扱いは `docs/design/anti-bot-exclusion.md`
+  - 403 ブロック（`SEC-1`）: a8 Medium・b6 Figma
+  - robots.txt の Disallow: b7 Airbnb の検索結果・b8 Twitter・c3 Pinterest・c5 Instagram
+  - 認証必須による到達不能（401）: c2 Unsplash
+  - 採用保留（動的テーブルの公開ビューが未確保）: e4 Airtable。見つかれば追加する
+- **到達可否**: `access_check.sh` → `results/access_check.jsonl`（「計測結果」）
+- **core の実測と動作率マトリクス**: `run_core.sh` → `results/core_results.jsonl` → `make_matrix.sh` → `results/matrix.json`。Chromium 参照は `reference/chromium_results.json`
+
+| 参照するタスク | 使うもの |
+| -------------- | -------- |
+| TASK-71（#311・#312・#313） | `run_core.sh`・`make_matrix.sh`・`REPORT.md` |
+| TASK-72（#315・#316） | `results/matrix.json` を入力にした `aggregate_by_type.sh`・`type-report.md` |
+| TASK-74（#318） | `results/matrix.json` の全体動作率（`harness/compat-regression/check-matrix.sh` が閾値を判定） |
+| TASK-46（#252） | `tasks.json` の 28 タスクを対象サイト群とし、Playwright / Puppeteer のスクリプトはエンドポイントの差し替えだけで同じタスクを実行する（接続の基盤は `harness/playwright-connect/`・`harness/puppeteer-connect/`） |
+
 ## ファイル
 
 | ファイル | 役割 |
