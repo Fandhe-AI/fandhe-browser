@@ -1662,10 +1662,59 @@ TASK-71.3 / MS-6 / `COMPAT-1`・`COMPAT-4`・`REPAIR-8`・`MEAS-4`（関連 `REP
 - 単一環境（Linux）・単一時点の 1 回の測定で、ばらつきは評価していない。b1 は 2026-10-21 の通し実測で揺れた経緯があり、今回の 1 回では安定性を評価できない
 - `COMPAT-4` の達成判定は TASK-74（人間担当）の範囲で、本書では判定しない
 
+## 28 サイト化の実測（#68・TASK-89・`MEAS-2`）
+
+対象を 22 サイトから 28 サイトへ広げた（除外判断は `docs/design/site-catalog-task70.md`。追加 6 件は c4・d5・d7・d8・e3・e6）。
+
+### 測定条件
+
+- 実施日: 2026-10-26 / OS: Linux / バイナリ: main `7d602f6` の `cargo build --release -p fandhe-browser-cli`（既定 feature・V8 同梱）/ フラグ: `--page-js v8 --page-modules`（前回 #920 と同じ）。`results/core_results.jsonl` のメタ行は `task_timeout_sec=45`・`total_timeout_sec=1200`
+- Chromium 参照: 既存 22 件は PoC-9 の生データのまま（変更なし）。追加 6 件は `chromium_reference.mjs`（playwright-core 1.63.0 + Chrome for Testing 153 の Chromium。UA は既定のまま変更しない）で取得（出所は README「Chromium 参照データの出所」）
+
+### 結果
+
+| 区分 | fandhe-browser-core | Chromium | 前回（22 件） | 判定 |
+| ---- | ------------------- | -------- | ------------- | ---- |
+| 全体 | 21/28（75.0%） | 25/28 | 17/22（77.3%） | PASS |
+| static | 6/7（85.7%） | 7/7 | 6/7 | PASS |
+| spa | 4/5（80.0%） | 5/5 | 4/5 | PASS |
+| form | 7/8（87.5%） | 8/8 | 5/5 | PASS |
+| lazy | 2/3（66.7%） | 2/3 | 1/2 | 判定外 |
+| table | 2/5（40.0%） | 3/5 | 1/3 | 判定外 |
+
+- 既存 22 件の成否は前回と同じ（失敗は a6・b5・c1・e1・e5 の 5 件）。判定は `check-matrix.sh --threshold 70 --categories static,spa,form` で全体・static・spa・form がすべて PASS（閾値・対象類型は変えていない）
+- form の余裕: 追加 2 件が失敗すると 5/8（62.5%）で閾値を割る。今回の追加 form 3 件のうち失敗は d8 の 1 件のみ
+
+### 追加 6 件の結果
+
+| id | サイト | core | Chromium | 備考 |
+| -- | ------ | ---- | -------- | ---- |
+| c4 | Product Hunt | 成功 | **失敗** | Chromium は Cloudflare のチャレンジページ（title `Just a moment...`）で止まり、selector に一致する要素に届かない。core は成功。UA 偽装等で回避しない（`SEC-2`）。Chromium 側の失敗はブロックに起因し、selector の正否は確認できていない |
+| d5 | Google ログイン | 成功 | 成功 | |
+| d7 | Google Forms 公開サンプル | 成功 | 成功 | selector は下記の修正後 |
+| d8 | Typeform 公開サンプル | 失敗（`no_match`） | 成功 | 描画後の DOM に `form` 要素が無い（下記）。対象フィールド（`textarea`）にも `name` 属性が無いため、core の form 判定（`name` 属性付きフィールド）は selector をどう選んでも成立しない可能性が高い（未検証） |
+| e3 | Google スプレッドシート公開ビュー | 成功 | 成功 | URL は下記の修正後 |
+| e6 | Kaggle データセット一覧 | 失敗（`no_match`） | 成功 | Chromium は 32 件一致。core は JS 描画後の DOM に届いていない。原因は未調査 |
+
+### selector 確認と修正（実測前に Chromium で描画後 DOM を確認）
+
+- d5: `form[action^="/v3/signin/identifier"]` は描画後に 1 件一致（action は相対パス）。修正なし
+- d7: 当初の `form[action$="/formResponse"]` は Chromium で一致するが、core のセレクタサブセットが `$=` を持たず、最初の実測は `selector_unsupported` だった。ページ側でなくセレクタエンジンの制約で成否が決まるのを避けるため、同じ要素を `^=` で取れる `form[action^="https://docs.google.com/forms/d/e/"]` へ変更（e1 が `^=` を使うのと同じ扱い。`$=` 等の対応は別課題）。変更後に再実測し、成功
+- d8: 当初の `form` は 0 件（Typeform は `form` を使わない）。`textarea` の祖先を辿り、安定した属性を持つ最上位の描画ルート `[data-qa="renderer"]` を選んだ（Chromium で配下に `textarea` が 1 件）
+- e3: `htmlview` ページの `table` は表示切替のタブだけで、データの `table.waffle` は iframe（`.../htmlview/sheet?headers=true&gid=0`）内にあるため `table.waffle tr` は 0 件だった。iframe の URL を直接 `url` にした（同一サービス・同一シートの公開ビュー。Playwright の `page.$` は iframe の内側を探さず、core も iframe を辿らない見込み〔未検証〕のため、`htmlview` のままだと比較にならない）。iframe 内の描画を扱えるかは本タスクでは測っていない
+- c4: Cloudflare に止められるため Chromium で selector の正否を確認できなかった。当初の `[data-test="vote-button"]` のまま（core では成功）
+- e6: `a[href^="/datasets/"]` は Chromium で一致。修正なし
+
+### 追加分の制約
+
+- 追加 6 件は単一時点・1 回の実測。Chromium 参照の 6 件は PoC-9 の 22 件と時期・UA・Chromium の版が異なる（README「Chromium 参照データの出所」）
+- `access_check.sh` は実測環境（IPv6 に届かない）で 28 件中 16 件が `curl_exit 7` となり実態を表さないため、`results/access_check.jsonl` は更新していない（README「計測結果」）
+- c4 の Chromium 失敗は anti-bot によるもので、core 側の成功と合わせて比較条件が揃っていない
+
 ## 制約
 
 - 実サイトは時期で変わる。単一環境（Linux）・単一時点の測定で、ばらつきは評価していない
-- `tasks.json`・セレクタ・UA・実行上限は変更していない。成功させるための調整はしていない
+- 既存 22 件の `tasks.json`・セレクタ・UA・実行上限は変更していない。成功させるための調整はしていない。ただし追加 6 件の selector・URL は、Chromium で描画後の DOM を見て決めた（d8 の `[data-qa="renderer"]`、d7 の `$=` から `^=` への変更〔core が対応するのは `=`・`^=` だけ〕、e3 の iframe URL への変更。c4 は Chromium が Cloudflare に止められ、当初の selector のまま）。既存 22 件は不変（詳細は「28 サイト化の実測」）
 - 22 タスクの通し実行では、ページごとのスクリプト実行成否は直接観測していない（固定診断行は打ち切り時のみ出る）。b5 だけは診断プローブ `page_script_probe` で観測した（前述「b5（Trello）の原因特定（#964）」）
 - macOS・Windows は測定していない（Windows は起動経路が未対応）
 

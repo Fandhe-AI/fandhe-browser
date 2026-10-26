@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # 実測ハーネス・ベンチ・計測系ターゲットの実体。Makefile の各ターゲットはここへ 1 行で委譲する。
 # 使い方: scripts/harness.sh <name>
-#   check-compat-practical   実測ハーネス（22 タスク定義・アクセス確認・run_core）の自己テスト（MEAS-4。要 jq・node）
+#   check-compat-practical   実測ハーネス（28 タスク定義・アクセス確認・run_core）の自己テスト（MEAS-4。要 jq・node）
 #   check-compat-regression  対象サイト群の動作率回帰チェック（COMPAT-1・COMPAT-4。要 jq）
 #   bench-record             competitor_lightpanda ベンチを実行し結果を時系列で記録（要 jq）
 #   check-bench-record       record.sh の自己テスト（要 jq）

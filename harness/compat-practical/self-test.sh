@@ -64,9 +64,9 @@ expect_contains() {
 
 # --- 本物の tasks.json ---
 expect_exit "real tasks validate" 0 bash "$CHECK" --validate-only
-expect_contains "$LAST_OUTPUT" "ok: 22 tasks validated" "real tasks count message"
-expect_eq "$(jq length "$TASKS")" "22" "task count"
-expect_eq "$(jq '[.[].id] | unique | length' "$TASKS")" "22" "unique ids"
+expect_contains "$LAST_OUTPUT" "ok: 28 tasks validated" "real tasks count message"
+expect_eq "$(jq length "$TASKS")" "28" "task count"
+expect_eq "$(jq '[.[].id] | unique | length' "$TASKS")" "28" "unique ids"
 expect_eq "$(jq -c '[.[] | select(.id == "b5" or .id == "d2" or .id == "d3") | .id]' "$TASKS")" '["b5","d2","d3"]' "js-required ids present"
 expect_eq "$(jq -c '[.[].kind] | unique' "$TASKS")" '["form","text","texts"]' "kinds"
 expect_eq "$(jq -c '[.[].cat] | unique' "$TASKS")" '["form","lazy","spa","static","table"]' "cats"
@@ -442,7 +442,7 @@ else
   # node が volta 等のシム（子プロセスを生む）でも kill が実体に届くよう、実体の絶対パスを使う
   NODE_BIN="$(node -p 'process.execPath' | tr -d '\r\n')"
   expect_exit "run_core validate-only" 0 bash "$RUN_CORE" --validate-only
-  expect_contains "$LAST_OUTPUT" "ok: 22 tasks validated" "run_core validate-only message"
+  expect_contains "$LAST_OUTPUT" "ok: 28 tasks validated" "run_core validate-only message"
   expect_exit "run_core bad tasks" 2 bash "$RUN_CORE" --validate-only --tasks "$WORK/dup.json"
   expect_exit "run_core task-timeout zero" 2 bash "$RUN_CORE" --validate-only --task-timeout 0
   expect_exit "run_core task-timeout over" 2 bash "$RUN_CORE" --validate-only --task-timeout 121
@@ -492,9 +492,9 @@ else
     "[1,\"cdp\",false,\"FakeCdp/0.0\",\"$EP\"]" "run_core meta"
   expect_eq "$(jq -s '[.[] | select(.type=="meta")] | length' "$WORK/rc.out.jsonl")" "1" "run_core one meta line"
 
-  # 本物の tasks.json を流して 22 件・id 集合一致（AC1）と b5・d2・d3 の個別行（AC2）を確認する
+  # 本物の tasks.json を流して 28 件・id 集合一致（AC1）と b5・d2・d3 の個別行（AC2）を確認する
   expect_exit "run_core real tasks" 0 bash "$RUN_CORE" --no-spawn --endpoint "$EP" --out "$WORK/real.out.jsonl"
-  expect_eq "$(jq -s '[.[] | select(.type=="result")] | length' "$WORK/real.out.jsonl")" "22" "run_core 22 results"
+  expect_eq "$(jq -s '[.[] | select(.type=="result")] | length' "$WORK/real.out.jsonl")" "28" "run_core 28 results"
   expect_eq "$(jq -c '[.[].id] | sort' "$TASKS")" "$(jq -sc '[.[] | select(.type=="result") | .id] | sort' "$WORK/real.out.jsonl")" "run_core ids match tasks"
   expect_eq "$(jq -sc '[.[] | select(.type=="result" and (.id=="b5" or .id=="d2" or .id=="d3")) | .id]' "$WORK/real.out.jsonl")" '["b5","d2","d3"]' "run_core b5 d2 d3 rows"
   expect_eq "$(jq -r 'select(.type=="meta") | .tasks_sha256' "$WORK/real.out.jsonl" | tr -d '\n' | wc -c | tr -d ' ')" "64" "run_core tasks_sha256 recorded"
@@ -731,10 +731,10 @@ expect_exit "make_matrix output stage failure" 1 env PATH="$MM_STUB:$PATH" bash 
 expect_eq "$(cat "$MM/keep2.json")" "previous matrix" "make_matrix output stage failure keeps existing --out"
 expect_eq "$(ls -A "$MM" | grep -c '^\.matrix\.' || true)" "0" "make_matrix output stage failure leaves no temp file"
 
-# 実入力: 22 タスクの突合（件数は再計測で変わるためハードコードしない。行単位の一致で確かめる）
+# 実入力: 28 タスクの突合（件数は再計測で変わるためハードコードしない。行単位の一致で確かめる）
 REAL_OUT="$WORK/real_matrix.json"
 expect_exit "make_matrix real inputs" 0 bash "$MAKE_MATRIX" --out "$REAL_OUT"
-expect_eq "$(jq length "$REAL_OUT")" "22" "real matrix entries"
+expect_eq "$(jq length "$REAL_OUT")" "28" "real matrix entries"
 expect_eq "$(jq -c '[.[].id]' "$REAL_OUT")" "$(jq -c '[.[].id]' "$TASKS")" "real matrix id order follows tasks.json"
 expect_eq "$(jq -c '[.[] | select(.id == "b5" or .id == "d2" or .id == "d3") | .id]' "$REAL_OUT")" '["b5","d2","d3"]' "real matrix js-required ids present"
 expect_eq "$(jq -c '[.[].fandhe_browser_core]' "$REAL_OUT")" \
@@ -849,6 +849,23 @@ for c in static spa form lazy table; do
     "aggregate real $c matches independent recount"
 done
 expect_eq "$(jq -c '[.types[] | select(.role != "unmapped") | .type]' "$AG/real.json")" '["a","b","d","c","e"]' "aggregate real type order"
+
+# --- chromium_reference.mjs（28 サイト化・TASK-89・MEAS-2）の引数検証 ---
+# 実ブラウザ・ネットワークへは出ない（--validate-only は tasks 検証までで終わる）。実行は手動専用（README）。
+if type -P node >/dev/null 2>&1; then
+  CR="$SCRIPT_DIR/chromium_reference.mjs"
+  expect_exit "chromium_reference validate-only" 0 node "$CR" --validate-only --only c4,d5,d7,d8,e3,e6
+  expect_contains "$LAST_OUTPUT" "ok: 6 tasks validated" "chromium_reference validate-only message"
+  expect_exit "chromium_reference missing --only" 2 node "$CR" --validate-only
+  expect_exit "chromium_reference unknown id" 2 node "$CR" --validate-only --only zz9
+  expect_exit "chromium_reference duplicate id" 2 node "$CR" --validate-only --only c4,c4
+  expect_exit "chromium_reference bad id" 2 node "$CR" --validate-only --only 'c4;x'
+  expect_exit "chromium_reference relative out" 2 node "$CR" --only c4 --out rel.json
+  expect_exit "chromium_reference unknown arg" 2 node "$CR" --validate-only --only c4 --bogus
+  : >"$WORK/exists.json"
+  expect_exit "chromium_reference refuses existing out" 2 node "$CR" --only c4 --out "$WORK/exists.json" --module-dir "$WORK" --executable /nonexistent
+  expect_exit "chromium_reference needs module dir" 2 env -u FANDHE_PLAYWRIGHT_MODULE_DIR node "$CR" --only c4 --out "$WORK/new.json"
+fi
 
 echo "cases=$CASES failures=$FAILURES"
 [ "$FAILURES" -eq 0 ]

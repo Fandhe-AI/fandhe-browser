@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# 22 タスクを実装リポの `fandhe-browser` バイナリ（CDP サーバー）で実行し、成否を JSONL に記録する
+# 28 タスクを実装リポの `fandhe-browser` バイナリ（CDP サーバー）で実行し、成否を JSONL に記録する
 # （TASK-71.2・MEAS-4。関連 JS-2・COMPAT-4・REPAIR-3・SEC-2）。
 # 結果は matrix.json 生成（TASK-71.3・#312）が id で Chromium 実測と突合し、測定レポート（#309）の入力になる。
 #

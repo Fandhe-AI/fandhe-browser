@@ -128,7 +128,7 @@ ci: lint-docs check-workspace-manifest fmt-check lint lint-rendering check-rende
 # 実測ハーネス・ベンチ・計測（各 README: harness/*/README.md・benches/*/README.md）
 # --------------------------------------------------
 
-check-compat-practical: ## 実測ハーネス（22 タスク定義・アクセス確認・run_core 実行）の自己テストとスキーマ検証（MEAS-4）
+check-compat-practical: ## 実測ハーネス（28 タスク定義・アクセス確認・run_core 実行）の自己テストとスキーマ検証（MEAS-4）
 	@scripts/harness.sh check-compat-practical
 
 check-compat-regression: ## 対象サイト群の動作率マトリクスに対する回帰チェック（COMPAT-1・COMPAT-4）

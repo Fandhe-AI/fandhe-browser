@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
-# 22 サイトへの到達可否を curl で記録する（TASK-71.1・MEAS-4。関連 COMPAT-4・JS-2）。
-# tasks.json（PoC-9 から移植した 22 タスク定義）を検証し、各 URL へ HTTPS で到達できるかを
+# 28 サイトへの到達可否を curl で記録する（TASK-71.1・MEAS-4。関連 COMPAT-4・JS-2）。
+# tasks.json（PoC-9 から移植した 22 タスクに 6 タスクを加えた 28 タスク定義）を検証し、各 URL へ HTTPS で到達できるかを
 # JSONL に書く。結果は後続の run_core.sh（TASK-71.2・#311）と matrix.json 生成
 # （TASK-71.3・#312）が jq で読む。本スクリプトは fandhe-browser を起動しない。
 #
