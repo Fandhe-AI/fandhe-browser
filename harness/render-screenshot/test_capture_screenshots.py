@@ -3102,6 +3102,25 @@ class SavedPagesCaptureTest(unittest.TestCase):
             self.assertEqual(result["captures"], [])
             self.assertFalse(result["isolation"]["isolated"])
 
+    def test_too_few_saved_pages_overwrites_stale_result_and_exits_2(self) -> None:
+        """保存ページ不足（404 等）で終了コード 2 のとき、古い成功結果を今回の失敗結果で上書きする（#1285）。"""
+        with tempfile.TemporaryDirectory() as tmp_str:
+            tmp = Path(tmp_str)
+            out = tmp / "out"
+            out.mkdir()
+            (out / "capture-result.json").write_text('{"captures": [{"status": "ok"}]}', encoding="utf-8")
+            report = {
+                **self.PASS_REPORT,
+                "missing_urls": [f"http://pages.test:8080/site-{i}/index.html" for i in range(3)],
+            }
+            with mock.patch.object(cs.isolation_check, "run_isolation_check", return_value=report):
+                code = cs.main(self._args(tmp, extra=["--allow-unproxied-engine"]))
+            self.assertEqual(code, 2)
+            result = json.loads((out / "capture-result.json").read_text(encoding="utf-8"))
+            self.assertEqual(result["captures"], [])
+            self.assertTrue(result["partial"])
+            self.assertEqual(result["isolation"], report)
+
     def test_requires_allow_unproxied_engine(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_str:
             tmp = Path(tmp_str)

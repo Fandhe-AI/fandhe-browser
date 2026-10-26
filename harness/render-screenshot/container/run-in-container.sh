@@ -39,10 +39,12 @@ for _ in $(seq 1 50); do
   sleep 0.2
 done
 
-# 隔離確認。不合格ならここで止まる（set -e）。記録は OUT_DIR に残す。
+# 隔離確認。記録は OUT_DIR に残す。不合格でもここでは止めず（set -e を回避して終了コードだけ記録）、
+# 次の capture_screenshots.py が同じ確認を再実行し、エンジンを起動せず `captures: []` の結果 JSON を
+# 書いて終了コード 2 で終わる（RUNBOOK の契約。--min-sites 不足の終了コード 1 と区別できる）。
 python3 "${SCRIPT_DIR}/isolation_check.py" \
   --sites "${SCRIPT_DIR}/sites.saved-pages.json" \
-  --report "${OUT_DIR}/isolation-report.json"
+  --report "${OUT_DIR}/isolation-report.json" || echo "warning: isolation_check failed; capture_screenshots.py will refuse to launch engines" >&2
 
 # 待ち時間（RENDER-5 の同条件比較）: Servo の cli `screenshot` には待ち時間の指定口が無く、load 完了と
 # 最初のフレームを待ってから撮る（servo-host/src/page.rs の `navigate`）。そのため保存済みページモードの

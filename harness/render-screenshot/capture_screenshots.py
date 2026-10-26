@@ -2460,6 +2460,20 @@ def main(argv: list[str] | None = None) -> int:
                     f"--min-sites is {args.min_sites}",
                     file=sys.stderr,
                 )
+                # 再利用した --out-dir の古い capture-result.json を今回の失敗結果で上書きし、
+                # 後続の measure_ssim.py が古い成功結果を読まないようにする。
+                try:
+                    write_result(
+                        out_dir,
+                        viewport=viewport,
+                        sites=sites,
+                        captures=[],
+                        partial=True,
+                        mode=result_mode,
+                        isolation=isolation_report,
+                    )
+                except CaptureError as exc:
+                    print(f"error: {exc}", file=sys.stderr)
                 return 2
         if not isolation_report.get("isolated"):
             print(

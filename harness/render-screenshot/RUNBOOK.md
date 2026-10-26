@@ -158,7 +158,8 @@ fandhe-browser screenshot [--profile-dir D] <URL> <OUTPUT>
 
 `egress_guard` はこのモードでは使わない（検証プロキシを起動しないため `proxy` キーも付かない）。
 隔離はコンテナのネットワーク名前空間の遮断を正とする。隔離確認に通らなければ、エンジンを
-1 つも起動せず終了コード 2 になる（記録として `captures: []` の結果 JSON を残す）。
+1 つも起動せず終了コード 2 になる（記録として `captures: []` の結果 JSON を残す）。保存済みページの欠落で `--min-sites` を満たせない場合も
+同様に終了コード 2 と `captures: []` の結果 JSON で、再利用した `--out-dir` の古い結果は上書きされる。
 異常があるサイトは失敗として記録し、接続下に切り替えて撮り直さない。
 
 ### 5.2 `/etc/hosts` の別名の運用と制約
@@ -181,7 +182,8 @@ Issue #1003（出口の通信制御）の設計で cli が解決先を検査す�
 | `--out-dir` | 出力先（必須）。`servo/` `chromium/` と `capture-result.json` を作る | なし |
 | `--servo-cmd` | Servo 側コマンドテンプレート（JSON 配列文字列。`{url}` `{out}` 等。`{proxy}`・`{html_path}` は不可） | なし（必須） |
 | `--chromium-bin` / `--chromium-cmd` | Chromium の実行ファイル / テンプレートの上書き | 自動検出 / 保存済みページ用テンプレート |
-| `--timeout-sec` / `--settle-ms` | 撮影のタイムアウト / 描画の待ち時間（保存済みページモードでは両エンジンとも無効。Servo 側の cli `screenshot` には待ち時間の指定口がなく、load 完了と最初のフレームを待つため、Chromium も `--virtual-time-budget` を付けず同条件にしている） | 90 / 5000 |
+| `--timeout-sec` | 撮影 1 回あたりのタイムアウト（保存済みページモードでも有効） | 90 |
+| `--settle-ms` | 描画の待ち時間（保存済みページモードでは両エンジンとも無効。Servo 側の cli `screenshot` には待ち時間の指定口がなく、load 完了と最初のフレームを待つため、Chromium も `--virtual-time-budget` を付けず同条件にしている） | 5000 |
 | `--min-sites` | 両エンジンで共通して `ok` になるべき最低サイト数 | 5 |
 
 終了コードは、両エンジンで共通して `ok` のサイト数が `--min-sites` 以上なら 0、未満なら 1、
