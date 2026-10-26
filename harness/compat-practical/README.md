@@ -59,7 +59,7 @@ bash harness/compat-practical/access_check.sh [--tasks P] [--out P] [--timeout S
 - 依存は bash・jq・curl のみ。実ネットワークへ出るため CI では実行しない（CI は `self-test.sh` と `--validate-only`）
 - `--timeout` は 1〜60 の整数（既定 8。curl 1 回あたりの上限）。`--total-timeout` は 1〜3600 の整数（既定 600）で全タスク合計の期限。超過後のタスクは取得せず `blocked: "total time limit exceeded"`・`curl_exit: 28` で記録を確定する（各 curl の `--max-time` も残り時間で切り詰める）。リダイレクトは自前で 5 回まで追う（`curl -L` は使わない）、https のみ（`--proto '=https' --proto-redir '=https'`）
 - UA は偽装しない識別子 `fandhe-browser-harness/0.1 (+https://github.com/Fandhe-AI/fandhe-browser)`。anti-bot 回避はしない
-- SSRF 対策（SEC 系）: 各ホップで `lib.sh` の `url_check`（https のみ・userinfo なし・ポート 443 のみ・IPv6 リテラル不可・localhost 系/内部ドメイン不可・IP リテラルは公開 IPv4 の厳密な 10 進表記のみ）と、ホスト名の正規形検証（小文字化後 ASCII の DNS ラベルのみ。末尾ドット・連続ドット・パーセントエンコード・IDN・バックスラッシュは拒否し、検証したホスト名と curl の接続先ホスト名を常に一致させて `--resolve` の固定を迂回させない）と、DNS 解決後アドレスの公開判定（DNS 解決にも `--timeout` と全体期限の残り時間の小さい方を上限とし、超過時は `total time limit exceeded` で記録して以降の取得を止める。getent / dscacheutil / Windows は powershell の `[System.Net.Dns]`（ホスト名は環境変数で渡す）で解決できるとき。検証済み IPv4/IPv6 を `--resolve` で固定。解決できない・固定できないホストは取得前に拒否）を行い、curl は `-q --noproxy '*'`（.curlrc・プロキシ無効）で起動し、`remote_ip` も事後検証する。tasks.json は JSON 文書がちょうど 1 個であることを検証する（空ファイル・複数文書は拒否）拒否時は curl を呼ばず（事後検証を除く）`blocked` に理由を記録し `reachable:false`
+- SSRF 対策（SEC 系）: 各ホップで `lib.sh` の `url_check`（https のみ・userinfo なし・ポート 443 のみ・IPv6 リテラル不可・localhost 系/内部ドメイン不可・IP リテラルは公開 IPv4 の厳密な 10 進表記のみ）と、ホスト名の正規形検証（小文字化後 ASCII の DNS ラベルのみ。末尾ドット・連続ドット・パーセントエンコード・IDN・バックスラッシュは拒否し、検証したホスト名と curl の接続先ホスト名を常に一致させて `--resolve` の固定を迂回させない）と、DNS 解決後アドレスの公開判定（DNS 解決にも `--timeout` と全体期限の残り時間の小さい方を上限とし、超過時は `total time limit exceeded` で記録して以降の取得を止める。getent / dscacheutil / Windows は powershell の `[System.Net.Dns]`（ホスト名は環境変数で渡す）で解決できるとき。検証済み IPv4/IPv6 を 1 本のカンマ区切り `--resolve`（IPv4 先頭。curl は同一 `host:port` への複数指定を後勝ちで置換するため単一指定にまとめ、IPv6 に届かない環境でも IPv4 で接続を試みる。curl 7.59 以降が必要。#1276・`MEAS-4`）で固定。解決できない・固定できないホストは取得前に拒否）を行い、curl は `-q --noproxy '*'`（.curlrc・プロキシ無効）で起動し、`remote_ip` も事後検証する。tasks.json は JSON 文書がちょうど 1 個であることを検証する（空ファイル・複数文書は拒否）拒否時は curl を呼ばず（事後検証を除く）`blocked` に理由を記録し `reachable:false`
 - Windows の jq が出す CRLF は `lib.sh` の `jq` ラッパーが除去する
 - 出力は JSONL。1 行目がメタ行、以降は 1 件 1 行
 
@@ -256,7 +256,7 @@ jq 'map({id, cat, kind, success, error})' <PoC-9 の chromium_results.json>
 
 - 実施日: 2026-10-26 / OS: Linux / バイナリ: `cargo build --release -p fandhe-browser-cli`（main `7d602f6`）/ フラグ: `--page-js v8 --page-modules`
 - `results/core_results.jsonl` を 28 件の実測で置き換え、21/28。`results/matrix.json` を `make_matrix.sh` で再生成した。内訳は `REPORT.md`「28 サイト化の実測」、類型別は `type-report.md`
-- `results/access_check.jsonl` は更新していない: 実測環境が IPv6 に届かず、`access_check.sh` が dual-stack ホストで `curl_exit 7` となり 28 件中 16 件が到達不能と記録されて実態（`run_core.sh`・Chromium は到達できた）を表さないため。`access_check.sh` の IPv6 取り扱いは本変更の範囲外
+- `results/access_check.jsonl` は更新していない: 実測環境が IPv6 に届かず、`access_check.sh` が dual-stack ホストで `curl_exit 7` となり 28 件中 16 件が到達不能と記録されて実態（`run_core.sh`・Chromium は到達できた）を表さないため。`access_check.sh` の IPv6 取り扱いは本変更の範囲外（原因は `--resolve` の複数指定が後勝ちで IPv4 候補が捨てられていたことで、#1276 で単一のカンマ区切り指定へ修正した。修正後の再計測は未実施で、IPv4 のみの環境での取り直しが必要）
 - 追加 6 件を含む `access_check.jsonl` の取り直しは、IPv6 に届く環境で行う
 
 ### 2026-10-19 の再計測（#1119）
