@@ -3033,9 +3033,11 @@ class SavedPagesTemplateTest(unittest.TestCase):
         expected = [
             a
             for a in cs.DEFAULT_CHROMIUM_TEMPLATE
-            if a not in ("--proxy-server={proxy}", "--proxy-bypass-list=<-loopback>")
+            if a
+            not in ("--proxy-server={proxy}", "--proxy-bypass-list=<-loopback>", "--virtual-time-budget={settle_ms}")
         ]
         self.assertEqual(rest, expected)
+        self.assertNotIn("{settle_ms}", " ".join(cs.SAVED_PAGES_CHROMIUM_TEMPLATE))
 
 
 class SavedPagesCaptureTest(unittest.TestCase):

@@ -51,7 +51,7 @@ class IsolationCheckTest(unittest.TestCase):
         self.proc = self.tmp / "dev"
         self.proc.write_text(PROC_NET_DEV_LO_ONLY, encoding="utf-8")
 
-    def _run(self, **overrides):  # noqa: ANN003, ANN202
+    def _run(self, urls: list[str] | None = None, **overrides):  # noqa: ANN003, ANN202
         kwargs = {
             "resolver": _resolver({"pages.test": ["127.0.0.1"]}),
             "connector": _connector_fail,
@@ -59,7 +59,7 @@ class IsolationCheckTest(unittest.TestCase):
             "proc_net_dev_path": self.proc,
         }
         kwargs.update(overrides)
-        return ic.run_isolation_check([URL], pages_port=8080, **kwargs)
+        return ic.run_isolation_check(urls or [URL], pages_port=8080, **kwargs)
 
     def _failed(self, report: dict) -> list[str]:
         return [c["name"] for c in report["checks"] if not c["ok"]]
@@ -122,6 +122,16 @@ class IsolationCheckTest(unittest.TestCase):
             with self.subTest(response=response):
                 report = self._run(http_get=lambda u, t, m, r=response: r)
                 self.assertEqual(self._failed(report), ["loopback_pages"])
+
+    def test_partial_404_is_skipped_not_isolation_failure(self) -> None:
+        urls = ["http://pages.test:8080/a/index.html", "http://pages.test:8080/b/index.html"]
+
+        def http_get(url: str, timeout: float, max_bytes: int) -> tuple[int, int]:
+            return (404, 5) if "/b/" in url else (200, 5)
+
+        report = self._run(urls, http_get=http_get)
+        self.assertTrue(report["isolated"])
+        self.assertEqual(report["missing_urls"], [urls[1]])
 
     def test_page_timeout_fails(self) -> None:
         def http_get(url: str, timeout: float, max_bytes: int) -> tuple[int, int]:

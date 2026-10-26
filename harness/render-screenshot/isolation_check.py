@@ -160,17 +160,34 @@ def check_pages_host(resolver: Resolver, host: str, port: int) -> dict[str, Any]
 
 
 def check_loopback_pages(urls: list[str], http_get: HttpGet, timeout: float) -> dict[str, Any]:
-    """各ページ URL が 200 で 1 バイト以上の本文を返すことを確かめる。"""
+    """各ページ URL が 200 で 1 バイト以上の本文を返すことを確かめる。
+
+    404 は「そのページが保存されていない」だけで隔離の不備ではないため、`missing_urls` に
+    記録して skipped 扱いにする（全ページが 404 のときは配信が成り立たないので失敗）。
+    それ以外の失敗（他のステータス・空本文・接続エラー）は fail-closed。
+    """
+    missing: list[str] = []
     for url in urls:
         try:
             status, body_len = http_get(url, timeout, HTTP_MAX_BODY_BYTES)
         except (OSError, http.client.HTTPException) as exc:
             return _check("loopback_pages", False, f"GET failed: {_err_detail(exc)}")
+        if status == 404:
+            missing.append(url)
+            continue
         if status != 200:
             return _check("loopback_pages", False, f"unexpected status {status}")
         if body_len < 1:
             return _check("loopback_pages", False, "empty body")
-    return _check("loopback_pages", True, f"{len(urls)} page(s) returned 200 with a body")
+    if len(missing) == len(urls):
+        return _check("loopback_pages", False, "no page was served (all returned 404)")
+    result = _check(
+        "loopback_pages",
+        True,
+        f"{len(urls) - len(missing)} page(s) returned 200 with a body, {len(missing)} missing (skipped)",
+    )
+    result["missing_urls"] = missing
+    return result
 
 
 def run_isolation_check(
@@ -205,6 +222,8 @@ def run_isolation_check(
         "schema_version": REPORT_SCHEMA_VERSION,
         "checked_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "isolated": all(c["ok"] for c in checks),
+        # 保存されておらず撮影対象から外すページ（`loopback_pages` の 404 分）。
+        "missing_urls": list(checks[-1].get("missing_urls", [])),
         "checks": checks,
         "environment": {
             "hostname": socket.gethostname(),

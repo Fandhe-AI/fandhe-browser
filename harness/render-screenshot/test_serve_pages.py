@@ -6,9 +6,11 @@
 from __future__ import annotations
 
 import http.client
+import socket
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 
@@ -94,14 +96,34 @@ class ServePagesTest(unittest.TestCase):
         self.assertEqual(self._request("GET", "/chunked.bin"), (200, payload))
 
     def test_concurrency_limit_returns_503(self) -> None:
-        held = [sp._REQUEST_SLOTS.acquire(blocking=False) for _ in range(sp.MAX_CONCURRENT_REQUESTS)]
+        held = [self.server.slots.acquire(blocking=False) for _ in range(sp.MAX_CONCURRENT_REQUESTS)]
         try:
             self.assertEqual(self._request("GET", "/site/index.html")[0], 503)
         finally:
             for ok in held:
                 if ok:
-                    sp._REQUEST_SLOTS.release()
+                    self.server.slots.release()
         self.assertEqual(self._request("GET", "/site/index.html")[0], 200)
+
+    def test_idle_connections_count_toward_limit_and_time_out(self) -> None:
+        # 要求を送らない接続を上限まで保持しても、次の接続は 503 になる（スレッド生成前に制限）。
+        port = self.server.server_address[1]
+        idle = [socket.create_connection(("127.0.0.1", port), timeout=5) for _ in range(sp.MAX_CONCURRENT_REQUESTS)]
+        try:
+            deadline = time.monotonic() + 5
+            # 取得できる空きが無くなるまで待つ（accept スレッドの処理待ち）。
+            while time.monotonic() < deadline:
+                if not self.server.slots.acquire(blocking=False):
+                    break
+                self.server.slots.release()
+                time.sleep(0.05)
+            self.assertEqual(self._request("GET", "/site/index.html")[0], 503)
+        finally:
+            for conn in idle:
+                conn.close()
+
+    def test_handler_has_read_timeout(self) -> None:
+        self.assertEqual(sp._PagesHandler.timeout, sp.REQUEST_TIMEOUT_SEC)
 
     def test_no_directory_listing(self) -> None:
         self.assertEqual(self._request("GET", "/empty/")[0], 404)

@@ -181,7 +181,7 @@ Issue #1003（出口の通信制御）の設計で cli が解決先を検査す�
 | `--out-dir` | 出力先（必須）。`servo/` `chromium/` と `capture-result.json` を作る | なし |
 | `--servo-cmd` | Servo 側コマンドテンプレート（JSON 配列文字列。`{url}` `{out}` 等。`{proxy}`・`{html_path}` は不可） | なし（必須） |
 | `--chromium-bin` / `--chromium-cmd` | Chromium の実行ファイル / テンプレートの上書き | 自動検出 / 保存済みページ用テンプレート |
-| `--timeout-sec` / `--settle-ms` | 撮影のタイムアウト / 描画の待ち時間（Chromium の `--virtual-time-budget` にのみ効く。Servo 側の cli `screenshot` には待ち時間の指定口がなく、load 完了と最初のフレームを待つ） | 90 / 5000 |
+| `--timeout-sec` / `--settle-ms` | 撮影のタイムアウト / 描画の待ち時間（保存済みページモードでは両エンジンとも無効。Servo 側の cli `screenshot` には待ち時間の指定口がなく、load 完了と最初のフレームを待つため、Chromium も `--virtual-time-budget` を付けず同条件にしている） | 90 / 5000 |
 | `--min-sites` | 両エンジンで共通して `ok` になるべき最低サイト数 | 5 |
 
 終了コードは、両エンジンで共通して `ok` のサイト数が `--min-sites` 以上なら 0、未満なら 1、

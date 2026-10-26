@@ -202,10 +202,14 @@ DEFAULT_SAVED_PAGES_SITES = Path(__file__).resolve().parent / "sites.saved-pages
 # `--network none`・非 root・`--cap-drop ALL`・ページを読み取り専用でマウントする
 # 隔離コンテナの運用（README・RUNBOOK）にあり、このテンプレート以外へは広げない。
 # UA 上書きや anti-bot 回避のフラグは付けない（SEC 系）。
+# `--virtual-time-budget={settle_ms}` も除く（RENDER-5 の同条件比較）: Servo の cli `screenshot` には
+# 待ち時間の指定口が無く load 完了と最初のフレームで撮るため、Chromium だけ仮想時間を進めると
+# タイマーや遅延描画を持つページを異なる時点で比べてしまう。両エンジンとも load 後に撮る。
 SAVED_PAGES_CHROMIUM_TEMPLATE = [
     arg
     for arg in DEFAULT_CHROMIUM_TEMPLATE
-    if arg not in ("--proxy-server={proxy}", "--proxy-bypass-list=<-loopback>")
+    if arg
+    not in ("--proxy-server={proxy}", "--proxy-bypass-list=<-loopback>", "--virtual-time-budget={settle_ms}")
 ]
 SAVED_PAGES_CHROMIUM_TEMPLATE.insert(SAVED_PAGES_CHROMIUM_TEMPLATE.index("--no-first-run"), "--no-sandbox")
 
@@ -2384,6 +2388,12 @@ def main(argv: list[str] | None = None) -> int:
                     raise CaptureError(
                         f"--saved-pages forbids {{proxy}} and {{html_path}} in the {engine_name} template"
                     )
+                if template_uses(template, "settle_ms"):
+                    # 片方のエンジンにだけ待ち時間を効かせると同条件の比較にならない（RENDER-5）。
+                    raise CaptureError(
+                        f"--saved-pages forbids {{settle_ms}} in the {engine_name} template "
+                        "(both engines capture right after load; Servo has no settle path)"
+                    )
                 if not template_uses(template, "url"):
                     raise CaptureError(
                         f"--saved-pages requires {{url}} in the {engine_name} template "
@@ -2439,6 +2449,18 @@ def main(argv: list[str] | None = None) -> int:
         isolation_report = isolation_check.run_isolation_check(
             [site.url for site in sites], pages_host=SAVED_PAGES_HOST, pages_port=first_url.port or 80
         )
+        if isolation_report.get("isolated"):
+            # 保存されていないページ（404）は隔離不合格ではなく skipped。撮影対象から外し、
+            # 残りが --min-sites 未満なら fail-closed（#1285）。
+            missing = set(isolation_report.get("missing_urls", []))
+            sites = [site for site in sites if site.url not in missing]
+            if len(sites) < args.min_sites:
+                print(
+                    f"error: only {len(sites)} saved page(s) available (missing: {len(missing)}); "
+                    f"--min-sites is {args.min_sites}",
+                    file=sys.stderr,
+                )
+                return 2
         if not isolation_report.get("isolated"):
             print(
                 "error: network isolation check failed; refusing to launch any engine "

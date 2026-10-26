@@ -356,7 +356,8 @@ Issue #55 のオーナー判断（2026-10-27）に基づく測定モード。現
   `--saved-pages` なしの既定検証（https 必須）と `{url}` 直接ナビゲーションの許可リストは変えない
   （`http://pages.test` は従来どおり `skipped`）。
 - テンプレートは `{url}` 必須、`{proxy}`・`{html_path}` は不可（違反は終了コード 2）。
-  Chromium の既定は `SAVED_PAGES_CHROMIUM_TEMPLATE`（検証プロキシ向け引数なし・`--no-sandbox` 明示）。
+  Chromium の既定は `SAVED_PAGES_CHROMIUM_TEMPLATE`（検証プロキシ向け引数・`--virtual-time-budget` なし・`--no-sandbox` 明示）。
+  `{settle_ms}` も不可（Servo に待ち時間の指定口が無く、両エンジンを load 後の同じ時点で撮るため。RENDER-5）。
 - 検証プロキシは起動せず、`--egress-guard` は働かない（結果 JSON に `proxy` キーは付かない）。
   隔離はコンテナのネットワーク名前空間の遮断を正とする。
 - dry-run 以外では `--allow-unproxied-engine` が必須（隔離が唯一の出口制御であることの明示）。
@@ -366,7 +367,7 @@ Issue #55 のオーナー判断（2026-10-27）に基づく測定モード。現
 - `isolation_check` の項目: `interfaces`（`/proc/net/dev` に `lo` 以外が無い。`/proc` が無ければ
   判定不能で失敗）・`external_dns`（公開 DNS 名の解決が失敗）・`external_ipv4` / `external_ipv6`
   （公開 IP・メタデータアドレスへの TCP 接続が短いタイムアウト内に失敗。接続できても何も送らず閉じる）・
-  `pages_host`（`pages.test` の解決先がすべて loopback）・`loopback_pages`（各ページが 200 かつ本文あり）。
+  `pages_host`（`pages.test` の解決先がすべて loopback）・`loopback_pages`（各ページが 200 かつ本文あり。404 は未保存として `missing_urls` に記録し撮影対象から外す。全ページが 404 なら失敗。撮影後の共通 ok 件数は `--min-sites` で判定）。
   `detail` はエラー種別・errno 程度で、取得本文は載せない。プロキシ系の環境変数は有無だけ記録する。
 
 `--no-sandbox` の根拠: コンテナ内では非 root かつユーザー名前空間が使えず Chromium の
