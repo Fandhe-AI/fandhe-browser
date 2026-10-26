@@ -1,4 +1,4 @@
-// 22 タスクを fandhe-browser の CDP サーバーへ流して成否を判定するクライアント（TASK-71.2・MEAS-4）。
+// 28 タスクを fandhe-browser の CDP サーバーへ流して成否を判定するクライアント（TASK-71.2・MEAS-4）。
 // 呼び出し元は run_core.sh のみ（バイナリの起動・停止・meta 行・JSONL の書き出しは sh 側が担う）。
 // 本ファイルは CDP の `Page.navigate` → `DOM.getDocument` → `DOM.querySelector` →
 // `DOM.requestChildNodes` だけを使い、タスク 1 件ごとに結果 1 行（JSON）を stdout へ出す。

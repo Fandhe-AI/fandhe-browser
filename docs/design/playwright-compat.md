@@ -782,7 +782,7 @@ TASK-43.3o（#1050）の取り込み後に再取得した同梱トレース（3 
 | 項目 | 事実 | 出典 |
 | ---- | ---- | ---- |
 | `newPage()` 到達 | 到達済み。`noDefaults:true`・`acceptDownloads:false`・`viewport:null` の指定が条件 | 上記「到達結果（TASK-43.3n・#1042）」 |
-| TASK-71 の実測 | TASK-71.3（#312）は完了。`harness/compat-practical/tasks.json` の 22 タスクにダウンロードを要するものは 0 件 | `tasks.json` |
+| TASK-71 の実測 | TASK-71.3（#312）は完了。`harness/compat-practical/tasks.json` の 28 タスクにダウンロードを要するものは 0 件 | `tasks.json` |
 | spec の要件 | `04-behavior/` にダウンロードの要件は無い。`CDP-2` の操作（`newContext()` → `newPage()` → `goto()` → セレクタ取得）にも含まれない | `CDP-2` |
 
 現状の制限（既定のオプションでは `allowAndName` が `-32602` で拒否される）は「段階 2g の実施結果」を参照。

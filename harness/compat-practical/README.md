@@ -1,12 +1,12 @@
 # compat-practical（実測ハーネス）
 
-PoC-9（実用互換性レベルの実測）の 22 サイト分のタスク定義と、到達可否の確認手順を
+PoC-9（実用互換性レベルの実測）の 22 サイトに 6 サイトを加えた 28 サイト分のタスク定義と、到達可否の確認手順を
 V8 統合後（TASK-30）の fandhe-browser 向けに移植したハーネス。
 spec 対応: TASK-71.1・TASK-71.2 / MS-6 / `MEAS-4`（関連 `COMPAT-4`・`JS-2`）。
 
 | 後続 | 内容 |
 | ---- | ---- |
-| #311（TASK-71.2） | 22 タスクの実行スクリプト `run_core.sh`（本 README「run_core.sh」節） |
+| #311（TASK-71.2） | 22 タスク（現在は 28）の実行スクリプト `run_core.sh`（本 README「run_core.sh」節） |
 | #312（TASK-71.3） | Chromium 実測との突合・`results/matrix.json` 生成（本 README「make_matrix.sh」節。生成スクリプトに加え、実測から生成した `results/matrix.json` をコミット済みで、回帰ゲートは有効。#920） |
 | #315（TASK-72.1） | 類型別動作率集計 `aggregate_by_type.sh`（本 README「aggregate_by_type.sh」節） |
 | #316（TASK-72.2） | 類型別の達成判定レポート `type-report.md`（static・spa・form の 70% 達成確認） |
@@ -16,14 +16,15 @@ spec 対応: TASK-71.1・TASK-71.2 / MS-6 / `MEAS-4`（関連 `COMPAT-4`・`JS-2
 
 | ファイル | 役割 |
 | -------- | ---- |
-| `tasks.json` | 22 タスク定義 |
+| `tasks.json` | 28 タスク定義（PoC-9 の 22 件 + 28 サイト化で追加した 6 件） |
 | `lib.sh` | 共通関数 `resolve_bin`（実行対象バイナリの解決と検証）・`sha256_of` |
 | `make_matrix.sh` | core 実測と Chromium 参照データを `id` で突合し動作率マトリクスを生成（TASK-71.3） |
 | `aggregate_by_type.sh` | `results/matrix.json` を類型 (a)〜(e) 別に集計し成功数・全体数・動作率を出力（TASK-72.1。判定はしない） |
 | `type-report.md` | 類型別動作率の達成判定と失敗の原因分類（TASK-72.2） |
-| `reference/chromium_results.json` | PoC-9 の Chromium（Playwright）実測の転記（22 件。出所は「make_matrix.sh」節） |
-| `access_check.sh` | tasks.json の検証と、22 サイトへの到達可否の記録（curl） |
-| `run_core.sh` | 22 タスクを `fandhe-browser` の CDP サーバーで実行し結果を JSONL へ記録（TASK-71.2） |
+| `reference/chromium_results.json` | Chromium 参照（PoC-9 の実測の転記 22 件 + `chromium_reference.mjs` で取得した 6 件。出所は「make_matrix.sh」節） |
+| `chromium_reference.mjs` | tasks.json の判定を Chromium（playwright-core）で実行し、Chromium 参照データを作る手動専用スクリプト（#68・TASK-89。引数検証のみ `self-test.sh` が確認） |
+| `access_check.sh` | tasks.json の検証と、28 サイトへの到達可否の記録（curl） |
+| `run_core.sh` | 28 タスクを `fandhe-browser` の CDP サーバーで実行し結果を JSONL へ記録（TASK-71.2） |
 | `run_core.mjs` | `run_core.sh` から呼ばれる依存ゼロの CDP クライアント（Node 22 以降） |
 | `fake_cdp_server.mjs` | 自己テスト用の偽 CDP サーバー（loopback のみ） |
 | `self-test.sh` | 上記のオフライン自己テスト（curl はスタブ・CDP は偽サーバー。CI で実行） |
@@ -38,14 +39,15 @@ spec 対応: TASK-71.1・TASK-71.2 / MS-6 / `MEAS-4`（関連 `COMPAT-4`・`JS-2
 
 ## tasks.json
 
-- PoC-9 の `harness/tasks.json` から 22 件をそのまま移植した。
+- PoC-9 の `harness/tasks.json` から 22 件をそのまま移植し、28 サイト化（#68・TASK-89・`MEAS-2`。対象の確定は `docs/design/site-catalog-task70.md`）で c4・d5・d7・d8・e3・e6 の 6 件を追加した。
   #312 が PoC-9 の Chromium 実測結果と `id` で突き合わせるため、`id` は変更しない
 - スキーマ: JSON 配列。各要素は `{id, cat, url, selector, kind}`
   - `id`・`cat`: `^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`（`cat` は `check-matrix.sh` と同じ規則）
   - `kind`: `text` / `texts` / `form`
   - `url`: `https://` のみ（空白・制御文字不可）
   - `selector`: 空でない文字列
-- c2（Unsplash）は PoC-9 で 401 のため除外されており、追加し直していない
+- 除外した 8 サイト（m1・m2: 403、m3・m4・m5・m7: robots.txt、c2〔Unsplash〕: 401、m12〔Airtable〕: 公開ビューなし）は含めない（`MEAS-2`・`SEC-1`・`SEC-3`）
+- 追加 6 件の selector は Chromium で描画後の DOM に対して確認した（d7 は core のセレクタサブセットに合わせて `^=` を使用、d8 は `[data-qa="renderer"]`、e3 は iframe 内の表を直接指す URL）。根拠は `REPORT.md`「28 サイト化の実測」
 - JS 必須で失敗していた 3 件は b5（Trello）・d2（Saucedemo）・d3（DemoQA）。V8 統合後に解消するかが測定の焦点
 
 ## access_check.sh
@@ -156,11 +158,31 @@ spec 対応: TASK-72.1 / MS-6 / `COMPAT-1`（関連 `COMPAT-4`・`MEAS-4`・`REP
 jq 'map({id, cat, kind, success, error})' <PoC-9 の chromium_results.json>
 ```
 
+- 28 サイト化で追加した 6 件（c4・d5・d7・d8・e3・e6）は PoC-9 に生データが無いため、`chromium_reference.mjs` で `tasks.json` と同じ判定（url・selector・kind）を実行して取得した（2026-10-26）。判定は PoC-9 の `run_chromium.mjs` と同一（`domcontentloaded` 後に 2500ms 待機・timeout 15000。`text` は innerText 非空、`texts` は一致件数 1 以上、`form` は配下の `input`/`select`/`textarea` が 1 件以上）。実行環境は playwright-core 1.63.0（`scripts/versions.sh` の固定版。`harness/playwright-connect/run.sh` と同じく `mktemp -d` へ一時導入して `verify-install.mjs` で検証。リポの依存には加えない）と Chrome for Testing 153 の Chromium（ブラウザ本体は取得せず `FANDHE_CHROMIUM_EXECUTABLE` で指定）。UA は変更しない（Chromium 既定。PoC-9 は別 UA を指定していた）。出力は `{id, cat, kind, success, error}` だけで、既存 22 件の値は変えていない
+  - 実行例（手動専用・要ネットワーク）: `FANDHE_PLAYWRIGHT_MODULE_DIR=<導入先> FANDHE_CHROMIUM_EXECUTABLE=<chromium> node harness/compat-practical/chromium_reference.mjs --only c4,d5,d7,d8,e3,e6 --out <絶対パス>`。`--probe` は一致件数と先頭一致要素の要約を stderr だけへ出す（ページ由来テキストを含みうるため転記しない）
+  - 前提（セキュリティ）: `FANDHE_CHROMIUM_EXECUTABLE`（`executablePath`）には信頼できる配布元から入手した Chromium を指定する。`--module-dir`（`FANDHE_PLAYWRIGHT_MODULE_DIR`）は playwright-core を `require` するため、導入先に対し事前に `harness/playwright-trace/verify-install.mjs`（版・integrity・単独導入の検証。`harness/playwright-connect/run.sh` と同じ手順）を実行してから渡す
+  - c4 は Chromium が Cloudflare のチャレンジページで止まり `success:false`（回避しない。`SEC-2`）
 - 計測条件の差: Chromium 側は PoC-9 当時の別時期・別 UA の Playwright 実測（`domcontentloaded` 後に待機）で、`texts` は全件一致の件数判定。本リポ側は `run_core.sh` の先頭一致 1 件判定（`method: "first_match"`）。条件が揃った比較ではない
 - PoC-9 の表との食い違い（生データをそのまま採用し、判断を混ぜない）:
   - e1: 生データは `success: false`（一致 0 件）。PoC-9 の `matrix.json`・README の表は成功扱い
   - c1: 生データは `success: true`（anti-bot のブロックページ内のリンクに一致した機械判定）。PoC-9 README は実質失敗と注記している
   - spec 側の不整合はオーナー経由で spec リポ側の課題として扱う
+
+### 追加 6 件の出所と robots.txt 確認
+
+- d7・d8・e3 は第三者が公開している form・sheet の ID を使う（所有者の同意の有無は未記録）。出所は `docs/design/site-catalog-task70.md` の記録に従う:
+  - d7: Google Forms API 公式ガイドの JSON 例に載るフォーム
+  - d8: Typeform 公式 GitHub の embed-demo
+  - e3: Google Sheets API 公式クイックスタートの「Class Data」シート（実測では `htmlview` 内の iframe URL を使う）
+  - 各ページの具体的な URL（辿ったページ）は未記録
+- robots.txt の確認（2026-10-26。`curl` で取得しただけで、UA は偽装していない）:
+
+| id | サイト | 結果 |
+| -- | ------ | ---- |
+| c4 | Product Hunt | 取得できた。`User-agent: *` の Disallow に `/auth/*`・`/search*`・`/my/*` 等があり、対象 URL（トップ `/`）は該当しない |
+| e6 | Kaggle | `https://www.kaggle.com/robots.txt` は HTTP 404（HTML）で、robots.txt は取得できなかった（規則の有無は未確認） |
+
+- c4・e6 以外の追加サイトの robots.txt は未確認
 
 ### 実測の突合結果と回帰ゲートの状況（2026-10-07 実測）
 
@@ -229,6 +251,13 @@ jq 'map({id, cat, kind, success, error})' <PoC-9 の chromium_results.json>
 
 - 実施日: 2026-10-22 / OS: Linux / バイナリ: `cargo build --release -p fandhe-browser-cli`（main `bd1c8be9`）/ フラグ: `--page-js v8 --page-modules`
 - `results/core_results.jsonl` をこの実測で置き換え、17/22。`results/matrix.json` を生成してコミットした。数値と判定は上の「2026-10-22 の再計測と回帰ゲートの有効化（#920）」、詳細は `REPORT.md` を参照
+
+### 2026-10-26 の再計測（28 サイト化。#68）
+
+- 実施日: 2026-10-26 / OS: Linux / バイナリ: `cargo build --release -p fandhe-browser-cli`（main `7d602f6`）/ フラグ: `--page-js v8 --page-modules`
+- `results/core_results.jsonl` を 28 件の実測で置き換え、21/28。`results/matrix.json` を `make_matrix.sh` で再生成した。内訳は `REPORT.md`「28 サイト化の実測」、類型別は `type-report.md`
+- `results/access_check.jsonl` は更新していない: 実測環境が IPv6 に届かず、`access_check.sh` が dual-stack ホストで `curl_exit 7` となり 28 件中 16 件が到達不能と記録されて実態（`run_core.sh`・Chromium は到達できた）を表さないため。`access_check.sh` の IPv6 取り扱いは本変更の範囲外
+- 追加 6 件を含む `access_check.jsonl` の取り直しは、IPv6 に届く環境で行う
 
 ### 2026-10-19 の再計測（#1119）
 
