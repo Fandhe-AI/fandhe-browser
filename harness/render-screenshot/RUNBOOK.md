@@ -2,15 +2,21 @@
 
 TASK-37（37.h1）/ MS-1 / ビヘイビア `RENDER-5`・`MEAS-3` 対応。Issue #55 の
 実機作業（担当: 人間）の手順書である。**この文書は手順の草案であり、測定結果ではない**。
-実機での撮影・測定・合否判定はオーナーが行い、結果は #55 に記録する。
+実機での撮影・測定・合否判定はオーナーが行い、結果は #55 に記録する。Issue #1281 で、
+現行の Servo ホスト（servo 0.6.0）と隔離コンテナを前提に書き直した。
 
-**実サイト（ネットワーク接続下）の Servo 撮影は保留を維持する**。`--proxy` 対応版 `servo-embed`
-（4.2）と `--egress-guard` を用いても、Servo の WebSocket はプロキシへ強制されず、
-`egress_guard` は接続後に検出して終了するだけの事後検出である。ページ JS が内部アドレスへ
-WebSocket 接続すると HTTP Upgrade リクエストが内部サービスへ届き得て（短命なら検出もされない）、
-SSRF の副作用は事後に `failed` にしても取り消せない。**エンジンからプロキシ以外への通信を
-事前に遮断する隔離（ネットワーク名前空間等）ができるまで、接続下での撮影は行わない**
-（再開条件は 5.1）。`--allow-unproxied-engine` も完全遮断環境専用で、接続下では使わない。
+**撮影は「保存済みページを `docker run --network none` のコンテナで撮る」方式で行う**
+（オーナー判断 2026-10-27・#55）。
+
+- 現行の `fandhe-browser-servo-host` は proxy 系の Preferences を空に固定しており、
+  かつての検証プロキシ経由（`--proxy` 対応の `servo-embed`）の手順は成り立たない。
+  **接続下で実サイトを撮らない**。
+- `docker run --network none` のコンテナは、旧 RUNBOOK 5.1 の再開条件（エンジンから外部への
+  通信を事前に遮断する隔離）を満たすものとして認める。オフラインで保存したページで
+  `RENDER-5` を測ってよい。
+- cli・ハーネスに loopback を許す経路は作らない（#1003 とまとめて決める）。それまでは、
+  コンテナ内の `/etc/hosts` の別名（`pages.test`）を使う運用とする（5.2）。
+- Chromium は計測用コンテナに版を固定して入れる。ホストには入れない。
 
 ハーネスの仕様（引数・スキーマ・セキュリティ上の注意）は [README.md](README.md) が
 正本で、本書は「実機で何をどの順に実行するか」だけを扱う。
@@ -32,224 +38,154 @@ SSRF の副作用は事後に `failed` にしても取り消せない。**エン
 
 | 項目 | 内容 |
 | ---- | ---- |
-| OS | Linux x86_64（TASK-36 / #50 で検証に使った Linux 実機と同じ環境が望ましい） |
-| GPU | なし。Mesa の llvmpipe（ソフトウェア GL）で描画する。フォント差などで SSIM が下がり得る点に注意 |
-| ネットワーク | 実サイト撮影の再開後は、代表サイト（`sites.json`）へ HTTPS で到達できること（到達不能なサイトは `skipped` / `failed` になり、5 サイト未満だと終了コード 1）。**現時点では接続下で Servo を撮影しない**（5.1 参照）。ネットワークを完全に遮断した環境では Servo 側のスナップショット取得も失敗するため、`sites.json` の実サイトは `skipped` になる |
-| ツール | `python3`（標準ライブラリのみで動作）、Rust stable（`rust-toolchain.toml`）、`cmake` と C/C++ ビルド環境（Servo のネイティブ依存に必要。PoC-6 の記録による） |
-| ディスク | Servo の release ビルドで `target/` が数 GB（PoC-6 の macOS 実測で約 2.4GB。Linux での診断版ビルドは約 4 分。#50 報告） |
+| OS | Linux x86_64（Docker が動くこと。共用機のホストには Chromium・Servo の依存を入れない） |
+| ツール | Docker（BuildKit）、`python3`（標準ライブラリのみで動作。コンテナの外で `--dry-run` と `measure_ssim.py` を実行するため） |
+| GPU | なし。コンテナ内の Mesa llvmpipe（ソフトウェア GL）で描画する。フォント差などで SSIM が下がり得る。コンテナは両エンジンで同じフォント（`fonts-dejavu-core`）を使う |
+| ネットワーク | イメージのビルド時だけ必要（apt・crates.io・V8 の prebuilt 等）。**撮影は `--network none` で行い、実サイトへは接続しない** |
+| ディスク | イメージ内で Servo ホストと cli を release ビルドする。`target/` 相当が数 GB 加わる（Servo ホストの release ビルドは長時間かかる） |
+| 保存済みページ | 5 サイト以上を `<pages-root>/<site_id>/index.html`（とサブリソース）として用意する（5.1 の 1） |
 
-撮影前に `python3 -m unittest discover -s harness/render-screenshot -p 'test_*.py' -v`
+撮影前に `make test-harness`（または
+`python3 -B -m unittest discover -s harness/render-screenshot -p 'test_*.py' -v`）
 を実行し、ハーネス自体が実機の Python で動くことを確認する（偽エンジンによるオフライン
 テストであり、実機撮影の検証ではない）。
 
-## 3. Chromium の導入
+## 3. Chromium（コンテナ内に版を固定して導入）
 
-`capture_screenshots.py` は `chromium` / `chromium-browser` / `google-chrome` の順で自動検出する。
-どれも無ければディストリビューションのパッケージで導入し、`--chromium-bin` に明示してもよい。
+Chromium は計測用コンテナの `runtime` ステージが導入する。Debian trixie の
+`snapshot.debian.org` の固定時刻（`ARG DEBIAN_SNAPSHOT`）から `chromium=<exact version>`
+（`ARG CHROMIUM_VERSION`）を `apt` で入れ、ビルド時に `chromium --version` と照合して
+食い違えばビルドを失敗させる（apt の署名検証は外さない）。版の記録方法:
 
 ```bash
-# 例（Debian / Ubuntu 系。パッケージ名はディストリビューションで異なる）
-sudo apt-get install -y chromium
-chromium --version   # 結果記録用にバージョンを控える
+docker run --rm --entrypoint chromium fandhe-render-screenshot:local --version
 ```
 
-root 実行やコンテナでは `--no-sandbox` が必要になることがある。その場合は既定テンプレートに
-勝手に足さず、`--chromium-cmd` で明示的に指定する（README「Chromium の既定テンプレート」）。
+保存済みページ用の既定テンプレート（`SAVED_PAGES_CHROMIUM_TEMPLATE`）は、検証プロキシ向けの
+引数を持たず、`--no-sandbox` を明示で含む。コンテナ内では非 root かつユーザー名前空間が
+使えずサンドボックスが起動できないためで、根拠は `--network none`・非 root・`--cap-drop ALL`・
+ページを読み取り専用でマウントする隔離運用にある（既存の `DEFAULT_CHROMIUM_TEMPLATE` は変えない）。
 UA の上書きや anti-bot 回避のフラグは付けない（SEC 系）。
 
-## 4. Servo 側の撮影コマンドの用意
+## 4. Servo 側（servo-host + cli の release ビルド）
 
-### 4.1 背景（#50 の報告）
+### 4.1 背景（#50 の経緯。過去の記録）
 
-TASK-36（#50）の実機検証では、PoC-6 の `servo-embed` を改変せずに実行すると、8 回すべて
-60 秒でタイムアウトし PNG を取得できなかった。原因は、埋め込み側の `WebViewDelegate` が
-`notify_new_frame_ready` を実装せず `WebView::paint()` を呼んでいないため、スクリーンショットの
-callback が呼ばれないことと推定されている（Servo 0.3.0 の描画モデル）。`paint()` を呼ぶ
-4 行を足した診断用コピーでは 7/7 回、1280x800 の PNG を 0.1〜0.8 秒で取得できた。
-**Servo 本体（`servo` クレート）は改変していない**（licensing 規約: Servo のソースを改変しない）。
+TASK-36（#50）の実機検証は PoC の `servo-embed`（Servo 0.3.0）で行った。改変なしでは
+8 回すべて 60 秒でタイムアウトし、`paint()` を呼ぶ診断用コピーでは 7/7 回、1280x800 の PNG を
+取得できた。**これは過去の経緯であり、現行の手順ではない**。現在は本体の `fandhe-browser`（cli）が
+`fandhe-browser-servo-host`（servo 0.6.0。`servo-host/`）を子プロセスとして起動して撮る。
 
-### 4.2 診断版 servo-embed の作り方
+### 4.2 ビルドと配置
 
-改変するのは埋め込み側のサンプルコード（`servo-embed`）だけで、Servo 本体は触らない。
-
-1. `servo-embed` を作業用ディレクトリへ複製する。ソースは private な spec リポの
-   `03-poc/rendering-layer-servo/servo-embed/`（アクセス権のある環境では `docs/spec` submodule 配下）。
-   `docs/spec` 配下は本リポから編集しないので、**必ず複製して使う**。複製には `Cargo.lock` も含める。
-2. 複製先の `src/main.rs` の `impl WebViewDelegate for Delegate` に、次のメソッドがあることを確認する。
-   無ければ追加する（#50 の診断差分と同じ内容）。
-
-   ```rust
-   // 新フレーム通知で paint() を呼ぶ（Servo 0.3.0 の描画モデル）。
-   fn notify_new_frame_ready(&self, webview: WebView) {
-       webview.paint();
-   }
-   ```
-
-   spec 側の最新版には既に同等の記述が入っている可能性がある。その場合は追加不要。
-3. 本リポの依存管理とは無関係の独立ビルドとして、別の `CARGO_TARGET_DIR` でビルドする。
-
-   ```bash
-   cd /path/to/servo-embed-copy
-   CARGO_TARGET_DIR=/path/to/servo-target cargo build --release
-   ```
-
-   本リポの `Cargo.toml` / `Cargo.lock` は変更しない（依存は `=x.y.z` 固定・承認制。
-   複製側の依存は PoC の `Cargo.lock` に従う）。
-4. 通信を検証プロキシへ強制する `--proxy` 対応の差分を当てる（次項「`--proxy` 対応の差分」）。
-5. 単体で PNG が出ることを確認してから、ハーネスに繋ぐ。
-
-   ```bash
-   /path/to/servo-target/release/servo_embed_poc page.html out.png --proxy http://127.0.0.1:PORT
-   file out.png   # PNG image data, 1280 x 800, 8-bit/color RGBA を確認
-   ```
-
-   無表示環境で GL 初期化に失敗する場合は、#50 で成功した条件を使う:
-   `LIBGL_ALWAYS_SOFTWARE=1 GALLIUM_DRIVER=llvmpipe`、`EGL_PLATFORM=surfaceless`、
-   または `xvfb-run -a -s "-screen 0 1280x800x24"`。
-
-#### `--proxy` 対応の差分（TASK-37 / #837）
-
-複製した `src/main.rs` に次の内容を足す。Servo 本体は改変しない。**以下は Servo 0.3.0 の
-ソース（`servo-config`・`servo-net`・`servo` クレート）で API 名を確認して書いた差分で、
-本リポではコンパイル確認をしていない（未検証。実ビルドでの確認は #55 の作業）**。
-本リポにはビルド対象の Servo 埋め込みコードをチェックインしない（MPL 隔離・依存承認制）。
-
-1. 引数 `--proxy URL` を解析する。**未指定なら `exit(2)`**（プロキシなしで走らせない）。
-   URL は `http://127.0.0.1:<port>`（loopback のみ）を要求し、それ以外は `exit(2)`。
-2. `Preferences::default()` から作った値に、次を**明示**して `ServoBuilder::preferences(...)` へ渡す。
-   `Preferences::default()` は環境変数から `no_proxy` を読むため、空文字の明示が要る。
-
-   ```rust
-   let mut prefs = Preferences::default();
-   prefs.network_http_proxy_uri = proxy_url.clone();
-   prefs.network_https_proxy_uri = proxy_url.clone();
-   prefs.network_http_no_proxy = String::new();
-   ```
-
-3. `WebViewDelegate::load_web_resource` で、各リクエストの scheme・host・port だけを stderr に出す
-   （クエリは出さない）。ログ出力のみで介入せず、通常どおりロードを続行する。
-
-   ```rust
-   fn load_web_resource(&self, _webview: WebView, load: WebResourceLoad) {
-       let url = &load.request.url;
-       eprintln!("servo-embed: load {}://{}:{}", url.scheme(), url.host_str().unwrap_or("?"), url.port_or_known_default().unwrap_or(0));
-       // intercept() を呼ばなければロードは続行される
-   }
-   ```
-
-4. 位置引数 `html_path`・`out.png` の仕様は維持する。
-
-注意: pref は HTTP(S) のサブリソース取得に効くが、WebSocket は `websocket_loader.rs` が直接接続
-するため強制されない（README「このプロキシで防げないこと」）。`--egress-guard`（Linux）が補う。
-
-### 4.3 servo-embed の入出力仕様と制約
-
-- 引数は `servo_embed_poc <html_path> <out.png>` の位置引数 2 つに加え、4.2 の差分で `--proxy URL`（必須）を受け取る。元の PoC は `--proxy` を持たない。
-- 出力寸法は 1280x800 固定。`sites.json` の viewport（1280x800）と一致するので追加指定は不要。
-- 入力は HTML ファイル（`data:` URL として読み込む）。ハーネスの `{html_path}` placeholder が
-  この用途にあたり、撮影直前に対象 URL の HTML をスナップショットとして 1 回取得して渡す。
-  Chromium は `{url}` を直接開くため、**両エンジンの入力条件が一致しない**。
-  スナップショットは HTML 本体のみを保存し外部ファイルは同梱しないが、保存 HTML には
-  `<base href>` が注入される（`inject_base_href`）。そのため、ネットワークに接続できる環境では
-  相対 URL の CSS・画像・スクリプトは撮影時に元サイトから取得され得る。
-  `data:` origin に由来する制約、動的リクエスト、取得時刻の差なども残る。
-  ネットワークを完全に遮断した環境ではこれらのサブリソースは取得されず、無スタイルに近い
-  描画になる。いずれの場合も差が SSIM に与える影響は測定時に必ず記録する（7 章の記録テンプレート）。
-- 元の `servo-embed` はプロキシ引数を持たないが、4.2 の差分を当てたものは `{proxy}` を受け取る。
-  ハーネスは `{proxy}` を含まない `--servo-cmd` を既定で拒否する。`--allow-unproxied-engine` は
-  **ネットワークを完全に遮断した環境専用**であり、実サイトへ接続できる環境では使わない
-  （スナップショットの `<base href>` で Servo が取得するサブリソースが検証プロキシを迂回し、
-  内部アドレス・メタデータアドレスへアクセスし得るため。SSRF）。
-- 経路強制の検証（多層防御。WebSocket はプロキシに強制されないため隔離の代替にはならない）: ハーネスは `{proxy}` 使用時にエンジン環境へプロキシを設定し `no_proxy` を除去する。
-  外部サブリソースを参照するページでプロキシ接続が 0 件なら `failed`、Linux では直接接続も検出する
-  （README「Servo 撮影コマンド」）。実 Servo で実際に強制されるかは本作業で確認する。
-
-## 5. 撮影（`capture_screenshots.py`）
-
-### 5.1 実サイト撮影（保留。ネットワーク隔離が再開条件）
-
-**保留中は本節のコマンドを接続下で実行しない**。再開条件は、撮影プロセスツリーがプロキシ
-以外へ通信できないことを事前に強制する隔離（ネットワーク名前空間等でループバックの
-検証プロキシのみ到達可能にする）が用意され、その効果を確認できていること。`--egress-guard`
-単独では再開条件を満たさない（事後検出のため）。以下は隔離が整った環境向けの手順の草案。
-
-前提: 4.2 の `--proxy` 対応版 `servo_embed_poc` をビルド済みで、Linux 上で実行する
-（`--egress-guard` は Linux 専用。非 Linux では Servo が `skipped` になる）。
+コンテナの `build` ステージが、ホストと同じ基盤（Debian trixie）で次を release ビルドする
+（glibc を揃えるため、別ホストでビルドしたバイナリを持ち込まない）。
 
 ```bash
-OUT=/path/to/render-out
-SERVO_BIN=/path/to/servo-target/release/servo_embed_poc
-
-# 1) 展開後のコマンドを確認する（{proxy} が含まれること）
-python3 harness/render-screenshot/capture_screenshots.py \
-  --out-dir "$OUT" \
-  --engines servo,chromium \
-  --servo-cmd "[\"$SERVO_BIN\", \"{html_path}\", \"{out}\", \"--proxy\", \"{proxy}\"]" \
-  --dry-run
-
-# 2) 実行する（--dry-run を外す）
-python3 harness/render-screenshot/capture_screenshots.py \
-  --out-dir "$OUT" \
-  --engines servo,chromium \
-  --servo-cmd "[\"$SERVO_BIN\", \"{html_path}\", \"{out}\", \"--proxy\", \"{proxy}\"]"
+cargo build --release --locked --manifest-path servo-host/Cargo.toml
+cargo build --release --locked -p fandhe-browser-cli
 ```
 
-3) `$OUT/capture-result.json` の `captures[]` を確認する。
+- ホストの解決順は、環境変数 `FANDHE_BROWSER_RENDER_HOST`、次に cli と同じディレクトリ。
+  コンテナでは両バイナリを `/opt/fandhe/bin/` に並べて置く。
+- ホスト単体の確認: `fandhe-browser-servo-host --selftest`。
+- cli はホストの環境変数を `env_clear` して起動する。そのため `LIBGL_ALWAYS_SOFTWARE`・
+  `GALLIUM_DRIVER`・`EGL_PLATFORM` や `xvfb-run` の指定は**届かない**ので使わない
+  （旧手順の GL 環境変数は廃止）。GL の経路（llvmpipe かどうか）は、撮影中のホストの
+  `/proc/<pid>/maps` で確認して 7 章に記録する。
+- Servo 本体は改変しない（licensing.md）。イメージは配布しない。
 
-- Servo の各行の `proxy.allowed`（プロキシ経由で通った件数）が、サブリソースを持つサイトで 1 以上であること
-- `proxy.denied` / `denied_targets` に内部アドレス宛の拒否があれば記録する（拒否自体は正常動作）
-- `proxy.egress_guard` が `enforced` であること。`violation` は直接接続の検出で、その撮影は
-  `failed`（`stderr_tail` に `unproxied connection detected`）。この場合は pref が効いていない
-  可能性があるので結果を 7 章に記録し、PNG を比較に使わない
-- エンジンだけを別ネットワーク名前空間へ隔離した場合、`egress_guard` は監視プロセスの
-  `/proc/net` に対象のソケットが現れないため `GuardUnavailable`（`proxy.egress_guard` が
-  `unavailable`、撮影は `failed`）になる。`enforced` とは記録されない。隔離下で撮影を再開する
-  際は、ガードを `enforced` に頼らず名前空間側の遮断を正とし、ガードの対応（対象 pid の
-  `/proc/<pid>/net` 参照）を別途実装してから再開する
-- `stderr_tail` に `no connections through the filtering proxy` があれば、エンジンがプロキシを
-  使っていない。同様に失敗として記録する
-
-異常があるサイトは失敗として記録し、プロキシを経由しないテンプレートや
-`--allow-unproxied-engine` に切り替えて撮り直さない。
-
-### 5.2 ネットワークを完全に遮断した環境での実行
-
-`--allow-unproxied-engine` を使えるのは、ネットワークを完全に遮断した環境（外部へ一切到達
-できないことを確認済みの環境）に限る。この環境ではサブリソースは取得されないが、
-`{html_path}` 用の HTML スナップショット取得も失敗するため `sites.json` の実サイトは
-`skipped` になる。したがって用途は、ローカルに用意した fixture によるパイプライン動作確認に
-限られ、`RENDER-5` の判定材料にはならない。まず `--dry-run` で展開後のコマンドを確認する。
+### 4.3 cli `screenshot` の入出力仕様
 
 ```bash
-OUT=/path/to/render-out
-SERVO_BIN=/path/to/servo-target/release/servo_embed_poc
-
-# ネットワークを完全に遮断した環境でのみ実行すること
-python3 harness/render-screenshot/capture_screenshots.py \
-  --out-dir "$OUT" \
-  --engines servo,chromium \
-  --servo-cmd "[\"$SERVO_BIN\", \"{html_path}\", \"{out}\"]" \
-  --allow-unproxied-engine \
-  --dry-run
+fandhe-browser screenshot [--profile-dir D] <URL> <OUTPUT>
 ```
 
-主な引数（正本は README の「CLI 引数」）:
+- URL は `http` / `https` のみ。IP リテラルと `localhost` の loopback は拒否する。
+  DNS 名の解決先は検査しない（既知の制約。`servo-host-design.md` §2.5・§13）。
+- 出力は 1280x800 固定。`sites.saved-pages.json` の viewport（1280x800）と一致する。
+- 上書きは拒否する（`create_new`）。ハーネスは撮影前に出力先を消すので問題にならない。
+- 両エンジンに**同じ URL**（`http://pages.test:<port>/<site_id>/index.html`）を渡す。旧方式の
+  「Servo はスナップショット HTML・Chromium は URL 直接」という入力条件の不一致は解消され、
+  結果 JSON の `captures[].input` は両エンジンとも `"url"` になる。
+  ただし保存の欠け（5.1 の 1）、JS の挙動、フォント、取得時刻差は残るので 7 章に記録する。
+
+## 5. 撮影
+
+### 5.1 手順（保存済みページ・`--network none` コンテナ）
+
+1. **ページを保存する（人間）**。保存の方法と基準は人間が決める（robots.txt・429 などで欠けた
+   場合の扱いを含む）。`<pages-root>/<site_id>/index.html` と、そのサブリソースを同じ
+   ディレクトリ配下に置く。サイト ID は `sites.saved-pages.json`（`sites.json` と同じ
+   `id`・`category`・`catalog_id`）に合わせる。**欠けたリソース**（取得できなかった URL、JS が
+   組み立てる URL）を記録しておく。保存ページはコミットしない。
+2. **イメージをビルドする**（リポジトリのルートで）。
+
+   ```bash
+   docker build -f harness/render-screenshot/container/Dockerfile \
+     -t fandhe-render-screenshot:local .
+   ```
+
+3. **展開結果を確認する**（`--dry-run`。コンテナの外でもよい。隔離確認とファイル作成はしない）。
+
+   ```bash
+   python3 harness/render-screenshot/capture_screenshots.py --saved-pages \
+     --out-dir "$(mktemp -d)" \
+     --servo-cmd '["fandhe-browser","screenshot","{url}","{out}"]' --dry-run
+   ```
+
+4. **隔離コンテナで実行する**。
+
+   ```bash
+   docker run --rm --network none \
+     --add-host pages.test:127.0.0.1 \
+     --read-only --tmpfs /tmp --tmpfs /home/measure \
+     --cap-drop ALL --security-opt no-new-privileges \
+     --memory 4g --pids-limit 512 --user measure \
+     -v "$PAGES_ROOT":/pages:ro -v "$OUT":/out \
+     fandhe-render-screenshot:local
+   ```
+
+   `OUT` は `measure` ユーザーが書き込める空のディレクトリ。entrypoint
+   （`container/run-in-container.sh`）は loopback の配信サーバー、隔離確認、撮影の順に実行する。
+   `--network none` のもとで `--add-host` が `/etc/hosts` に反映されない環境では、隔離確認の
+   `pages_host` 項目が fail-closed で検出して止まる。
+
+5. **結果を確認する**。`$OUT/capture-result.json` の `isolation.isolated == true` と各
+   `isolation.checks`（`interfaces`・`external_dns`・`external_ipv4`・`external_ipv6`・
+   `pages_host`・`loopback_pages`）がすべて ok であること。`captures[].status` と `stderr_tail`
+   で失敗要因を確認する。`$OUT/isolation-report.json` にも同じ確認の記録が残る。
+
+`egress_guard` はこのモードでは使わない（検証プロキシを起動しないため `proxy` キーも付かない）。
+隔離はコンテナのネットワーク名前空間の遮断を正とする。隔離確認に通らなければ、エンジンを
+1 つも起動せず終了コード 2 になる（記録として `captures: []` の結果 JSON を残す）。
+異常があるサイトは失敗として記録し、接続下に切り替えて撮り直さない。
+
+### 5.2 `/etc/hosts` の別名の運用と制約
+
+`--add-host pages.test:127.0.0.1` で別名を置き、両エンジンに `http://pages.test:<port>/...` を
+渡す。cli は IP リテラルと `localhost` の loopback を拒否するが、DNS 名の解決先は検査しない。
+この運用が通るのは**その既知の制約に依存しているため**で、隔離したコンテナの中でのみ使う。
+Issue #1003（出口の通信制御）の設計で cli が解決先を検査するようになれば、この運用は使えなくなる。
+そのときは本節と `--saved-pages` の URL 規則を見直す。cli・ハーネスに loopback を許す経路は
+作らない（#1003 とまとめて決める）。
+
+### 5.3 主な引数
+
+正本は README の「CLI 引数」。
 
 | 引数 | 用途 | 既定 |
 | ---- | ---- | ---- |
-| `--out-dir` | 出力先（必須）。`servo/` `chromium/` `snapshots/` と `capture-result.json` を作る | なし |
-| `--engines` | `servo,chromium`（RENDER-5 の判定には両方が必要） | `servo,chromium` |
-| `--servo-cmd` | Servo 側コマンドテンプレート（JSON 配列文字列。`{html_path}` `{url}` `{out}` `{width}` `{height}` `{proxy}` 等が使える） | なし（必須） |
-| `--chromium-bin` / `--chromium-cmd` | Chromium の実行ファイル / テンプレートの上書き | 自動検出 / 既定テンプレート |
-| `--timeout-sec` | 1 回の撮影のタイムアウト | 90 |
-| `--settle-ms` | 描画の待ち時間 | 5000 |
+| `--saved-pages` | 保存済みページモード（`pages.test` の http のみ許可・検証プロキシなし・撮影前に隔離確認） | 無効 |
+| `--allow-unproxied-engine` | `--saved-pages`（dry-run 以外）では必須。隔離が唯一の出口制御であることの利用者による明示 | 無効 |
+| `--out-dir` | 出力先（必須）。`servo/` `chromium/` と `capture-result.json` を作る | なし |
+| `--servo-cmd` | Servo 側コマンドテンプレート（JSON 配列文字列。`{url}` `{out}` 等。`{proxy}`・`{html_path}` は不可） | なし（必須） |
+| `--chromium-bin` / `--chromium-cmd` | Chromium の実行ファイル / テンプレートの上書き | 自動検出 / 保存済みページ用テンプレート |
+| `--timeout-sec` / `--settle-ms` | 撮影のタイムアウト / 描画の待ち時間 | 90 / 5000 |
 | `--min-sites` | 両エンジンで共通して `ok` になるべき最低サイト数 | 5 |
-| `--egress-guard` | 直接接続の検出対象（`servo`・`all`・`none`。Linux 専用） | `servo` |
-| `--allow-unproxied-engine` | `{proxy}` 無しのテンプレートを許可（ネットワークを完全に遮断した環境専用。接続下では使わない） | 無効 |
 
 終了コードは、両エンジンで共通して `ok` のサイト数が `--min-sites` 以上なら 0、未満なら 1、
-引数不正なら 2。`capture-result.json` の `captures[].status`（`ok` / `failed` / `timeout` /
-`skipped`）と `stderr_tail` で失敗要因を確認し、結果記録に残す。
+引数不正・隔離確認の不合格は 2。
 
 ## 6. SSIM・境界ボックスの算出（`measure_ssim.py`）
 
@@ -265,7 +201,7 @@ python3 harness/render-screenshot/measure_ssim.py \
 SSIM は Chromium を reference、Servo を target とした 7x7 一様窓の mean SSIM で、
 他ツール（scikit-image 等）の値とは一致しない可能性がある（README「SSIM の算出パラメータ」）。
 
-### 6.1 境界ボックスの入力（要判断）
+### 6.1 境界ボックスの入力
 
 `measure_ssim.py` は境界ボックスの**抽出**を行わない。エンジンごとに
 `$OUT/<engine>/<site_id>.bboxes.json`（`png_sha256`・`elements` を持つ。契約は README の
@@ -273,11 +209,11 @@ SSIM は Chromium を reference、Servo を target とした 7x7 一様窓の me
 
 - 1 サイトあたり主要要素 5〜10 件（Chromium 側が 5 件未満だと不合格）。要素の選定基準は未定。
 - Chromium 側は CDP の `DOM.getBoxModel` 等で取得できる見込みだが、取得スクリプトは本リポに無い。
-- Servo 側は、`servo-embed` に境界ボックスを出す API / 手段が無い（TASK-36 / TASK-38 の成果次第）。
+- Servo 側は、ホストの `bounding_box` を stdio で呼ぶ駆動スクリプトをハーネスに置く方針になった
+  （2026-10-27 の判断）。**そのスクリプトはまだ存在しない**（Issue #1281 の範囲外）。
 
-**境界ボックスの取得方法（Servo 側の手段、対象要素の選定基準）は未決定（オーナー判断待ち）**。
-取得できない間は SSIM のみを先に測定し、境界ボックスは「未測定」として記録する（合格を
-装わない。REPAIR-3）。
+存在しない間は、境界ボックスは「未測定」として記録し、SSIM のみを先に測定する
+（合格を装わない。REPAIR-3）。対象要素の選定基準は引き続きオーナー判断待ち。
 
 ## 7. 結果記録テンプレート
 
@@ -291,12 +227,23 @@ Issue #55 へ貼る。数値は `measure-result.json` から転記する。
 | 測定日 | YYYY-MM-DD |
 | OS / カーネル | |
 | CPU / メモリ | |
-| GL | llvmpipe（Mesa x.y.z） |
-| Chromium | バージョン |
-| Servo | 0.3.0（servo-embed 診断版。paint() 追加の有無: あり / なし。`--proxy` 差分: あり） |
+| GL | llvmpipe（Mesa x.y.z。ホストの /proc/<pid>/maps で確認した経路） |
+| Chromium | バージョン（`chromium --version`）/ DEBIAN_SNAPSHOT / CHROMIUM_VERSION |
+| Servo | servo-host（servo 0.6.0）+ cli の release ビルド / リポジトリのコミット |
+| イメージ | ダイジェスト（`docker image inspect --format '{{.Id}}'`） |
 | ハーネス | コミット（git rev-parse --short HEAD） |
-| 実行コマンド | capture_screenshots.py / measure_ssim.py の引数一式 |
+| 実行コマンド | docker run の引数一式 / EXTRA_ARGS / measure_ssim.py の引数 |
 | viewport / settle | 1280x800 / 5000ms |
+
+## 隔離
+
+- `isolation.isolated`: true / false
+- `isolation.checks`（interfaces・external_dns・external_ipv4・external_ipv6・pages_host・loopback_pages）: 結果
+
+## 保存したページ
+
+- 保存の方法と日付:
+- 欠けたリソース（robots.txt・429・JS が組み立てる URL など）:
 
 ## 結果
 
@@ -306,8 +253,7 @@ Issue #55 へ貼る。数値は `measure-result.json` から転記する。
 | ... | | | | | | |
 
 - 両基準を満たしたサイト数: N / 5（基準 5 以上）
-- 検証プロキシの結果（Servo の `proxy.allowed` / `proxy.denied` の有無と `denied_targets`、`egress_guard` の結果）: 記述
-- 入力条件の差（Servo: スナップショット HTML / Chromium: URL 直接。サブリソースの取得有無・取得時刻・`data:` origin の差を含む）の影響: 記述
+- 入力条件の差（両エンジンとも同じ URL。保存の欠け・JS・フォント・取得時刻差の影響）: 記述
 - 失敗・skipped のサイトと stderr_tail の要点: 記述
 - 境界ボックスの取得方法と要素選定: 記述（未測定の場合はその旨）
 

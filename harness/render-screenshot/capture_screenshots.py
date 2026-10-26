@@ -20,6 +20,19 @@
     `crates/fandhe-browser-render`（TASK-38 の本実装）や将来のスクリーンショット API
     には依存しない。本モジュールは Python 標準ライブラリのみで完結する
     （依存最小方針・Cargo.toml には触れない）。
+
+保存済みページモード（`--saved-pages`。Issue #1281・#55 のオーナー判断 2026-10-27）:
+    現行の `fandhe-browser-servo-host`（servo 0.6.0）は proxy 系の Preferences を
+    持たないため、検証プロキシ経由で実サイトを撮る従来経路は Servo では成り立たない。
+    代わりに、オフラインで保存したページを `docker run --network none` のコンテナ内
+    loopback HTTP サーバー（`serve_pages.py`）から配り、Servo（cli `screenshot`）と
+    Chromium の両方に同じ `http://pages.test:<port>/...` を渡して撮る。
+    隔離は撮影直前に `isolation_check.py` をプロセス内で実行して確かめ、不合格なら
+    エンジンを 1 つも起動しない（fail-closed。外部レポートファイルは信用しない）。
+    `pages.test` は `/etc/hosts` の別名で 127.0.0.1 に向ける運用で、cli が DNS 名の
+    解決先を検査しない既知の制約（`servo-host-design.md` §2.5・§13）に依存する。
+    #1003（出口の通信制御）で cli が解決先を検査するようになれば使えなくなるため、
+    cli・ハーネスに loopback を許す経路は作らない（#1003 とまとめて決める）。
 """
 
 from __future__ import annotations
@@ -55,6 +68,7 @@ from typing import Any
 from urllib.parse import urljoin, urlparse
 
 import egress_guard
+import isolation_check
 
 # --- 定数 -------------------------------------------------------------
 
@@ -172,6 +186,29 @@ DEFAULT_CHROMIUM_TEMPLATE = [
     "{url}",
 ]
 
+# 保存済みページモード（`--saved-pages`。Issue #1281）の固定値。ホスト名は引数で
+# 変えさせない（任意ホストへの http 到達を許す SSRF 経路を作らないため）。
+SAVED_PAGES_HOST = "pages.test"
+SAVED_PAGES_MIN_PORT = 1024
+SAVED_PAGES_MAX_PORT = 65535
+SAVED_PAGES_MODE_NAME = "saved-pages"
+DEFAULT_SAVED_PAGES_SITES = Path(__file__).resolve().parent / "sites.saved-pages.json"
+
+# 保存済みページモードの Chromium 既定テンプレート。`DEFAULT_CHROMIUM_TEMPLATE` から
+# 検証プロキシ向けの 2 引数（`--proxy-server`・`--proxy-bypass-list`）を除く。検証
+# プロキシは loopback と 80/443 以外のポートを拒否するため、このモードでは使えない。
+# `--no-sandbox` を明示で足すのは、コンテナ内で非 root 実行かつユーザー名前空間が
+# 使えず Chromium のサンドボックスが起動できないため。正当化の根拠は
+# `--network none`・非 root・`--cap-drop ALL`・ページを読み取り専用でマウントする
+# 隔離コンテナの運用（README・RUNBOOK）にあり、このテンプレート以外へは広げない。
+# UA 上書きや anti-bot 回避のフラグは付けない（SEC 系）。
+SAVED_PAGES_CHROMIUM_TEMPLATE = [
+    arg
+    for arg in DEFAULT_CHROMIUM_TEMPLATE
+    if arg not in ("--proxy-server={proxy}", "--proxy-bypass-list=<-loopback>")
+]
+SAVED_PAGES_CHROMIUM_TEMPLATE.insert(SAVED_PAGES_CHROMIUM_TEMPLATE.index("--no-first-run"), "--no-sandbox")
+
 # `{url}` を直接エンジンへ渡す直接ナビゲーション経路（既定 Chromium テンプレート等）で
 # 許可する URL の固定リスト（codex P0）。`_check_public_host` はエンジン起動前の
 # 一時点の名前解決に基づくベストエフォートに過ぎず、別プロセスのブラウザが公開
@@ -237,8 +274,38 @@ class Site:
 # --- サイト一覧の読み込み・検証 -----------------------------------------
 
 
+def check_saved_pages_url(url: str) -> str:
+    """保存済みページモードの URL 規則を検証し、origin（`http://pages.test:<port>`）を返す。
+
+    `load_sites(url_policy="saved-pages")` と `capture_one` の多層防御の両方から呼ばれる。
+    `http` かつホストが `pages.test` と完全一致し、1024〜65535 のポートが明示され、
+    userinfo を含まないものだけを許す。違反は `SiteListError`（fail-closed）。
+    """
+    try:
+        parsed = urlparse(url)
+        port = parsed.port
+    except ValueError as exc:
+        raise SiteListError(f"invalid saved-pages URL: {url}: {exc}") from exc
+    if parsed.scheme != "http":
+        raise SiteListError(f"saved-pages URL must use http: {url}")
+    if parsed.hostname != SAVED_PAGES_HOST:
+        raise SiteListError(f"saved-pages URL host must be exactly {SAVED_PAGES_HOST}: {url}")
+    if parsed.username is not None or parsed.password is not None or "@" in parsed.netloc:
+        raise SiteListError(f"saved-pages URL must not contain userinfo: {url}")
+    if port is None or not (SAVED_PAGES_MIN_PORT <= port <= SAVED_PAGES_MAX_PORT):
+        raise SiteListError(
+            f"saved-pages URL needs an explicit port in [{SAVED_PAGES_MIN_PORT}, "
+            f"{SAVED_PAGES_MAX_PORT}]: {url}"
+        )
+    return f"http://{SAVED_PAGES_HOST}:{port}"
+
+
 def load_sites(
-    path: Path, min_sites: int, *, allow_file_url: bool = False
+    path: Path,
+    min_sites: int,
+    *,
+    allow_file_url: bool = False,
+    url_policy: str = "https",
 ) -> tuple[dict[str, Any], list[Site]]:
     """サイト一覧 JSON を読み込み、検証済みの `Site` 一覧を返す。
 
@@ -258,7 +325,15 @@ def load_sites(
     （`stat` と実際の読み込みの間にファイルが差し替えられて大きくなる
     TOCTOU にも fail-closed に対応できるよう、確認だけでなく読み込み量にも
     上限を課す）。
+
+    `url_policy="saved-pages"`（`--saved-pages`。Issue #1281）では https の代わりに
+    `check_saved_pages_url` の規則（`http://pages.test:<port>`・全サイト同一 origin）を
+    課し、`allow_file_url` を指定していても `file:` は拒否する。既定の `"https"` は
+    従来の挙動のまま。
     """
+    if url_policy not in ("https", SAVED_PAGES_MODE_NAME):
+        raise SiteListError(f"unknown url_policy: {url_policy}")
+    saved_pages_origins: set[str] = set()
     try:
         file_size = path.stat().st_size
     except OSError as exc:
@@ -341,7 +416,9 @@ def load_sites(
         if not isinstance(url, str) or not url:
             raise SiteListError(f"sites[{index}].url is missing or empty")
         parsed = urlparse(url)
-        if parsed.scheme == "file" and allow_file_url:
+        if url_policy == SAVED_PAGES_MODE_NAME:
+            saved_pages_origins.add(check_saved_pages_url(url))
+        elif parsed.scheme == "file" and allow_file_url:
             pass
         elif parsed.scheme != "https":
             raise SiteListError(f"sites[{index}].url must use https: {url}")
@@ -350,6 +427,12 @@ def load_sites(
         if not isinstance(catalog_id, str) or not catalog_id:
             raise SiteListError(f"sites[{index}].catalog_id is missing or empty")
         sites.append(Site(site_id=site_id, url=url, category=category, catalog_id=catalog_id))
+
+    if len(saved_pages_origins) > 1:
+        # 1 つのサーバー（`serve_pages.py`）から配る前提のため origin の混在は拒否する。
+        raise SiteListError(
+            f"saved-pages sites must share a single origin: {sorted(saved_pages_origins)}"
+        )
 
     return {"width": width, "height": height}, sites
 
@@ -1633,6 +1716,7 @@ def capture_one(
     allow_unproxied_engine: bool = False,
     proxy_audit: ProxyAudit | None = None,
     egress_guard_mode: str = "none",
+    saved_pages: bool = False,
 ) -> dict[str, Any]:
     """1 サイト × 1 エンジンの撮影を実行し、結果レコード（dict）を返す。
 
@@ -1653,6 +1737,12 @@ def capture_one(
     使わなかった場合、または `egress_guard_mode` の対象エンジンが検証プロキシ以外へ
     直接接続した場合（Linux のみ。`egress_guard.py`）は PNG が出ていても `failed` にする（fail-closed。RENDER-5 /
     TASK-37。一部だけ迂回するケースは検出できない）。
+
+    `saved_pages=True`（`--saved-pages`。Issue #1281）では `{url}` の直接ナビゲーション
+    検査を `pages.test` 完全一致の規則（`check_saved_pages_url`）に置き換える。
+    `_check_public_host` と `DIRECT_NAVIGATION_ALLOWED_URLS` はここでは使わない
+    （隔離コンテナ内の loopback 宛が前提のため）。`saved_pages=False` では従来どおりで、
+    `http://pages.test` は `unsupported scheme` で skipped になる。
     """
     out_path = out_dir / engine / f"{site.site_id}.png"
     # `resolve()` した出力先が out-dir 配下にあることを確認する（パストラバーサル対策）。
@@ -1665,6 +1755,10 @@ def capture_one(
     needs_user_data_dir = template_uses(template, "user_data_dir")
     needs_chromium_bin = template_uses(template, "chromium_bin")
     needs_proxy = template_uses(template, "proxy")
+    if saved_pages and (needs_html or needs_proxy):
+        # 多層防御: `main` が先に弾くが、直接呼ばれても保存済みページモードで
+        # 検証プロキシ・スナップショット取得（https 専用）を使わせない。
+        raise CaptureError("saved-pages mode forbids {proxy} and {html_path} templates")
 
     values: dict[str, str] = {
         "url": site.url,
@@ -1815,7 +1909,12 @@ def capture_one(
             # `{html_path}` のみを使うテンプレートに回す（REPAIR-3）。
             parsed_url = urlparse(site.url)
             try:
-                if parsed_url.scheme == "https":
+                if saved_pages:
+                    try:
+                        check_saved_pages_url(site.url)
+                    except SiteListError as exc:
+                        raise SnapshotError(str(exc)) from exc
+                elif parsed_url.scheme == "https":
                     _check_public_host(parsed_url.hostname, context=f"direct navigation URL {site.url}")
                     if site.url not in DIRECT_NAVIGATION_ALLOWED_URLS:
                         raise SnapshotError(
@@ -2051,6 +2150,8 @@ def write_result(
     sites: list[Site],
     captures: list[dict[str, Any]],
     partial: bool,
+    mode: str | None = None,
+    isolation: dict[str, Any] | None = None,
 ) -> Path:
     """撮影結果を `<out-dir>/capture-result.json` へ書き出す（#54 の入力契約）。
 
@@ -2076,6 +2177,11 @@ def write_result(
     }
     if partial:
         payload["partial"] = True
+    if mode is not None:
+        # 保存済みページモード（Issue #1281）のみ。schema_version は 1 のままキーを追加する。
+        payload["mode"] = mode
+    if isolation is not None:
+        payload["isolation"] = isolation
     text = json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
     try:
         _write_bytes_nofollow(result_path, text.encode("utf-8"))
@@ -2146,8 +2252,21 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--sites",
         type=Path,
-        default=Path(__file__).resolve().parent / "sites.json",
-        help="Path to the sites list JSON (default: sites.json next to this script).",
+        default=None,
+        help=(
+            "Path to the sites list JSON (default: sites.json next to this script, "
+            "or sites.saved-pages.json with --saved-pages)."
+        ),
+    )
+    parser.add_argument(
+        "--saved-pages",
+        action="store_true",
+        help=(
+            "Saved-pages mode (Issue #1281): capture pages served from loopback as "
+            "http://pages.test:<port>/... inside a --network none container, without the "
+            "filtering proxy. Requires --allow-unproxied-engine and a passing in-process "
+            "isolation check before any engine is launched."
+        ),
     )
     parser.add_argument("--out-dir", type=Path, required=True, help="Output directory.")
     parser.add_argument(
@@ -2246,6 +2365,8 @@ def main(argv: list[str] | None = None) -> int:
                 templates["chromium"] = _parse_command_template(
                     args.chromium_cmd, arg_name="--chromium-cmd"
                 )
+            elif args.saved_pages:
+                templates["chromium"] = list(SAVED_PAGES_CHROMIUM_TEMPLATE)
             else:
                 templates["chromium"] = list(DEFAULT_CHROMIUM_TEMPLATE)
 
@@ -2253,7 +2374,36 @@ def main(argv: list[str] | None = None) -> int:
         if unknown_engines:
             raise CaptureError(f"unknown engine(s): {', '.join(sorted(unknown_engines))}")
 
-        viewport, sites = load_sites(args.sites, args.min_sites, allow_file_url=args.allow_file_url)
+        if args.saved_pages:
+            # 保存済みページモードの制約（fail-closed）。検証プロキシは loopback と
+            # 80/443 以外を拒否するため `{proxy}` は成り立たず、`{html_path}` の
+            # スナップショット取得は https 専用。両エンジンに同じ URL を渡すのが目的なので
+            # `{url}` も必須。
+            for engine_name, template in templates.items():
+                if template_uses(template, "proxy") or template_uses(template, "html_path"):
+                    raise CaptureError(
+                        f"--saved-pages forbids {{proxy}} and {{html_path}} in the {engine_name} template"
+                    )
+                if not template_uses(template, "url"):
+                    raise CaptureError(
+                        f"--saved-pages requires {{url}} in the {engine_name} template "
+                        "(both engines must receive the same URL)"
+                    )
+            if not args.dry_run and not args.allow_unproxied_engine:
+                raise CaptureError(
+                    "--saved-pages without --dry-run requires --allow-unproxied-engine: the user "
+                    "must explicitly acknowledge that network isolation (docker --network none) "
+                    "is the only egress control"
+                )
+        sites_path: Path = args.sites or (
+            DEFAULT_SAVED_PAGES_SITES if args.saved_pages else Path(__file__).resolve().parent / "sites.json"
+        )
+        viewport, sites = load_sites(
+            sites_path,
+            args.min_sites,
+            allow_file_url=args.allow_file_url,
+            url_policy=SAVED_PAGES_MODE_NAME if args.saved_pages else "https",
+        )
     except CaptureError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
@@ -2280,7 +2430,35 @@ def main(argv: list[str] | None = None) -> int:
     proxy_server: _FilteringProxyServer | None = None
     proxy_thread: threading.Thread | None = None
     proxy_url: str | None = None
-    if not args.dry_run:
+    result_mode = SAVED_PAGES_MODE_NAME if args.saved_pages else None
+    isolation_report: dict[str, Any] | None = None
+    if args.saved_pages and not args.dry_run:
+        # 撮影前の隔離確認。外部レポートは読まずプロセス内で実行し、不合格ならエンジンを
+        # 1 つも起動しない（fail-closed）。記録として captures 空の結果 JSON を残す。
+        first_url = urlparse(sites[0].url)
+        isolation_report = isolation_check.run_isolation_check(
+            [site.url for site in sites], pages_host=SAVED_PAGES_HOST, pages_port=first_url.port or 80
+        )
+        if not isolation_report.get("isolated"):
+            print(
+                "error: network isolation check failed; refusing to launch any engine "
+                "(run inside `docker run --network none`, see RUNBOOK.md)",
+                file=sys.stderr,
+            )
+            try:
+                write_result(
+                    out_dir,
+                    viewport=viewport,
+                    sites=sites,
+                    captures=[],
+                    partial=True,
+                    mode=result_mode,
+                    isolation=isolation_report,
+                )
+            except CaptureError as exc:
+                print(f"error: {exc}", file=sys.stderr)
+            return 2
+    elif not args.dry_run:
         proxy_server, proxy_thread, proxy_url = start_filtering_proxy()
 
     # SIGTERM を Ctrl-C（SIGINT/KeyboardInterrupt）と同じ後片付け経路に合流させる
@@ -2317,6 +2495,7 @@ def main(argv: list[str] | None = None) -> int:
                         allow_unproxied_engine=args.allow_unproxied_engine,
                         proxy_audit=proxy_server.audit if proxy_server is not None else None,
                         egress_guard_mode=args.egress_guard,
+                        saved_pages=args.saved_pages,
                     )
                     captures.append(record)
         except CaptureError as exc:
@@ -2338,7 +2517,15 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     try:
-        write_result(out_dir, viewport=viewport, sites=sites, captures=captures, partial=len(engines) < 2)
+        write_result(
+            out_dir,
+            viewport=viewport,
+            sites=sites,
+            captures=captures,
+            partial=len(engines) < 2,
+            mode=result_mode,
+            isolation=isolation_report,
+        )
     except CaptureError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
