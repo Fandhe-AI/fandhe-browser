@@ -119,6 +119,24 @@ cat >"$STUB_DIR/curl" <<'STUB'
 # STUB_LOG があれば呼び出しごとの引数を追記する。
 [ -z "${STUB_LOG:-}" ] || echo "$*" >>"$STUB_LOG"
 [ -z "${STUB_SLEEP:-}" ] || sleep "$STUB_SLEEP"
+# STUB_V6_UNREACHABLE=1: --resolve の候補（カンマ区切り。同一キーは実 curl 同様に後勝ち）のうち
+# IPv6 は接続失敗とみなして飛ばし、最初に届いた候補を remote_ip にする。尽きたら curl_exit 7（MEAS-4・#1276）。
+if [ -n "${STUB_V6_UNREACHABLE:-}" ]; then
+  last=""
+  while [ $# -gt 0 ]; do
+    if [ "$1" = "--resolve" ]; then last="${2#*:*:}"; shift; fi
+    shift
+  done
+  ip=""
+  IFS=',' read -r -a cands <<<"$last"
+  for c in ${cands[@]+"${cands[@]}"}; do
+    case "$c" in "["*) continue ;; esac
+    ip="$c"; break
+  done
+  if [ -z "$ip" ]; then printf '000 0.250  '; exit 7; fi
+  printf '%s 0.250 %s %s' "${STUB_CODE:-200}" "$ip" "${STUB_REDIRECT:-}"
+  exit 0
+fi
 printf '%s 0.250 %s %s' "${STUB_CODE:-200}" "${STUB_IP:-93.184.216.34}" "${STUB_REDIRECT:-}"
 exit "${STUB_RC:-0}"
 STUB
@@ -130,7 +148,7 @@ cat >"$STUB_DIR/getent" <<'STUB'
 [ -z "${STUB_RESOLVE_PID:-}" ] || echo $$ >"$STUB_RESOLVE_PID"
 [ -z "${STUB_RESOLVE_SLEEP:-}" ] || exec sleep "$STUB_RESOLVE_SLEEP"
 [ -z "${STUB_RESOLVE_DELAY:-}" ] || sleep "$STUB_RESOLVE_DELAY"
-printf '%s      STREAM %s\n' "${STUB_RESOLVE_IP:-93.184.216.34}" "${2:-}"
+for ip in ${STUB_RESOLVE_IP:-93.184.216.34}; do printf '%s      STREAM %s\n' "$ip" "${2:-}"; done
 STUB
 chmod +x "$STUB_DIR/getent"
 write_tasks net "[$VALID,{\"id\":\"x2\",\"cat\":\"spa\",\"url\":\"https://example.org/\",\"selector\":\"h1\",\"kind\":\"text\"}]"
@@ -251,6 +269,26 @@ expect_contains "$(cat "$LOG")" "--resolve example.com:443:93.184.216.34" "dns p
 : >"$LOG"
 expect_exit "dns pin ipv6" 0 env PATH="$STUB_DIR:$PATH" STUB_LOG="$LOG" STUB_RESOLVE_IP=2606:4700::1 STUB_IP=2606:4700::1 bash "$CHECK" --tasks "$WORK/net.json" --out "$WORK/pin6.jsonl"
 expect_contains "$(cat "$LOG")" "--resolve example.com:443:[2606:4700::1]" "ipv6 pinned to validated ip"
+
+# MEAS-4・#1276: dual-stack は単一のカンマ連結 --resolve で渡し、IPv6 非到達でも IPv4 で到達できる
+: >"$LOG"
+expect_exit "dual-stack ipv6 unreachable" 0 env PATH="$STUB_DIR:$PATH" STUB_LOG="$LOG" STUB_V6_UNREACHABLE=1 STUB_RESOLVE_IP="2606:4700::1 93.184.216.34" bash "$CHECK" --tasks "$WORK/net.json" --out "$WORK/ds.jsonl"
+expect_eq "$(jq -r 'select(.id=="x1") | .reachable' "$WORK/ds.jsonl")" "true" "dual-stack reachable via ipv4"
+expect_eq "$(jq -r 'select(.id=="x1") | .curl_exit' "$WORK/ds.jsonl")" "0" "dual-stack curl_exit 0"
+expect_eq "$(head -n1 "$LOG" | grep -o -- '--resolve' | wc -l | tr -d ' ')" "1" "single --resolve per call"
+expect_contains "$(cat "$LOG")" "--resolve example.com:443:93.184.216.34,[2606:4700::1]" "comma joined ipv4 first"
+
+# IPv6 のみで非到達なら従来どおり到達不能（成功扱いにしない）
+: >"$LOG"
+expect_exit "ipv6 only unreachable" 0 env PATH="$STUB_DIR:$PATH" STUB_LOG="$LOG" STUB_V6_UNREACHABLE=1 STUB_RESOLVE_IP=2606:4700::1 bash "$CHECK" --tasks "$WORK/net.json" --out "$WORK/v6only.jsonl"
+expect_eq "$(jq -r 'select(.id=="x1") | .reachable' "$WORK/v6only.jsonl")" "false" "ipv6 only unreachable"
+expect_eq "$(jq -r 'select(.id=="x1") | .curl_exit' "$WORK/v6only.jsonl")" "7" "ipv6 only curl_exit 7"
+
+# dual-stack に非公開アドレスが混ざれば curl を呼ばず拒否（SSRF 対策の維持）
+: >"$LOG"
+expect_exit "dual-stack with private" 0 env PATH="$STUB_DIR:$PATH" STUB_LOG="$LOG" STUB_RESOLVE_IP="93.184.216.34 10.0.0.5" bash "$CHECK" --tasks "$WORK/net.json" --out "$WORK/dsp.jsonl"
+expect_eq "$(jq -r 'select(.id=="x1") | .blocked' "$WORK/dsp.jsonl")" "host resolves to a non-public address" "dual-stack private blocked"
+expect_eq "$(grep -c . "$LOG")" "0" "dual-stack private: curl not called"
 
 : >"$LOG"
 expect_exit "unresolvable host rejected" 0 env PATH="$STUB_DIR:$PATH" STUB_LOG="$LOG" STUB_RESOLVE_NONE=1 bash "$CHECK" --tasks "$WORK/net.json" --out "$WORK/nores.jsonl"

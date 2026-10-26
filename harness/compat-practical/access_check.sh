@@ -135,11 +135,12 @@ MAX_REDIRS=5
 #   リダイレクトを自前で最大 MAX_REDIRS 回追い、各ホップで url_check（scheme・ポート・内部名・IP リテラル）と
 #   DNS 解決後アドレスの公開判定を行う（SSRF 対策。curl -L は使わない）。解決できたときは
 #   --resolve で検証済み IPv4/IPv6 へ接続先を固定する（固定できないホストは取得前に拒否）。
+#   --resolve は同一 host:port への複数指定が後勝ちのため、全アドレスを 1 本のカンマ区切りで渡す（#1276・MEAS-4）。
 #   プロキシは --noproxy '*' で無効化し、curl の remote_ip も事後検証する。
 #   結果をグローバル F_CODE / F_RC / F_MS / F_BLOCKED（拒否理由。無ければ空）へ設定する。
 fetch_site() {
   local cur="$1" hop=0 host ips ip out rc code t rip loc ms reason remaining max_time
-  local pins=()
+  local pins=() v4s v6s
   F_CODE=0; F_RC=0; F_MS=0; F_BLOCKED=""
   while :; do
     # 全体期限（TOTAL_TIMEOUT）を超えたら以降の取得は行わず、記録だけ確定させる（curl_exit=28 は timeout 相当）
@@ -157,15 +158,22 @@ fetch_site() {
     if ! [[ "$host" =~ ^[0-9.]+$ ]]; then
       # DNS 解決にも全体期限の残り時間を上限としてかける（getent 等は curl の --max-time の対象外）
       ips="$(resolve_host_ips "$host" "$max_time")"
+      v4s="" v6s=""
       for ip in $ips; do
         if ! is_public_ip "$ip"; then
           F_BLOCKED="host resolves to a non-public address"; F_CODE=0; return 0
         fi
         case "$ip" in
-          *:*) pins+=(--resolve "$host:443:[$ip]") ;;
-          *) pins+=(--resolve "$host:443:$ip") ;;
+          *:*) v6s="${v6s:+$v6s,}[$ip]" ;;
+          *) v4s="${v4s:+$v4s,}$ip" ;;
         esac
       done
+      # curl は同一 host:port への --resolve 複数指定を後勝ちで置換する（#1276）ため、検証済みアドレスを
+      # 1 本のカンマ区切りにまとめる。IPv4 を先頭にし、IPv6 非到達環境でも IPv4 へ接続できるようにする
+      # （実際の試行順は curl が決める）。必要な curl は 7.59 以降。
+      if [ -n "$v4s$v6s" ]; then
+        pins=(--resolve "$host:443:${v4s}${v4s:+${v6s:+,}}${v6s}")
+      fi
       # 固定できるアドレスが無いホストは再解決による接続先すり替えを防げないため取得前に拒否する
       if [ "${#pins[@]}" -eq 0 ]; then
         if [ "$((TOTAL_TIMEOUT - SECONDS))" -le 0 ]; then
