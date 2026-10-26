@@ -43,6 +43,12 @@ python3 "${SCRIPT_DIR}/isolation_check.py" \
   --sites "${SCRIPT_DIR}/sites.saved-pages.json" \
   --report "${OUT_DIR}/isolation-report.json"
 
+# 待ち時間の非対称（RENDER-5 の比較上の注意）: Chromium は `--virtual-time-budget={settle_ms}` で
+# 指定時間ぶん仮想時間を進めるが、Servo 側の cli `screenshot` には待ち時間の指定口が無い。
+# Servo ホストは load 完了と最初のフレームを待ってから撮る（servo-host/src/page.rs の
+# `navigate`）。そのため EXTRA_ARGS の --settle-ms は Chromium にだけ効く。保存済みページは
+# ネットワーク待ちがなく静的に近いが、同条件の比較とは言えない。指定口の追加は
+# Servo ホストのプロトコル変更を伴うため別 Issue で扱う。
 SERVO_CMD="[\"${BIN_DIR}/fandhe-browser\",\"screenshot\",\"{url}\",\"{out}\"]"
 
 # EXTRA_ARGS は意図的に単語分割する（引数は呼び出し側が与える。eval は使わない）。

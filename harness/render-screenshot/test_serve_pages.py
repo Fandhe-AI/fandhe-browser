@@ -60,6 +60,49 @@ class ServePagesTest(unittest.TestCase):
         self.assertEqual(self._request("GET", "/site/"), (200, b"<p>hello</p>"))
         self.assertEqual(self._request("HEAD", "/site/index.html")[0], 200)
 
+    def _raw(self, method: str, path: str) -> http.client.HTTPResponse:
+        conn = http.client.HTTPConnection("127.0.0.1", self.server.server_address[1], timeout=5)
+        self.addCleanup(conn.close)
+        conn.request(method, path)
+        return conn.getresponse()
+
+    def test_directory_without_trailing_slash_redirects(self) -> None:
+        resp = self._raw("GET", "/site")
+        self.assertEqual((resp.status, resp.getheader("Location")), (301, "/site/"))
+        resp = self._raw("GET", "/site?x=1")
+        self.assertEqual((resp.status, resp.getheader("Location")), (301, "/site/?x=1"))
+
+    def test_redirect_never_becomes_scheme_relative(self) -> None:
+        resp = self._raw("GET", "//site")
+        self.assertEqual(resp.status, 301)
+        self.assertEqual(resp.getheader("Location"), "/site/")
+
+    def test_oversized_file_is_413_and_head_has_no_body(self) -> None:
+        (self.root / "big.bin").write_bytes(b"x" * 100)
+        original = sp.MAX_FILE_BYTES
+        sp.MAX_FILE_BYTES = 10
+        self.addCleanup(setattr, sp, "MAX_FILE_BYTES", original)
+        self.assertEqual(self._request("GET", "/big.bin")[0], 413)
+        self.assertEqual(self._request("HEAD", "/big.bin")[0], 413)
+        sp.MAX_FILE_BYTES = original
+        resp = self._raw("HEAD", "/big.bin")
+        self.assertEqual((resp.status, resp.getheader("Content-Length"), resp.read()), (200, "100", b""))
+
+    def test_large_file_is_streamed_in_chunks(self) -> None:
+        payload = b"abcdefgh" * (sp.CHUNK_BYTES // 4)
+        (self.root / "chunked.bin").write_bytes(payload)
+        self.assertEqual(self._request("GET", "/chunked.bin"), (200, payload))
+
+    def test_concurrency_limit_returns_503(self) -> None:
+        held = [sp._REQUEST_SLOTS.acquire(blocking=False) for _ in range(sp.MAX_CONCURRENT_REQUESTS)]
+        try:
+            self.assertEqual(self._request("GET", "/site/index.html")[0], 503)
+        finally:
+            for ok in held:
+                if ok:
+                    sp._REQUEST_SLOTS.release()
+        self.assertEqual(self._request("GET", "/site/index.html")[0], 200)
+
     def test_no_directory_listing(self) -> None:
         self.assertEqual(self._request("GET", "/empty/")[0], 404)
         self.assertEqual(self._request("GET", "/")[0], 404)
