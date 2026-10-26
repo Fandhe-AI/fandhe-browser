@@ -1312,8 +1312,8 @@ jobs:
     if: ${{ github.event_name != 'pull_request' && needs.changes.outputs.servo == 'true' }}
     runs-on: macos-latest
     # cache なしのコールドビルド。dev は workflow_dispatch の実測（最大 12.5 分。run 38842938258・38847207875）。
-    # release（約 20 分の見込み）を足したため暫定 45 分。workflow_dispatch の実測 × 約 1.5 で確定する（#1279）
-    timeout-minutes: 45
+    # release を足したジョブ全体の workflow_dispatch 実測 35.3 分（dev ビルド 10.8 分・release 23.9 分。run 40396545036）× 約 1.5（#1279）
+    timeout-minutes: 55
     permissions:
       contents: read
     env:
@@ -1423,8 +1423,8 @@ jobs:
     if: ${{ github.event_name != 'pull_request' && needs.changes.outputs.servo == 'true' }}
     runs-on: windows-latest
     # cache なしのコールドビルド。dev は workflow_dispatch の実測（34 分。ANGLE のビルドを含む。run 38847207875）。
-    # release（約 30〜35 分の見込み）を足したため暫定 100 分。workflow_dispatch の実測 × 約 1.5 で確定する（#1279）
-    timeout-minutes: 100
+    # release を足したジョブ全体の workflow_dispatch 実測 57.6 分（dev ビルド 21.1 分・release 27.9 分。run 40396545036）× 約 1.5（#1279）
+    timeout-minutes: 90
     permissions:
       contents: read
     defaults:
