@@ -224,9 +224,10 @@ jq 'map({id, cat, kind, success, error})' <PoC-9 の chromium_results.json>
 
 `results/access_check.jsonl` は `access_check.sh` の実測（手書きしていない）。
 
-- 実施日: 2026-10-03 / OS: Linux
-- 結果: 22 件中 20 件が到達可（a6 StackOverflow・d4 W3Schools は HTTP 403）
-- 出力形式の版: 同梱の `results/access_check.jsonl` のメタ行は `total_timeout_sec` 追加前の形式（版 1）で測定したもの。現行スクリプトの出力（上記の契約）には `total_timeout_sec` が加わる。再計測時に置き換える
+- 実施日: 2026-10-26（メタ行の `measured_at`。UTC）/ OS: Linux（IPv6 に届かない環境）/ スクリプト: main `8ca44ba`（#1276 の修正後）
+- 結果: 28 件中 26 件が到達可（a6 StackOverflow・d4 W3Schools は HTTP 403。2026-10-03 の 22 件の計測と同じ 2 件）。`curl_exit` は全件 0
+- 出力形式: メタ行に `total_timeout_sec` を含む現行の形式。`tasks_sha256` は 28 件の `tasks.json` と一致する
+- 前回（2026-10-03・22 件・`total_timeout_sec` 追加前の形式）の結果はこの計測で置き換えた
 - 到達可否はネットワーク環境と時期で変わる。再計測したら実施日と OS をここへ追記する
 
 ### core_results.jsonl（run_core.sh の実測）
@@ -256,8 +257,7 @@ jq 'map({id, cat, kind, success, error})' <PoC-9 の chromium_results.json>
 
 - 実施日: 2026-10-26 / OS: Linux / バイナリ: `cargo build --release -p fandhe-browser-cli`（main `7d602f6`）/ フラグ: `--page-js v8 --page-modules`
 - `results/core_results.jsonl` を 28 件の実測で置き換え、21/28。`results/matrix.json` を `make_matrix.sh` で再生成した。内訳は `REPORT.md`「28 サイト化の実測」、類型別は `type-report.md`
-- `results/access_check.jsonl` は更新していない: 実測環境が IPv6 に届かず、`access_check.sh` が dual-stack ホストで `curl_exit 7` となり 28 件中 16 件が到達不能と記録されて実態（`run_core.sh`・Chromium は到達できた）を表さないため。`access_check.sh` の IPv6 取り扱いは本変更の範囲外（原因は `--resolve` の複数指定が後勝ちで IPv4 候補が捨てられていたことで、#1276 で単一のカンマ区切り指定へ修正した。修正後の再計測は未実施で、IPv4 のみの環境での取り直しが必要）
-- 追加 6 件を含む `access_check.jsonl` の取り直しは、IPv6 に届く環境で行う
+- この時点では `results/access_check.jsonl` を更新しなかった: 実測環境が IPv6 に届かず、`access_check.sh` が dual-stack ホストで `curl_exit 7` となり 28 件中 16 件が到達不能と記録されて実態（`run_core.sh`・Chromium は到達できた）を表さなかったため。原因は `--resolve` の複数指定が後勝ちで IPv4 候補が捨てられていたことで、#1276 で単一のカンマ区切り指定へ修正し、同じ環境で 28 件を取り直した（上の「計測結果」。26/28）
 
 ### 2026-10-19 の再計測（#1119）
 

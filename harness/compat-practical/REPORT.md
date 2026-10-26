@@ -1708,7 +1708,7 @@ TASK-71.3 / MS-6 / `COMPAT-1`・`COMPAT-4`・`REPAIR-8`・`MEAS-4`（関連 `REP
 ### 追加分の制約
 
 - 追加 6 件は単一時点・1 回の実測。Chromium 参照の 6 件は PoC-9 の 22 件と時期・UA・Chromium の版が異なる（README「Chromium 参照データの出所」）
-- `access_check.sh` は実測環境（IPv6 に届かない）で 28 件中 16 件が `curl_exit 7` となり実態を表さないため、`results/access_check.jsonl` は更新していない（README「計測結果」）
+- `access_check.sh` は実測環境（IPv6 に届かない）で 28 件中 16 件が `curl_exit 7` となり実態を表さなかったため、この時点では `results/access_check.jsonl` を更新しなかった。#1276 の修正後に同じ環境で取り直し、26/28（a6・d4 が HTTP 403）となった（README「計測結果」）
 - c4 の Chromium 失敗は anti-bot によるもので、core 側の成功と合わせて比較条件が揃っていない
 
 ## 制約
