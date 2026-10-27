@@ -846,7 +846,7 @@ Chromium を `--headless=new --remote-debugging-pipe` で起動し、CDP で PNG
 
 ### 決定事項（オーナー判断 2026-10-27・#1288）
 
-1. 撮影時点: `Page.loadEventFired` -> `document.fonts.ready` -> `requestAnimationFrame` 1 回の後に撮る。
+1. 撮影時点: load（`Page.navigate` の `loaderId` に紐付く `Page.lifecycleEvent`）-> `document.fonts.ready` -> `requestAnimationFrame` 1 回の後に撮る。
    headless で rAF が期待どおり進むかは実機で未検証。
 2. `BBOX_SELECTORS` を指定した実行では、Chromium の SSIM 基準 PNG も CDP `Page.captureScreenshot` で撮る。
    `measure_ssim.py` は `png_sha256` で bbox と PNG を対応付けるため、bbox と同じセッションで撮る必要がある
@@ -892,7 +892,7 @@ python3 harness/render-screenshot/chromium_bbox_driver.py --chromium-bin /usr/bi
 ### CDP の手順
 
 `Browser.getVersion` -> `Target.getTargets`（page がちょうど 1 件）-> `Target.attachToTarget`（`flatten`）->
-`Page.enable` -> `Page.navigate`（`Page.loadEventFired` を待つ。届かなければ `document.readyState` で確認）->
+`Page.enable` -> `Page.setLifecycleEventsEnabled` -> `Page.navigate`（返った `loaderId` の `Page.lifecycleEvent`（name=load）を待つ。届かなければ `document.readyState` で確認）->
 `document.fonts.ready` と rAF の待ち -> `Page.captureScreenshot`（PNG。寸法を要求値と照合）-> 要素ごとの
 `Runtime.evaluate` -> `Target.getTargetInfo`（最終 URL が一致したかの真偽値だけ記録）-> `Browser.close`。
 page レベルの要求・応答・イベントは `sessionId` で照合する。pipe の向き（Chromium は fd 3 から読み fd 4 へ書く。

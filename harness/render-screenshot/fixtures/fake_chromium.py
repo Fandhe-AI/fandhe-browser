@@ -110,20 +110,25 @@ def main() -> int:
                 win["width"] = params["bounds"]["width"]
                 win["height"] = params["bounds"]["height"]
             reply["result"] = {}
+        elif method == "Page.setLifecycleEventsEnabled":
+            reply["result"] = {}
         elif method == "Page.enable":
             reply["result"] = {}
+            if scenario == "stale_load":
+                # 初期 about:blank の古い load が受信キューに残る状況を模す。
+                events.append({"method": "Page.lifecycleEvent", "params": {"name": "load", "loaderId": "OLD"}, "sessionId": SESSION})
             if scenario == "event_flood":
                 for _ in range(2000):
                     events.append({"method": "Page.frameStartedLoading", "params": {}, "sessionId": SESSION})
         elif method == "Page.navigate":
             navigated_url = params["url"]
-            reply["result"] = {"frameId": "F"}
+            reply["result"] = {"frameId": "F", "loaderId": "L1"}
             if scenario == "navigate_error":
                 reply["result"]["errorText"] = "net::ERR_FAILED"
             elif scenario == "target_crashed":
                 events.append({"method": "Inspector.targetCrashed", "params": {}, "sessionId": SESSION})
-            elif scenario != "no_load_event":
-                events.append({"method": "Page.loadEventFired", "params": {"timestamp": 1.0}, "sessionId": SESSION})
+            elif scenario not in ("no_load_event", "stale_load"):
+                events.append({"method": "Page.lifecycleEvent", "params": {"name": "load", "loaderId": "L1"}, "sessionId": SESSION})
         elif method == "Runtime.evaluate":
             expr = params["expression"]
             if "document.fonts.ready" in expr:

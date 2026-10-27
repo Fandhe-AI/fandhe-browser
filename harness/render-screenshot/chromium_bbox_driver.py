@@ -17,7 +17,7 @@
     - 単体でも実行できる（`--assume-isolated` が必須）。使い方・信頼境界は README「`chromium_bbox_driver.py`」。
 
 撮影時点（オーナー判断 2026-10-27）:
-    `Page.loadEventFired` -> `document.fonts.ready` -> `requestAnimationFrame` 1 回の後に撮る。
+    load（`Page.navigate` の `loaderId` に紐付く `Page.lifecycleEvent`）-> `document.fonts.ready` -> `requestAnimationFrame` 1 回の後に撮る。
 
 座標の意味論:
     Servo ホストと同じ JS 関数式（`servo-host/src/layout.rs` の `selector_prelude!()` +
@@ -159,6 +159,11 @@ def _make_child_setup(read_fd: int, write_fd: int):
         high_w = fcntl.fcntl(write_fd, fcntl.F_DUPFD, 10)
         os.dup2(high_r, 3)
         os.dup2(high_w, 4)
+        # F_DUPFD の複製は close-on-exec でない。残すと Chromium が自分の読む pipe の書き込み端を
+        # 保持して EOF にならないため閉じる（元の fd は os.pipe 由来の非継承で exec 時に閉じる）。
+        for fd in (high_r, high_w):
+            if fd not in (3, 4):
+                os.close(fd)
 
     return setup
 
@@ -182,7 +187,7 @@ class CdpChannel:
         self.max_message = RESPONSE_MESSAGE_MAX
         self.next_id = 1
         self.session: str | None = None
-        self.load_seen = False
+        self.loaded_loaders: set[str] = set()
         self._thread = threading.Thread(target=self._read_loop, daemon=True)
         self._thread.start()
 
@@ -281,8 +286,11 @@ class CdpChannel:
             raise svd.HostError("chromium sent a message that is neither a response nor an event")
         mine = self.session is not None and message.get("sessionId") == self.session
         params = message.get("params")
-        if method == "Page.loadEventFired" and mine:
-            self.load_seen = True
+        if method == "Page.lifecycleEvent" and mine and isinstance(params, dict):
+            # load 完了は loaderId で対象ナビゲーションに紐付ける（about:blank の古いイベントと区別する）。
+            loader = params.get("loaderId")
+            if params.get("name") == "load" and isinstance(loader, str) and len(self.loaded_loaders) < 1024:
+                self.loaded_loaders.add(loader)
         elif method == "Inspector.targetCrashed" and mine:
             raise svd.HostError("the page crashed")
         elif method == "Target.detachedFromTarget" and isinstance(params, dict) and (
@@ -341,10 +349,10 @@ class CdpChannel:
                 raise svd.HostError(f"{method}: result must be an object")
             return result
 
-    def wait_for_load(self, timeout: float) -> bool:
-        """`Page.loadEventFired` を待つ。届かなければ False（呼び出し側が readyState で確認する）。"""
+    def wait_for_load(self, loader_id: str, timeout: float) -> bool:
+        """`loader_id` の `Page.lifecycleEvent`（name=load）を待つ。届かなければ False（呼び出し側が readyState で確認する）。"""
         deadline = time.monotonic() + timeout
-        while not self.load_seen:
+        while loader_id not in self.loaded_loaders:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 return False
@@ -510,17 +518,20 @@ def drive(
         raise svd.HostError("Target.attachToTarget: sessionId must be a non-empty string")
     chan.session = session
     chan.call("Page.enable", timeout=startup, session=True)
+    chan.call("Page.setLifecycleEventsEnabled", {"enabled": True}, timeout=startup, session=True)
     fit_viewport_to_window_size(chan, target_id, width, height, startup)
 
     load_wait = (DEFAULT_LOAD_TIMEOUT_MS if load_timeout_ms is None else load_timeout_ms) / 1000 + TIMEOUT_SLACK_S
-    chan.load_seen = False
     try:
         navigated = chan.call("Page.navigate", {"url": url}, timeout=load_wait, session=True)
     except CdpRpcError as exc:
         raise svd.HostError(f"navigate failed: {exc}") from exc
     if "errorText" in navigated:
         raise svd.HostError("navigate failed: the page could not be loaded")
-    if not chan.wait_for_load(load_wait):
+    loader_id = navigated.get("loaderId")
+    if not isinstance(loader_id, str) or not loader_id:
+        raise svd.HostError("navigate failed: loaderId is missing")
+    if not chan.wait_for_load(loader_id, load_wait):
         if evaluate(chan, READY_STATE_EXPR, QUERY_TIMEOUT_S + TIMEOUT_SLACK_S) is not True:
             raise svd.HostError("timed out waiting for the load event")
 

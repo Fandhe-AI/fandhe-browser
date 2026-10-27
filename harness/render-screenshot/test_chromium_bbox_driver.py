@@ -116,6 +116,7 @@ class OkScenarioTest(DriverCase):
                 "Target.getTargets",
                 "Target.attachToTarget",
                 "Page.enable",
+                "Page.setLifecycleEventsEnabled",
                 "Page.getLayoutMetrics",
                 "Browser.getWindowForTarget",
                 "Browser.setWindowBounds",
@@ -131,16 +132,16 @@ class OkScenarioTest(DriverCase):
         )
         self.assertEqual(reqs[2]["params"], {"targetId": "TARGET-1", "flatten": True})
         # 外枠 1280x800 に対しビューポートは高さ 85 少ない。差分だけ外枠を広げる。
-        self.assertEqual(reqs[5]["params"], {"targetId": "TARGET-1"})
+        self.assertEqual(reqs[6]["params"], {"targetId": "TARGET-1"})
         self.assertEqual(
-            reqs[6]["params"],
+            reqs[7]["params"],
             {"windowId": 7, "bounds": {"windowState": "normal", "width": 1280, "height": 885}},
         )
-        self.assertEqual(reqs[8]["params"], {"url": URL})
-        self.assertEqual(reqs[9]["params"]["expression"], drv.FONTS_AND_FRAME_EXPR)
-        self.assertTrue(reqs[9]["params"]["awaitPromise"])
+        self.assertEqual(reqs[9]["params"], {"url": URL})
+        self.assertEqual(reqs[10]["params"]["expression"], drv.FONTS_AND_FRAME_EXPR)
+        self.assertTrue(reqs[10]["params"]["awaitPromise"])
         self.assertEqual(
-            reqs[10]["params"], {"format": "png", "captureBeyondViewport": False, "fromSurface": True}
+            reqs[11]["params"], {"format": "png", "captureBeyondViewport": False, "fromSurface": True}
         )
         # browser レベルには sessionId が無く、page レベルには付く。
         for r in reqs:
@@ -152,8 +153,8 @@ class OkScenarioTest(DriverCase):
             else:
                 self.assertEqual(r["sessionId"], "SESSION-1")
         # セレクタは JSON 文字列リテラルとしてだけ埋め込まれる。
-        self.assertEqual(reqs[11]["params"]["expression"], drv.BOUNDING_BOX_FN + '("body > header")')
-        self.assertEqual(reqs[12]["params"]["expression"], drv.BOUNDING_BOX_FN + '("main")')
+        self.assertEqual(reqs[12]["params"]["expression"], drv.BOUNDING_BOX_FN + '("body > header")')
+        self.assertEqual(reqs[13]["params"]["expression"], drv.BOUNDING_BOX_FN + '("main")')
         bbox_path = svd.bbox_path_for(self.out)
         self.assertEqual(bbox_path.name, "site-a.bboxes.json")
         loaded = ms.load_bboxes(bbox_path)
@@ -195,7 +196,7 @@ class OkScenarioTest(DriverCase):
         self.assertEqual(
             methods,
             {
-                "Browser.getVersion", "Target.getTargets", "Target.attachToTarget", "Page.enable", "Page.navigate",
+                "Browser.getVersion", "Target.getTargets", "Target.attachToTarget", "Page.enable", "Page.setLifecycleEventsEnabled", "Page.navigate",
                 "Page.getLayoutMetrics", "Browser.getWindowForTarget", "Browser.setWindowBounds", "Runtime.evaluate", "Page.captureScreenshot", "Target.getTargetInfo", "Browser.close",
             },
         )
@@ -258,6 +259,9 @@ class FailureScenarioTest(DriverCase):
 
     def test_no_load_event_falls_back_to_ready_state_and_fails(self) -> None:
         self.assertFails("no_load_event", "load event")
+
+    def test_stale_load_event_from_previous_document_is_not_accepted(self) -> None:
+        self.assertFails("stale_load", "load event")
 
     def test_eval_exception(self) -> None:
         self.assertFails("eval_exception", "exception")

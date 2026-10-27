@@ -215,7 +215,7 @@ SSIM は Chromium を reference、Servo を target とした 7x7 一様窓の me
   PNG と `bboxes.json` を書く。使い方・信頼境界は README「`chromium_bbox_driver.py`」。座標は Servo と同じ
   JS 関数式（`querySelector` の最初の一致・`getBoundingClientRect`・ビューポート相対の CSS px）で取る。
   偽 Chromium でのオフライン検証のみで、**実機（実 Chromium・実コンテナ）では未検証**。
-  オーナー判断（2026-10-27）: (1) 撮影時点は `Page.loadEventFired` -> `document.fonts.ready` -> rAF 1 回の後、
+  オーナー判断（2026-10-27）: (1) 撮影時点は load（`Page.navigate` の `loaderId` に紐付く `Page.lifecycleEvent`）-> `document.fonts.ready` -> rAF 1 回の後、
   (2) `BBOX_SELECTORS` 指定時は Chromium の SSIM 基準 PNG も CDP `Page.captureScreenshot` で撮る
   （`png_sha256` の契約に合わせ bbox と同じセッションで撮る）、(3) 対象要素は #55 のコメントで採用したセレクタ。
 - Servo 側は `servo_bbox_driver.py`（Issue #1282）が、ホストの `bounding_box` を stdio で呼んで
