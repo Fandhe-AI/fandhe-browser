@@ -597,9 +597,8 @@ python3 harness/render-screenshot/measure_ssim.py \
 
 ### 境界ボックスの入力契約（範囲外: 抽出処理そのもの）
 
-境界ボックスの**抽出**（Chromium の CDP `DOM.getBoxModel` 等・Servo 側の API）は
-本スクリプトの範囲外である。Servo 側は `servo_bbox_driver.py`（下記。Issue #1282）が書く。
-Chromium 側は未定。
+境界ボックスの**抽出**は本スクリプトの範囲外である。Servo 側は `servo_bbox_driver.py`
+（下記。Issue #1282）が、Chromium 側は `chromium_bbox_driver.py`（下記。Issue #1288）が書く。
 本スクリプトはエンジンごとの**入力契約**だけを定義する:
 `<capture-dir>/<engine>/<site_id>.bboxes.json`
 
@@ -788,7 +787,7 @@ python3 harness/render-screenshot/servo_bbox_driver.py --host-bin <host> --selec
 ```
 
 上記は書式の例であり、**対象要素の選定の根拠ではない**（選定基準は #55 でオーナーが決める。
-実際のリストはコミットしない）。`site_id` は将来 Chromium 側の抽出で同じファイルを共有できるよう
+実際のリストはコミットしない）。`site_id` は Chromium 側の `chromium_bbox_driver.py` が同じファイルを共有できるよう
 キーにしてある。制約: ファイル 1 MiB 以下・サイト 50 件以下・要素は 100 件以下、`id` は
 `measure_ssim.py` の規則（`^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$`・サイト内で一意）、`selector` は
 1〜1024 UTF-8 バイトで制御文字・U+2028・U+2029 を含まない（ホストの検証と同じ規則を先に適用）。
@@ -827,25 +826,122 @@ python3 harness/render-screenshot/servo_bbox_driver.py --host-bin <host> --selec
 
 ### 申し送り
 
-- Chromium 側の bbox 抽出（CDP `DOM.getBoxModel` 等）と、対象要素の選定は本スクリプトの範囲外（#55）
+- Chromium 側の bbox 抽出は `chromium_bbox_driver.py`（#1288）。対象要素の選定は本スクリプトの範囲外（#55）
 - 最悪ケースの所要時間は、各 RPC で `TIMEOUT_SLACK_S`（5 秒）を余分に待つため、
   hello 10 秒 + load 35 秒 + screenshot 25 秒 + 要素 x 10 秒 + shutdown 8 秒（= 78 秒 + 要素数 x 10 秒）で、
   `capture_screenshots.py` の既定 `--timeout-sec`（90 秒）を超え得る。コンテナの `BBOX_SELECTORS` 指定時は
-  `--timeout-sec 300`（20 要素まで）を既定で付ける。要素が多い場合は `EXTRA_ARGS` で上書きする
+  `--timeout-sec 420`（Servo 側は 20 要素超、Chromium 側は 21 要素まで）を既定で付ける。要素が多い場合は `EXTRA_ARGS` で上書きする
 - セレクタ入力に `site_id` が無いサイトは PNG のみを書き、bbox JSON を出さない（空の bbox JSON は
   計測済みの 0 要素と読まれ一致率 0% になるため。`measure_ssim.py` は not_measured として扱う）
+
+## `chromium_bbox_driver.py`: Chromium 側の境界ボックス取得（Issue #1288・TASK-37・`RENDER-5`・`MEAS-3`）
+
+Chromium を `--headless=new --remote-debugging-pipe` で起動し、CDP で PNG と境界ボックス JSON を
+書く駆動スクリプト。`servo_bbox_driver.py` と対になる reference 側の取得手段で、#55 の合否にある
+「主要要素の 80% 以上が Chromium 側の位置から ±5% 以内」の比較を成り立たせる。標準ライブラリのみで動く。
+
+**状態**: 偽 Chromium（`fixtures/fake_chromium.py`）によるオフライン検証のみ。実 Chromium・実コンテナ・
+実 Servo ホストとの組での動作は未検証（#55 で人間が行う。`REPAIR-3`）。POSIX のみ（pipe の fd 3・4
+を使う。測定はコンテナ＝Linux で行う。非 POSIX は終了コード 2）。
+
+### 決定事項（オーナー判断 2026-10-27・#1288）
+
+1. 撮影時点: `Page.loadEventFired` -> `document.fonts.ready` -> `requestAnimationFrame` 1 回の後に撮る。
+   headless で rAF が期待どおり進むかは実機で未検証。
+2. `BBOX_SELECTORS` を指定した実行では、Chromium の SSIM 基準 PNG も CDP `Page.captureScreenshot` で撮る。
+   `measure_ssim.py` は `png_sha256` で bbox と PNG を対応付けるため、bbox と同じセッションで撮る必要がある
+   （`--screenshot` の別撮影とは紐付けられない）。`BBOX_SELECTORS` 未指定の実行は従来どおり `--screenshot`。
+3. 対象要素は #55 のコメントで採用したセレクタ（6 サイト・41 要素）。セレクタファイルはコミットしない。
+   `servo_bbox_driver.py` と同じファイルを共有する（`load_selectors` を再利用）。
+
+### 座標の意味論（Servo 側と揃える）
+
+`servo-host/src/layout.rs` の `selector_prelude!()` + `BOUNDING_BOX_FN` と同一の JS 関数式を
+`Runtime.evaluate` で評価する。`document.querySelector` の最初の一致・`getBoundingClientRect`・
+ビューポート相対の CSS px（`coordinate_space: viewport_css_px`）。同一性は
+`test_chromium_bbox_driver.py` のパリティテストが `layout.rs` から関数式を取り出して検査する。
+`DOM.getBoxModel` は使わない（ページ座標の quad で意味論が異なるため）。isolated world も使わず、Servo と
+同じページの world で評価する。セレクタは `validate_selector` で検証したうえで JSON 文字列リテラルとしてだけ
+関数式へ渡す（生の文字列を連結しない）。
+
+### 使い方
+
+```bash
+# capture_screenshots.py の --chromium-cmd として（コンテナでは BBOX_SELECTORS で自動設定される）
+python3 harness/render-screenshot/capture_screenshots.py --saved-pages --allow-unproxied-engine \
+  --chromium-cmd '["python3","chromium_bbox_driver.py","--chromium-bin","{chromium_bin}","--selectors","/selectors.json","--width","{width}","--height","{height}","--assume-isolated","{url}","{out}"]' ...
+
+# 単体実行（--network none の隔離コンテナ内であることを --assume-isolated で明示する）
+python3 harness/render-screenshot/chromium_bbox_driver.py --chromium-bin /usr/bin/chromium --selectors <file> \
+  --assume-isolated http://pages.test:8080/<site_id>/index.html <out>/<site_id>.png
+```
+
+| 引数 | 内容 |
+| ---- | ---- |
+| `--chromium-bin` / `--chromium-cmd` | 実行ファイルのパス / ランチャー argv の JSON 配列（テスト用。排他・どちらか必須。フラグは自動で後ろに付く） |
+| `--selectors` | セレクタ入力ファイル（必須。書式は「`servo_bbox_driver.py`」節と共通） |
+| `--site-id` | セレクタ入力の `site_id`（既定は `OUT_PNG` の stem） |
+| `--width` / `--height` | ビューポート（既定 1280・800。1〜16384。PNG の寸法と照合する） |
+| `--load-timeout-ms` | load 待ちの上限（1〜60000。省略時 30000） |
+| `--assume-isolated` | 隔離コンテナ内で実行している旨の明示（必須。無ければ終了コード 2） |
+
+起動引数は `capture_screenshots.SAVED_PAGES_CHROMIUM_TEMPLATE` から `--screenshot={out}` と `{url}` を除き、
+`--remote-debugging-pipe` と初期 URL `about:blank` を足して作る（フラグを複製せず、テンプレートとの乖離を防ぐ）。
+`--remote-debugging-port` は使わず、TCP のデバッグポートを開かない。
+
+### CDP の手順
+
+`Browser.getVersion` -> `Target.getTargets`（page がちょうど 1 件）-> `Target.attachToTarget`（`flatten`）->
+`Page.enable` -> `Page.navigate`（`Page.loadEventFired` を待つ。届かなければ `document.readyState` で確認）->
+`document.fonts.ready` と rAF の待ち -> `Page.captureScreenshot`（PNG。寸法を要求値と照合）-> 要素ごとの
+`Runtime.evaluate` -> `Target.getTargetInfo`（最終 URL が一致したかの真偽値だけ記録）-> `Browser.close`。
+page レベルの要求・応答・イベントは `sessionId` で照合する。pipe の向き（Chromium は fd 3 から読み fd 4 へ書く。
+NUL 終端の JSON）は Puppeteer の `PipeTransport` と同じ。実 Chromium での確認は未検証。
+
+### 出力
+
+`servo_bbox_driver.py` と同じ契約（`write_bbox_outputs` を共有）。`source` は
+`{tool: "chromium_bbox_driver", chromium_version, final_url_matches}`（`chromium_version` は
+`Browser.getVersion` の `product` が `^[A-Za-z]+/[0-9]+(\.[0-9]+){0,3}$` かつ 64 文字以下のときだけ。
+それ以外は `null`）。要素単位の失敗（セレクタ構文エラー -> `invalid_params`・一致なし -> `not_found`）は
+`elements` から外して `errors` に記録して続行する。スクリプトの例外や想定外の形はサイト全体の失敗とし、
+PNG・bbox のどちらも残さない。終了コード: 0／1（Chromium・CDP・ページ読み込みの失敗）／2（引数・入力・URL 規則の違反、非 POSIX）。
+
+### 信頼境界
+
+| 観点 | 対応 |
+| ---- | ---- |
+| URL | `check_saved_pages_url` を共有（`http://pages.test:<port>` のみ）。単体実行は `--assume-isolated` 必須 |
+| 起動 | シェル不使用・argv のリスト。pipe のみ（TCP のデバッグポートなし）。環境変数は親をそのまま継承する（`capture_one` の既存 Chromium 経路と撮影条件を揃えるため。上書き用の変数は無い） |
+| 識別面（`SEC-2`） | UA・ヘッダ・デバイスメトリクス・locale をフラグでも CDP（`Emulation.*`・`Network.setExtraHTTPHeaders` 等）でも上書きしない。テストで検査 |
+| プロトコル | 応答は untrusted（id・sessionId・result/error の排他・型・範囲を検証。未知フィールドは無視。`REPAIR-4`）。出力にページ由来の文字列は載せない |
+| 資源 | NUL が来る前のバッファ長にも上限（通常 1 MiB・screenshot 応答待ちの間は 24 MiB）、送信 64 KiB、未消費メッセージ 256 件・合計 48 MiB、全段（送信を含む）のタイムアウト、stderr は末尾 4 KiB のみ保持。base64 は厳密にデコードし、PNG は IHDR の寸法を照合 |
+| 出力 | symlink を辿らない一時ファイル + `os.replace`。出力ディレクトリが symlink なら拒否 |
+
+プロセスグループ: Chromium は子孫（レンダラー・GPU・zygote）を持つため `start_new_session=True` で
+driver とは別のグループに置き、終了経路（正常・失敗・SIGTERM・自前のタイムアウト）では必ず
+`killpg(SIGKILL)` で後始末し、一時の `--user-data-dir` を削除する。**制約**: `capture_screenshots.py` の
+タイムアウト時の kill は driver のグループにしか届かず Chromium のグループには届かない。対策は
+(a) driver の各段のタイムアウトで自身が先に後始末すること、(b) driver が死ぬと pipe が閉じて Chromium が終了すること
+（(b) は実機では未検証）。
+
+### 申し送り
+
+- 最悪ケースの所要時間: 各段の上限（スラック込み）の総和は 203 秒 + 要素数 x 10 秒。コンテナの
+  `BBOX_SELECTORS` 指定時は `--timeout-sec 420`（Chromium 側 21 要素まで）を既定で付ける。多い場合は `EXTRA_ARGS` で上書きする
+- 実機での動作（実 Chromium の pipe 実装・headless での rAF・`final_url_matches` の実際の一致）は未検証。#55 で確認する
 
 ## スコープ外・申し送り
 
 - 実機（Linux）での Servo・Chromium の撮影と合否判定: #55（人間が担当）
 - Servo 側の境界ボックスを取る stdio 駆動スクリプト: `servo_bbox_driver.py`（Issue #1282）で実装済み
-  （偽ホストによるオフライン検証のみ。実機は未検証）。Chromium 側の抽出と要素選定は引き続き範囲外
+  （偽ホストによるオフライン検証のみ。実機は未検証）。Chromium 側は `chromium_bbox_driver.py`（Issue #1288）で
+  実装済み（偽 Chromium によるオフライン検証のみ。実機は未検証）。要素選定は引き続き範囲外
 - cli・ハーネスに loopback を許す経路: 作らない（#1003 とまとめて決める）
 - 保存の基準（robots.txt・429 で欠けたときの代わりのサイト）: オーナー判断
 - 計測用コンテナの `Dockerfile`: Linux 実機でビルド確認済み（#1289）。ベースイメージのダイジェスト・Debian のスナップショット・
   Chromium の版は実在を確かめた値だが、採用はレビューでオーナーが確認する
-- 境界ボックスの抽出処理（Chromium の CDP `DOM.getBoxModel` 等・Servo 側の API。
-  TASK-36/38 の成果次第）と、サイトごとの対象要素（5〜10 件）の選定
+- サイトごとの対象要素（5〜10 件）の選定（境界ボックスの抽出処理は両エンジンとも実装済み・実機は未検証）
 - ±5% と 80% の解釈、および SSIM のパラメータ（上記「`measure_ssim.py`」の
   各節に記載）を #55（実機での測定・合否判定）で確認・確定してもらうこと
 - 16bit・パレット・インターレースの PNG への対応（実機のエンジンがそうした

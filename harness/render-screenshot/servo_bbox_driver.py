@@ -26,7 +26,7 @@
     - UA・ヘッダ・ビューポート等のパラメータは送らない（スキーマにも無い。`SEC-2`）。
 
 未実装（実装済みを装わない。`REPAIR-3`）:
-    - Chromium 側の bbox 抽出と、対象要素（セレクタ）の選定は範囲外（#55）。
+    - Chromium 側の bbox 抽出は `chromium_bbox_driver.py`（Issue #1288）。対象要素（セレクタ）の選定は範囲外（#55）。
     - 実ホストでの動作は未検証。偽ホスト（`fixtures/fake_render_host.py`）によるオフライン検証のみ。
 
 終了コード: 0（PNG を書いた）／1（ホスト・プロトコル・ページ読み込みの失敗）／2（引数・入力・URL 規則の違反）。
@@ -547,8 +547,19 @@ def bbox_path_for(out: Path) -> Path:
     return out.with_suffix(".bboxes.json")
 
 
-def write_outputs(out: Path, result: DriveResult, *, write_bboxes: bool = True) -> None:
+def write_bbox_outputs(
+    out: Path,
+    png: bytes,
+    elements: list[dict[str, Any]],
+    errors: list[dict[str, str]],
+    source: dict[str, Any],
+    *,
+    write_bboxes: bool = True,
+) -> None:
     """PNG -> bboxes の順に書く。どちらかが失敗したら両方消す。
+
+    エンジン非依存の書き出し（`chromium_bbox_driver.py` も呼ぶ。Issue #1288）。`source` は
+    エンジンごとの出所情報（ツール名・版・最終 URL 一致）で、ページ由来の文字列を含めない。
 
     `write_bboxes=False`（セレクタ未定義のサイト）では PNG のみ書く。空の bbox JSON は
     「計測済みの 0 要素」と読まれ Chromium 参照との一致率が 0% になるため、
@@ -557,25 +568,37 @@ def write_outputs(out: Path, result: DriveResult, *, write_bboxes: bool = True) 
     bboxes = bbox_path_for(out)
     payload = {
         "schema_version": 1,
-        "png_sha256": hashlib.sha256(result.png).hexdigest(),
-        "elements": result.elements,
+        "png_sha256": hashlib.sha256(png).hexdigest(),
+        "elements": elements,
         "coordinate_space": "viewport_css_px",
-        "errors": result.errors,
-        "source": {
-            "tool": TOOL_NAME,
-            "host_version": result.info.host_version,
-            "servo_version": result.info.servo_version,
-            "final_url_matches": result.final_url_matches,
-        },
+        "errors": errors,
+        "source": source,
     }
     text = json.dumps(payload, indent=2, allow_nan=False) + "\n"
     try:
-        cs._write_bytes_nofollow(out, result.png)
+        cs._write_bytes_nofollow(out, png)
         if write_bboxes:
             cs._write_bytes_nofollow(bboxes, text.encode("utf-8"))
     except OSError as exc:
         remove_outputs(out)
         raise HostError(f"failed to write outputs: {exc}") from exc
+
+
+def write_outputs(out: Path, result: DriveResult, *, write_bboxes: bool = True) -> None:
+    """Servo ホストの結果を `write_bbox_outputs` で書く薄いラッパー。"""
+    write_bbox_outputs(
+        out,
+        result.png,
+        result.elements,
+        result.errors,
+        {
+            "tool": TOOL_NAME,
+            "host_version": result.info.host_version,
+            "servo_version": result.info.servo_version,
+            "final_url_matches": result.final_url_matches,
+        },
+        write_bboxes=write_bboxes,
+    )
 
 
 def remove_outputs(out: Path) -> None:

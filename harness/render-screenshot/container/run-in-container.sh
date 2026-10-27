@@ -10,7 +10,9 @@
 #   EXTRA_ARGS  capture_screenshots.py へ渡す追加引数（空白区切り。例: "--min-sites 5"）
 #   BBOX_SELECTORS  任意。境界ボックス取得用セレクタファイルの**コンテナ内パス**（読み取り専用マウント想定。
 #               Issue #1282）。指定すると Servo の撮影を cli `screenshot` から `servo_bbox_driver.py` に
-#               切り替え、PNG と `<site_id>.bboxes.json` を同じホストセッションで書く。未指定なら従来どおり
+#               切り替え、PNG と `<site_id>.bboxes.json` を同じホストセッションで書く。Chromium 側も
+#               `chromium_bbox_driver.py`（Issue #1288）に切り替わり、CDP `Page.captureScreenshot` の PNG と
+#               bbox を同じセッションで書く。未指定なら従来どおり（Chromium は `--screenshot`）
 #
 # 配信ポートは 8080 固定（sites.saved-pages.json の URL と一致させるため、環境変数では変えられない）。
 #
@@ -55,6 +57,7 @@ python3 "${SCRIPT_DIR}/isolation_check.py" \
 # `--settle-ms` は両エンジンとも無効（`{settle_ms}` を使うテンプレートは capture_screenshots.py が拒否する）。
 # Servo に待ち時間の指定口を足すにはホストのプロトコル変更を伴うため別 Issue で扱う。
 SERVO_CMD="[\"${BIN_DIR}/fandhe-browser\",\"screenshot\",\"{url}\",\"{out}\"]"
+CHROMIUM_ARGS=()
 BBOX_ARGS=()
 if [ -n "${BBOX_SELECTORS:-}" ]; then
   # JSON 配列へ埋め込むため、引用符・バックスラッシュを含むパスは拒否する（eval は使わない）。
@@ -69,11 +72,20 @@ if [ -n "${BBOX_SELECTORS:-}" ]; then
     exit 2
   fi
   SERVO_CMD="[\"python3\",\"${SCRIPT_DIR}/servo_bbox_driver.py\",\"--host-bin\",\"${BIN_DIR}/fandhe-browser-servo-host\",\"--selectors\",\"${BBOX_SELECTORS}\",\"--assume-isolated\",\"{url}\",\"{out}\"]"
-  # 最悪ケース（hello + load + screenshot + 要素ごとの問い合わせ + shutdown）が既定の 90 秒を超え得るため。
-  # ドライバは各 RPC で TIMEOUT_SLACK_S（5 秒）を余分に待つので、スラック込みで
-  # 78 秒（10 + 35 + 25 + 8）+ 要素数 x 10 秒。300 秒は 20 要素まで。要素が多いなら EXTRA_ARGS で延ばす。
-  # argparse は後勝ちなので EXTRA_ARGS で上書きできる。
-  BBOX_ARGS=(--timeout-sec 300)
+  # Chromium 側（オーナー判断 2026-10-27・#1288）: bbox を取る実行では SSIM の基準 PNG も CDP で撮る
+  # （`png_sha256` の契約に合わせ、bbox と同じセッションで撮るため）。`--screenshot` は使わない。
+  # {chromium_bin}・{width}・{height} は capture_screenshots.py が展開する（フラグは駆動スクリプトが
+  # SAVED_PAGES_CHROMIUM_TEMPLATE から作る）。
+  CHROMIUM_CMD="[\"python3\",\"${SCRIPT_DIR}/chromium_bbox_driver.py\",\"--chromium-bin\",\"{chromium_bin}\",\"--selectors\",\"${BBOX_SELECTORS}\",\"--width\",\"{width}\",\"--height\",\"{height}\",\"--assume-isolated\",\"{url}\",\"{out}\"]"
+  CHROMIUM_ARGS=(--chromium-cmd "${CHROMIUM_CMD}")
+  # 最悪ケースが既定の 90 秒を超え得るため。ドライバは各段で TIMEOUT_SLACK_S（5 秒）を余分に待つので、
+  # 各段の上限の総和は、Servo 側が 78 秒（10 + 35 + 25 + 8）+ 要素数 x 10 秒、Chromium 側が
+  # 203 秒（起動と attach 60 + navigate 35 + load 待ち 35 + readyState 10 + フォント 15 + screenshot 25
+  # + URL 確認 15 + close 8）+ 要素数 x 10 秒。420 秒は Chromium 側で 21 要素まで。
+  # 要素が多いなら EXTRA_ARGS で延ばす（argparse は後勝ち）。
+  # Chromium は別のプロセスグループで動くため、これを超えて capture_one が kill しても Chromium には
+  # 届かない。ドライバ自身の各段のタイムアウトが先に切れて後始末する前提（README「信頼境界」）。
+  BBOX_ARGS=(--timeout-sec 420)
 fi
 
 # EXTRA_ARGS は意図的に単語分割する（引数は呼び出し側が与える。eval は使わない）。
@@ -85,5 +97,6 @@ python3 "${SCRIPT_DIR}/capture_screenshots.py" \
   --out-dir "${OUT_DIR}" \
   --servo-cmd "${SERVO_CMD}" \
   --chromium-bin /usr/bin/chromium \
+  "${CHROMIUM_ARGS[@]}" \
   "${BBOX_ARGS[@]}" \
   ${EXTRA_ARGS:-}
