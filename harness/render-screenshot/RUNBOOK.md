@@ -211,11 +211,17 @@ SSIM は Chromium を reference、Servo を target とした 7x7 一様窓の me
 
 - 1 サイトあたり主要要素 5〜10 件（Chromium 側が 5 件未満だと不合格）。要素の選定基準は未定。
 - Chromium 側は CDP の `DOM.getBoxModel` 等で取得できる見込みだが、取得スクリプトは本リポに無い。
-- Servo 側は、ホストの `bounding_box` を stdio で呼ぶ駆動スクリプトをハーネスに置く方針になった
-  （2026-10-27 の判断）。**そのスクリプトはまだ存在しない**（Issue #1281 の範囲外）。
+- Servo 側は `servo_bbox_driver.py`（Issue #1282）が、ホストの `bounding_box` を stdio で呼んで
+  PNG と `bboxes.json` を書く。使い方・セレクタ書式・信頼境界は README「`servo_bbox_driver.py`」。
+  偽ホストでのオフライン検証のみで、**実機（実 Servo ホスト）では未検証**。
+  - コンテナ: セレクタファイルを読み取り専用でマウントし、`BBOX_SELECTORS` に**コンテナ内のパス**を渡す。
+    `SERVO_CMD` が cli `screenshot` から駆動スクリプトに切り替わり、Servo の PNG も駆動スクリプトが撮る
+    （`png_sha256` で bbox と PNG を対応付けるため）。例: `-v "$SELECTORS":/selectors.json:ro -e BBOX_SELECTORS=/selectors.json`
+  - コンテナ外: `capture_screenshots.py` の `--servo-cmd` に駆動スクリプトのテンプレートを渡す（README の例）。
+  - 対象要素（セレクタ）の選定は #55 でオーナーが決める。実際のリストはコミットしない。
 
-存在しない間は、境界ボックスは「未測定」として記録し、SSIM のみを先に測定する
-（合格を装わない。REPAIR-3）。対象要素の選定基準は引き続きオーナー判断待ち。
+Chromium 側の取得スクリプトが無い間は、境界ボックスは「未測定」として記録し、SSIM のみを先に
+測定する（合格を装わない。REPAIR-3）。対象要素の選定基準は引き続きオーナー判断待ち。
 
 ## 7. 結果記録テンプレート
 
@@ -258,6 +264,8 @@ Issue #55 へ貼る。数値は `measure-result.json` から転記する。
 - 入力条件の差（両エンジンとも同じ URL。保存の欠け・JS・フォント・取得時刻差の影響）: 記述
 - 失敗・skipped のサイトと stderr_tail の要点: 記述
 - 境界ボックスの取得方法と要素選定: 記述（未測定の場合はその旨）
+- Servo PNG の取得経路: cli `screenshot` / `servo_bbox_driver.py`（bbox を取る場合は後者）
+- セレクタファイルの SHA-256（`sha256sum`）: 記述（bbox を取った場合）
 
 ## 判定
 
