@@ -76,12 +76,20 @@ fn fixed_opts() -> Opts {
 ///
 /// `Preferences::default()` は `http_proxy` 等の環境変数から proxy を設定するため、
 /// 3 フィールドを空に戻して環境由来の値を持ち込ませない（proxy は識別面・SSRF 経路）。
-/// UA 等の識別面には触れない（SEC-2）。
+/// あわせて IntersectionObserver を有効にする（理由は本体のコメント。#1294）。
+/// ほかの pref は既定のまま。UA 等の識別面には触れない（SEC-2）。
 fn fixed_preferences() -> Preferences {
     Preferences {
         network_http_proxy_uri: String::new(),
         network_https_proxy_uri: String::new(),
         network_http_no_proxy: String::new(),
+        // servo 0.6.0 は IntersectionObserver を既定で無効にしており、これを前提にする
+        // Next.js 系のページが `ReferenceError` で JS を止め、白紙を撮影成功として返してしまう。
+        // そのため有効にする（#1294・#1273・TASK-38・`RENDER-3`・`RENDER-5`）。標準 API を公開
+        // するだけで UA・ヘッダ・`navigator`・画面・TLS・locale 等の識別面は変えない（SEC-2）。
+        // Servo 側では実装途中の機能のため、クラッシュ・ハングが出たら無効に戻すかオーナーに
+        // 判断を仰ぐ。Servo のソースは改変せず設定値だけを変える。
+        dom_intersection_observer_enabled: true,
         ..Preferences::default()
     }
 }
@@ -154,6 +162,8 @@ mod tests {
         assert_eq!(prefs.network_http_proxy_uri, "");
         assert_eq!(prefs.network_https_proxy_uri, "");
         assert_eq!(prefs.network_http_no_proxy, "");
+        // #1294: IntersectionObserver を公開する。
+        assert!(prefs.dom_intersection_observer_enabled);
     }
 
     #[test]
