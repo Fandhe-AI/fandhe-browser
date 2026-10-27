@@ -79,6 +79,10 @@ LOAD_TIMEOUT_MAX_MS = 60_000
 MAX_DIMENSION = 16_384
 REQUIRED_CAPABILITIES = ("load", "screenshot", "bounding_box", "shutdown")
 STDERR_TAIL_BYTES = 4096
+# 受信キューの上限。プロトコルは要求 1 件につき応答 1 件のため、未消費フレームが溜まるのは異常。
+MAX_PENDING_FRAMES = 4
+MAX_PENDING_BYTES = 2 * SCREENSHOT_FRAME_MAX
+SEND_TIMEOUT_S = 10.0
 MAX_SELECTORS_FILE_BYTES = 1 * 1024 * 1024
 MAX_SITES = 50
 MAX_SELECTOR_BYTES = 1024
@@ -227,6 +231,9 @@ class HostChannel:
     def __init__(self, proc: subprocess.Popen[bytes]) -> None:
         self._proc = proc
         self._queue: queue.Queue[tuple[str, Any]] = queue.Queue()
+        self._lock = threading.Lock()
+        self._pending_frames = 0
+        self._pending_bytes = 0
         self.max_frame = HELLO_FRAME_MAX
         self.request_max = REQUEST_FRAME_MAX
         self._thread = threading.Thread(target=self._read_loop, daemon=True)
@@ -239,6 +246,20 @@ class HostChannel:
         if len(data) < size:
             return None
         return data
+
+    def _enqueue_frame(self, body: bytes) -> bool:
+        """未消費フレームの件数・合計バイト数に上限を設け、超過時は error を積んで False を返す。
+
+        キューへの投入で待たない（読み取りスレッドが投入待ちで残らない）。
+        """
+        with self._lock:
+            if self._pending_frames + 1 > MAX_PENDING_FRAMES or self._pending_bytes + len(body) > MAX_PENDING_BYTES:
+                self._queue.put(("error", "host sent more unsolicited frames than allowed"))
+                return False
+            self._pending_frames += 1
+            self._pending_bytes += len(body)
+        self._queue.put(("frame", body))
+        return True
 
     def _read_loop(self) -> None:
         try:
@@ -255,7 +276,8 @@ class HostChannel:
                 if body is None:
                     self._queue.put(("error", "host closed the pipe in the middle of a frame"))
                     return
-                self._queue.put(("frame", body))
+                if not self._enqueue_frame(body):
+                    return
         except (OSError, ValueError) as exc:
             self._queue.put(("error", f"failed to read from host: {exc}"))
 
@@ -268,22 +290,40 @@ class HostChannel:
             raise HostError("host closed stdout before responding")
         if kind == "error":
             raise HostError(str(value))
+        with self._lock:
+            self._pending_frames -= 1
+            self._pending_bytes -= len(value)
         try:
             return json.loads(value.decode("utf-8"))
         except (UnicodeDecodeError, ValueError, RecursionError) as exc:
             raise HostError(f"host sent an invalid JSON frame: {exc}") from exc
 
-    def send(self, message: dict[str, Any]) -> None:
+    def send(self, message: dict[str, Any], timeout: float = SEND_TIMEOUT_S) -> None:
+        """要求を送る。ホストが stdin を読まずパイプが詰まっても `timeout` で打ち切る（kill して失敗）。"""
         body = json.dumps(message, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
         if len(body) > self.request_max:
             raise HostError(f"request frame exceeds the {self.request_max} byte limit")
         stream = self._proc.stdin
         assert stream is not None
-        try:
-            stream.write(struct.pack("<I", len(body)) + body)
-            stream.flush()
-        except (OSError, ValueError) as exc:
-            raise HostError(f"failed to write to host: {exc}") from exc
+        failure: list[BaseException] = []
+
+        def _write() -> None:
+            try:
+                stream.write(struct.pack("<I", len(body)) + body)
+                stream.flush()
+            except (OSError, ValueError) as exc:
+                failure.append(exc)
+
+        writer = threading.Thread(target=_write, daemon=True)
+        writer.start()
+        writer.join(timeout)
+        if writer.is_alive():
+            # kill するとパイプが壊れ、書き込みスレッドが BrokenPipe で終わる。
+            if self._proc.poll() is None:
+                self._proc.kill()
+            raise HostError(f"timed out writing to the host ({timeout:.0f}s)")
+        if failure:
+            raise HostError(f"failed to write to host: {failure[0]}")
 
 
 @dataclass
@@ -357,7 +397,7 @@ def call(
         message["params"] = params
     # 応答待ちに入る前に上限を設定する（読み取りスレッドが長さ接頭辞を照合するため）。
     chan.max_frame = max_frame
-    chan.send(message)
+    chan.send(message, min(SEND_TIMEOUT_S, timeout))
     response = chan.recv(timeout)
     if not isinstance(response, dict) or response.get("v") != PROTOCOL_VERSION:
         raise HostError(f"{method}: response is not a protocol v1 envelope")
@@ -507,8 +547,13 @@ def bbox_path_for(out: Path) -> Path:
     return out.with_suffix(".bboxes.json")
 
 
-def write_outputs(out: Path, result: DriveResult) -> None:
-    """PNG -> bboxes の順に書く。どちらかが失敗したら両方消す。"""
+def write_outputs(out: Path, result: DriveResult, *, write_bboxes: bool = True) -> None:
+    """PNG -> bboxes の順に書く。どちらかが失敗したら両方消す。
+
+    `write_bboxes=False`（セレクタ未定義のサイト）では PNG のみ書く。空の bbox JSON は
+    「計測済みの 0 要素」と読まれ Chromium 参照との一致率が 0% になるため、
+    `measure_ssim.py` が not_measured として扱えるよう bbox ファイルを出さない。
+    """
     bboxes = bbox_path_for(out)
     payload = {
         "schema_version": 1,
@@ -526,7 +571,8 @@ def write_outputs(out: Path, result: DriveResult) -> None:
     text = json.dumps(payload, indent=2, allow_nan=False) + "\n"
     try:
         cs._write_bytes_nofollow(out, result.png)
-        cs._write_bytes_nofollow(bboxes, text.encode("utf-8"))
+        if write_bboxes:
+            cs._write_bytes_nofollow(bboxes, text.encode("utf-8"))
     except OSError as exc:
         remove_outputs(out)
         raise HostError(f"failed to write outputs: {exc}") from exc
@@ -543,25 +589,47 @@ def remove_outputs(out: Path) -> None:
 # --- 実行 ---------------------------------------------------------------------
 
 
-def _stderr_tail(path: Path) -> str:
-    try:
-        with path.open("rb") as fh:
-            fh.seek(0, os.SEEK_END)
-            size = fh.tell()
-            fh.seek(max(0, size - STDERR_TAIL_BYTES))
-            return fh.read().decode("utf-8", errors="replace")
-    except OSError:
-        return ""
+class StderrTail:
+    """ホストの stderr を継続的に読み捨て、末尾 `STDERR_TAIL_BYTES` だけを保持する（保存量を有界にする）。"""
+
+    def __init__(self, stream: Any) -> None:
+        self._stream = stream
+        self._buf = bytearray()
+        self._lock = threading.Lock()
+        self._thread = threading.Thread(target=self._drain, daemon=True)
+        self._thread.start()
+
+    def _drain(self) -> None:
+        try:
+            while True:
+                chunk = self._stream.read1(65536) if hasattr(self._stream, "read1") else self._stream.read(65536)
+                if not chunk:
+                    return
+                with self._lock:
+                    self._buf += chunk
+                    if len(self._buf) > STDERR_TAIL_BYTES:
+                        del self._buf[: len(self._buf) - STDERR_TAIL_BYTES]
+        except (OSError, ValueError):
+            return
+
+    def text(self) -> str:
+        self._thread.join(timeout=1.0)
+        with self._lock:
+            return bytes(self._buf).decode("utf-8", errors="replace")
 
 
 def _stop_host(proc: subprocess.Popen[bytes], graceful: bool) -> None:
-    """ホストを止める。正常終了時は猶予を待ち、それ以外と猶予超過は kill する。"""
-    for stream in (proc.stdin,):
-        try:
-            if stream is not None:
-                stream.close()
-        except OSError:
-            pass
+    """ホストを止める。正常終了時は猶予を待ち、それ以外と猶予超過は先に kill する。
+
+    stdin の close は flush を伴い、詰まったパイプで停止し得るため、非正常時は kill を先に行う。
+    """
+    if not graceful and proc.poll() is None:
+        proc.kill()
+    try:
+        if proc.stdin is not None:
+            proc.stdin.close()
+    except (OSError, ValueError):
+        pass
     if graceful:
         try:
             proc.wait(timeout=SHUTDOWN_GRACE_S)
@@ -584,31 +652,36 @@ def run_host(host_cmd: list[str], url: str, elements: list[dict[str, str]], load
         for sub in ("home", "tmp", "xdg-config", "xdg-cache", "xdg-data"):
             (workdir / sub).mkdir()
         env = build_host_env(workdir)
-        stderr_path = workdir / "host-stderr.log"
-        with stderr_path.open("wb") as stderr_file:
-            try:
-                proc = subprocess.Popen(  # noqa: S603  (argv 固定・シェル不使用)
-                    [*host_cmd, "--stdio"],
-                    stdin=subprocess.PIPE,
-                    stdout=subprocess.PIPE,
-                    stderr=stderr_file,
-                    env=env,
-                )
-            except OSError as exc:
-                raise HostError(f"failed to launch the host: {exc}") from exc
-            graceful = False
-            try:
-                chan = HostChannel(proc)
-                scratch = workdir / "tmp"
-                result = drive(chan, url, elements, load_timeout_ms, scratch)
-                graceful = result.graceful
-                return result
-            except HostError:
-                tail = _stderr_tail(stderr_path)
-                if tail:
-                    print(f"host stderr (tail):\n{tail}", file=sys.stderr)
-                raise
-            finally:
+        try:
+            proc = subprocess.Popen(  # noqa: S603  (argv 固定・シェル不使用)
+                [*host_cmd, "--stdio"],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=env,
+            )
+        except OSError as exc:
+            raise HostError(f"failed to launch the host: {exc}") from exc
+        assert proc.stderr is not None
+        stderr_tail = StderrTail(proc.stderr)
+        graceful = False
+        stopped = False
+        try:
+            chan = HostChannel(proc)
+            scratch = workdir / "tmp"
+            result = drive(chan, url, elements, load_timeout_ms, scratch)
+            graceful = result.graceful
+            return result
+        except HostError:
+            # stderr の末尾を確定させるため、読む前にホストを止める。
+            _stop_host(proc, False)
+            stopped = True
+            tail = stderr_tail.text()
+            if tail:
+                print(f"host stderr (tail):\n{tail}", file=sys.stderr)
+            raise
+        finally:
+            if not stopped:
                 _stop_host(proc, graceful)
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
@@ -656,7 +729,7 @@ def _host_command(args: argparse.Namespace) -> list[str]:
     return parsed
 
 
-def _prepare(args: argparse.Namespace) -> tuple[list[str], list[dict[str, str]], Path]:
+def _prepare(args: argparse.Namespace) -> tuple[list[str], list[dict[str, str]] | None, Path]:
     if not args.assume_isolated:
         raise UsageError("--assume-isolated is required (run inside the --network none container)")
     try:
@@ -674,12 +747,12 @@ def _prepare(args: argparse.Namespace) -> tuple[list[str], list[dict[str, str]],
     site_id = args.site_id or out.stem
     elements = sites.get(site_id)
     if elements is None:
+        # bbox JSON は出さない（空 elements は計測済みの 0 要素と読まれるため。write_outputs 参照）。
         print(
             f"warning: no selectors for site_id {site_id!r}; writing the PNG only "
             "(bbox will be not_measured)",
             file=sys.stderr,
         )
-        elements = []
     return _host_command(args), elements, out
 
 
@@ -699,8 +772,8 @@ def main(argv: list[str] | None = None) -> int:
     except ValueError:
         pass
     try:
-        result = run_host(host_cmd, args.url, elements, args.load_timeout_ms)
-        write_outputs(out, result)
+        result = run_host(host_cmd, args.url, elements or [], args.load_timeout_ms)
+        write_outputs(out, result, write_bboxes=elements is not None)
     except HostError as exc:
         remove_outputs(out)
         print(f"error: {exc}", file=sys.stderr)
@@ -712,7 +785,10 @@ def main(argv: list[str] | None = None) -> int:
     finally:
         if previous is not None:
             signal.signal(signal.SIGTERM, previous)
-    print(f"wrote {out} and {bbox_path_for(out)} ({len(result.elements)} elements)", file=sys.stderr)
+    if elements is None:
+        print(f"wrote {out} (no bboxes)", file=sys.stderr)
+    else:
+        print(f"wrote {out} and {bbox_path_for(out)} ({len(result.elements)} elements)", file=sys.stderr)
     return 0
 
 

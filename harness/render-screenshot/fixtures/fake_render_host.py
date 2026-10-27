@@ -81,6 +81,11 @@ def main() -> int:
     if scenario == "bad_protocol_version":
         hello["data"]["protocol"] = {"min": 2, "max": 2}
     send(hello)
+    if scenario == "stderr_flood":
+        # stderr を大量に書いても駆動側が詰まらず、保存量が有界であることの検証用。
+        for _ in range(80):
+            sys.stderr.write("x" * 65536)
+            sys.stderr.flush()
 
     while True:
         message = read_frame()

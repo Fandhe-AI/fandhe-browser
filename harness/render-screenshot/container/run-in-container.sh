@@ -69,9 +69,11 @@ if [ -n "${BBOX_SELECTORS:-}" ]; then
     exit 2
   fi
   SERVO_CMD="[\"python3\",\"${SCRIPT_DIR}/servo_bbox_driver.py\",\"--host-bin\",\"${BIN_DIR}/fandhe-browser-servo-host\",\"--selectors\",\"${BBOX_SELECTORS}\",\"--assume-isolated\",\"{url}\",\"{out}\"]"
-  # 最悪ケース（hello + load + screenshot + 要素ごとの問い合わせ）が既定の 90 秒を超え得るため。
+  # 最悪ケース（hello + load + screenshot + 要素ごとの問い合わせ + shutdown）が既定の 90 秒を超え得るため。
+  # ドライバは各 RPC で TIMEOUT_SLACK_S（5 秒）を余分に待つので、スラック込みで
+  # 78 秒（10 + 35 + 25 + 8）+ 要素数 x 10 秒。300 秒は 20 要素まで。要素が多いなら EXTRA_ARGS で延ばす。
   # argparse は後勝ちなので EXTRA_ARGS で上書きできる。
-  BBOX_ARGS=(--timeout-sec 180)
+  BBOX_ARGS=(--timeout-sec 300)
 fi
 
 # EXTRA_ARGS は意図的に単語分割する（引数は呼び出し側が与える。eval は使わない）。

@@ -11,6 +11,7 @@ import contextlib
 import hashlib
 import io
 import json
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -133,12 +134,76 @@ class OkScenarioTest(DriverCase):
         self.assertIn("no selectors for site_id 'site-a'", err)
         self.assertTrue(self.out.exists())
         self.assertEqual([r["method"] for r in self.requests()], ["load", "screenshot", "shutdown"])
+        self.assertFalse(drv.bbox_path_for(self.out).exists())
 
     def test_explicit_site_id(self) -> None:
         write_selectors(self.selectors, [{"site_id": "x", "elements": SELECTORS[:1]}])
         code, _ = self.run_main(extra=["--site-id", "x"])
         self.assertEqual(code, 0)
         self.assertEqual(list(ms.load_bboxes(drv.bbox_path_for(self.out))), ["header"])
+
+
+class ResourceLimitTest(DriverCase):
+    """受信キュー・stderr・送信の資源上限（有界であること）。"""
+
+    def test_unsolicited_frames_overflow_fails_and_reader_exits(self) -> None:
+        code = (
+            "import struct,sys\n"
+            "b=b'{}'\n"
+            "for _ in range(50):\n"
+            "    sys.stdout.buffer.write(struct.pack('<I',len(b))+b)\n"
+            "sys.stdout.buffer.flush()\n"
+            "import time; time.sleep(30)\n"
+        )
+        proc = subprocess.Popen(
+            [sys.executable, "-c", code], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
+        )
+        try:
+            chan = drv.HostChannel(proc)
+            chan._thread.join(timeout=10)
+            self.assertFalse(chan._thread.is_alive())
+            messages = []
+            with self.assertRaises(drv.HostError) as ctx:
+                for _ in range(60):
+                    chan.recv(1.0)
+                    messages.append(1)
+            self.assertEqual(len(messages), drv.MAX_PENDING_FRAMES)
+            self.assertIn("unsolicited", str(ctx.exception))
+        finally:
+            proc.kill()
+            proc.wait()
+
+    def test_stderr_flood_is_bounded_and_does_not_block(self) -> None:
+        code, _ = self.run_main("stderr_flood")
+        self.assertEqual(code, 0)
+
+    def test_stderr_tail_keeps_only_the_end(self) -> None:
+        data = b"a" * 100_000 + b"END"
+        tail = drv.StderrTail(io.BytesIO(data))
+        text = tail.text()
+        self.assertEqual(len(text), drv.STDERR_TAIL_BYTES)
+        self.assertTrue(text.endswith("END"))
+
+    def test_send_timeout_kills_host_that_does_not_read(self) -> None:
+        proc = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(60)"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
+        try:
+            chan = drv.HostChannel(proc)
+            chan.request_max = 4 * 1024 * 1024
+            big = {"v": 1, "id": 1, "method": "load", "params": {"url": "x" * (2 * 1024 * 1024)}}
+            with self.assertRaises(drv.HostError) as ctx:
+                chan.send(big, 0.5)
+            self.assertIn("timed out writing", str(ctx.exception))
+            drv._stop_host(proc, False)
+            self.assertIsNotNone(proc.poll())
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+            proc.wait()
 
 
 class ElementErrorTest(DriverCase):

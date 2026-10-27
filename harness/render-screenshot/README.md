@@ -818,7 +818,7 @@ python3 harness/render-screenshot/servo_bbox_driver.py --host-bin <host> --selec
 | 隔離 | 単体実行は `--assume-isolated` 必須。`--servo-cmd` 経由では `capture_screenshots.py` が撮影前に隔離確認を行う |
 | ホスト起動 | シェル不使用・argv は `[host, "--stdio"]`。環境変数は `host_process/env.rs` と同じ許可リストのみ（`HOME`・`TMPDIR`・`XDG_*` を実行ごとの一時ディレクトリへ。`LANG`・`TZ`・`*_PROXY`・`LD_*`・`DYLD_*` は渡さない。`SEC-2`）。一時ディレクトリは終了時に削除 |
 | プロトコル | `docs/design/render-host-protocol.schema.json` 準拠。UA・ヘッダ・ビューポート等のパラメータは送らない。応答は untrusted（id・result/error の排他・型・範囲を検証。未知フィールドは無視。`REPAIR-4`） |
-| 資源 | 長さ接頭辞を確保前に上限と照合（hello 16 KiB・応答 1 MiB・screenshot 24 MiB・要求 64 KiB）。全段にタイムアウトを付け、超えたらホストを kill する。base64 は厳密にデコードし、PNG は IHDR の寸法を応答と照合する |
+| 資源 | 長さ接頭辞を確保前に上限と照合（hello 16 KiB・応答 1 MiB・screenshot 24 MiB・要求 64 KiB）。全段（送信を含む）にタイムアウトを付け、超えたらホストを kill する。受信キューは未消費 4 件・合計 48 MiB までで、超過は通信失敗としてホストを止める。ホストの stderr は継続的に読み捨て、末尾 4 KiB だけをメモリに保持する。base64 は厳密にデコードし、PNG は IHDR の寸法を応答と照合する |
 | 出力 | symlink を辿らない一時ファイル + `os.replace` で書く。出力ディレクトリが symlink なら拒否 |
 
 ホストは `capture_screenshots.py` と同じプロセスグループで起動するため、撮影のタイムアウトで
@@ -827,9 +827,12 @@ python3 harness/render-screenshot/servo_bbox_driver.py --host-bin <host> --selec
 ### 申し送り
 
 - Chromium 側の bbox 抽出（CDP `DOM.getBoxModel` 等）と、対象要素の選定は本スクリプトの範囲外（#55）
-- 最悪ケースの所要時間（hello 10 秒 + load 30 秒 + screenshot 20 秒 + 要素 x 5 秒 + shutdown 3 秒）は
+- 最悪ケースの所要時間は、各 RPC で `TIMEOUT_SLACK_S`（5 秒）を余分に待つため、
+  hello 10 秒 + load 35 秒 + screenshot 25 秒 + 要素 x 10 秒 + shutdown 8 秒（= 78 秒 + 要素数 x 10 秒）で、
   `capture_screenshots.py` の既定 `--timeout-sec`（90 秒）を超え得る。コンテナの `BBOX_SELECTORS` 指定時は
-  `--timeout-sec 180` を既定で付ける（`EXTRA_ARGS` で上書きできる）
+  `--timeout-sec 300`（20 要素まで）を既定で付ける。要素が多い場合は `EXTRA_ARGS` で上書きする
+- セレクタ入力に `site_id` が無いサイトは PNG のみを書き、bbox JSON を出さない（空の bbox JSON は
+  計測済みの 0 要素と読まれ一致率 0% になるため。`measure_ssim.py` は not_measured として扱う）
 
 ## スコープ外・申し送り
 
