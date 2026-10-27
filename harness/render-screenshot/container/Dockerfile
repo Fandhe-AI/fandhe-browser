@@ -16,7 +16,8 @@
 #   docker build -f harness/render-screenshot/container/Dockerfile \
 #     -t fandhe-render-screenshot:local .
 #
-# 状態: 定義済み・ビルド未検証（CI でビルドしない。実撮影は #55 で人間が行う）。
+# 状態: Linux 実機（x86_64）で 2026-10-27 にビルド成功・RUNBOOK 5.1 の隔離撮影で 6 サイトを撮影済み
+#   （#1289）。CI ではビルドしない。合否判定は #55 で人間が行う。
 #
 # 固定:
 #   ベースイメージはダイジェスト、Chromium は版（CHROMIUM_VERSION）と Debian の
@@ -31,12 +32,16 @@ ARG CHROMIUM_VERSION=156.0.8078.47-1~deb13u1
 # --- build: ホストの glibc とバイナリを揃えるため、runtime と同じ Debian trixie でビルドする
 FROM rust:1-slim-trixie@sha256:1a939748a7cbab172de91a014e3804a97af1394a8c844faa67fce9401c4e40fb AS build
 
-# Servo ホストのビルド依存（docs/setup/linux.md・ci.yml の servo-host-ubuntu と同じ集合）
+# Servo ホストのビルド依存（docs/setup/linux.md・ci.yml の servo-host-ubuntu と同じ集合）。
+# mozjs_sys は C と C++ のコンパイラが同じ系統であることを要求する。slim イメージには g++ が
+# 無く、clang を入れると c++ が clang++ になって失敗するため（#1289）、CI の ubuntu と同じく
+# gcc / g++ でビルドし、clang（libclang）は bindgen 用に使う。系統は ENV で明示する。
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         libfontconfig1-dev libfreetype-dev libgl1-mesa-dev libx11-dev libssl-dev \
-        llvm clang cmake pkg-config python3 make curl ca-certificates \
+        g++ llvm clang cmake pkg-config python3 make curl ca-certificates \
     && rm -rf /var/lib/apt/lists/*
+ENV CC=gcc CXX=g++
 
 WORKDIR /src
 COPY . .
@@ -93,8 +98,10 @@ COPY harness/render-screenshot/capture_screenshots.py \
      harness/render-screenshot/container/run-in-container.sh \
      /opt/render-screenshot/
 
-# 非 root。cli の既定プロファイル置き場（HOME 配下）を書き込めるようにする。
-RUN useradd --create-home --home-dir /home/measure --shell /usr/sbin/nologin measure \
+# 非 root。cli の既定プロファイル置き場（HOME 配下）を書き込めるようにする。uid / gid は
+# RUNBOOK の `--tmpfs /home/measure:uid=1000,gid=1000` と対で 1000 に固定する（#1289）。
+RUN useradd --uid 1000 --user-group --create-home --home-dir /home/measure \
+        --shell /usr/sbin/nologin measure \
     && chmod 0555 /opt/render-screenshot/run-in-container.sh
 USER measure
 ENV HOME=/home/measure
