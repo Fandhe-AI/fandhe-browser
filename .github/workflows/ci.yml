@@ -14,7 +14,7 @@ name: CI
 #   harness-{ubuntu,macos,windows}        rust または harness 時。分離検証・ハーネス・サイズ検査
 #   windows-servo-prereqs        rust 時。Servo の Windows ビルド前提の検証
 #   servo-host-ubuntu            servo 時（PR でも実行）。Servo ホストの fmt・clippy・test・分離検証・release（main/dispatch のみ）
-#   servo-host-{macos,windows}   servo 時（main・dispatch のみ。PR は skipped）。ホストの --locked ビルド・--selftest・test（cache なし）
+#   servo-host-{macos,windows}   servo 時（main・dispatch のみ）。ホストの --locked ビルド・--selftest・test・release ビルド
 #   cross-target-check           rust 時。Linux 上で macOS・Windows 向けに型検査（PR でも実行）
 #
 # 3 OS の実行時機（オーナー判断 2026-10-10。.claude/rules/ci.md「3 OS CI」）:
@@ -1303,14 +1303,17 @@ jobs:
   # 実行は push（main）・workflow_dispatch のみ（PR は skipped。ci.md「3 OS CI」）。cache なし
   # （servohost の cache は ubuntu のみ。1 世代の合計を 10GB 以内に保つ設計 §6.3 の v1 方針）。
   # 意図的に含めないもの（OS 非依存または別の関心事）: fmt・分離検証 C〜E（servo-host-ubuntu で実行済み）、
-  # clippy（check 成果物が build と共有されず依存を再コンパイルするため）、release ビルド・real_host 結合テスト。
+  # clippy（check 成果物が build と共有されず依存を再コンパイルするため）、real_host 結合テスト。
+  # release ビルドとサイズ記録（実行はしない）は末尾の [servo-host-release] で行う（#1279・親 #293・XOS-4）。
+  # release は lto・strip・panic=abort・opt-level=z で dev と別のリンク時失敗が起き得るため、macOS・Windows でも確認する。
   # 特定 OS だけ skip したり continue-on-error で通したりしない。失敗は原因を報告しオーナーが判断する（#1000）。
   servo-host-macos:
     needs: changes
     if: ${{ github.event_name != 'pull_request' && needs.changes.outputs.servo == 'true' }}
     runs-on: macos-latest
-    # cache なしのコールドビルド。workflow_dispatch の実測（最大 12.5 分。run 38842938258・38847207875）× 約 1.5（#999）
-    timeout-minutes: 20
+    # cache なしのコールドビルド。dev は workflow_dispatch の実測（最大 12.5 分。run 38842938258・38847207875）。
+    # release を足したジョブ全体の workflow_dispatch 実測 35.3 分（dev ビルド 10.8 分・release 23.9 分。run 40396545036）× 約 1.5（#1279）
+    timeout-minutes: 55
     permissions:
       contents: read
     env:
@@ -1379,6 +1382,37 @@ jobs:
           esac
       - name: "[servo-host] cargo test（dev・--locked）"
         run: cargo test --manifest-path servo-host/Cargo.toml --locked
+      - name: "[servo-host-release] release ビルド（main・workflow_dispatch のみ）"
+        if: ${{ !cancelled() && github.event_name != 'pull_request' }}
+        env:
+          SERVO_HOST_RELEASE_TARGET_DIR: ${{ runner.temp }}/servo-host-release
+        run: |
+          cargo build --manifest-path servo-host/Cargo.toml --locked --release \
+            --target-dir "$SERVO_HOST_RELEASE_TARGET_DIR"
+      # 記録のみ。閾値で fail させない（ゲート化はオーナー判断。servo-host-ubuntu と同じ）
+      - name: "[servo-host-release] リリースバイナリのサイズ記録（main・workflow_dispatch のみ）"
+        if: ${{ !cancelled() && github.event_name != 'pull_request' }}
+        env:
+          SERVO_HOST_RELEASE_TARGET_DIR: ${{ runner.temp }}/servo-host-release
+        run: |
+          bin="$SERVO_HOST_RELEASE_TARGET_DIR/release/fandhe-browser-servo-host"
+          if [ ! -f "$bin" ]; then
+            echo "error: release binary not found: $bin" >&2
+            exit 1
+          fi
+          size="$(wc -c < "$bin" | tr -d ' ')"
+          if [ "$size" -le 0 ]; then
+            echo "error: release binary is empty" >&2
+            exit 1
+          fi
+          echo "servo-host release binary: ${size} bytes"
+          {
+            echo "### servo-host release binary size"
+            echo
+            echo "| host | bin | bytes |"
+            echo "| ---- | --- | ----- |"
+            echo "| macos | fandhe-browser-servo-host | ${size} |"
+          } >> "$GITHUB_STEP_SUMMARY"
 
   # Windows 版。前提検証（SDK・MSVC v143・ATL・Python・uv）は windows-servo-prereqs と同一内容を内包する
   # （ATL の導入は VM をまたいで持ち越せず、ビルドするジョブ自身が持つ必要があるため）。2 か所は同一に保つこと
@@ -1388,8 +1422,9 @@ jobs:
     needs: changes
     if: ${{ github.event_name != 'pull_request' && needs.changes.outputs.servo == 'true' }}
     runs-on: windows-latest
-    # cache なしのコールドビルド。workflow_dispatch の実測（34 分。ANGLE のビルドを含む。run 38847207875）× 約 1.5（#999）
-    timeout-minutes: 55
+    # cache なしのコールドビルド。dev は workflow_dispatch の実測（34 分。ANGLE のビルドを含む。run 38847207875）。
+    # release を足したジョブ全体の workflow_dispatch 実測 57.6 分（dev ビルド 21.1 分・release 27.9 分。run 40396545036）× 約 1.5（#1279）
+    timeout-minutes: 90
     permissions:
       contents: read
     defaults:
@@ -1405,6 +1440,9 @@ jobs:
       CARGO_ENCODED_RUSTFLAGS: "-Ctarget-feature=-crt-static"
       # 長パス回避のための短い target-dir
       SERVO_HOST_TARGET_DIR: C:\st
+      # release の出力先。C: の空きは約 33.5GB で dev（C:\st）と release の 2 本のフルビルドが収まらない
+      # おそれがあるため、空きの多い D:（約 158GB）の短いパスに置く。cache しない（#1279）
+      SERVO_HOST_RELEASE_TARGET_DIR: D:\sr
       # Servo の Windows 前提の下限（XOS-6）
       MIN_WINDOWS_SDK: "10.0.19041.0"
       # v143 向け C++ ATL の VS コンポーネント ID（VS 2026 の 14.44 サイドバイサイド）
@@ -1649,6 +1687,35 @@ jobs:
           }
       - name: "[servo-host] cargo test（dev・--locked）"
         run: cargo test --manifest-path servo-host/Cargo.toml --locked --target-dir $env:SERVO_HOST_TARGET_DIR
+      - name: "[servo-host-release] release ビルド（main・workflow_dispatch のみ）"
+        if: ${{ !cancelled() && github.event_name != 'pull_request' }}
+        run: |
+          cargo build --manifest-path servo-host/Cargo.toml --locked --release `
+            --target-dir $env:SERVO_HOST_RELEASE_TARGET_DIR
+      # 記録のみ。閾値で fail させない（ゲート化はオーナー判断。servo-host-ubuntu と同じ）。
+      # 実行はしないため ANGLE の DLL は配置しない（ビルドの前提は上のステップで満たす）
+      - name: "[servo-host-release] リリースバイナリのサイズ記録（main・workflow_dispatch のみ）"
+        if: ${{ !cancelled() && github.event_name != 'pull_request' }}
+        run: |
+          $bin = Join-Path $env:SERVO_HOST_RELEASE_TARGET_DIR 'release\fandhe-browser-servo-host.exe'
+          if (-not (Test-Path $bin)) {
+            Write-Host "::error::release binary not found: $bin"
+            exit 1
+          }
+          $size = (Get-Item $bin).Length
+          if ($size -le 0) {
+            Write-Host "::error::release binary is empty"
+            exit 1
+          }
+          Write-Host "servo-host release binary: $size bytes"
+          Get-PSDrive -PSProvider FileSystem | Format-Table Name, Used, Free
+          @(
+            '### servo-host release binary size',
+            '',
+            '| host | bin | bytes |',
+            '| ---- | --- | ----- |',
+            "| windows | fandhe-browser-servo-host.exe | $size |"
+          ) | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
 
   harness-macos:
     needs: changes
