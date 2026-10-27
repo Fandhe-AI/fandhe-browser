@@ -8,6 +8,9 @@
 #   PAGES_DIR   保存済みページのルート（読み取り専用マウント想定。既定 /pages）
 #   OUT_DIR     出力先（既定 /out）
 #   EXTRA_ARGS  capture_screenshots.py へ渡す追加引数（空白区切り。例: "--min-sites 5"）
+#   BBOX_SELECTORS  任意。境界ボックス取得用セレクタファイルの**コンテナ内パス**（読み取り専用マウント想定。
+#               Issue #1282）。指定すると Servo の撮影を cli `screenshot` から `servo_bbox_driver.py` に
+#               切り替え、PNG と `<site_id>.bboxes.json` を同じホストセッションで書く。未指定なら従来どおり
 #
 # 配信ポートは 8080 固定（sites.saved-pages.json の URL と一致させるため、環境変数では変えられない）。
 #
@@ -52,6 +55,26 @@ python3 "${SCRIPT_DIR}/isolation_check.py" \
 # `--settle-ms` は両エンジンとも無効（`{settle_ms}` を使うテンプレートは capture_screenshots.py が拒否する）。
 # Servo に待ち時間の指定口を足すにはホストのプロトコル変更を伴うため別 Issue で扱う。
 SERVO_CMD="[\"${BIN_DIR}/fandhe-browser\",\"screenshot\",\"{url}\",\"{out}\"]"
+BBOX_ARGS=()
+if [ -n "${BBOX_SELECTORS:-}" ]; then
+  # JSON 配列へ埋め込むため、引用符・バックスラッシュを含むパスは拒否する（eval は使わない）。
+  case "${BBOX_SELECTORS}" in
+    *'"'* | *\\*)
+      echo "error: BBOX_SELECTORS must not contain double quotes or backslashes" >&2
+      exit 2
+      ;;
+  esac
+  if [ ! -f "${BBOX_SELECTORS}" ]; then
+    echo "error: BBOX_SELECTORS is not a regular file: ${BBOX_SELECTORS}" >&2
+    exit 2
+  fi
+  SERVO_CMD="[\"python3\",\"${SCRIPT_DIR}/servo_bbox_driver.py\",\"--host-bin\",\"${BIN_DIR}/fandhe-browser-servo-host\",\"--selectors\",\"${BBOX_SELECTORS}\",\"--assume-isolated\",\"{url}\",\"{out}\"]"
+  # 最悪ケース（hello + load + screenshot + 要素ごとの問い合わせ + shutdown）が既定の 90 秒を超え得るため。
+  # ドライバは各 RPC で TIMEOUT_SLACK_S（5 秒）を余分に待つので、スラック込みで
+  # 78 秒（10 + 35 + 25 + 8）+ 要素数 x 10 秒。300 秒は 20 要素まで。要素が多いなら EXTRA_ARGS で延ばす。
+  # argparse は後勝ちなので EXTRA_ARGS で上書きできる。
+  BBOX_ARGS=(--timeout-sec 300)
+fi
 
 # EXTRA_ARGS は意図的に単語分割する（引数は呼び出し側が与える。eval は使わない）。
 # shellcheck disable=SC2086
@@ -62,4 +85,5 @@ python3 "${SCRIPT_DIR}/capture_screenshots.py" \
   --out-dir "${OUT_DIR}" \
   --servo-cmd "${SERVO_CMD}" \
   --chromium-bin /usr/bin/chromium \
+  "${BBOX_ARGS[@]}" \
   ${EXTRA_ARGS:-}

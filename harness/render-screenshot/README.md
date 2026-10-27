@@ -597,7 +597,8 @@ python3 harness/render-screenshot/measure_ssim.py \
 ### 境界ボックスの入力契約（範囲外: 抽出処理そのもの）
 
 境界ボックスの**抽出**（Chromium の CDP `DOM.getBoxModel` 等・Servo 側の API）は
-本スクリプトの範囲外であり、TASK-36/38 の成果次第でまだ決まっていない。
+本スクリプトの範囲外である。Servo 側は `servo_bbox_driver.py`（下記。Issue #1282）が書く。
+Chromium 側は未定。
 本スクリプトはエンジンごとの**入力契約**だけを定義する:
 `<capture-dir>/<engine>/<site_id>.bboxes.json`
 
@@ -733,11 +734,111 @@ symlink 拒否に加えて `os.path.samefile`（inode 比較）で chromium/serv
 同一ファイル（ハードリンク等）でないことを検証し、比較が成立しないまま
 誤って合格させない。シェル実行・`eval`・`subprocess` は使わない。
 
+## `servo_bbox_driver.py`: Servo 側の境界ボックス取得（Issue #1282・TASK-37・`RENDER-5`・`MEAS-3`）
+
+Servo ホスト（`fandhe-browser-servo-host --stdio`）の `bounding_box` を直接呼び、PNG と
+境界ボックス JSON を書く駆動スクリプト。cli・CDP からは `bounding_box` を呼べないため、
+2026-10-27 のオーナー判断で本体（cli・render・servo-host）は変えず、ハーネス側に置いた。
+標準ライブラリのみで動く（依存を追加しない）。
+
+**状態**: 偽ホスト（`fixtures/fake_render_host.py`）によるオフライン検証のみ。実 Servo ホスト・
+実コンテナでの動作は未検証（#55 で人間が行う。`REPAIR-3`）。
+
+### なぜ `--servo-cmd` に差し込む形か
+
+`measure_ssim.py` は bbox JSON の `png_sha256` と `<engine>/<site_id>.png` の実体を照合し、
+一致しなければ `stale` として不合格にする。cli `screenshot` の撮影と本スクリプトの撮影は別の
+読み込みなので、本スクリプトの矩形を cli の PNG に紐付けられない。そこで本スクリプトは
+`capture_screenshots.py --saved-pages` の `--servo-cmd` として差し込める CLI にし、同じホスト
+セッションで撮った PNG を `{out}` へ書き、その SHA-256 を持つ `<stem>.bboxes.json` を隣に書く。
+PNG の検証（寸法など）と `capture-result.json` は `capture_screenshots.py` が担い、
+`measure_ssim.py` はそのまま読める。
+
+### 使い方
+
+```bash
+# capture_screenshots.py の --servo-cmd として（コンテナでは BBOX_SELECTORS で自動設定される）
+python3 harness/render-screenshot/capture_screenshots.py --saved-pages --allow-unproxied-engine \
+  --servo-cmd '["python3","servo_bbox_driver.py","--host-bin","/opt/fandhe/bin/fandhe-browser-servo-host","--selectors","/selectors.json","--assume-isolated","{url}","{out}"]' ...
+
+# 単体実行（--network none の隔離コンテナ内であることを --assume-isolated で明示する）
+python3 harness/render-screenshot/servo_bbox_driver.py --host-bin <host> --selectors <file> \
+  --assume-isolated http://pages.test:8080/<site_id>/index.html <out>/<site_id>.png
+```
+
+| 引数 | 内容 |
+| ---- | ---- |
+| `--host-bin` / `--host-cmd` | ホストのパス / argv の JSON 配列（テスト用。排他・どちらか必須。`--stdio` は自動で付く） |
+| `--selectors` | セレクタ入力ファイル（必須） |
+| `--site-id` | セレクタ入力の `site_id`（既定は `OUT_PNG` の stem） |
+| `--load-timeout-ms` | `load` の `timeout_ms`（1〜60000。省略時はホスト既定の 30000） |
+| `--assume-isolated` | 隔離コンテナ内で実行している旨の明示（必須。無ければ終了コード 2） |
+
+### セレクタ入力ファイル
+
+```json
+{
+  "schema_version": 1,
+  "sites": [
+    { "site_id": "example-site",
+      "elements": [ { "id": "header", "selector": "body > header" } ] }
+  ]
+}
+```
+
+上記は書式の例であり、**対象要素の選定の根拠ではない**（選定基準は #55 でオーナーが決める。
+実際のリストはコミットしない）。`site_id` は将来 Chromium 側の抽出で同じファイルを共有できるよう
+キーにしてある。制約: ファイル 1 MiB 以下・サイト 50 件以下・要素は 100 件以下、`id` は
+`measure_ssim.py` の規則（`^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$`・サイト内で一意）、`selector` は
+1〜1024 UTF-8 バイトで制御文字・U+2028・U+2029 を含まない（ホストの検証と同じ規則を先に適用）。
+未知キー・重複は拒否する。該当 `site_id` が無いサイトは PNG だけを書き、警告を出して終了コード 0
+（bbox は `measure_ssim.py` 側で `not_measured`。SSIM だけ先に測れる）。
+
+### 出力
+
+- `{out}`: ホストの `screenshot`（`full_page: false`）の PNG
+- `{out}` の `.png` を `.bboxes.json` に替えたパス: `measure_ssim.py` の入力契約（上記
+  「境界ボックスの入力契約」）に従う `schema_version`・`png_sha256`・`elements`。追加キー
+  （`measure_ssim.py` は読み飛ばす）として `coordinate_space`（`viewport_css_px`）、`errors`
+  （`not_found`・`invalid_params` になった要素の `{id, kind}`）、`source`（ツール名・ホストと Servo の版・
+  最終 URL が要求 URL と一致したか）を持つ。ページ由来の文字列は載せない
+- 座標はビューポート相対の CSS px（ホストの `getBoundingClientRect`）。`display:none` などの
+  表示されない要素は (0, 0, 0, 0) で返る（ホスト仕様。そのまま記録する）
+- 要素単位の失敗（`not_found`・`invalid_params`）は `elements` から外して `errors` に記録して続行する
+  （Servo 側に無い id は `measure_ssim.py` で不一致になり、合格を装わない）。`timeout`・`not_loaded`・
+  `internal` と `load` の失敗はサイト全体の失敗とし、PNG・bbox のどちらも残さない
+
+終了コード: 0（PNG を書いた）／1（ホスト・プロトコル・ページ読み込みの失敗）／2（引数・入力ファイル・URL 規則の違反）。
+
+### 信頼境界
+
+| 観点 | 対応 |
+| ---- | ---- |
+| URL | `check_saved_pages_url` を共有（`http://pages.test:<port>` のみ）。https・任意ホストへの抜け道は無い |
+| 隔離 | 単体実行は `--assume-isolated` 必須。`--servo-cmd` 経由では `capture_screenshots.py` が撮影前に隔離確認を行う |
+| ホスト起動 | シェル不使用・argv は `[host, "--stdio"]`。環境変数は `host_process/env.rs` と同じ許可リストのみ（`HOME`・`TMPDIR`・`XDG_*` を実行ごとの一時ディレクトリへ。`LANG`・`TZ`・`*_PROXY`・`LD_*`・`DYLD_*` は渡さない。`SEC-2`）。一時ディレクトリは終了時に削除 |
+| プロトコル | `docs/design/render-host-protocol.schema.json` 準拠。UA・ヘッダ・ビューポート等のパラメータは送らない。応答は untrusted（id・result/error の排他・型・範囲を検証。未知フィールドは無視。`REPAIR-4`） |
+| 資源 | 長さ接頭辞を確保前に上限と照合（hello 16 KiB・応答 1 MiB・screenshot 24 MiB・要求 64 KiB）。全段（送信を含む）にタイムアウトを付け、超えたらホストを kill する。受信キューは未消費 4 件・合計 48 MiB までで、超過は通信失敗としてホストを止める。ホストの stderr は継続的に読み捨て、末尾 4 KiB だけをメモリに保持する。base64 は厳密にデコードし、PNG は IHDR の寸法を応答と照合する |
+| 出力 | symlink を辿らない一時ファイル + `os.replace` で書く。出力ディレクトリが symlink なら拒否 |
+
+ホストは `capture_screenshots.py` と同じプロセスグループで起動するため、撮影のタイムアウトで
+グループごと終了される。SIGTERM も後始末（ホストの kill）へ流す。
+
+### 申し送り
+
+- Chromium 側の bbox 抽出（CDP `DOM.getBoxModel` 等）と、対象要素の選定は本スクリプトの範囲外（#55）
+- 最悪ケースの所要時間は、各 RPC で `TIMEOUT_SLACK_S`（5 秒）を余分に待つため、
+  hello 10 秒 + load 35 秒 + screenshot 25 秒 + 要素 x 10 秒 + shutdown 8 秒（= 78 秒 + 要素数 x 10 秒）で、
+  `capture_screenshots.py` の既定 `--timeout-sec`（90 秒）を超え得る。コンテナの `BBOX_SELECTORS` 指定時は
+  `--timeout-sec 300`（20 要素まで）を既定で付ける。要素が多い場合は `EXTRA_ARGS` で上書きする
+- セレクタ入力に `site_id` が無いサイトは PNG のみを書き、bbox JSON を出さない（空の bbox JSON は
+  計測済みの 0 要素と読まれ一致率 0% になるため。`measure_ssim.py` は not_measured として扱う）
+
 ## スコープ外・申し送り
 
 - 実機（Linux）での Servo・Chromium の撮影と合否判定: #55（人間が担当）
-- Servo 側の境界ボックスを取る stdio 駆動スクリプト（ホストの `bounding_box` を呼ぶ。2026-10-27 の
-  判断）: 未実装。Issue #1281 の範囲外で、別 Issue 化はユーザー承認が要る
+- Servo 側の境界ボックスを取る stdio 駆動スクリプト: `servo_bbox_driver.py`（Issue #1282）で実装済み
+  （偽ホストによるオフライン検証のみ。実機は未検証）。Chromium 側の抽出と要素選定は引き続き範囲外
 - cli・ハーネスに loopback を許す経路: 作らない（#1003 とまとめて決める）
 - 保存の基準（robots.txt・429 で欠けたときの代わりのサイト）: オーナー判断
 - 計測用コンテナの `Dockerfile`: ビルド未検証。ベースイメージのダイジェスト・Debian のスナップショット・
