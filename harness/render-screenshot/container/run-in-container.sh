@@ -80,12 +80,16 @@ if [ -n "${BBOX_SELECTORS:-}" ]; then
   CHROMIUM_ARGS=(--chromium-cmd "${CHROMIUM_CMD}")
   # 最悪ケースが既定の 90 秒を超え得るため。ドライバは各段で TIMEOUT_SLACK_S（5 秒）を余分に待つので、
   # 各段の上限の総和は、Servo 側が 78 秒（10 + 35 + 25 + 8）+ 要素数 x 10 秒、Chromium 側が
-  # 203 秒（起動と attach 60 + navigate 35 + load 待ち 35 + readyState 10 + フォント 15 + screenshot 25
-  # + URL 確認 15 + close 8）+ 要素数 x 10 秒。420 秒は Chromium 側で 21 要素まで。
+  # 293 秒 + 要素数 x 10 秒。内訳: navigate 前の通常 5 要求（getVersion・getTargets・attachToTarget・
+  # Page.enable・setLifecycleEventsEnabled）とビューポート調整の最大 5 要求が各 15 秒で 150 秒、
+  # navigate 35 + load 待ち 35 + readyState 10 + フォント 15 + screenshot 25 + URL 確認 15 + close 8 で 143 秒。
+  # Target.getTargets の再試行（最大 9 回 x 15.2 秒 = 約 137 秒）が重なると +137 秒。
+  # 900 秒は再試行込みの最悪ケース（約 430 秒）でも Chromium 側で約 47 要素まで。
   # 要素が多いなら EXTRA_ARGS で延ばす（argparse は後勝ち）。
   # Chromium は別のプロセスグループで動くため、これを超えて capture_one が kill しても Chromium には
-  # 届かない。ドライバ自身の各段のタイムアウトが先に切れて後始末する前提（README「信頼境界」）。
-  BBOX_ARGS=(--timeout-sec 420)
+  # 直接は届かない。ドライバが死ぬと、別セッションの見張り（watchdog）が Chromium のグループを kill し
+  # 一時ディレクトリを削除する（README「信頼境界」）。
+  BBOX_ARGS=(--timeout-sec 900)
 fi
 
 # EXTRA_ARGS は意図的に単語分割する（引数は呼び出し側が与える。eval は使わない）。

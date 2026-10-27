@@ -830,7 +830,7 @@ python3 harness/render-screenshot/servo_bbox_driver.py --host-bin <host> --selec
 - 最悪ケースの所要時間は、各 RPC で `TIMEOUT_SLACK_S`（5 秒）を余分に待つため、
   hello 10 秒 + load 35 秒 + screenshot 25 秒 + 要素 x 10 秒 + shutdown 8 秒（= 78 秒 + 要素数 x 10 秒）で、
   `capture_screenshots.py` の既定 `--timeout-sec`（90 秒）を超え得る。コンテナの `BBOX_SELECTORS` 指定時は
-  `--timeout-sec 420`（Servo 側は 20 要素超、Chromium 側は 21 要素まで）を既定で付ける。要素が多い場合は `EXTRA_ARGS` で上書きする
+  `--timeout-sec 900`（Servo 側は 20 要素超、Chromium 側は再試行込みの最悪ケースで約 47 要素まで）を既定で付ける。要素が多い場合は `EXTRA_ARGS` で上書きする
 - セレクタ入力に `site_id` が無いサイトは PNG のみを書き、bbox JSON を出さない（空の bbox JSON は
   計測済みの 0 要素と読まれ一致率 0% になるため。`measure_ssim.py` は not_measured として扱う）
 
@@ -921,14 +921,18 @@ PNG・bbox のどちらも残さない。終了コード: 0／1（Chromium・CDP
 プロセスグループ: Chromium は子孫（レンダラー・GPU・zygote）を持つため `start_new_session=True` で
 driver とは別のグループに置き、終了経路（正常・失敗・SIGTERM・自前のタイムアウト）では必ず
 `killpg(SIGKILL)` で後始末し、一時の `--user-data-dir` を削除する。**制約**: `capture_screenshots.py` の
-タイムアウト時の kill は driver のグループにしか届かず Chromium のグループには届かない。対策は
-(a) driver の各段のタイムアウトで自身が先に後始末すること、(b) driver が死ぬと pipe が閉じて Chromium が終了すること
-（(b) は実機では未検証）。
+タイムアウト時の kill は driver のグループにしか届かず Chromium のグループには直接届かない。対策は
+(a) driver の各段のタイムアウトで自身が先に後始末すること、(b) `_start_watchdog` が別セッションで起動する
+見張りプロセスが、driver の死（書き込み端 pipe の EOF。"x" の合図なし）を検出して Chromium のグループを
+`killpg(SIGKILL)` し、一時ディレクトリを削除すること。**残る制約**: 見張り自身が SIGKILL・OOM 等で
+先に死んだ場合、見張りは kill をかけられず回収されない（Chromium 側の pipe EOF 終了には依存しない）。
+また、見張りの回収は driver の死後に非同期で行われるため、capture_screenshots.py の戻り直後には
+Chromium が残っている可能性がある。実機での検証は未実施。
 
 ### 申し送り
 
-- 最悪ケースの所要時間: 各段の上限（スラック込み）の総和は 203 秒 + 要素数 x 10 秒。コンテナの
-  `BBOX_SELECTORS` 指定時は `--timeout-sec 420`（Chromium 側 21 要素まで）を既定で付ける。多い場合は `EXTRA_ARGS` で上書きする
+- 最悪ケースの所要時間: 各段の上限（スラック込み）の総和は 293 秒 + 要素数 x 10 秒（`Target.getTargets` の再試行が重なると +137 秒）。コンテナの
+  `BBOX_SELECTORS` 指定時は `--timeout-sec 900`（Chromium 側は再試行込みで約 47 要素まで）を既定で付ける。多い場合は `EXTRA_ARGS` で上書きする
 - 実機での動作（実 Chromium の pipe 実装・headless での rAF・`final_url_matches` の実際の一致）は未検証。#55 で確認する
 
 ## スコープ外・申し送り
