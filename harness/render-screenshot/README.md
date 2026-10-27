@@ -16,6 +16,9 @@ SSIM 0.90 以上・主要レイアウト要素の境界ボックスの 80% 以�
   `capture-result.json`（下記スキーマ）を入力として読み、サイトごとの SSIM 値と
   境界ボックス一致率を算出する（下記「`measure_ssim.py`: SSIM・境界ボックス比較」参照）
 - Linux 実機での測定と合否判定: #55（TASK-37.h1。人間が担当。手順は [RUNBOOK.md](RUNBOOK.md)）
+- 保存済みページの隔離撮影（`--saved-pages`。Issue #1281）: 現行の Servo ホスト（servo 0.6.0）は
+  検証プロキシ経由の撮影に対応しないため、`--network none` のコンテナ内で保存済みページを配って
+  撮る測定モードを持つ（下記「保存済みページの隔離撮影」）
 
 ### spec パスからの読み替え
 
@@ -73,7 +76,8 @@ Chromium 側はローカルに `chromium` / `chromium-browser` / `google-chrome`
 
 | 引数 | 意味 | 既定 |
 | --- | --- | --- |
-| `--sites` | サイト一覧 JSON のパス | 同じディレクトリの `sites.json` |
+| `--sites` | サイト一覧 JSON のパス | 同じディレクトリの `sites.json`（`--saved-pages` 時は `sites.saved-pages.json`） |
+| `--saved-pages` | 保存済みページモード（下記）。`http://pages.test:<port>/...` のみ許可・検証プロキシを起動しない・撮影前に隔離確認。dry-run 以外では `--allow-unproxied-engine` が必須 | ― |
 | `--out-dir` | 出力先（必須） | なし |
 | `--engines` | 撮影するエンジン（`servo`・`chromium`。カンマ区切り） | `servo,chromium` |
 | `--servo-cmd` | Servo 側のコマンドテンプレート（JSON 配列文字列） | なし（servo を撮るなら必須） |
@@ -325,6 +329,67 @@ servoshell 系（TASK-36 で確定したオプション名に合わせて読み�
 テンプレートを使う場合はこれらのフラグを自分で含める必要がある（含めない
 場合は `--allow-unproxied-engine` を明示しない限り撮影自体が拒否される）。
 
+## 保存済みページの隔離撮影（`--saved-pages`。Issue #1281・TASK-37・`RENDER-5`）
+
+Issue #55 のオーナー判断（2026-10-27）に基づく測定モード。現行の `fandhe-browser-servo-host`
+（servo 0.6.0）は proxy 系の Preferences を空に固定しており、検証プロキシ経由で実サイトを撮る
+従来経路は Servo では成り立たない。そこで、オフラインで保存したページを
+`docker run --network none` のコンテナ内の loopback HTTP サーバーから配り、Servo（cli
+`screenshot`）と Chromium の両方に同じ `http://pages.test:<port>/...` を渡して撮る。
+手順は [RUNBOOK.md](RUNBOOK.md)。
+
+| ファイル | 役割 |
+| -------- | ---- |
+| `sites.saved-pages.json` | `sites.json` と同じ 6 サイト（`id`・`category`・`catalog_id`）を `http://pages.test:8080/<site_id>/index.html` に向けたサイト一覧 |
+| `serve_pages.py` | 保存済みページを 127.0.0.1 固定で静的配信する（GET・HEAD のみ。ルート外・symlink は 404。ディレクトリ一覧なし） |
+| `isolation_check.py` | 撮影前の隔離確認（下記）。単体 CLI としても使える（終了コード 0 / 1 / 2） |
+| `container/` | 計測用コンテナの定義（`Dockerfile`・`Dockerfile.dockerignore`・`run-in-container.sh`） |
+
+保存ページはコミットしない（第三者の著作物・サイズ）。期待する構成は
+`<pages-root>/<site_id>/index.html` と、そのサブリソース。保存の方法・基準は人間の入力で、
+ハーネスに保存ツールは無い。
+
+`--saved-pages` の規則（fail-closed）:
+
+- サイト URL は `http`・ホストが `pages.test` と完全一致・1024〜65535 の明示ポート・userinfo なし・
+  全サイトが同一 origin。`https`・他ホスト・`file:` は `--allow-file-url` を指定しても拒否する。
+  `--saved-pages` なしの既定検証（https 必須）と `{url}` 直接ナビゲーションの許可リストは変えない
+  （`http://pages.test` は従来どおり `skipped`）。
+- テンプレートは `{url}` 必須、`{proxy}`・`{html_path}` は不可（違反は終了コード 2）。
+  Chromium の既定は `SAVED_PAGES_CHROMIUM_TEMPLATE`（検証プロキシ向け引数・`--virtual-time-budget` なし・`--no-sandbox` 明示）。
+  `{settle_ms}` も不可（Servo に待ち時間の指定口が無く、両エンジンを load 後の同じ時点で撮るため。RENDER-5）。
+- 検証プロキシは起動せず、`--egress-guard` は働かない（結果 JSON に `proxy` キーは付かない）。
+  隔離はコンテナのネットワーク名前空間の遮断を正とする。
+- dry-run 以外では `--allow-unproxied-engine` が必須（隔離が唯一の出口制御であることの明示）。
+  さらに撮影直前に `isolation_check.run_isolation_check` をプロセス内で実行し、不合格なら
+  エンジンを 1 つも起動せず終了コード 2（`captures: []` の結果 JSON を残す）。外部のレポート
+  ファイルは読まない（古い・差し替えられたレポートを受け付けない）。
+- `isolation_check` の項目: `interfaces`（`/proc/net/dev` に `lo` 以外が無い。`/proc` が無ければ
+  判定不能で失敗）・`external_dns`（公開 DNS 名の解決が失敗）・`external_ipv4` / `external_ipv6`
+  （公開 IP・メタデータアドレスへの TCP 接続が短いタイムアウト内に失敗。接続できても何も送らず閉じる）・
+  `pages_host`（`pages.test` の解決先がすべて loopback）・`loopback_pages`（各ページが 200 かつ本文あり。404 は未保存として `missing_urls` に記録し撮影対象から外す。全ページが 404 なら失敗。撮影後の共通 ok 件数は `--min-sites` で判定）。
+  `detail` はエラー種別・errno 程度で、取得本文は載せない。プロキシ系の環境変数は有無だけ記録する。
+
+`--no-sandbox` の根拠: コンテナ内では非 root かつユーザー名前空間が使えず Chromium の
+サンドボックスが起動できない。代わりに `--network none`・非 root・`--cap-drop ALL`・ページを
+読み取り専用でマウントする隔離で担保する。`DEFAULT_CHROMIUM_TEMPLATE` には足さない。
+
+`/etc/hosts` の別名（`--add-host pages.test:127.0.0.1`）の運用と制約: cli は IP リテラルと
+`localhost` の loopback を拒否するが DNS 名の解決先は検査しない。この運用は**その既知の制約
+（`servo-host-design.md` §2.5・§13）に依存**しており、#1003（出口の通信制御）の設計で cli が
+解決先を検査するようになれば使えなくなる。cli・ハーネスに loopback を許す経路は作らない
+（#1003 とまとめて決める）。
+
+コンテナ（`container/Dockerfile`）は multi-stage で、`build` ステージが servo-host と cli を
+Debian trixie で release ビルドし（glibc を runtime と揃える）、`runtime` ステージが Chromium を
+Debian の `snapshot.debian.org` の固定時刻と版（`ARG DEBIAN_SNAPSHOT`・`ARG CHROMIUM_VERSION`）で
+導入する。Playwright の Chromium は、ブラウザ本体の zip をこちらでハッシュ検証できないため
+採らなかった（apt の署名とスナップショットのほうが再現性と完全性で上回る）。ベースイメージは
+ダイジェスト固定。**定義済み・ビルド未検証**（CI ではビルドしない。実撮影は #55）。計測用の
+ローカル成果物で、イメージは push・配布しない（servo-host の MPL-2.0 部分を含むため。`NOTICE`・
+`LICENSE-THIRD-PARTY` は変更しない）。結果 JSON には `mode: "saved-pages"` と `isolation`
+（`schema_version: 1`・`checked_at`・`isolated`・`checks[]`・`environment`）が加わる。
+
 ## 出力構造
 
 ```text
@@ -362,7 +427,9 @@ servoshell 系（TASK-36 で確定したオプション名に合わせて読み�
       "input": "snapshot"
     }
   ],
-  "partial": true
+  "partial": true,
+  "mode": "saved-pages",
+  "isolation": { "schema_version": 1, "isolated": true, "checks": [] }
 }
 ```
 
@@ -370,6 +437,8 @@ servoshell 系（TASK-36 で確定したオプション名に合わせて読み�
 `viewport` と不一致・エンジンバイナリ不在等でプロセスを起動できなかった場合を含む）/
 `timeout` / `skipped`（`{html_path}` のスナップショット取得に失敗した場合）のいずれか。
 `partial` キーは `--engines` で 1 エンジンのみを指定した実行にのみ付く。
+`mode`・`isolation` は `--saved-pages` の実行にのみ付く追加キー（`schema_version` は 1 のまま。
+`measure_ssim.py` は読み飛ばす）。隔離確認に失敗した実行は `captures: []`・`partial: true` で残る。
 `captures[].proxy` は任意キー（上記「Servo 撮影コマンド」）。
 `input` は `"url"`（テンプレートが `{url}` を直接使う）・`"snapshot"`
 （`{html_path}` 経由でスナップショットを使う）・`"snapshot+url"`
@@ -667,6 +736,12 @@ symlink 拒否に加えて `os.path.samefile`（inode 比較）で chromium/serv
 ## スコープ外・申し送り
 
 - 実機（Linux）での Servo・Chromium の撮影と合否判定: #55（人間が担当）
+- Servo 側の境界ボックスを取る stdio 駆動スクリプト（ホストの `bounding_box` を呼ぶ。2026-10-27 の
+  判断）: 未実装。Issue #1281 の範囲外で、別 Issue 化はユーザー承認が要る
+- cli・ハーネスに loopback を許す経路: 作らない（#1003 とまとめて決める）
+- 保存の基準（robots.txt・429 で欠けたときの代わりのサイト）: オーナー判断
+- 計測用コンテナの `Dockerfile`: ビルド未検証。ベースイメージのダイジェスト・Debian のスナップショット・
+  Chromium の版は実在を確かめた値だが、採用はレビューでオーナーが確認する
 - 境界ボックスの抽出処理（Chromium の CDP `DOM.getBoxModel` 等・Servo 側の API。
   TASK-36/38 の成果次第）と、サイトごとの対象要素（5〜10 件）の選定
 - ±5% と 80% の解釈、および SSIM のパラメータ（上記「`measure_ssim.py`」の

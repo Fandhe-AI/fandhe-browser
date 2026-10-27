@@ -1072,6 +1072,31 @@ class LoadCaptureResultTest(unittest.TestCase):
             self.assertEqual(pairs[0]["site_id"], "a")
             self.assertEqual(skipped, [])
 
+    def test_accepts_saved_pages_mode_extra_keys(self) -> None:
+        # Issue #1281: 保存済みページモードの結果 JSON は `mode`・`isolation` を
+        # トップレベルに足す（schema_version は 1 のまま）。読み込みが拒否しないこと。
+        with tempfile.TemporaryDirectory() as tmp:
+            capture_dir = Path(tmp)
+            (capture_dir / "chromium").mkdir()
+            (capture_dir / "servo").mkdir()
+            (capture_dir / "chromium" / "a.png").write_bytes(b"x")
+            (capture_dir / "servo" / "a.png").write_bytes(b"x")
+            self._write_result(
+                capture_dir,
+                [
+                    self._capture_entry("a", "chromium", "ok", "chromium/a.png"),
+                    self._capture_entry("a", "servo", "ok", "servo/a.png"),
+                ],
+            )
+            path = capture_dir / "capture-result.json"
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            payload["mode"] = "saved-pages"
+            payload["isolation"] = {"schema_version": 1, "isolated": True, "checks": []}
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            _viewport, pairs, skipped = ms.load_capture_result(capture_dir)
+            self.assertEqual([p["site_id"] for p in pairs], ["a"])
+            self.assertEqual(skipped, [])
+
     def test_one_engine_failed_is_skipped(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             capture_dir = Path(tmp)

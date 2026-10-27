@@ -1,0 +1,45 @@
+{
+  "schema_version": 1,
+  "viewport": {
+    "width": 1280,
+    "height": 800
+  },
+  "sites": [
+    {
+      "id": "a1-wikipedia",
+      "url": "http://pages.test:8080/a1-wikipedia/index.html",
+      "category": "static",
+      "catalog_id": "a1"
+    },
+    {
+      "id": "a3-rust-book",
+      "url": "http://pages.test:8080/a3-rust-book/index.html",
+      "category": "static",
+      "catalog_id": "a3"
+    },
+    {
+      "id": "a4-python-docs",
+      "url": "http://pages.test:8080/a4-python-docs/index.html",
+      "category": "static",
+      "catalog_id": "a4"
+    },
+    {
+      "id": "c6-hacker-news",
+      "url": "http://pages.test:8080/c6-hacker-news/index.html",
+      "category": "lazy-load",
+      "catalog_id": "c6"
+    },
+    {
+      "id": "b1-react-dev",
+      "url": "http://pages.test:8080/b1-react-dev/index.html",
+      "category": "spa",
+      "catalog_id": "b1"
+    },
+    {
+      "id": "a2-mdn",
+      "url": "http://pages.test:8080/a2-mdn/index.html",
+      "category": "static",
+      "catalog_id": "a2"
+    }
+  ]
+}

@@ -2932,5 +2932,279 @@ class ProxyAuditWindowTest(unittest.TestCase):
         self.assertEqual(audit.delta_since(second)["denied_targets"], ["192.168.0.1:80"])
 
 
+SAVED_PAGES_SITES_PATH = Path(__file__).resolve().parent / "sites.saved-pages.json"
+
+
+def url_engine_template(mode: str = "ok") -> list[str]:
+    """`{url}` のみを渡し `{proxy}` を使わない偽エンジンのテンプレート（保存済みページモード用）。"""
+    return [
+        sys.executable,
+        str(FAKE_ENGINE),
+        "--mode",
+        mode,
+        "--out",
+        "{out}",
+        "--width",
+        "{width}",
+        "--height",
+        "{height}",
+        "--url",
+        "{url}",
+    ]
+
+
+def make_saved_site(site_id: str = "site-a", url: str = "http://pages.test:8080/site-a/index.html") -> dict:
+    return make_site(site_id, url)
+
+
+class SavedPagesLoadSitesTest(unittest.TestCase):
+    """Issue #1281 / TASK-37 / RENDER-5: `load_sites(url_policy="saved-pages")` の URL 規則。"""
+
+    def _load(self, urls: list[str], *, allow_file_url: bool = False):  # noqa: ANN202
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "sites.json"
+            write_sites_json(path, [make_site(f"site-{i}", u) for i, u in enumerate(urls)])
+            return cs.load_sites(path, 1, allow_file_url=allow_file_url, url_policy="saved-pages")
+
+    def test_accepts_pages_test_with_explicit_port(self) -> None:
+        _viewport, sites = self._load(["http://pages.test:8080/a/index.html", "http://pages.test:8080/b/"])
+        self.assertEqual([s.url for s in sites], ["http://pages.test:8080/a/index.html", "http://pages.test:8080/b/"])
+
+    def test_rejects_disallowed_urls(self) -> None:
+        for url in (
+            "https://pages.test:8080/a",
+            "http://pages.test.evil:8080/a",
+            "http://127.0.0.1:8080/a",
+            "http://localhost:8080/a",
+            "http://pages.test/a",
+            "http://pages.test:80/a",
+            "http://pages.test:1023/a",
+            "http://user:pw@pages.test:8080/a",
+            "http://user@pages.test:8080/a",
+            "http://pages.test:99999/a",
+            "file:///tmp/a.html",
+        ):
+            with self.subTest(url=url), self.assertRaises(cs.SiteListError):
+                self._load([url])
+
+    def test_rejects_file_url_even_with_allow_file_url(self) -> None:
+        with self.assertRaises(cs.SiteListError):
+            self._load(["file:///tmp/a.html"], allow_file_url=True)
+
+    def test_rejects_mixed_origins(self) -> None:
+        with self.assertRaises(cs.SiteListError):
+            self._load(["http://pages.test:8080/a", "http://pages.test:8081/b"])
+
+    def test_default_policy_still_rejects_pages_test(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "sites.json"
+            write_sites_json(path, [make_site("site-0", "http://pages.test:8080/a")])
+            with self.assertRaises(cs.SiteListError):
+                cs.load_sites(path, 1)
+
+    def test_unknown_policy_is_rejected(self) -> None:
+        with self.assertRaises(cs.SiteListError):
+            cs.load_sites(SAVED_PAGES_SITES_PATH, 1, url_policy="http")
+
+    def test_bundled_saved_pages_sites_match_default_sites_ids(self) -> None:
+        _v, saved = cs.load_sites(SAVED_PAGES_SITES_PATH, 1, url_policy="saved-pages")
+        _v, default = cs.load_sites(DEFAULT_SITES_PATH, 1)
+        self.assertEqual(
+            [(s.site_id, s.category, s.catalog_id) for s in saved],
+            [(s.site_id, s.category, s.catalog_id) for s in default],
+        )
+
+
+class SavedPagesTemplateTest(unittest.TestCase):
+    """Issue #1281: 保存済みページ用 Chromium テンプレートと既定テンプレートの差分。"""
+
+    def test_saved_pages_template_has_no_proxy_flags_and_has_no_sandbox(self) -> None:
+        joined = " ".join(cs.SAVED_PAGES_CHROMIUM_TEMPLATE)
+        self.assertNotIn("--proxy-server", joined)
+        self.assertNotIn("--proxy-bypass-list", joined)
+        self.assertNotIn("{proxy}", joined)
+        self.assertIn("--no-sandbox", cs.SAVED_PAGES_CHROMIUM_TEMPLATE)
+        self.assertIn("{url}", cs.SAVED_PAGES_CHROMIUM_TEMPLATE)
+
+    def test_default_template_is_unchanged(self) -> None:
+        self.assertNotIn("--no-sandbox", cs.DEFAULT_CHROMIUM_TEMPLATE)
+        self.assertIn("--proxy-server={proxy}", cs.DEFAULT_CHROMIUM_TEMPLATE)
+        rest = [a for a in cs.SAVED_PAGES_CHROMIUM_TEMPLATE if a != "--no-sandbox"]
+        expected = [
+            a
+            for a in cs.DEFAULT_CHROMIUM_TEMPLATE
+            if a
+            not in ("--proxy-server={proxy}", "--proxy-bypass-list=<-loopback>", "--virtual-time-budget={settle_ms}")
+        ]
+        self.assertEqual(rest, expected)
+        self.assertNotIn("{settle_ms}", " ".join(cs.SAVED_PAGES_CHROMIUM_TEMPLATE))
+
+
+class SavedPagesCaptureTest(unittest.TestCase):
+    """Issue #1281 / TASK-37 / RENDER-5: `--saved-pages` の結合テスト（偽エンジン・隔離確認は mock）。"""
+
+    PASS_REPORT = {"schema_version": 1, "isolated": True, "checks": [{"name": "x", "ok": True, "detail": "d"}]}
+    FAIL_REPORT = {"schema_version": 1, "isolated": False, "checks": [{"name": "x", "ok": False, "detail": "d"}]}
+
+    def _args(
+        self,
+        tmp: Path,
+        *,
+        servo: list[str] | None = None,
+        chromium: list[str] | None = None,
+        extra: list[str] | None = None,
+    ) -> list[str]:
+        sites_path = tmp / "sites.json"
+        write_sites_json(
+            sites_path,
+            [make_saved_site(f"site-{i}", f"http://pages.test:8080/site-{i}/index.html") for i in range(5)],
+        )
+        return [
+            "--saved-pages",
+            "--sites",
+            str(sites_path),
+            "--out-dir",
+            str(tmp / "out"),
+            "--servo-cmd",
+            json.dumps(servo or url_engine_template()),
+            "--chromium-cmd",
+            json.dumps(chromium or url_engine_template()),
+            *(extra or []),
+        ]
+
+    def test_both_engines_ok_records_mode_and_isolation_without_proxy(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_str:
+            tmp = Path(tmp_str)
+            with mock.patch.object(
+                cs.isolation_check, "run_isolation_check", return_value=self.PASS_REPORT
+            ), mock.patch.object(cs, "start_filtering_proxy") as start_proxy:
+                code = cs.main(self._args(tmp, extra=["--allow-unproxied-engine"]))
+            self.assertEqual(code, 0)
+            start_proxy.assert_not_called()
+            result = json.loads((tmp / "out" / "capture-result.json").read_text(encoding="utf-8"))
+            self.assertEqual(result["schema_version"], 1)
+            self.assertEqual(result["mode"], "saved-pages")
+            self.assertEqual(result["isolation"], self.PASS_REPORT)
+            self.assertEqual(len(result["captures"]), 10)
+            for capture in result["captures"]:
+                self.assertEqual(capture["status"], "ok")
+                self.assertEqual(capture["input"], "url")
+                self.assertNotIn("proxy", capture)
+
+    def test_failed_isolation_launches_no_engine_and_exits_2(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_str:
+            tmp = Path(tmp_str)
+            with mock.patch.object(cs.isolation_check, "run_isolation_check", return_value=self.FAIL_REPORT):
+                code = cs.main(self._args(tmp, extra=["--allow-unproxied-engine"]))
+            self.assertEqual(code, 2)
+            self.assertEqual(list((tmp / "out").glob("*/*.png")), [])
+            result = json.loads((tmp / "out" / "capture-result.json").read_text(encoding="utf-8"))
+            self.assertEqual(result["captures"], [])
+            self.assertFalse(result["isolation"]["isolated"])
+
+    def test_too_few_saved_pages_overwrites_stale_result_and_exits_2(self) -> None:
+        """保存ページ不足（404 等）で終了コード 2 のとき、古い成功結果を今回の失敗結果で上書きする（#1285）。"""
+        with tempfile.TemporaryDirectory() as tmp_str:
+            tmp = Path(tmp_str)
+            out = tmp / "out"
+            out.mkdir()
+            (out / "capture-result.json").write_text('{"captures": [{"status": "ok"}]}', encoding="utf-8")
+            report = {
+                **self.PASS_REPORT,
+                "missing_urls": [f"http://pages.test:8080/site-{i}/index.html" for i in range(3)],
+            }
+            with mock.patch.object(cs.isolation_check, "run_isolation_check", return_value=report):
+                code = cs.main(self._args(tmp, extra=["--allow-unproxied-engine"]))
+            self.assertEqual(code, 2)
+            result = json.loads((out / "capture-result.json").read_text(encoding="utf-8"))
+            self.assertEqual(result["captures"], [])
+            self.assertTrue(result["partial"])
+            self.assertEqual(result["isolation"], report)
+
+    def test_requires_allow_unproxied_engine(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_str:
+            tmp = Path(tmp_str)
+            with mock.patch.object(cs.isolation_check, "run_isolation_check") as check:
+                code = cs.main(self._args(tmp))
+            self.assertEqual(code, 2)
+            check.assert_not_called()
+            self.assertFalse((tmp / "out").exists())
+
+    def test_rejects_forbidden_templates(self) -> None:
+        bad_templates = {
+            "proxy": url_engine_template() + ["--proxy", "{proxy}"],
+            "html_path": url_engine_template() + ["--html", "{html_path}"],
+            "no_url": [sys.executable, str(FAKE_ENGINE), "--out", "{out}"],
+        }
+        for name, template in bad_templates.items():
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as tmp_str:
+                tmp = Path(tmp_str)
+                with mock.patch.object(cs.isolation_check, "run_isolation_check") as check:
+                    code = cs.main(self._args(tmp, servo=template, extra=["--allow-unproxied-engine"]))
+                self.assertEqual(code, 2)
+                check.assert_not_called()
+
+    def test_dry_run_skips_isolation_check_and_writes_nothing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_str:
+            tmp = Path(tmp_str)
+            with mock.patch.object(cs.isolation_check, "run_isolation_check") as check, mock.patch.object(
+                cs, "start_filtering_proxy"
+            ) as start_proxy:
+                code = cs.main(self._args(tmp, extra=["--dry-run"]))
+            self.assertEqual(code, 0)
+            check.assert_not_called()
+            start_proxy.assert_not_called()
+            self.assertFalse((tmp / "out").exists())
+
+    def test_default_sites_file_is_used_with_saved_pages(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_str:
+            tmp = Path(tmp_str)
+            code = cs.main(
+                [
+                    "--saved-pages",
+                    "--dry-run",
+                    "--out-dir",
+                    str(tmp / "out"),
+                    "--servo-cmd",
+                    json.dumps(url_engine_template()),
+                ]
+            )
+            self.assertEqual(code, 0)
+
+    def _capture_one(self, tmp: Path, url: str, *, saved_pages: bool) -> dict:
+        return cs.capture_one(
+            cs.Site("site-a", url, "static", "z1"),
+            "servo",
+            url_engine_template(),
+            out_dir=tmp / "out",
+            snapshots_dir=tmp / "out" / "snapshots",
+            chromium_bin=None,
+            width=1280,
+            height=800,
+            settle_ms=0,
+            timeout_sec=30,
+            allow_file_url=False,
+            dry_run=False,
+            allow_unproxied_engine=True,
+            saved_pages=saved_pages,
+        )
+
+    def test_without_flag_http_pages_test_is_still_skipped(self) -> None:
+        # 回帰: `--saved-pages` なしでは `http://pages.test` の直接ナビゲーションを許さない。
+        with tempfile.TemporaryDirectory() as tmp_str:
+            record = self._capture_one(Path(tmp_str), "http://pages.test:8080/a/index.html", saved_pages=False)
+            self.assertEqual(record["status"], "skipped")
+
+    def test_capture_one_rejects_other_host_even_in_saved_pages_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_str:
+            record = self._capture_one(Path(tmp_str), "http://127.0.0.1:8080/a", saved_pages=True)
+            self.assertEqual(record["status"], "skipped")
+
+    def test_capture_one_accepts_pages_test_in_saved_pages_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_str:
+            record = self._capture_one(Path(tmp_str), "http://pages.test:8080/a/index.html", saved_pages=True)
+            self.assertEqual(record["status"], "ok")
+
+
 if __name__ == "__main__":
     unittest.main()
