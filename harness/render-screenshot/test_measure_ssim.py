@@ -715,10 +715,27 @@ class LoadBboxesTest(unittest.TestCase):
     def test_rejects_oversized_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = self._write(tmp, {"schema_version": 1, "elements": []})
-            with mock.patch.object(Path, "stat") as stat_mock:
-                stat_mock.return_value = mock.Mock(st_size=ms.MAX_BBOX_FILE_BYTES + 1)
-                with self.assertRaises(ms.BboxError):
+            real_stat = Path.stat
+            calls: list[Path] = []
+
+            # Python 3.12・3.13 の `is_symlink()` は `lstat()` 経由で
+            # `self.stat(follow_symlinks=False)` を呼ぶため、`Path.stat` を
+            # 丸ごと Mock にすると `S_ISLNK` が TypeError になる。対象ファイルを
+            # symlink を辿る stat で見たときだけ st_size を差し替え、残りは本物に
+            # 委ねる（bbox 上限の検査: MEAS-3・RENDER-5・TASK-37）。
+            def fake_stat(self_path: Path, *args: object, **kwargs: object):
+                result = real_stat(self_path, *args, **kwargs)
+                if self_path == path and kwargs.get("follow_symlinks", True):
+                    calls.append(self_path)
+                    fields = list(result)
+                    fields[6] = ms.MAX_BBOX_FILE_BYTES + 1
+                    return os.stat_result(fields)
+                return result
+
+            with mock.patch.object(Path, "stat", fake_stat):
+                with self.assertRaisesRegex(ms.BboxError, "exceeds the .* byte limit"):
                     ms.load_bboxes(path)
+            self.assertGreaterEqual(len(calls), 1)
 
     def test_refuses_symlink(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
