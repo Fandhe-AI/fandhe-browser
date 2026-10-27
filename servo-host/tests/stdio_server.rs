@@ -4,7 +4,7 @@
 //! フレーム（u32 LE 長さ接頭辞 + UTF-8 JSON）を対話的に読み書きし、hello・`load`（ループバック
 //! HTTP サーバー相手。外部ネットワークへ出ない）・`screenshot`（PNG の復号と上下の色。#232）・
 //! 未実装メソッドの `unsupported`・`shutdown`・プロトコル違反時の終了コード・stdout の純粋性・
-//! ログの秘匿を確かめる。このテストバイナリ自体は Servo をリンクしない（`image` は PNG の復号のみ）。
+//! ログの秘匿・IntersectionObserver の公開とコールバック（#1294）を確かめる。このテストバイナリ自体は Servo をリンクしない（`image` は PNG の復号のみ）。
 
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -173,6 +173,28 @@ const BOX_BODY: &str = "<html><head><title>box</title></head><body style=\"margi
 <div id=\"off\" style=\"position:absolute;left:0;top:-1000px;width:50px;height:50px\"></div>\
 <div id=\"none\" style=\"display:none\"></div>\
 <div data-k=\"x'y\" style=\"position:absolute;left:100px;top:200px;width:60px;height:70px\"></div>\
+</body></html>";
+
+/// IntersectionObserver 用の fixture 本文（#1294）。`#exposed` は未公開なら非表示になり、
+/// `#fired` は意味のある entry でコールバックが呼ばれたときだけ表示される。
+const IO_BODY: &str = "<html><head><title>io</title></head><body style=\"margin:0\">\
+<div id=\"exposed\" style=\"position:absolute;left:0;top:0;width:20px;height:20px\"></div>\
+<div id=\"target\" style=\"position:absolute;left:100px;top:100px;width:50px;height:50px\"></div>\
+<div id=\"fired\" style=\"display:none;position:absolute;left:200px;top:200px;width:30px;height:30px\"></div>\
+<script>\
+if (typeof IntersectionObserver !== 'function') {\
+  document.getElementById('exposed').style.display = 'none';\
+} else {\
+  try {\
+    var io = new IntersectionObserver(function (entries) {\
+      if (entries.length > 0 && entries[0].isIntersecting === true && entries[0].target.id === 'target') {\
+        document.getElementById('fired').style.display = 'block';\
+      }\
+    });\
+    io.observe(document.getElementById('target'));\
+  } catch (e) {}\
+}\
+</script>\
 </body></html>";
 
 /// スクリーンショット用の fixture 本文（上半分が赤・下半分が青）。
@@ -452,6 +474,52 @@ fn visibility_reports_known_states_after_load() {
         !stderr.contains("data-k") && !stderr.contains("missing") && !stderr.contains("127.0.0.1"),
         "{stderr}"
     );
+
+    let _ = stop.send(());
+    let _ = srv.join();
+}
+
+/// RENDER-3・RENDER-5（TASK-38・#1294・#1273）: IntersectionObserver が公開され、load 後に
+/// コールバックが意味のある entry で呼ばれる。ホストに JS 評価メソッドは無いため、ページ JS の
+/// 副作用を `visibility` で観測する。外部ネットワークへは出ない（#1003）。
+#[test]
+fn intersection_observer_is_exposed_and_fires_after_load() {
+    let (port, srv, stop) = serve_http_with(IO_BODY, false);
+    let mut h = spawn(&["--stdio"]);
+    let _hello = h.recv();
+
+    h.send(&load_req(1, &format!("http://127.0.0.1:{port}/io"), 20_000));
+    let r: serde_json::Value = serde_json::from_str(&h.recv()).unwrap();
+    assert!(r["result"].is_object(), "{r}");
+
+    let vis = |id: u64, sel: &str| {
+        format!(r#"{{"v":1,"id":{id},"method":"visibility","params":{{"selector":"{sel}"}}}}"#)
+    };
+    h.send(&vis(2, "#exposed"));
+    assert_eq!(h.recv(), r#"{"v":1,"id":2,"result":{"visible":true}}"#);
+
+    // コールバックは update the rendering 後に呼ばれるため、有限回だけ再試行する。
+    let mut last = String::new();
+    for i in 0..20u64 {
+        let id = 10 + i;
+        h.send(&vis(id, "#fired"));
+        last = h.recv();
+        if last == format!(r#"{{"v":1,"id":{id},"result":{{"visible":true}}}}"#) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    assert!(
+        last.ends_with(r#""result":{"visible":true}}"#),
+        "IntersectionObserver callback did not fire: {last}"
+    );
+
+    h.send(r#"{"v":1,"id":99,"method":"shutdown"}"#);
+    assert_eq!(h.recv(), r#"{"v":1,"id":99,"result":{}}"#);
+    let (code, rest, stderr) = h.finish();
+    assert_eq!(code, Some(0), "stderr: {stderr}");
+    assert_eq!(rest, 0, "stdout must contain frames only");
+    assert!(!stderr.contains("127.0.0.1"), "{stderr}");
 
     let _ = stop.send(());
     let _ = srv.join();
