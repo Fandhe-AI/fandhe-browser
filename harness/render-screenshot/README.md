@@ -385,7 +385,8 @@ Debian trixie で release ビルドし（glibc を runtime と揃える）、`ru
 Debian の `snapshot.debian.org` の固定時刻と版（`ARG DEBIAN_SNAPSHOT`・`ARG CHROMIUM_VERSION`）で
 導入する。Playwright の Chromium は、ブラウザ本体の zip をこちらでハッシュ検証できないため
 採らなかった（apt の署名とスナップショットのほうが再現性と完全性で上回る）。ベースイメージは
-ダイジェスト固定。**定義済み・ビルド未検証**（CI ではビルドしない。実撮影は #55）。計測用の
+ダイジェスト固定。Linux 実機（x86_64）で 2026-10-27 にビルドと隔離撮影を確認した（#1289。CI では
+ビルドしない。合否判定は #55）。計測用の
 ローカル成果物で、イメージは push・配布しない（servo-host の MPL-2.0 部分を含むため。`NOTICE`・
 `LICENSE-THIRD-PARTY` は変更しない）。結果 JSON には `mode: "saved-pages"` と `isolation`
 （`schema_version: 1`・`checked_at`・`isolated`・`checks[]`・`environment`）が加わる。
@@ -841,7 +842,7 @@ python3 harness/render-screenshot/servo_bbox_driver.py --host-bin <host> --selec
   （偽ホストによるオフライン検証のみ。実機は未検証）。Chromium 側の抽出と要素選定は引き続き範囲外
 - cli・ハーネスに loopback を許す経路: 作らない（#1003 とまとめて決める）
 - 保存の基準（robots.txt・429 で欠けたときの代わりのサイト）: オーナー判断
-- 計測用コンテナの `Dockerfile`: ビルド未検証。ベースイメージのダイジェスト・Debian のスナップショット・
+- 計測用コンテナの `Dockerfile`: Linux 実機でビルド確認済み（#1289）。ベースイメージのダイジェスト・Debian のスナップショット・
   Chromium の版は実在を確かめた値だが、採用はレビューでオーナーが確認する
 - 境界ボックスの抽出処理（Chromium の CDP `DOM.getBoxModel` 等・Servo 側の API。
   TASK-36/38 の成果次第）と、サイトごとの対象要素（5〜10 件）の選定

@@ -139,14 +139,15 @@ fandhe-browser screenshot [--profile-dir D] <URL> <OUTPUT>
    ```bash
    docker run --rm --network none \
      --add-host pages.test:127.0.0.1 \
-     --read-only --tmpfs /tmp --tmpfs /home/measure \
+     --read-only --tmpfs /tmp --tmpfs /home/measure:uid=1000,gid=1000,mode=0700 \
      --cap-drop ALL --security-opt no-new-privileges \
      --memory 4g --pids-limit 512 --user measure \
      -v "$PAGES_ROOT":/pages:ro -v "$OUT":/out \
      fandhe-render-screenshot:local
    ```
 
-   `OUT` は `measure` ユーザーが書き込める空のディレクトリ。entrypoint
+   `OUT` は `measure` ユーザー（uid 1000）が書き込める空のディレクトリ。`/home/measure` の tmpfs は
+   既定で root 所有になり HOME に書けないため、`uid`・`gid` を付ける（#1289）。entrypoint
    （`container/run-in-container.sh`）は loopback の配信サーバー、隔離確認、撮影の順に実行する。
    `--network none` のもとで `--add-host` が `/etc/hosts` に反映されない環境では、隔離確認の
    `pages_host` 項目が fail-closed で検出して止まる。
