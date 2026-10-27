@@ -530,6 +530,66 @@ def _kill_group(pgid: int) -> None:
         pass
 
 
+# 見張りプロセスの本体（`python -I -c` で実行する）。argv: 読み取り fd・Chromium のグループ ID・一時ディレクトリ。
+# ドライバーが握る書き込み端が閉じられたとき（EOF）に、先に "x"（正常終了の合図）が届いていなければ
+# ドライバーが SIGKILL 等で異常終了したとみなし、Chromium のグループを kill して一時ディレクトリを消す。
+_WATCHDOG_SRC = """
+import os, shutil, signal, sys, time
+fd, pgid, workdir = int(sys.argv[1]), int(sys.argv[2]), sys.argv[3]
+try:
+    data = os.read(fd, 1)
+except OSError:
+    data = b""
+if data != b"x":
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except OSError:
+        pass
+    time.sleep(0.5)
+    shutil.rmtree(workdir, ignore_errors=True)
+"""
+
+
+def _start_watchdog(pgid: int, workdir: Path) -> tuple[int, subprocess.Popen[bytes]]:
+    """ドライバーの異常終了（SIGKILL を含む）でも Chromium のグループと一時ディレクトリを回収する見張りを起動する。
+
+    Chromium は `start_new_session=True` で別グループにあり、capture_screenshots.py がドライバーのグループへ
+    送る SIGKILL では死なず、`finally` も走らない。見張りは自分の別セッションで動くため巻き込まれず、
+    pipe の EOF（書き込み端を握るドライバーの死）を契機に回収する。戻り値は (書き込み端 fd, 見張り)。
+    """
+    wd_r, wd_w = os.pipe()
+    try:
+        wd = subprocess.Popen(  # noqa: S603  (argv 固定・シェル不使用)
+            [sys.executable, "-I", "-c", _WATCHDOG_SRC, str(wd_r), str(pgid), str(workdir)],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            close_fds=True,
+            pass_fds=(wd_r,),
+            start_new_session=True,
+        )
+    except OSError:
+        os.close(wd_w)
+        raise
+    finally:
+        os.close(wd_r)
+    return wd_w, wd
+
+
+def _disarm_watchdog(wd_w: int, wd: subprocess.Popen[bytes]) -> None:
+    """正常な後始末が済んだ合図（"x"）を送って見張りを止め、reap する。"""
+    try:
+        os.write(wd_w, b"x")
+    except OSError:
+        pass
+    os.close(wd_w)
+    try:
+        wd.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        wd.kill()
+        wd.wait()
+
+
 def _stop_chromium(proc: subprocess.Popen[bytes], graceful: bool) -> None:
     """Chromium を止める。正常時は猶予を待ち、いずれの場合も最後にグループごと kill して reap する。"""
     pgid = proc.pid  # start_new_session=True のため pid == pgid
@@ -584,6 +644,11 @@ def run_chromium(
                 os.close(to_w)
                 os.close(from_r)
         assert proc.stderr is not None
+        try:
+            wd_w, watchdog = _start_watchdog(proc.pid, workdir)
+        except OSError as exc:
+            _stop_chromium(proc, False)
+            raise svd.HostError(f"failed to start watchdog: {exc}") from exc
         stderr_tail = svd.StderrTail(proc.stderr)
         graceful = False
         stopped = False
@@ -606,6 +671,8 @@ def run_chromium(
             if not stopped:
                 _stop_chromium(proc, graceful)
             chan.close()
+            # グループを kill して reap した後に解除する（解除前に死んだ場合は見張りが回収する）。
+            _disarm_watchdog(wd_w, watchdog)
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
 

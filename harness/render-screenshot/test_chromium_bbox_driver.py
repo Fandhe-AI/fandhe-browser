@@ -300,6 +300,34 @@ class FailureScenarioTest(DriverCase):
                 alive = False
         self.assertFalse(alive, "grandchild process survived")
 
+    def test_driver_sigkill_is_cleaned_up_by_watchdog(self) -> None:
+        """ドライバーが SIGKILL されても（finally が走らなくても）Chromium の子孫が残らない。"""
+        import signal
+        import subprocess
+
+        argv = [sys.executable, str(HERE / "chromium_bbox_driver.py"), "--chromium-cmd", self.chromium_cmd("spawn_grandchild_and_hang"),
+                "--selectors", str(self.selectors), "--assume-isolated", URL, str(self.out)]
+        # capture_screenshots と同様、ドライバーを自分のグループで起動して、そのグループへ SIGKILL を送る。
+        proc = subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+        marker = Path(str(self.record) + ".grandchild")
+        deadline = time.monotonic() + 10
+        while not marker.exists() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        self.assertTrue(marker.exists(), "fake chromium did not start")
+        pid = int(marker.read_text(encoding="utf-8"))
+        time.sleep(0.3)
+        os.killpg(proc.pid, signal.SIGKILL)
+        proc.wait()
+        deadline = time.monotonic() + 10
+        alive = True
+        while alive and time.monotonic() < deadline:
+            try:
+                os.kill(pid, 0)
+                time.sleep(0.1)
+            except ProcessLookupError:
+                alive = False
+        self.assertFalse(alive, "grandchild survived driver SIGKILL")
+
     def test_launch_failure(self) -> None:
         err = io.StringIO()
         argv = ["--chromium-cmd", json.dumps(["/nonexistent/chromium"]), "--selectors", str(self.selectors),
