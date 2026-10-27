@@ -94,6 +94,7 @@ COPY harness/render-screenshot/capture_screenshots.py \
      harness/render-screenshot/serve_pages.py \
      harness/render-screenshot/measure_ssim.py \
      harness/render-screenshot/servo_bbox_driver.py \
+     harness/render-screenshot/chromium_bbox_driver.py \
      harness/render-screenshot/sites.saved-pages.json \
      harness/render-screenshot/container/run-in-container.sh \
      /opt/render-screenshot/

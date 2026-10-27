@@ -211,18 +211,25 @@ SSIM は Chromium を reference、Servo を target とした 7x7 一様窓の me
 「境界ボックスの入力契約」）を用意する必要があり、無いサイトは `not_measured` で不合格になる。
 
 - 1 サイトあたり主要要素 5〜10 件（Chromium 側が 5 件未満だと不合格）。要素の選定基準は未定。
-- Chromium 側は CDP の `DOM.getBoxModel` 等で取得できる見込みだが、取得スクリプトは本リポに無い。
+- Chromium 側は `chromium_bbox_driver.py`（Issue #1288）が、`--remote-debugging-pipe` の CDP で
+  PNG と `bboxes.json` を書く。使い方・信頼境界は README「`chromium_bbox_driver.py`」。座標は Servo と同じ
+  JS 関数式（`querySelector` の最初の一致・`getBoundingClientRect`・ビューポート相対の CSS px）で取る。
+  偽 Chromium でのオフライン検証のみで、**実機（実 Chromium・実コンテナ）では未検証**。
+  オーナー判断（2026-10-27）: (1) 撮影時点は load（`Page.navigate` の `loaderId` に紐付く `Page.lifecycleEvent`）-> `document.fonts.ready` -> rAF 1 回の後、
+  (2) `BBOX_SELECTORS` 指定時は Chromium の SSIM 基準 PNG も CDP `Page.captureScreenshot` で撮る
+  （`png_sha256` の契約に合わせ bbox と同じセッションで撮る）、(3) 対象要素は #55 のコメントで採用したセレクタ。
 - Servo 側は `servo_bbox_driver.py`（Issue #1282）が、ホストの `bounding_box` を stdio で呼んで
   PNG と `bboxes.json` を書く。使い方・セレクタ書式・信頼境界は README「`servo_bbox_driver.py`」。
   偽ホストでのオフライン検証のみで、**実機（実 Servo ホスト）では未検証**。
   - コンテナ: セレクタファイルを読み取り専用でマウントし、`BBOX_SELECTORS` に**コンテナ内のパス**を渡す。
     `SERVO_CMD` が cli `screenshot` から駆動スクリプトに切り替わり、Servo の PNG も駆動スクリプトが撮る
-    （`png_sha256` で bbox と PNG を対応付けるため）。例: `-v "$SELECTORS":/selectors.json:ro -e BBOX_SELECTORS=/selectors.json`
+    （`png_sha256` で bbox と PNG を対応付けるため）。Chromium 側も `--chromium-cmd` が駆動スクリプトに
+    切り替わる（`--screenshot` ではなく CDP の PNG になる）。例: `-v "$SELECTORS":/selectors.json:ro -e BBOX_SELECTORS=/selectors.json`
   - コンテナ外: `capture_screenshots.py` の `--servo-cmd` に駆動スクリプトのテンプレートを渡す（README の例）。
   - 対象要素（セレクタ）の選定は #55 でオーナーが決める。実際のリストはコミットしない。
 
-Chromium 側の取得スクリプトが無い間は、境界ボックスは「未測定」として記録し、SSIM のみを先に
-測定する（合格を装わない。REPAIR-3）。対象要素の選定基準は引き続きオーナー判断待ち。
+`BBOX_SELECTORS` を使わない実行や、`site_id` がセレクタ入力に無いサイトは、境界ボックスを「未測定」として
+記録し、SSIM のみを先に測定する（合格を装わない。REPAIR-3）。
 
 ## 7. 結果記録テンプレート
 
@@ -266,6 +273,7 @@ Issue #55 へ貼る。数値は `measure-result.json` から転記する。
 - 失敗・skipped のサイトと stderr_tail の要点: 記述
 - 境界ボックスの取得方法と要素選定: 記述（未測定の場合はその旨）
 - Servo PNG の取得経路: cli `screenshot` / `servo_bbox_driver.py`（bbox を取る場合は後者）
+- Chromium PNG の取得経路: `--screenshot` / CDP `Page.captureScreenshot`（`chromium_bbox_driver.py`。bbox を取る場合は後者）
 - セレクタファイルの SHA-256（`sha256sum`）: 記述（bbox を取った場合）
 
 ## 判定
