@@ -67,6 +67,9 @@ def main() -> int:
         if args.record:
             Path(args.record + ".grandchild").write_text(str(child.pid), encoding="utf-8")
 
+    # 外枠 = --window-size。ビューポートは外枠より CHROME_H だけ低い（headless=new を模す）。
+    chrome_h = 0 if scenario == "viewport_equals_window" else 85
+    win = {"width": width, "height": height}
     navigated_url = "about:blank"
     first = True
     while True:
@@ -96,6 +99,17 @@ def main() -> int:
             reply["result"] = {"targetInfos": [{"targetId": TARGET, "type": "page", "url": "about:blank"}]}
         elif method == "Target.attachToTarget":
             reply["result"] = {"sessionId": SESSION}
+        elif method == "Page.getLayoutMetrics":
+            reply["result"] = {
+                "cssLayoutViewport": {"clientWidth": win["width"], "clientHeight": win["height"] - chrome_h}
+            }
+        elif method == "Browser.getWindowForTarget":
+            reply["result"] = {"windowId": 7, "bounds": dict(win)}
+        elif method == "Browser.setWindowBounds":
+            if scenario != "set_bounds_ignored":
+                win["width"] = params["bounds"]["width"]
+                win["height"] = params["bounds"]["height"]
+            reply["result"] = {}
         elif method == "Page.enable":
             reply["result"] = {}
             if scenario == "event_flood":
@@ -140,7 +154,7 @@ def main() -> int:
             elif scenario == "bad_base64":
                 data = "!!!not-base64!!!"
             else:
-                data = base64.b64encode(png_bytes(width, height)).decode()
+                data = base64.b64encode(png_bytes(win["width"], win["height"] - chrome_h)).decode()
             reply["result"] = {"data": data}
         elif method == "Target.getTargetInfo":
             reply["result"] = {"targetInfo": {"targetId": TARGET, "url": navigated_url}}

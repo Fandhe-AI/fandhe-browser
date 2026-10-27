@@ -116,6 +116,10 @@ class OkScenarioTest(DriverCase):
                 "Target.getTargets",
                 "Target.attachToTarget",
                 "Page.enable",
+                "Page.getLayoutMetrics",
+                "Browser.getWindowForTarget",
+                "Browser.setWindowBounds",
+                "Page.getLayoutMetrics",
                 "Page.navigate",
                 "Runtime.evaluate",
                 "Page.captureScreenshot",
@@ -126,21 +130,30 @@ class OkScenarioTest(DriverCase):
             ],
         )
         self.assertEqual(reqs[2]["params"], {"targetId": "TARGET-1", "flatten": True})
-        self.assertEqual(reqs[4]["params"], {"url": URL})
-        self.assertEqual(reqs[5]["params"]["expression"], drv.FONTS_AND_FRAME_EXPR)
-        self.assertTrue(reqs[5]["params"]["awaitPromise"])
+        # 外枠 1280x800 に対しビューポートは高さ 85 少ない。差分だけ外枠を広げる。
+        self.assertEqual(reqs[5]["params"], {"targetId": "TARGET-1"})
         self.assertEqual(
-            reqs[6]["params"], {"format": "png", "captureBeyondViewport": False, "fromSurface": True}
+            reqs[6]["params"],
+            {"windowId": 7, "bounds": {"windowState": "normal", "width": 1280, "height": 885}},
+        )
+        self.assertEqual(reqs[8]["params"], {"url": URL})
+        self.assertEqual(reqs[9]["params"]["expression"], drv.FONTS_AND_FRAME_EXPR)
+        self.assertTrue(reqs[9]["params"]["awaitPromise"])
+        self.assertEqual(
+            reqs[10]["params"], {"format": "png", "captureBeyondViewport": False, "fromSurface": True}
         )
         # browser レベルには sessionId が無く、page レベルには付く。
         for r in reqs:
-            if r["method"] in ("Browser.getVersion", "Target.getTargets", "Target.attachToTarget", "Target.getTargetInfo", "Browser.close"):
+            if r["method"] in (
+                "Browser.getVersion", "Target.getTargets", "Target.attachToTarget", "Target.getTargetInfo",
+                "Browser.close", "Browser.getWindowForTarget", "Browser.setWindowBounds",
+            ):
                 self.assertNotIn("sessionId", r)
             else:
                 self.assertEqual(r["sessionId"], "SESSION-1")
         # セレクタは JSON 文字列リテラルとしてだけ埋め込まれる。
-        self.assertEqual(reqs[7]["params"]["expression"], drv.BOUNDING_BOX_FN + '("body > header")')
-        self.assertEqual(reqs[8]["params"]["expression"], drv.BOUNDING_BOX_FN + '("main")')
+        self.assertEqual(reqs[11]["params"]["expression"], drv.BOUNDING_BOX_FN + '("body > header")')
+        self.assertEqual(reqs[12]["params"]["expression"], drv.BOUNDING_BOX_FN + '("main")')
         bbox_path = svd.bbox_path_for(self.out)
         self.assertEqual(bbox_path.name, "site-a.bboxes.json")
         loaded = ms.load_bboxes(bbox_path)
@@ -183,7 +196,7 @@ class OkScenarioTest(DriverCase):
             methods,
             {
                 "Browser.getVersion", "Target.getTargets", "Target.attachToTarget", "Page.enable", "Page.navigate",
-                "Runtime.evaluate", "Page.captureScreenshot", "Target.getTargetInfo", "Browser.close",
+                "Page.getLayoutMetrics", "Browser.getWindowForTarget", "Browser.setWindowBounds", "Runtime.evaluate", "Page.captureScreenshot", "Target.getTargetInfo", "Browser.close",
             },
         )
         for m in methods:
@@ -267,6 +280,29 @@ class FailureScenarioTest(DriverCase):
 
     def test_nonfinite_rect(self) -> None:
         self.assertFails("nonfinite_rect", "must be a number")
+
+    def test_viewport_not_fitted_after_resize(self) -> None:
+        self.assertFails("set_bounds_ignored", "viewport size does not match")
+
+    def test_late_response_after_deadline_is_rejected(self) -> None:
+        """期限後に届いた応答（イベントがキューに残っている間）を成功として受理しない。"""
+        r_in, w_in = os.pipe()
+        r_out, w_out = os.pipe()
+        with os.fdopen(w_out, "wb") as to_c, os.fdopen(r_in, "rb", buffering=0) as from_c:
+            chan = drv.CdpChannel(to_c, from_c)
+            chan.next_id = 1
+            for body in (b'{"method":"Page.frameStartedLoading","params":{}}', b'{"id":1,"result":{}}'):
+                os.write(w_in, body + b"\0")
+            while chan._queue.qsize() < 2:
+                time.sleep(0.01)
+            calls = iter([0.0])
+            with mock.patch.object(drv.time, "monotonic", side_effect=lambda: next(calls, 1000.0)):
+                with self.assertRaises(drv.CdpTimeout):
+                    chan.call("Browser.getVersion", timeout=1.0)
+            # 読み取りスレッドが EOF で抜けてから fdopen を閉じる（読み取り中の close はブロックする）。
+            os.close(w_in)
+            os.close(r_out)
+            chan._thread.join(5)
 
     def test_event_flood(self) -> None:
         self.assertFails("event_flood", "unsolicited")

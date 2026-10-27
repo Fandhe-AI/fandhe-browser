@@ -315,7 +315,11 @@ class CdpChannel:
         self.max_message = max_message
         self.send(message, timeout)
         while True:
-            reply = self.recv(deadline - time.monotonic())
+            # イベントが続く間も絶対期限を毎周確認する（期限後に届いた応答を成功として受理しない）。
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise CdpTimeout(f"{method}: timed out waiting for the response")
+            reply = self.recv(remaining)
             if not isinstance(reply, dict):
                 raise svd.HostError(f"{method}: message is not an object")
             if "id" not in reply:
@@ -395,6 +399,56 @@ def decode_screenshot(result: dict[str, Any], scratch: Path, width: int, height:
     return data
 
 
+def _layout_viewport(chan: CdpChannel, timeout: float) -> tuple[int, int]:
+    """`Page.getLayoutMetrics` から実ビューポート（CSS px）の寸法を取る。"""
+    metrics = chan.call("Page.getLayoutMetrics", timeout=timeout, session=True)
+    viewport = metrics.get("cssLayoutViewport")
+    if not isinstance(viewport, dict):
+        raise svd.HostError("Page.getLayoutMetrics: cssLayoutViewport must be an object")
+    dims = []
+    for key in ("clientWidth", "clientHeight"):
+        value = viewport.get(key)
+        if isinstance(value, bool) or not isinstance(value, int) or not 0 < value <= 100_000:
+            raise svd.HostError(f"Page.getLayoutMetrics: {key} must be a positive integer")
+        dims.append(value)
+    return dims[0], dims[1]
+
+
+def fit_viewport_to_window_size(chan: CdpChannel, target_id: str, width: int, height: int, timeout: float) -> None:
+    """実ビューポートを要求寸法に合わせる（RENDER-5 の同条件比較）。
+
+    `--window-size` は外枠の寸法で、headless=new ではページのビューポートと一致しない。
+    差分だけ `Browser.setWindowBounds`（通常のウィンドウ操作）で外枠を広げ縮め、`Emulation.*` は使わない。
+    """
+    current = _layout_viewport(chan, timeout)
+    if current == (width, height):
+        return
+    window = chan.call("Browser.getWindowForTarget", {"targetId": target_id}, timeout=timeout)
+    window_id = window.get("windowId")
+    bounds = window.get("bounds")
+    if isinstance(window_id, bool) or not isinstance(window_id, int) or not isinstance(bounds, dict):
+        raise svd.HostError("Browser.getWindowForTarget: unexpected result")
+    outer = []
+    for key, delta in (("width", width - current[0]), ("height", height - current[1])):
+        value = bounds.get(key)
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise svd.HostError(f"Browser.getWindowForTarget: bounds.{key} must be a positive integer")
+        target = value + delta
+        if not 0 < target <= 100_000:
+            raise svd.HostError("cannot fit the viewport to the requested size")
+        outer.append(target)
+    try:
+        chan.call(
+            "Browser.setWindowBounds",
+            {"windowId": window_id, "bounds": {"windowState": "normal", "width": outer[0], "height": outer[1]}},
+            timeout=timeout,
+        )
+    except CdpRpcError as exc:
+        raise svd.HostError(f"Browser.setWindowBounds failed: {exc}") from exc
+    if _layout_viewport(chan, timeout) != (width, height):
+        raise svd.HostError(f"viewport size does not match the requested {(width, height)} after resizing the window")
+
+
 def interpret_bbox_value(value: Any) -> dict[str, Any]:
     """`BOUNDING_BOX_FN` の戻り値を解釈する。`{"kind": ...}`（要素単位の失敗）または `{"box": ...}`。"""
     if not isinstance(value, dict):
@@ -456,6 +510,7 @@ def drive(
         raise svd.HostError("Target.attachToTarget: sessionId must be a non-empty string")
     chan.session = session
     chan.call("Page.enable", timeout=startup, session=True)
+    fit_viewport_to_window_size(chan, target_id, width, height, startup)
 
     load_wait = (DEFAULT_LOAD_TIMEOUT_MS if load_timeout_ms is None else load_timeout_ms) / 1000 + TIMEOUT_SLACK_S
     chan.load_seen = False
