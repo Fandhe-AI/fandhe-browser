@@ -15,7 +15,7 @@
 
 ## Servo（MPL-2.0）の隔離
 
-オーナー判断（2026-10-12・Issue #915）により、Servo は本体の workspace に入れず、別 workspace・別 `Cargo.lock` の子プロセス（以下「Servo ホスト」）として組み込む。本体の依存グラフから MPL-2.0 を完全に外す変更で、隔離を緩めるものではない。採用版は `servo =0.6.0`。設計は `docs/design/servo-host-design.md`（Issue #935）で確定し（オーナー判断 2026-10-15）、`servo-host/` に置く。
+オーナー判断（2026-10-12・Issue #915）により、Servo は本体の workspace に入れず、別 workspace・別 `Cargo.lock` の子プロセス（以下「Servo ホスト」）として組み込む。本体の依存グラフから MPL-2.0 を完全に外す変更で、隔離を緩めるものではない。採用版は `servo =0.6.0`（0.6 LTS 系列。#915）。ただし #1297（オーナー承認 2026-10-28）により、MDN のハング（上流 servo/servo#45915。修正 #47693 は 0.7.0 に含まれ 0.6 LTS には戻らない。#1291）の修正を取り込み IntersectionObserver の pref を有効にするため、現在は一時的に `servo =0.7.0`（LTS ではない月次版）へ上げている。緩和するのは LTS の条件だけで、隔離（`RENDER-1`）と MPL の扱い（`OSS-2`・`OSS-3`）は変えない。月次版にはセキュリティ修正が戻らないため、修正を含む次の LTS（6 か月ごと）が出たら LTS 系列へ戻す。それまでは上流の新しい版を追う。spec 本文の採用版の記載は spec リポ側で更新する（本リポからは編集しない）。設計は `docs/design/servo-host-design.md`（Issue #935）で確定し（オーナー判断 2026-10-15）、`servo-host/` に置く。
 
 - 本体の workspace の依存グラフに Servo 系クレートを入れない。`fandhe-browser-render` を Servo に依存させない（TASK-33。render は Servo ホストへの IPC クライアント）
 - 既定ビルドに Servo が含まれないことの検証（`RENDER-1`・`scripts/check-render-isolation.sh`）は、従来どおり維持する

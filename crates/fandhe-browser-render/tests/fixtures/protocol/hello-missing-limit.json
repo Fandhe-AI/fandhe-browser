@@ -7,7 +7,7 @@
     "event": "hello",
     "data": {
       "host_version": "0.0.0",
-      "servo_version": "0.6.0",
+      "servo_version": "0.7.0",
       "protocol": {
         "min": 1,
         "max": 1

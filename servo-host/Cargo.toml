@@ -5,7 +5,10 @@
 # docs/design/servo-host-design.md §1.1〜§1.3）。ルート Cargo.toml は
 # `exclude = ["servo-host"]` で本ディレクトリを物理的に除外している。
 # Servo は #988（TASK-38）で `=0.6.0` 完全固定・default-features 無効で追加した
-# （`baked-in-resources` は起動に必須。オーナー承認 2026-10-15）。`dpi`・`url` は未承認のため
+# （`baked-in-resources` は起動に必須。オーナー承認 2026-10-15）。#1297 で `=0.7.0` に上げた
+# （オーナー承認 2026-10-28）。0.7.0 は LTS ではない月次版で、spec の採用版（0.6 LTS 系列。#229）を
+# 一時的に緩めている。MDN のハング（servo/servo#45915）の修正を取り込み IntersectionObserver を
+# 有効にするためで、修正を含む次の LTS が出たら LTS 系列へ戻す。`dpi`・`url` は未承認のため
 # 直接依存にせず、Servo の再エクスポート（`ServoUrl` 等）を使う。`image` はスクリーンショットの PNG エンコード用に
 # #232 の記載（オーナー承認 2026-10-15）に基づき `png` 機能のみで追加した（Cargo.lock に同版が既にあり新規 crate は増えない）。
 # `serde_json` は stdio サーバー（#993）のフレーム JSON 用（オーナー承認済み。Servo 経由で
@@ -24,7 +27,7 @@ name = "fandhe-browser-servo-host"
 path = "src/main.rs"
 
 [dependencies]
-servo = { version = "=0.6.0", default-features = false, features = ["baked-in-resources"] }
+servo = { version = "=0.7.0", default-features = false, features = ["baked-in-resources"] }
 serde_json = "=1.0.154"
 image = { version = "=0.25.10", default-features = false, features = ["png"] }
 
@@ -33,7 +36,7 @@ image = { version = "=0.25.10", default-features = false, features = ["png"] }
 # 作れない。ANGLE なら D3D11 WARP で動く。feature は上の `servo` と統合され、Linux・macOS は変わらない。
 # 実行時に libEGL.dll・libGLESv2.dll（mozangle の OUT_DIR）が exe の隣か PATH に要る。
 [target.'cfg(windows)'.dependencies]
-servo = { version = "=0.6.0", default-features = false, features = ["baked-in-resources", "no-wgl"] }
+servo = { version = "=0.7.0", default-features = false, features = ["baked-in-resources", "no-wgl"] }
 
 # 本体とは独立した workspace ルートであることを宣言する（空テーブル）。
 [workspace]

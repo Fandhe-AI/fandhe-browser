@@ -22,7 +22,7 @@
     （依存最小方針・Cargo.toml には触れない）。
 
 保存済みページモード（`--saved-pages`。Issue #1281・#55 のオーナー判断 2026-10-27）:
-    現行の `fandhe-browser-servo-host`（servo 0.6.0）は proxy 系の Preferences を
+    現行の `fandhe-browser-servo-host`（servo 0.7.0）は proxy 系の Preferences を
     持たないため、検証プロキシ経由で実サイトを撮る従来経路は Servo では成り立たない。
     代わりに、オフラインで保存したページを `docker run --network none` のコンテナ内
     loopback HTTP サーバー（`serve_pages.py`）から配り、Servo（cli `screenshot`）と

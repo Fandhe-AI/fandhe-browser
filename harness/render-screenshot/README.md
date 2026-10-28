@@ -16,7 +16,7 @@ SSIM 0.90 以上・主要レイアウト要素の境界ボックスの 80% 以�
   `capture-result.json`（下記スキーマ）を入力として読み、サイトごとの SSIM 値と
   境界ボックス一致率を算出する（下記「`measure_ssim.py`: SSIM・境界ボックス比較」参照）
 - Linux 実機での測定と合否判定: #55（TASK-37.h1。人間が担当。手順は [RUNBOOK.md](RUNBOOK.md)）
-- 保存済みページの隔離撮影（`--saved-pages`。Issue #1281）: 現行の Servo ホスト（servo 0.6.0）は
+- 保存済みページの隔離撮影（`--saved-pages`。Issue #1281）: 現行の Servo ホスト（servo 0.7.0）は
   検証プロキシ経由の撮影に対応しないため、`--network none` のコンテナ内で保存済みページを配って
   撮る測定モードを持つ（下記「保存済みページの隔離撮影」）
 
@@ -332,7 +332,7 @@ servoshell 系（TASK-36 で確定したオプション名に合わせて読み�
 ## 保存済みページの隔離撮影（`--saved-pages`。Issue #1281・TASK-37・`RENDER-5`）
 
 Issue #55 のオーナー判断（2026-10-27）に基づく測定モード。現行の `fandhe-browser-servo-host`
-（servo 0.6.0）は proxy 系の Preferences を空に固定しており、検証プロキシ経由で実サイトを撮る
+（servo 0.7.0）は proxy 系の Preferences を空に固定しており、検証プロキシ経由で実サイトを撮る
 従来経路は Servo では成り立たない。そこで、オフラインで保存したページを
 `docker run --network none` のコンテナ内の loopback HTTP サーバーから配り、Servo（cli
 `screenshot`）と Chromium の両方に同じ `http://pages.test:<port>/...` を渡して撮る。

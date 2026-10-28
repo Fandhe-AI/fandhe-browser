@@ -78,9 +78,9 @@ FreeType の帰属 (Servo ホストの配布物。TASK-38・Issue #996):
    `fandhe-browser-servo-host` バイナリと、それを含むコンテナイメージ) の配布物のみである。
 2. 本体バイナリ (`fandhe-browser-cli` 等) と既定・軽量コンテナには Servo は含まれない
    (RENDER-1。`scripts/check-render-isolation.sh`・`scripts/check-servo-host-isolation.sh` で検証)。
-3. Servo の版は 0.6.0 (`servo-host/Cargo.toml` で `=0.6.0` に固定)。ソースは
-   https://github.com/servo/servo のタグ `v0.6.0` (コミット
-   c78d2c206f80a1c8b67eefa97f773bba513205d3) から入手できる。
+3. Servo の版は 0.7.0 (`servo-host/Cargo.toml` で `=0.7.0` に固定)。ソースは
+   https://github.com/servo/servo のタグ `v0.7.0` (コミット
+   aac43a3f31a259f04a574f5ec4e959c943ad7cc7) から入手できる。
 4. Servo のソースは改変しない。
 5. Servo 以外にホストの依存として入る MPL-2.0 の crate (`stylo*`・`webrender*`・
    `mozjs_*` (SpiderMonkey)・`selectors` 等) にも MPL-2.0 が適用される。各版は
@@ -110,9 +110,11 @@ docker/license-supplements/ に同梱した上流正本の全文 (タグ付き�
 (同スクリプトの流用を想定。別 Issue で扱う)。
 
 Servo ホストの配布物には、本体とは別の LICENSE-CARGO-DEPENDENCIES
-(`webpki-roots` 1.0.9 の CDLA-Permissive-2.0 を含む) を同梱する方針である。ただし
-現状は未整備である (REPAIR-3)。`servo-host/Cargo.lock` の外部 crate 509 件のうち
-93 件はパッケージにライセンスファイルを含まず、補完文書の整備が要る。
+(`webpki-roots` 1.0.10 の CDLA-Permissive-2.0 を含む) を同梱する方針である。ただし
+現状は未整備である (REPAIR-3)。`servo-host/Cargo.lock` の registry 由来のパッケージ 747 件
+(同名の別版を別々に数える。Servo 0.7.0 への更新時点) のうち 129 件は、パッケージに
+LICENSE・COPYING・NOTICE・UNLICENSE 系のファイルを含まず、補完文書の整備が要る
+(件数は Servo 0.7.0 への更新時に数え直したもので、以前の記載とは数え方が異なる)。
 scripts/gen-cargo-licenses.sh の Servo ホスト対応と補完文書は別 Issue で扱う。
 
 --------------------------------------------------------------------------------

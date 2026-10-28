@@ -61,7 +61,7 @@ fn all_fixture_names() -> BTreeSet<String> {
 fn render3_hello_fixtures() {
     let (_, ok, _) = fixture("hello-ok");
     let hello = decode_hello(&ok).expect("hello-ok");
-    assert_eq!(hello.servo_version, "0.6.0");
+    assert_eq!(hello.servo_version, "0.7.0");
     assert_eq!(hello.host_version, "0.0.0");
     assert_eq!(hello.limits.request_frame_bytes, 65536);
     assert_eq!(hello.limits.screenshot_frame_bytes, 25_165_824);
@@ -153,7 +153,7 @@ fn render3_response_fixtures_with_method() {
         Ok(MethodResult::Shutdown(_))
     ));
 
-    // status はホストが取得できない場合に省略される（Servo 0.6.0）。None として受理する。
+    // status はホストが取得できない場合に省略される（Servo 0.7.0）。None として受理する。
     let (m, b, _) = fixture("response-load-no-status");
     let r = decode_response(&b, m.expect("method")).expect("load-no-status");
     let Ok(MethodResult::Load(l)) = r.outcome else {

@@ -213,7 +213,7 @@ fn hello_is_first_frame_and_matches_fixture() {
         hello["data"]["capabilities"],
         expected["data"]["capabilities"]
     );
-    assert_eq!(hello["data"]["servo_version"], "0.6.0");
+    assert_eq!(hello["data"]["servo_version"], "0.7.0");
     assert_eq!(hello["data"]["host_version"], env!("CARGO_PKG_VERSION"));
     let bytes = serde_json::to_vec(hello).unwrap();
     assert!(bytes.len() <= MAX_HELLO_FRAME_BYTES);
