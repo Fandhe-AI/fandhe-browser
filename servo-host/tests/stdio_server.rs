@@ -4,7 +4,8 @@
 //! フレーム（u32 LE 長さ接頭辞 + UTF-8 JSON）を対話的に読み書きし、hello・`load`（ループバック
 //! HTTP サーバー相手。外部ネットワークへ出ない）・`screenshot`（PNG の復号と上下の色。#232）・
 //! 未実装メソッドの `unsupported`・`shutdown`・プロトコル違反時の終了コード・stdout の純粋性・
-//! ログの秘匿・IntersectionObserver の公開とコールバック（#1294）を確かめる。このテストバイナリ自体は Servo をリンクしない（`image` は PNG の復号のみ）。
+//! ログの秘匿・IntersectionObserver が無効のままであること（#1291・#1297。servo 0.7.0 で有効に戻すときに
+//! 公開とコールバックを確かめる形へ戻す）を確かめる。このテストバイナリ自体は Servo をリンクしない（`image` は PNG の復号のみ）。
 
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -175,8 +176,10 @@ const BOX_BODY: &str = "<html><head><title>box</title></head><body style=\"margi
 <div data-k=\"x'y\" style=\"position:absolute;left:100px;top:200px;width:60px;height:70px\"></div>\
 </body></html>";
 
-/// IntersectionObserver 用の fixture 本文（#1294）。`#exposed` は未公開なら非表示になり、
-/// `#fired` は意味のある entry でコールバックが呼ばれたときだけ表示される。
+/// IntersectionObserver 用の fixture 本文（#1294・#1291・#1297）。`#exposed` は未公開なら非表示になり、
+/// `#fired` は意味のある entry でコールバックが呼ばれたときだけ表示される。servo 0.6.0 では無効の
+/// ままなので、現在は `#exposed` が `display:none` になり `#fired` も表示されない（0.7.0 で有効に戻す
+/// ときに期待値を元の形へ戻す）。
 const IO_BODY: &str = "<html><head><title>io</title></head><body style=\"margin:0\">\
 <div id=\"exposed\" style=\"position:absolute;left:0;top:0;width:20px;height:20px\"></div>\
 <div id=\"target\" style=\"position:absolute;left:100px;top:100px;width:50px;height:50px\"></div>\
@@ -479,11 +482,14 @@ fn visibility_reports_known_states_after_load() {
     let _ = srv.join();
 }
 
-/// RENDER-3・RENDER-5（TASK-38・#1294・#1273）: IntersectionObserver が公開され、load 後に
-/// コールバックが意味のある entry で呼ばれる。ホストに JS 評価メソッドは無いため、ページ JS の
-/// 副作用を `visibility` で観測する。外部ネットワークへは出ない（#1003）。
+/// RENDER-3・RENDER-5（TASK-38・#1291・#1297）: servo 0.6.0 では IntersectionObserver が無効の
+/// ままである。有効にすると Script スレッドがハングする（上流 servo/servo#45915）ため無効に戻した。
+/// 未公開なら fixture の `#exposed` が `display:none` になり、`#fired` も表示されない。
+/// 0.7.0 で有効に戻すときは、公開され load 後にコールバックが呼ばれることを確かめる元の形
+/// （`#exposed` が可視・`#fired` が有限回の再試行内に可視）へ戻す。ホストに JS 評価メソッドは
+/// 無いため、ページ JS の副作用を `visibility` で観測する。外部ネットワークへは出ない（#1003）。
 #[test]
-fn intersection_observer_is_exposed_and_fires_after_load() {
+fn intersection_observer_stays_disabled_on_servo_0_6() {
     let (port, srv, stop) = serve_http_with(IO_BODY, false);
     let mut h = spawn(&["--stdio"]);
     let _hello = h.recv();
@@ -495,23 +501,17 @@ fn intersection_observer_is_exposed_and_fires_after_load() {
     let vis = |id: u64, sel: &str| {
         format!(r#"{{"v":1,"id":{id},"method":"visibility","params":{{"selector":"{sel}"}}}}"#)
     };
+    // 未公開の分岐は `display:none` にするため、不可視で理由は `display_none`。
     h.send(&vis(2, "#exposed"));
-    assert_eq!(h.recv(), r#"{"v":1,"id":2,"result":{"visible":true}}"#);
-
-    // コールバックは update the rendering 後に呼ばれるため、有限回だけ再試行する。
-    let mut last = String::new();
-    for i in 0..20u64 {
-        let id = 10 + i;
-        h.send(&vis(id, "#fired"));
-        last = h.recv();
-        if last == format!(r#"{{"v":1,"id":{id},"result":{{"visible":true}}}}"#) {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(250));
-    }
-    assert!(
-        last.ends_with(r#""result":{"visible":true}}"#),
-        "IntersectionObserver callback did not fire: {last}"
+    assert_eq!(
+        h.recv(),
+        r#"{"v":1,"id":2,"result":{"visible":false,"reason":"display_none"}}"#
+    );
+    // コールバックが呼ばれる経路が無いため、`#fired` は初期の `display:none` のまま。
+    h.send(&vis(3, "#fired"));
+    assert_eq!(
+        h.recv(),
+        r#"{"v":1,"id":3,"result":{"visible":false,"reason":"display_none"}}"#
     );
 
     h.send(r#"{"v":1,"id":99,"method":"shutdown"}"#);
