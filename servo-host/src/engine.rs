@@ -76,20 +76,22 @@ fn fixed_opts() -> Opts {
 ///
 /// `Preferences::default()` は `http_proxy` 等の環境変数から proxy を設定するため、
 /// 3 フィールドを空に戻して環境由来の値を持ち込ませない（proxy は識別面・SSRF 経路）。
-/// あわせて IntersectionObserver を有効にする（理由は本体のコメント。#1294）。
+/// あわせて IntersectionObserver は無効のままにする（既定どおり。理由は本体のコメント。#1291）。
 /// ほかの pref は既定のまま。UA 等の識別面には触れない（SEC-2）。
 fn fixed_preferences() -> Preferences {
     Preferences {
         network_http_proxy_uri: String::new(),
         network_https_proxy_uri: String::new(),
         network_http_no_proxy: String::new(),
-        // servo 0.6.0 は IntersectionObserver を既定で無効にしており、これを前提にする
-        // Next.js 系のページが `ReferenceError` で JS を止め、白紙を撮影成功として返してしまう。
-        // そのため有効にする（#1294・#1273・TASK-38・`RENDER-3`・`RENDER-5`）。標準 API を公開
-        // するだけで UA・ヘッダ・`navigator`・画面・TLS・locale 等の識別面は変えない（SEC-2）。
-        // Servo 側では実装途中の機能のため、クラッシュ・ハングが出たら無効に戻すかオーナーに
-        // 判断を仰ぐ。Servo のソースは改変せず設定値だけを変える。
-        dom_intersection_observer_enabled: true,
+        // servo 0.6.0 では IntersectionObserver を有効にすると、ボックスを持たない祖先で包含
+        // ブロックの探索が無限ループし、Script スレッドがハングする（上流 servo/servo#45915・
+        // 修正 servo/servo#47693 は 0.7.0 から）。実測で MDN の保存ページが毎回ハングした
+        // （#1291）ため、無効に戻した。既定でも false だが、意図を残すために明示する。
+        // 代償として、IntersectionObserver を前提にする Next.js 系のページ（react.dev。#1273）
+        // は `ReferenceError` で JS が止まり、白紙になる。servo 0.7.0 への更新で再び有効にする
+        // （#1297・TASK-38・`RENDER-3`・`RENDER-5`）。UA・ヘッダ・`navigator`・画面・TLS・
+        // locale 等の識別面は変えない（SEC-2）。Servo のソースは改変せず設定値だけを変える。
+        dom_intersection_observer_enabled: false,
         ..Preferences::default()
     }
 }
@@ -162,8 +164,9 @@ mod tests {
         assert_eq!(prefs.network_http_proxy_uri, "");
         assert_eq!(prefs.network_https_proxy_uri, "");
         assert_eq!(prefs.network_http_no_proxy, "");
-        // #1294: IntersectionObserver を公開する。
-        assert!(prefs.dom_intersection_observer_enabled);
+        // #1291・#1297: servo 0.6.0 ではハングするため IntersectionObserver は無効のまま。
+        // 0.7.0 への更新で有効に戻すときにこの assert を元の形へ戻す。
+        assert!(!prefs.dom_intersection_observer_enabled);
     }
 
     #[test]
