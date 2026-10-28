@@ -363,6 +363,55 @@ fn cli1_screenshot_full_page_is_rejected_as_unsupported() {
     assert!(!std::path::Path::new(&target).exists());
 }
 
+#[test]
+fn cli1_screenshot_timeout_out_of_range_is_rejected_before_host_resolution() {
+    // `--timeout` は 1〜60 秒。範囲外は丸めず usage エラー（終了コード 2）で拒否し、ファイルを作らない（#1301）。
+    let dir = OutDir::new("timeout");
+    for (tag, value) in [("zero", "0"), ("over", "61"), ("text", "abc")] {
+        let target = dir.file(&format!("{tag}.png"));
+        let out = run(
+            &format!("shot-timeout-{tag}"),
+            &[
+                "screenshot",
+                "--timeout",
+                value,
+                "https://a.example/",
+                &target,
+            ],
+        );
+        assert_eq!(out.code, Some(2), "stderr: {}", out.stderr);
+        assert_eq!(
+            out.stderr.trim(),
+            "error: invalid value for option '--timeout'; run 'fandhe-browser --help' for usage"
+        );
+        assert!(out.stdout.is_empty());
+        assert!(!std::path::Path::new(&target).exists());
+    }
+}
+
+#[test]
+fn cli1_screenshot_valid_timeout_reaches_host_resolution() {
+    // 有効な `--timeout` は引数解析を通り、ホスト未設定の環境では従来どおり描画不可で失敗する（#1301）。
+    let dir = OutDir::new("timeout-ok");
+    let target = dir.file("out.png");
+    let out = run(
+        "shot-timeout-ok",
+        &[
+            "screenshot",
+            "--timeout",
+            "60",
+            "https://a.example/",
+            &target,
+        ],
+    );
+    assert_eq!(out.code, Some(1), "stderr: {}", out.stderr);
+    assert_eq!(
+        out.stderr.trim(),
+        "error: rendering is not available (render host not found; set FANDHE_BROWSER_RENDER_HOST)"
+    );
+    assert!(!std::path::Path::new(&target).exists());
+}
+
 // --- TASK-48.1（#290・`CLI-2`）: セットアップ専用コマンド `setup` ---
 
 #[test]

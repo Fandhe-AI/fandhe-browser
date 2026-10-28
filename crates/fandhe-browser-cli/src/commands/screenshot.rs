@@ -1,6 +1,6 @@
 //! スクリーンショット取得コマンド `screenshot`（TASK-47.5・Issue #286・`CLI-1`・MS-5）。
 //!
-//! `screenshot [--] <URL> <OUTPUT>` はプロセス内で描画ホスト（`render_host` が解決する
+//! `screenshot [--timeout <SECONDS>] [--] <URL> <OUTPUT>` はプロセス内で描画ホスト（`render_host` が解決する
 //! `HostRenderer`）へ URL を 1 回読み込ませ、PNG を `OUTPUT` に書いて 1 行を stdout へ出し終了する
 //! （one-shot）。実行中の `launch` インスタンスや直前の `navigate` で開いたページは参照できない
 //! （navigate.rs と同じ理由。ai に `/ai/navigate` が無く、CDP クライアントには新規依存が要るため）。
@@ -11,6 +11,11 @@
 //! 出力先の誤りは描画ホストの有無によらず決定的に失敗させるため、ホスト起動より前に検証する。
 //! 上書きは拒否する（`create_new` = O_EXCL / CREATE_NEW）。検証と書き込みの間の競合や
 //! シンボリックリンク経由の既存ファイル破壊を、Linux・macOS・Windows で同じく防ぐ安全側の判断。
+//! `--timeout <SECONDS>`（#1301）はページ読み込み（`load`）の上限を 1〜60 秒の 10 進整数で指定する。
+//! 未指定はホスト既定（30 秒）。効くのは `load` だけで、スクリーンショットの段階の上限（20 秒）・
+//! ホスト起動の `hello` 待ち（10 秒）は変えない。上限を超える値は丸めず usage エラーで拒否する。
+//! `--timeout` が上限を延ばすのは遅いページ（react.dev 等）が既定の 30 秒を超えるときのためで、
+//! 上限の最大は render プロトコルの `MAX_LOAD_TIMEOUT_MS`（60 秒。`RENDER-4`・設計 §2.4）に揃える。
 //! 出力は常に PNG で、拡張子は強制しない。`cfg(target_os)` 分岐は置かず 3 OS で同一挙動（`CLI-1`）。
 //!
 //! # スタブについて
@@ -22,6 +27,8 @@
 //! - `--full-page`: v1 の描画ホストが未対応（固定ビューポート 1280x800。`servo-host-design.md` §2.3・
 //!   `SEC-2`）のため、解析時に usage エラーで拒否する。出力は常にビューポートの画像。ホストが対応したら
 //!   `ScreenshotOptions::with_full_page` を配線する（`RENDER-1`・`REPAIR-3`）
+//! - `--timeout` は `load` のみ。スクリーンショット段階・ホスト起動の上限は固定のまま（設定化は未定）。
+//!   `--timeout=<N>` 形式は未対応（`--profile-dir`・`--port` と同じく別引数の値だけ受け付ける）
 //! - 上書きオプション・stdout への出力（`-`）・クリップやスケールの指定は未対応
 //! - `screenshot --help`: ハンドラは出力先を受け取らないため未対応（トップレベルの `--help` には載る）
 //! - DNS 名がプライベート IP へ解決される場合とリバインディングは `HostRenderer` の既知の制約
@@ -36,7 +43,7 @@ use fandhe_browser_core::check_network_target_url;
 use fandhe_browser_core::render::{
     ImageFormat, PageRef, RenderError, Renderer, Screenshot, ScreenshotOptions,
 };
-use fandhe_browser_render::protocol::MAX_URL_BYTES;
+use fandhe_browser_render::protocol::{MAX_LOAD_TIMEOUT_MS, MAX_URL_BYTES};
 
 use super::navigate::NavigateError;
 use super::profile::{self, ProfileSelection};
@@ -60,6 +67,61 @@ pub(crate) struct ScreenshotCommandOptions {
     pub(crate) output: PathBuf,
     /// プロファイルの選択（`--profile-dir`）。
     pub(crate) profile: ProfileSelection,
+    /// ページ読み込み（`load`）の上限（ミリ秒。`--timeout` の秒数を変換済み）。
+    /// `None` はホスト既定（30 秒）。スクリーンショット段階の上限には効かない。
+    pub(crate) load_timeout_ms: Option<u32>,
+}
+
+/// `--timeout` のオプション名。
+const TIMEOUT_OPTION: &str = "--timeout";
+/// `--timeout` の値の名前（欠落エラーの表示用）。
+const TIMEOUT_VALUE_NAME: &str = "SECONDS";
+/// `--timeout` の最大秒数。render プロトコルの上限（`MAX_LOAD_TIMEOUT_MS`）から導く。
+const MAX_TIMEOUT_SECS: u32 = MAX_LOAD_TIMEOUT_MS / 1000;
+
+/// `--timeout` の値（秒）を `load` の上限（ミリ秒）へ変換する（副作用なし・外部入力）。
+///
+/// ASCII 数字だけの 10 進整数で 1〜[`MAX_TIMEOUT_SECS`] のものだけ受け付ける。`+`・`-`・小数・空白・
+/// 非 ASCII 数字・空文字は拒否し、`0` 以外の先頭ゼロも `--port` と揃えて拒否する。範囲外は丸めず拒否する。
+fn parse_timeout_secs(value: &str) -> Result<u32, UsageError> {
+    let invalid = UsageError::InvalidOptionValue {
+        option: TIMEOUT_OPTION,
+    };
+    let bytes = value.as_bytes();
+    if bytes.is_empty() || !bytes.iter().all(u8::is_ascii_digit) {
+        return Err(invalid);
+    }
+    if bytes.len() > 1 && bytes.first() == Some(&b'0') {
+        return Err(invalid);
+    }
+    match value.parse::<u32>() {
+        Ok(secs) if (1..=MAX_TIMEOUT_SECS).contains(&secs) => Ok(secs.saturating_mul(1000)),
+        _ => Err(invalid),
+    }
+}
+
+/// `--timeout <SECONDS>` を 1 つ消費する。該当しなければ `Ok(false)`。重複指定・値の欠落は拒否する。
+/// 書式の扱いは `--profile-dir`（[`profile::take_profile_dir`]）に揃える。
+fn take_timeout<'a>(
+    arg: &str,
+    iter: &mut impl Iterator<Item = &'a String>,
+    current: &mut Option<u32>,
+) -> Result<bool, UsageError> {
+    if arg != TIMEOUT_OPTION {
+        return Ok(false);
+    }
+    if current.is_some() {
+        return Err(UsageError::UnexpectedArgument(arg.to_string()));
+    }
+    let value = iter
+        .next()
+        .ok_or(UsageError::MissingArgument(TIMEOUT_VALUE_NAME))?;
+    if value.starts_with('-') {
+        // 後続のオプションを値として飲み込まない（`-5` などの符号つきも値の欠落として拒否する）。
+        return Err(UsageError::MissingArgument(TIMEOUT_VALUE_NAME));
+    }
+    *current = Some(parse_timeout_secs(value)?);
+    Ok(true)
 }
 
 /// `screenshot` の引数を解析する（副作用なし）。`--` より後ろはすべて位置引数として扱う。
@@ -69,6 +131,7 @@ pub(crate) fn parse_screenshot_args(
     let mut positionals: Vec<&String> = Vec::new();
     let mut only_positionals = false;
     let mut profile = ProfileSelection::OsDefault;
+    let mut load_timeout_ms = None;
     let mut iter = args.as_slice().iter();
     while let Some(arg) = iter.next() {
         if only_positionals || !arg.starts_with('-') {
@@ -76,6 +139,9 @@ pub(crate) fn parse_screenshot_args(
             continue;
         }
         if profile::take_profile_dir(arg, &mut iter, &mut profile)? {
+            continue;
+        }
+        if take_timeout(arg, &mut iter, &mut load_timeout_ms)? {
             continue;
         }
         match arg.as_str() {
@@ -94,6 +160,7 @@ pub(crate) fn parse_screenshot_args(
         url: url.clone(),
         output: PathBuf::from(output),
         profile,
+        load_timeout_ms,
     })
 }
 
@@ -342,7 +409,9 @@ fn run(args: CommandArgs) -> Result<CommandOutcome, CommandError> {
     precheck_url(&options.url)?;
     // 指定時のみ開き、コマンド終了までロックを保持する（出力ファイルの書き込みより前）。
     let _profile = profile::open_explicit(&options.profile)?;
-    let renderer = render_host::renderer_from_process(None)?;
+    // `--timeout` は `load` の上限だけを変える（スクリーンショット段階の 20 秒は変えない）。
+    let renderer =
+        render_host::renderer_from_process_with_load_timeout(None, options.load_timeout_ms)?;
     let (shot, final_url) = capture_with(&*renderer, &options)?;
     let bytes = write_png(&options.output, &shot)?;
     ScreenshotOutput {
@@ -376,6 +445,7 @@ mod tests {
             url: url.to_string(),
             output: PathBuf::from("out.png"),
             profile: ProfileSelection::OsDefault,
+            load_timeout_ms: None,
         }
     }
 
@@ -451,6 +521,7 @@ mod tests {
             url: "https://a.example/".into(),
             output: PathBuf::from("o.png"),
             profile: ProfileSelection::OsDefault,
+            load_timeout_ms: None,
         };
         assert_eq!(
             parse_screenshot_args(&args(&["https://a.example/", "o.png"])).unwrap(),
@@ -496,6 +567,110 @@ mod tests {
         }
         // `--` より後ろは位置引数として扱うため拒否されない。
         assert!(parse_screenshot_args(&args(&["--", "--full-page", "o"])).is_ok());
+    }
+
+    fn timeout_of(v: &[&str]) -> Result<Option<u32>, UsageError> {
+        parse_screenshot_args(&args(v)).map(|o| o.load_timeout_ms)
+    }
+
+    /// `CLI-1`・#1301: `--timeout` の正常値（境界 1・60 を含む）は秒からミリ秒へ変換され、未指定は `None`。
+    #[test]
+    fn cli1_screenshot_timeout_accepts_valid_seconds() {
+        for (given, ms) in [("1", 1_000), ("30", 30_000), ("60", 60_000), ("9", 9_000)] {
+            let o =
+                parse_screenshot_args(&args(&["--timeout", given, "https://a.example/", "o.png"]))
+                    .expect(given);
+            assert_eq!(o.load_timeout_ms, Some(ms), "{given}");
+            assert_eq!(o.url, "https://a.example/");
+        }
+        assert_eq!(timeout_of(&["u", "o"]), Ok(None));
+        // 位置引数の後ろ・`--profile-dir` との併用・`--` の直前でも解析できる。
+        assert_eq!(timeout_of(&["u", "--timeout", "5", "o"]), Ok(Some(5_000)));
+        assert_eq!(
+            timeout_of(&["--profile-dir", "p", "--timeout", "7", "u", "o"]),
+            Ok(Some(7_000))
+        );
+        assert_eq!(
+            timeout_of(&["--timeout", "60", "--", "u", "o"]),
+            Ok(Some(60_000))
+        );
+    }
+
+    /// `CLI-1`・#1301: 範囲外・非数・符号・小数・空文字は丸めず `InvalidOptionValue`（終了コード 2）。
+    #[test]
+    fn cli1_screenshot_timeout_rejects_invalid_values() {
+        for bad in [
+            "0",
+            "61",
+            "100",
+            "99999999999999999999",
+            "abc",
+            "10s",
+            "+5",
+            "5.0",
+            "1.5",
+            " 5",
+            "5 ",
+            "",
+            "05",
+            "00",
+            "0x10",
+            "\u{665}",
+        ] {
+            let e = timeout_of(&["--timeout", bad, "u", "o"]).expect_err(bad);
+            assert_eq!(
+                e,
+                UsageError::InvalidOptionValue {
+                    option: "--timeout"
+                },
+                "{bad:?}"
+            );
+            let ce = CommandError::from(e);
+            assert_eq!(
+                ce.to_string(),
+                "invalid value for option '--timeout'; run 'fandhe-browser --help' for usage"
+            );
+            assert_eq!(
+                format!("{:?}", ce.exit_code()),
+                format!("{:?}", std::process::ExitCode::from(2))
+            );
+        }
+    }
+
+    /// `CLI-1`・#1301: 値の欠落（末尾・後続のオプション・符号つき）と重複指定、`--timeout=N` 形式は usage エラー。
+    #[test]
+    fn cli1_screenshot_timeout_rejects_missing_duplicate_and_equals_form() {
+        let missing = UsageError::MissingArgument("SECONDS");
+        for a in [
+            vec!["u", "o", "--timeout"],
+            vec!["--timeout", "--profile-dir", "p", "u", "o"],
+            vec!["--timeout", "-5", "u", "o"],
+            vec!["--timeout", "--", "u", "o"],
+        ] {
+            assert_eq!(timeout_of(&a), Err(missing.clone()), "{a:?}");
+        }
+        assert_eq!(
+            timeout_of(&["--timeout", "5", "--timeout", "6", "u", "o"]),
+            Err(UsageError::UnexpectedArgument("--timeout".into()))
+        );
+        assert_eq!(
+            timeout_of(&["--timeout=5", "u", "o"]),
+            Err(UsageError::UnknownOption("--timeout=5".into()))
+        );
+    }
+
+    /// `CLI-1`・#1301: `--` より後ろの `--timeout` は位置引数として扱い、オプションとして解釈しない。
+    #[test]
+    fn cli1_screenshot_timeout_after_double_dash_is_positional() {
+        let o = parse_screenshot_args(&args(&["--", "--timeout", "o.png"])).expect("ok");
+        assert_eq!(o.url, "--timeout");
+        assert_eq!(o.output, PathBuf::from("o.png"));
+        assert_eq!(o.load_timeout_ms, None);
+        // `--timeout` は OUTPUT、`5` は余分な位置引数になる（値としては消費されない）。
+        assert_eq!(
+            parse_screenshot_args(&args(&["--", "u", "--timeout", "5"])).unwrap_err(),
+            UsageError::UnexpectedArgument("5".into())
+        );
     }
 
     /// `CLI-1`: 存在しないディレクトリ配下は panic せずエラーになる。

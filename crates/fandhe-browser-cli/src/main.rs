@@ -6,7 +6,7 @@
 //! `navigate`（TASK-47.3・#284）は one-shot で URL を取得して結果を出力する。
 //! `query`（TASK-47.4・#285）は one-shot で URL を取得し、CSS セレクタに一致する要素のテキスト・属性を出力する。
 //! `--file <PATH>`（#824・`PERF-7`）を付けるとネットワークを使わずローカル HTML を照会する（cold start 計測用）。
-//! `screenshot`（TASK-47.5・#286）は one-shot で描画ホストに URL を読み込ませ、PNG をファイルへ書く。
+//! `screenshot`（TASK-47.5・#286）は one-shot で描画ホストに URL を読み込ませ、PNG をファイルへ書く（`--timeout <SECONDS>` でページ読み込みの上限を 1〜60 秒に変えられる。#1301）。
 //! `setup`（TASK-48.1・#290・`CLI-2`）はセットアップ専用で、OS 固有のビルド前提を検出して報告する。
 //! `--profile-dir <PATH>`（TASK-47.6・#287）は全コマンド共通のプロファイル保管場所指定。
 //! サーバー組み立ての実体は [`server`] にあり、本ファイルは

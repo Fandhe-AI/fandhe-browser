@@ -339,6 +339,13 @@ fn write_help(out: &mut impl Write, registry: &Registry<'_>) -> io::Result<()> {
         "--port PORT"
     )?;
     writeln!(out)?;
+    writeln!(out, "Screenshot options:")?;
+    writeln!(
+        out,
+        "  {:<18} Page load limit in seconds, 1-60 (default 30; screenshot step is fixed)",
+        "--timeout SECONDS"
+    )?;
+    writeln!(out)?;
     writeln!(out, "Query options:")?;
     writeln!(
         out,
@@ -566,6 +573,23 @@ mod tests {
         assert!(text.contains("screenshot"), "{text}");
         assert!(
             text.contains("Render a URL once and save a PNG screenshot to a file"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn cli1_help_lists_screenshot_timeout_option() {
+        let registry = Registry {
+            default: default_ok,
+            commands: COMMANDS,
+        };
+        let mut out = Vec::new();
+        dispatch(os(&["--help"]), &registry, &mut out).expect("help succeeds");
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(
+            text.contains(
+                "Screenshot options:\n  --timeout SECONDS  Page load limit in seconds, 1-60 (default 30; screenshot step is fixed)"
+            ),
             "{text}"
         );
     }
