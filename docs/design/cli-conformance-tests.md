@@ -24,6 +24,7 @@ OS 間で違ってよいのは、spec が OS 固有と定める点だけ。具�
 | `--port`・ポート 0 | 実装済み（`CLI-3`・#823）。`launch --port <PORT>`（既定 9333・0 は OS 割り当て）。待ち受け IP は `127.0.0.1` 固定（`SEC-4`）。通知行の出力形式は暫定。期待値は末尾の補足節 |
 | `<cmd> --help` | 未対応。help は `--help`・`-h`・`help` のトップレベルのみ |
 | `screenshot --full-page` | v1 ホスト未対応。usage エラーで拒否（補助ケース） |
+| `screenshot --timeout <SECONDS>` | 実装済み（#1301）。`load` の上限（1〜60 秒）。実際に上限が効くことの確認は遅いページが要るため範囲外で、引数検証だけを `CT-SHOT-E4` で扱う |
 | プロファイルデータの実利用 | TASK-116・`PROF-7` |
 | 名前でのプロファイル選択 | `XOS-9`・TASK-62 |
 | ページ JS の実行 | 対象外 |
@@ -180,6 +181,7 @@ ID は `CT-<コマンド>-E<n>`（3 OS 共通。結果は OS ごとに記録す�
 | `CT-SHOT-E1` | 出力先が既にあるファイルで `["screenshot", "https://example.com/", "<既存>"]` | 1 | `output file already exists`（描画ホストの解決より前に失敗し、既存ファイルを変更しない） |
 | `CT-SHOT-E2` | `["screenshot", "--full-page", "https://example.com/", "<TMP>/n.png"]` | 2 | `option '--full-page' is not supported yet; run 'fandhe-browser --help' for usage` |
 | `CT-SHOT-E3` | `["screenshot", "about:blank", "<TMP>/n.png"]` | 1 | `screenshot requires a fetched document (about:blank has no content)` |
+| `CT-SHOT-E4` | `["screenshot", "--timeout", "61", "https://example.com/", "<TMP>/n.png"]`（`0`・`abc`・`5.0` も同じ） | 2 | `invalid value for option '--timeout'; run 'fandhe-browser --help' for usage`（`--timeout` は `load` の上限を 1〜60 秒で指定する。範囲外は丸めず拒否し、ファイルを作らない。#1301） |
 | `CT-PROFILE-E1` | `["navigate", "--profile-dir"]` | 2 | `missing required argument 'PATH'; run 'fandhe-browser --help' for usage` |
 | `CT-PROFILE-E2` | `["navigate", "--profile", "p", "about:blank"]` | 2 | `unknown option '--profile'; run 'fandhe-browser --help' for usage`（`--profile` は予約済みで、`--profile-dir` だけを受け付ける） |
 | `CT-PROFILE-E3` | `launch --profile-dir <P>` を常駐させたまま `["navigate", "--profile-dir", "<P>", "about:blank"]` | 1 | `profile is already in use` |

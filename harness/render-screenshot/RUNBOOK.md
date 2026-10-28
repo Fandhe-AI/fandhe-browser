@@ -98,8 +98,12 @@ cargo build --release --locked -p fandhe-browser-cli
 ### 4.3 cli `screenshot` の入出力仕様
 
 ```bash
-fandhe-browser screenshot [--profile-dir D] <URL> <OUTPUT>
+fandhe-browser screenshot [--profile-dir D] [--timeout <SECONDS>] [--] <URL> <OUTPUT>
 ```
+
+- `--timeout` はページ読み込み（`load`）の上限で、1〜60 の 10 進整数（秒）。未指定はホスト既定の
+  30 秒。重い SPA（react.dev 等）が 30 秒を超えて `error: render timed out` になるときに 60 を指定する
+  （#1301）。範囲外は丸めず usage エラー（終了コード 2）。スクリーンショット段階の上限（20 秒）は変わらない。
 
 - URL は `http` / `https` のみ。IP リテラルと `localhost` の loopback は拒否する。
   DNS 名の解決先は検査しない（既知の制約。`servo-host-design.md` §2.5・§13）。
