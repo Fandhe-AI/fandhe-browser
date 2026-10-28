@@ -17,7 +17,7 @@
 ## 既定の採用済み方針
 
 - JS エンジン: V8（`rusty_v8`）既定・`boa` へ切替可能（README「実装方針（要点）」参照。バージョン確定は導入時にユーザー承認）
-- レンダリング: `Servo`（`servo =0.6.0`。#915 で採用、#988 で追加。本体 workspace には入れず、`servo-host/` の別 workspace の依存に限る。[licensing](./licensing.md)）
+- レンダリング: `Servo`（`servo =0.7.0`。#915 で 0.6 LTS 系列を採用、#988 で追加。#1297（オーナー承認 2026-10-28）で MDN のハング修正（#1291）と IntersectionObserver の pref 有効化のため、LTS ではない月次版 0.7.0 へ一時的に上げている。LTS 系列へ戻すまで上流の新しい版を追う。本体 workspace には入れず、`servo-host/` の別 workspace の依存に限る。[licensing](./licensing.md)）
 
 ## subagent への適用
 
