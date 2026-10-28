@@ -6,7 +6,7 @@
 //! 有限な数値 4 つだけ）へ変換する（`RENDER-3`・`SEC-2`・TASK-38.4・#233、TASK-38.5・#234。設計 §2.2・§2.4・§2.5）。
 //! 境界ボックスも #233 の結論（JS 評価）に合わせ、同じ検証・埋め込み規則と 5 秒のタイムアウトを使う。
 //!
-//! 取得手段の確認結果: Servo 0.6.0 の `WebView` に要素矩形・computed style を直接返す埋め込み API は
+//! 取得手段の確認結果: Servo 0.7.0 の `WebView` に要素矩形・computed style を直接返す埋め込み API は
 //! 無く（アクセシビリティツリーはセレクタで引けない）、`WebView::evaluate_javascript` を採用する。
 //! スクリプトは読み取り専用（`querySelector`・`getComputedStyle`・`getBoundingClientRect`・
 //! `innerWidth/innerHeight` のみ）で、DOM 変更・スクロール・フォーカスをしない。

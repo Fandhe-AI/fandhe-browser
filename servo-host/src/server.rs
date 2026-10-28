@@ -49,7 +49,7 @@ pub(crate) const LOAD_TIMEOUT_MAX_MS: u64 = 60_000;
 
 /// 同梱する Servo の版。`servo` crate は版の定数を公開しないため手で持ち、
 /// `Cargo.toml` の pin との一致をテストで検証する。
-pub(crate) const SERVO_VERSION: &str = "0.6.0";
+pub(crate) const SERVO_VERSION: &str = "0.7.0";
 
 /// 要求メソッド。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

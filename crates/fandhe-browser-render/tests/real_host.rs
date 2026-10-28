@@ -8,7 +8,7 @@
 //! `FANDHE_BROWSER_RENDER_HOST=<絶対パス> cargo test -p fandhe-browser-render --test real_host -- --test-threads=1`
 //!
 //! 環境変数が未設定・不正なら skip せず panic する（fail-closed。通ったように見せない）。
-//! `status`: core の `PageLoad` は `final_url` しか持たず、Servo 0.6.0 のホストも返さないため、
+//! `status`: core の `PageLoad` は `final_url` しか持たず、Servo 0.7.0 のホストも返さないため、
 //! `HostProcess` 層で `status() == None` を確認する（作り出さない。REPAIR-3）。
 //! 外部入力の経路ではないため `unwrap` / `expect` / `panic!` を使う。
 

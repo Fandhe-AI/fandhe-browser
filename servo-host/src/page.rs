@@ -13,9 +13,9 @@
 //! （静的ページでは来ないことがある）。`notify_new_frame_ready` では必ず `WebView::paint()` を呼ぶ
 //! （呼ばないとフレームが進まない。TASK-36）。JS の評価でフレームを起こす手法は使わない
 //! （ページ状態を書き換えるため）。`SoftwareRenderingContext` では `show()` を呼ばずに
-//! フレームが届く（Servo 0.6.0 の tests/common と同じ手順）。
+//! フレームが届く（Servo 0.7.0 の tests/common と同じ手順）。
 //!
-//! 制約: HTTP ステータスは Servo 0.6.0 の埋め込み API から取得できないため `None` を返す
+//! 制約: HTTP ステータスは Servo 0.7.0 の埋め込み API から取得できないため `None` を返す
 //! （固定値で成功を装わない。`REPAIR-3`・`REPAIR-4`）。標準出力へは書かず、ログに URL・タイトル・
 //! クラッシュ理由を出さない（機密を含みうる。設計 §2.1）。
 
@@ -107,7 +107,7 @@ fn wait_until<T>(
 #[non_exhaustive]
 pub(crate) struct PageLoad {
     pub final_url: String,
-    /// HTTP ステータス。Servo 0.6.0 では取得できないため常に `None`（`REPAIR-3`・`REPAIR-4`）。
+    /// HTTP ステータス。Servo 0.7.0 では取得できないため常に `None`（`REPAIR-3`・`REPAIR-4`）。
     pub status: Option<u16>,
 }
 
