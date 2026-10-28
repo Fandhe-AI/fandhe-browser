@@ -3539,7 +3539,7 @@ SOFTWARE.
 15. Mozilla Public License 2.0 (Servo ホストの配布物)
 SPDX: MPL-2.0
 取得元: https://www.mozilla.org/media/MPL/2.0/index.txt (公式テキスト。改変・要約なし)
-リビジョン: Servo v0.6.0 タグ (c78d2c206f80a1c8b67eefa97f773bba513205d3) の LICENSE と照合し、空白・インデントの整形差のみで文言は同一であることを確認した
+リビジョン: Servo v0.7.0 タグ (aac43a3f31a259f04a574f5ec4e959c943ad7cc7) の LICENSE と照合し、空白・インデントの整形差のみで文言は同一であることを確認した
 同梱条件: Servo ホスト (fandhe-browser-servo-host) の配布物のみ。本体バイナリには含まれない (NOTICE 節 2)
 ================================================================================
 

@@ -13,7 +13,8 @@
 | 区分 | 内容 | 出典 |
 | ---- | ---- | ---- |
 | 決定済み | Servo は本体 workspace に入れず、別 workspace・別 `Cargo.lock` の子プロセス（Servo ホスト）とする | #915（2026-10-12） |
-| 決定済み | 採用版は `servo =0.6.0` | #915 |
+| 決定済み | 採用版は `servo =0.6.0`（0.6 LTS 系列） | #915 |
+| 一時緩和（オーナー承認 2026-10-28） | 現行版は `servo =0.7.0`（LTS ではない月次版）。上流 MDN のハングの修正（servo/servo#45915・修正 #47693 は 0.7.0 に含まれ 0.6 LTS には戻らない。#1291）と IntersectionObserver の pref 有効化のため。緩和するのは LTS の条件だけで、隔離（`RENDER-1`）と MPL の扱い（`OSS-2`・`OSS-3`）は変えない。月次版にはセキュリティ修正が戻らないため、修正を含む次の LTS が出たら LTS 系列へ戻す | #1297・#1291・TASK-38 |
 | 決定済み | Servo ホスト側 `deny.toml` だけで `MPL-2.0`・`MPL-2.0 AND BSD-3-Clause` を許可し、`CDLA-Permissive-2.0` は `webpki-roots` 1 件に限る。本体の `deny.toml` は変えない | #915・[licensing](../../.claude/rules/licensing.md) |
 | 決定済み | FreeType は FTL を選び、`NOTICE` に帰属表示を載せる | #915 |
 | 決定済み | 配置は `servo-host/`、通信は stdio + 長さ接頭辞 JSON | 本書 §1・§2（実装済み: #1005・#1021） |
@@ -57,7 +58,7 @@ servo-host/
 
 ### 1.4 依存
 
-- `servo =0.6.0`、`default-features = false`、`features = ["baked-in-resources"]`（試作で起動に必須と確認済み）。
+- `servo =0.7.0`、`default-features = false`、`features = ["baked-in-resources"]`（試作で起動に必須と確認済み）。版は #1297 で 0.6.0 から上げた一時的な緩和（§0 の一時緩和の行を参照）。
 - 試作で直接必要になった `dpi` / `url` / PNG エンコード用の画像 crate 等は、Servo の `Cargo.lock` で解決される版に合わせて `=x.y.z` 固定する。
 - これらの追加は本書の範囲では行わず、実装 Issue で承認事項として提示する（[dependency-policy](../../.claude/rules/dependency-policy.md)）。承認提示項目の雛形は付録 A。
 
@@ -84,7 +85,7 @@ servo-host/
 
 | メソッド | params | result |
 | -------- | ------ | ------ |
-| `load` | `url`, `timeout_ms` | `final_url`, `status?`（Servo 0.6.0 では省略） |
+| `load` | `url`, `timeout_ms` | `final_url`, `status?`（Servo 0.6.0・0.7.0 では省略） |
 | `screenshot` | `full_page` | `format:"png"`, `width`, `height`, `data_base64` |
 | `visibility` | `selector` | `visible`, `reason?` |
 | `bounding_box` | `selector` | `x`, `y`, `width`, `height` |
@@ -213,7 +214,7 @@ v1 はホストが自分で fetch する（URL のみ送る）。Cookie・セッ
 
 実際の変更は「Servo ホストの実装と同時に記載する」運用（[licensing](../../.claude/rules/licensing.md)）に従い、実装 Issue（N1）で行う。
 
-- `NOTICE` §2 の MPL 適用範囲を「Servo ホストの配布物（`fandhe-browser-servo-host` バイナリとそれを含むコンテナイメージ）」に書き換える。本体バイナリには含まれない。Servo 版は `0.6.0`、ソース入手先は `https://github.com/servo/servo` の対応タグ、ソースは無改変と明記する。MPL-2.0 全文を `LICENSE-THIRD-PARTY` に追加する。
+- `NOTICE` §2 の MPL 適用範囲を「Servo ホストの配布物（`fandhe-browser-servo-host` バイナリとそれを含むコンテナイメージ）」に書き換える。本体バイナリには含まれない。Servo 版は実装時点の `0.6.0`（現行の版は `NOTICE` を正とする。#1297 で `0.7.0` へ一時的に上げた）、ソース入手先は `https://github.com/servo/servo` の対応タグ、ソースは無改変と明記する。MPL-2.0 全文を `LICENSE-THIRD-PARTY` に追加する。
 - `NOTICE` §1 の CA バンドルの注記は「MPL-2.0 は `fandhe-browser-render` 配下に限る規約の例外」から「Servo ホスト workspace 外の例外（データファイル）」へ言い換える。
 - FreeType は FTL を選び、`NOTICE` に FTL の帰属文（同梱ソースの `docs/FTL.TXT` の文言に一致させる）を載せる。GPLv2 側は選ばない旨を明記する。
 - 同梱 libpng は PNG Reference Library License v2 の著作権表示・許諾文を `LICENSE-THIRD-PARTY` に収録する。
@@ -225,6 +226,8 @@ v1 はホストが自分で fetch する（URL のみ送る）。Cookie・セッ
 ### 5.1 `servo-default-resources` 埋め込みリソースの手動確認（TASK-38・Issue #996）
 
 `servo-default-resources` 0.6.0（crate の SPDX は MPL-2.0、上流タグ `v0.6.0` の `components/default-resources`）が `include_bytes!` で埋め込む 11 ファイルを確認した。ファイル個別のライセンスヘッダは `gatt_blocklist.txt` のみにあり、他は crate の SPDX（MPL-2.0）に従う。上流に個別の出所表記が無いものは推測で埋めず「未確認」とする。
+
+0.7.0 への更新（#1297）で再確認した: `servo-default-resources` 0.7.0（上流タグ `v0.7.0`、コミット `aac43a3f`）の `include_bytes!` の 11 ファイル一覧は 0.6.0 と同じで、内容が変わったのは `debugger.js` のロジックだけ（ライセンスヘッダ・出所の記載の追加なし）。個別のライセンスヘッダが `gatt_blocklist.txt` のみである点も変わらないため、下表は 0.7.0 でも有効である。
 
 | ファイル | 出所 | ライセンス | 確認状態 |
 | -------- | ---- | ---------- | -------- |

@@ -113,7 +113,7 @@ class OkScenarioTest(DriverCase):
         self.assertEqual(payload["errors"], [])
         self.assertEqual(
             payload["source"],
-            {"tool": "servo_bbox_driver", "host_version": "0.0.0", "servo_version": "0.6.0", "final_url_matches": True},
+            {"tool": "servo_bbox_driver", "host_version": "0.0.0", "servo_version": "0.7.0", "final_url_matches": True},
         )
 
     def test_load_timeout_is_forwarded(self) -> None:

@@ -3,7 +3,7 @@
 TASK-37（37.h1）/ MS-1 / ビヘイビア `RENDER-5`・`MEAS-3` 対応。Issue #55 の
 実機作業（担当: 人間）の手順書である。**この文書は手順の草案であり、測定結果ではない**。
 実機での撮影・測定・合否判定はオーナーが行い、結果は #55 に記録する。Issue #1281 で、
-現行の Servo ホスト（servo 0.6.0）と隔離コンテナを前提に書き直した。
+現行の Servo ホスト（servo 0.7.0）と隔離コンテナを前提に書き直した。
 
 **撮影は「保存済みページを `docker run --network none` のコンテナで撮る」方式で行う**
 （オーナー判断 2026-10-27・#55）。
@@ -74,7 +74,7 @@ UA の上書きや anti-bot 回避のフラグは付けない（SEC 系）。
 TASK-36（#50）の実機検証は PoC の `servo-embed`（Servo 0.3.0）で行った。改変なしでは
 8 回すべて 60 秒でタイムアウトし、`paint()` を呼ぶ診断用コピーでは 7/7 回、1280x800 の PNG を
 取得できた。**これは過去の経緯であり、現行の手順ではない**。現在は本体の `fandhe-browser`（cli）が
-`fandhe-browser-servo-host`（servo 0.6.0。`servo-host/`）を子プロセスとして起動して撮る。
+`fandhe-browser-servo-host`（servo 0.7.0。`servo-host/`）を子プロセスとして起動して撮る。
 
 ### 4.2 ビルドと配置
 
@@ -245,7 +245,7 @@ Issue #55 へ貼る。数値は `measure-result.json` から転記する。
 | CPU / メモリ | |
 | GL | llvmpipe（Mesa x.y.z。ホストの /proc/<pid>/maps で確認した経路） |
 | Chromium | バージョン（`chromium --version`）/ DEBIAN_SNAPSHOT / CHROMIUM_VERSION |
-| Servo | servo-host（servo 0.6.0）+ cli の release ビルド / リポジトリのコミット |
+| Servo | servo-host（servo 0.7.0）+ cli の release ビルド / リポジトリのコミット |
 | イメージ | ダイジェスト（`docker image inspect --format '{{.Id}}'`） |
 | ハーネス | コミット（git rev-parse --short HEAD） |
 | 実行コマンド | docker run の引数一式 / EXTRA_ARGS / measure_ssim.py の引数 |
