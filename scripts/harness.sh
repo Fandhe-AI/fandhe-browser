@@ -171,7 +171,16 @@ case "${name}" in
     # 2 構成は同じ出力パスへ上書きされるため、各ビルドの直後に検査する。片方が NG でももう片方を実行する。
     for flavor in default lite; do
       echo "static-link: flavor=${flavor} target=${triple}"
-      if [ "${flavor}" = "default" ]; then
+      if [ "${flavor}" = "default" ] && [ "${triple}" = "aarch64-unknown-linux-musl" ]; then
+        # aarch64 の V8 prebuilt は `__clear_cache` を libgcc から得る前提だが、musl ターゲットは `-nodefaultlibs` で
+        # リンクするため未定義参照になる。docker/release-build.sh（正本）と同じ条件（aarch64 かつ V8）でだけ
+        # `-lgcc` を足す（#1307・TASK-64.3・TASK-93.3）。軽量構成（boa）には付けない。
+        # 空文字の設定は config の rustflags を打ち消すため、付けない側は変数ごと設定せず分岐し、
+        # 付ける側は環境変数をこのコマンド 1 回にだけ効かせる（export しない）。
+        CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_RUSTFLAGS="-C link-arg=-lgcc" \
+          RUSTY_V8_ARCHIVE_SHA256="${v8_sha}" cargo build --release --locked -p fandhe-browser-cli \
+          --bin fandhe-browser --target "${triple}" --target-dir "${st_dir}" || { sl_rc=1; continue; }
+      elif [ "${flavor}" = "default" ]; then
         RUSTY_V8_ARCHIVE_SHA256="${v8_sha}" cargo build --release --locked -p fandhe-browser-cli \
           --bin fandhe-browser --target "${triple}" --target-dir "${st_dir}" || { sl_rc=1; continue; }
       else
