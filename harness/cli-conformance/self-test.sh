@@ -14,6 +14,9 @@ for t in jq curl node; do
   command -v "$t" >/dev/null 2>&1 || { echo "error: $t is required but was not found on PATH" >&2; exit 2; }
 done
 
+# jq の出力から CR を除く（Windows のネイティブ jq は CRLF で出力し、`pass\r` と `pass` の比較が崩れるため。run.sh と同じ処置）
+jq() { command jq "$@" | tr -d '\r'; }
+
 PASS=0
 FAIL=0
 ok() { PASS=$((PASS + 1)); echo "ok: $1"; }
@@ -194,6 +197,56 @@ expect_eq "args: unknown option exits 2" "2" "$rc_b"
 expect_eq "args: bad --timeout exits 2" "2" "$rc_c"
 expect_eq "args: missing render host exits 2" "2" "$rc_d"
 expect_eq "args: bad --only exits 2" "2" "$rc_e"
+
+# --- 9. 回帰: Windows 経路の期待値と jq の CRLF（PR #1319 の P1 指摘 2 件）---
+# (a) Windows 分岐は Linux・macOS では実行できないため、run.sh の check_run / aux_simple 呼び出しを静的に走査し、
+#     期待値の第 1 文字が check_text の接頭辞（= ~ - + *）であることを確かめる（接頭辞なしは `internal: bad expectation` で exit 2 になる）
+bad_expect=""
+n_expect=0
+re_check_run='^[[:space:]]*check_run[[:space:]]+[^[:space:]]+[[:space:]]+("(.?)[^"]*"|'"'"'(.?)[^'"'"']*'"'"')[[:space:]]+"(.?)'
+re_aux_simple='^[[:space:]]*aux_simple[[:space:]]+[A-Z0-9-]+[[:space:]]+[0-9]+[[:space:]]+"(.?)[^"]*"[[:space:]]+"(.?)'
+while IFS= read -r line; do
+  # check_run は stdout 期待が単一引用符のこともある（グループ 2 か 3）。aux_simple は双方とも二重引用符（グループ 1・2）
+  if [[ "$line" =~ $re_check_run ]]; then
+    first_a="${BASH_REMATCH[2]}${BASH_REMATCH[3]}"; first_b="${BASH_REMATCH[4]}"
+  elif [[ "$line" =~ $re_aux_simple ]]; then
+    first_a="${BASH_REMATCH[1]}"; first_b="${BASH_REMATCH[2]}"
+  else
+    continue
+  fi
+  n_expect=$((n_expect + 1))
+  for f in "$first_a" "$first_b"; do
+    case "$f" in "=" | "~" | "-" | "+" | "*") ;; *) bad_expect="$bad_expect [$line]" ;; esac
+  done
+done < <(grep -E '^[[:space:]]*(check_run|aux_simple) ' "$RUN" | grep -v '"\$rc" "\$eo" "\$ee"')
+expect_eq "expectations: every check_run / aux_simple expectation has a valid prefix" "" "$bad_expect"
+expect_eq "expectations: Windows E4 expectation is prefixed" "1" "$(grep -c 'check_run 1 "\*" "=\$WIN_OUTSIDE_ERR"' "$RUN")"
+if [ "$n_expect" -ge 24 ]; then ok "expectations: scanned $n_expect call sites"; else ng "expectations: scanned only $n_expect call sites (parser broken?)"; fi
+
+# (b) CRLF を出す偽 jq（PATH 先頭のシム）でも、run.sh の出力と self-test の比較が崩れない
+# self-test 内の jq は関数のため、実体は type -P で引く（command -v だと関数名が返り、シムが自分自身を呼んで無限再帰する）
+REAL_JQ="$(type -P jq)"
+mkdir -p "$WORK/crlf-bin"
+printf '#!/usr/bin/env bash\nset -o pipefail\n"%s" "$@" | sed "s/\\$/$(printf "\\r")/"\n' "$REAL_JQ" >"$WORK/crlf-bin/jq"
+chmod +x "$WORK/crlf-bin/jq"
+# シム自体が CR を出すこと（出さないとこの回帰テストが何も検証しない）と、素の比較が崩れること
+raw_cmp="$(PATH="$WORK/crlf-bin:$PATH" command jq -rn '"pass"')"
+expect_eq "jq-crlf: shim emits CR (raw comparison breaks without CR removal)" "$(printf 'pass\r')" "$raw_cmp"
+SAVED_PATH="$PATH"
+PATH="$WORK/crlf-bin:$PATH"
+FAKE_MODE="" FAKE_FIXTURE=ok run_suite jqcrlf --render-host "$WORK/bin/fake-host$EXE" --strict
+jq_crlf_rc="$RC"
+jq_crlf_nav="$(verdict jqcrlf "CT-NAV-$LABEL")"
+jq_crlf_nav_stdout="$(jq -r --arg id "CT-NAV-$LABEL" 'select(.id==$id)|.stdout' "$WORK/jqcrlf.jsonl")"
+jq_crlf_meta="$(jq -r 'select(.type=="meta")|.suite' "$WORK/jqcrlf.jsonl")"
+jq_crlf_verdicts=""
+for id in $REQ; do jq_crlf_verdicts="$jq_crlf_verdicts $(verdict jqcrlf "$id")"; done
+PATH="$SAVED_PATH"
+expect_eq "jq-crlf: suite exit code (strict)" "0" "$jq_crlf_rc"
+expect_eq "jq-crlf: NAV verdict has no CR" "pass" "$jq_crlf_nav"
+expect_eq "jq-crlf: NAV stdout has no CR" "status=200 url=https://example.com/" "$jq_crlf_nav_stdout"
+expect_eq "jq-crlf: meta suite has no CR" "cli-conformance" "$jq_crlf_meta"
+expect_eq "jq-crlf: all required verdicts" " pass pass pass pass pass" "$jq_crlf_verdicts"
 
 echo "cases=$((PASS + FAIL)) failures=$FAIL"
 [ "$FAIL" -eq 0 ]

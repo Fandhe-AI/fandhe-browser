@@ -738,7 +738,7 @@ aux_profile_outside() {
     mkdir -p "$outside_unix"
     LA_CLEAN+=("$outside_unix")
     run_cli "$CMD_TIMEOUT" navigate --profile-dir "$(cygpath -w "$outside_unix/p")" about:blank
-    check_run 1 "*" "$WIN_OUTSIDE_ERR"
+    check_run 1 "*" "=$WIN_OUTSIDE_ERR"
     if [ -e "$outside_unix/p" ]; then fail_check "directory was created outside %LOCALAPPDATA%"; else side "no directory created outside"; fi
   else
     # Linux・macOS では同じ argv（LOCALAPPDATA の外）が成功するのが期待値
