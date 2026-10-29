@@ -478,10 +478,8 @@ jobs:
             Write-Host "::error::--selftest failed (exit code $code)"
             exit 1
           }
-      # 偽バイナリによる判定ロジックの確認。Windows ではこの自己テスト自体が未検証のため、失敗しても計測は続ける
-      # （結果は注釈に残る。判定ロジックの信頼度は自己テストの結果と併せて人間が読む）
+      # 偽バイナリによる判定ロジックの確認。判定ロジックを信頼できない状態で計測しないよう、失敗したら止める（fail-closed）
       - name: "[cli-conformance] 自己テスト"
-        continue-on-error: true
         shell: bash
         run: bash harness/cli-conformance/self-test.sh
       - name: "[cli-conformance] 実行"
