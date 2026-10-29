@@ -31,8 +31,9 @@
 # 外部アクセス: example.com（FIXTURE_URL）と 127.0.0.1 のみ。SSRF の既定拒否を緩める手順は含まない（仕様書 6 章）。
 set -euo pipefail
 
-# MSYS（Git Bash）が / 始まりの引数や file:/// を Windows パスへ書き換えるのを止める。argv は仕様書どおりに渡す
-export MSYS2_ARG_CONV_EXCL='*'
+# MSYS（Git Bash）の引数パス変換は、ネイティブの curl・jq に /tmp/... の絶対パスを渡すために必要なので全体では止めない。
+# 変換が害になる箇所（`/c`・`/F` を取る cmd・taskkill、値だけを渡す jq -cn、バイナリへ渡す env）にだけ
+# MSYS2_ARG_CONV_EXCL='*' をインラインで付ける
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
@@ -110,7 +111,7 @@ os_version() {
       # shellcheck source=/dev/null
       if [ -r /etc/os-release ]; then (. /etc/os-release && printf '%s (kernel %s)' "${PRETTY_NAME:-Linux}" "$(uname -r)"); else uname -sr; fi ;;
     MACOS) printf 'macOS %s (Darwin %s)' "$(sw_vers -productVersion 2>/dev/null || echo unknown)" "$(uname -r)" ;;
-    WINDOWS) (cmd /c ver 2>/dev/null | tr -d '\r' | sed '/^$/d' | head -n 1) || uname -sr ;;
+    WINDOWS) (MSYS2_ARG_CONV_EXCL='*' cmd /c ver 2>/dev/null | tr -d '\r' | sed '/^$/d' | head -n 1) || uname -sr ;;
   esac
 }
 OS_VERSION="$(os_version)"
@@ -236,7 +237,7 @@ end_case() {
   elif [ "$CUR_UNMET" -eq 1 ]; then verdict=unmet; verdict_ja="前提未充足"
   else verdict=pass; verdict_ja="合格"
   fi
-  jq -cn --arg id "$CUR_ID" --argjson req "$CUR_REQ" --arg os "$OS_NAME" --arg osv "$OS_VERSION" --arg arch "$ARCH" \
+  MSYS2_ARG_CONV_EXCL='*' jq -cn --arg id "$CUR_ID" --argjson req "$CUR_REQ" --arg os "$OS_NAME" --arg osv "$OS_VERSION" --arg arch "$ARCH" \
     --arg commit "$COMMIT" --arg date "$RUN_DATE" --arg rc "$CUR_RC" --arg argv "$CUR_ARGV" \
     --arg out "$(clip "$CUR_STDOUT" 2000)" --arg err "$(clip "$CUR_STDERR" 2000)" \
     --arg side "$CUR_SIDE" --arg verdict "$verdict" --arg note "$CUR_NOTES" \
@@ -268,6 +269,8 @@ cli_env_args() {
   # `env` は NAME=VALUE の後ろの -u をコマンドと解釈するため、-u を先に全部並べる
   ENV_ARGS=(-u FANDHE_BROWSER_CONFIG)
   [ -n "$RENDER_HOST" ] || ENV_ARGS+=(-u FANDHE_BROWSER_RENDER_HOST)
+  # バイナリへ渡す argv（URL・file:///・--オプション）を MSYS に書き換えさせない
+  [ "$IS_WINDOWS" -eq 0 ] || ENV_ARGS+=("MSYS2_ARG_CONV_EXCL=*")
   if [ "$IS_WINDOWS" -eq 0 ]; then
     ENV_ARGS+=("HOME=$CASE_HOME" "XDG_DATA_HOME=$CASE_HOME/xdg")
   fi
@@ -304,7 +307,7 @@ stop_proc() {
     STOP_METHOD="taskkill"
     local winpid=""
     [ -r "/proc/$pid/winpid" ] && winpid="$(tr -d '\r\n' <"/proc/$pid/winpid")"
-    [ -z "$winpid" ] || taskkill /F /PID "$winpid" >/dev/null 2>&1 || true
+    [ -z "$winpid" ] || MSYS2_ARG_CONV_EXCL='*' taskkill /F /PID "$winpid" >/dev/null 2>&1 || true
   fi
   for i in 1 2 3 4 5; do kill -0 "$pid" 2>/dev/null || return 0; sleep 0.2; done
   return 1
@@ -775,7 +778,7 @@ aux_profile_symlink() {
 # 実行
 # ---------------------------------------------------------------------------
 check_fixture
-jq -cn --arg commit "$COMMIT" --arg date "$RUN_DATE" --arg os "$OS_NAME" --arg osv "$OS_VERSION" --arg arch "$ARCH" \
+MSYS2_ARG_CONV_EXCL='*' jq -cn --arg commit "$COMMIT" --arg date "$RUN_DATE" --arg os "$OS_NAME" --arg osv "$OS_VERSION" --arg arch "$ARCH" \
   --arg bin "$BIN_REC" --arg host "$([ -n "$RENDER_HOST" ] && basename "$RENDER_HOST" || true)" --arg fixture "$FIXTURE_URL" \
   --argjson fok "$FIXTURE_OK" --arg fdetail "$FIXTURE_DETAIL" --argjson port "$PORT" \
   '{type:"meta",schema_version:1,suite:"cli-conformance",spec:"docs/design/cli-conformance-tests.md",commit:$commit,date:$date,

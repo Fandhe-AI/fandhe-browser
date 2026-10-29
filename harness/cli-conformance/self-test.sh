@@ -9,7 +9,6 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RUN="$HERE/run.sh"
-export MSYS2_ARG_CONV_EXCL='*'
 
 for t in jq curl node; do
   command -v "$t" >/dev/null 2>&1 || { echo "error: $t is required but was not found on PATH" >&2; exit 2; }
