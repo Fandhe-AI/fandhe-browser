@@ -7,8 +7,10 @@
 # 使い方: repeat_core.sh --repeat N --bin P --out-dir DIR [run_core.sh のオプション...]
 #   --repeat    1〜5（既定なし）。run_core.sh の全体期限（既定 1200 秒）× 回数がジョブ時間の上限を決める
 #   --bin       対象バイナリ（run_core.sh の --bin へそのまま渡す）
-#   --out-dir   出力先。core_results_<n>.jsonl（各回）と summary.md（集計）を作る
-#   以降の引数は run_core.sh へそのまま渡す（例: --page-js v8 --page-modules、Windows は --windows-localappdata-profile）
+#   --out-dir   出力先。core_results_<n>.jsonl（各回）と summary.md（集計）を作る。前回の成果物を今回のものと
+#               取り違えないよう、これらが既にある出力先は拒否する（使用エラー。新しい出力先か空のディレクトリを指定する）
+#   以降の引数は run_core.sh へそのまま渡す（例: --page-js v8 --page-modules、Windows は --windows-localappdata-profile）。
+#   ただし --tasks は拒否する（集計 summarize_repeats.sh が 28 件・22 件の定義に固定のため。使用エラー）
 # 終了コード: 0=全回が記録完了、1=いずれかの回が失敗（完了した回だけで集計は出す）、2=使用エラー
 # 環境変数 FC_REPEAT_RUN_CORE は自己テスト用（run_core.sh の代わりに呼ぶスクリプト。実測では設定しない）。
 set -euo pipefail
@@ -37,8 +39,19 @@ done
 [ -n "$OUT_DIR" ] || die "--out-dir is required"
 # 出力名は固定文字列 + 回数だけで組み立てる（引数を連結しない）。--out は run_core.sh へ渡す引数に含めさせない
 for a in "$@"; do
-  case "$a" in --out | --bin) die "$a is managed by repeat_core.sh" ;; esac
+  case "$a" in
+    --out | --bin) die "$a is managed by repeat_core.sh" ;;
+    --tasks | --tasks=*) die "--tasks is not supported (repeat_core.sh is fixed to the 28/22-task definition of tasks.json)" ;;
+  esac
 done
+# 同じ出力先の再利用で、今回失敗した回の位置に前回の成果物が残ると今回のものと誤認するため、管理対象があれば拒否する
+if [ -d "$OUT_DIR" ]; then
+  for stale in "$OUT_DIR"/core_results_*.jsonl "$OUT_DIR"/summary.md; do
+    { [ ! -e "$stale" ] && [ ! -L "$stale" ]; } || die "output directory already has results: $stale (use a new --out-dir)"
+  done
+elif [ -e "$OUT_DIR" ]; then
+  die "--out-dir exists and is not a directory: $OUT_DIR"
+fi
 mkdir -p "$OUT_DIR" || die "cannot create output directory"
 
 FILES=()

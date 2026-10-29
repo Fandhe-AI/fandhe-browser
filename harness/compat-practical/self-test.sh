@@ -1018,6 +1018,75 @@ expect_exit "repeat_core rejects 6" 2 bash "$SCRIPT_DIR/repeat_core.sh" --repeat
 expect_exit "repeat_core requires --repeat" 2 bash "$SCRIPT_DIR/repeat_core.sh" --bin /bin/true --out-dir "$REP/o6"
 expect_exit "repeat_core requires --bin" 2 bash "$SCRIPT_DIR/repeat_core.sh" --repeat 1 --out-dir "$REP/o7"
 expect_exit "repeat_core rejects a forwarded --out" 2 bash "$SCRIPT_DIR/repeat_core.sh" --repeat 1 --bin /bin/true --out-dir "$REP/o8" --out x
+# 回帰（PR #1319 の Codex P2）: 前回の成果物が残る出力先は拒否し、前回のファイルを触らない
+expect_exit "repeat_core rejects an out-dir that already has results" 2 env FC_REPEAT_RUN_CORE="$REP/fake_run_core.sh" bash "$SCRIPT_DIR/repeat_core.sh" --repeat 2 --bin /bin/true --out-dir "$REP/out"
+expect_contains "$LAST_OUTPUT" "output directory already has results" "repeat_core stale out-dir message"
+mkdir -p "$REP/stale1" "$REP/stale2"
+printf 'old\n' >"$REP/stale1/core_results_2.jsonl"
+printf 'old\n' >"$REP/stale2/summary.md"
+expect_exit "repeat_core rejects a stale core_results_<n>.jsonl" 2 env FC_REPEAT_RUN_CORE="$REP/fake_run_core.sh" bash "$SCRIPT_DIR/repeat_core.sh" --repeat 2 --bin /bin/true --out-dir "$REP/stale1"
+expect_eq "$(cat "$REP/stale1/core_results_2.jsonl")" "old" "repeat_core leaves the stale file untouched"
+expect_exit "repeat_core rejects a stale summary.md" 2 env FC_REPEAT_RUN_CORE="$REP/fake_run_core.sh" bash "$SCRIPT_DIR/repeat_core.sh" --repeat 1 --bin /bin/true --out-dir "$REP/stale2"
+mkdir -p "$REP/emptydir"
+expect_exit "repeat_core accepts an existing empty out-dir" 0 env FC_REPEAT_RUN_CORE="$REP/fake_run_core.sh" bash "$SCRIPT_DIR/repeat_core.sh" --repeat 1 --bin /bin/true --out-dir "$REP/emptydir"
+printf 'x\n' >"$REP/afile"
+expect_exit "repeat_core rejects an out-dir that is a file" 2 env FC_REPEAT_RUN_CORE="$REP/fake_run_core.sh" bash "$SCRIPT_DIR/repeat_core.sh" --repeat 1 --bin /bin/true --out-dir "$REP/afile"
+# --tasks は集計が 28/22 件固定のため拒否する
+expect_exit "repeat_core rejects --tasks" 2 env FC_REPEAT_RUN_CORE="$REP/fake_run_core.sh" bash "$SCRIPT_DIR/repeat_core.sh" --repeat 1 --bin /bin/true --out-dir "$REP/o9" --tasks "$TASKS"
+expect_contains "$LAST_OUTPUT" "--tasks is not supported" "repeat_core --tasks message"
+expect_eq "$([ -e "$REP/o9" ] && echo present || echo absent)" "absent" "repeat_core creates nothing when --tasks is rejected"
+
+# --- stop_spawned（lib.sh。run_core.sh の cleanup。PR #1319 の Cursor Bugbot 指摘）---
+# Windows 経路は実 Windows でしか動かない。ここでは偽 uname・ps・taskkill を PATH に置き、分岐の論理
+# （Windows の PID の取得・taskkill の引数・有界待機・Unix 経路の不変）だけを検証する。実際の Windows 動作は
+# CI の workflow_dispatch（xos-measure.yml）でしか確かめられない
+SP="$WORK/stopsp"
+mkdir -p "$SP/bin"
+printf '#!/bin/sh\necho "${FAKE_UNAME:-Linux}"\n' >"$SP/bin/uname"
+# 偽 ps（MSYS の `ps -p PID` 形式。WINPID は 4 列目）
+cat >"$SP/bin/ps" <<'SHIM'
+#!/bin/sh
+echo "      PID    PPID    PGID     WINPID   TTY         UID    STIME COMMAND"
+echo "$2       1       1       4242  cons0    197609 12:00:00 /usr/bin/sleep"
+SHIM
+# 偽 taskkill: 引数を記録し、FAKE_TASKKILL_KILLS=1 のときだけ対象（SP_TARGET の PID）を実際に止める
+cat >"$SP/bin/taskkill" <<'SHIM'
+#!/bin/sh
+echo "$*" >>"$SP_LOG"
+[ "${FAKE_TASKKILL_KILLS:-0}" = "1" ] && kill -KILL "$(cat "$SP_TARGET")" 2>/dev/null
+exit 0
+SHIM
+chmod +x "$SP/bin/uname" "$SP/bin/ps" "$SP/bin/taskkill"
+# sp_case <FAKE_UNAME> <FAKE_TASKKILL_KILLS> <signals_work 0|1>: 子プロセスを起動して stop_spawned で止め、
+#   終了コードと最終の生死を "rc=<..> alive=<0|1>" で出す。signals_work=0 は Git Bash の signal がネイティブ
+#   プロセスに効かない状況の模擬（kill を関数で上書きし、シグナル送信を何もしないものにする。kill -0 は実物）
+sp_case() {
+  local pid rc=0 alive=0
+  : >"$SP/log"
+  (
+    export PATH="$SP/bin:$PATH" FAKE_UNAME="$1" FAKE_TASKKILL_KILLS="$2" SP_LOG="$SP/log" SP_TARGET="$SP/target.pid" FC_STOP_POLLS=3
+    if [ "$3" = "0" ]; then
+      kill() { if [ "$1" = "-0" ]; then builtin kill "$@"; else return 0; fi; }
+    fi
+    sleep 30 &
+    pid=$!
+    echo "$pid" >"$SP/target.pid"
+    stop_spawned "$pid" 2>"$SP/stderr" || rc=$?
+    builtin kill -0 "$pid" 2>/dev/null && alive=1
+    builtin kill -KILL "$pid" 2>/dev/null || true
+    echo "rc=$rc alive=$alive"
+  )
+}
+# Unix 経路: kill と wait だけで止め、taskkill は呼ばない
+expect_eq "$(sp_case Linux 0 1)" "rc=0 alive=0" "stop_spawned (unix) stops the child"
+expect_eq "$(cat "$SP/log")" "" "stop_spawned (unix) does not call taskkill"
+expect_eq "$(sp_case Darwin 0 1)" "rc=0 alive=0" "stop_spawned (macOS) stops the child"
+# Windows 経路: signal が効かなくても taskkill /F /T /PID <WINPID> で止める
+expect_eq "$(sp_case MINGW64_NT-10.0 1 0)" "rc=0 alive=0" "stop_spawned (windows) stops a signal-proof child via taskkill"
+expect_eq "$(cat "$SP/log")" "/F /T /PID 4242" "stop_spawned (windows) passes the WINPID to taskkill /F /T"
+# Windows 経路: 止まらない場合は wait で詰まらず（有界）、警告して非 0 を返す
+expect_eq "$(sp_case MSYS_NT-10.0 0 0)" "rc=1 alive=1" "stop_spawned (windows) gives up instead of hanging when the child survives"
+expect_contains "$(cat "$SP/stderr")" "could not stop spawned process (pid=" "stop_spawned (windows) warns on giving up"
 
 echo "cases=$CASES failures=$FAILURES"
 [ "$FAILURES" -eq 0 ]

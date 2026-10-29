@@ -172,6 +172,11 @@ expect_eq "fixture-minified: QUERY pass" "pass" "$(verdict minified "CT-QUERY-$L
 node -e 'const s=require("net").createServer();s.listen(Number(process.argv[1]),"127.0.0.1");setInterval(()=>{try{process.kill(process.ppid,0)}catch{process.exit(0)}},200)' "$PORT" &
 HOLDER_PID=$!
 for _ in $(seq 1 25); do (exec 3<>"/dev/tcp/127.0.0.1/$PORT") 2>/dev/null && break; sleep 0.2; done
+# 回帰（PR #1319 の Cursor Bugbot 指摘への確認）: `node -e` では process.argv[1] が最初の引数（ポート）になり、
+# 占有プロセスは実際に $PORT を握っている。占有後に同じポートへ bind すると EADDRINUSE になることで、
+# 「接続できる」だけでなく「他者が bind できない」ことまで確かめる（run.sh の aux_launch_bind と同じ占有の書き方）
+expect_eq "node -e passes the port as process.argv[1]" "2 $PORT" "$(node -e 'console.log(process.argv.length, Number(process.argv[1]))' "$PORT")"
+expect_eq "occupied port cannot be bound again" "EADDRINUSE" "$(node -e 'const s=require("net").createServer();s.on("error",e=>{console.log(e.code);process.exit(0)});s.listen(Number(process.argv[1]),"127.0.0.1",()=>{console.log("bound");s.close()})' "$PORT")"
 FAKE_MODE="" FAKE_FIXTURE=ok run_suite busy --render-host "$WORK/bin/fake-host$EXE"
 expect_eq "port-busy: LAUNCH unmet" "unmet" "$(verdict busy "CT-LAUNCH-$LABEL")"
 expect_eq "port-busy: LAUNCH-E2 unmet" "unmet" "$(verdict busy CT-LAUNCH-E2)"

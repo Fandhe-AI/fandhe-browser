@@ -185,8 +185,7 @@ LOG="$(mktemp)" || { rm -f "$TMP" "$RAW"; echo "error: cannot create temp file" 
 
 cleanup() {
   if [ -n "$PID" ]; then
-    kill "$PID" 2>/dev/null || true
-    wait "$PID" 2>/dev/null || true
+    stop_spawned "$PID" || true
   fi
   [ -z "$PROFILE_DIR" ] || rm -rf "$PROFILE_DIR"
   [ -z "$CONF_DIR" ] || rm -rf "$CONF_DIR"
