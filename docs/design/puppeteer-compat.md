@@ -6,7 +6,7 @@
 - **基準コミット**: `42ce7c0`（`origin/main`）
 - **調査日**: 2026-10-06
 - **調査対象の版**: puppeteer-core 25.12.0（npm の最新版。integrity `sha512-z6LQUt5SH7jwGtGA+nMtJuEjZIsqPiwQ+EFHCYuVDQrJpvifNmmGuyDvTzAKPyFzihxgHc5f3aMzu2kn8Ps37A==`）・node v24.21.0。
-  これは読解した公開物の記録であり、依存としての採用・固定ではない（導入はユーザー承認待ち）
+  これは読解した公開物の記録であり、依存としての採用・固定ではない（測定時の一時導入のみ承認済み〔2026-10-29・#252〕。CI への組み込み・lockfile のコミットは未承認）
 
 ## 目的・前提
 
@@ -14,8 +14,8 @@
 `browser.disconnect()` の各段階が fandhe-browser の CDP サーバーでどこまで到達するかを記録する。
 本書は記録までで、方針の決定（Playwright と Puppeteer のどちらを主軸にするか）と追加実装は含めない。
 
-**重要: 実 Puppeteer での実測は 1 件も存在しない。** `puppeteer-core` の導入・バージョン固定は承認待ちで、
-`package.json`・実試験ターゲット・CI ジョブは未追加（`harness/puppeteer-connect/README.md`「導入状況（承認待ち）」）。
+**重要: 本節の段階表は実 Puppeteer で実測していない（2026-10-06 時点の読解）。** `puppeteer-core` は測定時の一時導入のみ承認済み（2026-10-29・#252。`harness/endpoint-swap/`）で、
+`package.json`・CI ジョブは追加していない（`harness/puppeteer-connect/README.md`「導入状況」）。
 段階別 status は「未実測」であり、「到達 0 段階」という実測結果ではない。以下の停止点はすべてソース読解に基づく予測である（`REPAIR-3`）。
 
 | 種別 | 内容 | 確度 |
