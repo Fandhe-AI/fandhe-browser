@@ -53,14 +53,15 @@ Playwright 接続試験の実行基盤（TASK-44.1・Issue #476・ビヘイビ�
 skip せず、理由と導入手順（`PLAYWRIGHT_INSTALL_HINT`）つきの `HarnessError::ToolUnavailable` を返す。
 実 Playwright 実行テストはこれを panic として表面化させる（成功を装わない）。
 
-## 導入状況（承認待ち）
+## 導入状況
 
-テスト基盤・CI での `playwright-core` 導入は **未承認**。リポジトリに `package.json`・lockfile・
-`node_modules` は置かず、CI ジョブにも組み込んでいない。承認依頼の内容:
-
-- パッケージ: `playwright-core`（`scripts/versions.sh` の exact 固定版・integrity。ブラウザ本体は取得しない）
-- 導入方式: (a) 推奨: 本 `run.sh` の一時導入（リポに何も置かない）、(b) `package.json` + lockfile をコミットして `npm ci --ignore-scripts`
-- CI 組み込み（`actions/setup-node` の SHA 固定・npm レジストリへのネットワークアクセス）は別途承認事項
+- **承認済み（2026-10-29 オーナー）**: `playwright-core` を**測定時の一時導入のみ**で使う。`run.sh`（本実行基盤）と
+  `harness/endpoint-swap/run.sh`（TASK-46・#252）が `mktemp -d` へ導入し、終了時に削除する。
+  `scripts/versions.sh` の exact 固定版・integrity で検証し、ブラウザ本体は取得しない。リポジトリに `package.json`・lockfile・
+  `node_modules` は置かない
+- **未承認**: CI への組み込み（`actions/setup-node` の SHA 固定・npm レジストリへのネットワークアクセス）と、
+  `package.json` + lockfile のコミット（`npm ci --ignore-scripts`）。必要になった場合は別途承認を得る。
+  CI ジョブには組み込んでいない
 
 ## 既知の制約（TASK-44.3）
 

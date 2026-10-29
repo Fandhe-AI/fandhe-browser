@@ -10,7 +10,7 @@
 # 付け、テストは独自 main（harness = false）でケース名の引数で実行する。成功時の完了マーカー行が
 # ちょうど 1 件であることを検査する（0 件・2 件以上は失敗。fail-closed）。
 # ブラウザ本体は取得せず、install script も実行しない。要 node/npm/cargo とネットワーク。
-# 導入の承認状況は README の「導入状況」を参照。
+# 導入の承認状況（測定時の一時導入のみ承認済み・CI 組み込みは未承認）は README の「導入状況」を参照。
 #
 # 使い方: run.sh <playwright-core の exact バージョン> <npm integrity>
 set -euo pipefail

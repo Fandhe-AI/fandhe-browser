@@ -33,6 +33,13 @@
 : "${PLAYWRIGHT_VERSION:=1.63.0}"
 : "${PLAYWRIGHT_INTEGRITY:=sha512-rYCsBF/M5HjUch52bbtVONEFjv6Xu8sm8h72dNlR5bzIE1fvC/bxgspzkjSfU+MweEMmPM8KJebG6nnyxo5mCg==}"
 
+# endpoint-swap（TASK-46・CDP-4。harness/endpoint-swap/README.md 参照）が測定のときだけ npm から一時導入する
+# puppeteer-core の版（exact 固定）。docs/design/puppeteer-compat.md の調査版に合わせる。最上位の版・integrity だけを
+# 固定検証し、推移的依存（ws・chromium-bidi 等）は導入時の解決結果を結果の meta に記録する。
+# Playwright 側は上の PLAYWRIGHT_VERSION / PLAYWRIGHT_INTEGRITY を共用する。
+: "${PUPPETEER_VERSION:=25.12.0}"
+: "${PUPPETEER_INTEGRITY:=sha512-z6LQUt5SH7jwGtGA+nMtJuEjZIsqPiwQ+EFHCYuVDQrJpvifNmmGuyDvTzAKPyFzihxgHc5f3aMzu2kn8Ps37A==}"
+
 # measure-container-size（TASK-65.1・CTR-1・CTR-5。harness/container-size/README.md 参照）の比較対象。
 # tag は CTR-1 が指定する Playwright 公式イメージ。digest は manifest list（amd64・arm64 共通）で、
 # 取得時は digest 指定で pull し、取得後に RepoDigests と照合する（不一致は fail-closed）。

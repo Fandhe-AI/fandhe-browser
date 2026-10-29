@@ -23,8 +23,8 @@
 #      deny.toml・rust-toolchain.toml・profiles・benches・tests・Dockerfile・
 #      compose.yaml）-> rust=true
 #   2. harness/ 配下 -> harness=true。Rust から読まれないと確認済みのディレクトリ（binary-size・
-#      render-screenshot・cold-start・multi-instance-memory・container-memory・cli-conformance）以外は
-#      rust=true も立てる
+#      render-screenshot・cold-start・multi-instance-memory・container-memory・cli-conformance・
+#      endpoint-swap）以外は rust=true も立てる
 #   3. docs 扱いの allowlist（*.md・docs/・.claude/・.agents/・LICENSE-*（LICENSE-THIRD-PARTY*
 #      を含む）・NOTICE・skills-lock.json・lint 設定ファイル類）-> どちらも変えない
 #   4. 上記以外 -> rust=true
@@ -84,7 +84,8 @@ classify() {
       # にする。それ以外の harness/ 配下（compat_fixtures・playwright-trace 等の include_str! 入力、
       # workspace メンバーの wpt_subset_runner、未知の新規ディレクトリ）は rust も true（fail-closed）
       harness/binary-size/* | harness/render-screenshot/* | harness/cold-start/* | \
-        harness/multi-instance-memory/* | harness/container-memory/* | harness/cli-conformance/*)
+        harness/multi-instance-memory/* | harness/container-memory/* | harness/cli-conformance/* | \
+        harness/endpoint-swap/*)
         harness=true
         ;;
       harness/*)
@@ -178,7 +179,7 @@ self_test() {
     $'CLAUDE.md\n.claude/rules/ci.md\n.agents/skills/a/SKILL.md\nLICENSE-MIT\nNOTICE\nLICENSE-THIRD-PARTY.md\nskills-lock.json\n.markdownlint.jsonc\n.yamllint\n.editorconfig-checker.json\ncommitlint.config.mjs\nlefthook.yml'
   expect "md at any depth" "rust=false harness=false servo=false" $'a/b/c/d.md'
   expect "harness-only (known dirs)" "rust=false harness=true servo=false" \
-    $'harness/binary-size/README.md\nharness/cold-start/measure.sh\nharness/multi-instance-memory/measure.sh\nharness/container-memory/measure.sh\nharness/cli-conformance/run.sh\nharness/render-screenshot/RUNBOOK.md'
+    $'harness/binary-size/README.md\nharness/cold-start/measure.sh\nharness/multi-instance-memory/measure.sh\nharness/container-memory/measure.sh\nharness/cli-conformance/run.sh\nharness/endpoint-swap/run.sh\nharness/render-screenshot/RUNBOOK.md'
   expect "harness + docs" "rust=false harness=true servo=false" $'docs/a.md\nharness/cold-start/measure.sh'
   expect "harness fixture read by Rust" "rust=true harness=true servo=false" $'harness/compat_fixtures/a.html'
   expect "harness trace read by Rust" "rust=true harness=true servo=false" $'harness/playwright-trace/results/newpage-trace.jsonl'
