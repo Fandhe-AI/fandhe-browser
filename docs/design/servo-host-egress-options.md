@@ -73,7 +73,7 @@ URL の検証は**最初の `load` の URL だけ**に効く。Servo がペー�
 | ---- | ---------- | ------ | ------------------ | ---------- | -------- |
 | user ns + net ns（`CLONE_NEWUSER\|CLONE_NEWNET`） | 全遮断。新しい netns には loopback だけが入る（bubblewrap の記述） | カーネル上は可（Linux 3.8 以降、user ns と他の `CLONE_NEW*` を同時指定できる）。**Ubuntu 24.04 では既定の AppArmor 制限で ns 内の capability が拒否される** | `pre_exec` + `unshare` は `unsafe` かつ libc 依存。外部の `bwrap` を起動する手もあるが実行時依存になる | 親 ns への veth は親側の権限が要るはずで（未検証）、プロキシへの到達は ns 内に中継プロセスを置いて継承 fd で本体につなぐ構成が必要。loopback を up にするには ns 内の `CAP_NET_ADMIN` が要る（未検証）。**Docker 既定の seccomp は `CAP_SYS_ADMIN` なしでは `unshare` と `CLONE_NEW*` 付き `clone` を拒否**。`clone3` も `ENOSYS`。ほかに、userns の悪用による DoS 懸念の注意書きがある | [user_namespaces(7)](https://man7.org/linux/man-pages/man7/user_namespaces.7.html)、[bubblewrap README](https://raw.githubusercontent.com/containers/bubblewrap/main/README.md)、[moby seccomp](https://raw.githubusercontent.com/moby/profiles/main/seccomp/default.json)、[Ubuntu 制限の概説](https://discourse.ubuntu.com/t/understanding-apparmor-user-namespace-restriction/58007) |
 | Landlock net（ABI 4、Linux 6.7 以降） | **TCP の bind / connect をポート単位**で許可。宛先 IP・ホスト名は絞れない。ABI 4 は UDP と DNS を制限しない | 可（`no_new_privs` が必須）。userns を使わないので Ubuntu の AppArmor 制限とは無関係（推測）。Docker 既定 seccomp も `landlock_*`・`prctl`・`seccomp` を無条件許可 | ホスト起動直後に自分自身へ適用するのが最も素直（`servo-host` 側の依存追加＋`unsafe` / syscall。親の `pre_exec` より安全）。「connect はプロキシのポートだけ」にできる | 新しいドキュメントは UDP を ABI 10 で追加するが、実機の対応カーネルは未確認。6.7 未満のディストリでは使えない。ポートが同じなら任意 IP に届く。Landlock が拒否した接続は WebSocket の直接接続を含めて止まる | [kernel Landlock](https://docs.kernel.org/userspace-api/landlock.html)、[landlock(7)](https://man7.org/linux/man-pages/man7/landlock.7.html) |
-| seccomp-bpf | `socket()` の引数（domain・type）でソケット種別を禁止できる。`connect()` の宛先は見えない | 可（`no_new_privs`） | ホスト自身か `pre_exec`。BPF の組み立てに依存クレートか自前実装が要る | フィルタが見るのはレジスタ値で、`sockaddr` の中身は見えない（man ページの記述からの推論）。宛先の判別には `SECCOMP_RET_USER_NOTIF` と監督プロセスが要る。Landlock と組んで「UDP・IPv6・AF_UNIX 以外のソケットを禁止」に使うのが現実的 | [seccomp(2)](https://man7.org/linux/man-pages/man2/seccomp.2.html) |
+| seccomp-bpf | `socket()` の引数（domain・type）でソケット種別を禁止できる。`connect()` の宛先は見えない | 可（`no_new_privs`） | ホスト自身か `pre_exec`。BPF の組み立てに依存クレートか自前実装が要る | フィルタが見るのはレジスタ値で、`sockaddr` の中身は見えない（man ページの記述からの推論）。宛先の判別には `SECCOMP_RET_USER_NOTIF` と監督プロセスが要る。Landlock は TCP のポートしか制限できず UDP を制限できない（ABI 4）ため、seccomp で UDP を塞ぐ役を担わせる案が候補になる。許可を AF_INET の SOCK_STREAM（プロキシへの TCP）と AF_UNIX に限り、禁止を SOCK_DGRAM（UDP。DNS・QUIC を含む）・SOCK_RAW・AF_INET6 とする形が考えられる。要検証: AF_UNIX が Servo の内部 IPC で要るか、AF_INET6 を禁止できるか（プロキシ経由を IPv4 に限れるか）、`socketpair()` を同じ規則で扱うか、`type` 引数のフラグ（SOCK_NONBLOCK・SOCK_CLOEXEC）を除いて種別だけを比べる必要があるか。この手段は宛先 IP を絞れない（§4.1） | [seccomp(2)](https://man7.org/linux/man-pages/man2/seccomp.2.html) |
 | cgroup BPF / nftables / iptables | IP・ポート・ホスト（IP 集合） | 不可（root / `CAP_NET_ADMIN`、`CAP_BPF`）。netns 内なら権限を得られるが経路が無い | 要件に合わない | man ページ未取得のため、この行は一般知識（推測） | 未取得 |
 | 現行の `egress_guard.py` | 接続済みソケットの宛先（検出のみ） | 可 | ポーリング監視で、止めるのではなく検出して kill する | 25 ms 未満の短命な接続は取りこぼす。Linux 専用。別 netns のプロセスは検査不能 | リポ内 `harness/render-screenshot/egress_guard.py` |
 
@@ -111,13 +111,27 @@ Issue #1003 の選択肢 3（core が取得済みの HTML を渡す方式）は�
 | -- | ----- | ----- | ------- | ---- |
 | **選択肢 1: egress ガード** | 条件付き。検出のみなら現行の `/proc` ポーリング（保証にならない）。**予防**はポート単位の Landlock しかなく、IP は絞れない | 不成立。非特権で宛先ホストを絞れる手段が見つからない（Seatbelt の host は `*` か `localhost` のみ、NE は特権・承認が要る） | 不成立。WFP は管理者前提 | **不成立**。OS 間で揃わず、WebSocket 直接接続と DNS リバインディングも残る |
 | **選択肢 2: OS 隔離** | 条件付き。netns は非特権で動くが、Ubuntu 24.04 の AppArmor 制限と Docker 既定 seccomp で塞がれうる | 成立。`sandbox-exec` で全遮断できる（非推奨 API） | 成立。capability なしの AppContainer（`unsafe` と `windows-sys` が要る） | 技術的には 3 OS で全遮断できる。ただし**外部 http/https に出るという要件と矛盾**し、単独では使えない |
-| **プロキシ＋OS 隔離** | 条件付き。ポート単位の **Landlock**（6.7 以降）＋ seccomp で socket 種別を制限が現実的で、user ns を使わず Docker でも動く見込み。6.7 未満のディストリでは不可。netns 方式は中継プロセスが要り、Ubuntu / Docker で塞がれうる | 条件付き。`sandbox-exec` の `(deny network*)` ＋ `(allow network-outbound (remote ip "localhost:<port>"))`。プロファイルの動作は未実測、非推奨 API | **不成立の公算が高い**。AppContainer は loopback を既定で通さず、例外化は開発用途のみで管理者要否も未確認。`internetClient` だけのコンテナで private / loopback を落とす緩い代替案にとどまる | 本体側プロキシが許可リストと再検査を担い、OS 隔離が WebSocket 直接接続などの迂回を塞ぐ。**唯一 DNS リバインディングとリダイレクトの両方を扱える案**だが、Windows が最大の障害 |
+| **プロキシ＋OS 隔離** | 条件付き。ポート単位の **Landlock**（6.7 以降）＋ seccomp で socket 種別を制限する案が現実的で、user ns を使わず Docker でも動く見込み。ただし宛先 IP は絞れず、プロキシと同じポートで待ち受ける別 IP への直接接続は塞げない（§4.1）。6.7 未満のディストリでは不可。netns 方式は中継プロセスが要り、Ubuntu / Docker で塞がれうる | 条件付き。`sandbox-exec` の `(deny network*)` ＋ `(allow network-outbound (remote ip "localhost:<port>"))`。プロファイルの動作は未実測、非推奨 API | **不成立の公算が高い**。AppContainer は loopback を既定で通さず、例外化は開発用途のみで管理者要否も未確認。`internetClient` だけのコンテナで private / loopback を落とす緩い代替案にとどまる | 本体側プロキシが許可リストと再検査を担い、プロキシ経由の HTTP(S) のリダイレクト・サブリソース・DNS リバインディングを扱える見込み。ただし **Linux 案は OS 隔離だけでは宛先 IP を絞れず、WebSocket 直接接続などの迂回を完全には塞げない**（§3.1・§4.1。候補の可否は未確認）。macOS は §3.2 の記述どおりなら localhost の宛先だけを許す制限を書ける見込みで、Linux より迂回を塞ぐ余地が大きいが未実測。Windows が最大の障害 |
 
 プロキシ構成の前提は次のとおり（推測を含む）。
 
 - Servo の `Preferences` の `network_http_proxy_uri` と `network_https_proxy_uri` を、本体が loopback で待ち受けるプロキシの `http://<loopback アドレス>:<port>` に向ける
 - `network_http_no_proxy` は空のままにする（loopback の自動除外は無いため、空なら実害はない）
 - 本体側プロキシは新規コンポーネントで、置き場所（`fandhe-browser-render` か別 crate か）と待ち受けの扱いは未設計。loopback のみに bind することは、`security.md` の「アクセス制御の不備」観点で確認が要る
+
+### 4.1 Linux で宛先 IP を絞る追加の検討事項
+
+Landlock（TCP のポート）と seccomp（ソケット種別）は宛先 IP を判別しない。そのため、プロキシ＋OS 隔離の案は、プロキシと同じポートで待ち受ける別 IP への直接接続（§2 の WebSocket の `TcpStream::connect` など）を塞げない。宛先 IP を絞る手段の候補は次のとおり。いずれも可否は未確認で、採用を決めたものではない。
+
+| 候補 | 内容 | 確認が要る点 |
+| ---- | ---- | ------------ |
+| network namespace + veth | Servo ホストを専用の netns に置き、そこから到達できるのを本体側プロキシの veth 端だけにする | 親 ns 側の veth 作成とルーティングに権限が要る見込み（§3.1）。Ubuntu 24.04 の AppArmor 制限と Docker 既定 seccomp に塞がれうる |
+| nftables・iptables の owner（uid）・cgroup マッチ | 専用の uid・cgroup のプロセスから、プロキシ宛以外の送信を drop する | 規則の設定に root か CAP_NET_ADMIN が要る見込み。非特権起動の前提と衝突する（§3.1 の「要件に合わない」） |
+| cgroup BPF（connect4 等） | cgroup に付けた BPF で connect() の宛先 IP を検査する | BPF のロードに CAP_BPF 等の権限が要る見込み（§3.1 と同じ） |
+| seccomp user notification | `SECCOMP_RET_USER_NOTIF` で connect() を監督プロセスに通知し、宛先を読んで許可・拒否を返す | 監督プロセスの常駐が要る。sockaddr をメモリから読む時点と判定の間に書き換えられるおそれ（TOCTOU）の検討が要る。カーネルの要件は未確認 |
+| Landlock の新しい ABI | 宛先の制限を加えた版があるか | 本書が参照したのは ABI 4 と、UDP の制限を含む ABI 10 まで。IP の制限は未確認 |
+
+上記の組み合わせ（例: seccomp で UDP と IPv6 を塞ぎ、宛先 IP は netns か cgroup BPF で絞る）も比較の候補になる。採る場合は §5.1 の承認事項（依存・`unsafe`・権限）に加えて扱う。
 
 ## 5. 案ごとの承認事項と変更が要る箇所
 
