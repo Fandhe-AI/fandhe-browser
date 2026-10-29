@@ -42,11 +42,20 @@ const WORLD = {
       "form#nameless": { fields: [{}, { name: "" }] },
     },
   },
-  "https://forbidden.test/": { status: 403, sel: { h1: { text: "Forbidden" } } },
+  "https://forbidden.test/": { status: 403, sel: { h1: { text: "Forbidden" }, a: { text: "Sign in" } } },
+  "https://servererr.test/": { status: 503, sel: { h1: { text: "Unavailable" } } },
+  "https://redirected.test/": { status: 304, sel: { h1: { text: "Cached" } } },
+  // 応答が取れない（Playwright の goto が null を返す / fandhe-browser の http_status: null 相当）
+  "https://nostatus.test/": { sel: { h1: { text: "No status" } } },
+  "https://nostatus-empty.test/": { sel: { h1: { text: "  " } } },
   "https://fetcherr.test/": { sel: {} },
   "https://hang.test/": { sel: {} },
   "https://evalerr.test/": { status: 200, sel: { h1: { text: "x", evalError: true } } },
 };
+
+// stageTimeoutMs(60) より後に解決させる遅延（期限後に完了する接続・ページ作成の再現用）
+const LATE_MS = 150;
+const sleepMs = (ms) => new Promise((r) => setTimeout(r, ms));
 
 function fakeNode(spec) {
   return {
@@ -88,14 +97,16 @@ function fakePlaywright(calls, fail = {}) {
       calls.connect.push({ endpoint, opts });
       if (fail.connect === "throw") throw new Error("connect refused");
       if (fail.connect === "hang") return new Promise(() => {});
-      return {
+      const browser = {
         version: () => "FakeChrome/1.0",
         async newContext(o) {
           calls.context.push(o);
-          if (fail.newContext) throw new Error("newContext failed");
+          if (fail.newContext === "late") await sleepMs(LATE_MS);
+          else if (fail.newContext) throw new Error("newContext failed");
           return {
             async newPage() {
-              if (fail.newPage) throw new Error("newPage failed");
+              if (fail.newPage === "late") await sleepMs(LATE_MS);
+              else if (fail.newPage) throw new Error("newPage failed");
               return fakePage(calls);
             },
             async close() {
@@ -107,6 +118,8 @@ function fakePlaywright(calls, fail = {}) {
           calls.closed.push("browser");
         },
       };
+      if (fail.connect === "late") await sleepMs(LATE_MS);
+      return browser;
     },
   };
 }
@@ -117,18 +130,21 @@ function fakePuppeteer(calls, fail = {}) {
       calls.connect.push({ opts });
       if (fail.connect === "throw") throw new Error("connect refused");
       if (fail.connect === "hang") return new Promise(() => {});
-      return {
+      const browser = {
         async version() {
           return "FakeChrome/1.0";
         },
         async newPage() {
-          if (fail.newPage) throw new Error("newPage failed");
+          if (fail.newPage === "late") await sleepMs(LATE_MS);
+          else if (fail.newPage) throw new Error("newPage failed");
           return fakePage(calls);
         },
         async disconnect() {
           calls.closed.push("disconnect");
         },
       };
+      if (fail.connect === "late") await sleepMs(LATE_MS);
+      return browser;
     },
   };
 }
@@ -209,10 +225,55 @@ for (const lib of ["playwright", "puppeteer"]) {
     const { r } = await run(lib, task("x12", "text", "h1", "https://evalerr.test/"));
     assert.deepEqual([r.failed_stage, r.reason], ["selector", "cdp_error"]);
   });
-  await t(`${lib}: a 403 page is judged by its content, status is recorded`, async () => {
-    const { r } = await run(lib, task("x13", "text", "h1", "https://forbidden.test/"));
+  await t(`${lib}: a 403 page with a matching non-empty element is a failure (http_error at goto)`, async () => {
+    // c1 のセレクタ `a` のように、エラーページにも要素と非空テキストがある場合を成功に数えない
+    const { r } = await run(lib, task("x13", "text", "a", "https://forbidden.test/"));
+    assert.deepEqual([r.success, r.failed_stage, r.reason, r.reached_stage], [false, "goto", "http_error", "goto"]);
     assert.equal(r.http_status, 403);
-    assert.equal(r.success, true);
+    assert.equal(r.http_status_check, "failed");
+    assert.equal(r.detail, "HTTP 403");
+    assert.equal(r.output_sample, "");
+  });
+  await t(`${lib}: a 5xx page and a form task are failures too`, async () => {
+    const a = (await run(lib, task("x13b", "text", "h1", "https://servererr.test/"))).r;
+    assert.deepEqual([a.success, a.failed_stage, a.reason, a.http_status], [false, "goto", "http_error", 503]);
+    const b = (await run(lib, task("x13c", "form", "form#f", "https://servererr.test/"))).r;
+    assert.deepEqual([b.success, b.failed_stage, b.reason], [false, "goto", "http_error"]);
+  });
+  await t(`${lib}: 2xx and 3xx statuses pass the status check`, async () => {
+    const ok = (await run(lib, task("x13d", "text", "h1"))).r;
+    assert.deepEqual([ok.success, ok.http_status, ok.http_status_check], [true, 200, "passed"]);
+    const nm = (await run(lib, task("x13e", "text", "h1", "https://redirected.test/"))).r;
+    assert.deepEqual([nm.success, nm.http_status, nm.http_status_check], [true, 304, "passed"]);
+  });
+  await t(`${lib}: null status skips only the status check and is recorded (no inflation, no penalty)`, async () => {
+    const ok = (await run(lib, task("x13f", "text", "h1", "https://nostatus.test/"))).r;
+    assert.deepEqual([ok.success, ok.http_status, ok.http_status_check], [true, null, "skipped_no_status"]);
+    // 要素の判定は通常どおり行う（ステータスが無くても空テキスト・要素なしは失敗のまま）
+    const empty = (await run(lib, task("x13g", "text", "h1", "https://nostatus-empty.test/"))).r;
+    assert.deepEqual([empty.success, empty.reason, empty.http_status_check], [false, "empty_result", "skipped_no_status"]);
+    const none = (await run(lib, task("x13h", "text", "h9", "https://nostatus.test/"))).r;
+    assert.deepEqual([none.success, none.reason, none.http_status_check], [false, "no_match", "skipped_no_status"]);
+  });
+  await t(`${lib}: goto failure leaves http_status_check null`, async () => {
+    const { r } = await run(lib, task("x13i", "text", "h1", "https://fetcherr.test/"));
+    assert.equal(r.http_status_check, null);
+  });
+  await t(`${lib}: connect that resolves after the stage deadline is released`, async () => {
+    const calls = newCalls();
+    const { r } = await run(lib, task("x16", "text", "h1"), { connect: "late" }, calls);
+    assert.deepEqual([r.failed_stage, r.reason], ["connect", "timeout"]);
+    assert.deepEqual(calls.closed, []);
+    await sleepMs(LATE_MS + 100);
+    assert.deepEqual(calls.closed, [lib === "playwright" ? "browser" : "disconnect"]);
+  });
+  await t(`${lib}: newPage that resolves after the stage deadline is released`, async () => {
+    const calls = newCalls();
+    const { r } = await run(lib, task("x17", "text", "h1"), { newPage: "late" }, calls);
+    assert.deepEqual([r.failed_stage, r.reason], ["newPage", "timeout"]);
+    await sleepMs(LATE_MS + 100);
+    assert.ok(calls.closed.includes("page"), `late page must be closed: ${calls.closed}`);
+    assert.ok(calls.closed.includes(lib === "playwright" ? "browser" : "disconnect"));
   });
   await t(`${lib}: cleanup runs (page and connection are released)`, async () => {
     const { calls } = await run(lib, task("x14", "text", "h1"));
@@ -230,6 +291,14 @@ await t("playwright: spec-sanctioned options (CDP-2) are passed", async () => {
   assert.equal(calls.connect[0].opts.noDefaults, true);
   assert.deepEqual(calls.context[0], { acceptDownloads: false, viewport: null });
   assert.equal(calls.goto[0].opts.waitUntil, "domcontentloaded");
+});
+await t("playwright: newContext that resolves after the stage deadline is released", async () => {
+  const calls = newCalls();
+  const { r } = await run("playwright", task("y2b", "text", "h1"), { newContext: "late" }, calls);
+  assert.deepEqual([r.failed_stage, r.reason], ["newContext", "timeout"]);
+  await sleepMs(LATE_MS + 100);
+  assert.ok(calls.closed.includes("context"), `late context must be closed: ${calls.closed}`);
+  assert.ok(calls.closed.includes("browser"));
 });
 await t("playwright: newContext failure is attributed to newContext", async () => {
   const { r } = await run("playwright", task("y2", "text", "h1"), { newContext: true });
@@ -250,10 +319,10 @@ await t("puppeteer: browserURL mode passes the origin", async () => {
   assert.equal(c.connect[0].opts.browserURL, "http://127.0.0.1:9");
 });
 await t("same judgment for both libraries (no per-library or per-target logic)", async () => {
-  for (const [tk] of [[task("z1", "text", "h1")], [task("z2", "form", "form#f")], [task("z3", "text", "h9")]]) {
+  for (const [tk] of [[task("z1", "text", "h1")], [task("z2", "form", "form#f")], [task("z3", "text", "h9")], [task("z4", "text", "a", "https://forbidden.test/")], [task("z5", "text", "h1", "https://nostatus.test/")]]) {
     const a = (await run("playwright", tk)).r;
     const b = (await run("puppeteer", tk)).r;
-    for (const k of ["success", "failed_stage", "reason", "output_sample", "match_count", "method"]) assert.equal(a[k], b[k], `${tk.id}.${k}`);
+    for (const k of ["success", "failed_stage", "reason", "output_sample", "match_count", "method", "http_status", "http_status_check"]) assert.equal(a[k], b[k], `${tk.id}.${k}`);
   }
 });
 await t("runAll: tasks after the total deadline are blocked, not run", async () => {
@@ -316,6 +385,18 @@ await t("summarize: 28 and 22 denominators per library and target; a6/c1 stay in
   assert.match(text, /^library=playwright target=fandhe-browser set=28 success=24\/28 rate=85\.7%$/m);
   assert.match(text, /^library=playwright target=fandhe-browser set=22 success=20\/22 rate=90\.9%$/m);
   assert.match(text, /^library=puppeteer target=fandhe-browser failed_stage selector=25$/m);
+});
+await t("summarize: successes without a status are listed separately; http_error counts as a failed goto", async () => {
+  const rows = synthetic("playwright", "fandhe-browser", ["a6"]).map((r) => {
+    if (r.id === "a6") return { ...r, failed_stage: "goto", reason: "http_error", http_status: 403, http_status_check: "failed" };
+    if (r.id === "a1") return { ...r, http_status: null, http_status_check: "skipped_no_status" };
+    return { ...r, http_status: 200, http_status_check: "passed" };
+  });
+  const [g] = summarize(rows, realTasks);
+  assert.deepEqual(g.status_unchecked_success_ids, ["a1"]);
+  assert.deepEqual(g.failed_stage, { goto: 1 });
+  assert.deepEqual(g.reason, { http_error: 1 });
+  assert.match(formatSummary([g]), /^library=playwright target=fandhe-browser status_unchecked_success a1 /m);
 });
 await t("summarize: incomplete, duplicate or unknown ids are rejected (fail-closed)", async () => {
   const full = synthetic("playwright", "chromium", []);

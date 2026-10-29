@@ -38,9 +38,12 @@ fandhe-browser と Chromium の両方へ流す。関連: `CDP-2`・`CDP-3`・`ME
 | `texts` | 先頭一致 1 件の `textContent` が空白除去後に非空（件数は数えない。`method: "first_match"`・`match_count: null`） | 同上 |
 | `form` | 先頭一致要素の子孫に、`name` 属性が非空の `input` / `textarea` / `select` が 1 件以上 | `handle.evaluate(...)` で数える（`match_count` に件数） |
 
-- `reason` の語彙は `run_core.mjs` と同じ: `no_match`（要素なし）・`empty_result`・`timeout`・`fetch_error`（`goto` の例外）・`cdp_error`（それ以外の例外）・`blocked`（全体期限超過で未実行）
+- `reason` の語彙は `run_core.mjs` と同じ: `no_match`（要素なし）・`empty_result`・`timeout`・`fetch_error`（`goto` の例外）・`cdp_error`（それ以外の例外）・`blocked`（全体期限超過で未実行）。本ハーネス固有の追加が `http_error`（`goto` の応答が 4xx・5xx。次項）
 - `failed_stage`: `connect` / `newContext`（Playwright のみ）/ `newPage` / `goto` / `selector`。成功は `null`。`reached_stage` は到達した最後の段階
-- HTTP ステータスは `goto` の応答から `http_status` に記録する（参考。a6 の 403 などの切り分け用。応答が取れなければ `null`）
+- **HTTP ステータス条件**（両ライブラリ・両接続先に共通。接続先ごとの分岐は無い）: `goto` の応答ステータスを `http_status` に記録し、**4xx・5xx は要素取得の結果にかかわらず失敗**にする（`failed_stage: "goto"`・`reason: "http_error"`・`detail: "HTTP 403"` 等。要素取得には進まない）。403 のエラーページにも `a` などのセレクタと非空テキストがあり得るため、内容だけで成功にしない（a6 の 403・c1 の anti-bot を失敗として数える契約。`SEC-2`・`SEC-3`）
+  - **ステータスが取れない場合**（`goto` の応答が `null`。fandhe-browser は現状 `http_status: null`、Playwright は応答を `null` で返すことがある）は「判定不能」として**ステータス条件だけをスキップ**し、要素取得の判定（上の表）は通常どおり行う。`null` を一律失敗にすると、ステータスを返さない fandhe-browser が構造的に不利になる。そこで、判定できない条件だけをスキップして要素判定に委ね、スキップした事実を結果に残して後から数え直せるようにする（成功を水増しせず、一方の接続先だけを不利にもしない）
+  - 結果の `http_status_check` に判定を残す: `passed`（100〜599 のうち 400 未満）・`failed`（4xx・5xx）・`skipped_no_status`（取得不能）・`null`（`goto` に到達しなかった）。100〜599 の整数以外の値は取得不能として扱う
+  - **残るリスク**: ステータスが取れない接続先では、エラーページ（403 等）が要素判定を通ると成功に数えられる。`summary.txt` / `summary.json` の `status_unchecked_success`（成功のうちステータス条件をスキップした id）が、その成功の中でエラーページ由来が混ざり得る範囲。人間の判定では、この id 群を別掲して確認する（Chromium 側が同じ id で `http_error` なら、fandhe-browser の同 id の成功は疑う）
 - 各段階は `--stage-timeout`（既定 30 秒）で打ち切る。全体期限（`--total-timeout`、既定 1800 秒）を超えたら以降は実行せず `blocked`
 
 ## 分母と 60% の見方（判定は人間）
@@ -115,7 +118,7 @@ node harness/endpoint-swap/summarize.mjs /abs/path/out/*.jsonl
 bash harness/endpoint-swap/self-test.sh   # 要 node 22 以降。ネットワーク・npm 不要
 ```
 
-- 対象: 判定（text / texts / form・各 `failed_stage` と `reason`・タイムアウト・全体期限）、集計（28 件 / 22 件の分母・欠落と重複の拒否）、導入検証の純関数、エンドポイント検証、`/json/version` からの WebSocket URL 解決（`compat-practical/fake_cdp_server.mjs` を再利用）、`run_swap.mjs` / `summarize.mjs` の CLI の配線（偽の `playwright-core` / `puppeteer-core` を一時ディレクトリに置いて実行）、`run.sh` の引数検証、`SEC-2` の静的検査
+- 対象: 判定（text / texts / form・各 `failed_stage` と `reason`・HTTP ステータス条件〔403・5xx は要素ありでも失敗、`null` は `skipped_no_status` で要素判定のみ〕・タイムアウト・全体期限）、期限後に完了した接続・コンテキスト・ページの解放（両ライブラリ）、集計（28 件 / 22 件の分母・欠落と重複の拒否）、導入検証の純関数、エンドポイント検証、`/json/version` からの WebSocket URL 解決（`compat-practical/fake_cdp_server.mjs` を再利用）、`run_swap.mjs` / `summarize.mjs` の CLI の配線（偽の `playwright-core` / `puppeteer-core` を一時ディレクトリに置いて実行）、`run.sh` の引数検証、`SEC-2` の静的検査
 - ページ内で評価する関数（`PAGE_FN_*`）は偽 DOM に対して本物の関数のまま実行する
 - **対象外（npm を入れないと回せない部分）**: 実 Playwright / Puppeteer の API 挙動（`page.$`・`evaluate`・`goto` の実際の戻り値や例外の形）、実 Chromium・実 fandhe-browser との接続、`run.sh` の npm 導入・接続先の起動・停止。これらは実走（上の使い方）でのみ確認できる
 - 偽サーバーは `run_core.mjs` 用で、Playwright / Puppeteer のプロトコル全体は話せない。ライブラリ経由の実接続の検証には使っていない

@@ -10,7 +10,15 @@
 //   texts : 先頭一致 1 件の textContent が空白除去後に非空（件数は捏造しない。method: "first_match"）
 //   form  : 先頭一致要素の子孫に name 属性が非空の input / textarea / select が 1 件以上
 // reason の語彙も run_core と揃える: no_match / empty_result / timeout / fetch_error / cdp_error / blocked。
+// 追加の reason は http_error（goto の応答が 4xx・5xx。下記）。
 // 追加の failed_stage は connect / newContext（Playwright のみ）/ newPage / goto / selector。
+//
+// HTTP ステータス条件（両接続先・両ライブラリに共通。403・anti-bot の失敗を失敗として数える契約。SEC-2・SEC-3）:
+//   goto の応答が 4xx・5xx なら要素取得の結果にかかわらず失敗（failed_stage: goto・reason: http_error・detail: "HTTP <status>"）。
+//   ステータスが取れない（応答 null。fandhe-browser は現状 http_status: null）場合は「判定不能」としてステータス条件だけを
+//   スキップし、結果に http_status_check: "skipped_no_status" を残す。null を一律失敗にすると接続先によって
+//   構造的に不利になり、一律成功にすると 403 を水増しするため、スキップを記録して後から数え直せるようにする。
+//   記録値は http_status_check: "passed"（2xx・3xx）/ "failed"（4xx・5xx）/ "skipped_no_status"（取得不能）/ null（goto 未到達）。
 
 export const POC22_EXCLUDED = Object.freeze(["c4", "d5", "d7", "d8", "e3", "e6"]);
 export const LIBRARIES = Object.freeze(["playwright", "puppeteer"]);
@@ -18,6 +26,17 @@ export const ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 export const KINDS = new Set(["text", "texts", "form"]);
 export const SAMPLE_MAX = 300;
 export const THRESHOLD_PERCENT = 60;
+
+/** goto の応答ステータスを正規化する。HTTP として妥当な 100〜599 の整数だけを返し、それ以外は null（判定不能）。 */
+export function normalizeHttpStatus(status) {
+  return Number.isInteger(status) && status >= 100 && status <= 599 ? status : null;
+}
+
+/** ステータス条件の判定結果（"passed" / "failed" / "skipped_no_status"）。null は判定不能でスキップ。 */
+export function httpStatusCheck(status) {
+  if (status === null) return "skipped_no_status";
+  return status >= 400 ? "failed" : "passed";
+}
 
 // ページ内で評価する関数。toString で直列化されるため、閉包・外部参照を持たない自己完結の形にする。
 // 全アダプタ・全接続先で同じ関数を渡す（接続先ごとに差し替えない）。
@@ -87,6 +106,34 @@ export async function withTimeout(promise, ms) {
   }
 }
 
+/** goto 後の要素取得と成否判定。rec の success / failed_stage / reason / match_count / output_sample を更新する。 */
+async function judgeSelector(adapter, task, rec, stageTimeoutMs) {
+  const handle = await withTimeout(adapter.queryFirst(task.selector), stageTimeoutMs);
+  if (handle === null || handle === undefined) {
+    rec.failed_stage = "selector";
+    rec.reason = "no_match";
+  } else if (task.kind === "form") {
+    const n = await withTimeout(adapter.evaluate(handle, PAGE_FN_FORM_FIELDS), stageTimeoutMs);
+    rec.match_count = Number.isInteger(n) ? n : 0;
+    if (rec.match_count > 0) {
+      rec.success = true;
+      rec.output_sample = `${rec.match_count} named fields`;
+    } else {
+      rec.failed_stage = "selector";
+      rec.reason = "empty_result";
+    }
+  } else {
+    const text = String(await withTimeout(adapter.evaluate(handle, PAGE_FN_TEXT), stageTimeoutMs));
+    if (text.replace(/\s+/g, "") === "") {
+      rec.failed_stage = "selector";
+      rec.reason = "empty_result";
+    } else {
+      rec.success = true;
+      rec.output_sample = sanitizeSample(text);
+    }
+  }
+}
+
 /**
  * 1 タスクを実行して結果レコード（JSON 化可能）を返す。例外は投げない。
  * adapter: { stages, connect, newContext?, newPage, goto, queryFirst, evaluate, version, cleanup }（adapters.mjs）
@@ -97,11 +144,10 @@ export async function executeTask(adapter, task, { stageTimeoutMs, settleMs, lib
   const rec = {
     type: "result", library, target, id: task.id, cat: task.cat, kind: task.kind, url: task.url, selector: task.selector,
     in_poc22: inPoc22(task.id), success: false, failed_stage: null, reached_stage: null, reason: null, detail: null,
-    browser: null, http_status: null, method: task.kind === "form" ? "form_fields" : "first_match", match_count: null,
-    elapsed_ms: 0, output_sample: "",
+    browser: null, http_status: null, http_status_check: null, method: task.kind === "form" ? "form_fields" : "first_match",
+    match_count: null, elapsed_ms: 0, output_sample: "",
   };
   let stage = "connect";
-  let handle = null;
   try {
     stage = "connect";
     await withTimeout(adapter.connect(), stageTimeoutMs);
@@ -122,35 +168,20 @@ export async function executeTask(adapter, task, { stageTimeoutMs, settleMs, lib
     rec.reached_stage = "newPage";
     stage = "goto";
     const status = await withTimeout(adapter.goto(task.url), stageTimeoutMs);
-    rec.http_status = Number.isInteger(status) ? status : null;
-    if (settleMs > 0) await sleep(settleMs);
+    rec.http_status = normalizeHttpStatus(status);
+    rec.http_status_check = httpStatusCheck(rec.http_status);
     rec.reached_stage = "goto";
-    stage = "selector";
-    handle = await withTimeout(adapter.queryFirst(task.selector), stageTimeoutMs);
-    if (handle === null || handle === undefined) {
-      rec.failed_stage = "selector";
-      rec.reason = "no_match";
-    } else if (task.kind === "form") {
-      const n = await withTimeout(adapter.evaluate(handle, PAGE_FN_FORM_FIELDS), stageTimeoutMs);
-      rec.match_count = Number.isInteger(n) ? n : 0;
-      if (rec.match_count > 0) {
-        rec.success = true;
-        rec.output_sample = `${rec.match_count} named fields`;
-      } else {
-        rec.failed_stage = "selector";
-        rec.reason = "empty_result";
-      }
+    if (rec.http_status_check === "failed") {
+      // HTTP エラー応答は要素の有無にかかわらず失敗（エラーページの `a` 等を成功に数えない）
+      rec.failed_stage = "goto";
+      rec.reason = "http_error";
+      rec.detail = `HTTP ${rec.http_status}`;
     } else {
-      const text = String(await withTimeout(adapter.evaluate(handle, PAGE_FN_TEXT), stageTimeoutMs));
-      if (text.replace(/\s+/g, "") === "") {
-        rec.failed_stage = "selector";
-        rec.reason = "empty_result";
-      } else {
-        rec.success = true;
-        rec.output_sample = sanitizeSample(text);
-      }
+      if (settleMs > 0) await sleep(settleMs);
+      stage = "selector";
+      await judgeSelector(adapter, task, rec, stageTimeoutMs);
+      if (rec.success) rec.reached_stage = "selector";
     }
-    if (rec.success) rec.reached_stage = "selector";
   } catch (e) {
     rec.failed_stage = stage;
     rec.reason = isTimeoutError(e) ? "timeout" : stage === "goto" ? "fetch_error" : "cdp_error";
@@ -177,7 +208,7 @@ export async function runAll(makeAdapter, tasks, { stageTimeoutMs, settleMs, tot
       r = {
         type: "result", library, target, id: task.id, cat: task.cat, kind: task.kind, url: task.url, selector: task.selector,
         in_poc22: inPoc22(task.id), success: false, failed_stage: null, reached_stage: null, reason: "blocked",
-        detail: "total time limit exceeded", browser: null, http_status: null, method: task.kind === "form" ? "form_fields" : "first_match",
+        detail: "total time limit exceeded", browser: null, http_status: null, http_status_check: null, method: task.kind === "form" ? "form_fields" : "first_match",
         match_count: null, elapsed_ms: 0, output_sample: "",
       };
     } else {
@@ -246,6 +277,8 @@ export function summarize(lines, tasks) {
       failed_stage: count("failed_stage"), reason: count("reason"),
       failed_ids: failures.map((f) => f.id).sort(),
       success_ids: g.rows.filter((r) => r.success).map((r) => r.id).sort(),
+      // 成功のうちステータスが取れず HTTP エラー判定をスキップした id（成功率の読み手が数え直せるよう別掲する）
+      status_unchecked_success_ids: g.rows.filter((r) => r.success && r.http_status_check === "skipped_no_status").map((r) => r.id).sort(),
     });
   }
   out.sort((a, b) => a.library.localeCompare(b.library) || a.target.localeCompare(b.target));
@@ -273,6 +306,7 @@ export function formatSummary(groups) {
     lines.push(`${head} failed_stage ${fmt(g.failed_stage)}`);
     lines.push(`${head} reason ${fmt(g.reason)}`);
     lines.push(`${head} failed_ids ${g.failed_ids.join(",") || "-"}`);
+    lines.push(`${head} status_unchecked_success ${g.status_unchecked_success_ids.join(",") || "-"} (HTTP status unavailable; error-status check skipped)`);
     if (g.of_chromium_success) {
       const c = g.of_chromium_success;
       lines.push(`${head} of_chromium_success=${c.success}/${c.total} rate=${c.rate}% (reference only; not a denominator)`);

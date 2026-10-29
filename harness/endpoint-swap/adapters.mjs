@@ -92,16 +92,25 @@ export function playwrightAdapter({ chromium, endpoint, stageTimeoutMs, waitUnti
   let browser;
   let context;
   let page;
+  // cleanup 開始後は true。executeTask の期限（withTimeout）は元の処理を中断しないため、期限後に遅れて得た
+  // browser・context・page は代入せず、その場で解放する（解放漏れで接続先にセッションが残らないようにする）
+  let cleaned = false;
   return {
     stages: STAGES_PLAYWRIGHT,
     async connect() {
-      browser = await chromium.connectOverCDP(endpoint, { noDefaults: true, timeout: stageTimeoutMs });
+      const b = await chromium.connectOverCDP(endpoint, { noDefaults: true, timeout: stageTimeoutMs });
+      if (cleaned) return await quietly(() => b.close(), 3000);
+      browser = b;
     },
     async newContext() {
-      context = await browser.newContext({ acceptDownloads: false, viewport: null });
+      const c = await browser.newContext({ acceptDownloads: false, viewport: null });
+      if (cleaned) return await quietly(() => c.close(), 3000);
+      context = c;
     },
     async newPage() {
-      page = await context.newPage();
+      const p = await context.newPage();
+      if (cleaned) return await quietly(() => p.close(), 3000);
+      page = p;
     },
     async goto(url) {
       const response = await page.goto(url, { waitUntil, timeout: stageTimeoutMs });
@@ -121,6 +130,7 @@ export function playwrightAdapter({ chromium, endpoint, stageTimeoutMs, waitUnti
       }
     },
     async cleanup() {
+      cleaned = true;
       if (page) await quietly(() => page.close(), 3000);
       if (context) await quietly(() => context.close(), 3000);
       // connectOverCDP の browser.close() は切断のみ（接続先のブラウザプロセスは終了しない）
@@ -132,6 +142,8 @@ export function playwrightAdapter({ chromium, endpoint, stageTimeoutMs, waitUnti
 export function puppeteerAdapter({ puppeteer, endpoint, stageTimeoutMs, waitUntil = "domcontentloaded", viewport = "null", connectMode = "ws" }) {
   let browser;
   let page;
+  // Playwright 側と同じ。cleanup 後に遅れて得たリソースは代入せず即時に解放する
+  let cleaned = false;
   return {
     stages: STAGES_PUPPETEER,
     async connect() {
@@ -141,10 +153,14 @@ export function puppeteerAdapter({ puppeteer, endpoint, stageTimeoutMs, waitUnti
       if (base.protocol === "ws:") opts.browserWSEndpoint = base.href;
       else if (connectMode === "url") opts.browserURL = base.origin;
       else opts.browserWSEndpoint = await resolveWsEndpoint(endpoint, stageTimeoutMs);
-      browser = await puppeteer.connect(opts);
+      const b = await puppeteer.connect(opts);
+      if (cleaned) return await quietly(() => b.disconnect(), 3000);
+      browser = b;
     },
     async newPage() {
-      page = await browser.newPage();
+      const p = await browser.newPage();
+      if (cleaned) return await quietly(() => p.close(), 3000);
+      page = p;
     },
     async goto(url) {
       const response = await page.goto(url, { waitUntil, timeout: stageTimeoutMs });
@@ -164,6 +180,7 @@ export function puppeteerAdapter({ puppeteer, endpoint, stageTimeoutMs, waitUnti
       }
     },
     async cleanup() {
+      cleaned = true;
       if (page) await quietly(() => page.close(), 3000);
       // disconnect は接続先のブラウザを終了しない
       if (browser) await quietly(() => browser.disconnect(), 3000);
