@@ -2,6 +2,8 @@
 # 実測ハーネス・ベンチ・計測系ターゲットの実体。Makefile の各ターゲットはここへ 1 行で委譲する。
 # 使い方: scripts/harness.sh <name>
 #   check-compat-practical   実測ハーネス（28 タスク定義・アクセス確認・run_core）の自己テスト（MEAS-4。要 jq・node）
+#   check-cli-conformance    CLI コンフォーマンステスト実行スクリプトの自己テスト（TASK-49・CLI-1。偽バイナリ・オフライン。要 jq・curl・node）
+#   measure-cli-conformance  実バイナリでの CLI コンフォーマンステスト（TASK-49・CLI-1。3 OS の実測は手動 workflow xos-measure.yml。追加引数は CLI_CONFORMANCE_ARGS）
 #   check-compat-regression  対象サイト群の動作率回帰チェック（COMPAT-1・COMPAT-4。要 jq）
 #   bench-record             competitor_lightpanda ベンチを実行し結果を時系列で記録（要 jq）
 #   check-bench-record       record.sh の自己テスト（要 jq）
@@ -29,7 +31,7 @@
 # 上書き可能な環境変数（`make <target> VAR=value` も可）: BINARY_SIZE_PACKAGE・BINARY_SIZE_LIMIT_BYTES・
 # JS_BINARY_SIZE_STRIP（非空で --strip）・CSSOM_PROFILE_COST_ARGS・MCP_ENVELOPE_ARGS・
 # CONTAINER_SIZE_REFERENCE_IMAGE・CONTAINER_SIZE_REFERENCE_DIGEST・CONTAINER_SIZE_DEFAULT_IMAGE・
-# CONTAINER_MEMORY_ARGS（空白区切りの追加引数）・CONTAINER_MEMORY_COMPARE_ARGS（同・compare 用）・CONTAINER_MEMORY_HELPER_IMAGE・CONTAINER_MEMORY_HELPER_DIGEST・
+# CLI_CONFORMANCE_ARGS（空白区切りの追加引数。measure-cli-conformance 用）・CONTAINER_MEMORY_ARGS（空白区切りの追加引数）・CONTAINER_MEMORY_COMPARE_ARGS（同・compare 用）・CONTAINER_MEMORY_HELPER_IMAGE・CONTAINER_MEMORY_HELPER_DIGEST・
 # CONTAINER_SIZE_LITE_IMAGE・CONTAINER_SIZE_PLATFORM・CONTAINER_SIZE_SKIP_BUILD・CONTAINER_SIZE_NO_PULL（非空で有効）・
 # CONTAINER_SMOKE_ROLE（lite|default）・CONTAINER_SMOKE_IMAGE・CONTAINER_SMOKE_PLATFORM・CONTAINER_SMOKE_SKIP_BUILD（非空で有効）・CONTAINER_SMOKE_TASK_TIMEOUT・
 # CONTAINER_JS_SMOKE_IMAGE・CONTAINER_JS_SMOKE_PLATFORM・CONTAINER_JS_SMOKE_SKIP_BUILD（非空で有効）・CONTAINER_JS_SMOKE_CASE_TIMEOUT・
@@ -53,6 +55,7 @@ name="$1"
 : "${CONTAINER_SIZE_SKIP_BUILD:=}"
 : "${CONTAINER_SIZE_NO_PULL:=}"
 : "${CONTAINER_MEMORY_ARGS:=}"
+: "${CLI_CONFORMANCE_ARGS:=}"
 : "${CONTAINER_MEMORY_COMPARE_ARGS:=}"
 : "${CONTAINER_SMOKE_ROLE:=lite}"
 : "${CONTAINER_SMOKE_IMAGE:=}"
@@ -89,6 +92,23 @@ case "${name}" in
     bash harness/compat-practical/access_check.sh --validate-only
     bash harness/compat-practical/run_core.sh --validate-only
     bash harness/compat-practical/make_matrix.sh --validate-only
+    ;;
+  check-cli-conformance)
+    # 偽バイナリ（node 製）とオフラインの偽 curl だけを使う。launch の待ち受けは自己テスト用の空きポート（loopback）のみ
+    require_cmd jq "required by ${name}"
+    require_cmd curl "required by ${name}"
+    require_cmd node "required by ${name}"
+    bash harness/cli-conformance/self-test.sh
+    ;;
+  measure-cli-conformance)
+    # 実バイナリ（既定: target/release/fandhe-browser。無ければ run.sh が exit 2）に対して必須 5 ケース + 補助ケースを実行する。
+    # 実際に example.com へ出る。描画ホスト（CT-SHOT 用）は CLI_CONFORMANCE_ARGS に `--render-host <path>` で渡す。
+    # `make ci` と CI（ci.yml）には含めない。3 OS の実測は手動 workflow（.github/workflows/xos-measure.yml）が行う。
+    require_cmd jq "required by ${name}"
+    require_cmd curl "required by ${name}"
+    bash harness/cli-conformance/self-test.sh
+    # shellcheck disable=SC2086 # 引数文字列は意図的に単語分割する
+    bash harness/cli-conformance/run.sh ${CLI_CONFORMANCE_ARGS}
     ;;
   check-compat-regression)
     # self-test（合成データで「閾値未満で fail する」ことをログに残す）を先に実行してから実マトリクスを判定する。

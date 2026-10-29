@@ -26,7 +26,7 @@
 	lint-md lint-yaml lint-editorconfig lint-commits lint-docs \
 	check-workspace-manifest fmt fmt-check lint test test-harness lint-rendering test-rendering \
 	check-render-isolation check-js-engine-isolation check-publish-private deny deny-servo-host license-inventory license-inventory-servo-host check-deny-license-reject ci \
-	check-compat-practical check-compat-regression bench-record check-ci-changes check-bench-record \
+	check-compat-practical check-cli-conformance measure-cli-conformance check-compat-regression bench-record check-ci-changes check-bench-record \
 	check-binary-size check-static-link check-dynamic-link-macos check-dynamic-link-windows measure-mcp-envelope check-mcp-envelope measure-plugin-overhead check-plugin-overhead measure-js-binary-size measure-container-size check-container-smoke check-container-js-smoke check-container-memory measure-container-memory compare-container-memory measure-cssom-profile-cost \
 	docker-build docker-shell docker-ci trace-playwright check-playwright-trace check-puppeteer-connect check-playwright-connect test-playwright-connect
 
@@ -172,6 +172,12 @@ measure-js-binary-size: ## JS エンジン構成別（既定 V8 / 軽量 boa / �
 
 measure-container-size: ## 既定・軽量コンテナと比較対象（Playwright 公式）イメージのサイズを計測する（TASK-65.1・CTR-1・CTR-5。要 docker・jq）
 	@scripts/harness.sh measure-container-size
+
+check-cli-conformance: ## CLI コンフォーマンステスト実行スクリプトの自己テスト（TASK-49・CLI-1。偽バイナリ・オフライン。要 jq・curl・node）
+	@scripts/harness.sh check-cli-conformance
+
+measure-cli-conformance: ## 実バイナリで CLI コンフォーマンステストを実行する（TASK-49・CLI-1。example.com へ出る。CLI_CONFORMANCE_ARGS で --render-host 等を指定。3 OS の実測は手動 workflow xos-measure.yml）
+	@scripts/harness.sh measure-cli-conformance
 
 check-container-memory: ## コンテナ同時起動の集約メモリ測定スクリプトの自己テスト（TASK-67・CTR-3・CTR-7。Linux のみ。要 jq。docker 不要）
 	@scripts/harness.sh check-container-memory

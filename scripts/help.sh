@@ -41,7 +41,7 @@ Rust checks (skipped while Cargo.toml or member crates are absent)
   ci                         (runs the gates above plus harness self-tests) full local gate
 
 Harnesses, benches, measurements (scripts/harness.sh <name>)
-  test-harness  check-compat-practical  check-compat-regression  bench-record  check-ci-changes
+  test-harness  check-compat-practical  check-cli-conformance  measure-cli-conformance  check-compat-regression  bench-record  check-ci-changes
   check-bench-record  check-binary-size  check-static-link  check-dynamic-link-macos  check-dynamic-link-windows  measure-mcp-envelope  check-mcp-envelope
   measure-plugin-overhead  check-plugin-overhead
   measure-js-binary-size  measure-container-size  check-container-smoke  check-container-js-smoke  check-container-memory  measure-container-memory  compare-container-memory  measure-cssom-profile-cost  trace-playwright  check-playwright-trace
