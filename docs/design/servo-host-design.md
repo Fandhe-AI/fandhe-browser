@@ -5,7 +5,7 @@
 - 関連 Issue: #935（本設計）・#915（構成・採用版・ライセンス判断。本書は `Refs` で参照し、閉じない）・#914（試作）・#230〜#237（TASK-38 の実装 Issue）
 - 状態: **確定**（オーナー判断 2026-10-15・#228）。実装は TASK-38 の issue（#228 配下）で進行中
 - 範囲: 本書の作成時点では設計文書のみ。実装・依存追加・既存 Issue の本文書き換え・追加起票・ruleset 変更は行わない（設計レビュー後に別途行う）
-- 数値の出典: #914 の試作（[servo-out-of-process-prototype.md](./servo-out-of-process-prototype.md)）と #915 の記録。計測は Linux x86_64 のみで、macOS・Windows・実ページ・musl / scratch 配布・IPC 実装は**未検証**
+- 数値の出典: #914 の試作（[servo-out-of-process-prototype.md](./servo-out-of-process-prototype.md)）と #915 の記録。計測は Linux x86_64 のみで、macOS・Windows・実ページ・IPC 実装は**未検証**（musl・glibc の配布形態は #1001 で実測済み。§7.1）
 - spec の確認元: `docs/spec` の記録コミット f7cb79e（`RENDER-1`〜`RENDER-3`・`OSS-2`・`OSS-3` 注記、`TASK-33`・`TASK-34`・`TASK-38`）
 
 ## 0. 決定済み事項と本書の推奨
@@ -194,7 +194,7 @@ v1 はホストが自分で fetch する（URL のみ送る）。Cookie・セッ
 - 本体の `deny.toml` は変更しない（`OSS-2`・`OSS-3`）。
 - `[bans]` に `mozangle`・`gstreamer` 系・`wgpu` 系・LGPL 系を明示し、`default-features = false` の効果の回帰を検出する。`[sources]` は crates.io のみとし git ソースを拒否する。`mozangle` は `wrappers = ["servo"]` で、Windows の `no-wgl`（ANGLE）に限り servo からの直接依存だけ許す（#999）。
 - `[graph]` は `all-features = false`、`targets` は 3 OS の主要ターゲットに限定する（aarch64-windows / musl は検証待ち）。
-- 試作の `cargo deny` は拒否 85 件（`MPL-2.0` 83・`MPL-2.0 AND BSD-3-Clause` 1・`CDLA-Permissive-2.0` 1）。FreeType 本体（FTL）と同梱 libpng は `cargo deny` で検出できないため手動確認項目とする（§5）。
+- 試作の `cargo deny` は拒否 85 件（`MPL-2.0` 83・`MPL-2.0 AND BSD-3-Clause` 1・`CDLA-Permissive-2.0` 1）。FreeType 本体（FTL）と libpng の帰属は `cargo deny` で検出できないため手動確認項目とする（§5）。
 
 ### 4.1 2 workspace での実行
 
@@ -216,11 +216,12 @@ v1 はホストが自分で fetch する（URL のみ送る）。Cookie・セッ
 
 - `NOTICE` §2 の MPL 適用範囲を「Servo ホストの配布物（`fandhe-browser-servo-host` バイナリとそれを含むコンテナイメージ）」に書き換える。本体バイナリには含まれない。Servo 版は実装時点の `0.6.0`（現行の版は `NOTICE` を正とする。#1297 で `0.7.0` へ一時的に上げた）、ソース入手先は `https://github.com/servo/servo` の対応タグ、ソースは無改変と明記する。MPL-2.0 全文を `LICENSE-THIRD-PARTY` に追加する。
 - `NOTICE` §1 の CA バンドルの注記は「MPL-2.0 は `fandhe-browser-render` 配下に限る規約の例外」から「Servo ホスト workspace 外の例外（データファイル）」へ言い換える。
-- FreeType は FTL を選び、`NOTICE` に FTL の帰属文（同梱ソースの `docs/FTL.TXT` の文言に一致させる）を載せる。GPLv2 側は選ばない旨を明記する。
-- 同梱 libpng は PNG Reference Library License v2 の著作権表示・許諾文を `LICENSE-THIRD-PARTY` に収録する。
+- FreeType は FTL を選び、`NOTICE` に FTL の帰属文（FreeType のソース配布物の `docs/FTL.TXT` の文言に一致させる）を載せる。ホスト単体では FreeType を同梱しないが、FTL の帰属は残す（オーナー判断 2026-10-29・#1001）。GPLv2 側は選ばない旨を明記する。
+- libpng は現行構成（`bundled_freetype` 無効）ではホストのバイナリに同梱されない。system の libfreetype・libfontconfig 経由で OS から供給されるため、著作権表示・許諾文の扱いは下記の FreeType の項に従う。同梱構成に変える場合は PNG Reference Library License v2 の著作権表示・許諾文を `LICENSE-THIRD-PARTY` に収録する。
 - Cargo 依存約 569 件分の著作権表示のため、`scripts/gen-cargo-licenses.sh` を manifest パスを受け取れる形に拡張し、ホスト配布物用の `LICENSE-CARGO-DEPENDENCIES` を別に生成する。`webpki-roots`（CDLA-Permissive-2.0）の帰属を含める。
 - `baked-in-resources`（`servo-default-resources`）に埋め込まれるリソースファイルのライセンスを手動確認する。
-- FreeType は `bundled_freetype` でも `libfreetype` へ動的リンクされる（試作の `ldd` で 13 ライブラリ）。同梱版と system 版のどちらが使われるかは**未検証**で、配布形態で `NOTICE` の内容が変わるため §7 の配布検証と対にする。
+- FreeType・fontconfig は system の共有ライブラリを実行時に読み込む（解決済み・#1001）。`servo-host/Cargo.toml` は `default-features = false` と `baked-in-resources` のみで `bundled_freetype` を無効にしているため、ホスト単体の配布物には FreeType・fontconfig は同梱されない（musl・glibc の 3 構成で 2026-10-29 に実測。§7.1）。libpng・expat・bz2・brotli は system の libfreetype・libfontconfig 経由で入り、harfbuzz は harfbuzz-sys の `bundled` により全構成で静的に取り込まれる。配布物ごとの出所は一意で、同梱版と system 版の判別は不要になった。`bundled_freetype` を有効にした場合は試していない（feature の切り替えはしていない）。
+- `NOTICE` は配布形態別に分けず 1 本のまま（オーナー判断 2026-10-29・#1001。§13 項目 9）。注記で次を分ける。ホスト単体の配布物には FreeType・fontconfig・libpng 等は同梱されない。コンテナでは OS パッケージとして入るため、そのパッケージの著作権ファイル（`/usr/share/doc` 配下）を残す。FreeType の FTL の帰属は残す。
 - ライセンス判断が要る事項は Agent が決めず、オーナーへ報告する。
 
 ### 5.1 `servo-default-resources` 埋め込みリソースの手動確認（TASK-38・Issue #996）
@@ -280,11 +281,27 @@ v1 はホストが自分で fetch する（URL のみ送る）。Cookie・セッ
 | macOS ビルド | `servo-host-macos`（main）・dispatch | `--locked` ビルドと `--selftest` が通る | 原因を報告し、対象外とするかをオーナーが判断 |
 | Windows ビルド | `servo-host-windows`（#229 条件 5）。前提は `windows-servo-prereqs` の範囲 | 同上 | 報告し、一級対応方針との整合を判断 |
 | 実ページのスクリーンショット | `harness/render-screenshot/` の runbook を流用し代表サイトで PNG 取得 | `paint()` で PNG 取得に成功（#50 の知見）。画質比較は `RENDER-5` の別タスク | 切り分けは `TASK-36` の知見を引き継ぐ |
-| musl 静的 / scratch 配布 | musl ターゲットでビルドし `ldd` / `check-static-link.sh` 相当で確認 | 動的リンク 0 | glibc 系ベースの別コンテナイメージを代替案とする |
-| FreeType の同梱 / system 判別 | `nm` / `ldd` / ビルドログでシンボル出所を確認 | 配布物で出所が一意 | `NOTICE` を配布形態別にする |
+| musl 静的 / scratch 配布 | musl ターゲットでビルドし `ldd` / `check-static-link.sh` 相当で確認 | 動的リンク 0 | glibc 系ベースの別コンテナイメージを代替案とする。2026-10-29 に実測（§7.1）。静的強制は起動直後に SIGSEGV で不成立のため、glibc（Debian slim）系の別イメージを採用（#1001） |
+| FreeType の同梱 / system 判別 | `nm` / `ldd` / ビルドログでシンボル出所を確認 | 配布物で出所が一意 | `NOTICE` を配布形態別にする。2026-10-29 に実測（§7.1）。出所は一意で基準を満たしたため、配布形態別の分割は採らない（NOTICE は 1 本のまま注記で分ける。オーナー判断 2026-10-29・#1001） |
 | 最小 system 依存 | `make`・Python・`uv`・libclang の個別欠如試験 | 必須ツールの一覧が確定 | `docs/setup/` に前提を追記 |
 | IPC 実装・負荷 | Servo なしの偽ホストで再起動・タイムアウト・巨大フレーム・不正 JSON を試験 | 各ケースで成功を装わず失敗する | 上限値を調整 |
 | メモリ・リソース制限 | 実ページの RSS 計測（`TASK-82` と連携） | 親側 RSS 監視が効く | OS 制限の追加を検討（承認事項） |
+
+### 7.1 musl・配布形態の実測（#1001）
+
+実測の数値と経過は Issue #1001 のコメント（https://github.com/Fandhe-AI/fandhe-browser/issues/1001#issuecomment-6490592615）を参照する。ここでは判断に必要な要点だけを記す。
+
+- 対象: ソース 165eda0（`servo =0.7.0`）の `servo-host/` を release ビルド。イメージは rust:1-alpine（rustc 1.99.0）と rust:1-bookworm（rustc 1.99.1）。実測マシンは DGX Spark（GB10・aarch64・121 GiB）と TASK-87 の Linux VM（x86_64）。
+
+| 構成 | 結果 | 判断 |
+| ---- | ---- | ---- |
+| musl 既定（Alpine・`-crt-static`） | aarch64・x86_64 とも成功。動的リンク（PIE）で、直接 NEEDED は 6 個、ldd の閉包は 12 行。`--selftest` はランタイム（wayland・mesa 等）を入れると通るが、最小集合は未確定。素の Alpine では wayland-sys が panic する | 動的リンクのため静的配布の基準を満たさない |
+| musl 静的強制（`--target` と `+crt-static`） | リンクは通り NEEDED は 0。しかし両アーキとも起動直後に SIGSEGV する（原因未特定）。実行時の dlopen（wayland-client・libEGL）も未検証。`--target` では bindgen が libclang を dlopen できない問題もある | 不成立。musl 静的・scratch では配布しない（オーナー判断 2026-10-29） |
+| glibc（rust:1-bookworm） | 標準の clang 14・15 では mozjs の bindgen が失敗する。backports の clang-19 で成功。直接 NEEDED は 8 個、ldd の閉包は 13 行 | 採用。glibc（Debian slim）系の別イメージでビルド・配布する。ビルドには backports の clang-19 が要る |
+
+- 出所: `servo-host/Cargo.toml` は `bundled_freetype` を無効にしているため、FreeType・fontconfig は system の共有ライブラリ、harfbuzz は静的。出所は構成によらず一意で、ホストのバイナリには FreeType 等が入らない（§5）。
+- 帰結: Servo ホストのコンテナは glibc 系の別イメージとする（§13 項目 8）。本体の既定・軽量コンテナ（musl 静的・scratch）は変えない。配布の起票は spec の整理（`TASK-64`・`CTR-4`）後とし、#1001 では起票しない。
+- 未検証の点: 静的強制の SIGSEGV の原因、Servo の dlopen 先（wayland-client・libEGL）の実行時の扱い、`--selftest` のランタイムの最小集合、`bundled_freetype` を有効にした場合の出所（試していない）。
 
 ## 8. #230〜#237 の書き換え案と依存順
 
@@ -364,7 +381,7 @@ AGENTS.md の変更はレビュー基準の変更として AI レビューで P0
 | `TASK-35` / `TASK-82` | サイズ増分が「ホスト単体の絶対値」になり、メモリ増分の測定対象もホストの RSS に変わる |
 | `TASK-38` | 枝番 38.1〜38.8 を §8 の分け方に合わせて改訂し、担当と成果物パスを更新する |
 | 設計文書群 | `self-repair-design.md` 決定 4、`js-engine.md` の feature `rendering` 組合せ、`plugin-boundary-policy.md` の「コンパイル時プラグインの例に `rendering` を挙げている」点（Servo ホストは実行時の別プロセス境界に近い）（`PLUG-1`） |
-| コンテナ（`CTR-4`） | Servo ホストの配布物をコンテナで扱うか。scratch + musl の前提とホストの動的リンクが衝突しうる |
+| コンテナ（`CTR-4`） | Servo ホストの配布物をコンテナで扱うか。scratch + musl の前提とホストの動的リンクが衝突しうる（#1001 で musl 静的・scratch は不成立と実測。§7.1） |
 | `OSS-2` / `OSS-3` | 注記の整合（ホスト workspace 限定の MPL 許可） |
 
 ## 11. セキュリティ考慮（OWASP Top 10 観点）
@@ -396,7 +413,7 @@ AGENTS.md の変更はレビュー基準の変更として AI レビューで P0
 | #230〜#237 の書き換え案と依存順 | §8 |
 | spec 側の課題 | §10 |
 
-## 13. オーナー判断（2026-10-15）
+## 13. オーナー判断（2026-10-15・2026-10-29）
 
 出典は #228。各項目の結果を記す。
 
@@ -407,6 +424,11 @@ AGENTS.md の変更はレビュー基準の変更として AI レビューで P0
 5. `ci.yml` のジョブは 16 → 19、required の合計は 20 → 23。ruleset はジョブ追加 PR のマージ時に更新する（§6.2）: 決定
 6. egress 方針（Servo 内部のリダイレクト・サブリソース・DNS リバインディング。§2.5）: GA 前に判断する（#1003）
 7. 配布方式（ホスト単体 release・コンテナ。§8.2・§10）: spec の整理（`TASK-64`・`CTR-4`）後に起票する
+
+2026-10-29 の判断（項目 8・9）は Issue #1001 による。実測の根拠は §7.1 と §5。
+
+8. Servo ホストのコンテナは musl 静的・scratch では配布せず、glibc（Debian slim）系の別イメージとする。本体の既定・軽量コンテナ（musl 静的・scratch）は変えない。ビルドには backports の clang-19 が要る。配布の起票は項目 7 のとおり後続とする: 決定
+9. `NOTICE` は配布形態別に分けず 1 本のまま。ホスト単体の配布物には FreeType・fontconfig・libpng 等は同梱されないこと、コンテナでは OS パッケージの著作権ファイルを残すこと、FreeType の FTL の帰属は残すことを注記で分ける（§5）: 決定
 
 ## 付録 A. 依存追加の承認提示雛形
 
