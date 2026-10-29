@@ -86,6 +86,14 @@ if [ "${expect}" = "v8" ]; then
   export RUSTY_V8_ARCHIVE_SHA256
 fi
 
+# V8 の aarch64 prebuilt は `__clear_cache`（命令キャッシュのフラッシュ）を libgcc から得る前提だが、
+# Rust の musl ターゲットは `-nodefaultlibs` でリンクするため供給されず、リンクが未定義参照で失敗する。
+# x86_64 の V8 とエンジンが boa の軽量コンテナはこの関数を使わないため、aarch64 かつ V8 のときだけ足す
+# （TASK-64.3）。
+if [ "${expect}" = "v8" ] && [ "${target}" = "aarch64-unknown-linux-musl" ]; then
+  export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_RUSTFLAGS="-C link-arg=-lgcc"
+fi
+
 # musl の版は LICENSE-THIRD-PARTY 節 5 の COPYRIGHT 全文と連動する。
 # apk-tools 3 では `apk info -v` が詳細表示になり版が取れないため、`apk list -I` の先頭語を使う。
 musl_ver="$(apk list -I musl | awk '$1 ~ /^musl-[0-9]/ {print $1; exit}')"
