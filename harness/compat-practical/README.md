@@ -45,6 +45,8 @@ TASK-89 / MS-1 / `MEAS-2`（#68）。本ハーネスを、対象サイト群を�
 | `access_check.sh` | tasks.json の検証と、28 サイトへの到達可否の記録（curl） |
 | `run_core.sh` | 28 タスクを `fandhe-browser` の CDP サーバーで実行し結果を JSONL へ記録（TASK-71.2） |
 | `run_core.mjs` | `run_core.sh` から呼ばれる依存ゼロの CDP クライアント（Node 22 以降） |
+| `repeat_core.sh` | `run_core.sh` を 1〜5 回繰り返し、各回の JSONL と集計 `summary.md` を出す（TASK-59。`xos-measure.yml` の入口） |
+| `summarize_repeats.sh` | 複数回の結果から 28 件・22 件の成功数と、1 回でも失敗したタスクを Markdown で集計する（TASK-59。判定はしない） |
 | `fake_cdp_server.mjs` | 自己テスト用の偽 CDP サーバー（loopback のみ） |
 | `self-test.sh` | 上記のオフライン自己テスト（curl はスタブ・CDP は偽サーバー。CI で実行） |
 | `js_api_spike/` | ページ内 JS が要求する Web API の計測スパイク（TASK-106。core の example `compat_js_api_spike` としてビルド） |
@@ -108,7 +110,7 @@ bash harness/compat-practical/access_check.sh [--tasks P] [--out P] [--timeout S
 ```bash
 bash harness/compat-practical/run_core.sh [--tasks P] [--out P] [--bin P] [--endpoint URL] [--no-spawn] \
   [--page-js v8|boa [--page-modules]] [--log ABS_PATH] \
-  [--task-timeout SEC] [--total-timeout SEC] [--startup-timeout SEC] [--validate-only]
+  [--task-timeout SEC] [--total-timeout SEC] [--startup-timeout SEC] [--windows-localappdata-profile] [--validate-only]
 ```
 
 - 実行経路は **CDP クライアント方式**。CLI サブコマンド（TASK-47）は未実装で、`fandhe-browser` は引数なしで `127.0.0.1:9333` に CDP サーバーを立てるだけのため、`run_core.mjs` が `Page.navigate` → `DOM.getDocument` → `DOM.querySelector` → `DOM.requestChildNodes` を送って判定する（新規依存なし。Node 22 以降の組み込み WebSocket / fetch のみ）
@@ -126,6 +128,7 @@ bash harness/compat-practical/run_core.sh [--tasks P] [--out P] [--bin P] [--end
 
 - b5・d2・d3 の個別確認: `jq -c 'select(.type=="result" and (.id=="b5" or .id=="d2" or .id=="d3")) | {id,success,reason}' results/core_results.jsonl`
 - 終了コード: `0` 記録完了（失敗タスクがあっても 0。成否は計測結果でありゲートではない）、`1` 書き込み失敗・結果件数/id 集合の不一致、`2` 入力・使用エラー（スキーマ違反・引数不正・jq/node 無し・起動失敗）
+- `--windows-localappdata-profile`（Windows の起動モード専用の明示オプトイン。手動 workflow `xos-measure.yml` の `compat-practical-windows` 用）: Windows のバイナリは `XDG_DATA_HOME`・`HOME` を見ないため既定では起動不可（上記）だが、このオプションを付けると `launch --profile-dir %LOCALAPPDATA%\fandhe-ct-<pid>-<乱数>\p`（`XOS-7`・`XOS-10`）で隔離して起動し、終了時にその一時領域だけを消す。設定ファイルのパスは `cygpath -m` で Windows 形式にして渡す。Windows 以外・`--no-spawn` との併用は exit 2。オプションの分岐（`launch --profile-dir` の組み立てと掃除）は偽 `uname`・`cygpath` で `self-test.sh` が模擬確認しているが、実 Windows での起動は手動 workflow の初回実行で確かめる
 - 結果ファイルは一時ファイルへ書いてから置換する（途中失敗で既存結果を壊さない）。`bin` はリポジトリ配下ならリポ相対で記録する
 
 ### 制約（REPAIR-3・JS-2）
@@ -136,6 +139,19 @@ bash harness/compat-practical/run_core.sh [--tasks P] [--out P] [--bin P] [--end
 `--log <絶対パス>` は起動したバイナリの stdout / stderr を保存する（固定診断行 `cdp: page scripts: ...` の回収用。ページ由来の非信頼データを含みうるためコミットしない）。
 b5・d2・d3 の結果は実測のまま記録し、解消を装わない（結果は `REPORT.md`）。
 属性演算子 `^=` は TASK-71.6（#760）で core のセレクタサブセットに入った。e1 の再計測と `matrix.json` の更新は #920 で行った（2026-10-22。e1 は依然 `no_match`）。
+
+## repeat_core.sh・summarize_repeats.sh
+
+```bash
+bash harness/compat-practical/repeat_core.sh --repeat N --bin P --out-dir DIR [run_core.sh のオプション...]
+bash harness/compat-practical/summarize_repeats.sh [--tasks P] [--out-md P] RESULT.jsonl [RESULT.jsonl ...]
+```
+
+spec 対応: TASK-59（PoC-1 代表タスクの 3 OS 動作率差）/ `MEAS-4`（関連 `COMPAT-4`）。3 OS の実行は手動 workflow `.github/workflows/xos-measure.yml`（`suite=compat-practical`）が GitHub ホステッドランナーで行う（オーナー承認 2026-10-29）。**成功数の集計までで、OS 間の差の判定は人間が行う**。
+
+- `repeat_core.sh`: `--repeat`（1〜5）回 `run_core.sh --out DIR/core_results_<n>.jsonl` を実行し、`DIR/summary.md` を出す。`--bin`・`--out` 以外の引数は `run_core.sh` へそのまま渡す（`--page-js v8 --page-modules`、Windows は `--windows-localappdata-profile`）。実サイトの応答揺れ・runner のネットワーク差による成否のぶれを見るための繰り返し。いずれかの回が失敗したら終了コード 1（完了した回だけで集計は出す）。自己テスト用の `FC_REPEAT_RUN_CORE` は実測では設定しない
+- `summarize_repeats.sh`: 回ごとに 28 件（`tasks.json` 全体）と **22 件**（PoC-1 の定義 = 28 件から 28 サイト化で追加した c4・d5・d7・d8・e3・e6 を除いたもの。上記「tasks.json」節）の成功数・動作率を表にし、1 回でも失敗したタスクを cat・22 件に含むか・成功回数・失敗理由つきで並べる。入力検証は fail-closed（メタ行が 1 行、結果の id 集合が `tasks.json` と完全一致、追加 6 件が `tasks.json` にあり差し引いて 22 件になること。違反は終了コード 1）
+- 自己テスト: `self-test.sh` が合成データ（28 件分の結果 JSONL）で集計値・失敗時の挙動・引数エラーを確認する（`make check-compat-practical`）
 
 ## make_matrix.sh
 

@@ -651,6 +651,26 @@ STUB
       expect_contains "$LAST_OUTPUT" "did not become ready" "run_core startup timeout message"
       expect_exit "run_core binary dies" 2 env FC_TEST_ALLOW_SPAWN_PORT=1 bash "$RUN_CORE" --bin "$STUB_BIN/dies" --endpoint "http://127.0.0.1:$RC_PORT" --out "$WORK/sp4.jsonl"
       expect_contains "$LAST_OUTPUT" "exited before" "run_core binary dies message"
+      # --windows-localappdata-profile（xos-measure.yml 用）: Windows 以外では使えない
+      expect_exit "run_core --windows-localappdata-profile off Windows" 2 bash "$RUN_CORE" --windows-localappdata-profile --bin "$STUB_BIN/ok" --out "$WORK/sp_w0.jsonl"
+      expect_contains "$LAST_OUTPUT" "only supported on Windows" "run_core windows profile flag message"
+      # Windows の起動経路の模擬（偽 uname・cygpath・LOCALAPPDATA）。実 Windows の確認ではなく、
+      # `launch --profile-dir <LOCALAPPDATA 配下>` の組み立てと一時領域の掃除という分岐の論理だけを検証する
+      FAKE_WIN="$WORK/fakewin"
+      mkdir -p "$FAKE_WIN/bin" "$FAKE_WIN/la"
+      printf '#!/bin/sh\necho MINGW64_NT-10.0\n' >"$FAKE_WIN/bin/uname"
+      printf '#!/bin/sh\nfor a; do last="$a"; done\necho "$last"\n' >"$FAKE_WIN/bin/cygpath"
+      cat >"$FAKE_WIN/bin/winstub" <<STUB
+#!/bin/sh
+echo "\$*" >"$WORK/winstub.args"
+exec "$NODE_BIN" "$FAKE" --port $RC_PORT
+STUB
+      chmod +x "$FAKE_WIN/bin/uname" "$FAKE_WIN/bin/cygpath" "$FAKE_WIN/bin/winstub"
+      expect_exit "run_core spawn unsupported on (simulated) windows without opt-in" 2 env PATH="$FAKE_WIN/bin:$PATH" bash "$RUN_CORE" --bin "$FAKE_WIN/bin/winstub" --endpoint "http://127.0.0.1:$RC_PORT" --out "$WORK/sp_w1.jsonl"
+      expect_contains "$LAST_OUTPUT" "not supported on Windows" "run_core simulated windows message"
+      expect_exit "run_core spawn on (simulated) windows with opt-in" 0 env PATH="$FAKE_WIN/bin:$PATH" LOCALAPPDATA="$FAKE_WIN/la" FC_TEST_ALLOW_SPAWN_PORT=1 bash "$RUN_CORE" --windows-localappdata-profile --bin "$FAKE_WIN/bin/winstub" --endpoint "http://127.0.0.1:$RC_PORT" --tasks "$WORK/rc.json" --out "$WORK/sp_w2.jsonl"
+      expect_contains "$(cat "$WORK/winstub.args")" "launch --profile-dir $FAKE_WIN/la/fandhe-ct-" "run_core simulated windows passes launch --profile-dir under LOCALAPPDATA"
+      expect_eq "$(find "$FAKE_WIN/la" -mindepth 1 | wc -l | tr -d ' ')" "0" "run_core simulated windows removes its LOCALAPPDATA area"
       start_fake --port "$RC_PORT"
       expect_exit "run_core endpoint already responding" 2 env FC_TEST_ALLOW_SPAWN_PORT=1 bash "$RUN_CORE" --bin "$STUB_BIN/ok" --endpoint "http://127.0.0.1:$RC_PORT" --out "$WORK/sp5.jsonl"
       expect_contains "$LAST_OUTPUT" "already responding" "run_core already responding message"
@@ -904,6 +924,66 @@ if type -P node >/dev/null 2>&1; then
   expect_exit "chromium_reference refuses existing out" 2 node "$CR" --only c4 --out "$WORK/exists.json" --module-dir "$WORK" --executable /nonexistent
   expect_exit "chromium_reference needs module dir" 2 env -u FANDHE_PLAYWRIGHT_MODULE_DIR node "$CR" --only c4 --out "$WORK/new.json"
 fi
+
+# --- summarize_repeats.sh（TASK-59・xos-measure.yml。繰り返し実行の成功数集計）---
+# 合成の結果 JSONL（tasks.json の全 28 件）で、28 件・22 件（c4・d5・d7・d8・e3・e6 を除く）の成功数と
+# タスク別の不安定さの集計を確かめる。オフライン・一時ファイルは $WORK のみ。
+SUM="$SCRIPT_DIR/summarize_repeats.sh"
+SR="$WORK/sr"
+mkdir -p "$SR"
+TASKS_JSON="$SCRIPT_DIR/tasks.json"
+# sr_run <出力> <成功にする id の JSON 配列。"all" は全件>
+sr_run() {
+  jq -cn '{type:"meta",schema_version:1,os:"Linux",bin:"target/release/fandhe-browser",page_js_engine:"v8",page_modules_executed:true}' >"$1"
+  jq -c --argjson ok "$2" '.[] | {type:"result",id:.id,cat:.cat,success:(($ok == "all") or (.id as $i | $ok | index($i) != null)),reason:"no_match"}' "$TASKS_JSON" >>"$1"
+}
+sr_run "$SR/r1.jsonl" '"all"'
+# 2 回目: a1（22 件内）と c4（追加 6 件の 1 つ）だけ成功
+sr_run "$SR/r2.jsonl" '["a1","c4"]'
+expect_exit "summarize_repeats two runs" 0 bash "$SUM" "$SR/r1.jsonl" "$SR/r2.jsonl"
+expect_contains "$LAST_OUTPUT" "| 1 | 28/28 | 100% | 22/22 | 100% |" "summarize_repeats run 1 counts"
+expect_contains "$LAST_OUTPUT" "| 2 | 2/28 | 7.1% | 1/22 | 4.5% |" "summarize_repeats run 2 counts (c4 is outside the 22)"
+expect_contains "$LAST_OUTPUT" "| a2 | static | はい | 1/2 | no_match |" "summarize_repeats flaky task row"
+expect_eq "$([[ "$LAST_OUTPUT" == *"| c4 |"* ]] && echo listed || echo omitted)" "omitted" "summarize_repeats omits a task that passed every run"
+expect_exit "summarize_repeats --out-md" 0 bash "$SUM" --out-md "$SR/out.md" "$SR/r1.jsonl"
+expect_contains "$(cat "$SR/out.md")" "| 1 | 28/28 | 100% | 22/22 | 100% |" "summarize_repeats --out-md content"
+jq -c 'select(.type=="meta")' "$SR/r1.jsonl" >"$SR/short.jsonl"
+jq -c 'select(.type=="result")' "$SR/r1.jsonl" | head -n 27 >>"$SR/short.jsonl"
+expect_exit "summarize_repeats rejects missing ids" 1 bash "$SUM" "$SR/short.jsonl"
+expect_exit "summarize_repeats rejects missing file" 1 bash "$SUM" "$SR/none.jsonl"
+expect_exit "summarize_repeats needs a file" 2 bash "$SUM"
+expect_exit "summarize_repeats unknown option" 2 bash "$SUM" --bogus "$SR/r1.jsonl"
+jq 'map(select(.id != "c4"))' "$TASKS_JSON" >"$SR/tasks27.json"
+expect_exit "summarize_repeats rejects a changed 22-task definition" 1 bash "$SUM" --tasks "$SR/tasks27.json" "$SR/r1.jsonl"
+
+# --- repeat_core.sh（TASK-59・xos-measure.yml の入口）---
+# run_core.sh の代わりに合成の結果をコピーする偽スクリプト（FC_REPEAT_RUN_CORE）で、繰り返し・集計・失敗時の挙動を確かめる
+REP="$WORK/rep"
+mkdir -p "$REP"
+cat >"$REP/fake_run_core.sh" <<'FAKE'
+#!/usr/bin/env bash
+# 引数の --out にだけ結果を書く。FAKE_FAIL_RUN に回数 n を入れると n 回目（出力名 core_results_n.jsonl）を失敗させる
+out=""
+while [ $# -gt 0 ]; do
+  case "$1" in --out) out="$2"; shift 2 ;; *) shift ;; esac
+done
+if [ -n "${FAKE_FAIL_RUN:-}" ] && [[ "$out" == *"core_results_${FAKE_FAIL_RUN}.jsonl" ]]; then exit 3; fi
+cp "$FAKE_SRC" "$out"
+echo "success=fake"
+FAKE
+export FAKE_SRC="$SR/r2.jsonl"
+expect_exit "repeat_core two runs" 0 env FC_REPEAT_RUN_CORE="$REP/fake_run_core.sh" bash "$SCRIPT_DIR/repeat_core.sh" --repeat 2 --bin /bin/true --out-dir "$REP/out" --page-js v8
+expect_eq "$(ls "$REP/out" | LC_ALL=C sort | tr '\n' ' ')" "core_results_1.jsonl core_results_2.jsonl summary.md " "repeat_core output files"
+expect_contains "$(cat "$REP/out/summary.md")" "| 2 | 2/28 | 7.1% | 1/22 | 4.5% |" "repeat_core summary has both runs"
+expect_exit "repeat_core one run fails" 1 env FAKE_FAIL_RUN=2 FC_REPEAT_RUN_CORE="$REP/fake_run_core.sh" bash "$SCRIPT_DIR/repeat_core.sh" --repeat 2 --bin /bin/true --out-dir "$REP/out2"
+expect_contains "$(cat "$REP/out2/summary.md")" "| 1 | 2/28 |" "repeat_core still summarizes the completed run"
+expect_eq "$([ -e "$REP/out2/core_results_2.jsonl" ] && echo present || echo absent)" "absent" "repeat_core leaves no file for the failed run"
+expect_exit "repeat_core every run fails" 1 env FAKE_FAIL_RUN=1 FC_REPEAT_RUN_CORE="$REP/fake_run_core.sh" bash "$SCRIPT_DIR/repeat_core.sh" --repeat 1 --bin /bin/true --out-dir "$REP/out3"
+expect_exit "repeat_core rejects 0" 2 bash "$SCRIPT_DIR/repeat_core.sh" --repeat 0 --bin /bin/true --out-dir "$REP/o4"
+expect_exit "repeat_core rejects 6" 2 bash "$SCRIPT_DIR/repeat_core.sh" --repeat 6 --bin /bin/true --out-dir "$REP/o5"
+expect_exit "repeat_core requires --repeat" 2 bash "$SCRIPT_DIR/repeat_core.sh" --bin /bin/true --out-dir "$REP/o6"
+expect_exit "repeat_core requires --bin" 2 bash "$SCRIPT_DIR/repeat_core.sh" --repeat 1 --out-dir "$REP/o7"
+expect_exit "repeat_core rejects a forwarded --out" 2 bash "$SCRIPT_DIR/repeat_core.sh" --repeat 1 --bin /bin/true --out-dir "$REP/o8" --out x
 
 echo "cases=$CASES failures=$FAILURES"
 [ "$FAILURES" -eq 0 ]
