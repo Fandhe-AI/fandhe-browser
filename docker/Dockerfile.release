@@ -49,8 +49,10 @@ COPY . .
 FROM base AS build-default
 ARG TARGETARCH
 # target キャッシュは並列ビルド時の競合を避けるためフレーバー・アーキごとに id を分ける。
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/usr/local/cargo/git \
+# registry・git は build-default と build-lite で共有するため sharing=locked にし、並行ビルドが同じ crate を
+# 同時に展開して `failed to unpack package ... File exists` で落ちるのを防ぐ（#1309。既定の shared では排他されない）。
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,target=/build/target,id=fandhe-release-target-default-${TARGETARCH} \
     docker/release-build.sh "${TARGETARCH}" "" v8
 
@@ -58,8 +60,9 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 # js-boa を --features で足すだけでは両エンジン同梱になる（CTR-1 違反）ため --no-default-features が必須。
 FROM base AS build-lite
 ARG TARGETARCH
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/usr/local/cargo/git \
+# registry・git は build-default と共有のため sharing=locked（理由は build-default 側のコメント。#1309）。
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,target=/build/target,id=fandhe-release-target-lite-${TARGETARCH} \
     docker/release-build.sh "${TARGETARCH}" "--no-default-features --features js-boa,plugin-registry" boa_engine
 
