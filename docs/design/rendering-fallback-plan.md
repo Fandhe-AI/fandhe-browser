@@ -73,7 +73,7 @@ Servo ホスト（`servo =0.7.0`）の Linux 実測（#55・#1297。RENDER-5・T
 
 - **Servo の LTS への復帰**: 0.7.0 は一時的な月次版（#1297）。LTS へ戻す作業は #1300 で追う。0.7.0 の `content` 代替テキストの後退は上流で修正済み（servo/servo#49022）
 - **v2 の目標水準の確定**: v2 の目標を決めるとき、主要なブラウザ同士（例: Firefox と Chromium）の SSIM を同じページで測り、0.90 の妥当性を確かめる（決定事項 5。`rendering-layer.md`「レンダリング層の自作（v2）の方針」節。議論: #1301）
-- **Conditional Go 条件 1 の残り**: PERF-5（TASK-82。レンダリング有効時のメモリ増分・レンダリング時間の数値化）が MS-6 で残る
+- **Conditional Go 条件 1**: PERF-5（TASK-82。レンダリング有効時のメモリ増分・レンダリング時間の数値化）も 2026-10-29 に確定し、条件 1 は解消した（計測: #320。spec への反映: Fandhe-AI/fandhe-browser-spec#35）
 
 ## spec への反映
 
