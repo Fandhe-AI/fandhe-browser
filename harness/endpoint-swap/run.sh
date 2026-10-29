@@ -8,7 +8,8 @@
 #    （リポに package.json・lockfile・node_modules は残さない。ブラウザ本体は取得しない）。版と integrity は
 #    scripts/versions.sh の正本（PLAYWRIGHT_*・PUPPETEER_*）。最上位の版・integrity は verify_install.mjs が検証する。
 # 2. 接続先（fandhe-browser は --bin、Chromium は --chromium）を 1 つずつ起動し、run_swap.mjs を実行して停止する。
-# 3. summarize.mjs が集計する（60% の達成判定はしない。判定は人間）。
+# 3. summarize.mjs が、今回生成した結果ファイルだけを集計する（60% の達成判定はしない。判定は人間）。
+#    出力ディレクトリに前回の *.jsonl が残っていても集計に混ざらない（結果は run_swap.mjs が上書き拒否で新規作成する）。
 #
 # 使い方:
 #   run.sh --out-dir ABS [--libraries playwright,puppeteer] [--targets fandhe-browser,chromium]
@@ -208,6 +209,8 @@ BIN_SHA=""
 [ -z "${BIN_RESOLVED:-}" ] || BIN_SHA="$(sha256_of "$BIN_RESOLVED")"
 MODULES=0
 [ "$PAGE_MODULES" -eq 1 ] && MODULES=1
+# 今回のループで生成した結果ファイルだけを集計へ渡す（出力ディレクトリに前回の測定が残っていても混ぜない）
+RESULT_FILES=()
 
 for lib in playwright puppeteer; do
   want_lib "$lib" || continue
@@ -224,7 +227,8 @@ for lib in playwright puppeteer; do
       endpoint="http://127.0.0.1:$port"
       start_chromium "$port" || { stop_target; echo "error: failed to start chromium" >&2; exit 2; }
     fi
-    args=(--library "$lib" --target "$target" --endpoint "$endpoint" --module-dir "$WORK/$lib" --out "$OUT_DIR/$lib-$target.jsonl"
+    out_file="$OUT_DIR/$lib-$target.jsonl"
+    args=(--library "$lib" --target "$target" --endpoint "$endpoint" --module-dir "$WORK/$lib" --out "$out_file"
       --stage-timeout "$STAGE_TIMEOUT" --total-timeout "$TOTAL_TIMEOUT" --settle-ms "$SETTLE_MS"
       --puppeteer-connect "$PP_CONNECT" --puppeteer-viewport "$PP_VIEWPORT" --context-json "$ctx")
     [ -z "$ONLY" ] || args+=(--only "$ONLY")
@@ -232,6 +236,7 @@ for lib in playwright puppeteer; do
     node "$SCRIPT_DIR/run_swap.mjs" "${args[@]}" || status=$?
     stop_target
     [ "$status" -eq 0 ] || { echo "error: run_swap.mjs failed for $lib/$target (exit $status)" >&2; exit 1; }
+    RESULT_FILES+=("$out_file")
   done
 done
 
@@ -239,6 +244,4 @@ if [ -n "$ONLY" ]; then
   echo "info: --only was given, so the summary (which needs the full task set) is skipped" >&2
   exit 0
 fi
-shopt -s nullglob
-files=("$OUT_DIR"/*.jsonl)
-node "$SCRIPT_DIR/summarize.mjs" --json-out "$OUT_DIR/summary.json" "${files[@]}" | tee "$OUT_DIR/summary.txt"
+node "$SCRIPT_DIR/summarize.mjs" --json-out "$OUT_DIR/summary.json" "${RESULT_FILES[@]}" | tee "$OUT_DIR/summary.txt"

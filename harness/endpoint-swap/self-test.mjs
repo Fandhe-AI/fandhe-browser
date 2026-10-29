@@ -4,13 +4,13 @@
 // 判定・集計・CLI の配線を確かめる。実 Playwright / Puppeteer・実 Chromium・実 fandhe-browser との接続は対象外。
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { playwrightAdapter, puppeteerAdapter, parseLoopbackEndpoint, resolveWsEndpoint } from "./adapters.mjs";
 import {
-  executeTask, formatSummary, inPoc22, POC22_EXCLUDED, ratePercent, runAll, summarize, validateTasks, verifyInstall,
+  executeTask, formatSummary, inPoc22, POC22_EXCLUDED, ratePercent, runAll, summarize, validateTasks, verifyInstall, verifyMetaConsistency, verifyResultFile,
 } from "./swap_lib.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -576,7 +576,115 @@ await t("summarize CLI: incomplete results exit 2", async () => {
   writeFileSync(p, JSON.stringify({ type: "result", library: "playwright", target: "x", id: "a1", success: true }) + "\n");
   const s = spawnSync(process.execPath, [join(here, "summarize.mjs"), p], { encoding: "utf8" });
   assert.equal(s.status, 2);
-  assert.match(s.stderr, /id set mismatch/);
+  assert.match(s.stderr, /exactly one meta line, found 0/);
+});
+
+// ---- 集計入力の検証（古い測定・別のタスク定義の結果を受理しない。fail-closed）----
+const jl = (path) => readFileSync(path, "utf8").trim().split("\n").map((l) => JSON.parse(l));
+const writeJl = (path, rows) => writeFileSync(path, rows.map((r) => JSON.stringify(r)).join("\n") + "\n");
+const sumCli = (args) => spawnSync(process.execPath, [join(here, "summarize.mjs"), ...args], { encoding: "utf8" });
+await t("verifyResultFile: meta line count, tasks_sha256, task_count, library and target are all checked", async () => {
+  const sha = "a".repeat(64);
+  const rows = synthetic("playwright", "chromium", []);
+  const meta = { type: "meta", schema_version: 1, library: "playwright", target: "chromium", tasks_sha256: sha, task_count: 28 };
+  const ok = (lines) => verifyResultFile(lines, { tasks: realTasks, tasksSha256: sha, label: "f.jsonl" });
+  assert.equal(ok([meta, ...rows]).results.length, 28);
+  assert.throws(() => ok(rows), /exactly one meta line, found 0/);
+  assert.throws(() => ok([meta, meta, ...rows]), /exactly one meta line, found 2/);
+  assert.throws(() => ok([...rows, meta]), /meta line must be the first line/);
+  assert.throws(() => ok([{ ...meta, tasks_sha256: "b".repeat(64) }, ...rows]), /tasks_sha256 mismatch/);
+  assert.throws(() => ok([{ ...meta, tasks_sha256: undefined }, ...rows]), /tasks_sha256 mismatch/);
+  assert.throws(() => ok([{ ...meta, task_count: 4 }, ...rows]), /task_count mismatch/);
+  assert.throws(() => ok([meta, ...rows.slice(1)]), /does not match task_count/);
+  assert.throws(() => ok([{ ...meta, target: "other" }, ...rows]), /different from the meta line/);
+  assert.throws(() => ok([{ ...meta, library: "puppeteer" }, ...rows]), /different from the meta line/);
+  assert.throws(() => ok([{ ...meta, schema_version: 2 }, ...rows]), /schema_version/);
+  assert.throws(() => ok([meta, { type: "note" }, ...rows]), /unexpected line type/);
+});
+await t("verifyMetaConsistency: library_version, options and duplicate targets are rejected", async () => {
+  const m = (target, extra = {}) => ({ library: "playwright", target, library_version: "1.0.0", options: { settle_ms: 0 }, ...extra });
+  verifyMetaConsistency([m("chromium"), m("fandhe-browser"), { ...m("chromium"), library: "puppeteer" }]);
+  assert.throws(() => verifyMetaConsistency([m("chromium"), m("chromium")]), /more than one results file/);
+  assert.throws(() => verifyMetaConsistency([m("chromium"), m("fandhe-browser", { library_version: "2.0.0" })]), /library_version differs/);
+  assert.throws(() => verifyMetaConsistency([m("chromium"), m("fandhe-browser", { options: { settle_ms: 5 } })]), /options differ/);
+});
+await t("summarize CLI: results measured with a different tasks file are rejected even if the ids are the same", async () => {
+  const outs = ["playwright-fandhe-browser", "playwright-chromium"].map((n) => join(work, `${n}.jsonl`));
+  assert.equal(sumCli(["--tasks", tasksFile, ...outs]).status, 0);
+  // id は同じまま selector だけ変えたタスク定義（旧定義の結果を新定義の結果として受理しない）
+  const changed = join(work, "mini-tasks-changed.json");
+  writeFileSync(changed, JSON.stringify(miniTasks.map((x) => (x.id === "m1" ? { ...x, selector: "h2" } : x))));
+  const s = sumCli(["--tasks", changed, ...outs]);
+  assert.equal(s.status, 2);
+  assert.match(s.stderr, /tasks_sha256 mismatch/);
+});
+await t("summarize CLI: a file without a meta line, or with a mismatched meta, exits 2", async () => {
+  const src = join(work, "playwright-chromium.jsonl");
+  const rows = jl(src);
+  const other = join(work, "playwright-fandhe-browser.jsonl");
+  const noMeta = join(work, "nometa.jsonl");
+  writeJl(noMeta, rows.slice(1));
+  let s = sumCli(["--tasks", tasksFile, noMeta, other]);
+  assert.equal(s.status, 2);
+  assert.match(s.stderr, /nometa\.jsonl: expected exactly one meta line, found 0/);
+  const wrongTarget = join(work, "wrong-target.jsonl");
+  writeJl(wrongTarget, [{ ...rows[0], target: "fandhe-browser" }, ...rows.slice(1)]);
+  s = sumCli(["--tasks", tasksFile, wrongTarget, other]);
+  assert.equal(s.status, 2);
+  assert.match(s.stderr, /different from the meta line/);
+  const staleOptions = join(work, "stale-options.jsonl");
+  writeJl(staleOptions, [{ ...rows[0], options: { ...rows[0].options, settle_ms: 999 } }, ...rows.slice(1)]);
+  s = sumCli(["--tasks", tasksFile, staleOptions, other]);
+  assert.equal(s.status, 2);
+  assert.match(s.stderr, /options differ between targets/);
+  const dup = join(work, "dup-target.jsonl");
+  copyFileSync(src, dup);
+  s = sumCli(["--tasks", tasksFile, src, dup]);
+  assert.equal(s.status, 2);
+  assert.match(s.stderr, /more than one results file/);
+});
+
+// ---- run.sh の集計対象（前回の測定が残る出力ディレクトリでも今回生成した分だけを集計する）----
+// npm は偽の実行ファイルで差し替え、Chromium は偽 CDP サーバーを起動する薄いシェルで代替する。実サイト・実 npm には出ない。
+await t("run.sh: summarizes only the files generated in this run, not stale jsonl left in --out-dir", async () => {
+  const bin = join(work, "fakebin");
+  mkdirSync(bin, { recursive: true });
+  const fakeNpm = join(bin, "npm");
+  writeFileSync(fakeNpm, `#!/usr/bin/env bash
+pkg="\${@: -1}"; name="\${pkg%@*}"; ver="\${pkg##*@}"
+mkdir -p "node_modules/$name"
+cat >"node_modules/$name/package.json" <<EOF2
+{"name":"$name","version":"$ver","main":"index.js"}
+EOF2
+cat >"node_modules/$name/index.js" <<'EOF2'
+exports.chromium = { async connectOverCDP() { throw new Error("fake: no browser"); } };
+EOF2
+cat >node_modules/.package-lock.json <<EOF2
+{"packages":{"node_modules/$name":{"version":"$ver","integrity":"$PLAYWRIGHT_INTEGRITY"}}}
+EOF2
+`);
+  chmodSync(fakeNpm, 0o755);
+  const fakeChromium = join(bin, "fake-chromium");
+  writeFileSync(fakeChromium, `#!/bin/sh
+for a in "$@"; do case "$a" in --remote-debugging-port=*) port="\${a#*=}" ;; esac; done
+exec "${process.execPath}" "${FAKE_SERVER}" --port "$port"
+`);
+  chmodSync(fakeChromium, 0o755);
+  const outDir = join(work, "runsh-out");
+  mkdirSync(outDir, { recursive: true });
+  // 前回の測定が残っている状況（Puppeteer × Chromium のファイル。中身は今回のタスク定義と無関係）
+  writeJl(join(outDir, "puppeteer-chromium.jsonl"), [{ type: "meta", library: "puppeteer", target: "chromium", tasks_sha256: "0".repeat(64) }, ...synthetic("puppeteer", "chromium", [])]);
+  const r = spawnSync("bash", [join(here, "run.sh"), "--out-dir", outDir, "--libraries", "playwright", "--targets", "chromium", "--chromium", fakeChromium, "--settle-ms", "0", "--stage-timeout", "2"], {
+    encoding: "utf8",
+    env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, PLAYWRIGHT_INTEGRITY: "sha512-AAAA" },
+    timeout: 120000,
+  });
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(r.stdout, /^library=playwright target=chromium set=28 success=0\/28 rate=0\.0%$/m);
+  assert.doesNotMatch(r.stdout, /library=puppeteer/);
+  const summary = JSON.parse(readFileSync(join(outDir, "summary.json"), "utf8"));
+  assert.deepEqual(summary.groups.map((g) => `${g.library}/${g.target}`), ["playwright/chromium"]);
+  assert.ok(existsSync(join(outDir, "playwright-chromium.jsonl")));
 });
 
 console.log(cases > 0 && process.exitCode !== 1 ? `all ${cases} cases passed` : "FAILED");

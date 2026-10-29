@@ -229,6 +229,55 @@ export function ratePercent(success, total) {
   return `${Math.floor(x / 10)}.${x % 10}`;
 }
 
+/** 値が一致するか（options 用。JSON で表せる値だけを比べる）。 */
+function sameJson(a, b) {
+  return JSON.stringify(a) === JSON.stringify(b);
+}
+
+/**
+ * 結果ファイル 1 つ分の行を検証し、結果行だけを返す（fail-closed。違反は Error）。呼び出し元は summarize.mjs。
+ * 古い測定・別のタスク定義の結果を今回の比較へ混ぜないため、id 集合の照合に加えて次を要求する:
+ * meta 行がちょうど 1 行で先頭にあること・meta の tasks_sha256 が集計時に読んだタスクファイルのハッシュと一致すること・
+ * task_count が tasks の件数と一致すること・全結果行の library / target が meta と一致すること・meta / result 以外の行がないこと。
+ */
+export function verifyResultFile(lines, { tasks, tasksSha256, label }) {
+  const metas = lines.filter((l) => l && l.type === "meta");
+  const others = lines.filter((l) => !l || (l.type !== "meta" && l.type !== "result"));
+  if (others.length > 0) throw new Error(`${label}: unexpected line type`);
+  if (metas.length !== 1) throw new Error(`${label}: expected exactly one meta line, found ${metas.length}`);
+  const meta = metas[0];
+  if (lines[0] !== meta) throw new Error(`${label}: meta line must be the first line`);
+  if (meta.schema_version !== 1) throw new Error(`${label}: unsupported meta schema_version`);
+  if (!LIBRARIES.includes(meta.library)) throw new Error(`${label}: meta has an unknown library`);
+  if (typeof meta.target !== "string" || meta.target === "") throw new Error(`${label}: meta has no target`);
+  if (meta.tasks_sha256 !== tasksSha256) throw new Error(`${label}: tasks_sha256 mismatch (results were measured with a different tasks file)`);
+  if (meta.task_count !== tasks.length) throw new Error(`${label}: task_count mismatch (meta ${String(meta.task_count).slice(0, 10)}, tasks ${tasks.length})`);
+  const results = lines.filter((l) => l.type === "result");
+  if (results.length !== meta.task_count) throw new Error(`${label}: result count ${results.length} does not match task_count ${meta.task_count}`);
+  if (results.some((r) => r.library !== meta.library || r.target !== meta.target)) {
+    throw new Error(`${label}: a result line has a library or target different from the meta line`);
+  }
+  return { meta, results };
+}
+
+/**
+ * 複数ファイルの meta 同士の整合を検証する。同一ライブラリの接続先間で版・実行オプションが違うと「エンドポイントだけの差し替え」
+ * の比較にならないため拒否する（別日の測定の混在を防ぐ）。
+ */
+export function verifyMetaConsistency(metas) {
+  const byLib = new Map();
+  for (const m of metas) {
+    const first = byLib.get(m.library);
+    if (!first) {
+      byLib.set(m.library, m);
+      continue;
+    }
+    if (first.target === m.target) throw new Error(`${m.library}/${m.target}: more than one results file for the same library and target`);
+    if (first.library_version !== m.library_version) throw new Error(`${m.library}: library_version differs between targets`);
+    if (!sameJson(first.options, m.options)) throw new Error(`${m.library}: options differ between targets`);
+  }
+}
+
 /**
  * JSONL の行（パース済みオブジェクト）を (library, target) ごとに集計する。
  * 各グループが tasks の id 集合とちょうど一致しない（欠落・重複・未知 id）場合は Error（fail-closed。

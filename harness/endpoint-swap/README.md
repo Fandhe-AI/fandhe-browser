@@ -14,7 +14,7 @@ fandhe-browser と Chromium の両方へ流す。関連: `CDP-2`・`CDP-3`・`ME
 | `swap_lib.mjs` | タスクの成否判定（`executeTask`）・全体期限（`runAll`）・集計（`summarize`）・導入検証（`verifyInstall`）。接続先もライブラリも知らない純粋ロジック |
 | `adapters.mjs` | Playwright / Puppeteer のアダプタ。ライブラリ差だけを吸収する。接続先ごとの分岐は無い |
 | `run_swap.mjs` | 1 ライブラリ × 1 接続先を実行して JSONL を書く。単体でも任意のループバックエンドポイントに対して使える |
-| `summarize.mjs` | JSONL をライブラリ別・接続先別に集計（28 件と 22 件の両方） |
+| `summarize.mjs` | JSONL をライブラリ別・接続先別に集計（28 件と 22 件の両方）。入力ごとに meta 行を検証する |
 | `verify_install.mjs` | npm の一時導入の版・integrity 検証 |
 | `run.sh` | 実行入口。npm の一時導入 → 接続先の起動 → `run_swap.mjs` → 停止 → 集計 |
 | `self-test.sh` / `self-test.mjs` | オフライン自己テスト（下記「自己テストの範囲」） |
@@ -50,7 +50,7 @@ fandhe-browser と Chromium の両方へ流す。関連: `CDP-2`・`CDP-3`・`ME
 
 - **Playwright と Puppeteer を別々に**判定する。合算しない。接続先（`fandhe-browser` / `chromium`）ごとにも別々の集計になる
 - 分母は 2 通りを同時に出す: `set=28`（`tasks.json` の全 28 件）と `set=22`（PoC-1 由来の 22 件 = 28 件から 28 サイト化で追加した c4・d5・d7・d8・e3・e6 を除いたもの。`compat-practical/README.md` の「tasks.json」）
-- **a6（HTTP 403）・c1（anti-bot）などの失敗は分母に入れたまま失敗として数える**。回避しない（`SEC-2`）。取得できなかった結果を黙って分母から落とさないよう、`summarize.mjs` は id の欠落・重複・未知 id があると exit 2 で止まる
+- **a6（HTTP 403）・c1（anti-bot）などの失敗は分母に入れたまま失敗として数える**。回避しない（`SEC-2`）。取得できなかった結果を黙って分母から落とさないよう、`summarize.mjs` は id の欠落・重複・未知 id があると exit 2 で止まる。さらに入力ファイルごとに meta 行を検証し、次のいずれかで exit 2 になる（fail-closed）: meta 行がちょうど 1 行・先頭にない、meta の `tasks_sha256` が集計時に読んだタスクファイル（`--tasks` 省略時は `compat-practical/tasks.json`）のハッシュと不一致（id が同じでも URL・selector・kind を変えた旧定義の結果は受理しない）、`task_count` や結果行数が不一致、結果行の `library` / `target` が meta と不一致、meta / result 以外の行、同一ライブラリで接続先間の `library_version` または `options` が不一致、同一 library × target のファイルが複数
 - 参考行 `of_chromium_success`: 同じライブラリで Chromium が成功した id のうち、fandhe-browser も成功した件数。サイト側の事情（時期・403 等）を切り分ける材料で、判定の分母ではない
 - `summarize.mjs` の出力は 1 行 1 区分:
 
@@ -102,13 +102,15 @@ bash harness/endpoint-swap/run.sh --out-dir /abs/path/out --targets chromium --l
 bash harness/endpoint-swap/run.sh --out-dir /abs/path/out --validate-only --targets chromium --chromium "/path/to/chromium"
 
 # 集計だけやり直す
-node harness/endpoint-swap/summarize.mjs /abs/path/out/*.jsonl
+# 引数のファイルがそのまま集計対象になる。出力ディレクトリに別の測定の *.jsonl があるときはグロブを使わず列挙する
+node harness/endpoint-swap/summarize.mjs /abs/path/out/playwright-fandhe-browser.jsonl /abs/path/out/playwright-chromium.jsonl
 ```
 
 - `--bin`: 省略時は `FANDHE_BROWSER_BIN`、なければ `target/release/fandhe-browser`（`compat-practical/lib.sh` の `resolve_bin`）
 - `--page-js v8|boa [--page-modules]`: `run_core.sh` と同じ固定文面の設定（`[js] engine`・`execute_page_scripts = true`、`execute_modules = true`）で起動する。指定なしはページ JS オフ（`FANDHE_BROWSER_CONFIG` を外す）。直近の core の実測は `--page-js v8 --page-modules`
 - fandhe-browser は固定ポート `127.0.0.1:9333` で起動する。起動前に応答があれば他プロセスを誤計測しないよう中止する。プロファイルは一時ディレクトリへ隔離する。Chromium は `--headless=new` で空きポートに一時プロファイルで起動する（UA は既定のまま）
 - 任意の起動済みエンドポイントへ直接流す場合は `node harness/endpoint-swap/run_swap.mjs --library playwright|puppeteer --target <label> --endpoint http://127.0.0.1:<port> --module-dir <導入先> --out /abs/path.jsonl`。`--endpoint` はループバックの `http:` / `ws:`（ポート必須・userinfo なし）に限る
+- **集計対象**: `run.sh` は今回のループで生成した結果ファイルだけを `summarize.mjs` に渡す（`--out-dir` を glob しない）。前回の測定の `*.jsonl` が `--out-dir` に残っていても集計には混ざらない（空でない出力ディレクトリは拒否しない）。同名の結果ファイルが残っている組は `run_swap.mjs` が上書きを拒否して exit 2 になる（`summary.json` も同様）。前回分と混ぜたくない場合は新しい `--out-dir` を使う
 - 出力（`--out-dir`）: `<library>-<target>.jsonl`（メタ行 1 + 結果 28 行）・`<library>-npm-packages.json`・`summary.txt`・`summary.json`。結果行の `output_sample` はページ由来の非信頼テキスト（300 文字で切り詰め・制御文字除去）のため、**コミットしない**。進捗（stderr）には id・成否・理由コードしか出さない
 - 終了コード: `0` 記録完了（失敗タスクがあっても 0）、`1` 実行失敗、`2` 入力・使用エラー
 
@@ -118,7 +120,7 @@ node harness/endpoint-swap/summarize.mjs /abs/path/out/*.jsonl
 bash harness/endpoint-swap/self-test.sh   # 要 node 22 以降。ネットワーク・npm 不要
 ```
 
-- 対象: 判定（text / texts / form・各 `failed_stage` と `reason`・HTTP ステータス条件〔403・5xx は要素ありでも失敗、`null` は `skipped_no_status` で要素判定のみ〕・タイムアウト・全体期限）、期限後に完了した接続・コンテキスト・ページの解放（両ライブラリ）、集計（28 件 / 22 件の分母・欠落と重複の拒否）、導入検証の純関数、エンドポイント検証、`/json/version` からの WebSocket URL 解決（`compat-practical/fake_cdp_server.mjs` を再利用）、`run_swap.mjs` / `summarize.mjs` の CLI の配線（偽の `playwright-core` / `puppeteer-core` を一時ディレクトリに置いて実行）、`run.sh` の引数検証、`SEC-2` の静的検査
+- 対象: 判定（text / texts / form・各 `failed_stage` と `reason`・HTTP ステータス条件〔403・5xx は要素ありでも失敗、`null` は `skipped_no_status` で要素判定のみ〕・タイムアウト・全体期限）、期限後に完了した接続・コンテキスト・ページの解放（両ライブラリ）、集計（28 件 / 22 件の分母・欠落と重複の拒否）、集計入力の検証（meta 欠落・複数・`tasks_sha256` 不一致・件数・library / target・版 / オプション不一致の拒否。id が同じで定義だけ違う結果の拒否を含む）、`run.sh` が今回生成した分だけを集計すること（偽の `npm`・偽 Chromium で前回の古い JSONL が残るディレクトリを模擬）、導入検証の純関数、エンドポイント検証、`/json/version` からの WebSocket URL 解決（`compat-practical/fake_cdp_server.mjs` を再利用）、`run_swap.mjs` / `summarize.mjs` の CLI の配線（偽の `playwright-core` / `puppeteer-core` を一時ディレクトリに置いて実行）、`run.sh` の引数検証、`SEC-2` の静的検査
 - ページ内で評価する関数（`PAGE_FN_*`）は偽 DOM に対して本物の関数のまま実行する
 - **対象外（npm を入れないと回せない部分）**: 実 Playwright / Puppeteer の API 挙動（`page.$`・`evaluate`・`goto` の実際の戻り値や例外の形）、実 Chromium・実 fandhe-browser との接続、`run.sh` の npm 導入・接続先の起動・停止。これらは実走（上の使い方）でのみ確認できる
 - 偽サーバーは `run_core.mjs` 用で、Playwright / Puppeteer のプロトコル全体は話せない。ライブラリ経由の実接続の検証には使っていない
