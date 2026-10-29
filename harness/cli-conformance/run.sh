@@ -367,8 +367,14 @@ run_cli() {
 }
 
 # 取り込み: stdout・stderr を正規化して CUR_STDOUT / CUR_STDERR へ入れる。CR が混じったら差分として記録する
+#
+# CR の有無は `tr -cd '\r'` でバイト数を数えて判定する。`grep -q $'\r'` は使わない: Git Bash（MSYS2）の GNU grep は
+# テキストモードで読むため CR を行末として落とし、CRLF のファイルでも一致しない（windows-latest で実測。
+# `grep -U` なら一致する）。`tr` は入力をバイト列のまま扱うため 3 OS で同じ結果になる
 absorb_output() {
-  if grep -q $'\r' "$OUT_FILE" "$ERR_FILE" 2>/dev/null; then note "CRLF found in output (normalized to LF)"; fi
+  local cr_bytes
+  cr_bytes="$({ tr -cd '\r' <"$OUT_FILE"; tr -cd '\r' <"$ERR_FILE"; } 2>/dev/null | wc -c | tr -d ' ')" || cr_bytes=0
+  if [ "${cr_bytes:-0}" -gt 0 ]; then note "CRLF found in output (normalized to LF)"; fi
   CUR_RC="$RC"
   CUR_STDOUT="$(tr -d '\r' <"$OUT_FILE")"
   CUR_STDERR="$(tr -d '\r' <"$ERR_FILE")"
