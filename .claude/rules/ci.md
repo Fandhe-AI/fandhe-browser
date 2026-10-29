@@ -86,6 +86,11 @@ cargo test --workspace
 - Puppeteer 接続試験ハーネスのオフライン自己テスト（`CDP-3`。TASK-45.2）は `make check-puppeteer-connect`（`make ci` に含む。要 node）。CI では `harness-*` ジョブの `[puppeteer-connect-selftest]` ステップが `harness/puppeteer-connect/self-test.sh` を実行する。`stages.mjs` と Rust パーサーの契約テスト `cdp3_stages_mjs_result_line_satisfies_rust_contract`（`tests/puppeteer_contract.rs`。要 node）は `#[ignore]` で既定の `cargo test` から外れ、self-test.sh が `--ignored` 付きで実行する（0 件実行は fail-closed）
 - feature 無効（既定）時のリリースバイナリサイズが `RENDER-2`（基準は `CORE-2` と同じ「Chromium 比 80% 以上削減」）の上限以下かを `make check-binary-size`（CI では `harness-*` ジョブの `[binary-size]` ステップ・3 OS）で検証する（TASK-34.2・TASK-34.3）。既定 package `fandhe-browser-cli` が workspace に無い場合は exit 2（fail-closed。#633。詳細は `harness/binary-size/README.md`）
 
+## 手動計測 workflow（`xos-measure.yml`。required に含めない）
+
+- `on: workflow_dispatch` のみ。`ci.yml` とは別 workflow で、PR・push では動かない。人間担当の計測 TASK-49（#292。CLI コンフォーマンステスト `harness/cli-conformance/`）と TASK-59（#294。PoC-1 代表タスク `harness/compat-practical/repeat_core.sh`）を 3 OS の GitHub ホステッドランナーで実行する（オーナー承認 2026-10-29: 実機の代替）。結果は Step Summary とアーティファクトに出すだけで、合否・OS 間の差の判定は人間が行う
+- ここの check-run は required に登録しない（PR で pending のままになりマージできなくなる）。ジョブ名・構成の変更で ruleset の更新は要らない。`ci.yml` には手を入れない（`ci.yml` のジョブ追加・改名は ruleset の更新を伴う）。起動例は `gh workflow run xos-measure.yml -f suite=cli-conformance`
+
 ## ワークフロー変更時の注意
 
 - ジョブ追加・変更時は [github-actions](./github-actions.md)（runner 方針・発火条件・追加チェックリスト・計測方法）に従う
