@@ -20,7 +20,7 @@
 #   --commit        記録する commit SHA（既定: GITHUB_SHA、無ければ git rev-parse HEAD）
 #   --outside-dir   Windows の CT-PROFILE-E4 用に %LOCALAPPDATA% の外にあるディレクトリ（既定: RUNNER_TEMP）
 #   --timeout       コマンド 1 回の上限秒（既定 60。screenshot は 2 倍）
-#   --only          指定したケース ID だけ実行する（再実行・デバッグ用）
+#   --only          指定したケース ID だけ実行する（再実行・デバッグ用）。この OS のケース集合にない ID は終了コード 2
 #   --strict        必須ケースに fail または unmet があれば終了コード 1（既定は記録完了で 0）
 # 環境変数（自己テスト用。実測では設定しない）: CT_LAUNCH_PORT（既定 9333）・CT_FIXTURE_CURL（既定 curl）
 # 終了コード: 0=記録完了（fail があっても 0。成否は計測結果）、1=--strict で必須ケースが非合格、2=入力・環境エラー
@@ -83,7 +83,7 @@ command -v jq >/dev/null 2>&1 || die "jq is required but was not found on PATH"
 command -v curl >/dev/null 2>&1 || die "curl is required but was not found on PATH"
 [[ "$CMD_TIMEOUT" =~ ^[1-9][0-9]{0,2}$ ]] && [ "$CMD_TIMEOUT" -le 600 ] || die "--timeout must be an integer in 1..600"
 [[ "$PORT" =~ ^[1-9][0-9]{0,4}$ ]] && [ "$PORT" -le 65535 ] || die "CT_LAUNCH_PORT must be a port number"
-if [ -n "$ONLY" ] && ! [[ "$ONLY" =~ ^[A-Za-z0-9_,-]+$ ]]; then die "--only must be a comma-separated list of case IDs"; fi
+if [ -n "$ONLY" ] && ! [[ "$ONLY" =~ ^[A-Za-z0-9_-]+(,[A-Za-z0-9_-]+)*$ ]]; then die "--only must be a comma-separated list of case IDs"; fi
 
 # jq の出力から CR を除く（Windows のネイティブ jq は CRLF で出力し、等値判定が壊れるため）
 jq() { command jq "$@" | tr -d '\r'; }
@@ -99,6 +99,21 @@ case "$(uname -s)" in
 esac
 IS_WINDOWS=0
 [ "$OS_LABEL" = WINDOWS ] && IS_WINDOWS=1
+
+# --only に指定できるケース ID は、この OS で実行するケースの集合（必須 5 件は OS 別、補助 20 件は全 OS 共通）。
+# 誤記や別 OS の ID が 0 件実行のまま --strict で exit 0 になるのを防ぐため、実行前に使用エラー（exit 2）で拒否する。
+# ケースを増減したら本一覧と self-test.sh の REQ・AUX を揃える（揃っていないと下の「実行されなかった ID」検査で止まる）
+KNOWN_CASE_IDS=" CT-LAUNCH-$OS_LABEL CT-NAV-$OS_LABEL CT-QUERY-$OS_LABEL CT-SHOT-$OS_LABEL CT-PROFILE-$OS_LABEL"
+KNOWN_CASE_IDS="$KNOWN_CASE_IDS CT-CMD-E1 CT-CMD-E2 CT-LAUNCH-E1 CT-LAUNCH-E2 CT-NAV-E1 CT-NAV-E2 CT-NAV-E3"
+KNOWN_CASE_IDS="$KNOWN_CASE_IDS CT-QUERY-E1 CT-QUERY-E2 CT-QUERY-E3 CT-SHOT-E1 CT-SHOT-E2 CT-SHOT-E3 CT-SHOT-E4"
+KNOWN_CASE_IDS="$KNOWN_CASE_IDS CT-PROFILE-E1 CT-PROFILE-E2 CT-PROFILE-E3 CT-PROFILE-E4 CT-PROFILE-E5 CT-PROFILE-E6 "
+if [ -n "$ONLY" ]; then
+  IFS=, read -r -a ONLY_IDS <<<"$ONLY"
+  for only_id in "${ONLY_IDS[@]}"; do
+    case "$KNOWN_CASE_IDS" in *" $only_id "*) ;; *) die "--only: unknown case ID for $OS_NAME: $only_id" ;; esac
+  done
+fi
+EXECUTED_IDS=" "
 
 # bash 用のパス（unix 形式）→ ネイティブバイナリへ渡すパス（Windows は C:\... 形式）
 native_path() {
@@ -211,6 +226,7 @@ CASE_DIR=""; CASE_HOME=""
 
 begin_case() {
   CUR_ID="$1"; CUR_REQ="$2"
+  EXECUTED_IDS="$EXECUTED_IDS$1 "
   CUR_FAILED=0; CUR_UNMET=0
   CUR_NOTES=""; CUR_SIDE=""; CUR_ARGV=""; CUR_RC=""; CUR_STDOUT=""; CUR_STDERR=""
   CASE_DIR="$(mktemp -d "$BASE/case.XXXXXX")"
@@ -824,6 +840,13 @@ aux_profile_dotdot
 aux_profile_symlink
 
 cleanup_default_root
+
+# --only に指定した ID がすべて実行されたことの確認（KNOWN_CASE_IDS と実際のケースのずれ・0 件実行を使用エラーにする）
+if [ -n "$ONLY" ]; then
+  for only_id in "${ONLY_IDS[@]}"; do
+    case "$EXECUTED_IDS" in *" $only_id "*) ;; *) echo "error: --only case did not run: $only_id" >&2; exit 2 ;; esac
+  done
+fi
 
 # ---------------------------------------------------------------------------
 # 集計

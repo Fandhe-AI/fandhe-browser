@@ -47,7 +47,8 @@ for ((i = 1; i <= REPEAT; i++)); do
   out="$OUT_DIR/core_results_$i.jsonl"
   echo "== run $i/$REPEAT =="
   if bash "$RUN_CORE" --bin "$BIN" --out "$out" "$@"; then
-    FILES+=("$out")
+    # 失敗した回があっても回番号がずれないよう、元の実行番号を明示して渡す
+    FILES+=(--run "$i" "$out")
   else
     echo "error: run $i failed (exit $?)" >&2
     FAILED=1
@@ -55,7 +56,7 @@ for ((i = 1; i <= REPEAT; i++)); do
 done
 
 if [ "${#FILES[@]}" -gt 0 ]; then
-  bash "$SCRIPT_DIR/summarize_repeats.sh" --out-md "$OUT_DIR/summary.md" "${FILES[@]}" || FAILED=1
+  bash "$SCRIPT_DIR/summarize_repeats.sh" --out-md "$OUT_DIR/summary.md" --total "$REPEAT" "${FILES[@]}" || FAILED=1
 else
   echo "error: no run was recorded" >&2
   FAILED=1

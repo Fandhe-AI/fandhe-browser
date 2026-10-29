@@ -671,6 +671,20 @@ STUB
       expect_exit "run_core spawn on (simulated) windows with opt-in" 0 env PATH="$FAKE_WIN/bin:$PATH" LOCALAPPDATA="$FAKE_WIN/la" FC_TEST_ALLOW_SPAWN_PORT=1 bash "$RUN_CORE" --windows-localappdata-profile --bin "$FAKE_WIN/bin/winstub" --endpoint "http://127.0.0.1:$RC_PORT" --tasks "$WORK/rc.json" --out "$WORK/sp_w2.jsonl"
       expect_contains "$(cat "$WORK/winstub.args")" "launch --profile-dir $FAKE_WIN/la/fandhe-ct-" "run_core simulated windows passes launch --profile-dir under LOCALAPPDATA"
       expect_eq "$(find "$FAKE_WIN/la" -mindepth 1 | wc -l | tr -d ' ')" "0" "run_core simulated windows removes its LOCALAPPDATA area"
+      # 回帰（PR #1319 の P1 指摘）: プロファイル領域の作成に失敗しても、本実行で作っていない既存データを消さない。
+      # LOCALAPPDATA 配下の mktemp だけを失敗させる偽 mktemp（それ以外は実物へ委譲）と、既存の中身を置いた
+      # fandhe-ct-* ディレクトリを用意し、die 後も既存の中身が残ることを確かめる
+      FAKE_MK="$WORK/fakemk"
+      mkdir -p "$FAKE_MK" "$FAKE_WIN/la/fandhe-ct-keep/p"
+      printf 'precious\n' >"$FAKE_WIN/la/fandhe-ct-keep/p/data.txt"
+      printf 'precious\n' >"$FAKE_WIN/la/other-app-data.txt"
+      printf '#!/bin/sh\ncase "$*" in *"%s/fandhe-ct-"*) echo "mktemp: simulated collision" >&2; exit 1 ;; esac\nexec "%s" "$@"\n' "$FAKE_WIN/la" "$(type -P mktemp)" >"$FAKE_MK/mktemp"
+      chmod +x "$FAKE_MK/mktemp"
+      expect_exit "run_core simulated windows profile creation failure" 2 env PATH="$FAKE_MK:$FAKE_WIN/bin:$PATH" LOCALAPPDATA="$FAKE_WIN/la" FC_TEST_ALLOW_SPAWN_PORT=1 bash "$RUN_CORE" --windows-localappdata-profile --bin "$FAKE_WIN/bin/winstub" --endpoint "http://127.0.0.1:$RC_PORT" --tasks "$WORK/rc.json" --out "$WORK/sp_w3.jsonl"
+      expect_contains "$LAST_OUTPUT" "cannot create profile dir" "run_core simulated windows profile creation failure message"
+      expect_eq "$(cat "$FAKE_WIN/la/fandhe-ct-keep/p/data.txt" 2>/dev/null)" "precious" "run_core profile creation failure keeps the pre-existing directory contents"
+      expect_eq "$(cat "$FAKE_WIN/la/other-app-data.txt" 2>/dev/null)" "precious" "run_core profile creation failure keeps unrelated LOCALAPPDATA files"
+      rm -rf "$FAKE_WIN/la/fandhe-ct-keep" "$FAKE_WIN/la/other-app-data.txt"
       start_fake --port "$RC_PORT"
       expect_exit "run_core endpoint already responding" 2 env FC_TEST_ALLOW_SPAWN_PORT=1 bash "$RUN_CORE" --bin "$STUB_BIN/ok" --endpoint "http://127.0.0.1:$RC_PORT" --out "$WORK/sp5.jsonl"
       expect_contains "$LAST_OUTPUT" "already responding" "run_core already responding message"
@@ -955,6 +969,20 @@ expect_exit "summarize_repeats needs a file" 2 bash "$SUM"
 expect_exit "summarize_repeats unknown option" 2 bash "$SUM" --bogus "$SR/r1.jsonl"
 jq 'map(select(.id != "c4"))' "$TASKS_JSON" >"$SR/tasks27.json"
 expect_exit "summarize_repeats rejects a changed 22-task definition" 1 bash "$SUM" --tasks "$SR/tasks27.json" "$SR/r1.jsonl"
+# 回帰（PR #1319 の P2 指摘）: 失敗した回があっても元の実行番号を保ち、欠測の回を表に残す。
+# 第 2 回が欠けた入力（--run 1 と --run 3 だけ渡す）で、第 3 回が「3」のまま、第 2 回が「欠測」になること
+expect_exit "summarize_repeats keeps run numbers with a missing run" 0 bash "$SUM" --total 3 --run 1 "$SR/r1.jsonl" --run 3 "$SR/r2.jsonl"
+expect_contains "$LAST_OUTPUT" "| 1 | 28/28 | 100% | 22/22 | 100% |" "summarize_repeats gap: run 1 row"
+expect_contains "$LAST_OUTPUT" "| 2 | 欠測 | 欠測 | 欠測 | 欠測 |" "summarize_repeats gap: run 2 is shown as missing"
+expect_contains "$LAST_OUTPUT" "| 3 | 2/28 | 7.1% | 1/22 | 4.5% |" "summarize_repeats gap: run 3 keeps its number"
+expect_contains "$LAST_OUTPUT" "3 回中 2 回記録" "summarize_repeats gap: heading shows recorded count"
+expect_contains "$LAST_OUTPUT" "| a2 | static | はい | 1/2 | no_match |" "summarize_repeats gap: task rows count only recorded runs"
+# 最後の回が欠けた場合も --total で欠測行を残す
+expect_exit "summarize_repeats trailing missing run" 0 bash "$SUM" --total 2 --run 1 "$SR/r1.jsonl"
+expect_contains "$LAST_OUTPUT" "| 2 | 欠測 | 欠測 | 欠測 | 欠測 |" "summarize_repeats trailing run is shown as missing"
+expect_exit "summarize_repeats rejects non-increasing run numbers" 2 bash "$SUM" --run 2 "$SR/r1.jsonl" --run 2 "$SR/r2.jsonl"
+expect_exit "summarize_repeats rejects --total below the largest run" 2 bash "$SUM" --total 1 --run 2 "$SR/r1.jsonl"
+expect_exit "summarize_repeats rejects a bad --run" 2 bash "$SUM" --run 0 "$SR/r1.jsonl"
 
 # --- repeat_core.sh（TASK-59・xos-measure.yml の入口）---
 # run_core.sh の代わりに合成の結果をコピーする偽スクリプト（FC_REPEAT_RUN_CORE）で、繰り返し・集計・失敗時の挙動を確かめる
@@ -977,6 +1005,12 @@ expect_eq "$(ls "$REP/out" | LC_ALL=C sort | tr '\n' ' ')" "core_results_1.jsonl
 expect_contains "$(cat "$REP/out/summary.md")" "| 2 | 2/28 | 7.1% | 1/22 | 4.5% |" "repeat_core summary has both runs"
 expect_exit "repeat_core one run fails" 1 env FAKE_FAIL_RUN=2 FC_REPEAT_RUN_CORE="$REP/fake_run_core.sh" bash "$SCRIPT_DIR/repeat_core.sh" --repeat 2 --bin /bin/true --out-dir "$REP/out2"
 expect_contains "$(cat "$REP/out2/summary.md")" "| 1 | 2/28 |" "repeat_core still summarizes the completed run"
+expect_contains "$(cat "$REP/out2/summary.md")" "| 2 | 欠測 | 欠測 | 欠測 | 欠測 |" "repeat_core keeps the failed last run as missing"
+# 第 1 回が失敗し第 2 回が成功: 成功した回は「2」のまま（core_results_2.jsonl と対応）、第 1 回は欠測
+expect_exit "repeat_core first run fails" 1 env FAKE_FAIL_RUN=1 FC_REPEAT_RUN_CORE="$REP/fake_run_core.sh" bash "$SCRIPT_DIR/repeat_core.sh" --repeat 2 --bin /bin/true --out-dir "$REP/out4"
+expect_contains "$(cat "$REP/out4/summary.md")" "| 1 | 欠測 | 欠測 | 欠測 | 欠測 |" "repeat_core marks the failed first run as missing"
+expect_contains "$(cat "$REP/out4/summary.md")" "| 2 | 2/28 | 7.1% | 1/22 | 4.5% |" "repeat_core keeps run 2 numbered 2 when run 1 failed"
+expect_eq "$(ls "$REP/out4" | LC_ALL=C sort | tr '\n' ' ')" "core_results_2.jsonl summary.md " "repeat_core output files when run 1 failed"
 expect_eq "$([ -e "$REP/out2/core_results_2.jsonl" ] && echo present || echo absent)" "absent" "repeat_core leaves no file for the failed run"
 expect_exit "repeat_core every run fails" 1 env FAKE_FAIL_RUN=1 FC_REPEAT_RUN_CORE="$REP/fake_run_core.sh" bash "$SCRIPT_DIR/repeat_core.sh" --repeat 1 --bin /bin/true --out-dir "$REP/out3"
 expect_exit "repeat_core rejects 0" 2 bash "$SCRIPT_DIR/repeat_core.sh" --repeat 0 --bin /bin/true --out-dir "$REP/o4"

@@ -32,7 +32,7 @@ CLI_CONFORMANCE_ARGS="--render-host <path>" make measure-cli-conformance   # 自
 | `--commit` | `GITHUB_SHA`、無ければ `git rev-parse HEAD` | 記録する commit SHA |
 | `--outside-dir` | `RUNNER_TEMP` | Windows の `CT-PROFILE-E4` 用。`%LOCALAPPDATA%` の外にあるディレクトリ（`%TEMP%` は配下なので使えない） |
 | `--timeout` | 60 | コマンド 1 回の上限秒（screenshot は 2 倍） |
-| `--only` | なし | 指定したケース ID だけ実行（再実行・デバッグ用） |
+| `--only` | なし | 指定したケース ID だけ実行（再実行・デバッグ用）。現在の OS のケース集合にない ID（誤記・別 OS の必須 ID）や空の要素は終了コード 2 |
 | `--strict` | 無効 | 必須ケースに不合格または前提未充足があれば終了コード 1 |
 
 終了コード: `0` 記録完了（不合格があっても 0。成否は計測結果）、`1` `--strict` で必須ケースが非合格、`2` 入力・環境エラー（バイナリ不在・Windows で既定プロファイルルートが既にある等）。

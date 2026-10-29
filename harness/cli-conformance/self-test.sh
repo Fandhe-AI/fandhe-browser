@@ -198,6 +198,28 @@ expect_eq "args: bad --timeout exits 2" "2" "$rc_c"
 expect_eq "args: missing render host exits 2" "2" "$rc_d"
 expect_eq "args: bad --only exits 2" "2" "$rc_e"
 
+# --- 8b. 回帰: --only は現在の OS のケース集合にない ID を使用エラーで拒否する（PR #1319 の P2 指摘）---
+# 別 OS の必須 ID（現在の OS 以外のラベル）と、誤記の ID。0 件実行で --strict が exit 0 になってはならない
+case "$LABEL" in LINUX) OTHER_LABEL=WINDOWS ;; *) OTHER_LABEL=LINUX ;; esac
+set +e
+only_unknown_out="$(bash "$RUN" --bin "$WORK/bin/fandhe-browser$EXE" --out-jsonl "$WORK/ou.jsonl" --out-md "$WORK/ou.md" --strict --only "CT-NOPE-E9" 2>&1)"; rc_u=$?
+only_other_out="$(bash "$RUN" --bin "$WORK/bin/fandhe-browser$EXE" --out-jsonl "$WORK/oo.jsonl" --out-md "$WORK/oo.md" --strict --only "CT-NAV-$OTHER_LABEL" 2>&1)"; rc_o=$?
+only_mixed_out="$(bash "$RUN" --bin "$WORK/bin/fandhe-browser$EXE" --out-jsonl "$WORK/om.jsonl" --out-md "$WORK/om.md" --strict --only "CT-CMD-E1,CT-NOPE-E9" 2>&1)"; rc_m=$?
+bash "$RUN" --bin "$WORK/bin/fandhe-browser$EXE" --out-jsonl "$WORK/oe.jsonl" --out-md "$WORK/oe.md" --only "CT-CMD-E1,,CT-NAV-$LABEL" >/dev/null 2>&1; rc_empty=$?
+set -e
+expect_eq "only: unknown ID exits 2 even with --strict" "2" "$rc_u"
+expect_contains "only: unknown ID message" "unknown case ID" "$only_unknown_out"
+expect_eq "only: other-OS ID exits 2 even with --strict" "2" "$rc_o"
+expect_contains "only: other-OS ID message names the ID" "CT-NAV-$OTHER_LABEL" "$only_other_out"
+expect_eq "only: one unknown ID among valid ones exits 2" "2" "$rc_m"
+expect_contains "only: mixed message names the unknown ID" "CT-NOPE-E9" "$only_mixed_out"
+expect_eq "only: empty list entry exits 2" "2" "$rc_empty"
+expect_eq "only: rejected before running any case" "absent" "$([ -e "$WORK/ou.jsonl" ] && echo present || echo absent)"
+# REQ・AUX の全 ID が受理され、すべて実行される（run.sh の KNOWN_CASE_IDS と実際のケースが揃っていることの確認）
+all_ids="$(printf '%s\n' $REQ $AUX | paste -sd, -)"
+FAKE_MODE="" FAKE_FIXTURE=ok run_suite onlyall --only "$all_ids"
+expect_eq "only: every known ID runs" "25" "$(jq -s '[.[]|select(.type=="result")]|length' "$WORK/onlyall.jsonl")"
+
 # --- 9. 回帰: Windows 経路の期待値と jq の CRLF（PR #1319 の P1 指摘 2 件）---
 # (a) Windows 分岐は Linux・macOS では実行できないため、run.sh の check_run / aux_simple 呼び出しを静的に走査し、
 #     期待値の第 1 文字が check_text の接頭辞（= ~ - + *）であることを確かめる（接頭辞なしは `internal: bad expectation` で exit 2 になる）

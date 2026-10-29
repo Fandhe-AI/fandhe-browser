@@ -144,13 +144,13 @@ b5・d2・d3 の結果は実測のまま記録し、解消を装わない（結�
 
 ```bash
 bash harness/compat-practical/repeat_core.sh --repeat N --bin P --out-dir DIR [run_core.sh のオプション...]
-bash harness/compat-practical/summarize_repeats.sh [--tasks P] [--out-md P] RESULT.jsonl [RESULT.jsonl ...]
+bash harness/compat-practical/summarize_repeats.sh [--tasks P] [--out-md P] [--total N] [--run N] RESULT.jsonl [[--run N] RESULT.jsonl ...]
 ```
 
 spec 対応: TASK-59（PoC-1 代表タスクの 3 OS 動作率差）/ `MEAS-4`（関連 `COMPAT-4`）。3 OS の実行は手動 workflow `.github/workflows/xos-measure.yml`（`suite=compat-practical`）が GitHub ホステッドランナーで行う（オーナー承認 2026-10-29）。**成功数の集計までで、OS 間の差の判定は人間が行う**。
 
-- `repeat_core.sh`: `--repeat`（1〜5）回 `run_core.sh --out DIR/core_results_<n>.jsonl` を実行し、`DIR/summary.md` を出す。`--bin`・`--out` 以外の引数は `run_core.sh` へそのまま渡す（`--page-js v8 --page-modules`、Windows は `--windows-localappdata-profile`）。実サイトの応答揺れ・runner のネットワーク差による成否のぶれを見るための繰り返し。いずれかの回が失敗したら終了コード 1（完了した回だけで集計は出す）。自己テスト用の `FC_REPEAT_RUN_CORE` は実測では設定しない
-- `summarize_repeats.sh`: 回ごとに 28 件（`tasks.json` 全体）と **22 件**（PoC-1 の定義 = 28 件から 28 サイト化で追加した c4・d5・d7・d8・e3・e6 を除いたもの。上記「tasks.json」節）の成功数・動作率を表にし、1 回でも失敗したタスクを cat・22 件に含むか・成功回数・失敗理由つきで並べる。入力検証は fail-closed（メタ行が 1 行、結果の id 集合が `tasks.json` と完全一致、追加 6 件が `tasks.json` にあり差し引いて 22 件になること。違反は終了コード 1）
+- `repeat_core.sh`: `--repeat`（1〜5）回 `run_core.sh --out DIR/core_results_<n>.jsonl` を実行し、`DIR/summary.md` を出す。`--bin`・`--out` 以外の引数は `run_core.sh` へそのまま渡す（`--page-js v8 --page-modules`、Windows は `--windows-localappdata-profile`）。実サイトの応答揺れ・runner のネットワーク差による成否のぶれを見るための繰り返し。いずれかの回が失敗したら終了コード 1（完了した回だけで集計は出し、失敗した回は元の回番号のまま「欠測」行として表に残す）。自己テスト用の `FC_REPEAT_RUN_CORE` は実測では設定しない
+- `summarize_repeats.sh`: 回ごとに 28 件（`tasks.json` 全体）と **22 件**（PoC-1 の定義 = 28 件から 28 サイト化で追加した c4・d5・d7・d8・e3・e6 を除いたもの。上記「tasks.json」節）の成功数・動作率を表にし、1 回でも失敗したタスクを cat・22 件に含むか・成功回数・失敗理由つきで並べる。`--run N` で直後のファイルの元の実行番号を明示し（省略時は直前 + 1）、`--total N` で実行した回数を渡すと、結果ファイルの無い回を「欠測」行にする（`repeat_core.sh` が常に指定する。タスク別の成功回数は記録された回数に対する値）。入力検証は fail-closed（メタ行が 1 行、結果の id 集合が `tasks.json` と完全一致、追加 6 件が `tasks.json` にあり差し引いて 22 件になること。違反は終了コード 1）
 - 自己テスト: `self-test.sh` が合成データ（28 件分の結果 JSONL）で集計値・失敗時の挙動・引数エラーを確認する（`make check-compat-practical`）
 
 ## make_matrix.sh

@@ -216,8 +216,11 @@ if [ "$NO_SPAWN" -eq 0 ]; then
     # Windows のバイナリは `%LOCALAPPDATA%` 配下のプロファイルだけを受け付ける（XOS-7・XOS-10）。一意名の
     # 一時領域を作り、`launch --profile-dir` で明示する。利用者の既定プロファイルには触れない
     [ -n "${LOCALAPPDATA:-}" ] || die "LOCALAPPDATA is not set"
-    PROFILE_DIR="$(cygpath -u "$LOCALAPPDATA")/fandhe-ct-$$-$RANDOM" || die "cannot resolve LOCALAPPDATA"
-    mkdir "$PROFILE_DIR" || die "cannot create profile dir"
+    # mktemp -d は既存のパスと衝突すると失敗するだけで既存の中身に触れない。cleanup が消す PROFILE_DIR には、
+    # 作成に成功した後でだけ代入する（衝突で失敗した場合に、本実行で作っていない既存ディレクトリを消さないため）
+    WIN_LA_ROOT="$(cygpath -u "$LOCALAPPDATA")" || die "cannot resolve LOCALAPPDATA"
+    WIN_PROFILE_NEW="$(mktemp -d "$WIN_LA_ROOT/fandhe-ct-$$-XXXXXX")" || die "cannot create profile dir"
+    PROFILE_DIR="$WIN_PROFILE_NEW"
     SPAWN_ARGS=(launch --profile-dir "$(cygpath -w "$PROFILE_DIR/p")")
   else
     PROFILE_DIR="$(mktemp -d)" || die "cannot create profile dir"
