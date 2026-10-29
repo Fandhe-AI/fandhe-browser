@@ -18,7 +18,7 @@ lefthook との重複回避は [git-hooks](./git-hooks.md) を参照する。本
 - 本リポジトリは **public**。runner は GitHub-hosted（`ubuntu-latest`・`macos-latest`・`windows-latest`）を使う
 - public リポジトリで self-hosted runner を使うと、fork PR 経由で任意コードが実行されるリスクがある。新規に使わない
 - 現在 self-hosted を使う箇所は `ai-review.yml` の `codex` ジョブ（reusable workflow の review ジョブ。provider 名と同名の用途ラベル `codex` の専用 runner）のみ。資格情報を扱うため例外とし、fork PR は reusable workflow 側が fail-closed で拒否する。`preflight`・`post_feedback` は `ubuntu-latest`（組織 runner 方針: Fandhe-AI/actions の `docs/runner-policy.md`）
-- macOS・Windows は OS 固有の挙動を検証するための例外（`ci.yml` の `*-macos`・`*-windows`・`bench-competitor.yml`）。PR では原則 skipped だが、`rust-test-macos`・`rust-test-windows` だけは OS 依存の変更（`native=true`: profile crate 配下、または `*.rs` 差分の `cfg(windows`・`cfg(unix`・`target_os` 等。判定は `scripts/ci-changes.sh`）を含む PR で実行する（ジョブ名は不変）。他の macOS・Windows ジョブを PR で走らせるのは、枠待ちで CI が詰まるため避ける
+- macOS・Windows は OS 固有の挙動を検証するための例外（`ci.yml` の `*-macos`・`*-windows`・`bench-competitor.yml`・手動計測専用の `xos-measure.yml`）。PR では原則 skipped だが、`rust-test-macos`・`rust-test-windows` だけは OS 依存の変更（`native=true`: profile crate 配下、または `*.rs` 差分の `cfg(windows`・`cfg(unix`・`target_os` 等。判定は `scripts/ci-changes.sh`）を含む PR で実行する（ジョブ名は不変）。他の macOS・Windows ジョブを PR で走らせるのは、枠待ちで CI が詰まるため避ける
 
 ## 必須チェックとジョブ名
 
@@ -33,6 +33,7 @@ lefthook との重複回避は [git-hooks](./git-hooks.md) を参照する。本
 - `concurrency` は PR 単位で `cancel-in-progress: true`（`ci.yml`・`ai-review.yml`）。release・定期実行・update-external のように途中キャンセルが危険なものは `false`
 - **required check を含む workflow に workflow 単位の `paths` / `paths-ignore` を付けない**（フィルタで起動しないと check が pending のままマージ不能になる）。変更検知はジョブ内（`changes` ジョブ + `scripts/ci-changes.sh`）で行い、下流ジョブの skipped は required を満たす
 - draft PR のスキップは現状行っていない。導入する場合は `ready_for_review` も `pull_request.types` に含め、required の `changes` が skipped にならないかを確認する
+- `xos-measure.yml` は `workflow_dispatch` のみ（人間担当の計測 TASK-49・TASK-59 を 3 OS の GitHub ホステッドランナーで実行する手動専用。required に含めず、PR・push・schedule では動かさない。非 required の補助ジョブを `ci.yml` に足せないための別 workflow。詳細は [ci](./ci.md)「手動計測 workflow」）
 - schedule: `update-external.yml` は毎日 1 回（約 2 分）、`bench-competitor.yml` は毎週月曜 1 回（3 OS）。頻度を上げない。`ci.yml` に `schedule` を足さない（全ジョブが cron で走る）
 
 ## 新規ジョブ・ワークフロー追加チェックリスト
@@ -144,6 +145,7 @@ gh api repos/Fandhe-AI/fandhe-browser/actions/runs/<run-id>/jobs --paginate   # 
 | `ai-review.yml` | pull_request | 約 1〜2 分 | |
 | `update-external.yml` | schedule・dispatch | 約 2 分 | 日次 |
 | `bench-competitor.yml` | schedule・dispatch | 約 2〜3 分 | 週次・3 OS。対象バイナリ未配線のため skipped が多い |
+| `xos-measure.yml` | workflow_dispatch | 未計測（初回実行後に記入） | 手動のみ・3 OS・cache なし。timeout は cli-conformance が ubuntu 75・macOS 80・Windows 90 分、compat-practical が 150 分（`repeat` 最大 5 回 × run_core.sh の全体期限 1200 秒）。実測で見直す |
 | `release.yml` | workflow_dispatch | 実績少 | 手動のみ |
 
 短縮余地は残るが、`rust-features-ubuntu` を複数ジョブに分割すると required checks の追加（ruleset 更新）が要るため、実施する場合はユーザー判断とする。

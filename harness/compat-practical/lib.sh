@@ -238,3 +238,42 @@ sha256_of() {
     shasum -a 256 "$1" | cut -d' ' -f1
   fi
 }
+
+# stop_spawned <pid>
+#   run_core.sh が起動したバックグラウンドのバイナリを止めて回収する（cleanup から呼ぶ。TASK-59・MEAS-4）。
+#   Linux・macOS: `kill`（SIGTERM）→ `wait`（従来どおり）。
+#   Windows（`uname -s` が MINGW / MSYS / CYGWIN）: Git Bash の signal はネイティブ PE プロセスを止めないことがあり、
+#   `wait` が呼び出し元ジョブの期限まで詰まって次の回が 9333 の使用中で失敗するため、Windows の PID を
+#   `/proc/<pid>/winpid`（無ければ `ps -p` の WINPID 列）で引き、`taskkill /F /T` でプロセスツリーごと止める。
+#   終了確認は有界ポーリング（約 10 秒）で、止まらなければ `wait` せず警告して非 0 を返す（ハングより失敗を選ぶ）。
+#   ポーリング回数（既定 50 回 × 0.2 秒）は環境変数 FC_STOP_POLLS で変えられる（self-test 専用。実測では設定しない）。
+#   実 Windows での動作は workflow_dispatch（xos-measure.yml）でしか確認できない。分岐の論理は self-test が偽コマンドで通す。
+stop_spawned() {
+  local pid="$1" winpid=""
+  case "$(uname -s)" in
+    MINGW* | MSYS* | CYGWIN*)
+      kill -0 "$pid" 2>/dev/null || { wait "$pid" 2>/dev/null || true; return 0; }
+      if [ -r "/proc/$pid/winpid" ]; then
+        winpid="$(tr -d '\r\n' <"/proc/$pid/winpid")"
+      fi
+      if [ -z "$winpid" ]; then
+        winpid="$(ps -p "$pid" 2>/dev/null | awk 'NR == 2 { print $4 }' | tr -d '\r\n')"
+      fi
+      case "$winpid" in '' | *[!0-9]*) winpid="" ;; esac
+      if [ -n "$winpid" ]; then
+        MSYS2_ARG_CONV_EXCL='*' taskkill /F /T /PID "$winpid" >/dev/null 2>&1 || true
+      fi
+      kill -KILL "$pid" 2>/dev/null || true
+      for _ in $(seq 1 "${FC_STOP_POLLS:-50}"); do
+        kill -0 "$pid" 2>/dev/null || { wait "$pid" 2>/dev/null || true; return 0; }
+        sleep 0.2
+      done
+      echo "warning: could not stop spawned process (pid=$pid winpid=${winpid:-unknown})" >&2
+      return 1
+      ;;
+    *)
+      kill "$pid" 2>/dev/null || true
+      wait "$pid" 2>/dev/null || true
+      ;;
+  esac
+}

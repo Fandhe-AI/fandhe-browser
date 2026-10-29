@@ -14,6 +14,10 @@
 #
 # 使い方: run_core.sh [--tasks P] [--out P] [--bin P] [--endpoint URL] [--no-spawn]
 #                     [--page-js v8|boa [--page-modules]] [--log ABS_PATH] [--task-timeout SEC] [--total-timeout SEC] [--startup-timeout SEC] [--validate-only]
+#                     [--windows-localappdata-profile]
+# --windows-localappdata-profile は Windows の起動モード専用の明示オプトイン（xos-measure.yml の手動計測用）。Windows のバイナリは
+# XDG_DATA_HOME・HOME を見ず `%LOCALAPPDATA%` 配下をプロファイルに使うため既定では起動不可（exit 2）のままにし、このオプションで
+# `launch --profile-dir %LOCALAPPDATA%\fandhe-ct-<pid>-<rand>\p`（XOS-7・XOS-10）へ隔離して起動する。終了時にその一時領域だけを消す。
 # --startup-timeout は起動モードでは起動待ち、--no-spawn では接続確認の予算（拒否・2xx 以外は即失敗し理由を出力）。
 # 終了コード: 0=記録完了（失敗タスクがあっても 0。成否は計測結果でありゲートではない）
 #            1=記録の書き込み失敗・結果件数/id 集合の不一致
@@ -33,6 +37,7 @@ NO_SPAWN=0
 PAGE_JS=""
 PAGE_MODULES=0
 LOG_OUT=""
+WIN_PROFILE=0
 VALIDATE_ONLY=0
 TASK_TIMEOUT=45
 TOTAL_TIMEOUT=1200
@@ -56,6 +61,7 @@ while [ $# -gt 0 ]; do
     --page-modules) PAGE_MODULES=1; shift ;;
     --log) [ $# -ge 2 ] || die "--log requires a value"; LOG_OUT="$2"; shift 2 ;;
     --no-spawn) NO_SPAWN=1; shift ;;
+    --windows-localappdata-profile) WIN_PROFILE=1; shift ;;
     --validate-only) VALIDATE_ONLY=1; shift ;;
     *) die "unknown argument: $1" ;;
   esac
@@ -82,6 +88,14 @@ esac
 if [ -n "$LOG_OUT" ]; then
   [ "$NO_SPAWN" -eq 0 ] || die "--log cannot be combined with --no-spawn"
   case "$LOG_OUT" in /*) ;; *) die "--log must be an absolute path" ;; esac
+fi
+
+# Windows（Git Bash 等）かどうか。ネイティブバイナリの起動可否とパス表記の分岐に使う
+IS_WINDOWS=0
+case "$(uname -s)" in MINGW* | MSYS* | CYGWIN*) IS_WINDOWS=1 ;; esac
+if [ "$WIN_PROFILE" -eq 1 ]; then
+  [ "$IS_WINDOWS" -eq 1 ] || die "--windows-localappdata-profile is only supported on Windows"
+  [ "$NO_SPAWN" -eq 0 ] || die "--windows-localappdata-profile cannot be combined with --no-spawn"
 fi
 
 # tasks.json の検証は access_check.sh と同一規則（重複実装しない）。違反は exit 2 で伝わる
@@ -171,8 +185,7 @@ LOG="$(mktemp)" || { rm -f "$TMP" "$RAW"; echo "error: cannot create temp file" 
 
 cleanup() {
   if [ -n "$PID" ]; then
-    kill "$PID" 2>/dev/null || true
-    wait "$PID" 2>/dev/null || true
+    stop_spawned "$PID" || true
   fi
   [ -z "$PROFILE_DIR" ] || rm -rf "$PROFILE_DIR"
   [ -z "$CONF_DIR" ] || rm -rf "$CONF_DIR"
@@ -182,13 +195,13 @@ trap cleanup EXIT
 
 BIN_RESOLVED=""
 if [ "$NO_SPAWN" -eq 0 ]; then
-  case "$(uname -s)" in
-    MINGW* | MSYS* | CYGWIN*)
-      # 計測用プロファイルは XDG_DATA_HOME・HOME の一時ディレクトリで隔離しているが、Windows の
-      # バイナリはこれらを見ず `%LOCALAPPDATA%` 配下を使うため、起動すると利用者の実プロファイルに
-      # 触れて隔離の約束が崩れる。Windows での起動は未確認でもある。成功を装わず fail-closed にする
-      die "spawning the binary is not supported on Windows yet (profile isolation via XDG_DATA_HOME/HOME does not apply on Windows); use --no-spawn" ;;
-  esac
+  if [ "$IS_WINDOWS" -eq 1 ] && [ "$WIN_PROFILE" -eq 0 ]; then
+    # 計測用プロファイルは XDG_DATA_HOME・HOME の一時ディレクトリで隔離しているが、Windows の
+    # バイナリはこれらを見ず `%LOCALAPPDATA%` 配下を使うため、起動すると利用者の実プロファイルに
+    # 触れて隔離の約束が崩れる。成功を装わず fail-closed にする（隔離して起動するなら
+    # --windows-localappdata-profile でオプトインする）
+    die "spawning the binary is not supported on Windows yet (profile isolation via XDG_DATA_HOME/HOME does not apply on Windows); use --no-spawn or --windows-localappdata-profile"
+  fi
   # バイナリは待ち受けポートを引数・環境変数で変更できず 9333 固定のため、別ポートでは readiness を観測できない。
   # 起動モードでは 9333 以外を拒否する（別ポートの既存サーバーへ接続するなら --no-spawn を使う）
   # FC_TEST_ALLOW_SPAWN_PORT=1 は self-test の偽バイナリ専用（実バイナリでは設定しない）
@@ -197,16 +210,32 @@ if [ "$NO_SPAWN" -eq 0 ]; then
   # 固定ポートのため、起動前に応答があれば他プロセスを誤計測しないよう中止する（fail-closed）
   if probe; then die "endpoint is already responding: $ENDPOINT (stop the other process first)"; fi
   # 利用者の実プロファイルに触れず Locked 衝突も避けるため、計測用プロファイルを一時ディレクトリへ隔離する
-  PROFILE_DIR="$(mktemp -d)" || die "cannot create profile dir"
+  SPAWN_ARGS=()
+  if [ "$IS_WINDOWS" -eq 1 ]; then
+    # Windows のバイナリは `%LOCALAPPDATA%` 配下のプロファイルだけを受け付ける（XOS-7・XOS-10）。一意名の
+    # 一時領域を作り、`launch --profile-dir` で明示する。利用者の既定プロファイルには触れない
+    [ -n "${LOCALAPPDATA:-}" ] || die "LOCALAPPDATA is not set"
+    # mktemp -d は既存のパスと衝突すると失敗するだけで既存の中身に触れない。cleanup が消す PROFILE_DIR には、
+    # 作成に成功した後でだけ代入する（衝突で失敗した場合に、本実行で作っていない既存ディレクトリを消さないため）
+    WIN_LA_ROOT="$(cygpath -u "$LOCALAPPDATA")" || die "cannot resolve LOCALAPPDATA"
+    WIN_PROFILE_NEW="$(mktemp -d "$WIN_LA_ROOT/fandhe-ct-$$-XXXXXX")" || die "cannot create profile dir"
+    PROFILE_DIR="$WIN_PROFILE_NEW"
+    SPAWN_ARGS=(launch --profile-dir "$(cygpath -w "$PROFILE_DIR/p")")
+  else
+    PROFILE_DIR="$(mktemp -d)" || die "cannot create profile dir"
+  fi
   if [ -n "$PAGE_JS" ]; then
     CONF_DIR="$(mktemp -d)" || die "cannot create config dir"
+    CONF_PATH="$CONF_DIR/config.toml"
     # [profile] は書かない（cli は profile root を含む設定を拒否する）。エンジン未同梱のバイナリは起動前に非 0 終了する
-    printf '[js]\nengine = "%s"\nexecute_page_scripts = true\n' "$PAGE_JS" >"$CONF_DIR/config.toml"
+    printf '[js]\nengine = "%s"\nexecute_page_scripts = true\n' "$PAGE_JS" >"$CONF_PATH"
     # execute_modules は真偽の固定行のみ追記する（引数文字列は連結しない）
-    if [ "$PAGE_MODULES" -eq 1 ]; then printf 'execute_modules = true\n' >>"$CONF_DIR/config.toml"; fi
-    env XDG_DATA_HOME="$PROFILE_DIR" HOME="$PROFILE_DIR" FANDHE_BROWSER_CONFIG="$CONF_DIR/config.toml" "$BIN_RESOLVED" >"$LOG" 2>&1 &
+    if [ "$PAGE_MODULES" -eq 1 ]; then printf 'execute_modules = true\n' >>"$CONF_PATH"; fi
+    # ネイティブの Windows バイナリは MSYS 形式のパスを解釈できないため、混在形式（C:/...）へ変換して渡す
+    if [ "$IS_WINDOWS" -eq 1 ]; then CONF_PATH="$(cygpath -m "$CONF_PATH")"; fi
+    env XDG_DATA_HOME="$PROFILE_DIR" HOME="$PROFILE_DIR" FANDHE_BROWSER_CONFIG="$CONF_PATH" "$BIN_RESOLVED" ${SPAWN_ARGS[@]+"${SPAWN_ARGS[@]}"} >"$LOG" 2>&1 &
   else
-    env -u FANDHE_BROWSER_CONFIG XDG_DATA_HOME="$PROFILE_DIR" HOME="$PROFILE_DIR" "$BIN_RESOLVED" >"$LOG" 2>&1 &
+    env -u FANDHE_BROWSER_CONFIG XDG_DATA_HOME="$PROFILE_DIR" HOME="$PROFILE_DIR" "$BIN_RESOLVED" ${SPAWN_ARGS[@]+"${SPAWN_ARGS[@]}"} >"$LOG" 2>&1 &
   fi
   PID=$!
   start=$SECONDS
