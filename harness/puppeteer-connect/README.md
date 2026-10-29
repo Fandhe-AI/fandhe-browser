@@ -47,9 +47,12 @@ Puppeteer 接続試験の実行基盤（TASK-45.1・Issue #480・ビヘイビア
 `make check-puppeteer-connect`（`stages.mjs` の自己テストと契約テスト `puppeteer_contract`）のみ。
 `preflight_puppeteer` は `puppeteer-core` 未導入なら skip せず、理由付きで失敗を返す。
 
-## 導入状況（承認待ち）
+## 導入状況
 
-`puppeteer-core` の導入・バージョン固定はユーザー承認が必要で、現時点では未承認のため
+**承認済み（2026-10-29 オーナー）**: `puppeteer-core` を**測定時の一時導入のみ**で使う（`harness/endpoint-swap/run.sh`。
+TASK-46・#252。`mktemp -d` へ導入して削除し、版は `scripts/versions.sh` の `PUPPETEER_VERSION` で完全固定）。
+`package.json`・lockfile のコミットと CI 組み込みは引き続き**未承認**で、以下の記述はその範囲について述べる。
+`puppeteer-core` の導入・バージョン固定はユーザー承認が必要で、CI・コミット用としては未承認のため
 `package.json`・`package-lock.json`・CI ジョブは追加していない。したがって実 Puppeteer での
 実行は未検証で、基盤は偽スクリプトで検証している。実試験ターゲットは `cargo test --workspace` で実行されない
 `test = false` 形式にせず、依存導入と CI 組み込みと同時に追加する。承認後に追加する内容:
