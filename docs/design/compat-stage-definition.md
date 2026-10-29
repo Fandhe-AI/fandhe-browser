@@ -83,7 +83,7 @@ spec の内容は ID とパスで参照し、本文は転記しない。SSOT は
 
 - 指標は `PLUG-8` が定義する。実装は TASK-100（MS-8）
 - カバレッジ率: 88.8%（318 / 358）。出典 `profiles/README.md`「件数・カバレッジ」。基準 85% 以上を超える。PoC-16 の実測は 89.4%（320 件）
-- 読み込みコスト: バイナリ増分 +4.03%（strip なし）・+4.25%（strip あり）、アイドル RSS 増分 +200 KiB（0.195MiB）・+192 KiB（0.188MiB）。出典 `docs/design/cssom-profile-cost-report.md`。基準（10% 以内・1.2MiB 以内）の内
+- 読み込みコスト（TASK-100.6 の再計測・再マッピング後。出典 `profiles/README.md`「件数・カバレッジ」）: バイナリ増分 +4.41%（strip なし）・+4.69%（strip あり）、アイドル RSS 増分 0.168 MiB・0.145 MiB。基準（10% 以内・1.2 MiB 以内）の内に収まる。RSS の対応は、バイナリと同じ strip なし・strip ありの順と読んだ（`profiles/README.md` は RSS の対応を明記していない）。`profiles/README.md` は値が Chrome と Safari のどちらの読み込みかを示していない。旧レポート（`docs/design/cssom-profile-cost-report.md`。+4.03%・+4.25%、+200 KiB・+192 KiB）は計測コミット `2119e371d14b` の結果で、Chrome と Safari を両方読み込む構成で計測した。再計測も同じ構成かは README に記載がない
 - 限界: 計測は Linux のみ。cli が `cssom_profile` を参照せず、`--profile` の実配線は未実装のため、出荷バイナリでの再計測が要る（同レポート「限界」）
 - 識別面（UA 文字列・フィンガープリント）は変更しない（`SEC-2`。`docs/design/anti-bot-review.md`）
 
@@ -99,7 +99,7 @@ spec の内容は ID とパスで参照し、本文は転記しない。SSOT は
 - `RENDER-4`: 確定（達成）。Linux で 7 回とも 0.1〜0.8 秒で PNG を取得（#50）。Servo ホスト（`servo =0.7.0`）でも代表 6 サイトで取得
 - `RENDER-5` の v1 基準（境界ボックス）: 6 サイト中 5 サイトで合格（基準は 5 サイト以上）。SSIM（参考値）が 0.90 以上なのは 1/6 サイト（b1-react-dev 0.9654。他は 0.7209〜0.8459）。出典は同書「根拠」
 - `RENDER-7`: 段階導入。v1 はスクリーンショットと境界ボックスを Servo ホストの描画の範囲で提供し、見た目の一致は v2 の目標とする
-- 動的ダッシュボード類型の扱い（#317・TASK-73 の判断。記録は `docs/design/dashboard-scope-decision.md`〔#1314〕）: 段階導入。v1 は Servo ホストのスクリーンショットと境界ボックスまでで、非 DOM 描画からのデータ抽出は対象外
+- 動的ダッシュボード類型の扱い（#317・TASK-73 の判断。判定日 2026-10-29。記録は `docs/design/dashboard-scope-decision.md`。この文書は #1314 で main に追加）: 段階導入。v1 は Servo ホストのスクリーンショットと境界ボックスまでで、非 DOM 描画からのデータ抽出は対象外
 - `PLUG-7` の注記: 段階 3 は「コア v1 では対象外」であり、`README.md` の除外事項「Servo 以外のレンダリングエンジンの本格採用」と緊張関係がある。Servo ホストは別 workspace・別プロセスに隔離されている（`RENDER-1`）
 
 ## オーナー判断が要る点
