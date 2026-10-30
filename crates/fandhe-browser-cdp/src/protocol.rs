@@ -693,7 +693,7 @@ fn auto_attach_events(
     for (target_id, sid) in &rec.detached {
         events.push(crate::playwright_compat::detached_event(target_id, sid));
     }
-    // discover の通知は detached の後・attached の前（Chromium の順。#1324・`CDP-3`）。
+    // 順序は detached → destroyed → created → attached（Chromium の順。#1324・`CDP-3`・`CDP-7`）。
     for tid in &rec.destroyed {
         events.push(crate::playwright_compat::target_destroyed_event(tid));
     }
@@ -708,18 +708,22 @@ fn auto_attach_events(
     events
 }
 
-/// ハンドラ生成のイベント列へ reconcile 生成分を足す。discover の通知（`targetDestroyed`・`targetCreated`）は
+/// ハンドラ生成のイベント列へ reconcile 生成分を足す。reconcile 側の `attachedToTarget` より前の通知
+/// （`detachedFromTarget`・`targetDestroyed`・`targetCreated`。`auto_attach_events` の順を保つ）は
 /// ハンドラ生成の `attachedToTarget` より前に置く（Chromium の順。例: 他接続のページ作成後の
-/// `Target.setAutoAttach`。#1324・`CDP-3`）。
+/// `Target.setAutoAttach`。#1324・`CDP-3`・`CDP-7`）。`detachedFromTarget` は `targetDestroyed` より先のまま。
 fn insert_auto_events(events: &mut Vec<CdpEvent>, auto: Vec<CdpEvent>) {
-    let is_discovery =
-        |e: &CdpEvent| matches!(e.method, "Target.targetCreated" | "Target.targetDestroyed");
-    let (discovery, rest): (Vec<_>, Vec<_>) = auto.into_iter().partition(is_discovery);
+    let split = auto
+        .iter()
+        .position(|e| e.method == "Target.attachedToTarget")
+        .unwrap_or(auto.len());
+    let mut auto = auto;
+    let rest = auto.split_off(split);
     let pos = events
         .iter()
         .position(|e| e.method == "Target.attachedToTarget")
         .unwrap_or(events.len());
-    events.splice(pos..pos, discovery);
+    events.splice(pos..pos, auto);
     events.extend(rest);
 }
 
@@ -747,6 +751,45 @@ mod tests {
     fn parse_err(text: &str) -> (Option<i64>, i64) {
         let f = parse_request(text).unwrap_err();
         (f.id, f.error.code)
+    }
+
+    #[test]
+    fn cdp7_insert_auto_events_keeps_detached_before_destroyed() {
+        let ev = |m: &'static str| CdpEvent {
+            method: m,
+            params: json!({}),
+            session_id: None,
+        };
+        let mut events = vec![ev("Target.attachedToTarget")];
+        let auto = vec![
+            ev("Target.detachedFromTarget"),
+            ev("Target.targetDestroyed"),
+            ev("Target.targetCreated"),
+            ev("Target.attachedToTarget"),
+        ];
+        insert_auto_events(&mut events, auto);
+        let m: Vec<_> = events.iter().map(|e| e.method).collect();
+        assert_eq!(
+            m,
+            vec![
+                "Target.detachedFromTarget",
+                "Target.targetDestroyed",
+                "Target.targetCreated",
+                "Target.attachedToTarget",
+                "Target.attachedToTarget"
+            ]
+        );
+        let mut events = Vec::new();
+        let auto = vec![
+            ev("Target.detachedFromTarget"),
+            ev("Target.targetDestroyed"),
+        ];
+        insert_auto_events(&mut events, auto);
+        let m: Vec<_> = events.iter().map(|e| e.method).collect();
+        assert_eq!(
+            m,
+            vec!["Target.detachedFromTarget", "Target.targetDestroyed"]
+        );
     }
 
     #[test]
