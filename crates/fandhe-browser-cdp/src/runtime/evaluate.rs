@@ -35,11 +35,18 @@
 //! `MAIN_WORLD_EVALUATION_UNSUPPORTED`。
 //!
 //! `Runtime.callFunctionOn`（`call_function_on` モジュール）: `sessionId` なし → `UNSUPPORTED_PARAMS` →
-//! 非オブジェクト → `INVALID_PARAMS` → 未知キー → `UNSUPPORTED_PARAMS` → 型の誤り・`objectId` 無し・書式不正 →
-//! `INVALID_PARAMS` → `arguments` が 64 件超 → `TOO_MANY_CALL_ARGUMENTS`（要素を走査する前）→ 引数要素の誤り →
-//! `INVALID_PARAMS` → 引数の `objectId` が `this` と別の contextId → `ARGUMENT_CONTEXT_MISMATCH`（Rust 側の比較だけ）
-//! → `functionDeclaration` が 1 MiB 超 → `EXPRESSION_TOO_LARGE` → 以降は `Runtime.releaseObject` と同じ
-//! 解決（未知・他セッション・main world・ヘルパー未注入は `REMOTE_OBJECT_NOT_FOUND`）。
+//! 非オブジェクト → `INVALID_PARAMS` → 未知キー → `UNSUPPORTED_PARAMS` → `functionDeclaration` の型の誤り →
+//! `objectId` と `executionContextId` が両方ある・どちらも無い（排他）→ 各キーの型の誤り（`executionContextId` は
+//! `1..=MAX_CONTEXT_ID` の整数）・`objectId` の書式不正 → `INVALID_PARAMS` →
+//! `arguments` が 64 件超 → `TOO_MANY_CALL_ARGUMENTS`（要素を走査する前）→ 引数要素の誤り →
+//! `INVALID_PARAMS` → 引数の `objectId` が呼び出し対象と別の contextId → `ARGUMENT_CONTEXT_MISMATCH`（Rust 側の比較だけ）
+//! → `functionDeclaration` が 1 MiB 超 → `EXPRESSION_TOO_LARGE` → 未知セッション → `INVALID_PARAMS` →
+//! 止めたターゲット → `TARGET_WAITING_FOR_DEBUGGER` → 評価器が無効 → `EXECUTION_CONTEXTS_UNAVAILABLE` →
+//! 確定文書なし → `TARGET_DOCUMENT_UNAVAILABLE` → contextId の解決。`objectId` 経路は `Runtime.releaseObject` と同じ
+//! （未知・他セッション・main world・ヘルパー未注入は `REMOTE_OBJECT_NOT_FOUND`、世代違いは `EXECUTION_CONTEXT_STALE`）。
+//! `executionContextId` 経路は未知・他セッションが `INVALID_PARAMS`、世代違いが `EXECUTION_CONTEXT_STALE`、main world が
+//! `MAIN_WORLD_EVALUATION_UNSUPPORTED`（評価器を起動しない）で、ヘルパー未注入なら引数にハンドルがあれば
+//! `REMOTE_OBJECT_NOT_FOUND`、無ければ注入してから評価する。
 //!
 //! `Runtime.releaseObject`: `sessionId` なし → `UNSUPPORTED_PARAMS` → 非オブジェクト → `INVALID_PARAMS` →
 //! `objectId` 以外のキー → `UNSUPPORTED_PARAMS` → `objectId` 無し・非文字列・書式不正 → `INVALID_PARAMS` →
@@ -1354,6 +1361,10 @@ mod dispatch_tests {
                 Box::new(RuntimeEvaluate::new(EvalLimits::default())),
             ),
             ("Runtime.releaseObject", Box::new(RuntimeReleaseObject)),
+            (
+                "Runtime.callFunctionOn",
+                Box::new(RuntimeCallFunctionOn::new(EvalLimits::default())),
+            ),
         ])
         .unwrap()
     }
@@ -1392,6 +1403,56 @@ mod dispatch_tests {
 
     fn worker_spawns(st: &Arc<CdpState>) -> u64 {
         st.app_state().script_contexts().stats().worker_spawns()
+    }
+
+    /// `CDP-6`・#1345: `executionContextId` 経路の検証順（評価器が無効な構成。評価器は起動しない）。
+    #[tokio::test]
+    async fn cdp6_call_function_on_execution_context_validates_params_in_order() {
+        let dir = TempDir::new();
+        let st = state(&dir);
+        let (_, sid) = page_session(&st);
+        let m = "Runtime.callFunctionOn";
+        // sessionId なし。
+        let v = call(
+            &st,
+            None,
+            m,
+            r#"{"functionDeclaration":"function(){}","executionContextId":1}"#,
+        )
+        .await;
+        assert_eq!(error(&v), (-32602, "unsupported params"));
+        // 排他の誤り（両方・どちらも無し）。
+        for params in [
+            r#"{"functionDeclaration":"function(){}","objectId":"1.1","executionContextId":1}"#,
+            r#"{"functionDeclaration":"function(){}"}"#,
+        ] {
+            let v = call(&st, Some(&sid), m, params).await;
+            assert_eq!(error(&v), (-32602, "invalid params"), "{params}");
+        }
+        // 1 MiB 超の functionDeclaration は評価器を起動せず拒否する。
+        let big = "x".repeat(1024 * 1024 + 1);
+        let params = format!(r#"{{"functionDeclaration":"{big}","executionContextId":1}}"#);
+        let v = call(&st, Some(&sid), m, &params).await;
+        assert_eq!(error(&v), (-32000, "expression too large"));
+        // 未知セッション。
+        let v = call(
+            &st,
+            Some(&SessionId::parse("NOPE").unwrap()),
+            m,
+            r#"{"functionDeclaration":"function(){}","executionContextId":1}"#,
+        )
+        .await;
+        assert_eq!(error(&v), (-32602, "invalid params"));
+        // 正しい入力は評価器が無効なので固定のエラー。
+        let v = call(
+            &st,
+            Some(&sid),
+            m,
+            r#"{"functionDeclaration":"function(){}","executionContextId":1}"#,
+        )
+        .await;
+        assert_eq!(error(&v), (-32000, "execution contexts unavailable"));
+        assert_eq!(worker_spawns(&st), 0);
     }
 
     #[tokio::test]

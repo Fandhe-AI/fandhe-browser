@@ -4,8 +4,8 @@
 
 ## 位置づけ
 
-- 本書は設計案であり、**コードは変更していない**。実装は §9 の分割案で、オーナー承認後に別 issue として進める
-- 本書の時点で、main world の評価と `executionContextId` 指定の `Runtime.callFunctionOn` は**未実装**である（`REPAIR-3`）。以下に書く挙動はすべて設計案である
+- 本書は設計案である。実装は §9 の分割案で、オーナー承認後に別 issue として進める。分割案 1（`executionContextId` 指定の `Runtime.callFunctionOn`。isolated world のみ）は #1345 で実装済み
+- main world の評価とノード同一性の橋渡し（`DOM.describeNode`・`DOM.resolveNode`）は**未実装**である（`REPAIR-3`）。これらについて以下に書く挙動は設計案である
 - 「オーナー判断待ち」と書いた箇所は、推奨案を置いたうえで決定を保留している
 - 確度の区分は [puppeteer-compat.md](./puppeteer-compat.md) と同じ。A は実測、B はソースの読解（未実測）。§2 の Puppeteer の記述は **B**
 - 基準コミットは origin/main `04a9d4e2`。シンボル名は基準コミットのもので、実装時に再確認する
@@ -18,7 +18,7 @@
 - `runtime/evaluate.rs` の `RuntimeEvaluate::handle` は、main world への評価に固定エラー `MAIN_WORLD_EVALUATION_UNSUPPORTED` を返す。理由は、main world のページ JS 状態が別の実行系にあること（`runtime.rs` の「差異・スタブ」）
 - ハンドル表は JS 側のヘルパー（`helper.js` の `__fandheCdpHelper`）が持つ。`objectId` は `<contextId>.<n>` の書式。ヘルパーは注入時点の組込み（`JSON.parse`・`Reflect.apply` 等）を退避する。main world・ヘルパー未注入の `objectId` は `REMOTE_OBJECT_NOT_FOUND` になる
 - `runtime/evaluate/call_function_on.rs`
-  - `objectId` は必須で、`executionContextId` は `UNSUPPORTED_PARAMS` で拒否する
+  - `objectId` か `executionContextId` のどちらか一方を必須とする（排他。#1345）。`executionContextId` は isolated world だけ受理し、`this` は undefined。main world は `MAIN_WORLD_EVALUATION_UNSUPPORTED`
   - 引数の `objectId` の contextId が `this` と違えば、Rust 側で `ARGUMENT_CONTEXT_MISMATCH`
   - `uniqueContextId`・`serializationOptions` 等も `UNSUPPORTED_PARAMS`
 - `dom.rs` の `nodeId` は、払い出した文書ごとの `base` に文書順の番号を足して振る（`IssuedDocuments`）。`backendNodeId` は `nodeId` と同じ値。`DOM.describeNode`・`DOM.resolveNode` は未実装
@@ -39,7 +39,7 @@ puppeteer-core 25.12.0 の `src/` を一時ディレクトリに展開して読�
 
 | 段 | 送るメソッド | 必須の引数 | fandhe の現状 |
 | -- | ------------ | ---------- | ------------- |
-| 1 | `Runtime.callFunctionOn`（`Frame.#document()` の `evaluateHandle(() => document)`） | main の `executionContextId`、`functionDeclaration`、`returnByValue: false`、`awaitPromise`、`userGesture`。`objectId` は使わない | `UNSUPPORTED_PARAMS` で拒否（停止点） |
+| 1 | `Runtime.callFunctionOn`（`Frame.#document()` の `evaluateHandle(() => document)`） | main の `executionContextId`、`functionDeclaration`、`returnByValue: false`、`awaitPromise`、`userGesture`。`objectId` は使わない | isolated world は受理（#1345）。main world は `MAIN_WORLD_EVALUATION_UNSUPPORTED`（停止点） |
 | 2 | `Runtime.addBinding`（`executionContextName` 指定） | 失敗はログだけで握りつぶされる | `-32601`。成功を装わない（§5） |
 | 3 | `Runtime.evaluate`（`puppeteerUtil` の注入） | isolated の `contextId` | 実装済み |
 | 4 | `DOM.describeNode {objectId}` → `DOM.resolveNode {backendNodeId, executionContextId: isolated}`（`@bindIsolatedHandle` の `adoptHandle`） | | 未実装 |
@@ -92,9 +92,9 @@ puppeteer-core 25.12.0 の `src/` を一時ディレクトリに展開して読�
   - 他セッションの contextId は `INVALID_PARAMS` で、存在を区別しない
   - 世代違いは `EXECUTION_CONTEXT_STALE`
   - main world は段階 1 の実装後に受理する（それまでは `MAIN_WORLD_EVALUATION_UNSUPPORTED`）
-- この経路では `this` を `undefined` にする（ヘルパーに `thisHandle` 省略の型を追加する）
+- この経路では `this` を `undefined` にする（ヘルパーのペイロードの `thisHandle` を `null` にして表す。キーを省くとプロトタイプ汚染を拾い得るため、own property の null にする）
 - 引数の `objectId` の contextId は、解決した contextId と一致すること（既存の `ARGUMENT_CONTEXT_MISMATCH` の経路を流用する）
-- 検証順は既存の表に挿入する位置を決めて記す（実装 issue で確定する）
+- 検証順は #1345 で確定した。排他の検査は `functionDeclaration` の型の後、各キーの型の前に置く。`executionContextId` の解決は `objectId` 経路と同じ位置で行い、エラーの写像だけを経路で分ける。順序の全文は `runtime/evaluate.rs` のモジュール doc「検証順」を参照
 - `uniqueContextId`・`serializationOptions` は Puppeteer 25.12.0 が送らないため、`UNSUPPORTED_PARAMS` のまま残す
 - `Runtime.evaluate` の `contextId` 省略は、Chromium の意味に合わせ「セッションの現在の文書の main world」にする（段階 1 の後。Puppeteer と Playwright はどちらも明示するため互換性への影響は小さい）
 
@@ -147,7 +147,7 @@ puppeteer-core 25.12.0 の `src/` を一時ディレクトリに展開して読�
 
 | # | 対象 | 内容 | 依存 |
 | - | ---- | ---- | ---- |
-| 1 | cdp | `Runtime.callFunctionOn` の `executionContextId` 受理（isolated world のみ。排他・`this` undefined・引数の contextId 一致・検証順・テスト） | なし |
+| 1 | cdp | `Runtime.callFunctionOn` の `executionContextId` 受理（isolated world のみ。排他・`this` undefined・引数の contextId 一致・検証順・テスト）。**#1345 で実装済み** | なし |
 | 2 | cdp | 段階 1: main world の評価（`Runtime.evaluate` の main の contextId と `contextId` 省略・`releaseObject`・`callFunctionOn` の `World::Main` 許可・既存テスト `tests/support/runtime_evaluate_cases.rs` の main world エラー期待の更新・`MAIN_WORLD_EVALUATION_UNSUPPORTED` の扱い） | 段階 1 の既定有効・opt-in のオーナー判断 |
 | 3 | core（設計は main） | 初期の文書順番号によるノード同一性の API（`DomBridge` / `ScriptContextHandle`） | なし（2 と並行可） |
 | 4 | cdp | `DOM.describeNode`（`objectId`）・`DOM.resolveNode`（`backendNodeId` + `executionContextId`）。DOM ドメインの採番と統一する | 3、main world を対象にするなら 2 |
