@@ -424,15 +424,14 @@ id 7・11・13・15・16・17・18。
 
 | メソッド | 受理条件 | エラー |
 | -------- | -------- | ------ |
-| `Page.addScriptToEvaluateOnNewDocument` | 生存セッションの `sessionId` 付き・`params` が `source`（空文字列、または `//# sourceURL=<ASCII 印字可能 1 文字以上>` の 1 行で 256 バイト以下。#1325）と任意の `worldName`（文字列）だけ。`{"identifier":"<10 進連番>"}` を返す。止めたターゲットでも受理する | `sessionId` なし・上記以外の非空 `source`（改行・LS/PS・空白を含む、旧 `//@` 形式、長さ超過）・`source`／`worldName` 以外のキー（`runImmediately`・`includeCommandLineAPI` 等）は `-32602 unsupported params`、`source` 欠落・型違い・`worldName` の型違い／NUL・未知セッションは `-32602 invalid params`、`worldName` が 256 バイト超は `-32000 world name too long`、セッションあたり 64 件超は `-32000 too many init scripts` |
+| `Page.addScriptToEvaluateOnNewDocument` | 生存セッションの `sessionId` 付き・`params` が `source`（空文字列のみ）と任意の `worldName`（文字列）だけ。`{"identifier":"<10 進連番>"}` を返す。止めたターゲットでも受理する | `sessionId` なし・非空 `source`・`source`／`worldName` 以外のキー（`runImmediately`・`includeCommandLineAPI` 等）は `-32602 unsupported params`、`source` 欠落・型違い・`worldName` の型違い／NUL・未知セッションは `-32602 invalid params`、`worldName` が 256 バイト超は `-32000 world name too long`、セッションあたり 64 件超は `-32000 too many init scripts` |
 | `Target.setAutoAttach`（`sessionId` 付き） | 生存セッション・`autoAttach` が bool。`autoAttach:true` は `flatten:true` 必須。`{}` を返し、`waitForDebuggerOnStart` とともに状態を保持する（`autoAttach:false` で解除）。イベントは 0 件 | `filter` 付き・`autoAttach:true` で `flatten` が `true` 以外は `-32602 unsupported params`、`autoAttach` 欠落・型違い・未知セッションは `-32602 invalid params` |
 
 - 状態は `target.rs` の `Tables`（`init_scripts`・`next_init_script`・`child_auto_attach`）に置く（Issue 記載の `conn_state.rs` から外れる。理由は段階 3a と同じ）。
   セッション削除と同じロックで消え、切断・ターゲットの close・context の破棄で漏れない（付随状態の削除は `drop_session_state` に集約）。
 - **identifier は registry 全体の連番**（Issue 記載の接続スコープより広い）。採番を 1 回のロックで原子的にでき、同一接続での再登録が別 identifier になる。
   セッション ID と同じ性質で新しい情報漏えいは無い。
-- **sourceURL コメントだけの `source` を受理する理由**（#1325）: Puppeteer の `newPage()` が `//# sourceURL=pptr:internal` を送る。実行内容が無いので空 `source` と同じ no-op が事実と一致する。LineTerminator 以降は実行可能コードになるため URL 部は ASCII 印字可能文字の許可リストで判定し、値は保持しない。
-- **それ以外の非空 `source` を拒否する理由**: 実行経路（`JS-4`・TASK-112）が無く、効いていないのに成功を返すと stealth 用のスクリプト注入として働く（`SEC-2`・`CDP-6`）。
+- **非空 `source` を拒否する理由**: 実行経路（`JS-4`・TASK-112）が無く、効いていないのに成功を返すと stealth 用のスクリプト注入として働く（`SEC-2`・`CDP-6`）。
   空 `source` は実行しても何も起きないので no-op が事実と一致する。`worldName` は保持しない。
 - **差異**（`REPAIR-3`）: 子ターゲット（iframe・worker・OOPIF）のモデルが無く、セッション付き `Target.setAutoAttach` の attach 対象は常に 0 件
   （事実と一致する応答で、一律の成功ではない）。`waitForDebuggerOnStart` は保持するだけ。`Page.removeScriptToEvaluateOnNewDocument` は未実装。

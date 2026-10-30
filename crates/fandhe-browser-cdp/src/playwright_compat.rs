@@ -23,7 +23,7 @@
 //! イベントは送らない。`REPAIR-3`）を足す。
 //! 43.3k（#1039）で `Page.setLifecycleEventsEnabled`（セッション単位の有効フラグ。`Page.enable` 済みの
 //! セッションの `Page.navigate` が `Page.lifecycleEvent` の `init`・`load` を送る。#1322 で `DOMContentLoaded` も送る）を足す。
-//! 43.3l（#1040）で `Page.addScriptToEvaluateOnNewDocument`（空 `source` と、#1325 で `//# sourceURL=<URL>` の 1 行だけの `source` を受理。それ以外の非空は拒否）と
+//! 43.3l（#1040）で `Page.addScriptToEvaluateOnNewDocument`（空 `source` のみ受理・非空は拒否）と
 //! セッション付き `Target.setAutoAttach`（状態の保持のみ・子 attach は 0 件）を足す。接続スコープの状態と寿命は [`crate::conn_state`]。方針は `docs/design/playwright-compat.md`。
 //! #1324 で `Target.setDiscoverTargets`（`filter` は省略か `[{}]` のみ）と `Target.targetCreated`・`Target.targetDestroyed` の送出を足す。
 //! 43.3m（#1041）で `Emulation.setFocusEmulationEnabled`・`Emulation.setEmulatedMedia` を足す。Playwright 既定値（`enabled:true`、
@@ -692,35 +692,15 @@ impl CommandHandler for PageSetLifecycleEventsEnabled {
     }
 }
 
-/// `source` が `//# sourceURL=<URL>` の 1 行だけで、実行内容を持たないか（#1325・`CDP-3`・`SEC-2`）。
+/// `Page.addScriptToEvaluateOnNewDocument`（空 `source` のみ。`CDP-2`・TASK-43.3l・#1040）。
 ///
-/// [`PageAddScriptToEvaluateOnNewDocument`] が Puppeteer の `//# sourceURL=pptr:internal` を空 `source` と同じ
-/// no-op として受理するための判定。JS の `//` コメントは LineTerminator（`\n`・`\r`・U+2028・U+2029）で終わり、
-/// その後ろは実行可能コードになるため、URL 部は ASCII 印字可能文字（0x21..=0x7E。空白を含まない）の許可リスト方式にし、
-/// 改行・LS/PS・タブ・非 ASCII を一括で弾く。末尾改行・先頭空白・BOM・旧形式 `//@ sourceURL=` も不受理。
-/// 長さは走査前に `MAX_SOURCE_URL_COMMENT_LEN` で検査し（`CDP-7`）、超過は新しいエラーコードを作らず
-/// 「sourceURL だけの source ではない」として呼び出し側が `UNSUPPORTED_PARAMS` にする。
-fn is_source_url_comment_only(source: &str) -> bool {
-    if source.len() > crate::target::MAX_SOURCE_URL_COMMENT_LEN {
-        return false;
-    }
-    match source.strip_prefix("//# sourceURL=") {
-        Some(url) => !url.is_empty() && url.bytes().all(|b| (0x21..=0x7E).contains(&b)),
-        None => false,
-    }
-}
-
-/// `Page.addScriptToEvaluateOnNewDocument`（空 `source` と sourceURL コメントだけの `source`。
-/// `CDP-2`・`CDP-3`・TASK-43.3l・#1040・TASK-45・TASK-46・#1325）。
-///
-/// Playwright の `newPage()` が `source:""`、Puppeteer の `newPage()` が `//# sourceURL=pptr:internal` で送る。
-/// どちらも実行すべきスクリプトが無いので no-op が正しい応答になり、受理するのはこの 2 形だけ
-/// （[`is_source_url_comment_only`]）。実行可能な内容を 1 文字でも含む `source` は実行経路（`JS-4`・TASK-112）が無く、
-/// 効いていないのに成功を返すと stealth 用のスクリプト注入として働くため `UNSUPPORTED_PARAMS` で拒否する（`SEC-2`・`CDP-6`）。
+/// Playwright の `newPage()` が `source:""` で送る。実行すべきスクリプトが無いので no-op が正しい応答になり、
+/// 受理するのは空の `source` だけ。非空の `source` は実行経路（`JS-4`・TASK-112）が無く、効いていないのに
+/// 成功を返すと stealth 用のスクリプト注入として働くため `UNSUPPORTED_PARAMS` で拒否する（`SEC-2`・`CDP-6`）。
 ///
 /// 検証順: `sessionId` なしは `UNSUPPORTED_PARAMS` → `params` が非オブジェクトは `INVALID_PARAMS` →
 /// `source`・`worldName` 以外のキー（`includeCommandLineAPI`・`runImmediately` 等）は `UNSUPPORTED_PARAMS` →
-/// `source` が無い・文字列でないは `INVALID_PARAMS` → 空でも sourceURL コメントだけでもない `source` は `UNSUPPORTED_PARAMS` →
+/// `source` が無い・文字列でないは `INVALID_PARAMS` → 非空 `source` は `UNSUPPORTED_PARAMS` →
 /// `worldName` が文字列でない・NUL を含むは `INVALID_PARAMS` → 長さ超過（`MAX_WORLD_NAME_LEN`）と
 /// セッションあたりの登録数超過は `-32000`（`CDP-7`）→ 未知・閉じたセッションは `INVALID_PARAMS`。
 /// 失敗時は状態を変えない。`worldName` の文字種は絞らない（Playwright は `@<hash>` 付きの名前を送る）。
@@ -752,7 +732,7 @@ impl CommandHandler for PageAddScriptToEvaluateOnNewDocument {
                 .get("source")
                 .and_then(Value::as_str)
                 .ok_or(CdpError::INVALID_PARAMS)?;
-            if !source.is_empty() && !is_source_url_comment_only(source) {
+            if !source.is_empty() {
                 return Err(CdpError::UNSUPPORTED_PARAMS);
             }
             let mut world: Option<&str> = None;
@@ -3253,90 +3233,6 @@ mod tests {
                 call(&st, Some(c), &sreq(3, m, &sid, r#"{"source":""}"#)).await,
                 vec![json!({"id":3,"sessionId":sid,"result":{"identifier":"1"}})]
             );
-        }
-
-        #[tokio::test]
-        async fn cdp3_add_script_accepts_source_url_comment_only() {
-            let dir = TempDir::new();
-            let st = state(&dir);
-            let c = open_conn(&st, 1);
-            let sid = attached_session(&st, c).await;
-            let s = SessionId::parse(&sid).unwrap();
-            let m = "Page.addScriptToEvaluateOnNewDocument";
-            let w = r#"{"source":"//# sourceURL=pptr:internal","worldName":"__puppeteer_utility_world__25.12.0"}"#;
-            assert_eq!(
-                call(&st, Some(c), &sreq(2, m, &sid, w)).await,
-                vec![json!({"id":2,"sessionId":sid,"result":{"identifier":"1"}})]
-            );
-            let p = r#"{"source":"//# sourceURL=pptr:internal"}"#;
-            assert_eq!(
-                call(&st, Some(c), &sreq(3, m, &sid, p)).await,
-                vec![json!({"id":3,"sessionId":sid,"result":{"identifier":"2"}})]
-            );
-            assert_eq!(st.registry().init_script_count(&s), 2);
-            // ちょうど 256 バイトは受理する。
-            let ok = json!({"source": format!("//# sourceURL={}", "a".repeat(242))}).to_string();
-            assert_eq!(
-                call(&st, Some(c), &sreq(4, m, &sid, &ok)).await,
-                vec![json!({"id":4,"sessionId":sid,"result":{"identifier":"3"}})]
-            );
-        }
-
-        #[tokio::test]
-        async fn sec2_add_script_rejects_non_comment_source_without_changing_state() {
-            let dir = TempDir::new();
-            let st = state(&dir);
-            let c = open_conn(&st, 1);
-            let sid = attached_session(&st, c).await;
-            let s = SessionId::parse(&sid).unwrap();
-            let m = "Page.addScriptToEvaluateOnNewDocument";
-            let too_long = format!("//# sourceURL={}", "a".repeat(243));
-            let sources: Vec<&str> = vec![
-                "//# sourceURL=",
-                "//@ sourceURL=x",
-                " //# sourceURL=x",
-                "\u{feff}//# sourceURL=x",
-                "//# sourceURL=x\n",
-                "//# sourceURL=x\r",
-                "//# sourceURL=x\nwindow.x=1",
-                "//# sourceURL=x\rwindow.x=1",
-                "//# sourceURL=x\u{2028}window.x=1",
-                "//# sourceURL=x\u{2029}window.x=1",
-                "//# sourceURL=a b",
-                "//# sourceURL=a\tb",
-                "//# sourceURL=あ",
-                "//# sourceMappingURL=x",
-                "/*x*/",
-                "window.x=1",
-                &too_long,
-            ];
-            for (i, src) in sources.iter().enumerate() {
-                let id = 10 + i as i64;
-                let p = json!({ "source": src }).to_string();
-                assert_eq!(
-                    call(&st, Some(c), &sreq(id, m, &sid, &p)).await,
-                    vec![serr(-32602, "unsupported params", id, &sid)],
-                    "{src:?}"
-                );
-            }
-            assert_eq!(st.registry().init_script_count(&s), 0);
-        }
-
-        #[test]
-        fn cdp3_is_source_url_comment_only_cases() {
-            let cases: [(&str, bool); 8] = [
-                ("//# sourceURL=pptr:internal", true),
-                ("//# sourceURL=x", true),
-                ("", false),
-                ("//# sourceURL=", false),
-                ("//@ sourceURL=x", false),
-                ("//# sourceURL=x\ny", false),
-                ("//# sourceURL=x y", false),
-                ("//# sourceURL=\u{2028}", false),
-            ];
-            for (src, want) in cases {
-                assert_eq!(is_source_url_comment_only(src), want, "{src:?}");
-            }
         }
 
         #[tokio::test]
