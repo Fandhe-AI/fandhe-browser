@@ -18,6 +18,9 @@
 //! 自動化ブラウザであることを正直に示し（`SEC-2`）、`location` はランナーが
 //! [`crate::dom_bridge::DomBridge::set_location`] で設定した URL を読む。
 //!
+//! `dom.js` は初期ノード同一性の窓口 `__fandheDomIdentity`（`orderOf` / `nodeAt`。#1346・`CDP-2`）も
+//! 出す（cdp ヘルパーが注入時に捕捉して使う想定。実体は core の `DomBridge::initial_order`）。
+//!
 //! # 未実装（REPAIR-3）
 //!
 //! `dom.js` / `window.js` / `events.js` 冒頭の「未実装」節を参照（DOMException 写像・

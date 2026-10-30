@@ -139,7 +139,8 @@ pub use dom::{
 pub use dom_bridge::{
     BridgeDiagnostics, ConsoleLevel, ConsoleMessage, DOM_BRIDGE_METHOD_NAME,
     DOM_BRIDGE_OBJECT_NAME, DocumentReadyState, DomBridge, DomBridgeError, DomBridgeLimits,
-    IgnoredLocationChange, LocationChangeKind, MAX_BRIDGE_DIAGNOSTICS, MAX_CONSOLE_MESSAGE_BYTES,
+    IgnoredLocationChange, InitialNodeOrder, LocationChangeKind, MAX_BRIDGE_DIAGNOSTICS,
+    MAX_CONSOLE_MESSAGE_BYTES,
 };
 pub use error::{DomError, Error, NameKind, ParseError, Result};
 pub use event_loop::{
