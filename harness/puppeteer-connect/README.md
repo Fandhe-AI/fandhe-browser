@@ -47,6 +47,11 @@ Puppeteer 接続試験の実行基盤（TASK-45.1・Issue #480・ビヘイビア
 `make check-puppeteer-connect`（`stages.mjs` の自己テストと契約テスト `puppeteer_contract`）のみ。
 `preflight_puppeteer` は `puppeteer-core` 未導入なら skip せず、理由付きで失敗を返す。
 
+測定条件（#1334）: `stages.mjs` は `puppeteer.connect` に `defaultViewport: null` を渡す
+（既定だと `Emulation.setDeviceMetricsOverride` を送るが、画面の識別面は実装しない。`SEC-2`）。
+実機の測定は `puppeteer-core` の一時導入による手動実行（自己テストは偽 `connect` に `defaultViewport: null` が渡ることを検査する）。
+結果は `docs/design/puppeteer-compat.md` に記す。
+
 ## 導入状況
 
 **承認済み（2026-10-29 オーナー）**: `puppeteer-core` を**測定時の一時導入のみ**で使う（`harness/endpoint-swap/run.sh`。
