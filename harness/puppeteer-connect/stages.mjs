@@ -45,6 +45,9 @@ export async function runStages({ puppeteer, endpoint, stageTimeoutMs = 10000, o
       browser = await puppeteer.connect({
         browserWSEndpoint: endpoint,
         protocolTimeout: stageTimeoutMs,
+        // 既定ビューポートを無効にする。有効だと newPage が Emulation.setDeviceMetricsOverride を送るが、
+        // 画面寸法の識別面を変える実装はしない（SEC-2）。docs/design/puppeteer-compat.md の測定条件。
+        defaultViewport: null,
       });
     },
     async () => {

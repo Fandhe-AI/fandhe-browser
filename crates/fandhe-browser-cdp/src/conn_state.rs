@@ -17,6 +17,8 @@
 //! 上限を持つ。自動 attach で払い出したセッションは本表が接続ごとに所有し、切断で
 //! [`ConnectionScoped::release`] が返す ID を呼び出し側が `detach` して必ず解放する
 //! （解放漏れはセッション枠の枯渇、すなわち DoS になる）。ロック順序は常に「本表 → registry」。
+//! Puppeteer 経路（#1334・`CDP-3`）では、ページの代わりに tab 擬似ターゲットのセッションと、その子のページの
+//! セッションを同じ規則で所有する（切断では子 → tab の順で解放し、消失は 子 → tab の順で通知する）。
 //!
 //! # スタブについて（実装済みを装わない。`REPAIR-3`）
 //!
@@ -34,6 +36,7 @@ use std::sync::{Mutex, PoisonError};
 use crate::protocol::ConnId;
 use crate::target::{
     BrowserContextId, CdpStateError, SessionId, TargetId, TargetInfo, TargetKind, TargetRegistry,
+    is_tab_id,
 };
 
 /// `downloadPath` の最大バイト長（巨大入力による無制限消費の防止）。
@@ -99,8 +102,64 @@ pub(crate) fn validate_download_path(s: &str) -> Option<PathBuf> {
     Some(p.to_path_buf())
 }
 
-/// discover の差分 `(新規 (info, attached), 消滅 ID)`（#1324）。
-type DiscoverDiff = (Vec<(TargetInfo, bool)>, Vec<TargetId>);
+/// `Target.setAutoAttach`（root）が attach する対象の種別（#1334・`CDP-3`）。有効の間だけ意味を持つ。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum AutoAttachKind {
+    /// ページを root から直接 attach する（Playwright 経路。`filter` 省略）。
+    #[default]
+    Pages,
+    /// tab 擬似ターゲットを root から attach し、ページは tab のセッションの子にする
+    /// （Puppeteer 経路。`filter:[{type:"page",exclude:true},{}]`）。
+    Tabs,
+}
+
+/// tab 擬似ターゲットへの attach 1 件と、その子のページのセッション（#1334・`CDP-3`・`CDP-7`）。
+#[derive(Debug, Clone)]
+struct TabAttachment {
+    page: TargetId,
+    /// 払い出し時点の tab ID（ページが消えた後の通知に使う）。
+    tab_id: TargetId,
+    tab_session: SessionId,
+    /// tab のセッションの `Target.setAutoAttach` で attach したページのセッション。
+    child: Option<SessionId>,
+}
+
+/// 消えた（または自分で外した）tab の attach の通知内容（#1334）。通知の順は 子 → tab（`CDP-7`）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TabDetach {
+    /// tab 擬似ターゲットの ID。
+    pub tab_id: TargetId,
+    /// tab のセッション（root の `Target.detachedFromTarget` の `sessionId`。子の通知のエンベロープでもある）。
+    pub tab_session: SessionId,
+    /// 子のページの `(targetId, sessionId)`。あれば tab のセッション上で先に通知する。
+    pub child: Option<(TargetId, SessionId)>,
+}
+
+/// discover の差分（#1324・#1334）。
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct DiscoverDiff {
+    /// 新規に通知すべきページ `(info, attached)`。
+    pub created: Vec<(TargetInfo, bool)>,
+    /// 新規に通知すべき tab `(ページの info, attached)`。discover が tab を含むときだけ。
+    pub created_tabs: Vec<(TargetInfo, bool)>,
+    /// 消滅したターゲット（ページ → tab の順）。
+    pub destroyed: Vec<TargetId>,
+}
+
+/// [`ConnectionScoped::set_tab_child_auto_attach`] の結果（#1334）。
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum TabChildChange {
+    /// 変化なし（既に attach 済み、または既に外れている）。
+    None,
+    /// 子のページを attach した（`Target.attachedToTarget` を tab のセッション上で送る）。
+    Attached {
+        info: TargetInfo,
+        session: SessionId,
+        waiting_for_debugger: bool,
+    },
+    /// 子のページを外した（`Target.detachedFromTarget` を tab のセッション上で送る）。
+    Detached { page: TargetId, session: SessionId },
+}
 
 /// 接続 1 本分の状態。
 #[derive(Default)]
@@ -115,6 +174,14 @@ struct Entry {
     wait_for_debugger_on_start: bool,
     /// registry 側で消えたため所有記録から落としたが、まだ `Target.detachedFromTarget` を送出していないもの。
     pending_detached: Vec<(TargetId, SessionId)>,
+    /// root の自動 attach が有効な間、何を attach するか（#1334）。
+    auto_attach_kind: AutoAttachKind,
+    /// tab を attach している記録（`Tabs` の間。件数は `MAX_TARGETS` 以下）。
+    tab_attached: Vec<TabAttachment>,
+    /// registry 側で消えた tab の attach で、まだ通知していないもの。
+    pending_tab_detached: Vec<TabDetach>,
+    /// `Target.setDiscoverTargets` の通知対象に tab を含めるか（`filter:[{}]`。#1334）。
+    discover_tabs: bool,
     download: Option<DownloadSettings>,
     /// この接続が `Target.createBrowserContext` で作った browser context（切断で破棄する）。
     /// 件数は registry 側の `MAX_BROWSER_CONTEXTS` で抑えられる。
@@ -122,9 +189,9 @@ struct Entry {
     /// `Target.setDiscoverTargets` が有効か（#1324・`CDP-3`）。
     discover_enabled: bool,
     /// この接続へ `Target.targetCreated` を通知済みで、まだ `Target.targetDestroyed` を通知していない
-    /// ターゲット（ID 昇順）。discover 有効の間、enable・reconcile のたびに registry の可視ターゲット
-    /// （既定 context と自接続所有 context のページ。件数は `MAX_TARGETS` 以下）と同期するため、
-    /// 件数は `MAX_TARGETS` に 1 件（`create_target` が直後の reconcile までに足す分）を足した値で抑えられる。
+    /// ターゲット（ID 昇順。ページと、`discover_tabs` のときは tab）。discover 有効の間、enable・reconcile のたびに
+    /// registry の可視ターゲット（既定 context と自接続所有 context のページ。件数は `MAX_TARGETS` 以下）と同期するため、
+    /// 件数は `2 * MAX_TARGETS` に 2 件（`create_target` が直後の reconcile までに足す分）を足した値で抑えられる。
     /// TargetId は単調増加で再利用されないので、「記録 − 現在の可視集合」の差分が消滅の通知対象になる。
     discovered: Vec<TargetId>,
 }
@@ -132,7 +199,7 @@ struct Entry {
 /// [`ConnectionScoped::release`] が返す、切断時に解放すべき資源。
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct Released {
-    /// 自動 attach が払い出したセッション。
+    /// 自動 attach が払い出したセッション（tab 経路では子のページ → tab のセッションの順）。
     pub sessions: Vec<SessionId>,
     /// この接続が所有していた browser context。
     pub contexts: Vec<BrowserContextId>,
@@ -144,7 +211,13 @@ pub(crate) struct CreatedTarget {
     /// 作成したターゲット。
     pub info: TargetInfo,
     /// 呼び出し接続の自動 attach が払い出したセッション（自動 attach 無効なら `None`）。
+    /// `tab` が true のときは tab のセッション（ページのセッションは tab のセッションの
+    /// `Target.setAutoAttach` で子として払い出す。#1334）。
     pub session: Option<SessionId>,
+    /// `session` が tab のセッションか（Puppeteer 経路。#1334）。
+    pub tab: bool,
+    /// 呼び出し接続が discover 有効で tab を含み、`Target.targetCreated`（type:"tab"）を送出すべきか（#1334）。
+    pub announce_tab_created: bool,
     /// `waitForDebuggerOnStart` で止めたか（`Target.attachedToTarget` の `waitingForDebugger`）。
     pub waiting_for_debugger: bool,
     /// 呼び出し接続が discover 有効で、`Target.targetCreated` を送出すべきか（#1324・`CDP-3`）。
@@ -158,6 +231,12 @@ pub(crate) struct ClosedTarget {
     pub sessions: Vec<SessionId>,
     /// 呼び出し接続が discover 有効でこのターゲットを通知済みか（`Target.targetDestroyed` の送出要否。#1324）。
     pub announce_destroyed: bool,
+    /// 自接続が tab として attach していた分の通知内容（子 → tab の順。#1334）。
+    pub tabs: Vec<TabDetach>,
+    /// 呼び出し接続が tab を通知済みか（tab の `Target.targetDestroyed` の送出要否。#1334）。
+    pub announce_tab_destroyed: bool,
+    /// 閉じたページの tab ID（`announce_tab_destroyed` で使う）。
+    pub tab_id: Option<TargetId>,
 }
 
 /// 接続操作の失敗。
@@ -167,6 +246,8 @@ pub(crate) enum ConnStateError {
     NotLive,
     /// セッション枠の枯渇など registry 側の失敗。
     Registry(CdpStateError),
+    /// 有効な自動 attach と別の種別（ページ / tab）で `Target.setAutoAttach` が来た（先に無効化が要る。#1334）。
+    KindConflict,
 }
 
 /// [`ConnectionScoped::reconcile_auto_attach`] の結果。
@@ -176,9 +257,15 @@ pub(crate) struct Reconciled {
     pub attached: Vec<(TargetInfo, SessionId)>,
     /// 消失した `(targetId, sessionId)`（`Target.detachedFromTarget` の送出対象）。
     pub detached: Vec<(TargetId, SessionId)>,
+    /// tab 経路で新たに attach した `(ページの targetInfo, tab のセッション)`（root の `Target.attachedToTarget`。#1334）。
+    pub tab_attached: Vec<(TargetInfo, SessionId)>,
+    /// tab 経路で消失した attach（子 → tab の順で通知。#1334）。
+    pub tab_detached: Vec<TabDetach>,
     /// discover 有効な接続へ新たに通知すべき `(targetInfo, attached)`（`Target.targetCreated`。#1324・`CDP-3`）。
     /// `attached` は通知時点で何らかのセッションが attach 中か（この呼び出しの自動 attach より前の実値）。
     pub created: Vec<(TargetInfo, bool)>,
+    /// discover が tab を含むときの、新たに通知すべき tab `(ページの targetInfo, attached)`（#1334）。
+    pub created_tabs: Vec<(TargetInfo, bool)>,
     /// discover 有効な接続へ通知すべき消滅ターゲット（`Target.targetDestroyed`。#1324）。
     pub destroyed: Vec<TargetId>,
     /// attach の途中失敗（セッション枠の枯渇等）。
@@ -211,9 +298,18 @@ impl ConnectionScoped {
     pub(crate) fn release(&self, conn: ConnId) -> Released {
         self.lock()
             .remove(&conn)
-            .map(|e| Released {
-                sessions: e.auto_attached.into_iter().map(|(_, s)| s).collect(),
-                contexts: e.owned_contexts,
+            .map(|e| {
+                let mut sessions: Vec<SessionId> =
+                    e.auto_attached.into_iter().map(|(_, s)| s).collect();
+                // 子のページ → tab の順（`CDP-7`）。registry の `detach` は両方の表に対応する。
+                for ta in e.tab_attached {
+                    sessions.extend(ta.child);
+                    sessions.push(ta.tab_session);
+                }
+                Released {
+                    sessions,
+                    contexts: e.owned_contexts,
+                }
             })
             .unwrap_or_default()
     }
@@ -258,6 +354,32 @@ impl ConnectionScoped {
                 CdpStateError::UnknownBrowserContext,
             ));
         }
+        if entry.auto_attach_enabled && entry.auto_attach_kind == AutoAttachKind::Tabs {
+            // Puppeteer 経路: ページは tab へ attach する。ページのセッションは作らない（#1334）。
+            let pause = entry.wait_for_debugger_on_start;
+            let (tid, sid) = registry
+                .create_target_tab_attached(context, TargetKind::Page, url, pause)
+                .map_err(ConnStateError::Registry)?;
+            let info = registry
+                .target(&tid)
+                .ok_or(ConnStateError::Registry(CdpStateError::UnknownTarget))?;
+            entry.tab_attached.push(TabAttachment {
+                page: tid,
+                tab_id: info.tab_id().clone(),
+                tab_session: sid.clone(),
+                child: None,
+            });
+            let announce_created = Self::record_discovered(entry, &info);
+            let announce_tab_created = Self::record_discovered_tab(entry, &info);
+            return Ok(CreatedTarget {
+                info,
+                session: Some(sid),
+                tab: true,
+                announce_tab_created,
+                waiting_for_debugger: pause,
+                announce_created,
+            });
+        }
         if entry.auto_attach_enabled {
             let pause = entry.wait_for_debugger_on_start;
             let (tid, sid) = registry
@@ -268,9 +390,13 @@ impl ConnectionScoped {
                 .ok_or(ConnStateError::Registry(CdpStateError::UnknownTarget))?;
             entry.auto_attached.push((tid, sid.clone()));
             let announce_created = Self::record_discovered(entry, &info);
+            // discover が tab を含むなら tab の作成通知も先に送る（通知順序は tab → ページ → attach。`CDP-3`）。
+            let announce_tab_created = Self::record_discovered_tab(entry, &info);
             Ok(CreatedTarget {
                 info,
                 session: Some(sid),
+                tab: false,
+                announce_tab_created,
                 waiting_for_debugger: pause,
                 announce_created,
             })
@@ -284,9 +410,12 @@ impl ConnectionScoped {
                 .target(&tid)
                 .ok_or(ConnStateError::Registry(CdpStateError::UnknownTarget))?;
             let announce_created = Self::record_discovered(entry, &info);
+            let announce_tab_created = Self::record_discovered_tab(entry, &info);
             Ok(CreatedTarget {
                 info,
                 session: None,
+                tab: false,
+                announce_tab_created,
                 waiting_for_debugger: false,
                 announce_created,
             })
@@ -305,13 +434,112 @@ impl ConnectionScoped {
     ) -> Result<Vec<(TargetInfo, SessionId)>, ConnStateError> {
         let mut map = self.lock();
         let entry = map.get_mut(&conn).ok_or(ConnStateError::NotLive)?;
+        if entry.auto_attach_enabled && entry.auto_attach_kind != AutoAttachKind::Pages {
+            return Err(ConnStateError::KindConflict);
+        }
         let (added, err) = Self::attach_missing(entry, registry, true, true);
         if let Some(e) = err {
             return Err(e);
         }
         entry.auto_attach_enabled = true;
+        entry.auto_attach_kind = AutoAttachKind::Pages;
         entry.wait_for_debugger_on_start = wait_for_debugger_on_start;
         Ok(added)
+    }
+
+    /// root の `Target.setAutoAttach` を tab 経路で有効にし、未 attach の可視ページの tab へ attach して
+    /// `(ページの targetInfo, tab のセッション)` を昇順で返す（Puppeteer 経路。#1334・`CDP-3`・`CDP-7`）。
+    /// 途中で失敗したらこの呼び出しの attach を巻き戻して `Err`（有効化もしない）。ページ経路が有効な間は
+    /// `KindConflict`（状態は変えない）。対象は既定 context と自接続所有 context のページだけ。
+    pub(crate) fn enable_tab_auto_attach(
+        &self,
+        conn: ConnId,
+        registry: &TargetRegistry,
+        wait_for_debugger_on_start: bool,
+    ) -> Result<Vec<(TargetInfo, SessionId)>, ConnStateError> {
+        let mut map = self.lock();
+        let entry = map.get_mut(&conn).ok_or(ConnStateError::NotLive)?;
+        if entry.auto_attach_enabled && entry.auto_attach_kind != AutoAttachKind::Tabs {
+            return Err(ConnStateError::KindConflict);
+        }
+        let (added, err) = Self::attach_missing_tabs(entry, registry, true, true);
+        if let Some(e) = err {
+            return Err(e);
+        }
+        entry.auto_attach_enabled = true;
+        entry.auto_attach_kind = AutoAttachKind::Tabs;
+        entry.wait_for_debugger_on_start = wait_for_debugger_on_start;
+        Ok(added)
+    }
+
+    /// 接続の自動 attach の種別（有効でなければ `None`）。
+    pub(crate) fn auto_attach_kind(&self, conn: ConnId) -> Option<AutoAttachKind> {
+        self.lock()
+            .get(&conn)
+            .filter(|e| e.auto_attach_enabled)
+            .map(|e| e.auto_attach_kind)
+    }
+
+    /// この接続が払い出した tab のセッションか（tab のセッション宛ての `Target.setAutoAttach`・
+    /// `Runtime.runIfWaitingForDebugger` の所有確認。他接続の ID を使わせない。#1334・`CDP-7`）。
+    pub(crate) fn owns_tab_session(&self, conn: ConnId, sid: &SessionId) -> bool {
+        self.lock()
+            .get(&conn)
+            .is_some_and(|e| e.tab_attached.iter().any(|t| t.tab_session == *sid))
+    }
+
+    /// tab のセッション宛ての `Target.setAutoAttach` の本体（#1334・`CDP-3`・`CDP-7`）。
+    /// `auto_attach` が true なら子のページを 1 つ attach し（既に attach 済みなら変化なし）、false なら外す。
+    /// `wait_for_debugger_on_start` は、tab が止めていたページの停止を子へ移すかの指示。
+    /// この接続の tab のセッションでなければ `Registry(UnknownSession)`。ロック順序は本表 → registry。
+    pub(crate) fn set_tab_child_auto_attach(
+        &self,
+        conn: ConnId,
+        registry: &TargetRegistry,
+        tab_session: &SessionId,
+        auto_attach: bool,
+        wait_for_debugger_on_start: bool,
+    ) -> Result<TabChildChange, ConnStateError> {
+        let mut map = self.lock();
+        let entry = map.get_mut(&conn).ok_or(ConnStateError::NotLive)?;
+        let unknown = ConnStateError::Registry(CdpStateError::UnknownSession);
+        let ta = entry
+            .tab_attached
+            .iter_mut()
+            .find(|t| t.tab_session == *tab_session)
+            .ok_or(unknown)?;
+        if !registry.is_tab_session(tab_session) {
+            return Err(ConnStateError::Registry(CdpStateError::UnknownSession));
+        }
+        if auto_attach {
+            if ta.child.is_some() {
+                return Ok(TabChildChange::None);
+            }
+            let (page, session, waiting) = registry
+                .attach_child_page(tab_session, wait_for_debugger_on_start)
+                .map_err(ConnStateError::Registry)?;
+            let Some(info) = registry.target(&page) else {
+                let _ = registry.detach(&session);
+                return Err(ConnStateError::Registry(CdpStateError::UnknownTarget));
+            };
+            ta.child = Some(session.clone());
+            Ok(TabChildChange::Attached {
+                info,
+                session,
+                waiting_for_debugger: waiting,
+            })
+        } else {
+            match ta.child.take() {
+                Some(session) => {
+                    let _ = registry.detach(&session);
+                    Ok(TabChildChange::Detached {
+                        page: ta.page.clone(),
+                        session,
+                    })
+                }
+                None => Ok(TabChildChange::None),
+            }
+        }
     }
 
     /// 自動 attach が有効な接続について、有効化後に registry へ現れたターゲットへ attach し、
@@ -333,38 +561,51 @@ impl ConnectionScoped {
             return Reconciled::default();
         };
         // discover の差分は attach より前に計算する（`attached` を自動 attach 前の実値にするため。#1324）。
-        let (created, destroyed) = Self::discover_diff(entry, registry);
+        let diff = Self::discover_diff(entry, registry);
+        let mut rec = Reconciled {
+            created: diff.created,
+            created_tabs: diff.created_tabs,
+            destroyed: diff.destroyed,
+            ..Reconciled::default()
+        };
         if entry.auto_attach_enabled {
-            let (attached, error) = Self::attach_missing(entry, registry, false, attach_new);
-            Reconciled {
-                attached,
-                detached: std::mem::take(&mut entry.pending_detached),
-                created,
-                destroyed,
-                error,
-            }
-        } else {
-            Reconciled {
-                detached: std::mem::take(&mut entry.pending_detached),
-                created,
-                destroyed,
-                ..Reconciled::default()
+            match entry.auto_attach_kind {
+                AutoAttachKind::Pages => {
+                    let (attached, error) =
+                        Self::attach_missing(entry, registry, false, attach_new);
+                    rec.attached = attached;
+                    rec.error = error;
+                }
+                AutoAttachKind::Tabs => {
+                    let (attached, error) =
+                        Self::attach_missing_tabs(entry, registry, false, attach_new);
+                    rec.tab_attached = attached;
+                    rec.error = error;
+                }
             }
         }
+        rec.detached = std::mem::take(&mut entry.pending_detached);
+        rec.tab_detached = std::mem::take(&mut entry.pending_tab_detached);
+        rec
     }
 
     /// `Target.setDiscoverTargets {discover:true}` の本体（#1324・`CDP-3`）。discover を有効にし、
     /// まだ通知していない可視ターゲット（既定 context と自接続所有 context のページ）を ID 昇順で
     /// `(targetInfo, attached)` として返す。記録済みで既に消えたターゲットは第 2 要素で返す。冪等（2 回目以降は新規分のみ）。
     /// 他接続の context のターゲットは通知対象にしない（`Target.getBrowserContexts` と同じ接続間分離。`CDP-7`）。
+    ///
+    /// `include_tabs` が true（`filter:[{}]`）なら tab 擬似ターゲットも通知対象にする（#1334）。false に変えた場合、
+    /// 通知済みの tab の記録は `targetDestroyed` を出さずに捨てる（フィルタ変更であって消滅ではない）。
     pub(crate) fn enable_discover(
         &self,
         conn: ConnId,
         registry: &TargetRegistry,
+        include_tabs: bool,
     ) -> Result<DiscoverDiff, ConnStateError> {
         let mut map = self.lock();
         let entry = map.get_mut(&conn).ok_or(ConnStateError::NotLive)?;
         entry.discover_enabled = true;
+        entry.discover_tabs = include_tabs;
         // 消滅分も返す（再送時に捨てると、記録が可視集合へ同期されて `targetDestroyed` が永久に欠落する）。
         Ok(Self::discover_diff(entry, registry))
     }
@@ -375,6 +616,7 @@ impl ConnectionScoped {
         let mut map = self.lock();
         let entry = map.get_mut(&conn).ok_or(ConnStateError::NotLive)?;
         entry.discover_enabled = false;
+        entry.discover_tabs = false;
         entry.discovered.clear();
         Ok(())
     }
@@ -387,31 +629,66 @@ impl ConnectionScoped {
 
     /// discover 有効なら、記録と registry の可視ターゲットの差分を返して記録を同期する。
     /// 戻りは `(新規 (info, attached), 消滅 ID)`。無効なら空（記録も持たない）。
-    fn discover_diff(
-        entry: &mut Entry,
-        registry: &TargetRegistry,
-    ) -> (Vec<(TargetInfo, bool)>, Vec<TargetId>) {
+    fn discover_diff(entry: &mut Entry, registry: &TargetRegistry) -> DiscoverDiff {
         if !entry.discover_enabled {
-            return (Vec::new(), Vec::new());
+            return DiscoverDiff::default();
+        }
+        if !entry.discover_tabs {
+            // フィルタが tab を含まない: 通知済みの tab の記録は `targetDestroyed` を出さずに捨てる。
+            entry.discovered.retain(|t| !is_tab_id(t));
         }
         let visible: Vec<(TargetInfo, bool)> = registry
             .targets_with_attached()
             .into_iter()
             .filter(|(i, _)| Self::is_visible(entry, registry, i))
             .collect();
+        let visible_tabs: Vec<(TargetInfo, bool)> = if entry.discover_tabs {
+            registry
+                .tabs_with_attached()
+                .into_iter()
+                .filter(|(i, _)| Self::is_visible(entry, registry, i))
+                .collect()
+        } else {
+            Vec::new()
+        };
         let created: Vec<(TargetInfo, bool)> = visible
             .iter()
             .filter(|(i, _)| !entry.discovered.contains(i.target_id()))
             .cloned()
             .collect();
+        let created_tabs: Vec<(TargetInfo, bool)> = visible_tabs
+            .iter()
+            .filter(|(i, _)| !entry.discovered.contains(i.tab_id()))
+            .cloned()
+            .collect();
+        let mut now: Vec<TargetId> = visible.iter().map(|(i, _)| i.target_id().clone()).collect();
+        now.extend(visible_tabs.iter().map(|(i, _)| i.tab_id().clone()));
+        now.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+        // 記録は ID 昇順（ページ → tab）なので、消滅もページ → tab の順になる。
         let destroyed: Vec<TargetId> = entry
             .discovered
             .iter()
-            .filter(|t| !visible.iter().any(|(i, _)| i.target_id() == *t))
+            .filter(|t| !now.contains(t))
             .cloned()
             .collect();
-        entry.discovered = visible.iter().map(|(i, _)| i.target_id().clone()).collect();
-        (created, destroyed)
+        entry.discovered = now;
+        DiscoverDiff {
+            created,
+            created_tabs,
+            destroyed,
+        }
+    }
+
+    /// `create_target` が作った tab を通知済みとして記録する。discover が無効か tab を含まなければ記録せず `false`。
+    fn record_discovered_tab(entry: &mut Entry, info: &TargetInfo) -> bool {
+        if !entry.discover_enabled || !entry.discover_tabs {
+            return false;
+        }
+        if !entry.discovered.contains(info.tab_id()) {
+            entry.discovered.push(info.tab_id().clone());
+            entry.discovered.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+        }
+        true
     }
 
     /// `create_target` が作ったターゲットを通知済みとして記録する。discover 無効なら記録せず `false`。
@@ -481,6 +758,97 @@ impl ConnectionScoped {
         (added, error)
     }
 
+    /// [`Self::attach_missing`] の tab 版（#1334）。registry 側で消えた tab の attach は
+    /// `pending_tab_detached` に積み（通知は呼び出し側。`CDP-7`）、未 attach の可視ページの tab へ attach する。
+    fn attach_missing_tabs(
+        entry: &mut Entry,
+        registry: &TargetRegistry,
+        atomic: bool,
+        attach_new: bool,
+    ) -> (Vec<(TargetInfo, SessionId)>, Option<ConnStateError>) {
+        let owned = std::mem::take(&mut entry.tab_attached);
+        for ta in owned {
+            if registry.is_tab_session(&ta.tab_session) {
+                entry.tab_attached.push(ta);
+            } else {
+                entry.pending_tab_detached.push(TabDetach {
+                    tab_id: ta.tab_id,
+                    tab_session: ta.tab_session,
+                    child: ta.child.map(|c| (ta.page, c)),
+                });
+            }
+        }
+        let mut added: Vec<(TargetInfo, SessionId)> = Vec::new();
+        let mut error = None;
+        let candidates = if attach_new {
+            registry.targets()
+        } else {
+            Vec::new()
+        };
+        for info in candidates {
+            if !Self::is_visible(entry, registry, &info)
+                || entry
+                    .tab_attached
+                    .iter()
+                    .any(|t| t.page == *info.target_id())
+            {
+                continue;
+            }
+            match registry.attach_tab(info.target_id()) {
+                Ok(sid) => added.push((info, sid)),
+                Err(e) => {
+                    error = Some(ConnStateError::Registry(e));
+                    break;
+                }
+            }
+        }
+        if error.is_some() && atomic {
+            for (_, sid) in &added {
+                let _ = registry.detach(sid);
+            }
+            return (Vec::new(), error);
+        }
+        for (info, sid) in &added {
+            entry.tab_attached.push(TabAttachment {
+                page: info.target_id().clone(),
+                tab_id: info.tab_id().clone(),
+                tab_session: sid.clone(),
+                child: None,
+            });
+        }
+        (added, error)
+    }
+
+    /// tab 経路の自動 attach を外し、通知すべき attach（子 → tab の順）を返す（#1334・`CDP-7`）。
+    /// registry 側で既に消えていた分も通知対象に含める。種別が `Tabs` でなければ何も外さない。
+    pub(crate) fn disable_tab_auto_attach(
+        &self,
+        conn: ConnId,
+        registry: &TargetRegistry,
+    ) -> Result<Vec<TabDetach>, ConnStateError> {
+        let mut map = self.lock();
+        let entry = map.get_mut(&conn).ok_or(ConnStateError::NotLive)?;
+        if entry.auto_attach_kind != AutoAttachKind::Tabs {
+            return Ok(Vec::new());
+        }
+        entry.auto_attach_enabled = false;
+        entry.auto_attach_kind = AutoAttachKind::Pages;
+        entry.wait_for_debugger_on_start = false;
+        let mut out = std::mem::take(&mut entry.pending_tab_detached);
+        for ta in std::mem::take(&mut entry.tab_attached) {
+            if let Some(c) = &ta.child {
+                let _ = registry.detach(c);
+            }
+            let _ = registry.detach(&ta.tab_session);
+            out.push(TabDetach {
+                tab_id: ta.tab_id,
+                tab_session: ta.tab_session,
+                child: ta.child.map(|c| (ta.page, c)),
+            });
+        }
+        Ok(out)
+    }
+
     /// この接続が自動 attach したセッションを detach し、通知すべき `(targetId, sessionId)` を返す。
     /// registry 側で既に消えていて `detach` が失敗したセッションも通知対象に含める（`CDP-7`）。
     pub(crate) fn disable_auto_attach(
@@ -490,6 +858,10 @@ impl ConnectionScoped {
     ) -> Result<Vec<(TargetId, SessionId)>, ConnStateError> {
         let mut map = self.lock();
         let entry = map.get_mut(&conn).ok_or(ConnStateError::NotLive)?;
+        if entry.auto_attach_kind == AutoAttachKind::Tabs {
+            // tab 経路は `disable_tab_auto_attach` が外す（種別を取り違えて黙って何もしないのを防ぐ）。
+            return Ok(Vec::new());
+        }
         entry.auto_attach_enabled = false;
         entry.wait_for_debugger_on_start = false;
         let mut out = std::mem::take(&mut entry.pending_detached);
@@ -539,9 +911,24 @@ impl ConnectionScoped {
     ) -> Result<ClosedTarget, ConnStateError> {
         let mut map = self.lock();
         let entry = map.get_mut(&conn).ok_or(ConnStateError::NotLive)?;
+        let tab_id = registry.target(tid).map(|i| i.tab_id().clone());
         registry
             .close_target_in_contexts(tid, &entry.owned_contexts)
             .map_err(ConnStateError::Registry)?;
+        // 自接続が tab として attach していた分は、子 → tab の順で通知させる（#1334）。
+        let mut tabs: Vec<TabDetach> = Vec::new();
+        entry.tab_attached.retain(|ta| {
+            if ta.page == *tid {
+                tabs.push(TabDetach {
+                    tab_id: ta.tab_id.clone(),
+                    tab_session: ta.tab_session.clone(),
+                    child: ta.child.clone().map(|c| (ta.page.clone(), c)),
+                });
+                false
+            } else {
+                true
+            }
+        });
         let mut own: Vec<SessionId> = Vec::new();
         entry.auto_attached.retain(|(t, s)| {
             if t == tid {
@@ -555,9 +942,17 @@ impl ConnectionScoped {
         // 通知済みなら記録から外し、続く reconcile で `targetDestroyed` を二重に送らない（#1324）。
         let before = entry.discovered.len();
         entry.discovered.retain(|t| t != tid);
+        let announce_destroyed = entry.discovered.len() != before;
+        let before_tab = entry.discovered.len();
+        if let Some(t) = &tab_id {
+            entry.discovered.retain(|d| d != t);
+        }
         Ok(ClosedTarget {
             sessions: own,
-            announce_destroyed: entry.discovered.len() != before,
+            announce_destroyed,
+            tabs,
+            announce_tab_destroyed: entry.discovered.len() != before_tab,
+            tab_id,
         })
     }
 
@@ -892,5 +1287,80 @@ mod tests {
         let d = format!("{s:?}");
         assert!(!d.contains("secret"));
         assert!(d.contains("download_path_len: Some(11)"));
+    }
+    // ---- tab 経路（#1334・`CDP-3`・`CDP-7`） ----
+
+    #[test]
+    fn cdp7_enable_tab_auto_attach_rolls_back_on_session_limit_and_rejects_kind_switch() {
+        let r = TargetRegistry::new();
+        let t1 = page(&r);
+        let _t2 = page(&r);
+        let cs = ConnectionScoped::new();
+        let c = ConnId::new(1);
+        cs.open(c);
+        // 残り枠を 1 に絞ると、2 ページ分の tab attach は巻き戻って何も残らない。
+        while r.session_count() < MAX_SESSIONS - 1 {
+            r.attach(&t1).unwrap();
+        }
+        let before = r.session_count();
+        assert_eq!(
+            cs.enable_tab_auto_attach(c, &r, false),
+            Err(ConnStateError::Registry(CdpStateError::TooManySessions {
+                limit: MAX_SESSIONS
+            }))
+        );
+        assert_eq!(r.session_count(), before);
+        assert_eq!(cs.auto_attach_kind(c), None);
+    }
+
+    #[test]
+    fn cdp3_page_auto_attach_create_announces_discovered_tab_first() {
+        let r = TargetRegistry::new();
+        let cs = ConnectionScoped::new();
+        let c = ConnId::new(1);
+        cs.open(c);
+        cs.enable_discover(c, &r, true).unwrap();
+        cs.enable_auto_attach(c, &r, false).unwrap();
+        let created = cs.create_target(c, &r, None, "about:blank").unwrap();
+        assert!(!created.tab);
+        assert!(created.announce_tab_created);
+        assert!(created.announce_created);
+    }
+
+    #[test]
+    fn cdp7_tab_and_page_kinds_conflict_and_release_frees_child_then_tab() {
+        let r = TargetRegistry::new();
+        let t = page(&r);
+        let cs = ConnectionScoped::new();
+        let c = ConnId::new(1);
+        cs.open(c);
+        let added = cs.enable_tab_auto_attach(c, &r, true).unwrap();
+        let tab = added[0].1.clone();
+        assert_eq!(cs.auto_attach_kind(c), Some(AutoAttachKind::Tabs));
+        assert!(cs.owns_tab_session(c, &tab));
+        assert!(!cs.owns_tab_session(ConnId::new(2), &tab));
+        assert_eq!(
+            cs.enable_auto_attach(c, &r, false),
+            Err(ConnStateError::KindConflict)
+        );
+        let TabChildChange::Attached { session: child, .. } = cs
+            .set_tab_child_auto_attach(c, &r, &tab, true, false)
+            .unwrap()
+        else {
+            panic!("child must attach");
+        };
+        // 2 回目は変化なし。
+        assert_eq!(
+            cs.set_tab_child_auto_attach(c, &r, &tab, true, false),
+            Ok(TabChildChange::None)
+        );
+        assert_eq!(r.session_count(), 2);
+        let released = cs.release(c);
+        assert_eq!(released.sessions, vec![child, tab]);
+        for s in &released.sessions {
+            r.detach(s).unwrap();
+        }
+        assert_eq!(r.session_count(), 0);
+        assert!(r.target(&t).is_some());
     }
 }

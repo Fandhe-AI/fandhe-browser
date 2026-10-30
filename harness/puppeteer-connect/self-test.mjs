@@ -30,7 +30,15 @@ function fake({ failAt, nullBody, hangAt, lateRejectAt, hangDisconnect, failDisc
       if (failDisconnect) throw new Error("disconnect boom");
     },
   };
-  return { calls, puppeteer: { connect: () => maybe("connect", browser) } };
+  return {
+    calls,
+    puppeteer: {
+      connect: (opts) => {
+        calls.connectOpts = opts;
+        return maybe("connect", browser);
+      },
+    },
+  };
 }
 
 const statuses = (r) => r.stages.map((s) => `${s.name}:${s.status}`);
@@ -44,6 +52,9 @@ const run = (f, ms = 200) =>
   assert.equal(r.step, "disconnect");
   assert.deepEqual(statuses(r), ["connect:ok", "newPage:ok", "goto:ok", "selector:ok", "disconnect:ok"]);
   assert.equal(f.calls.disconnect, 1);
+  // 測定条件: defaultViewport は null で渡す（Emulation.setDeviceMetricsOverride を送らせない。SEC-2）。
+  assert.equal(f.calls.connectOpts.defaultViewport, null);
+  assert.equal(f.calls.connectOpts.browserWSEndpoint, "ws://127.0.0.1:1/x");
 }
 for (const [at, expected] of [
   ["connect", ["connect:failed", "newPage:not_reached", "goto:not_reached", "selector:not_reached", "disconnect:not_reached"]],

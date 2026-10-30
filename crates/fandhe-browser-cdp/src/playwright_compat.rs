@@ -21,11 +21,14 @@
 //! `Page.getFrameTree`（メインフレームのみ）を足す。
 //! 43.3j（#1038）で `Log.enable`・`Runtime.enable`・`Network.enable`（セッション単位の有効フラグのみ。
 //! イベントは送らない。`REPAIR-3`）を足す。
+//! #1326 で `Performance.enable`・`Audits.enable`（セッション単位の有効フラグのみ。イベント・計測なし。`REPAIR-3`）を足す。
 //! 43.3k（#1039）で `Page.setLifecycleEventsEnabled`（セッション単位の有効フラグ。`Page.enable` 済みの
 //! セッションの `Page.navigate` が `Page.lifecycleEvent` の `init`・`load` を送る。#1322 で `DOMContentLoaded` も送る）を足す。
 //! 43.3l（#1040）で `Page.addScriptToEvaluateOnNewDocument`（空 `source` と、#1325 で `//# sourceURL=<URL>` の 1 行だけの `source` を受理。それ以外の非空は拒否）と
 //! セッション付き `Target.setAutoAttach`（状態の保持のみ・子 attach は 0 件）を足す。接続スコープの状態と寿命は [`crate::conn_state`]。方針は `docs/design/playwright-compat.md`。
 //! #1324 で `Target.setDiscoverTargets`（`filter` は省略か `[{}]` のみ）と `Target.targetCreated`・`Target.targetDestroyed` の送出を足す。
+//! #1334 で tab 擬似ターゲット（`type:"tab"`）を足し、root の `Target.setAutoAttach` の `filter:[{"type":"page","exclude":true},{}]` と
+//! `Target.setDiscoverTargets` の `filter:[{}]`（tab も通知）に対応する。受理しない `filter` の形は `-32602` のまま（`CDP-6`）。
 //! 43.3m（#1041）で `Emulation.setFocusEmulationEnabled`・`Emulation.setEmulatedMedia` を足す。Playwright 既定値（`enabled:true`、
 //! `media:""` と既定 4 feature）だけを受理して検証済みの値をセッション状態に保持し、どの API からも読まない（観測できる
 //! 効果は無い。`REPAIR-3`）。`setDeviceMetricsOverride`・`setUserAgentOverride`・`setLocaleOverride`・`setTimezoneOverride` は
@@ -34,7 +37,8 @@
 use serde_json::{Value, json};
 
 use crate::conn_state::{
-    ConnStateError, DownloadBehavior, DownloadSettings, validate_download_path,
+    AutoAttachKind, ConnStateError, DownloadBehavior, DownloadSettings, TabChildChange, TabDetach,
+    validate_download_path,
 };
 use crate::discovery::{PRODUCT, PROTOCOL_VERSION};
 use crate::page::MAIN_FRAME_MIME_TYPE;
@@ -85,12 +89,17 @@ impl CommandHandler for TargetGetTargetInfo {
                 Some(v) => {
                     let s = v.as_str().ok_or(CdpError::INVALID_PARAMS)?;
                     let id = TargetId::parse(s).map_err(|_| CdpError::INVALID_PARAMS)?;
-                    let (t, attached) = ctx
-                        .state
-                        .registry()
-                        .target_with_attached(&id)
-                        .ok_or(CdpError::INVALID_PARAMS)?;
-                    page_target_info(&t, attached)
+                    let registry = ctx.state.registry();
+                    match registry.target_with_attached(&id) {
+                        Some((t, attached)) => page_target_info(&t, attached),
+                        // tab 擬似ターゲットの実値（読み取りのみ。#1334・`CDP-3`）。
+                        None => {
+                            let (t, attached) = registry
+                                .tab_with_attached(&id)
+                                .ok_or(CdpError::INVALID_PARAMS)?;
+                            tab_target_info(&t, attached)
+                        }
+                    }
                 }
             };
             Ok(HandlerOutput::result(json!({ "targetInfo": info })))
@@ -115,8 +124,15 @@ impl CommandHandler for TargetGetTargetInfo {
 /// 状態はセッションの切断・ターゲットの close・context の破棄で消える。
 ///
 /// スコープ外の入力は成功を装わず `-32602` で拒否する: `autoAttach:true` で `flatten` が `true` 以外
-/// （`sendMessageToTarget` 方式は未実装）、`filter`（Puppeteer の除外フィルタを黙って無視すると
-/// 除外すべきターゲットまで attach するため）。
+/// （`sendMessageToTarget` 方式は未実装）、受理表（[`parse_target_filter`]）にない `filter`
+/// （黙って無視すると除外すべきターゲットまで attach するため。`CDP-6`）。
+///
+/// tab 擬似ターゲット（#1334・`CDP-3`）: root は `filter` 省略でページを直接 attach し（Playwright 経路）、
+/// `[{"type":"page","exclude":true},{}]`（Puppeteer 経路）ではページを除いて tab（`type:"tab"`）を attach する。
+/// 後者は `waitForDebuggerOnStart:true` のとき `Target.createTarget` で作ったページを tab が止め、tab のセッションの
+/// `Target.setAutoAttach`（`[{}]`・`flatten:true`）が子のページを attach して停止を子へ移す。子の
+/// `Target.attachedToTarget` のエンベロープ `sessionId` は tab のセッション。有効中に別種別の指定が来たら
+/// `UNSUPPORTED_PARAMS`（先に `autoAttach:false`）。受理表と差異は `docs/design/puppeteer-compat.md`。
 ///
 /// `waitForDebuggerOnStart:true` は受理して接続状態に保持する（TASK-43.3g・#942）。CDP の定義
 /// （Target.pdl）で止める対象は「以後に attach される新しいターゲット」で、Chromium も既存ターゲットを
@@ -139,9 +155,7 @@ impl CommandHandler for TargetSetAutoAttach {
                 .get("autoAttach")
                 .and_then(Value::as_bool)
                 .ok_or(CdpError::INVALID_PARAMS)?;
-            if params.get("filter").is_some() {
-                return Err(CdpError::UNSUPPORTED_PARAMS);
-            }
+            let form = parse_target_filter(params.get("filter"))?;
             let wait_for_debugger = match params.get("waitForDebuggerOnStart") {
                 None => false,
                 Some(Value::Bool(b)) => *b,
@@ -153,10 +167,18 @@ impl CommandHandler for TargetSetAutoAttach {
                 Some(_) => return Err(CdpError::INVALID_PARAMS),
             };
             if let Some(sid) = ctx.session_id {
-                // セッション付き（子ターゲットの自動 attach）: 状態を保持するだけで子は作らない。
+                // ページ側・tab 側のどちらのセッションでも `[{type:"page",exclude:true},{}]` は受理しない
+                // （子に tab 型は無く、page を除くと子が 0 件になる形は未実装。`CDP-6`・`REPAIR-3`）。
+                if form == TargetFilterForm::ExcludePageThenAll {
+                    return Err(CdpError::UNSUPPORTED_PARAMS);
+                }
                 if auto_attach && !flatten {
                     return Err(CdpError::UNSUPPORTED_PARAMS);
                 }
+                if ctx.state.registry().is_tab_session(sid) {
+                    return tab_child_auto_attach(&ctx, sid, auto_attach, wait_for_debugger);
+                }
+                // セッション付き（子ターゲットの自動 attach）: 状態を保持するだけで子は作らない。
                 let state = auto_attach.then_some(wait_for_debugger);
                 ctx.state
                     .registry()
@@ -164,14 +186,32 @@ impl CommandHandler for TargetSetAutoAttach {
                     .map_err(|_| CdpError::INVALID_PARAMS)?;
                 return Ok(HandlerOutput::result(json!({})));
             }
+            // root で受理するのは「filter 省略（ページを直接 attach）」と
+            // `[{type:"page",exclude:true},{}]`（tab を attach。Puppeteer 経路）だけ。`[{}]`（ページと tab の
+            // 同時 attach）は未実装（`CDP-6`・`REPAIR-3`）。
+            if form == TargetFilterForm::All {
+                return Err(CdpError::UNSUPPORTED_PARAMS);
+            }
             let conn = ctx.conn.ok_or(CdpError::NO_CONNECTION)?;
             let state = ctx.state;
             if !auto_attach {
+                let mut out = HandlerOutput::result(json!({}));
+                if state.conn_scoped().auto_attach_kind(conn) == Some(AutoAttachKind::Tabs) {
+                    let tabs = state
+                        .conn_scoped()
+                        .disable_tab_auto_attach(conn, state.registry())
+                        .map_err(conn_error)?;
+                    for td in &tabs {
+                        for ev in tab_detach_events(td) {
+                            out = out.with_event(ev);
+                        }
+                    }
+                    return Ok(out);
+                }
                 let detached = state
                     .conn_scoped()
                     .disable_auto_attach(conn, state.registry())
                     .map_err(conn_error)?;
-                let mut out = HandlerOutput::result(json!({}));
                 for (target_id, session_id) in &detached {
                     out = out.with_event(detached_event(target_id, session_id));
                 }
@@ -179,6 +219,19 @@ impl CommandHandler for TargetSetAutoAttach {
             }
             if !flatten {
                 return Err(CdpError::UNSUPPORTED_PARAMS);
+            }
+            if form == TargetFilterForm::ExcludePageThenAll {
+                // tab を root で attach する。ページは attach せず、tab のセッションの
+                // `Target.setAutoAttach` が子として attach する（#1334・`CDP-3`）。
+                let attached = state
+                    .conn_scoped()
+                    .enable_tab_auto_attach(conn, state.registry(), wait_for_debugger)
+                    .map_err(conn_error)?;
+                let mut out = HandlerOutput::result(json!({}));
+                for (info, session_id) in &attached {
+                    out = out.with_event(tab_attached_event(info, session_id, false));
+                }
+                return Ok(out);
             }
             // `waitForDebuggerOnStart` は以後に作られる新しいターゲットだけを止める指示で、
             // 既存ターゲットは止めない（このため下の既存ターゲット通知は `waitingForDebugger:false`）。
@@ -250,6 +303,156 @@ pub(crate) fn target_destroyed_event(target_id: &TargetId) -> CdpEvent {
     }
 }
 
+/// `Target.setAutoAttach` / `Target.setDiscoverTargets` の `filter` の受理する形（#1334・`CDP-6`・`REPAIR-3`）。
+///
+/// 一般の TargetFilter（先頭一致で include / exclude を評価する）は未実装で、実際のクライアントが送る形だけを
+/// 完全一致で受理する。それ以外は黙って無視せず `UNSUPPORTED_PARAMS`（無視すると除外すべきターゲットまで
+/// attach・通知するため）。一般形へ広げるときも呼び出し側が match で扱えるよう、真偽値でなく enum で返す
+/// （`REPAIR-4`）。受理表は `docs/design/puppeteer-compat.md`「tab 擬似ターゲットと filter」。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TargetFilterForm {
+    /// 省略。CDP 既定の `[{type:browser,exclude:true},{type:tab,exclude:true},{}]` に相当（page を含み tab を除く）。
+    Default,
+    /// `[{}]` ちょうど（全種別。tab を含む）。
+    All,
+    /// `[{"type":"page","exclude":true},{}]` ちょうど（page を除き tab を含む。Puppeteer の root の自動 attach）。
+    ExcludePageThenAll,
+}
+
+/// `filter` を受理表と照合する。照合は固定長の比較だけで、入力の大きさで処理量は増えない。
+pub(crate) fn parse_target_filter(v: Option<&Value>) -> Result<TargetFilterForm, CdpError> {
+    let Some(v) = v else {
+        return Ok(TargetFilterForm::Default);
+    };
+    let is_empty_obj = |e: &Value| e.as_object().is_some_and(|o| o.is_empty());
+    match v.as_array().map(Vec::as_slice) {
+        Some([e]) if is_empty_obj(e) => Ok(TargetFilterForm::All),
+        Some([first, last]) if is_empty_obj(last) => {
+            let exclude_page = first.as_object().is_some_and(|o| {
+                o.len() == 2
+                    && o.get("type").and_then(Value::as_str) == Some("page")
+                    && o.get("exclude").and_then(Value::as_bool) == Some(true)
+            });
+            if exclude_page {
+                Ok(TargetFilterForm::ExcludePageThenAll)
+            } else {
+                Err(CdpError::UNSUPPORTED_PARAMS)
+            }
+        }
+        _ => Err(CdpError::UNSUPPORTED_PARAMS),
+    }
+}
+
+/// tab のセッション宛ての `Target.setAutoAttach`（#1334・`CDP-3`・`CDP-7`）。この接続が払い出した
+/// tab のセッションだけを受け付け（他接続の ID は `INVALID_PARAMS`）、子のページを attach / 外して、
+/// `Target.attachedToTarget` / `detachedFromTarget` をエンベロープ `sessionId` = tab のセッションで送る
+/// （Puppeteer の `Connection` はこの `sessionId` を親として子セッションを作るため）。
+fn tab_child_auto_attach(
+    ctx: &CommandContext<'_>,
+    tab_session: &SessionId,
+    auto_attach: bool,
+    wait_for_debugger: bool,
+) -> Result<HandlerOutput, CdpError> {
+    let conn = ctx.conn.ok_or(CdpError::NO_CONNECTION)?;
+    let state = ctx.state;
+    let change = state
+        .conn_scoped()
+        .set_tab_child_auto_attach(
+            conn,
+            state.registry(),
+            tab_session,
+            auto_attach,
+            wait_for_debugger,
+        )
+        .map_err(|e| match e {
+            ConnStateError::NotLive => CdpError::NO_CONNECTION,
+            ConnStateError::Registry(
+                CdpStateError::UnknownSession | CdpStateError::UnknownTarget,
+            ) => CdpError::INVALID_PARAMS,
+            ConnStateError::Registry(_) | ConnStateError::KindConflict => CdpError::SERVER_ERROR,
+        })?;
+    let mut out = HandlerOutput::result(json!({}));
+    match change {
+        TabChildChange::None => {}
+        TabChildChange::Attached {
+            info,
+            session,
+            waiting_for_debugger,
+        } => {
+            out = out.with_event(child_attached_event(
+                &info,
+                &session,
+                waiting_for_debugger,
+                tab_session,
+            ));
+        }
+        TabChildChange::Detached { page, session } => {
+            out = out.with_event(child_detached_event(&page, &session, tab_session));
+        }
+    }
+    Ok(out)
+}
+
+/// tab のセッションの子のページを通知する `Target.attachedToTarget`。エンベロープの `sessionId` は
+/// 親の tab のセッション（#1334）。
+pub(crate) fn child_attached_event(
+    info: &TargetInfo,
+    session_id: &SessionId,
+    waiting_for_debugger: bool,
+    parent: &SessionId,
+) -> CdpEvent {
+    let mut ev = attached_event(info, session_id, waiting_for_debugger);
+    ev.session_id = Some(parent.clone());
+    ev
+}
+
+/// tab のセッションの子のページの `Target.detachedFromTarget`。エンベロープは親の tab のセッション（#1334）。
+pub(crate) fn child_detached_event(
+    target_id: &TargetId,
+    session_id: &SessionId,
+    parent: &SessionId,
+) -> CdpEvent {
+    let mut ev = detached_event(target_id, session_id);
+    ev.session_id = Some(parent.clone());
+    ev
+}
+
+/// root の `Target.attachedToTarget`（`type:"tab"`）。`info` はページの情報で、tab の ID は派生値（#1334）。
+pub(crate) fn tab_attached_event(
+    info: &TargetInfo,
+    tab_session: &SessionId,
+    waiting_for_debugger: bool,
+) -> CdpEvent {
+    CdpEvent {
+        method: "Target.attachedToTarget",
+        params: json!({
+            "sessionId": tab_session.as_str(),
+            "targetInfo": tab_target_info(info, true),
+            "waitingForDebugger": waiting_for_debugger,
+        }),
+        session_id: None,
+    }
+}
+
+/// tab の attach の解除通知（子のページ → tab の順。子の通知のエンベロープは tab のセッション。#1334・`CDP-7`）。
+pub(crate) fn tab_detach_events(td: &TabDetach) -> Vec<CdpEvent> {
+    let mut v = Vec::new();
+    if let Some((page, child)) = &td.child {
+        v.push(child_detached_event(page, child, &td.tab_session));
+    }
+    v.push(detached_event(&td.tab_id, &td.tab_session));
+    v
+}
+
+/// `Target.targetCreated`（`type:"tab"`）。`attached` は tab にセッションが attach 中か（#1334・`CDP-3`）。
+pub(crate) fn tab_created_event(info: &TargetInfo, attached: bool) -> CdpEvent {
+    CdpEvent {
+        method: "Target.targetCreated",
+        params: json!({ "targetInfo": tab_target_info(info, attached) }),
+        session_id: None,
+    }
+}
+
 /// `Target.setDiscoverTargets`（`CDP-3`・`CDP-7`・`CDP-6`・`SEC-2`・`REPAIR-3`・TASK-45・TASK-46・#1324）。
 ///
 /// Puppeteer の `connect()`（`TargetManager.initialize`）が `Target.getBrowserContexts` の次に root へ
@@ -259,19 +462,20 @@ pub(crate) fn target_destroyed_event(target_id: &TargetId) -> CdpEvent {
 /// `protocol::auto_attach_events` が次のコマンドへ同伴して通知する（push 経路が無いため）。
 /// `discover:false` は状態を捨てて以後の送出を止める（`Target.targetDestroyed` は送らない。Chromium も同じ）。
 ///
-/// 受理する `filter` は省略か `[{}]` だけ（それ以外は黙って無視せず `UNSUPPORTED_PARAMS`。`CDP-6`）。
-/// 省略は `[{}]` と結果が同じ（registry にはページしか無い）ため受理する。tab 型ターゲットを足したら
-/// 同じでなくなるので見直す（#1327）。`discover:false` でも filter は同じ規則で検証する。
+/// 受理する `filter` は省略（ページのみ通知）か `[{}]`（ページと tab 擬似ターゲットを通知。#1334）だけ。
+/// それ以外（`[{"type":"page","exclude":true},{}]` を含む）は黙って無視せず `UNSUPPORTED_PARAMS`（`CDP-6`）。
+/// `discover:false` でも filter は同じ規則で検証する。
 /// `discover` 以外・`filter` 以外のキーは `UNSUPPORTED_PARAMS`、`discover` の欠落・非 bool と params が
 /// object でない場合は `INVALID_PARAMS`、`sessionId` 付きは `UNSUPPORTED_PARAMS`、接続なし・切断済みは
 /// `NO_CONNECTION`。失敗時は状態を変えない。
 ///
 /// Chromium との差異（`REPAIR-3`）:
 /// - Chromium は既存ターゲットを応答より前に通知する。本実装は応答の後（受入基準・`DispatchOutcome` の規約）。
-///   Puppeteer の `initialize()` は応答直後に発見済みの表を読むため、既存ページは初期化待ちに入らない
-///   （ソース読解による想定で、実測は未確認）。tab モデル（#1327）の実装時に順序を見直す。
+///   tab モデル導入後（#1334）も変えない: Puppeteer の `initialize()` は tab → 子ページの attach で初期化待ちが
+///   空になるため、通知の順序に依らず完了する（ソース読解による想定で、実測は未確認）。
 /// - 通知対象は既定 context と自接続所有 context のページだけ（他接続の context の存在を漏らさない）。
-///   browser 型・tab 型ターゲットは通知しない。`Target.targetInfoChanged` も送らない。
+///   browser 型ターゲットは通知しない（Chromium の `[{}]` は含む差異）。tab 型は `filter:[{}]` のときだけ通知する。
+///   `Target.targetInfoChanged` も送らない。
 /// - `targetInfo.attached` は通知時点（この接続の attach より前）の実値で、その後の変化は通知しない。
 pub(crate) struct TargetSetDiscoverTargets;
 
@@ -295,27 +499,29 @@ impl CommandHandler for TargetSetDiscoverTargets {
                 .get("discover")
                 .and_then(Value::as_bool)
                 .ok_or(CdpError::INVALID_PARAMS)?;
-            if let Some(f) = obj.get("filter") {
-                // 長さ 1 の配列で中身が空 object のときだけ受理する（入力の大きさで処理量は増えない）。
-                let ok = matches!(f.as_array().map(Vec::as_slice),
-                    Some([e]) if e.as_object().is_some_and(|o| o.is_empty()));
-                if !ok {
+            let include_tabs = match parse_target_filter(obj.get("filter"))? {
+                TargetFilterForm::Default => false,
+                TargetFilterForm::All => true,
+                TargetFilterForm::ExcludePageThenAll => {
                     return Err(CdpError::UNSUPPORTED_PARAMS);
                 }
-            }
+            };
             let conn = ctx.conn.ok_or(CdpError::NO_CONNECTION)?;
             let state = ctx.state;
             let mut out = HandlerOutput::result(json!({}));
             if discover {
-                let (created, destroyed) = state
+                let diff = state
                     .conn_scoped()
-                    .enable_discover(conn, state.registry())
+                    .enable_discover(conn, state.registry(), include_tabs)
                     .map_err(conn_error)?;
-                // 消滅 → 新規の順（`auto_attach_events` と同じ。`CDP-3`・`CDP-7`）。
-                for tid in &destroyed {
+                // 消滅 → 新規（tab → ページ）の順（`auto_attach_events` と同じ。`CDP-3`・`CDP-7`）。
+                for tid in &diff.destroyed {
                     out = out.with_event(target_destroyed_event(tid));
                 }
-                for (info, attached) in &created {
+                for (info, attached) in &diff.created_tabs {
+                    out = out.with_event(tab_created_event(info, *attached));
+                }
+                for (info, attached) in &diff.created {
                     out = out.with_event(target_created_event(info, *attached));
                 }
             } else {
@@ -466,15 +672,28 @@ impl CommandHandler for TargetCloseTarget {
                 .close_target(conn, state.registry(), &id)
                 .map_err(|e| match e {
                     ConnStateError::NotLive => CdpError::NO_CONNECTION,
-                    ConnStateError::Registry(_) => CdpError::INVALID_PARAMS,
+                    ConnStateError::Registry(_) | ConnStateError::KindConflict => {
+                        CdpError::INVALID_PARAMS
+                    }
                 })?;
             state.navigations().forget(&id);
             let mut out = HandlerOutput::result(json!({ "success": true }));
             for sid in &closed.sessions {
                 out = out.with_event(detached_event(&id, sid));
             }
+            // tab 経路: 子のページ → tab の順（#1334）。
+            for td in &closed.tabs {
+                for ev in tab_detach_events(td) {
+                    out = out.with_event(ev);
+                }
+            }
             if closed.announce_destroyed {
                 out = out.with_event(target_destroyed_event(&id));
+            }
+            if closed.announce_tab_destroyed
+                && let Some(tab_id) = &closed.tab_id
+            {
+                out = out.with_event(target_destroyed_event(tab_id));
             }
             Ok(out)
         })
@@ -547,7 +766,9 @@ impl CommandHandler for TargetCreateTarget {
                     ConnStateError::Registry(CdpStateError::UnknownBrowserContext) => {
                         CdpError::INVALID_PARAMS
                     }
-                    ConnStateError::Registry(_) => CdpError::SERVER_ERROR,
+                    ConnStateError::Registry(_) | ConnStateError::KindConflict => {
+                        CdpError::SERVER_ERROR
+                    }
                 })?;
             // 止めたターゲットは `Runtime.runIfWaitingForDebugger` まで初期文書を確定しない。
             if !created.waiting_for_debugger {
@@ -557,15 +778,19 @@ impl CommandHandler for TargetCreateTarget {
             }
             let mut out =
                 HandlerOutput::result(json!({ "targetId": created.info.target_id().as_str() }));
+            // tab 経路（Puppeteer）の順は tab → ページの targetCreated → tab の attachedToTarget（#1334）。
+            if created.announce_tab_created {
+                out = out.with_pre_event(tab_created_event(&created.info, false));
+            }
             if created.announce_created {
                 out = out.with_pre_event(target_created_event(&created.info, false));
             }
             if let Some(sid) = &created.session {
-                out = out.with_pre_event(attached_event(
-                    &created.info,
-                    sid,
-                    created.waiting_for_debugger,
-                ));
+                out = out.with_pre_event(if created.tab {
+                    tab_attached_event(&created.info, sid, created.waiting_for_debugger)
+                } else {
+                    attached_event(&created.info, sid, created.waiting_for_debugger)
+                });
             }
             Ok(out)
         })
@@ -594,7 +819,20 @@ impl CommandHandler for RuntimeRunIfWaitingForDebugger {
             let state = ctx.state;
             let registry = state.registry();
             if registry.session_target(sid).is_none() {
-                return Err(CdpError::INVALID_PARAMS);
+                // tab のセッション: この接続が払い出したものだけ。tab が止めていればページの初期 `about:blank` を
+                // 確定する（Runtime のイベントは tab には無いので送らない）。子に停止を移した後は実際の no-op
+                // （#1334・`CDP-3`・`CDP-7`）。
+                let owned = ctx
+                    .conn
+                    .is_some_and(|c| state.conn_scoped().owns_tab_session(c, sid));
+                // 他接続がページを閉じて registry から消えた tab セッションは所有記録が残っていても拒否する。
+                if !owned || !registry.is_tab_session(sid) {
+                    return Err(CdpError::INVALID_PARAMS);
+                }
+                if let Some(tid) = registry.resume_by_session(sid) {
+                    state.navigations().commit_initial_blank(registry, &tid);
+                }
+                return Ok(HandlerOutput::result(json!({})));
             }
             let mut out = HandlerOutput::result(json!({}));
             if let Some(tid) = registry.resume_by_session(sid) {
@@ -927,7 +1165,7 @@ impl CommandHandler for EmulationSetEmulatedMedia {
         })
     }
 }
-/// `Log.enable`・`Runtime.enable`・`Network.enable` の共通本体（`CDP-2`・TASK-43.3j・#1038）。
+/// `Log.enable`・`Runtime.enable`・`Network.enable`（TASK-43.3j・#1038）・`Performance.enable`・`Audits.enable`（#1326）の共通本体（`CDP-2`・`CDP-3`）。
 ///
 /// 検証順は [`PageEnable`] と同じ。`sessionId` なしは `UNSUPPORTED_PARAMS`、未知・閉じたセッションは
 /// `INVALID_PARAMS`、`params` にキーがあれば黙って無視せず `UNSUPPORTED_PARAMS`（フラグは立てない）。
@@ -1028,6 +1266,44 @@ impl CommandHandler for NetworkEnable {
     }
 }
 
+/// `Performance.enable`（`CDP-3`・#1326）。Puppeteer の `newPage()` が page session に送るため受理する。
+///
+/// セッションに有効フラグを立てて `{}` を返す（冪等）。フラグを保持するだけで、イベントも計測も行わない。
+/// 差異（`REPAIR-3`）: `Performance.metrics` は送らず、`Performance.getMetrics`・`Performance.disable` は
+/// 未実装で `-32601`。`timeDomain` 等の params は未実装のため `UNSUPPORTED_PARAMS`。
+/// 実際に状態を変える成功であり、検出回避のための一律成功ではない。フラグは fetch・ヘッダ・UA・
+/// `navigator`・画面を何も変えない（`SEC-2`・`CDP-6`）。検証は [`enable_session_domain`]。
+pub(crate) struct PerformanceEnable;
+
+impl CommandHandler for PerformanceEnable {
+    fn handle<'a>(
+        &'a self,
+        ctx: CommandContext<'a>,
+        params: &'a Value,
+    ) -> BoxFuture<'a, Result<HandlerOutput, CdpError>> {
+        Box::pin(async move { enable_session_domain(ctx, params, SessionDomain::Performance) })
+    }
+}
+
+/// `Audits.enable`（`CDP-3`・#1326）。Puppeteer の `newPage()` が page session に送るため受理する。
+///
+/// セッションに有効フラグを立てて `{}` を返す（冪等）。フラグを保持するだけで、イベントも計測も行わない。
+/// 差異（`REPAIR-3`）: `Audits.issueAdded` は送らず、`Audits.disable`・`Audits.checkContrast` 等は
+/// 未実装で `-32601`。params は未実装のため非空なら `UNSUPPORTED_PARAMS`。
+/// 実際に状態を変える成功であり、検出回避のための一律成功ではない。識別面には影響しない（`SEC-2`・`CDP-6`）。
+/// 検証は [`enable_session_domain`]。
+pub(crate) struct AuditsEnable;
+
+impl CommandHandler for AuditsEnable {
+    fn handle<'a>(
+        &'a self,
+        ctx: CommandContext<'a>,
+        params: &'a Value,
+    ) -> BoxFuture<'a, Result<HandlerOutput, CdpError>> {
+        Box::pin(async move { enable_session_domain(ctx, params, SessionDomain::Audits) })
+    }
+}
+
 /// `Page.getFrameTree`（`CDP-2`・TASK-43.3i・#1037）。
 ///
 /// `sessionId` 付きで、メインフレームだけの `frameTree` を返す。`Page.enable` は前提にしない（Chromium と同じ）。
@@ -1081,6 +1357,8 @@ fn conn_error(e: ConnStateError) -> CdpError {
     match e {
         ConnStateError::NotLive => CdpError::NO_CONNECTION,
         ConnStateError::Registry(_) => CdpError::SERVER_ERROR,
+        // 有効な自動 attach と別種別の指定（先に `autoAttach:false` が要る。#1334）。
+        ConnStateError::KindConflict => CdpError::UNSUPPORTED_PARAMS,
     }
 }
 
@@ -1195,6 +1473,20 @@ fn page_target_info(t: &TargetInfo, attached: bool) -> Value {
 }
 
 /// ブラウザ自身の `targetInfo`。
+/// tab 擬似ターゲットの `targetInfo`（#1334・`CDP-3`・`SEC-2`）。ページの実値（url・context）だけで組み立て、
+/// `type:"tab"`・`targetId` は派生 ID。Chrome を装う値は載せない。
+fn tab_target_info(page: &TargetInfo, attached: bool) -> Value {
+    json!({
+        "targetId": page.tab_id().as_str(),
+        "type": "tab",
+        "title": page.url(),
+        "url": page.url(),
+        "attached": attached,
+        "canAccessOpener": false,
+        "browserContextId": page.browser_context_id().as_str(),
+    })
+}
+
 fn browser_target_info(browser_id: &str) -> Value {
     json!({
         "targetId": browser_id,
@@ -1836,7 +2128,10 @@ mod tests {
             format!(r#"{{"id":{id},"method":"Browser.getVersion"}}"#)
         }
 
-        const DISCOVER_ON: &str = r#""discover":true,"filter":[{}]"#;
+        /// filter 省略（ページのみ通知。既存の page 経路のテストはこれで固定する）。tab を含む `[{}]` は
+        /// `DISCOVER_ALL`（#1334）。
+        const DISCOVER_ON: &str = r#""discover":true"#;
+        const DISCOVER_ALL: &str = r#""discover":true,"filter":[{}]"#;
 
         #[tokio::test]
         async fn cdp3_set_discover_targets_announces_existing_targets_after_response() {
@@ -3657,14 +3952,16 @@ mod tests {
             );
         }
 
-        const DOMAINS: [(&str, SessionDomain); 3] = [
+        const DOMAINS: [(&str, SessionDomain); 5] = [
             ("Log.enable", SessionDomain::Log),
             ("Runtime.enable", SessionDomain::Runtime),
             ("Network.enable", SessionDomain::Network),
+            ("Performance.enable", SessionDomain::Performance),
+            ("Audits.enable", SessionDomain::Audits),
         ];
 
         #[tokio::test]
-        async fn cdp2_log_runtime_network_enable_with_session_return_empty_and_are_idempotent() {
+        async fn cdp2_session_domain_enable_with_session_return_empty_and_are_idempotent() {
             let dir = TempDir::new();
             let st = state(&dir);
             let c = open_conn(&st, 1);
@@ -3685,7 +3982,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn cdp2_log_runtime_network_enable_reject_missing_or_unknown_session() {
+        async fn cdp2_session_domain_enable_reject_missing_or_unknown_session() {
             let dir = TempDir::new();
             let st = state(&dir);
             let c = open_conn(&st, 1);
@@ -3733,6 +4030,88 @@ mod tests {
                 assert_eq!(
                     call(&st, Some(c), &sreq(id, m, &sid, r#"{"x":1}"#)).await,
                     vec![serr(-32602, "unsupported params", id, &sid)]
+                );
+                assert!(!st.registry().is_domain_enabled(&s, d));
+            }
+        }
+
+        #[tokio::test]
+        async fn cdp3_performance_and_audits_enable_reject_non_empty_params() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let c = open_conn(&st, 1);
+            let sid = attached_session(&st, c).await;
+            let s = SessionId::parse(&sid).unwrap();
+            let mut id = 1;
+            for (m, d) in [DOMAINS[3], DOMAINS[4]] {
+                for p in [r#"{"x":1}"#, r#"{"timeDomain":"timeTicks"}"#] {
+                    id += 1;
+                    assert_eq!(
+                        call(&st, Some(c), &sreq(id, m, &sid, p)).await,
+                        vec![serr(-32602, "unsupported params", id, &sid)]
+                    );
+                }
+                assert!(!st.registry().is_domain_enabled(&s, d));
+            }
+        }
+
+        #[tokio::test]
+        async fn cdp6_performance_and_audits_unimplemented_methods_stay_method_not_found() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let c = open_conn(&st, 1);
+            let sid = attached_session(&st, c).await;
+            let mut id = 1;
+            for enabled in [false, true] {
+                if enabled {
+                    for m in ["Performance.enable", "Audits.enable"] {
+                        id += 1;
+                        call(&st, Some(c), &sreq(id, m, &sid, "{}")).await;
+                    }
+                }
+                for m in [
+                    "Performance.getMetrics",
+                    "Performance.disable",
+                    "Audits.disable",
+                    "Audits.checkContrast",
+                ] {
+                    id += 1;
+                    assert_eq!(
+                        call(&st, Some(c), &sreq(id, m, &sid, "{}")).await,
+                        vec![serr(-32601, "method not implemented", id, &sid)],
+                        "{m} enabled={enabled}"
+                    );
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn cdp7_performance_audits_flags_gone_after_close_target() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let c = open_conn(&st, 1);
+            let sid = attached_session(&st, c).await;
+            let s = SessionId::parse(&sid).unwrap();
+            let mut id = 1;
+            for (m, d) in [DOMAINS[3], DOMAINS[4]] {
+                id += 1;
+                call(&st, Some(c), &sreq(id, m, &sid, "{}")).await;
+                assert!(st.registry().is_domain_enabled(&s, d));
+            }
+            let t = target_of(&st, &sid);
+            call(
+                &st,
+                Some(c),
+                &format!(
+                    r#"{{"id":50,"method":"Target.closeTarget","params":{{"targetId":"{t}"}}}}"#
+                ),
+            )
+            .await;
+            for (m, d) in [DOMAINS[3], DOMAINS[4]] {
+                id += 1;
+                assert_eq!(
+                    call(&st, Some(c), &sreq(id, m, &sid, "{}")).await,
+                    vec![serr(-32602, "invalid params", id, &sid)]
                 );
                 assert!(!st.registry().is_domain_enabled(&s, d));
             }
@@ -4402,6 +4781,466 @@ mod tests {
                     vec![serr(-32601, "method not implemented", id, &sid)]
                 );
             }
+        }
+        // ---- tab 擬似ターゲットと filter（#1334・`CDP-3`・`CDP-6`・`CDP-7`・`SEC-2`） ----
+
+        /// Puppeteer の root の `Target.setAutoAttach`（`TargetManager.initialize`）の params。
+        const PPTR_ROOT: &str = r#""waitForDebuggerOnStart":true,"flatten":true,"autoAttach":true,"filter":[{"type":"page","exclude":true},{}]"#;
+        /// Puppeteer が tab のセッション・ページのセッションへ送る params。
+        const PPTR_CHILD: &str =
+            r#"{"waitForDebuggerOnStart":true,"flatten":true,"autoAttach":true,"filter":[{}]}"#;
+
+        fn id32(n: u64) -> String {
+            format!("{n:032X}")
+        }
+
+        fn page_info_json(t: u64, url: &str, attached: bool) -> Value {
+            json!({
+                "targetId": id32(t), "type":"page", "title": url, "url": url,
+                "attached": attached, "canAccessOpener": false,
+                "browserContextId": "00000000000000000000000000000001"})
+        }
+
+        fn tab_info_json(t: u64, url: &str, attached: bool) -> Value {
+            json!({
+                "targetId": id32(t | (1 << 62)), "type":"tab", "title": url, "url": url,
+                "attached": attached, "canAccessOpener": false,
+                "browserContextId": "00000000000000000000000000000001"})
+        }
+
+        fn create_blank(id: i64) -> String {
+            format!(
+                r#"{{"id":{id},"method":"Target.createTarget","params":{{"url":"about:blank"}}}}"#
+            )
+        }
+
+        /// 実際の Puppeteer の送信順で `newPage` 直前まで進め、`(tab のセッション, ページのセッション)` を返す。
+        async fn pptr_new_page(st: &Arc<CdpState>, c: ConnId) -> (String, String) {
+            let f = call(st, Some(c), &discover(1, DISCOVER_ALL)).await;
+            assert_eq!(f, vec![json!({"id":1,"result":{}})]);
+            let f = call(st, Some(c), &auto_attach(2, PPTR_ROOT)).await;
+            assert_eq!(f, vec![json!({"id":2,"result":{}})]);
+            let f = call(st, Some(c), &create_blank(3)).await;
+            let tab_sid = f[2]["params"]["sessionId"].as_str().unwrap().to_owned();
+            let f = call(
+                st,
+                Some(c),
+                &sreq(4, "Target.setAutoAttach", &tab_sid, PPTR_CHILD),
+            )
+            .await;
+            let page_sid = f[1]["params"]["sessionId"].as_str().unwrap().to_owned();
+            (tab_sid, page_sid)
+        }
+
+        #[tokio::test]
+        async fn cdp3_puppeteer_tab_sequence_reaches_page_session() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let c = open_conn(&st, 1);
+            let u = "about:blank";
+            // getBrowserContexts → setDiscoverTargets([{}]) → root setAutoAttach（既存ターゲットなし）。
+            let f = call(&st, Some(c), &discover(1, DISCOVER_ALL)).await;
+            assert_eq!(f, vec![json!({"id":1,"result":{}})]);
+            let f = call(&st, Some(c), &auto_attach(2, PPTR_ROOT)).await;
+            assert_eq!(f, vec![json!({"id":2,"result":{}})]);
+            assert_eq!(st.registry().session_count(), 0);
+            // createTarget: 応答の前に tab → ページの targetCreated と tab の attachedToTarget（止める）。
+            let f = call(&st, Some(c), &create_blank(3)).await;
+            assert_eq!(
+                f,
+                vec![
+                    json!({"method":"Target.targetCreated","params":{"targetInfo": tab_info_json(1, u, false)}}),
+                    json!({"method":"Target.targetCreated","params":{"targetInfo": page_info_json(1, u, false)}}),
+                    json!({"method":"Target.attachedToTarget","params":{
+                        "sessionId": id32(1), "targetInfo": tab_info_json(1, u, true),
+                        "waitingForDebugger": true}}),
+                    json!({"id":3,"result":{"targetId": id32(1)}}),
+                ]
+            );
+            let (tab, page) = (id32(1), id32(2));
+            let page_id = TargetId::parse(&id32(1)).unwrap();
+            assert!(st.registry().is_paused(&page_id));
+            // tab のセッションの setAutoAttach: 子のページを attach し、エンベロープは tab のセッション。
+            let f = call(
+                &st,
+                Some(c),
+                &sreq(4, "Target.setAutoAttach", &tab, PPTR_CHILD),
+            )
+            .await;
+            assert_eq!(
+                f,
+                vec![
+                    json!({"id":4,"sessionId":tab,"result":{}}),
+                    json!({"method":"Target.attachedToTarget","sessionId":tab,"params":{
+                        "sessionId": page, "targetInfo": page_info_json(1, u, true),
+                        "waitingForDebugger": true}}),
+                ]
+            );
+            // 子へ移った後の tab の runIfWaitingForDebugger は実際の no-op（初期文書はまだ確定しない）。
+            let f = call(
+                &st,
+                Some(c),
+                &sreq(5, "Runtime.runIfWaitingForDebugger", &tab, "{}"),
+            )
+            .await;
+            assert_eq!(f, vec![json!({"id":5,"sessionId":tab,"result":{}})]);
+            assert!(st.registry().is_paused(&page_id));
+            // ページのセッション: 子の自動 attach（0 件）と再開。
+            let f = call(
+                &st,
+                Some(c),
+                &sreq(6, "Target.setAutoAttach", &page, PPTR_CHILD),
+            )
+            .await;
+            assert_eq!(f, vec![json!({"id":6,"sessionId":page,"result":{}})]);
+            let f = call(
+                &st,
+                Some(c),
+                &sreq(7, "Runtime.runIfWaitingForDebugger", &page, "{}"),
+            )
+            .await;
+            assert_eq!(f, vec![json!({"id":7,"sessionId":page,"result":{}})]);
+            assert!(!st.registry().is_paused(&page_id));
+            // ページ系コマンドはページのセッションでは通り、tab のセッションでは未知のセッションとして拒否される。
+            let f = call(&st, Some(c), &sreq(8, "Page.enable", &page, "{}")).await;
+            assert_eq!(f, vec![json!({"id":8,"sessionId":page,"result":{}})]);
+            for (id, m) in [
+                (9, "Page.enable"),
+                (10, "Page.getFrameTree"),
+                (11, "Runtime.enable"),
+            ] {
+                let f = call(&st, Some(c), &sreq(id, m, &tab, "{}")).await;
+                assert_eq!(f, vec![serr(-32602, "invalid params", id, &tab)], "{m}");
+            }
+            // 2 セッション（tab とページ）を消費する。
+            assert_eq!(st.registry().session_count(), 2);
+        }
+
+        #[tokio::test]
+        async fn cdp6_set_auto_attach_rejects_unsupported_filter_forms() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let c = open_conn(&st, 1);
+            new_page(&st, "about:blank");
+            let bad = [
+                r#"[]"#,
+                r#"{}"#,
+                r#"null"#,
+                r#"[{}, {}]"#,
+                r#"[{"type":"page","exclude":true}]"#,
+                r#"[{"type":"page","exclude":false},{}]"#,
+                r#"[{"type":"tab","exclude":true},{}]"#,
+                r#"[{},{"type":"page","exclude":true}]"#,
+                r#"[{"type":"page","exclude":true,"x":1},{}]"#,
+                r#"[{"type":"page"},{}]"#,
+            ];
+            for (i, f) in bad.iter().enumerate() {
+                let id = i as i64 + 1;
+                let p = format!(r#""autoAttach":true,"flatten":true,"filter":{f}"#);
+                assert_eq!(
+                    call(&st, Some(c), &auto_attach(id, &p)).await,
+                    vec![err(-32602, "unsupported params", id)],
+                    "{f}"
+                );
+            }
+            // root の `[{}]`（ページと tab の同時 attach）は未実装として拒否する。
+            let p = r#""autoAttach":true,"flatten":true,"filter":[{}]"#;
+            assert_eq!(
+                call(&st, Some(c), &auto_attach(20, p)).await,
+                vec![err(-32602, "unsupported params", 20)]
+            );
+            assert_eq!(st.registry().session_count(), 0);
+            // 拒否は状態を変えない: どちらの経路も有効にできる。
+            let f = call(&st, Some(c), &auto_attach(21, PPTR_ROOT)).await;
+            assert_eq!(f.len(), 2);
+            assert_eq!(st.registry().session_count(), 1);
+            // tab のセッション・ページのセッションの `[{type:"page",exclude:true},{}]` も拒否する。
+            let tab = f[1]["params"]["sessionId"].as_str().unwrap().to_owned();
+            let exclude = r#"{"flatten":true,"autoAttach":true,"filter":[{"type":"page","exclude":true},{}]}"#;
+            assert_eq!(
+                call(
+                    &st,
+                    Some(c),
+                    &sreq(22, "Target.setAutoAttach", &tab, exclude)
+                )
+                .await,
+                vec![serr(-32602, "unsupported params", 22, &tab)]
+            );
+            let f = call(
+                &st,
+                Some(c),
+                &sreq(23, "Target.setAutoAttach", &tab, PPTR_CHILD),
+            )
+            .await;
+            let page = f[1]["params"]["sessionId"].as_str().unwrap().to_owned();
+            assert_eq!(
+                call(
+                    &st,
+                    Some(c),
+                    &sreq(24, "Target.setAutoAttach", &page, exclude)
+                )
+                .await,
+                vec![serr(-32602, "unsupported params", 24, &page)]
+            );
+            assert_eq!(st.registry().session_count(), 2);
+        }
+
+        #[tokio::test]
+        async fn cdp7_tab_and_page_auto_attach_kinds_conflict_until_disabled() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let c = open_conn(&st, 1);
+            new_page(&st, "about:blank");
+            let f = call(&st, Some(c), &auto_attach(1, PPTR_ROOT)).await;
+            let tab = f[1]["params"]["sessionId"].as_str().unwrap().to_owned();
+            let f = call(
+                &st,
+                Some(c),
+                &sreq(2, "Target.setAutoAttach", &tab, PPTR_CHILD),
+            )
+            .await;
+            let page = f[1]["params"]["sessionId"].as_str().unwrap().to_owned();
+            // 有効中に別種別で有効化しても状態は変わらない。
+            assert_eq!(
+                call(&st, Some(c), &auto_attach(3, ON)).await,
+                vec![err(-32602, "unsupported params", 3)]
+            );
+            assert_eq!(st.registry().session_count(), 2);
+            // 無効化: 子のページ（エンベロープは tab のセッション）→ tab の順。
+            let f = call(&st, Some(c), &auto_attach(4, r#""autoAttach":false"#)).await;
+            assert_eq!(
+                f,
+                vec![
+                    json!({"id":4,"result":{}}),
+                    json!({"method":"Target.detachedFromTarget","sessionId":tab,"params":{
+                        "sessionId": page, "targetId": id32(1)}}),
+                    json!({"method":"Target.detachedFromTarget","params":{
+                        "sessionId": tab, "targetId": id32(1 | (1 << 62))}}),
+                ]
+            );
+            assert_eq!(st.registry().session_count(), 0);
+            // 無効化後はページ経路を有効にできる。
+            assert_eq!(call(&st, Some(c), &auto_attach(5, ON)).await.len(), 2);
+            assert_eq!(st.registry().session_count(), 1);
+        }
+
+        #[tokio::test]
+        async fn cdp7_tab_sessions_released_on_close_and_disconnect() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let c = open_conn(&st, 1);
+            let (tab, page) = pptr_new_page(&st, c).await;
+            assert_eq!(st.registry().session_count(), 2);
+            // closeTarget(ページ): 子 → tab の detach の後に page → tab の targetDestroyed。
+            let req = format!(
+                r#"{{"id":9,"method":"Target.closeTarget","params":{{"targetId":"{}"}}}}"#,
+                id32(1)
+            );
+            let f = call(&st, Some(c), &req).await;
+            assert_eq!(
+                f,
+                vec![
+                    json!({"id":9,"result":{"success":true}}),
+                    json!({"method":"Target.detachedFromTarget","sessionId":tab,"params":{
+                        "sessionId": page, "targetId": id32(1)}}),
+                    json!({"method":"Target.detachedFromTarget","params":{
+                        "sessionId": tab, "targetId": id32(1 | (1 << 62))}}),
+                    json!({"method":"Target.targetDestroyed","params":{"targetId": id32(1)}}),
+                    json!({"method":"Target.targetDestroyed","params":{"targetId": id32(1 | (1 << 62))}}),
+                ]
+            );
+            assert_eq!(st.registry().session_count(), 0);
+            // 切断: 次のページの tab と子のセッションも解放される。
+            let (_t2, _p2) = pptr_new_page_again(&st, c).await;
+            assert_eq!(st.registry().session_count(), 2);
+            st.release_connection(c);
+            assert_eq!(st.registry().session_count(), 0);
+        }
+
+        /// 既に discover・root の自動 attach が有効な接続で、もう 1 ページ作って子まで attach する。
+        async fn pptr_new_page_again(st: &Arc<CdpState>, c: ConnId) -> (String, String) {
+            let f = call(st, Some(c), &create_blank(30)).await;
+            let tab_sid = f[2]["params"]["sessionId"].as_str().unwrap().to_owned();
+            let f = call(
+                st,
+                Some(c),
+                &sreq(31, "Target.setAutoAttach", &tab_sid, PPTR_CHILD),
+            )
+            .await;
+            let page_sid = f[1]["params"]["sessionId"].as_str().unwrap().to_owned();
+            (tab_sid, page_sid)
+        }
+
+        #[tokio::test]
+        async fn cdp3_discover_filter_all_announces_tabs_and_default_hides_them() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let c = open_conn(&st, 1);
+            let t = new_page(&st, "about:blank");
+            let u = "about:blank";
+            // 省略（既定）はページのみ。
+            let f = call(&st, Some(c), &discover(1, DISCOVER_ON)).await;
+            assert_eq!(
+                f,
+                vec![json!({"id":1,"result":{}}), created_ev(&t, u, false)]
+            );
+            // `[{}]` へ広げると tab だけが新規に通知される。
+            let f = call(&st, Some(c), &discover(2, DISCOVER_ALL)).await;
+            assert_eq!(
+                f,
+                vec![
+                    json!({"id":2,"result":{}}),
+                    json!({"method":"Target.targetCreated","params":{"targetInfo": tab_info_json(1, u, false)}}),
+                ]
+            );
+            // 既定へ戻すと tab の記録は黙って捨てる（targetDestroyed を出さない）。
+            let f = call(&st, Some(c), &discover(3, DISCOVER_ON)).await;
+            assert_eq!(f, vec![json!({"id":3,"result":{}})]);
+            st.registry().close_target(&t).unwrap();
+            let f = call(&st, Some(c), &ping(4)).await;
+            assert_eq!(f.len(), 2);
+            assert_eq!(f[1], destroyed_ev(&t));
+            // Chromium の `[{"type":"page","exclude":true},{}]` は discover では未実装として拒否する。
+            let p = r#""discover":true,"filter":[{"type":"page","exclude":true},{}]"#;
+            let f = call(&st, Some(c), &discover(5, p)).await;
+            assert_eq!(f, vec![err(-32602, "unsupported params", 5)]);
+        }
+
+        #[tokio::test]
+        async fn cdp7_tab_session_commands_require_owning_connection() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let c1 = open_conn(&st, 1);
+            let c2 = open_conn(&st, 2);
+            new_page(&st, "about:blank");
+            let f = call(&st, Some(c1), &auto_attach(1, PPTR_ROOT)).await;
+            let tab = f[1]["params"]["sessionId"].as_str().unwrap().to_owned();
+            // 他接続の tab のセッション宛ては、子の attach も再開も拒否する。
+            assert_eq!(
+                call(
+                    &st,
+                    Some(c2),
+                    &sreq(2, "Target.setAutoAttach", &tab, PPTR_CHILD)
+                )
+                .await,
+                vec![serr(-32602, "invalid params", 2, &tab)]
+            );
+            assert_eq!(
+                call(
+                    &st,
+                    Some(c2),
+                    &sreq(3, "Runtime.runIfWaitingForDebugger", &tab, "{}")
+                )
+                .await,
+                vec![serr(-32602, "invalid params", 3, &tab)]
+            );
+            assert_eq!(st.registry().session_count(), 1);
+            // 接続なしの直接 dispatch も同様（所有を確認できない）。
+            assert_eq!(
+                call(
+                    &st,
+                    None,
+                    &sreq(4, "Runtime.runIfWaitingForDebugger", &tab, "{}")
+                )
+                .await,
+                vec![serr(-32602, "invalid params", 4, &tab)]
+            );
+        }
+
+        #[tokio::test]
+        async fn cdp3_get_target_info_returns_tab_actual_values() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let c = open_conn(&st, 1);
+            let _t = new_page(&st, "https://example.test/");
+            let req = format!(
+                r#"{{"id":1,"method":"Target.getTargetInfo","params":{{"targetId":"{}"}}}}"#,
+                id32(1 | (1 << 62))
+            );
+            let f = call(&st, Some(c), &req).await;
+            assert_eq!(
+                f,
+                vec![json!({"id":1,"result":{"targetInfo":
+                    tab_info_json(1, "https://example.test/", false)}})]
+            );
+            // tab は registry のターゲットではない: closeTarget は未知の ID と同じ拒否（未実装）。
+            let req = format!(
+                r#"{{"id":2,"method":"Target.closeTarget","params":{{"targetId":"{}"}}}}"#,
+                id32(1 | (1 << 62))
+            );
+            assert_eq!(
+                call(&st, Some(c), &req).await,
+                vec![err(-32602, "invalid params", 2)]
+            );
+            // `Target.getTargets`・`Target.attachToTarget` は未実装のまま。
+            for (id, m) in [(3, "Target.getTargets"), (4, "Target.attachToTarget")] {
+                let r = format!(r#"{{"id":{id},"method":"{m}","params":{{}}}}"#);
+                assert_eq!(
+                    call(&st, Some(c), &r).await,
+                    vec![err(-32601, "method not implemented", id)],
+                    "{m}"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn cdp2_playwright_default_filter_path_unchanged() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let c = open_conn(&st, 1);
+            let f = call(&st, Some(c), &auto_attach(1, ON)).await;
+            assert_eq!(f, vec![json!({"id":1,"result":{}})]);
+            let f = call(&st, Some(c), &create_blank(2)).await;
+            assert_eq!(
+                f,
+                vec![
+                    json!({"method":"Target.attachedToTarget","params":{
+                        "sessionId": id32(1), "targetInfo": page_info_json(1, "about:blank", true),
+                        "waitingForDebugger": false}}),
+                    json!({"id":2,"result":{"targetId": id32(1)}}),
+                ]
+            );
+            // tab のセッションは作らず、ページのセッションが 1 つだけ。
+            assert_eq!(st.registry().session_count(), 1);
+            assert!(
+                !st.registry()
+                    .is_tab_session(&SessionId::parse(&id32(1)).unwrap())
+            );
+        }
+
+        #[tokio::test]
+        async fn cdp7_vanished_tab_is_reported_child_first_on_next_command() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let c = open_conn(&st, 1);
+            new_page(&st, "about:blank");
+            let f = call(&st, Some(c), &auto_attach(1, PPTR_ROOT)).await;
+            let tab = f[1]["params"]["sessionId"].as_str().unwrap().to_owned();
+            let f = call(
+                &st,
+                Some(c),
+                &sreq(2, "Target.setAutoAttach", &tab, PPTR_CHILD),
+            )
+            .await;
+            let page = f[1]["params"]["sessionId"].as_str().unwrap().to_owned();
+            // 他経路（registry 直接）で閉じると、次のコマンドに 子 → tab の順で同伴する。
+            st.registry()
+                .close_target(&TargetId::parse(&id32(1)).unwrap())
+                .unwrap();
+            let f = call(&st, Some(c), &ping(3)).await;
+            assert_eq!(f.len(), 3);
+            assert_eq!(
+                f[1],
+                json!({"method":"Target.detachedFromTarget","sessionId":tab,"params":{
+                    "sessionId": page, "targetId": id32(1)}})
+            );
+            assert_eq!(
+                f[2],
+                json!({"method":"Target.detachedFromTarget","params":{
+                    "sessionId": tab, "targetId": id32(1 | (1 << 62))}})
+            );
+            // 通知は 1 回だけ。
+            assert_eq!(call(&st, Some(c), &ping(4)).await.len(), 1);
         }
     }
 }

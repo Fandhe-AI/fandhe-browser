@@ -8,7 +8,7 @@
 //!
 //! 公開入口は無く crate 内部専用。後続タスクは [`builtin_handlers`] へメソッドを
 //! 追加するだけでよい（`Page.navigate` は 42.2 で登録済み、イベント送出は 42.3 で実装済み、
-//! `DOM.getDocument`・`DOM.querySelector` は 42.4・42.5、`DOM.requestChildNodes` は #657、`Browser.getVersion` は TASK-43.3a、`Target.getTargetInfo` は TASK-43.3b、`Target.setAutoAttach`・`Browser.setDownloadBehavior` は TASK-43.3c、`Target.createBrowserContext` は TASK-43.3d、`Target.getBrowserContexts` は #1323、`Target.setDiscoverTargets` は #1324、`Target.closeTarget` は TASK-43.3h、`Target.createTarget`・`Runtime.runIfWaitingForDebugger` は TASK-43.3e、`Page.enable`・`Page.getFrameTree` は TASK-43.3i、`Log.enable`・`Runtime.enable`・`Network.enable` は TASK-43.3j、`Page.setLifecycleEventsEnabled` は TASK-43.3k、`Emulation.setFocusEmulationEnabled`・`Emulation.setEmulatedMedia` は TASK-43.3m、`Page.createIsolatedWorld` は TASK-44.6（#1217）で登録済み）。
+//! `DOM.getDocument`・`DOM.querySelector` は 42.4・42.5、`DOM.requestChildNodes` は #657、`Browser.getVersion` は TASK-43.3a、`Target.getTargetInfo` は TASK-43.3b、`Target.setAutoAttach`・`Browser.setDownloadBehavior` は TASK-43.3c、`Target.createBrowserContext` は TASK-43.3d、`Target.getBrowserContexts` は #1323、`Target.setDiscoverTargets` は #1324、`Target.closeTarget` は TASK-43.3h、`Target.createTarget`・`Runtime.runIfWaitingForDebugger` は TASK-43.3e、`Page.enable`・`Page.getFrameTree` は TASK-43.3i、`Log.enable`・`Runtime.enable`・`Network.enable` は TASK-43.3j、`Performance.enable`・`Audits.enable` は #1326、`Page.setLifecycleEventsEnabled` は TASK-43.3k、`Emulation.setFocusEmulationEnabled`・`Emulation.setEmulatedMedia` は TASK-43.3m、`Page.createIsolatedWorld` は TASK-44.6（#1217）で登録済み）。
 //!
 //! # 入力の扱い
 //!
@@ -22,7 +22,7 @@
 //!
 //! [`builtin_handlers`] には `Page.navigate`（TASK-42.2）・`DOM.getDocument`（TASK-42.4）・
 //! `DOM.querySelector`（TASK-42.5）・`DOM.requestChildNodes`（#657）・
-//! `Browser.getVersion`（TASK-43.3a・`CDP-2`）・`Target.getTargetInfo`（TASK-43.3b・`CDP-2`）・`Target.setAutoAttach`・`Browser.setDownloadBehavior`（TASK-43.3c・`CDP-2`）・`Target.createBrowserContext`（TASK-43.3d・`CDP-2`）・`Target.getBrowserContexts`（#1323・`CDP-3`）・`Target.setDiscoverTargets`（#1324・`CDP-3`）・`Target.closeTarget`（TASK-43.3h・`CDP-2`）・`Target.createTarget`・`Runtime.runIfWaitingForDebugger`（TASK-43.3e・#910・`CDP-2`）・`Page.enable`・`Page.getFrameTree`（TASK-43.3i・#1037・`CDP-2`）・`Log.enable`・`Runtime.enable`・`Network.enable`（TASK-43.3j・#1038・`CDP-2`）・`Page.setLifecycleEventsEnabled`（TASK-43.3k・#1039・`CDP-2`）・`Emulation.setFocusEmulationEnabled`・`Emulation.setEmulatedMedia`（TASK-43.3m・#1041・`CDP-2`）・`Page.createIsolatedWorld`（TASK-44.6・#1217・`CDP-2`）・`Runtime.evaluate`・`Runtime.releaseObject`（TASK-44.7・#1218・`CDP-2`）のみ登録済みで、
+//! `Browser.getVersion`（TASK-43.3a・`CDP-2`）・`Target.getTargetInfo`（TASK-43.3b・`CDP-2`）・`Target.setAutoAttach`・`Browser.setDownloadBehavior`（TASK-43.3c・`CDP-2`）・`Target.createBrowserContext`（TASK-43.3d・`CDP-2`）・`Target.getBrowserContexts`（#1323・`CDP-3`）・`Target.setDiscoverTargets`（#1324・`CDP-3`）・`Target.closeTarget`（TASK-43.3h・`CDP-2`）・`Target.createTarget`・`Runtime.runIfWaitingForDebugger`（TASK-43.3e・#910・`CDP-2`）・`Page.enable`・`Page.getFrameTree`（TASK-43.3i・#1037・`CDP-2`）・`Log.enable`・`Runtime.enable`・`Network.enable`（TASK-43.3j・#1038・`CDP-2`）・`Performance.enable`・`Audits.enable`（#1326・`CDP-3`）・`Page.setLifecycleEventsEnabled`（TASK-43.3k・#1039・`CDP-2`）・`Emulation.setFocusEmulationEnabled`・`Emulation.setEmulatedMedia`（TASK-43.3m・#1041・`CDP-2`）・`Page.createIsolatedWorld`（TASK-44.6・#1217・`CDP-2`）・`Runtime.evaluate`・`Runtime.releaseObject`（TASK-44.7・#1218・`CDP-2`）のみ登録済みで、
 //! それ以外のメソッドは JSON-RPC の「method not implemented」（`-32601`）エラーを返す。
 //! 汎用の空 success フォールバック（PoC-5 の暫定挙動）は採らない。理由は次のとおり。
 //!
@@ -437,7 +437,7 @@ type HandlerTable = Vec<(&'static str, Box<dyn CommandHandler>)>;
 
 /// 組込みハンドラ表。`Page.navigate`（TASK-42.2）・`DOM.getDocument`（TASK-42.4）・
 /// `DOM.querySelector`（TASK-42.5）・`DOM.requestChildNodes`（#657）・`Browser.getVersion`（TASK-43.3a）・
-/// `Target.getTargetInfo`（TASK-43.3b）・`Target.setAutoAttach`・`Browser.setDownloadBehavior`（TASK-43.3c。実体に接続済み）・`Target.createBrowserContext`（TASK-43.3d）・`Target.getBrowserContexts`（#1323）・`Target.setDiscoverTargets`（#1324）・`Target.closeTarget`（TASK-43.3h）・`Target.createTarget`・`Runtime.runIfWaitingForDebugger`（TASK-43.3e）・`Page.enable`・`Page.getFrameTree`（TASK-43.3i・#1037）・`Log.enable`・`Runtime.enable`・`Network.enable`（TASK-43.3j・#1038）・`Page.setLifecycleEventsEnabled`（TASK-43.3k・#1039）・`Page.addScriptToEvaluateOnNewDocument`（空 source と sourceURL コメントだけの source のみ。TASK-43.3l・#1040・#1325）・`Emulation.setFocusEmulationEnabled`・`Emulation.setEmulatedMedia`（TASK-43.3m・#1041）・`Page.createIsolatedWorld`（TASK-44.6・#1217）・`Runtime.evaluate`・`Runtime.releaseObject`（TASK-44.7・#1218。isolated world のみ）を登録済み（`CDP-1`・`CDP-2`）。
+/// `Target.getTargetInfo`（TASK-43.3b）・`Target.setAutoAttach`・`Browser.setDownloadBehavior`（TASK-43.3c。実体に接続済み）・`Target.createBrowserContext`（TASK-43.3d）・`Target.getBrowserContexts`（#1323）・`Target.setDiscoverTargets`（#1324）・`Target.closeTarget`（TASK-43.3h）・`Target.createTarget`・`Runtime.runIfWaitingForDebugger`（TASK-43.3e）・`Page.enable`・`Page.getFrameTree`（TASK-43.3i・#1037）・`Log.enable`・`Runtime.enable`・`Network.enable`（TASK-43.3j・#1038）・`Performance.enable`・`Audits.enable`（#1326）・`Page.setLifecycleEventsEnabled`（TASK-43.3k・#1039）・`Page.addScriptToEvaluateOnNewDocument`（空 source と sourceURL コメントだけの source のみ。TASK-43.3l・#1040・#1325）・`Emulation.setFocusEmulationEnabled`・`Emulation.setEmulatedMedia`（TASK-43.3m・#1041）・`Page.createIsolatedWorld`（TASK-44.6・#1217）・`Runtime.evaluate`・`Runtime.releaseObject`（TASK-44.7・#1218。isolated world のみ）を登録済み（`CDP-1`・`CDP-2`）。
 ///
 /// `Page.navigate` は既定の `FetchOptions`（内部アドレス拒否）で `Fetcher` を構築する。
 pub(crate) fn builtin_handlers() -> Result<HandlerTable, DispatcherError> {
@@ -539,6 +539,14 @@ pub(crate) fn builtin_handlers_with(fetch: FetchOptions) -> Result<HandlerTable,
         (
             "Network.enable",
             Box::new(crate::playwright_compat::NetworkEnable),
+        ),
+        (
+            "Performance.enable",
+            Box::new(crate::playwright_compat::PerformanceEnable),
+        ),
+        (
+            "Audits.enable",
+            Box::new(crate::playwright_compat::AuditsEnable),
         ),
         (
             "Page.getFrameTree",
@@ -693,9 +701,16 @@ fn auto_attach_events(
     for (target_id, sid) in &rec.detached {
         events.push(crate::playwright_compat::detached_event(target_id, sid));
     }
+    // tab 経路の消失は 子のページ（エンベロープは tab のセッション）→ tab の順（#1334・`CDP-7`）。
+    for td in &rec.tab_detached {
+        events.extend(crate::playwright_compat::tab_detach_events(td));
+    }
     // 順序は detached → destroyed → created → attached（Chromium の順。#1324・`CDP-3`・`CDP-7`）。
     for tid in &rec.destroyed {
         events.push(crate::playwright_compat::target_destroyed_event(tid));
+    }
+    for (info, attached) in &rec.created_tabs {
+        events.push(crate::playwright_compat::tab_created_event(info, *attached));
     }
     for (info, attached) in &rec.created {
         events.push(crate::playwright_compat::target_created_event(
@@ -704,6 +719,11 @@ fn auto_attach_events(
     }
     for (info, sid) in &rec.attached {
         events.push(crate::playwright_compat::attached_event(info, sid, false));
+    }
+    for (info, sid) in &rec.tab_attached {
+        events.push(crate::playwright_compat::tab_attached_event(
+            info, sid, false,
+        ));
     }
     events
 }
