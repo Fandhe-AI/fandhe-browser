@@ -32,7 +32,7 @@ Puppeteer のソースは長く引用せず、クラス・関数名と要約に�
 
 | 段階 | 実測 | 予測（B） | 予測の根拠 |
 | ---- | ---- | --------- | ---------- |
-| `connect` | 未実測 | 失敗する見込み | 接続直後の最初の送信 `Target.getBrowserContexts`（root session）は #1323 で実装済み（#1）。次の `Target.setDiscoverTargets` が組込みハンドラ無しで `-32601` になる（#2。#1324）。#1323 後の実機測定は未実施 |
+| `connect` | 未実測 | 失敗する見込み | 接続直後の最初の送信 `Target.getBrowserContexts`（root session）は #1323、続く `Target.setDiscoverTargets` は #1324 で実装済み（#1・#2。`filter` は省略か `[{}]` のみ。既存ターゲットの `Target.targetCreated` は応答の後に送る）。次の停止点は #3 の `Target.setAutoAttach` の `filter`（#1327）。実機測定は未実施 |
 | `newPage` | 未実測 | 未到達の見込み | `connect` が先に失敗するため |
 | `goto` | 未実測 | 未到達の見込み | 同上 |
 | `selector` | 未実測 | 未到達の見込み | 同上 |
@@ -51,7 +51,7 @@ Playwright と異なり、`browserWSEndpoint` 指定の接続では HTTP の `/j
 | # | 段階 | Puppeteer の箇所 | 送る CDP メソッド | 読む応答・待つイベント | 現状の応答 | 不足 | 種別 |
 | - | ---- | ---------------- | ----------------- | ---------------------- | ---------- | ---- | ---- |
 | 1 | connect | `_connectToCdpBrowser` | `Target.getBrowserContexts`（root。接続後の最初の送信） | `browserContextIds`（配列。既存 context の把握） | 実装済み（#1323）。自接続が所有する非既定 context の `browserContextIds` を作成順に返す（context 未作成なら空配列。既定 context は含めず、他接続の context も返さない） | なし（`TargetInfo` は `browserContextId` を持たない点は別途） | B |
-| 2 | connect | `TargetManager.initialize` | `Target.setDiscoverTargets` `{discover:true, filter}` | 応答は読み捨て。以後 `Target.targetCreated`・`targetInfoChanged`・`targetDestroyed` を購読 | `-32601` | ハンドラと `Target.targetCreated` 等の送出 | B |
+| 2 | connect | `TargetManager.initialize` | `Target.setDiscoverTargets` `{discover:true, filter}` | 応答は読み捨て。以後 `Target.targetCreated`・`targetInfoChanged`・`targetDestroyed` を購読 | #1324 で実装済み（`-32601` ではない）。`filter` は省略か `[{}]` のみ、既存ターゲットの通知は応答の後（Chromium は前。`initialize()` の初期化待ちに既存ページが入らない。#1327 の tab モデル時に見直す）。`targetInfoChanged` と browser・tab 型の通知は未実装 | ハンドラと `Target.targetCreated`・`targetDestroyed` の送出（実装済み。`targetInfoChanged` は未実装） | B |
 | 3 | connect | `TargetManager.initialize` | `Target.setAutoAttach` `{autoAttach:true, waitForDebuggerOnStart:true, flatten:true, filter}`（root。`page` を除外するフィルタ付き） | 応答は読み捨て。以後 `Target.attachedToTarget` を購読し、既存 `tab` ターゲットの初期化完了まで `connect` が待つ | `-32601` | ハンドラ、自動 attach の実体（`TargetRegistry::attach` は CDP から未接続）、filter の解釈 | B |
 | 4 | newPage | `CdpBrowser._createPageInContext` | `Target.createTarget` `{url:"about:blank", browserContextId?}` | 応答の `targetId`。その後 `waitForTarget` で、同 `targetId` のターゲットが `targetCreated`／attach 経由で現れるのを待つ | `-32601` | ハンドラ（`TargetRegistry::create_target` は存在するが未接続。上限 `MAX_TARGETS`=64） | B |
 | 5 | newPage | `TargetManager.#onAttachedToTarget` | イベント `Target.attachedToTarget`（`sessionId`・`targetInfo`）。受信後に `Target.setAutoAttach`（子 session）・`Runtime.runIfWaitingForDebugger` を送る | `targetInfo.targetId`・`type`・`url`・`browserContextId`。`waitForDebugger` 中のターゲットは `runIfWaitingForDebugger` で解放される | 送出経路なし。現実装のイベントはコマンド応答に同伴する形のみ（`HandlerOutput.events`） | `Target.attachedToTarget` の生成、子 session 向けの 2 メソッド | B |
@@ -83,7 +83,7 @@ Playwright と異なり、`browserWSEndpoint` 指定の接続では HTTP の `/j
 | 区分 | 項目 | 影響する実装箇所 |
 | ---- | ---- | ---------------- |
 | 両方が必要 | `Target.setAutoAttach`・`Target.createTarget`・`Target.attachedToTarget` 送出・子 session の `runIfWaitingForDebugger`・`Page.enable`・`Page.getFrameTree`・`Page.setLifecycleEventsEnabled`・`Runtime.enable`・`Network.enable`・`Log.enable`・`Page.createIsolatedWorld`（握りつぶし）・`Emulation.*` | `target.rs`（ターゲット・attach・上限）、イベント送出経路（`DispatchOutcome`）、page 状態モデル（frame tree・実行コンテキスト） |
-| Puppeteer のみ | `Target.getBrowserContexts`（#1323 で実装済み）・`Target.setDiscoverTargets`（＋ `Target.targetCreated` 系イベント）・`Performance.enable`・`Audits.enable`・`Target` の `tab` 型階層・`Runtime.callFunctionOn` 等の評価系（`page.$`） | `target.rs`（discover とイベント）、`Runtime` ドメイン |
+| Puppeteer のみ | `Target.getBrowserContexts`（#1323 で実装済み）・`Target.setDiscoverTargets`（#1324 で実装済み。`Target.targetCreated`・`targetDestroyed` を送出。`targetInfoChanged` は未実装）・`Performance.enable`・`Audits.enable`・`Target` の `tab` 型階層・`Runtime.callFunctionOn` 等の評価系（`page.$`） | `target.rs`（discover とイベント）、`Runtime` ドメイン |
 | Playwright のみ | `/json/version/` の末尾スラッシュ受理・`Browser.getVersion`・`Browser.setDownloadBehavior`・`Target.createBrowserContext`・`Target.getTargetInfo`・`Page.frameNavigated`（初期 `about:blank`）の送出 | `server.rs`・`protocol.rs`・browser context の追加 |
 
 所見（B に基づく）:
@@ -110,7 +110,7 @@ Playwright と異なり、`browserWSEndpoint` 指定の接続では HTTP の `/j
 
 | 候補 | 影響範囲 |
 | ---- | -------- |
-| `Target.setDiscoverTargets`（`Target.getBrowserContexts` は #1323 で実装済み）・`Target.setAutoAttach`・`Target.createTarget` と `Target.targetCreated`／`attachedToTarget` の実装 | `target.rs`・イベント送出経路 |
+| `Target.setDiscoverTargets`（#1324 で実装済み。`Target.getBrowserContexts` は #1323 で実装済み）・`Target.setAutoAttach`・`Target.createTarget` と `Target.targetCreated`／`attachedToTarget` の実装 | `target.rs`・イベント送出経路 |
 | ページ session 初期化メソッド群（#6〜#8）の最小実装 | page 状態モデル。メソッドごとに「実装」か「明示エラー」かを選ぶ |
 | `Page.lifecycleEvent` の送出 | `navigation.rs`・`page.rs` |
 | `Runtime` の実行コンテキストと評価系の最小実装 | 新規モジュール（JS エンジン抽象との接続を含む。設計判断が必要） |

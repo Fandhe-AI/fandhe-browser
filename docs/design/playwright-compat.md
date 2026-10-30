@@ -243,7 +243,9 @@ TASK-43.h1（Issue #248）のオーナー判断（2026-10-10）を記録する�
 - ブラウザ ID は別名前空間（最上位ビット）で払い出すため、ページの `targetId` と衝突しない
 - Chromium との差異（`REPAIR-3`）: `waitingForDebugger:true` は作成した接続にだけ通知しクライアントごとの待ちは持たない。
   既定 context に作ったターゲットは作成接続の切断では閉じない（`Target.closeTarget` で閉じる。`MAX_TARGETS` が歯止め）
-- 未実装: 任意 URL の読み込み、`Target.targetCreated`（`Target.setDiscoverTargets` が未実装）、window 系 params、
+- discover 有効な接続（`Target.setDiscoverTargets`。#1324・`CDP-3`）では `Target.targetCreated` を `attachedToTarget` より前に送る。
+  Playwright は `setDiscoverTargets` を送らないため、Playwright の経路は変わらない
+- 未実装: 任意 URL の読み込み、window 系 params、
   初期読み込み時の `Page.frameNavigated` 等（`Page.enable` が未実装）
 
 実測（`make trace-playwright`。`playwright-core` 1.63.0。`worldName` の乱数ハッシュを `<WORLD_HASH>` へ正規化した上で、2 回の実行で同一出力）:

@@ -25,6 +25,7 @@
 //! セッションの `Page.navigate` が `Page.lifecycleEvent` の `init`・`load` を送る。#1322 で `DOMContentLoaded` も送る）を足す。
 //! 43.3l（#1040）で `Page.addScriptToEvaluateOnNewDocument`（空 `source` のみ受理・非空は拒否）と
 //! セッション付き `Target.setAutoAttach`（状態の保持のみ・子 attach は 0 件）を足す。接続スコープの状態と寿命は [`crate::conn_state`]。方針は `docs/design/playwright-compat.md`。
+//! #1324 で `Target.setDiscoverTargets`（`filter` は省略か `[{}]` のみ）と `Target.targetCreated`・`Target.targetDestroyed` の送出を足す。
 //! 43.3m（#1041）で `Emulation.setFocusEmulationEnabled`・`Emulation.setEmulatedMedia` を足す。Playwright 既定値（`enabled:true`、
 //! `media:""` と既定 4 feature）だけを受理して検証済みの値をセッション状態に保持し、どの API からも読まない（観測できる
 //! 効果は無い。`REPAIR-3`）。`setDeviceMetricsOverride`・`setUserAgentOverride`・`setLocaleOverride`・`setTimezoneOverride` は
@@ -228,6 +229,106 @@ pub(crate) fn detached_event(target_id: &TargetId, session_id: &SessionId) -> Cd
     }
 }
 
+/// `Target.targetCreated`（ブラウザレベル）イベントを組み立てる（#1324・`CDP-3`）。
+/// `attached` はこの接続が attach する前の時点で、何らかのセッションが attach 中か。
+/// 呼び出し元は discover 有効な接続への通知（`TargetSetDiscoverTargets`・`TargetCreateTarget`・
+/// `protocol::auto_attach_events`）。
+pub(crate) fn target_created_event(info: &TargetInfo, attached: bool) -> CdpEvent {
+    CdpEvent {
+        method: "Target.targetCreated",
+        params: json!({ "targetInfo": page_target_info(info, attached) }),
+        session_id: None,
+    }
+}
+
+/// `Target.targetDestroyed`（ブラウザレベル）イベントを組み立てる（#1324・`CDP-3`）。
+pub(crate) fn target_destroyed_event(target_id: &TargetId) -> CdpEvent {
+    CdpEvent {
+        method: "Target.targetDestroyed",
+        params: json!({ "targetId": target_id.as_str() }),
+        session_id: None,
+    }
+}
+
+/// `Target.setDiscoverTargets`（`CDP-3`・`CDP-7`・`CDP-6`・`SEC-2`・`REPAIR-3`・TASK-45・TASK-46・#1324）。
+///
+/// Puppeteer の `connect()`（`TargetManager.initialize`）が `Target.getBrowserContexts` の次に root へ
+/// 送る（`{discover:true, filter:[{}]}`）。接続スコープで discover を有効にし、既存ターゲットの
+/// `Target.targetCreated` を**応答の後**に送る。以後は `Target.createTarget`・`Target.closeTarget` と、
+/// 他経路（他接続の操作・context 破棄・`/json/*`・registry 直接）での出現・消滅を
+/// `protocol::auto_attach_events` が次のコマンドへ同伴して通知する（push 経路が無いため）。
+/// `discover:false` は状態を捨てて以後の送出を止める（`Target.targetDestroyed` は送らない。Chromium も同じ）。
+///
+/// 受理する `filter` は省略か `[{}]` だけ（それ以外は黙って無視せず `UNSUPPORTED_PARAMS`。`CDP-6`）。
+/// 省略は `[{}]` と結果が同じ（registry にはページしか無い）ため受理する。tab 型ターゲットを足したら
+/// 同じでなくなるので見直す（#1327）。`discover:false` でも filter は同じ規則で検証する。
+/// `discover` 以外・`filter` 以外のキーは `UNSUPPORTED_PARAMS`、`discover` の欠落・非 bool と params が
+/// object でない場合は `INVALID_PARAMS`、`sessionId` 付きは `UNSUPPORTED_PARAMS`、接続なし・切断済みは
+/// `NO_CONNECTION`。失敗時は状態を変えない。
+///
+/// Chromium との差異（`REPAIR-3`）:
+/// - Chromium は既存ターゲットを応答より前に通知する。本実装は応答の後（受入基準・`DispatchOutcome` の規約）。
+///   Puppeteer の `initialize()` は応答直後に発見済みの表を読むため、既存ページは初期化待ちに入らない
+///   （ソース読解による想定で、実測は未確認）。tab モデル（#1327）の実装時に順序を見直す。
+/// - 通知対象は既定 context と自接続所有 context のページだけ（他接続の context の存在を漏らさない）。
+///   browser 型・tab 型ターゲットは通知しない。`Target.targetInfoChanged` も送らない。
+/// - `targetInfo.attached` は通知時点（この接続の attach より前）の実値で、その後の変化は通知しない。
+pub(crate) struct TargetSetDiscoverTargets;
+
+impl CommandHandler for TargetSetDiscoverTargets {
+    fn handle<'a>(
+        &'a self,
+        ctx: CommandContext<'a>,
+        params: &'a Value,
+    ) -> BoxFuture<'a, Result<HandlerOutput, CdpError>> {
+        Box::pin(async move {
+            if ctx.session_id.is_some() {
+                return Err(CdpError::UNSUPPORTED_PARAMS);
+            }
+            let Some(obj) = params.as_object() else {
+                return Err(CdpError::INVALID_PARAMS);
+            };
+            if obj.keys().any(|k| k != "discover" && k != "filter") {
+                return Err(CdpError::UNSUPPORTED_PARAMS);
+            }
+            let discover = obj
+                .get("discover")
+                .and_then(Value::as_bool)
+                .ok_or(CdpError::INVALID_PARAMS)?;
+            if let Some(f) = obj.get("filter") {
+                // 長さ 1 の配列で中身が空 object のときだけ受理する（入力の大きさで処理量は増えない）。
+                let ok = matches!(f.as_array().map(Vec::as_slice),
+                    Some([e]) if e.as_object().is_some_and(|o| o.is_empty()));
+                if !ok {
+                    return Err(CdpError::UNSUPPORTED_PARAMS);
+                }
+            }
+            let conn = ctx.conn.ok_or(CdpError::NO_CONNECTION)?;
+            let state = ctx.state;
+            let mut out = HandlerOutput::result(json!({}));
+            if discover {
+                let (created, destroyed) = state
+                    .conn_scoped()
+                    .enable_discover(conn, state.registry())
+                    .map_err(conn_error)?;
+                // 消滅 → 新規の順（`auto_attach_events` と同じ。`CDP-3`・`CDP-7`）。
+                for tid in &destroyed {
+                    out = out.with_event(target_destroyed_event(tid));
+                }
+                for (info, attached) in &created {
+                    out = out.with_event(target_created_event(info, *attached));
+                }
+            } else {
+                state
+                    .conn_scoped()
+                    .disable_discover(conn)
+                    .map_err(conn_error)?;
+            }
+            Ok(out)
+        })
+    }
+}
+
 /// `Target.createBrowserContext`（`CDP-2`・`CDP-7`・TASK-43.3d・#909）。
 ///
 /// 接続が所有する browser context を作り `{"browserContextId"}` を返す。所有する context は接続の
@@ -335,8 +436,8 @@ impl CommandHandler for TargetGetBrowserContexts {
 /// にして存在を問い合わせる手段にしない。`sessionId` 付きは `UNSUPPORTED_PARAMS`、接続なしは
 /// `NO_CONNECTION`。ブラウザ全体は終了しない。
 ///
-/// 未実装（`REPAIR-3`）: `Target.targetDestroyed` は `Target.setDiscoverTargets` が未実装で
-/// discover 有効な接続が存在しないため送らない。実装時は下の `detachedFromTarget` の後ろへ足す。
+/// discover 有効（[`TargetSetDiscoverTargets`]）で通知済みのターゲットなら、`Target.detachedFromTarget` の
+/// 後に `Target.targetDestroyed` を送る（Chromium と同じ順。#1324・`CDP-3`）。
 pub(crate) struct TargetCloseTarget;
 
 impl CommandHandler for TargetCloseTarget {
@@ -360,7 +461,7 @@ impl CommandHandler for TargetCloseTarget {
                 return Err(CdpError::INVALID_PARAMS);
             }
             let conn = ctx.conn.ok_or(CdpError::NO_CONNECTION)?;
-            let sessions = state
+            let closed = state
                 .conn_scoped()
                 .close_target(conn, state.registry(), &id)
                 .map_err(|e| match e {
@@ -369,10 +470,12 @@ impl CommandHandler for TargetCloseTarget {
                 })?;
             state.navigations().forget(&id);
             let mut out = HandlerOutput::result(json!({ "success": true }));
-            for sid in &sessions {
+            for sid in &closed.sessions {
                 out = out.with_event(detached_event(&id, sid));
             }
-            // TODO(REPAIR-3): `Target.setDiscoverTargets` 実装時にここへ `Target.targetDestroyed` を足す。
+            if closed.announce_destroyed {
+                out = out.with_event(target_destroyed_event(&id));
+            }
             Ok(out)
         })
     }
@@ -396,8 +499,10 @@ impl CommandHandler for TargetCloseTarget {
 /// `UNSUPPORTED_PARAMS`、接続なしは `NO_CONNECTION`、上限（ターゲット・セッション）超過は
 /// `SERVER_ERROR`（巻き戻し済みで何も作らない）。
 ///
-/// 未実装（`REPAIR-3`）: 任意 URL の読み込み、`Target.targetCreated`（`Target.setDiscoverTargets` が
-/// 未実装）、初期 `about:blank` 読み込み時の `Page.frameNavigated`（`Page.enable` は 43.3i で実装済みだが未送出。段階 4 で要否を実測で判断）、クライアントごとの待ち。
+/// discover 有効な接続（[`TargetSetDiscoverTargets`]）では `Target.targetCreated`（`attached:false`）を
+/// `Target.attachedToTarget` より前、応答より前に送る（Chromium と同じ順。#1324・`CDP-3`）。
+///
+/// 未実装（`REPAIR-3`）: 任意 URL の読み込み、初期 `about:blank` 読み込み時の `Page.frameNavigated`（`Page.enable` は 43.3i で実装済みだが未送出。段階 4 で要否を実測で判断）、クライアントごとの待ち。
 /// 既定 context に作ったターゲットは作成接続の切断では閉じない（Chromium のタブと同じ。
 /// `Target.closeTarget` で閉じる。上限 `MAX_TARGETS` が歯止め）。
 pub(crate) struct TargetCreateTarget;
@@ -452,6 +557,9 @@ impl CommandHandler for TargetCreateTarget {
             }
             let mut out =
                 HandlerOutput::result(json!({ "targetId": created.info.target_id().as_str() }));
+            if created.announce_created {
+                out = out.with_pre_event(target_created_event(&created.info, false));
+            }
             if let Some(sid) = &created.session {
                 out = out.with_pre_event(attached_event(
                     &created.info,
@@ -1686,6 +1794,361 @@ mod tests {
         async fn make_context(st: &Arc<CdpState>, c: ConnId) -> BrowserContextId {
             let f = call(st, Some(c), &create_ctx(1)).await;
             BrowserContextId::parse(f[0]["result"]["browserContextId"].as_str().unwrap()).unwrap()
+        }
+
+        fn discover(id: i64, extra: &str) -> String {
+            format!(r#"{{"id":{id},"method":"Target.setDiscoverTargets","params":{{{extra}}}}}"#)
+        }
+
+        fn created_ev(t: &TargetId, url: &str, attached: bool) -> Value {
+            json!({"method":"Target.targetCreated","params":{"targetInfo":{
+                "targetId": t.as_str(), "type":"page", "title": url, "url": url,
+                "attached": attached, "canAccessOpener": false,
+                "browserContextId": "00000000000000000000000000000001"}}})
+        }
+
+        fn destroyed_ev(t: &TargetId) -> Value {
+            json!({"method":"Target.targetDestroyed","params":{"targetId": t.as_str()}})
+        }
+
+        fn ping(id: i64) -> String {
+            format!(r#"{{"id":{id},"method":"Browser.getVersion"}}"#)
+        }
+
+        const DISCOVER_ON: &str = r#""discover":true,"filter":[{}]"#;
+
+        #[tokio::test]
+        async fn cdp3_set_discover_targets_announces_existing_targets_after_response() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let c = open_conn(&st, 1);
+            let t1 = new_page(&st, "about:blank");
+            let t2 = new_page(&st, "https://example.test/");
+            let f = call(&st, Some(c), &discover(1, DISCOVER_ON)).await;
+            assert_eq!(
+                f,
+                vec![
+                    json!({"id":1,"result":{}}),
+                    created_ev(&t1, "about:blank", false),
+                    created_ev(&t2, "https://example.test/", false),
+                ]
+            );
+        }
+
+        #[tokio::test]
+        async fn cdp3_set_discover_targets_reports_attached_for_attached_targets() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let c = open_conn(&st, 1);
+            let t1 = new_page(&st, "about:blank");
+            call(&st, Some(c), &auto_attach(1, ON)).await;
+            let f = call(&st, Some(c), &discover(2, DISCOVER_ON)).await;
+            assert_eq!(
+                f,
+                vec![
+                    json!({"id":2,"result":{}}),
+                    created_ev(&t1, "about:blank", true)
+                ]
+            );
+        }
+
+        #[tokio::test]
+        async fn cdp3_set_discover_targets_is_idempotent_and_filter_may_be_omitted() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let c = open_conn(&st, 1);
+            let t1 = new_page(&st, "about:blank");
+            let f = call(&st, Some(c), &discover(1, r#""discover":true"#)).await;
+            assert_eq!(
+                f,
+                vec![
+                    json!({"id":1,"result":{}}),
+                    created_ev(&t1, "about:blank", false)
+                ]
+            );
+            let f = call(&st, Some(c), &discover(2, DISCOVER_ON)).await;
+            assert_eq!(f, vec![json!({"id":2,"result":{}})]);
+        }
+
+        #[tokio::test]
+        async fn cdp3_set_discover_targets_false_stops_events_and_reenable_replays() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let c = open_conn(&st, 1);
+            let t1 = new_page(&st, "about:blank");
+            call(&st, Some(c), &discover(1, DISCOVER_ON)).await;
+            let f = call(&st, Some(c), &discover(2, r#""discover":false"#)).await;
+            assert_eq!(f, vec![json!({"id":2,"result":{}})]);
+            let _t2 = new_page(&st, "about:blank");
+            st.registry().close_target(&t1).unwrap();
+            assert_eq!(call(&st, Some(c), &ping(3)).await.len(), 1);
+            // 再び有効にすると現存する全件を通知し直す。
+            let f = call(&st, Some(c), &discover(4, DISCOVER_ON)).await;
+            assert_eq!(f.len(), 2);
+            assert_eq!(f[1]["method"], "Target.targetCreated");
+        }
+
+        #[tokio::test]
+        async fn cdp3_create_target_emits_target_created_before_attached_and_response() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let c = open_conn(&st, 1);
+            call(&st, Some(c), &discover(1, DISCOVER_ON)).await;
+            // discover だけ: [targetCreated, response]
+            let f = call(
+                &st,
+                Some(c),
+                r#"{"id":2,"method":"Target.createTarget","params":{"url":"about:blank"}}"#,
+            )
+            .await;
+            assert_eq!(f.len(), 2);
+            assert_eq!(f[0]["method"], "Target.targetCreated");
+            assert_eq!(f[0]["params"]["targetInfo"]["attached"], false);
+            let tid = f[1]["result"]["targetId"].as_str().unwrap().to_owned();
+            assert_eq!(f[0]["params"]["targetInfo"]["targetId"], tid.as_str());
+            // 自動 attach も有効: [targetCreated, attachedToTarget, response]
+            call(&st, Some(c), &auto_attach(3, ON)).await;
+            let f = call(
+                &st,
+                Some(c),
+                r#"{"id":4,"method":"Target.createTarget","params":{"url":"about:blank"}}"#,
+            )
+            .await;
+            assert_eq!(f.len(), 3);
+            assert_eq!(f[0]["method"], "Target.targetCreated");
+            assert_eq!(f[1]["method"], "Target.attachedToTarget");
+            assert_eq!(f[2]["id"], 4);
+            // 直後の reconcile で二重通知しない。
+            assert_eq!(call(&st, Some(c), &ping(5)).await.len(), 1);
+        }
+
+        #[tokio::test]
+        async fn cdp3_create_target_without_discover_emits_no_target_created() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let c = open_conn(&st, 1);
+            let f = call(
+                &st,
+                Some(c),
+                r#"{"id":1,"method":"Target.createTarget","params":{"url":"about:blank"}}"#,
+            )
+            .await;
+            assert_eq!(f.len(), 1);
+        }
+
+        #[tokio::test]
+        async fn cdp3_close_target_emits_target_destroyed_after_detached() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let c = open_conn(&st, 1);
+            let t = new_page(&st, "about:blank");
+            call(&st, Some(c), &auto_attach(1, ON)).await;
+            call(&st, Some(c), &discover(2, DISCOVER_ON)).await;
+            let f = call(
+                &st,
+                Some(c),
+                &format!(
+                    r#"{{"id":3,"method":"Target.closeTarget","params":{{"targetId":"{}"}}}}"#,
+                    t.as_str()
+                ),
+            )
+            .await;
+            assert_eq!(f.len(), 3);
+            assert_eq!(f[0], json!({"id":3,"result":{"success":true}}));
+            assert_eq!(f[1]["method"], "Target.detachedFromTarget");
+            assert_eq!(f[2], destroyed_ev(&t));
+            assert_eq!(call(&st, Some(c), &ping(4)).await.len(), 1);
+        }
+
+        #[tokio::test]
+        async fn cdp7_discover_notifies_other_connection_changes_once() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let a = open_conn(&st, 1);
+            let b = open_conn(&st, 2);
+            call(&st, Some(b), &discover(1, DISCOVER_ON)).await;
+            let f = call(
+                &st,
+                Some(a),
+                r#"{"id":1,"method":"Target.createTarget","params":{"url":"about:blank"}}"#,
+            )
+            .await;
+            let tid = TargetId::parse(f[0]["result"]["targetId"].as_str().unwrap()).unwrap();
+            let f = call(&st, Some(b), &ping(2)).await;
+            assert_eq!(f.len(), 2);
+            assert_eq!(f[1], created_ev(&tid, "about:blank", false));
+            assert_eq!(call(&st, Some(b), &ping(3)).await.len(), 1);
+            call(
+                &st,
+                Some(a),
+                &format!(
+                    r#"{{"id":2,"method":"Target.closeTarget","params":{{"targetId":"{}"}}}}"#,
+                    tid.as_str()
+                ),
+            )
+            .await;
+            let f = call(&st, Some(b), &ping(4)).await;
+            assert_eq!(f.len(), 2);
+            assert_eq!(f[1], destroyed_ev(&tid));
+            assert_eq!(call(&st, Some(b), &ping(5)).await.len(), 1);
+        }
+
+        #[tokio::test]
+        async fn cdp7_discover_reenable_reports_destroyed_targets() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let a = open_conn(&st, 1);
+            let t = new_page(&st, "about:blank");
+            call(&st, Some(a), &discover(1, DISCOVER_ON)).await;
+            // 他接続が閉じた後に discover:true を再送しても targetDestroyed が届く。
+            st.registry().close_target(&t).unwrap();
+            let f = call(&st, Some(a), &discover(2, DISCOVER_ON)).await;
+            assert_eq!(f, vec![json!({"id":2,"result":{}}), destroyed_ev(&t)]);
+            assert_eq!(call(&st, Some(a), &ping(3)).await.len(), 1);
+        }
+
+        #[tokio::test]
+        async fn cdp3_discover_notifications_precede_handler_attached_events() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let c = open_conn(&st, 1);
+            call(&st, Some(c), &discover(1, DISCOVER_ON)).await;
+            let _t = new_page(&st, "about:blank");
+            let f = call(
+                &st,
+                Some(c),
+                &auto_attach(
+                    2,
+                    r#""autoAttach":true,"waitForDebuggerOnStart":false,"flatten":true"#,
+                ),
+            )
+            .await;
+            let methods: Vec<&str> = f.iter().filter_map(|v| v["method"].as_str()).collect();
+            assert_eq!(
+                methods,
+                vec!["Target.targetCreated", "Target.attachedToTarget"]
+            );
+        }
+
+        #[tokio::test]
+        async fn cdp7_discover_hides_other_connections_contexts() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let a = open_conn(&st, 1);
+            let b = open_conn(&st, 2);
+            let ctx = make_context(&st, b).await;
+            let _hidden = st
+                .registry()
+                .create_target_in(&ctx, TargetKind::Page, "about:blank")
+                .unwrap();
+            let f = call(&st, Some(a), &discover(1, DISCOVER_ON)).await;
+            assert_eq!(f, vec![json!({"id":1,"result":{}})]);
+            // 所有者の B には通知される。
+            let f = call(&st, Some(b), &discover(1, DISCOVER_ON)).await;
+            assert_eq!(f.len(), 2);
+            // B の切断で context ごと消えても A には何も届かない。
+            st.release_connection(b);
+            assert_eq!(call(&st, Some(a), &ping(2)).await.len(), 1);
+        }
+
+        #[tokio::test]
+        async fn cdp7_discover_reports_registry_direct_changes() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let c = open_conn(&st, 1);
+            call(&st, Some(c), &discover(1, DISCOVER_ON)).await;
+            let t = new_page(&st, "about:blank");
+            let f = call(&st, Some(c), &ping(2)).await;
+            assert_eq!(f.len(), 2);
+            assert_eq!(f[1], created_ev(&t, "about:blank", false));
+            st.registry().close_target(&t).unwrap();
+            let f = call(&st, Some(c), &ping(3)).await;
+            assert_eq!(f[1], destroyed_ev(&t));
+        }
+
+        #[tokio::test]
+        async fn cdp3_set_discover_targets_rejects_bad_params_without_state_change() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let c = open_conn(&st, 1);
+            let _t = new_page(&st, "about:blank");
+            let unsupported = |id: i64| err(-32602, "unsupported params", id);
+            let invalid = |id: i64| err(-32602, "invalid params", id);
+            for (i, extra) in [
+                r#""discover":true,"filter":[]"#,
+                r#""discover":true,"filter":[{},{}]"#,
+                r#""discover":true,"filter":[{"type":"page"}]"#,
+                r#""discover":true,"filter":[{"exclude":true}]"#,
+                r#""discover":true,"filter":{}"#,
+                r#""discover":true,"filter":null"#,
+                r#""discover":false,"filter":[{"type":"page"}]"#,
+                r#""discover":true,"x":1"#,
+            ]
+            .iter()
+            .enumerate()
+            {
+                let id = i as i64 + 1;
+                let f = call(&st, Some(c), &discover(id, extra)).await;
+                assert_eq!(f, vec![unsupported(id)], "{extra}");
+            }
+            for (id, extra) in [(20, r#""filter":[{}]"#), (21, r#""discover":"yes""#)] {
+                let f = call(&st, Some(c), &discover(id, extra)).await;
+                assert_eq!(f, vec![invalid(id)], "{extra}");
+            }
+            let f = call(
+                &st,
+                Some(c),
+                r#"{"id":22,"method":"Target.setDiscoverTargets","params":[]}"#,
+            )
+            .await;
+            assert_eq!(f, vec![invalid(22)]);
+            let f = call(
+                &st,
+                Some(c),
+                r#"{"id":23,"sessionId":"S1","method":"Target.setDiscoverTargets","params":{"discover":true}}"#,
+            )
+            .await;
+            assert_eq!(
+                f,
+                vec![
+                    json!({"id":23,"sessionId":"S1","error":{"code":-32602,"message":"unsupported params"}})
+                ]
+            );
+            let f = call(&st, None, &discover(24, DISCOVER_ON)).await;
+            assert_eq!(f, vec![err(-32000, "no connection", 24)]);
+            // 拒否しても状態は変わらない（後続のコマンドに通知が付かない）。
+            assert_eq!(call(&st, Some(c), &ping(30)).await.len(), 1);
+        }
+
+        #[tokio::test]
+        async fn cdp7_set_discover_targets_after_release_returns_no_connection() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let c = open_conn(&st, 1);
+            st.release_connection(c);
+            let f = call(&st, Some(c), &discover(1, DISCOVER_ON)).await;
+            assert_eq!(f, vec![err(-32000, "no connection", 1)]);
+        }
+
+        #[tokio::test]
+        async fn cdp7_discover_is_bounded_by_max_targets() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let c = open_conn(&st, 1);
+            for _ in 0..crate::target::MAX_TARGETS {
+                new_page(&st, "about:blank");
+            }
+            let f = call(&st, Some(c), &discover(1, DISCOVER_ON)).await;
+            assert_eq!(f.len(), 1 + crate::target::MAX_TARGETS);
+            // 上限超過の createTarget は従来どおり失敗し、通知も増えない。
+            let f = call(
+                &st,
+                Some(c),
+                r#"{"id":2,"method":"Target.createTarget","params":{"url":"about:blank"}}"#,
+            )
+            .await;
+            assert_eq!(f, vec![err(-32000, "server error", 2)]);
+            assert_eq!(call(&st, Some(c), &ping(3)).await.len(), 1);
         }
 
         #[tokio::test]
