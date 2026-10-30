@@ -69,8 +69,8 @@
 //! ルートまでの各ディレクトリと `profile.lock` を `FILE_SHARE_DELETE` なしで開いて保持し
 //! （`Profile` はルート・4 つのデータ種別ディレクトリのハンドルと `profile.lock` のハンドルを
 //! 生存中持つ）、改名・削除による別実体への差し替えを防ぐ。`create_file_in` は保持する
-//! データ種別ディレクトリのハンドルを親にして開く。Windows では所有者・ハードリンク数の
-//! 検査をしない（REPAIR-3。残る限界は `local_root.rs` のモジュール doc「限界」）。
+//! データ種別ディレクトリのハンドルを親にして開く。Windows では開いたハンドルで
+//! ハードリンク数 1・所有者・DACL を検証する（Issue #1313。残る限界は `local_root.rs` のモジュール doc「限界」）。
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -922,8 +922,10 @@ impl Profile {
     /// - 名前: 上記の検査に加え `validate_single_component` が予約デバイス名・末尾の `.` と空白・
     ///   `:`（ストリーム）・制御文字を `InvalidComponent` で拒否する（unix より厳しい）
     /// - 大文字小文字: 区別しない（`SID` と `sid` は同じファイル。衝突の扱いは `normalize.rs` の担当）
-    /// - 所有者・ハードリンク数・権限: 検査・変更しない（DACL はルートの保護付き DACL を継承する）。
-    ///   新しい `unsafe` が要るため未実装で、unix との差である（REPAIR-3）
+    /// - ハードリンク数: 開いたハンドルで 1 でなければ `InvalidLayout`（Issue #1313）
+    /// - 所有者・DACL: 開いたハンドルで検証し、本人・SYSTEM・Administrators の外なら `InvalidLayout`
+    ///   （ACL は書き換えず拒否する。新規作成分はルートの保護付き DACL を継承する）。
+    ///   unix の 0600 への締め直しとは異なる
     ///
     /// Windows・unix 以外の OS では [`ProfileError::Unsupported`] を返す（成功を装わない）。
     pub fn create_file_in(
@@ -3404,6 +3406,56 @@ mod tests {
             std::fs::read_dir(&outside).unwrap().count(),
             0,
             "配下外に作られた"
+        );
+    }
+
+    /// PROF-1（Windows、Issue #1313）: データディレクトリの外のファイルへのハードリンクは
+    /// `InvalidLayout` で拒否され、外側のファイルは変更されない。
+    #[cfg(windows)]
+    #[test]
+    fn prof1_windows_create_file_in_rejects_hard_linked_file() {
+        let tmp = TempDir::new();
+        let (_root, profile) = open_windows_profile(&tmp);
+        let outside = tmp.path().join("outside.txt");
+        std::fs::write(&outside, b"secret").unwrap();
+        let link = profile.data_dir(DataKind::Cookies).join("session");
+        std::fs::hard_link(&outside, &link).unwrap();
+        let err = profile
+            .create_file_in(DataKind::Cookies, std::ffi::OsStr::new("session"))
+            .expect_err("ハードリンクは拒否される");
+        assert!(
+            matches!(&err, ProfileError::InvalidLayout { reason, .. }
+                if *reason == crate::local_root::REASON_DATA_FILE_LINKS),
+            "{err:?}"
+        );
+        assert_eq!(std::fs::read(&outside).unwrap(), b"secret");
+    }
+
+    /// PROF-1・PROF-6（Windows、Issue #1313）: Everyone に読み取りを許可した既存データファイルは
+    /// `InvalidLayout` で拒否される（ACL は書き換えない）。
+    #[cfg(windows)]
+    #[test]
+    fn prof1_prof6_windows_create_file_in_rejects_file_granting_everyone() {
+        let tmp = TempDir::new();
+        let (_root, profile) = open_windows_profile(&tmp);
+        let name = std::ffi::OsStr::new("session");
+        drop(profile.create_file_in(DataKind::Cookies, name).unwrap());
+        let path = profile.data_dir(DataKind::Cookies).join("session");
+        let plain = PathBuf::from(path.to_string_lossy().trim_start_matches(r"\\?\"));
+        let out = std::process::Command::new("cmd")
+            .args(["/C", "icacls"])
+            .arg(&plain)
+            .args(["/grant", "*S-1-1-0:R"])
+            .output()
+            .expect("icacls を起動できる");
+        assert!(out.status.success(), "icacls failed: {out:?}");
+        let err = profile
+            .create_file_in(DataKind::Cookies, name)
+            .expect_err("Everyone を許可したファイルは拒否される");
+        assert!(
+            matches!(&err, ProfileError::InvalidLayout { reason, .. }
+                if *reason == crate::local_root::REASON_DATA_FILE_DACL),
+            "{err:?}"
         );
     }
 

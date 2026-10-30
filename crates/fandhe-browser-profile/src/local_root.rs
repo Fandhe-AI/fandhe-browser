@@ -69,8 +69,8 @@
 //!   ハンドルを親にした相対 open のため、配下外への書き込みにならない。
 //! - `open` の成功後に保持するのはルートと 4 つのデータ種別ディレクトリのハンドル
 //!   （[`DataDirHandles`]）。いずれも DELETE を共有しないため、`Profile` の生存中は改名・削除できない。
-//! - `create_file_in`（[`open_data_file`]）は既存ファイルの所有者・ハードリンク数を検査しない
-//!   （unix は検査する。新しい `unsafe` が要るため未実装。DACL はルートの保護付き DACL を継承する）。
+//! - `create_file_in`（[`open_data_file`]）は開いたハンドルでハードリンク数 1・所有者・DACL を
+//!   検証する（許可リストはルートと同じ。締め直さず拒否する。Issue #1313）。`profile.lock` は検査しない。
 //! - 既存の要素にも名前の検査（`validate_single_component`）がかかる。Win32 で通常は作れない
 //!   名前（予約名・末尾の `.` 等）の既存要素は `InvalidComponent` で拒否される（fail-closed）。
 //! - 入力パスの中に `%LOCALAPPDATA%` の内側へ向くジャンクションがある場合は、`plan_root` が
@@ -552,6 +552,15 @@ fn open_or_create_child_dir(
 pub(crate) const REASON_EXISTING_ROOT_OWNER: &str = "existing profile root is owned by a principal other than the current user, SYSTEM or Administrators";
 /// 既存ルートの DACL が許可した主体の外へ権限を与えている場合の拒否理由（SID は含めない）。
 pub(crate) const REASON_EXISTING_ROOT_DACL: &str = "existing profile root grants access to principals other than the current user, SYSTEM and Administrators (or has a null DACL or an unsupported ACE)";
+/// 既存データファイルのハードリンク数が 1 でない場合の拒否理由（`win32` が使う。Issue #1313・PROF-1）。
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) const REASON_DATA_FILE_LINKS: &str = "existing data file has more than one hard link (it may alias a file outside the profile); refusing to open it";
+/// 既存データファイルの所有者が許可した主体でない場合の拒否理由（SID は含めない。Issue #1313）。
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) const REASON_DATA_FILE_OWNER: &str = "existing data file is owned by a principal other than the current user, SYSTEM or Administrators";
+/// 既存データファイルの DACL が許可した主体の外へ権限を与えている場合の拒否理由（Issue #1313）。
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) const REASON_DATA_FILE_DACL: &str = "existing data file grants access to principals other than the current user, SYSTEM and Administrators (or has a null DACL or an unsupported ACE)";
 /// 既存の中間ディレクトリの所有者が許可した主体でない場合の拒否理由（SID は含めない。Issue #1098）。
 pub(crate) const REASON_EXISTING_INTERMEDIATE_OWNER: &str = "existing intermediate directory of the profile root is owned by a principal other than the current user, SYSTEM or Administrators";
 /// 既存の中間ディレクトリの DACL が許可した主体の外へ権限を与えている場合の拒否理由（Issue #1098）。
@@ -848,14 +857,23 @@ pub(crate) fn ensure_data_dirs(
 /// 作成する（既にあれば切り詰めずに開く）。`Profile::create_file_in`（Windows）から呼ばれる
 /// 継ぎ目で、`win32` を直接呼ばせないために置く（`PROF-2`・`PROF-4`・`XOS-10`）。
 /// 名前の検査・再解析ポイントの拒否・非 TRUNC は [`open_or_create_child_file`] 側（`win32`）が担い、
-/// 所有者・ハードリンク数の検査は行わない（REPAIR-3）。`dir_path` はエラー表示にだけ使う。
+/// Windows はさらに開いたハンドルでハードリンク数 1・所有者・DACL を検証する（`win32::open_or_create_data_file_at`）。`dir_path` はエラー表示にだけ使う。
 #[cfg_attr(not(windows), allow(dead_code))]
 pub(crate) fn open_data_file(
     dir: &File,
     dir_path: &Path,
     name: &OsStr,
 ) -> Result<File, ProfileError> {
-    open_or_create_child_file(dir, dir_path, name)
+    #[cfg(windows)]
+    {
+        // 開いたハンドルでハードリンク数・所有者・DACL を検証してから返す（Issue #1313）。
+        crate::win32::open_or_create_data_file_at(dir, name)
+            .map_err(|err| with_full_path(err, dir_path))
+    }
+    #[cfg(not(windows))]
+    {
+        open_or_create_child_file(dir, dir_path, name)
+    }
 }
 
 #[cfg(test)]
