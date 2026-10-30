@@ -23,6 +23,9 @@
 //!   epoch と違う・ヘルパーが無い（コンテキストが作り直された）場合は「リセット」として contextId を失効
 //!   させる（親モジュールの「差異・スタブ」参照。黙って再注入しない）。
 //!
+//! `DOM.describeNode`・`DOM.resolveNode`（#1348）は子モジュール `dom_node` が同じ評価経路で実装する（world をまたぐ
+//! ノード同一性。検証順・差異はそのモジュールのドキュメント）。
+//!
 //! # 検証順
 //!
 //! `Runtime.evaluate`: `sessionId` なし → `UNSUPPORTED_PARAMS` → `params` が非オブジェクト → `INVALID_PARAMS`
@@ -98,8 +101,10 @@ use fandhe_browser_core::{
 use serde_json::{Map, Value, json};
 
 mod call_function_on;
+mod dom_node;
 
 pub(crate) use call_function_on::RuntimeCallFunctionOn;
+pub(crate) use dom_node::{DomDescribeNode, DomResolveNode};
 
 use super::{ContextError, ContextLookupError, ContextView, MAX_CONTEXT_ID, World};
 use crate::protocol::{BoxFuture, CdpError, CommandContext, CommandHandler, HandlerOutput};
@@ -311,6 +316,14 @@ enum Envelope {
     ObjectNotFound,
     /// `functionDeclaration` が関数に評価されなかった（`callFunctionOn`。#1219）。
     NotFunction,
+    /// ハンドルのノードの初期の文書順番号（`DOM.describeNode`。#1348）。
+    Order {
+        order: u64,
+    },
+    /// ハンドルの値が DOM ノードでない（`DOM.describeNode`。#1348）。
+    NotNode,
+    /// ノードが初期の ID 空間に無い（確定後に作られた・木に属さない。`DOM.describeNode`/`resolveNode`。#1348）。
+    NodeUnavailable,
 }
 
 /// 封筒を解析する。解析失敗・未知の `kind`・欠落は `SERVER_ERROR`（成功を装わない）。
@@ -350,6 +363,15 @@ fn parse_envelope(text: &str) -> Result<Envelope, CdpError> {
         "notSettled" => Envelope::NotSettled,
         "objectNotFound" => Envelope::ObjectNotFound,
         "notFunction" => Envelope::NotFunction,
+        "order" => Envelope::Order {
+            order: v
+                .get("order")
+                .and_then(Value::as_u64)
+                .filter(|n| (1..=u64::from(u32::MAX)).contains(n))
+                .ok_or(CdpError::SERVER_ERROR)?,
+        },
+        "notNode" => Envelope::NotNode,
+        "nodeUnavailable" => Envelope::NodeUnavailable,
         "released" => Envelope::Released {
             found: v
                 .get("found")
@@ -765,7 +787,10 @@ impl EvalSite<'_> {
             | Envelope::Installed { .. }
             | Envelope::Released { .. }
             | Envelope::Awaiting { .. }
-            | Envelope::Checkpointed => Err(CdpError::SERVER_ERROR),
+            | Envelope::Checkpointed
+            | Envelope::Order { .. }
+            | Envelope::NotNode
+            | Envelope::NodeUnavailable => Err(CdpError::SERVER_ERROR),
         }
     }
 }
@@ -1073,7 +1098,23 @@ mod tests {
                 exception: json!({"type":"undefined"})
             })
         );
+        assert_eq!(
+            parse_envelope(r#"{"kind":"order","order":5}"#),
+            Ok(Envelope::Order { order: 5 })
+        );
+        assert_eq!(
+            parse_envelope(r#"{"kind":"notNode"}"#),
+            Ok(Envelope::NotNode)
+        );
+        assert_eq!(
+            parse_envelope(r#"{"kind":"nodeUnavailable"}"#),
+            Ok(Envelope::NodeUnavailable)
+        );
         for bad in [
+            r#"{"kind":"order","order":0}"#,
+            r#"{"kind":"order","order":4294967296}"#,
+            r#"{"kind":"order","order":"5"}"#,
+            r#"{"kind":"order"}"#,
             "",
             "not json",
             "[]",

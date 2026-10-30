@@ -16,6 +16,13 @@
 //! 同じ払い出し済み文書への再 `DOM.getDocument` は同じ `base` を再利用する。
 //! `backendNodeId` は `nodeId` と同値。
 //!
+//! # `DOM.describeNode`・`DOM.resolveNode`（#1348）
+//!
+//! `Runtime` の `objectId` と DOM ドメインの ID を行き来させる（`CDP-2`・`CDP-3`。実装は
+//! `runtime/evaluate/dom_node.rs`、ID 空間の払い出しは [`describe_issued_node`]）。`backendNodeId` は上の採番の値で、
+//! JS の安全整数（[`MAX_BACKEND_NODE_ID`]）を超える払い出し・採番は checked 演算で拒否する。world 間で DOM の変更は
+//! 共有されず、`describeNode` の `Node` は確定 HTML の初期状態から組む（詳細は `dom_node.rs` の差異節）。
+//!
 //! # スタブについて（実装済みを装わない。`REPAIR-3`）
 //!
 //! - `pierce: true` は明示エラー（`UNSUPPORTED_PARAMS`）。iframe の `contentDocument`・shadow DOM・`<template>` の `templateContent` は返さない
@@ -81,6 +88,10 @@ pub(crate) const MAX_NUMBERED_NODES: usize = 200_000;
 /// 超過時は他クライアントの記録を追い出さず、新規の払い出しを明示エラーで拒否する（`SEC-2`）。
 pub(crate) const MAX_ISSUED_DOCUMENTS: usize = 1024;
 
+/// 払い出す `nodeId`・`backendNodeId` の上限（JS の安全整数 2^53−1）。`DOM.resolveNode` の入力と
+/// ヘルパーへ渡す数値が JS で正確に表せる範囲に収める（`SEC-2`・`CDP-2`。#1348）。
+pub(crate) const MAX_BACKEND_NODE_ID: i64 = (1 << 53) - 1;
+
 /// `DOM.getDocument` の展開深さ。`limit` は [`MAX_TREE_DEPTH`] へ丸め済みで、
 /// `clamped` は要求値（`-1` 含む）が上限で丸められたことを示す。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -142,7 +153,7 @@ fn parse_child_depth(params: &Value) -> Result<Depth, CdpError> {
 
 /// `pierce` を検証する。bool 以外は不正、`true`（shadow DOM・iframe の貫通）は未実装のため
 /// 成功を装わず明示的に拒否する（`REPAIR-3`）。実装は後続で `pierce: true` を受理する。
-fn check_pierce(params: &Value) -> Result<(), CdpError> {
+pub(crate) fn check_pierce(params: &Value) -> Result<(), CdpError> {
     match params.get("pierce") {
         None | Some(Value::Bool(false)) => Ok(()),
         Some(Value::Bool(true)) => Err(CdpError::UNSUPPORTED_PARAMS),
@@ -172,20 +183,24 @@ impl NodeNumbering {
 }
 
 /// root から文書順に採番する（root = `base + 1`）。同じ文書・同じ `base` なら常に同じ結果になる。
-pub(crate) fn number_nodes(doc: &Document, base: i64) -> NodeNumbering {
+///
+/// 加算は checked 演算で、`base + 番号` が [`MAX_BACKEND_NODE_ID`]（JS の安全整数）を超える場合は
+/// 飽和させず `SERVER_ERROR` にする（`SEC-2`。`backendNodeId` を JS の数値として渡す #1348 のため）。
+pub(crate) fn number_nodes(doc: &Document, base: i64) -> Result<NodeNumbering, CdpError> {
     let root = doc.root();
     let mut order = Vec::with_capacity(doc.node_count());
     order.push(root);
     order.extend(doc.descendants(root));
-    let ids = order
-        .iter()
-        .enumerate()
-        .map(|(i, id)| {
-            let off = i64::try_from(i + 1).unwrap_or(i64::MAX);
-            (*id, base.saturating_add(off))
-        })
-        .collect();
-    NodeNumbering { base, order, ids }
+    let mut ids = HashMap::with_capacity(order.len());
+    for (i, id) in order.iter().enumerate() {
+        let off = i64::try_from(i + 1).map_err(|_| CdpError::SERVER_ERROR)?;
+        let n = base.checked_add(off).ok_or(CdpError::SERVER_ERROR)?;
+        if n > MAX_BACKEND_NODE_ID {
+            return Err(CdpError::SERVER_ERROR);
+        }
+        ids.insert(*id, n);
+    }
+    Ok(NodeNumbering { base, order, ids })
 }
 
 /// 修飾名（prefix があれば `prefix:local`）。
@@ -288,7 +303,7 @@ pub(crate) fn build_document_node(
     if doc.node_count() > MAX_NUMBERED_NODES {
         return Err(CdpError::DOCUMENT_TOO_LARGE);
     }
-    let numbering = number_nodes(doc, base);
+    let numbering = number_nodes(doc, base)?;
     // <base href> は未解決のため、存在する文書では誤った baseURL を返さず省略する（REPAIR-3）。
     let include_base_url = !has_base_href(doc);
     build_subtree(
@@ -412,13 +427,18 @@ fn load_document(
     target: Option<&TargetId>,
 ) -> Result<(Arc<NavigationResult>, ParsedDocument), CdpError> {
     let latest = current_latest(ctx, target)?;
-    // DOM 応答用の上限をパース時点で適用し、巨大文書の全ノード構築を避ける（`SEC-2`）。
+    let parsed = parse_navigation(&latest)?;
+    Ok((latest, parsed))
+}
+
+/// 確定文書を DOM 化する。DOM 応答用の上限をパース時点で適用し、巨大文書の全ノード構築を避ける（`SEC-2`）。
+/// [`load_document`] と、`Runtime` の評価文書を指す `DOM.describeNode`（#1348）が共有する。
+fn parse_navigation(latest: &NavigationResult) -> Result<ParsedDocument, CdpError> {
     let opts = ParseOptions::default().with_max_nodes(MAX_NUMBERED_NODES);
-    let parsed = parse_document(latest.html(), &opts).map_err(|e| match e {
+    parse_document(latest.html(), &opts).map_err(|e| match e {
         Error::Parse(ParseError::NodeLimitExceeded { .. }) => CdpError::DOCUMENT_TOO_LARGE,
         _ => CdpError::SERVER_ERROR,
-    })?;
-    Ok((latest, parsed))
+    })
 }
 
 /// `DOM.getDocument` が nodeId を払い出した文書の記録（`CDP-1`）。
@@ -508,7 +528,12 @@ impl IssuedDocuments {
         }
         let base = st.next_base;
         let span = i64::try_from(node_count).map_err(|_| CdpError::SERVER_ERROR)?;
-        st.next_base = base.checked_add(span).ok_or(CdpError::SERVER_ERROR)?;
+        let end = base.checked_add(span).ok_or(CdpError::SERVER_ERROR)?;
+        // 払い出す ID はすべて JS の安全整数に収める（`DOM.resolveNode` が数値で受け渡す。#1348）。
+        if end > MAX_BACKEND_NODE_ID {
+            return Err(CdpError::SERVER_ERROR);
+        }
+        st.next_base = end;
         Ok(base)
     }
 
@@ -581,7 +606,7 @@ impl IssuedDocuments {
     }
 
     /// `doc` が現在の払い出し済み文書と同一ならその nodeId の `base`。
-    fn issued_base(
+    pub(crate) fn issued_base(
         &self,
         conn: Option<ConnId>,
         session: Option<&SessionId>,
@@ -621,7 +646,7 @@ fn query_selector_node_id(
     if doc.node_count() > MAX_NUMBERED_NODES {
         return Err(CdpError::DOCUMENT_TOO_LARGE);
     }
-    let numbering = number_nodes(doc, base);
+    let numbering = number_nodes(doc, base)?;
     let scope = numbering.resolve(node_id).ok_or(CdpError::NODE_NOT_FOUND)?;
     match query_selector_str(doc, scope, selector) {
         Ok(Some(found)) => numbering.node_id(found).ok_or(CdpError::SERVER_ERROR),
@@ -711,7 +736,7 @@ impl CommandHandler for DomRequestChildNodes {
             if doc.node_count() > MAX_NUMBERED_NODES {
                 return Err(CdpError::DOCUMENT_TOO_LARGE);
             }
-            let numbering = number_nodes(doc, base);
+            let numbering = number_nodes(doc, base)?;
             let start = numbering.resolve(node_id).ok_or(CdpError::NODE_NOT_FOUND)?;
             let subtree = build_subtree(doc, &numbering, start, depth, latest.url(), false)?;
             // 構築中に遷移が確定した場合は旧文書の結果を返さない（`CDP-1`）。
@@ -799,6 +824,67 @@ impl CommandHandler for DomGetDocument {
             Ok(HandlerOutput::result(json!({ "root": root })))
         })
     }
+}
+
+/// 評価文書 `doc` の `order` 番目（文書順。Document = 1）のノードを `DOM.Node` にする。
+/// `Runtime` の `objectId` を `DOM.describeNode` で DOM ドメインの ID 空間へ写す入口（`CDP-2`・`CDP-3`。#1348）。
+///
+/// Puppeteer は `DOM.getDocument` を呼ばずに送ってくるため、`doc` に ID 範囲が未払い出しならここで払い出して
+/// 記録する（`DOM.getDocument` と同じ [`IssuedDocuments`]・同じ採番。以後の `DOM.resolveNode` はこの範囲を使う）。
+/// 構築・記録の最中に `doc` が最新の確定文書でなくなった（世代違い）場合は `EXECUTION_CONTEXT_STALE`。
+/// `Node` は確定 HTML の初期状態から組み、world 内の変更は反映しない（モジュール先頭の差異節）。
+pub(crate) fn describe_issued_node(
+    ctx: &CommandContext<'_>,
+    tid: &TargetId,
+    doc: &Arc<NavigationResult>,
+    order: u64,
+    depth: Depth,
+) -> Result<Value, CdpError> {
+    let parsed = parse_navigation(doc)?;
+    let dom = &parsed.document;
+    let order = i64::try_from(order).map_err(|_| CdpError::SERVER_ERROR)?;
+    let latest = || ctx.state.navigations().get(tid).and_then(|n| n.latest());
+    let is_latest = || latest().is_some_and(|l| Arc::ptr_eq(&l, doc));
+    for _ in 0..MAX_ISSUE_ATTEMPTS {
+        let issued = ctx.state.dom_issued();
+        let base = issued.base_for(ctx.conn, ctx.session_id, doc, dom.node_count())?;
+        let numbering = number_nodes(dom, base)?;
+        let backend = base.checked_add(order).ok_or(CdpError::SERVER_ERROR)?;
+        // core の採番（`InitialNodeOrder`）と cdp の採番が食い違う場合は偽のノードを返さない。
+        let start = numbering.resolve(backend).ok_or(CdpError::SERVER_ERROR)?;
+        let node = build_subtree(dom, &numbering, start, depth, doc.url(), false)?;
+        match issued.record(
+            ctx.state.registry(),
+            ctx.conn,
+            ctx.session_id,
+            doc,
+            base,
+            latest,
+        ) {
+            RecordOutcome::Recorded => {
+                // 構築中に遷移が確定した場合は旧文書のノードを返さない。
+                return if is_latest()
+                    && issued.issued_base(ctx.conn, ctx.session_id, doc) == Some(base)
+                {
+                    Ok(node)
+                } else {
+                    Err(CdpError::EXECUTION_CONTEXT_STALE)
+                };
+            }
+            RecordOutcome::LimitExceeded => return Err(CdpError::ISSUED_LIMIT_EXCEEDED),
+            RecordOutcome::Stale if !is_latest() => return Err(CdpError::EXECUTION_CONTEXT_STALE),
+            RecordOutcome::Stale => {}
+        }
+    }
+    Err(CdpError::SERVER_ERROR)
+}
+
+/// `backendNodeId` を払い出し済みの `base` からの文書順番号にする。`1..=u32::MAX` に収まらない
+/// （`base` 以下・範囲外・オーバーフロー）ときは `None`。上限の細かい検査は評価側の `nodeAt` が行う
+/// （`DOM.resolveNode`。#1348。checked 演算のみで wrap しない）。
+pub(crate) fn order_in_range(base: i64, backend_node_id: i64) -> Option<u64> {
+    let order = u64::try_from(backend_node_id.checked_sub(base)?).ok()?;
+    (1..=u64::from(u32::MAX)).contains(&order).then_some(order)
 }
 
 #[cfg(test)]
@@ -1069,8 +1155,8 @@ mod tests {
 
     #[test]
     fn cdp1_numbering_is_deterministic() {
-        let a = number_nodes(&doc(PAGE), 0);
-        let b = number_nodes(&doc(PAGE), 0);
+        let a = number_nodes(&doc(PAGE), 0).unwrap();
+        let b = number_nodes(&doc(PAGE), 0).unwrap();
         assert_eq!(a.order.len(), b.order.len());
         for i in 1..=a.order.len() as i64 {
             assert_eq!(a.resolve(i).and_then(|n| a.node_id(n)), Some(i));
@@ -1210,7 +1296,7 @@ mod tests {
         assert_eq!(issued.issued_base(None, None, &a), None);
         assert_eq!(issued.issued_base(None, None, &b), Some(10));
         // 旧範囲の nodeId は新文書の採番に含まれない。
-        let n = number_nodes(&doc(PAGE), 10);
+        let n = number_nodes(&doc(PAGE), 10).unwrap();
         assert_eq!(n.resolve(1), None);
         assert_eq!(n.resolve(10), None);
         assert!(n.resolve(11).is_some());
@@ -1226,11 +1312,52 @@ mod tests {
         );
     }
 
+    /// 払い出す ID は JS の安全整数に収め、超える予約は拒否する（`SEC-2`。#1348）。
+    #[test]
+    fn sec2_issued_base_stays_within_safe_integer() {
+        let a = Arc::new(NavigationResult::new("https://example.com/", "<p>a</p>"));
+        let issued = IssuedDocuments::new();
+        let max = usize::try_from(MAX_BACKEND_NODE_ID).unwrap();
+        assert_eq!(issued.base_for(None, None, &a, max), Ok(0));
+        // 次の予約は 1 件でも上限（2^53-1）を超える。
+        let b = Arc::new(NavigationResult::new("https://example.com/", "<p>b</p>"));
+        assert_eq!(
+            issued.base_for(None, None, &b, 1),
+            Err(CdpError::SERVER_ERROR)
+        );
+    }
+
+    /// 採番も上限を超えたら飽和させずエラーにする（`SEC-2`。#1348）。
+    #[test]
+    fn sec2_number_nodes_rejects_ids_beyond_safe_integer() {
+        let d = doc("<p>a</p>");
+        assert!(number_nodes(&d, MAX_BACKEND_NODE_ID - 1_000).is_ok());
+        assert_eq!(
+            number_nodes(&d, MAX_BACKEND_NODE_ID).err(),
+            Some(CdpError::SERVER_ERROR)
+        );
+        assert_eq!(
+            number_nodes(&d, i64::MAX).err(),
+            Some(CdpError::SERVER_ERROR)
+        );
+    }
+
+    /// `backendNodeId` → 文書順番号の写像は checked 演算で、範囲外は `None`（#1348）。
+    #[test]
+    fn cdp2_order_in_range_boundaries() {
+        assert_eq!(order_in_range(10, 11), Some(1));
+        assert_eq!(order_in_range(10, 10), None);
+        assert_eq!(order_in_range(10, 9), None);
+        assert_eq!(order_in_range(0, 4_294_967_295), Some(4_294_967_295));
+        assert_eq!(order_in_range(0, 4_294_967_296), None);
+        assert_eq!(order_in_range(i64::MIN, i64::MAX), None);
+    }
+
     /// 起点ノード（HTML）から depth 1 で組んだ部分木は、子だけを展開し parentId が起点を指す（`CDP-1`）。
     #[test]
     fn cdp1_build_subtree_from_html_depth_one() {
         let d = doc(PAGE);
-        let n = number_nodes(&d, 0);
+        let n = number_nodes(&d, 0).unwrap();
         let html = n.resolve(3).unwrap();
         let v = build_subtree(&d, &n, html, Depth::exact(1), "u", false).unwrap();
         assert_eq!(v["nodeId"], 3);
@@ -1279,7 +1406,7 @@ mod tests {
         let n = MAX_NODES_PER_RESPONSE + 50;
         let html = format!("<body>{}</body>", "<i></i>".repeat(n));
         let d = doc(&html);
-        let num = number_nodes(&d, 0);
+        let num = number_nodes(&d, 0).unwrap();
         let body = num.resolve(4).unwrap();
         assert_eq!(
             build_subtree(&d, &num, body, Depth::exact(1), "u", false),
@@ -1293,7 +1420,7 @@ mod tests {
         let n = MAX_TREE_DEPTH as usize + 10;
         let html = format!("{}{}", "<div>".repeat(n), "</div>".repeat(n));
         let d = doc(&html);
-        let num = number_nodes(&d, 0);
+        let num = number_nodes(&d, 0).unwrap();
         let html_el = num.resolve(2).unwrap();
         assert_eq!(
             build_subtree(&d, &num, html_el, Depth::unlimited(), "u", false),
@@ -1995,7 +2122,7 @@ mod tests {
             .document
         };
         for base in [0_i64, 1000] {
-            let numbering = number_nodes(&parse(), base);
+            let numbering = number_nodes(&parse(), base).unwrap();
             let bridge = DomBridge::new(DomBridgeLimits::default());
             let document = parse();
             let root = document.root();

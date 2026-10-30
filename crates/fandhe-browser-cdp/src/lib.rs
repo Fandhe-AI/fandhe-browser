@@ -15,7 +15,7 @@
 //! 以下は未実装で、実装済みを装う公開 API・ダミー実装は置かない
 //! （`code-comment-style.md`・REPAIR-3）。
 //!
-//! - JSON-RPC ディスパッチャ（`protocol.rs`。TASK-42.1）は実装済みで、組込みメソッドは `Page.navigate`（TASK-42.2）・`DOM.getDocument`（TASK-42.4。`sessionId` 付きはターゲット別の確定文書を返す。#658）・`DOM.querySelector`（TASK-42.5。#243）・`DOM.requestChildNodes`（#657）・`Browser.getVersion`（TASK-43.3a。`CDP-2`）・`Target.getTargetInfo`（TASK-43.3b。`CDP-2`）・`Target.setAutoAttach`・`Browser.setDownloadBehavior`（TASK-43.3c。`CDP-2`。前者は既存ターゲットへの自動 attach と `Target.attachedToTarget` 送出まで、後者は設定の検証と保持のみでダウンロード実行系は未実装。`browserContextId` 付きは context 単位で保持）・`Target.createBrowserContext`（TASK-43.3d・#909。`disposeOnDetach:true` のみ受理し接続切断で破棄。`Target.disposeBrowserContext` は未実装）・`Target.getBrowserContexts`（#1323・`CDP-3`。自接続所有の非既定 context のみ）・`Target.setDiscoverTargets`（#1324・`CDP-3`。`filter` は省略か `[{}]` のみ。discover 有効な接続へ `Target.targetCreated`・`Target.targetDestroyed` を送出）・`Target.closeTarget`（TASK-43.3h・#1028。既定 context か接続所有 context のページを閉じ、自接続の `Target.detachedFromTarget` と、discover 有効なら `Target.targetDestroyed` を送出）・`Page.createIsolatedWorld` と `Runtime.executionContextCreated`（TASK-44.6・#1217。評価器が有効なときだけ。`runtime.rs`）・`Runtime.evaluate`・`Runtime.releaseObject`（TASK-44.7・#1218。isolated world のみ。`runtime/evaluate.rs`）・`Runtime.callFunctionOn` と `awaitPromise`（TASK-44.8・#1219。`runtime/evaluate/call_function_on.rs`）
+//! - JSON-RPC ディスパッチャ（`protocol.rs`。TASK-42.1）は実装済みで、組込みメソッドは `Page.navigate`（TASK-42.2）・`DOM.getDocument`（TASK-42.4。`sessionId` 付きはターゲット別の確定文書を返す。#658）・`DOM.querySelector`（TASK-42.5。#243）・`DOM.requestChildNodes`（#657）・`Browser.getVersion`（TASK-43.3a。`CDP-2`）・`Target.getTargetInfo`（TASK-43.3b。`CDP-2`）・`Target.setAutoAttach`・`Browser.setDownloadBehavior`（TASK-43.3c。`CDP-2`。前者は既存ターゲットへの自動 attach と `Target.attachedToTarget` 送出まで、後者は設定の検証と保持のみでダウンロード実行系は未実装。`browserContextId` 付きは context 単位で保持）・`Target.createBrowserContext`（TASK-43.3d・#909。`disposeOnDetach:true` のみ受理し接続切断で破棄。`Target.disposeBrowserContext` は未実装）・`Target.getBrowserContexts`（#1323・`CDP-3`。自接続所有の非既定 context のみ）・`Target.setDiscoverTargets`（#1324・`CDP-3`。`filter` は省略か `[{}]` のみ。discover 有効な接続へ `Target.targetCreated`・`Target.targetDestroyed` を送出）・`Target.closeTarget`（TASK-43.3h・#1028。既定 context か接続所有 context のページを閉じ、自接続の `Target.detachedFromTarget` と、discover 有効なら `Target.targetDestroyed` を送出）・`Page.createIsolatedWorld` と `Runtime.executionContextCreated`（TASK-44.6・#1217。評価器が有効なときだけ。`runtime.rs`）・`Runtime.evaluate`・`Runtime.releaseObject`（TASK-44.7・#1218。isolated world のみ。`runtime/evaluate.rs`）・`Runtime.callFunctionOn` と `awaitPromise`（TASK-44.8・#1219。`runtime/evaluate/call_function_on.rs`）・`DOM.describeNode`・`DOM.resolveNode`（#1348・`CDP-2`。world をまたぐノード同一性。`runtime/evaluate/dom_node.rs`）
 //! - 個別 CDP メソッドのハンドラ（`CDP-1`/`CDP-5`/`CDP-7`、`TASK-42.2`〜`42.5`、`MS-4`）
 //!
 //! 未実装メソッドの応答方針（`-32601` を返し成功を捏造しない）と受信ログは TASK-42.6（`CDP-6`・`SEC-2`）で
@@ -88,7 +88,9 @@ pub mod test_support {
     }
 
     /// 評価系（TASK-44.7・#1218）の結合テスト用ディスパッチャ。ループバック許可の `Page.navigate`・
-    /// `Page.createIsolatedWorld`・`Runtime.enable`・`Runtime.evaluate`・`Runtime.releaseObject` を持つ。
+    /// `Page.createIsolatedWorld`・`Runtime.enable`・`Runtime.evaluate`・`Runtime.releaseObject`・
+    /// `Runtime.callFunctionOn` と、ID 空間の往復（#1348）を確かめる `DOM.getDocument`・`DOM.querySelector`・
+    /// `DOM.describeNode`・`DOM.resolveNode` を持つ。
     /// `sessionId` 付きのリクエスト（`text` の JSON に含める）をそのまま処理する。
     pub struct RuntimeDispatcher(Dispatcher);
 
@@ -127,6 +129,16 @@ pub mod test_support {
                 (
                     "Runtime.callFunctionOn",
                     Box::new(crate::runtime::RuntimeCallFunctionOn::new(limits)),
+                ),
+                ("DOM.getDocument", Box::new(DomGetDocument)),
+                ("DOM.querySelector", Box::new(DomQuerySelector)),
+                (
+                    "DOM.describeNode",
+                    Box::new(crate::runtime::DomDescribeNode::new(limits)),
+                ),
+                (
+                    "DOM.resolveNode",
+                    Box::new(crate::runtime::DomResolveNode::new(limits)),
                 ),
             ])
             .map_err(|_| Error::InvalidInput {

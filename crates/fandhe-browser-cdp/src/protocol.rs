@@ -151,6 +151,11 @@ impl CdpError {
         Self::new(-32000, "value could not be returned by value");
     /// 評価コンテキストが作り直された（タイムアウト後の再起動等）ため、contextId を失効させた（#1218）。
     pub const EXECUTION_CONTEXT_RESET: Self = Self::new(-32000, "execution context was reset");
+    /// `DOM.describeNode` の `objectId` が DOM ノードでない（`CDP-2`・#1348）。
+    pub const OBJECT_NOT_A_NODE: Self = Self::new(-32000, "object is not a node");
+    /// `DOM.describeNode` のノードが DOM ドメインの ID 空間を持たない（確定後に作られたノード・文書の木に属さない
+    /// ノード。偽の ID は返さない。`CDP-2`・`SEC-2`・#1348）。
+    pub const NODE_HAS_NO_BACKEND_ID: Self = Self::new(-32000, "node has no backend node id");
     /// 指定 nodeId が現在の文書の採番表に無い（形式は正しいが対象が無い。`DOM.querySelector`。`CDP-1`）。
     pub const NODE_NOT_FOUND: Self = Self::new(-32000, "node not found");
     /// nodeId の払い出し記録が件数上限に達した（`DOM.getDocument`。他クライアントの記録を
@@ -553,6 +558,18 @@ pub(crate) fn builtin_handlers_with(fetch: FetchOptions) -> Result<HandlerTable,
         (
             "DOM.requestChildNodes",
             Box::new(crate::dom::DomRequestChildNodes),
+        ),
+        (
+            "DOM.describeNode",
+            Box::new(crate::runtime::DomDescribeNode::new(
+                crate::runtime::EvalLimits::default(),
+            )),
+        ),
+        (
+            "DOM.resolveNode",
+            Box::new(crate::runtime::DomResolveNode::new(
+                crate::runtime::EvalLimits::default(),
+            )),
         ),
     ])
 }
@@ -1198,6 +1215,7 @@ mod tests {
                 "Target.attachToTarget",
                 "Runtime.getProperties",
                 "Runtime.releaseObjectGroup",
+                "Runtime.addBinding",
                 "Emulation.setUserAgentOverride",
                 "Network.setUserAgentOverride",
                 "Emulation.setDeviceMetricsOverride",
