@@ -31,10 +31,11 @@
 //!
 //! # 差異・スタブ（`REPAIR-3`）
 //!
-//! - main world は告知するが、そこへの評価（`Runtime.evaluate` の `contextId` 省略・main の contextId）は
-//!   仕様として固定文言の CDP エラー（`MAIN_WORLD_EVALUATION_UNSUPPORTED`）にする（#1218。`Runtime.callFunctionOn` の
-//!   `executionContextId` 経路も同じ。#1345）。評価できるのは
-//!   isolated world（utility world 等）だけで、main world のページ JS 状態は別の実行系にある。
+//! - main world への評価（`Runtime.evaluate` の `contextId` 省略・main の contextId、`Runtime.callFunctionOn`、
+//!   `Runtime.releaseObject`）は段階 1（#1347）で、isolated world と同じく core が確定 HTML を再パースしたコンテキストで
+//!   行う。ページ JS のヒープは持たないため、ページのグローバルの参照は `exceptionDetails`（`ReferenceError` 等）に出る
+//!   （偽の値は返さない）。core の上限は scope あたり 4 コンテキストで、main と utility の 2 つを使うため 2 セッションで届き得る。
+//!   設計は `docs/design/main-world-evaluation.md`。
 //! - 評価の再起動（boa のタイムアウト・子プロセスの異常終了等で core が `EngineRestarted` を返したとき）は
 //!   隠さず、その contextId を表から失効させて固定文言のエラーを返す（黙って再注入しない。`objectId` は
 //!   `<contextId>.<n>` でハンドル番号が 1 から振り直されるため、同じ contextId で作り直すと古い `objectId`
