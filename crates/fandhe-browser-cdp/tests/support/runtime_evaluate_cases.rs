@@ -264,6 +264,8 @@ pub fn run(engine: &str) {
     rt.block_on(call_function_on(engine));
     eprintln!("case: callFunctionOn rejections");
     rt.block_on(call_function_on_rejections(engine));
+    eprintln!("case: callFunctionOn executionContextId");
+    rt.block_on(call_function_on_execution_context(engine));
     eprintln!("case: awaitPromise");
     rt.block_on(await_promise(engine));
 }
@@ -957,12 +959,20 @@ async fn call_function_on_rejections(engine: &str) {
     );
     // 未対応キー・型の誤り。
     for params in [
-        json!({"functionDeclaration": decl, "objectId": h, "executionContextId": ctx}),
         json!({"functionDeclaration": decl, "objectId": h, "objectGroup": "g"}),
+        json!({"functionDeclaration": decl, "objectId": h, "uniqueContextId": "x"}),
     ] {
         let f = c.callf(&p, params).await;
         assert!(is_err(&f, -32602, "unsupported params"), "{f}");
     }
+    // objectId と executionContextId は排他（#1345）。
+    let f = c
+        .callf(
+            &p,
+            json!({"functionDeclaration": decl, "objectId": h, "executionContextId": ctx}),
+        )
+        .await;
+    assert!(is_err(&f, -32602, "invalid params"), "{f}");
     let f = c
         .callf(
             &p,
@@ -1142,4 +1152,174 @@ async fn await_promise(engine: &str) {
             assert!(is_err(&f, -32000, "promise was not settled"), "{name}: {f}");
         }
     }
+}
+
+/// #1345: `executionContextId` で world を指す `Runtime.callFunctionOn`（Puppeteer の `queryOne` の経路）。
+async fn call_function_on_execution_context(engine: &str) {
+    let mut c = Cdp::new(engine);
+    let (p, ctx) = c.ready().await;
+
+    // ヘルパー未注入の新しい world でも、事前の evaluate なしで評価できる。
+    let fresh = c.isolated(&p, "fresh").await;
+    let f = c
+        .callf(
+            &p,
+            json!({"functionDeclaration": "function () { return 6 * 7; }", "executionContextId": fresh, "returnByValue": true}),
+        )
+        .await;
+    assert_eq!(ro(&f), &json!({"type":"number","value":42}), "{f}");
+    // 未注入の world で引数にハンドルがあれば、評価器を起動せず「無い」。
+    let fresh2 = c.isolated(&p, "fresh2").await;
+    let spawns = c.worker_spawns();
+    let f = c
+        .callf(
+            &p,
+            json!({"functionDeclaration": "function () { return 1; }", "executionContextId": fresh2,
+                   "arguments": [{"objectId": format!("{fresh2}.1")}]}),
+        )
+        .await;
+    assert!(is_err(&f, -32000, "remote object not found"), "{f}");
+    assert_eq!(c.worker_spawns(), spawns);
+
+    // this は undefined（strict）。sloppy 関数は JS の仕様どおり globalThis になる。
+    for (decl, want) in [
+        (
+            "function () { 'use strict'; return this === undefined; }",
+            true,
+        ),
+        ("function () { return this === globalThis; }", true),
+    ] {
+        let f = c
+            .callf(
+                &p,
+                json!({"functionDeclaration": decl, "executionContextId": ctx, "returnByValue": true}),
+            )
+            .await;
+        assert_eq!(
+            ro(&f),
+            &json!({"type":"boolean","value":want}),
+            "{decl}: {f}"
+        );
+    }
+
+    // Puppeteer の queryOne 型。
+    let el = c.handle(&p, ctx, "document").await;
+    let util = c.handle(&p, ctx, "({ tag: 'util' })").await;
+    let f = c
+        .callf(
+            &p,
+            json!({
+                "functionDeclaration": "function (node, selector, util) { return util.tag + ':' + (node.querySelector(selector) !== null); }",
+                "executionContextId": ctx,
+                "arguments": [{"objectId": el}, {"value": "body"}, {"objectId": util}],
+                "returnByValue": true,
+                "awaitPromise": true,
+                "userGesture": true,
+            }),
+        )
+        .await;
+    assert_eq!(ro(&f), &json!({"type":"string","value":"util:true"}), "{f}");
+
+    // ハンドル返し。
+    let f = c
+        .callf(
+            &p,
+            json!({"functionDeclaration": "function () { return { n: 1 }; }", "executionContextId": ctx}),
+        )
+        .await;
+    assert_eq!(ro(&f)["type"], "object", "{f}");
+    let oid = ro(&f)["objectId"].as_str().expect("objectId");
+    assert!(oid.starts_with(&format!("{ctx}.")), "{oid}");
+
+    // 排他。
+    let f = c
+        .callf(
+            &p,
+            json!({"functionDeclaration": "function () {}", "executionContextId": ctx, "objectId": el}),
+        )
+        .await;
+    assert!(is_err(&f, -32602, "invalid params"), "{f}");
+    let f = c
+        .callf(&p, json!({"functionDeclaration": "function () {}"}))
+        .await;
+    assert!(is_err(&f, -32602, "invalid params"), "{f}");
+
+    // 未対応キー。
+    for extra in [
+        json!({"uniqueContextId": "x"}),
+        json!({"serializationOptions": {}}),
+        json!({"objectGroup": "g"}),
+    ] {
+        let mut params =
+            json!({"functionDeclaration": "function () {}", "executionContextId": ctx});
+        params
+            .as_object_mut()
+            .expect("object")
+            .extend(extra.as_object().expect("object").clone());
+        let f = c.callf(&p, params).await;
+        assert!(is_err(&f, -32602, "unsupported params"), "{f}");
+    }
+
+    // 他セッションの contextId は未知と区別しない。
+    let other = c.page().await;
+    c.navigate(&other).await;
+    let f = c
+        .callf(
+            &other,
+            json!({"functionDeclaration": "function () { return 1; }", "executionContextId": ctx}),
+        )
+        .await;
+    assert!(is_err(&f, -32602, "invalid params"), "{f}");
+
+    // 引数の objectId の contextId 不一致。ユーザーコードは実行しない。
+    let other_ctx = c.isolated(&p, "other").await;
+    let foreign = c.handle(&p, other_ctx, "({})").await;
+    c.eval(&p, ctx, "globalThis.__ran = 0", false).await;
+    let f = c
+        .callf(
+            &p,
+            json!({"functionDeclaration": "function () { globalThis.__ran = 1; }", "executionContextId": ctx,
+                   "arguments": [{"objectId": foreign}]}),
+        )
+        .await;
+    assert!(
+        is_err(&f, -32000, "argument belongs to another execution context"),
+        "{f}"
+    );
+    let f = c.eval(&p, ctx, "globalThis.__ran", true).await;
+    assert_eq!(ro(&f), &json!({"type":"number","value":0}));
+
+    // 遷移後の古い contextId は未知。
+    c.navigate(&p).await;
+    let f = c
+        .callf(
+            &p,
+            json!({"functionDeclaration": "function () { return 1; }", "executionContextId": ctx}),
+        )
+        .await;
+    assert!(is_err(&f, -32602, "invalid params"), "{f}");
+
+    // main world は評価器を起動せず固定エラー。
+    let mut c = Cdp::new(engine);
+    let p = c.page().await;
+    let nav = c.navigate(&p).await;
+    let main_id = nav
+        .iter()
+        .find(|f| {
+            f["method"] == "Runtime.executionContextCreated"
+                && f["params"]["context"]["auxData"]["isDefault"] == true
+        })
+        .and_then(|f| f["params"]["context"]["id"].as_u64())
+        .expect("main context announced");
+    let f = c
+        .callf(
+            &p,
+            json!({"functionDeclaration": "function () { return 1; }", "executionContextId": main_id}),
+        )
+        .await;
+    assert!(
+        is_err(&f, -32000, "evaluation in the main world is not supported"),
+        "{f}"
+    );
+    assert_eq!(c.worker_spawns(), 0, "main world 評価は評価器を起動しない");
 }
