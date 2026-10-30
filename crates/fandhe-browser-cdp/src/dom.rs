@@ -1977,4 +1977,56 @@ mod tests {
             assert!(!f[0].to_string().contains("zzz-secret"));
         }
     }
+
+    /// core の `DomBridge` の初期文書順番号が `number_nodes` の採番と一致する
+    /// （`CDP-2`・`CDP-3`。#1346。`backendNodeId = base + order`）。
+    #[test]
+    fn cdp_2_dom_bridge_initial_order_matches_number_nodes() {
+        use fandhe_browser_core::{DomBridge, DomBridgeLimits, InitialNodeOrder};
+        // arena の順と文書順が食い違う入力（adoption agency・foster parenting・template・doctype・コメント）。
+        let html = "<!DOCTYPE html><!--c--><html><body><b><p>x</b>y</p>\
+            <table>text<tr><td>c</td></tr></table><template><i id=\"t\"></i></template></body></html>";
+        let parse = || {
+            parse_document(
+                html,
+                &ParseOptions::default().with_max_nodes(MAX_NUMBERED_NODES),
+            )
+            .unwrap()
+            .document
+        };
+        for base in [0_i64, 1000] {
+            let numbering = number_nodes(&parse(), base);
+            let bridge = DomBridge::new(DomBridgeLimits::default());
+            let document = parse();
+            let root = document.root();
+            let tree: Vec<NodeId> = std::iter::once(root)
+                .chain(document.descendants(root))
+                .collect();
+            let template = tree
+                .iter()
+                .copied()
+                .find(|&id| document.template_contents(id).is_some())
+                .expect("template がある");
+            let contents = document.template_contents(template).unwrap();
+            bridge.attach(document).unwrap();
+            assert!(tree.len() > 10);
+            for (i, &id) in tree.iter().enumerate() {
+                let expected = u64::try_from(i + 1).unwrap();
+                let order = bridge.initial_order(id).unwrap();
+                assert_eq!(order.get(), expected);
+                let node_id = numbering.node_id(id).unwrap();
+                assert_eq!(node_id, base + i64::try_from(order.get()).unwrap());
+                assert_eq!(numbering.resolve(node_id), Some(id));
+                assert_eq!(bridge.node_by_initial_order(order).unwrap(), id);
+            }
+            // template contents は cdp の採番にも含まれず、core でも番号が無い。
+            assert_eq!(numbering.node_id(contents), None);
+            assert!(bridge.initial_order(contents).is_err());
+            let k = InitialNodeOrder::new(1).unwrap();
+            assert_eq!(
+                numbering.resolve(base + 1),
+                bridge.node_by_initial_order(k).ok()
+            );
+        }
+    }
 }
