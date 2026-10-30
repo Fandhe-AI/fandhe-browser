@@ -503,14 +503,19 @@
     return undefined;
   }
 
-  // Runtime.callFunctionOn。this と引数のハンドルはユーザーコードを動かす前にすべて解決する。
+  // Runtime.callFunctionOn。this と引数のハンドルはユーザーコードを動かす前にすべて解決する（this は thisHandle: null で undefined）。
   function callFunctionOn(text) {
     evalStart = nextHandle;
     try {
       var p = jsonParse(text);
       if (p.epoch !== epoch) return RESET;
-      if (apply(mapHas, handles, [p.thisHandle]) !== true) return NOT_FOUND;
-      var thisValue = apply(mapGet, handles, [p.thisHandle]);
+      // thisHandle が null（own property）なら executionContextId 経路で this は undefined。
+      // キーを省かず null を明示するのは、Object.prototype.thisHandle の汚染を拾わないため。
+      var thisValue;
+      if (p.thisHandle !== null) {
+        if (apply(mapHas, handles, [p.thisHandle]) !== true) return NOT_FOUND;
+        thisValue = apply(mapGet, handles, [p.thisHandle]);
+      }
       // 引数リストは null prototype の array-like にする（Array.prototype の setter の影響を避ける）。
       var list = objCreate(null);
       var n = p.args.length;

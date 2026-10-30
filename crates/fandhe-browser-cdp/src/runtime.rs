@@ -32,7 +32,8 @@
 //! # 差異・スタブ（`REPAIR-3`）
 //!
 //! - main world は告知するが、そこへの評価（`Runtime.evaluate` の `contextId` 省略・main の contextId）は
-//!   仕様として固定文言の CDP エラー（`MAIN_WORLD_EVALUATION_UNSUPPORTED`）にする（#1218）。評価できるのは
+//!   仕様として固定文言の CDP エラー（`MAIN_WORLD_EVALUATION_UNSUPPORTED`）にする（#1218。`Runtime.callFunctionOn` の
+//!   `executionContextId` 経路も同じ。#1345）。評価できるのは
 //!   isolated world（utility world 等）だけで、main world のページ JS 状態は別の実行系にある。
 //! - 評価の再起動（boa のタイムアウト・子プロセスの異常終了等で core が `EngineRestarted` を返したとき）は
 //!   隠さず、その contextId を表から失効させて固定文言のエラーを返す（黙って再注入しない。`objectId` は

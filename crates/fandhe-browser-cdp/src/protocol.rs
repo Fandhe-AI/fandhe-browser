@@ -142,7 +142,7 @@ impl CdpError {
     pub const PROMISE_NOT_SETTLED: Self = Self::new(-32000, "promise was not settled");
     /// `Runtime.callFunctionOn` の `arguments` が上限（64 件）を超えた（`CDP-7`・`SEC-2`・#1219）。
     pub const TOO_MANY_CALL_ARGUMENTS: Self = Self::new(-32000, "too many call arguments");
-    /// `Runtime.callFunctionOn` の引数の `objectId` が `this` と別の実行コンテキストのもの（#1219）。
+    /// `Runtime.callFunctionOn` の引数の `objectId` が呼び出し対象（`this` の `objectId` または `executionContextId`）と別の実行コンテキストのもの（#1219）。
     pub const ARGUMENT_CONTEXT_MISMATCH: Self =
         Self::new(-32000, "argument belongs to another execution context");
     /// `Runtime.callFunctionOn` の `functionDeclaration` が関数に評価されなかった（#1219）。
