@@ -28,6 +28,9 @@ pub const MAX_TARGETS: usize = 64;
 pub const MAX_BROWSER_CONTEXTS: usize = 64;
 /// 同時に保持できるセッション数の上限。
 pub const MAX_SESSIONS: usize = 256;
+/// tab 擬似ターゲットの ID 名前空間（カウンタ値の bit 62。#1334・`CDP-3`）。ページ（小さい連番）とも
+/// ブラウザ ID（bit 63。`server.rs` の `BROWSER_ID_NAMESPACE`）とも衝突しない。
+pub(crate) const TAB_ID_NAMESPACE: u64 = 1 << 62;
 /// 外部入力から ID を組み立てる際の最大バイト長。
 const MAX_ID_LEN: usize = 64;
 /// ターゲット URL の最大バイト長（巨大 URL によるメモリ無制限消費の防止）。
@@ -139,6 +142,13 @@ fn drop_session_state(t: &mut Tables, sid: &SessionId) {
     t.emulation.remove(sid);
 }
 
+/// tab 擬似ターゲットの ID か（`TAB_ID_NAMESPACE` の bit が立ち、ブラウザ ID の bit 63 が無い 16 進）。
+/// discover の記録からページと tab を見分けるために使う（#1334）。
+pub(crate) fn is_tab_id(id: &TargetId) -> bool {
+    u128::from_str_radix(id.as_str(), 16)
+        .is_ok_and(|n| n >> 63 == 0 && n & u128::from(TAB_ID_NAMESPACE) != 0)
+}
+
 /// 外部入力の ID 文字列を検証する（長さ・文字種）。
 fn validate_id(s: &str) -> Result<(), CdpStateError> {
     if s.is_empty() || s.len() > MAX_ID_LEN {
@@ -239,6 +249,9 @@ impl TargetKind {
 #[non_exhaustive]
 pub struct TargetInfo {
     target_id: TargetId,
+    /// このページと 1:1 の tab 擬似ターゲットの ID（`type:"tab"`。#1334・`CDP-3`）。tab は registry の
+    /// `targets` には入らず、ページ作成時に払い出したこの ID だけを派生して持つ。
+    tab_id: TargetId,
     kind: TargetKind,
     url: String,
     browser_context_id: BrowserContextId,
@@ -248,6 +261,11 @@ impl TargetInfo {
     /// ターゲット ID。
     pub fn target_id(&self) -> &TargetId {
         &self.target_id
+    }
+
+    /// このページの tab 擬似ターゲットの ID（Puppeteer の `Target.setAutoAttach` の `filter` 経路。#1334）。
+    pub(crate) fn tab_id(&self) -> &TargetId {
+        &self.tab_id
     }
 
     /// 種別。
@@ -324,6 +342,11 @@ impl SessionDomains {
 struct Tables {
     targets: HashMap<TargetId, TargetInfo>,
     sessions: HashMap<SessionId, TargetId>,
+    /// tab 擬似ターゲットのセッション（値は対応するページの ID。#1334・`CDP-3`・`CDP-7`）。
+    /// `sessions` には入れない: ページ系ハンドラは `sessions` だけでセッションを解決するため、tab のセッションは
+    /// `Page.*`・`DOM.*` 等で未知のセッションとして拒否される（fail-closed）。払い出しは `next_session` と
+    /// 上限 `MAX_SESSIONS` を `sessions` と共有する。寿命はページと同じ（close・context 破棄で一緒に消える）。
+    tab_sessions: HashMap<SessionId, TargetId>,
     /// 既定 context を含む browser context 表。
     contexts: HashMap<BrowserContextId, ContextEntry>,
     default_context: BrowserContextId,
@@ -431,6 +454,7 @@ impl TargetRegistry {
             inner: Mutex::new(Tables {
                 targets: HashMap::new(),
                 sessions: HashMap::new(),
+                tab_sessions: HashMap::new(),
                 contexts,
                 default_context,
                 paused: HashMap::new(),
@@ -494,9 +518,13 @@ impl TargetRegistry {
         }
         let n = t.next_target;
         let next = n.checked_add(1).ok_or(CdpStateError::IdExhausted)?;
+        if n >= TAB_ID_NAMESPACE {
+            return Err(CdpStateError::IdExhausted);
+        }
         let id = TargetId::from_counter(n);
         let info = TargetInfo {
             target_id: id.clone(),
+            tab_id: TargetId::from_counter(n | TAB_ID_NAMESPACE),
             kind,
             url,
             browser_context_id: context,
@@ -592,6 +620,8 @@ impl TargetRegistry {
             return Err(CdpStateError::UnknownTarget);
         }
         t.paused.remove(id);
+        // tab のセッションもページと一緒に消す（通知は接続状態側が registry との差分で行う。#1334・`CDP-7`）。
+        t.tab_sessions.retain(|_, page| page != id);
         let mut removed: Vec<SessionId> = t
             .sessions
             .iter()
@@ -612,24 +642,105 @@ impl TargetRegistry {
         if !t.targets.contains_key(id) {
             return Err(CdpStateError::UnknownTarget);
         }
-        if t.sessions.len() >= MAX_SESSIONS {
+        let sid = Self::alloc_session(&mut t)?;
+        t.sessions.insert(sid.clone(), id.clone());
+        Ok(sid)
+    }
+
+    /// セッション ID を払い出す。上限は `sessions` と `tab_sessions` の合計で数える（`CDP-7`）。
+    /// 失敗時は何も変えない。挿入は呼び出し側が行う。
+    fn alloc_session(t: &mut Tables) -> Result<SessionId, CdpStateError> {
+        if t.sessions.len() + t.tab_sessions.len() >= MAX_SESSIONS {
             return Err(CdpStateError::TooManySessions {
                 limit: MAX_SESSIONS,
             });
         }
         let n = t.next_session;
         let next = n.checked_add(1).ok_or(CdpStateError::IdExhausted)?;
-        let sid = SessionId::from_counter(n);
         t.next_session = next;
-        t.sessions.insert(sid.clone(), id.clone());
-        Ok(sid)
+        Ok(SessionId::from_counter(n))
     }
 
-    /// セッションを切り離し、attach 先のターゲット ID を返す。
+    /// セッションを切り離し、attach 先のターゲット ID を返す（tab のセッションならページの ID）。
     pub fn detach(&self, id: &SessionId) -> Result<TargetId, CdpStateError> {
         let mut t = self.lock();
         drop_session_state(&mut t, id);
+        if let Some(page) = t.tab_sessions.remove(id) {
+            return Ok(page);
+        }
         t.sessions.remove(id).ok_or(CdpStateError::UnknownSession)
+    }
+
+    /// ページの tab 擬似ターゲットへ attach し、tab のセッションを払い出す（#1334・`CDP-3`・`CDP-7`）。
+    /// 未知のページは `UnknownTarget`、枠の枯渇は `TooManySessions`（表は不変）。同じページへ複数回呼べば
+    /// 複数の tab セッションができる（呼び出し側の接続状態が接続あたり 1 件に保つ）。
+    pub(crate) fn attach_tab(&self, page: &TargetId) -> Result<SessionId, CdpStateError> {
+        let mut t = self.lock();
+        if !t.targets.contains_key(page) {
+            return Err(CdpStateError::UnknownTarget);
+        }
+        let sid = Self::alloc_session(&mut t)?;
+        t.tab_sessions.insert(sid.clone(), page.clone());
+        Ok(sid)
+    }
+
+    /// tab のセッションの子としてページのセッションを払い出す（tab のセッションの `Target.setAutoAttach`。#1334）。
+    ///
+    /// `transfer_pause` が true で、そのページを止めているのが `tab_session` なら、停止の所有を新しい
+    /// ページのセッションへ移し、戻りの第 3 要素（`waitingForDebugger`）を true にする。Puppeteer は子の
+    /// ページのセッションで `Runtime.runIfWaitingForDebugger` を送り、そこで初期 `about:blank` が確定する。
+    /// tab のセッションが無い・ページが消えた場合は `UnknownSession`、枠の枯渇は `TooManySessions`（表は不変）。
+    pub(crate) fn attach_child_page(
+        &self,
+        tab_session: &SessionId,
+        transfer_pause: bool,
+    ) -> Result<(TargetId, SessionId, bool), CdpStateError> {
+        let mut t = self.lock();
+        let page = t
+            .tab_sessions
+            .get(tab_session)
+            .cloned()
+            .ok_or(CdpStateError::UnknownSession)?;
+        if !t.targets.contains_key(&page) {
+            return Err(CdpStateError::UnknownSession);
+        }
+        let sid = Self::alloc_session(&mut t)?;
+        t.sessions.insert(sid.clone(), page.clone());
+        let waiting = transfer_pause && t.paused.get(&page) == Some(tab_session);
+        if waiting {
+            t.paused.insert(page.clone(), sid.clone());
+        }
+        Ok((page, sid, waiting))
+    }
+
+    /// tab ID に対応するページ情報と、tab に何らかのセッションが attach 中か
+    /// （`Target.getTargetInfo(tabId)` の `attached`。#1334）。
+    pub(crate) fn tab_with_attached(&self, tab_id: &TargetId) -> Option<(TargetInfo, bool)> {
+        let t = self.lock();
+        let info = t.targets.values().find(|i| i.tab_id == *tab_id)?.clone();
+        let attached = t.tab_sessions.values().any(|p| *p == info.target_id);
+        Some((info, attached))
+    }
+
+    /// 全ページの tab について、ページ情報と「tab にセッションが attach 中か」をページ ID 昇順で返す
+    /// （`Target.setDiscoverTargets` が tab を含むときの `targetCreated`。#1334）。
+    pub(crate) fn tabs_with_attached(&self) -> Vec<(TargetInfo, bool)> {
+        let t = self.lock();
+        let mut v: Vec<(TargetInfo, bool)> = t
+            .targets
+            .values()
+            .map(|info| {
+                let attached = t.tab_sessions.values().any(|p| *p == info.target_id);
+                (info.clone(), attached)
+            })
+            .collect();
+        v.sort_by(|a, b| a.0.target_id.as_str().cmp(b.0.target_id.as_str()));
+        v
+    }
+
+    /// tab のセッション（払い出し済みで未解放）か。
+    pub(crate) fn is_tab_session(&self, id: &SessionId) -> bool {
+        self.lock().tab_sessions.contains_key(id)
     }
 
     /// セッションに `Page.enable` 済みの印を付ける（冪等。43.3i・#1037・`CDP-2`）。
@@ -990,8 +1101,36 @@ impl TargetRegistry {
         if url.len() > MAX_URL_LEN {
             return Err(CdpStateError::UrlTooLong { limit: MAX_URL_LEN });
         }
+        self.create_target_attached_impl(context, kind, url, pause, false)
+    }
+
+    /// [`Self::create_target_attached`] の tab 版（Puppeteer 経路。#1334・`CDP-3`）。ページを作り、ページ自身ではなく
+    /// その tab 擬似ターゲットへ attach して tab のセッションを返す。ページのセッションは作らない
+    /// （子の attach は tab のセッションの `Target.setAutoAttach` が行う）。`pause` が true なら tab のセッションが
+    /// 止め役になり、子 attach 時に停止がページのセッションへ移る。原子性は同じ。
+    pub(crate) fn create_target_tab_attached(
+        &self,
+        context: Option<&BrowserContextId>,
+        kind: TargetKind,
+        url: &str,
+        pause: bool,
+    ) -> Result<(TargetId, SessionId), CdpStateError> {
+        self.create_target_attached_impl(context, kind, url, pause, true)
+    }
+
+    fn create_target_attached_impl(
+        &self,
+        context: Option<&BrowserContextId>,
+        kind: TargetKind,
+        url: &str,
+        pause: bool,
+        tab: bool,
+    ) -> Result<(TargetId, SessionId), CdpStateError> {
+        if url.len() > MAX_URL_LEN {
+            return Err(CdpStateError::UrlTooLong { limit: MAX_URL_LEN });
+        }
         let mut t = self.lock();
-        if t.sessions.len() >= MAX_SESSIONS {
+        if t.sessions.len() + t.tab_sessions.len() >= MAX_SESSIONS {
             return Err(CdpStateError::TooManySessions {
                 limit: MAX_SESSIONS,
             });
@@ -1006,6 +1145,9 @@ impl TargetRegistry {
         }
         let tn = t.next_target;
         let next_t = tn.checked_add(1).ok_or(CdpStateError::IdExhausted)?;
+        if tn >= TAB_ID_NAMESPACE {
+            return Err(CdpStateError::IdExhausted);
+        }
         let sn = t.next_session;
         let next_s = sn.checked_add(1).ok_or(CdpStateError::IdExhausted)?;
         let tid = TargetId::from_counter(tn);
@@ -1016,12 +1158,17 @@ impl TargetRegistry {
             tid.clone(),
             TargetInfo {
                 target_id: tid.clone(),
+                tab_id: TargetId::from_counter(tn | TAB_ID_NAMESPACE),
                 kind,
                 url: url.to_owned(),
                 browser_context_id: context,
             },
         );
-        t.sessions.insert(sid.clone(), tid.clone());
+        if tab {
+            t.tab_sessions.insert(sid.clone(), tid.clone());
+        } else {
+            t.sessions.insert(sid.clone(), tid.clone());
+        }
         if pause {
             t.paused.insert(tid.clone(), sid.clone());
         }
@@ -1037,7 +1184,10 @@ impl TargetRegistry {
     /// `None`（`Runtime.runIfWaitingForDebugger`。Chromium と同じ実際の no-op）。
     pub(crate) fn resume_by_session(&self, session: &SessionId) -> Option<TargetId> {
         let mut t = self.lock();
-        let tid = t.sessions.get(session)?.clone();
+        let tid = match t.sessions.get(session) {
+            Some(tid) => tid.clone(),
+            None => t.tab_sessions.get(session)?.clone(),
+        };
         if t.paused.get(&tid) == Some(session) {
             t.paused.remove(&tid);
             Some(tid)
@@ -1053,7 +1203,7 @@ impl TargetRegistry {
         let orphaned: Vec<TargetId> = t
             .paused
             .iter()
-            .filter(|(_, s)| !t.sessions.contains_key(*s))
+            .filter(|(_, s)| !t.sessions.contains_key(*s) && !t.tab_sessions.contains_key(*s))
             .map(|(tid, _)| tid.clone())
             .collect();
         for tid in &orphaned {
@@ -1115,6 +1265,7 @@ impl TargetRegistry {
         for tid in targets {
             t.targets.remove(&tid);
             t.paused.remove(&tid);
+            t.tab_sessions.retain(|_, page| *page != tid);
             let mut sids: Vec<SessionId> = t
                 .sessions
                 .iter()
@@ -1166,9 +1317,10 @@ impl TargetRegistry {
         self.lock().targets.len()
     }
 
-    /// セッション数。
+    /// セッション数（tab のセッションを含む。上限 `MAX_SESSIONS` の消費量）。
     pub fn session_count(&self) -> usize {
-        self.lock().sessions.len()
+        let t = self.lock();
+        t.sessions.len() + t.tab_sessions.len()
     }
 }
 
@@ -1919,5 +2071,123 @@ mod tests {
             }
         );
         assert_eq!(r.target_count(), before);
+    }
+    // ---- tab 擬似ターゲット（#1334・`CDP-3`・`CDP-7`） ----
+
+    #[test]
+    fn cdp3_tab_id_is_derived_in_its_own_namespace() {
+        let r = TargetRegistry::new();
+        let p = page(&r);
+        let info = r.target(&p).unwrap();
+        assert_eq!(info.tab_id().as_str(), "00000000000000004000000000000001");
+        assert!(is_tab_id(info.tab_id()));
+        assert!(!is_tab_id(&p));
+        // ブラウザ ID の名前空間（bit 63）は tab ID ではない。
+        assert!(!is_tab_id(&TargetId::from_counter(1 << 63)));
+        // tab は registry のターゲットではない。
+        assert_eq!(r.target_count(), 1);
+        assert!(r.target(info.tab_id()).is_none());
+        let (found, attached) = r.tab_with_attached(info.tab_id()).unwrap();
+        assert_eq!(found.target_id(), &p);
+        assert!(!attached);
+    }
+
+    #[test]
+    fn cdp7_tab_sessions_share_the_session_limit_and_leave_table_unchanged() {
+        let r = TargetRegistry::new();
+        let p = page(&r);
+        for _ in 0..MAX_SESSIONS / 2 {
+            r.attach(&p).unwrap();
+            r.attach_tab(&p).unwrap();
+        }
+        assert_eq!(r.session_count(), MAX_SESSIONS);
+        let limit = CdpStateError::TooManySessions {
+            limit: MAX_SESSIONS,
+        };
+        assert_eq!(r.attach(&p), Err(limit));
+        assert_eq!(r.attach_tab(&p), Err(limit));
+        assert_eq!(
+            r.create_target_tab_attached(None, TargetKind::Page, "about:blank", false),
+            Err(limit)
+        );
+        assert_eq!(r.target_count(), 1);
+        assert_eq!(r.session_count(), MAX_SESSIONS);
+    }
+
+    #[test]
+    fn cdp1_tab_session_is_not_a_page_session() {
+        let r = TargetRegistry::new();
+        let (p, tab) = r
+            .create_target_tab_attached(None, TargetKind::Page, "about:blank", false)
+            .unwrap();
+        // ページ系のセッション解決には現れない（Page.* 等は fail-closed で拒否される）。
+        assert!(r.session_target(&tab).is_none());
+        assert!(r.is_tab_session(&tab));
+        assert_eq!(r.enable_page(&tab), Err(CdpStateError::UnknownSession));
+        assert!(
+            r.tab_with_attached(r.target(&p).unwrap().tab_id())
+                .unwrap()
+                .1
+        );
+        assert_eq!(r.detach(&tab), Ok(p));
+        assert_eq!(r.session_count(), 0);
+    }
+
+    #[test]
+    fn cdp7_close_and_dispose_remove_tab_sessions_with_the_page() {
+        let r = TargetRegistry::new();
+        let p = page(&r);
+        let tab = r.attach_tab(&p).unwrap();
+        let (_, child, _) = r.attach_child_page(&tab, false).unwrap();
+        assert_eq!(r.session_count(), 2);
+        assert_eq!(r.close_target(&p).unwrap(), vec![child]);
+        assert!(!r.is_tab_session(&tab));
+        assert_eq!(r.session_count(), 0);
+
+        let ctx = r.create_browser_context().unwrap();
+        let q = r
+            .create_target_in(&ctx, TargetKind::Page, "about:blank")
+            .unwrap();
+        r.attach_tab(&q).unwrap();
+        assert_eq!(r.session_count(), 1);
+        r.dispose_browser_context(&ctx).unwrap();
+        assert_eq!(r.session_count(), 0);
+    }
+
+    #[test]
+    fn cdp2_attach_child_page_moves_the_pause_only_when_asked() {
+        let r = TargetRegistry::new();
+        let (p, tab) = r
+            .create_target_tab_attached(None, TargetKind::Page, "about:blank", true)
+            .unwrap();
+        assert!(r.is_paused(&p));
+        // 停止を移さない子は止めたまま（tab 自身が再開できる）。
+        let (_, c1, waiting) = r.attach_child_page(&tab, false).unwrap();
+        assert!(!waiting);
+        assert_eq!(r.resume_by_session(&c1), None);
+        // 移すと所有がページのセッションへ変わり、tab の再開は no-op になる。
+        let (_, c2, waiting) = r.attach_child_page(&tab, true).unwrap();
+        assert!(waiting);
+        assert_eq!(r.resume_by_session(&tab), None);
+        assert_eq!(r.resume_by_session(&c2), Some(p.clone()));
+        assert!(!r.is_paused(&p));
+        // 未知の tab のセッションは拒否する。
+        let bogus = SessionId::parse("ZZ").unwrap();
+        assert_eq!(
+            r.attach_child_page(&bogus, true),
+            Err(CdpStateError::UnknownSession)
+        );
+    }
+
+    #[test]
+    fn cdp7_tab_paused_target_is_orphaned_when_the_tab_session_detaches() {
+        let r = TargetRegistry::new();
+        let (p, tab) = r
+            .create_target_tab_attached(None, TargetKind::Page, "about:blank", true)
+            .unwrap();
+        // tab のセッションが生きている間は孤立ではない。
+        assert!(r.take_orphaned_paused().is_empty());
+        r.detach(&tab).unwrap();
+        assert_eq!(r.take_orphaned_paused(), vec![p]);
     }
 }

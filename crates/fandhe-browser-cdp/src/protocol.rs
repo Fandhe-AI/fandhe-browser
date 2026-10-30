@@ -701,9 +701,16 @@ fn auto_attach_events(
     for (target_id, sid) in &rec.detached {
         events.push(crate::playwright_compat::detached_event(target_id, sid));
     }
+    // tab 経路の消失は 子のページ（エンベロープは tab のセッション）→ tab の順（#1334・`CDP-7`）。
+    for td in &rec.tab_detached {
+        events.extend(crate::playwright_compat::tab_detach_events(td));
+    }
     // 順序は detached → destroyed → created → attached（Chromium の順。#1324・`CDP-3`・`CDP-7`）。
     for tid in &rec.destroyed {
         events.push(crate::playwright_compat::target_destroyed_event(tid));
+    }
+    for (info, attached) in &rec.created_tabs {
+        events.push(crate::playwright_compat::tab_created_event(info, *attached));
     }
     for (info, attached) in &rec.created {
         events.push(crate::playwright_compat::target_created_event(
@@ -712,6 +719,11 @@ fn auto_attach_events(
     }
     for (info, sid) in &rec.attached {
         events.push(crate::playwright_compat::attached_event(info, sid, false));
+    }
+    for (info, sid) in &rec.tab_attached {
+        events.push(crate::playwright_compat::tab_attached_event(
+            info, sid, false,
+        ));
     }
     events
 }
