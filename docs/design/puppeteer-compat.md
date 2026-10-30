@@ -124,7 +124,7 @@ Puppeteer が接続段階で送る `Target.setAutoAttach` の `filter` の扱い
 - **不採用**:
   - 案 (b)「`filter` を受けるが page 除外は適用しない」: 除外すべき `page` まで attach してしまい、#908 の「黙って無視しない」方針に反する。また未実装の指定を成功扱いで受け流すフォールバックに当たる。これはセキュリティ規約が検出回避として作用しないか確認を求めるもので、`CDP-6`（未実装メソッドへの応答方針。検討中）の論点とも重なる
   - 案 (c)「非対応のまま」: Puppeteer で `CDP-4` を満たせない
-- **着手順**: #1321 配下の Playwright 側の不足（例: DOMContentLoaded の lifecycleEvent〔#1322〕）を先に直し、その後に案 (a) に着手する。Playwright で `CDP-4` の成功率を上げる方が効果が大きく、手間も小さいため
+- **着手順**: #1321 配下の Playwright 側の不足（例: DOMContentLoaded の lifecycleEvent〔#1322。`Page.navigate` が確定時に送出するようになった。`playwright-compat.md` の該当節〕）を先に直し、その後に案 (a) に着手する。Playwright で `CDP-4` の成功率を上げる方が効果が大きく、手間も小さいため
 - **案 (a) の実装時の確認事項**: tab ターゲットを `Target.getTargets`・`Target.targetCreated` 等に出すことで、Playwright の接続・`newPage` が後退しないことを `harness/playwright-connect`・`harness/endpoint-swap` で確かめる
 - **測定条件の前提**: Puppeteer は `defaultViewport: null` 以外では `Emulation.setDeviceMetricsOverride` で止まる。これは画面の識別面にあたり `SEC-2` で実装しないため、Puppeteer の測定は `defaultViewport: null` を前提とする
 - **実装状況**: 未着手

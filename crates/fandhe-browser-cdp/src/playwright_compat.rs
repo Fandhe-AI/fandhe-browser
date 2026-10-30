@@ -22,7 +22,7 @@
 //! 43.3j（#1038）で `Log.enable`・`Runtime.enable`・`Network.enable`（セッション単位の有効フラグのみ。
 //! イベントは送らない。`REPAIR-3`）を足す。
 //! 43.3k（#1039）で `Page.setLifecycleEventsEnabled`（セッション単位の有効フラグ。`Page.enable` 済みの
-//! セッションの `Page.navigate` が `Page.lifecycleEvent` の `init`・`load` を送る）を足す。
+//! セッションの `Page.navigate` が `Page.lifecycleEvent` の `init`・`load` を送る。#1322 で `DOMContentLoaded` も送る）を足す。
 //! 43.3l（#1040）で `Page.addScriptToEvaluateOnNewDocument`（空 `source` のみ受理・非空は拒否）と
 //! セッション付き `Target.setAutoAttach`（状態の保持のみ・子 attach は 0 件）を足す。接続スコープの状態と寿命は [`crate::conn_state`]。方針は `docs/design/playwright-compat.md`。
 //! 43.3m（#1041）で `Emulation.setFocusEmulationEnabled`・`Emulation.setEmulatedMedia` を足す。Playwright 既定値（`enabled:true`、
@@ -469,8 +469,8 @@ impl CommandHandler for RuntimeRunIfWaitingForDebugger {
 /// `sessionId` 付きで、そのセッションに有効フラグを立てて `{}` を返す（冪等）。フラグは registry の
 /// セッション表と同じロック・寿命で持つ（`conn_state` でなく `target.rs` に置く理由: 自動 attach 由来でない
 /// セッションも扱え、セッション削除と同時に消えて TOCTOU が起きないため）。実効果は
-/// `Page.lifecycleEvent` 送出ゲートの片方（もう片方は [`PageSetLifecycleEventsEnabled`]。43.3k・#1039）だけで、
-/// `Page.frameNavigated` 等の既存イベントの送出は変えない。
+/// `Page.lifecycleEvent` 送出ゲートの片方（もう片方は [`PageSetLifecycleEventsEnabled`]。43.3k・#1039）と、
+/// `Page.domContentEventFired` の送出条件（#1322）。`Page.frameNavigated` 等の既存イベントの送出は変えない。
 ///
 /// 差異（`REPAIR-3`）: 既存の `Page.frameNavigated`・`Page.loadEventFired` は `Page.enable` なしでも従来どおり
 /// 送出する（Chromium は有効化後のみ。`Page.enable` を送らない既存の利用と Puppeteer 系の回帰を避けるため）。
@@ -505,13 +505,14 @@ impl CommandHandler for PageEnable {
 ///
 /// `sessionId` 付きで `{"enabled": bool}` を受け、セッションの lifecycle 有効フラグを設定して `{}` を返す
 /// （true・false とも冪等）。実効果は `Page.navigate`（`page.rs`）の送出ゲート: `Page.enable` 済みかつ本フラグが
-/// 有効なセッションにだけ、確定した遷移で `Page.lifecycleEvent`（`init`・`load`）を送る。
+/// 有効なセッションにだけ、確定した遷移で `Page.lifecycleEvent`（`init`・`DOMContentLoaded`・`load`）を送る。
 /// 検証順: `sessionId` なしは `UNSUPPORTED_PARAMS`、`params` が非オブジェクトは `INVALID_PARAMS`、
 /// `enabled` 以外のキーは `UNSUPPORTED_PARAMS`（黙って無視しない）、`enabled` が無い・bool でないは
 /// `INVALID_PARAMS`、未知・閉じたセッションは `INVALID_PARAMS`。いずれも状態を変えない。
 /// 止めたターゲット（`Runtime.runIfWaitingForDebugger` より前）でも受理する（Playwright は再開前に送る）。
 ///
-/// 差異（`REPAIR-3`）: 送る名前は `init`・`load` のみ（他は `page::lifecycle_event` の doc 参照）。
+/// 差異（`REPAIR-3`）: 送る名前は `init`・`DOMContentLoaded`・`load` のみ（他は `page::lifecycle_event` の doc 参照）。
+/// `DOMContentLoaded` は core が発火を記録した文書にだけ送る（#1322。条件は `page::navigation_events`）。
 /// 有効化時に現在の文書の lifecycle を再送しない（Chromium は再送する）。送り先は `Page.navigate` を送った
 /// セッションだけで、同じターゲットの他セッションへは送らない（セッション単位の配送は TASK-43・`CDP-2`）。
 /// フラグは fetch・ヘッダ・UA・`navigator` に影響しない（`SEC-2`）。実際の状態変更であり一律成功ではない（`CDP-6`）。
@@ -3188,31 +3189,43 @@ mod tests {
                 [
                     "Page.lifecycleEvent",
                     "Page.frameNavigated",
+                    "Page.domContentEventFired",
+                    "Page.lifecycleEvent",
                     "Page.loadEventFired",
                     "Page.lifecycleEvent"
                 ]
             );
-            assert_eq!(nav.len(), 5);
+            // nav[0] は応答、以降がイベント（#1322 AC1）。
+            assert_eq!(nav.len(), 7);
             let loader = nav[0]["result"]["loaderId"].as_str().unwrap();
+            assert_eq!(nav[3]["method"], "Page.domContentEventFired");
             assert_eq!(nav[2]["params"]["frame"]["loaderId"], loader);
-            let names: Vec<&str> = [&nav[1], &nav[4]]
+            let names: Vec<&str> = [&nav[1], &nav[4], &nav[6]]
                 .iter()
                 .map(|v| v["params"]["name"].as_str().unwrap())
                 .collect();
-            assert_eq!(names, ["init", "load"]);
-            for ev in [&nav[1], &nav[4]] {
+            assert_eq!(names, ["init", "DOMContentLoaded", "load"]);
+            for ev in [&nav[1], &nav[4], &nav[6]] {
                 assert_eq!(ev["params"]["frameId"], target_of(&st, &sid).as_str());
                 assert_eq!(ev["params"]["loaderId"], loader);
                 assert_eq!(ev["sessionId"], sid.as_str());
             }
-            assert_eq!(nav[1]["params"]["timestamp"], nav[3]["params"]["timestamp"]);
-            assert_eq!(nav[4]["params"]["timestamp"], nav[3]["params"]["timestamp"]);
+            assert_eq!(nav[3]["sessionId"], sid.as_str());
+            // timestamp は非減少（#1322 AC2）。同種のペアは同じ値。
+            let ts: Vec<f64> = [1usize, 3, 4, 5, 6]
+                .iter()
+                .map(|&i| nav[i]["params"]["timestamp"].as_f64().unwrap())
+                .collect();
+            assert!(ts.windows(2).all(|w| w[0] <= w[1]), "{ts:?}");
+            assert_eq!(nav[3]["params"]["timestamp"], nav[4]["params"]["timestamp"]);
+            assert_eq!(nav[5]["params"]["timestamp"], nav[6]["params"]["timestamp"]);
         }
 
         #[tokio::test]
         async fn cdp2_navigate_emits_no_lifecycle_unless_both_enabled() {
             let m = "Page.setLifecycleEventsEnabled";
             // (Page.enable を送る, lifecycle を true にする, 直後に false に戻す) の組。
+            // lifecycleEvent は出ない。`Page.domContentEventFired` は `Page.enable` 済みのときだけ出る（#1322）。
             for (page_enable, lifecycle, disable_again) in [
                 (false, true, false),
                 (true, false, false),
@@ -3238,7 +3251,18 @@ mod tests {
                 )
                 .await;
                 let methods: Vec<&str> = nav.iter().filter_map(|v| v["method"].as_str()).collect();
-                assert_eq!(methods, ["Page.frameNavigated", "Page.loadEventFired"]);
+                if page_enable {
+                    assert_eq!(
+                        methods,
+                        [
+                            "Page.frameNavigated",
+                            "Page.domContentEventFired",
+                            "Page.loadEventFired"
+                        ]
+                    );
+                } else {
+                    assert_eq!(methods, ["Page.frameNavigated", "Page.loadEventFired"]);
+                }
             }
         }
 

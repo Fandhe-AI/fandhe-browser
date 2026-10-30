@@ -8,6 +8,7 @@ import { runStages } from "./stages.mjs";
 const mode = process.argv[2] ?? "ok";
 const page = {
   goto: async () => null,
+  waitForLoadState: async () => {},
   locator: () => {
     const l = {
       count: async () => 1,

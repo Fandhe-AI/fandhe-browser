@@ -1469,6 +1469,8 @@ mod dispatch_tests {
                     "Runtime.executionContextsCleared",
                     "Page.frameNavigated",
                     "Runtime.executionContextCreated",
+                    "Page.domContentEventFired",
+                    "Page.lifecycleEvent",
                     "Page.loadEventFired",
                     "Page.lifecycleEvent",
                 ]

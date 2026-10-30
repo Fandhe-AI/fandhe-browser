@@ -41,7 +41,9 @@
 //! ES module も同様で、`[js] execute_page_scripts` と `[js] execute_modules` が共に真のときだけ
 //! 実行される（`JS-4`・Issue #1118。ゲートの適用は core の `PageScriptHandle::with_options`）。
 //! `Page.frameStoppedLoading` は未送出（`CDP-2`・TASK-43）。`Page.lifecycleEvent` は `Page.enable` と
-//! `Page.setLifecycleEventsEnabled` の両方が有効なセッションに `init`・`load` だけ送る（43.3k・#1039。
+//! `Page.setLifecycleEventsEnabled` の両方が有効なセッションに `init`・`DOMContentLoaded`・`load` を送る
+//! （43.3k・#1039、`DOMContentLoaded` は #1322。`DOMContentLoaded` は core が発火を記録した文書だけで、
+//! `Page.domContentEventFired` は `Page.enable` 済みセッションに限る。条件は [`navigation_events`]、
 //! 送らない名前は [`lifecycle_event`] を参照）。
 //! `Page.navigate` の応答自体もスクリプト完了後になる（実 Chromium との差異）。JS 段の全体期限は
 //! cdp 側には無く、アクターの待ち行列上限とランナーの実時間上限に依存する。
@@ -61,9 +63,10 @@ use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::Instant;
 
 use fandhe_browser_core::{
-    ActorFailureKind, Error, FetchOptions, Fetcher, NavigationGeneration, NavigationResult,
-    NavigationState, PageRunRequest, PageScriptError, PageScriptHandle, PageScriptOutcome,
-    PageScriptSkipReason, ScriptContextError, ScriptContextHandle, StateError,
+    ActorFailureKind, Error, FetchOptions, Fetcher, LifecycleEvent, LifecycleOutcome,
+    NavigationGeneration, NavigationResult, NavigationState, PageRunRequest, PageScriptError,
+    PageScriptHandle, PageScriptOutcome, PageScriptSkipReason, ScriptContextError,
+    ScriptContextHandle, StateError,
 };
 use serde_json::{Value, json};
 
@@ -71,7 +74,9 @@ use crate::protocol::{
     BoxFuture, CdpError, CdpEvent, CommandContext, CommandHandler, HandlerOutput,
 };
 use crate::runtime::{context_created_event, contexts_cleared_event};
-use crate::target::{CdpStateError, MAX_URL_LEN, SessionDomain, TargetId, TargetRegistry};
+use crate::target::{
+    CdpStateError, MAX_URL_LEN, PageEventGates, SessionDomain, TargetId, TargetRegistry,
+};
 
 /// ターゲットを持たないブラウザレベルの `Page.navigate`（`sessionId` なし）が使うフォールバックの frame ID。
 /// ターゲットありの場合のメインフレームの frame ID は targetId（[`main_frame_id`]。`CDP-2`・TASK-43.3o・#1050）。
@@ -115,9 +120,47 @@ pub(crate) enum ScriptStage {
     /// アクターが実行しなかった。
     Skipped(PageScriptSkipReason),
     /// 実行した。`abort` は打ち切り理由の安定表記（打ち切りなしなら `None`）。
-    Executed { abort: Option<&'static str> },
+    /// `dom_content_loaded` は core が記録した `DOMContentLoaded` の発火結果（#1322）。
+    Executed {
+        abort: Option<&'static str>,
+        dom_content_loaded: DomContentLoaded,
+    },
     /// 実行できなかった。取得した HTML のまま確定する。
     Failed(ScriptFailure),
+}
+
+/// 確定した文書で `DOMContentLoaded` が発火したか（`CDP-2`・`CDP-4`・Issue #1322）。
+///
+/// bool ではなく列挙にして将来の拡張（発火時刻の保持など）に備える（`REPAIR-4`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DomContentLoaded {
+    /// 発火した、または JS を実行しておらず文書が解析済みのため発火済みとみなせる。
+    Fired,
+    /// 打ち切り・記録なし・未知の結果のため、発火したと言えない（送らない。fail-closed）。
+    NotFired,
+}
+
+/// core の `DOMContentLoaded` 記録から [`DomContentLoaded`] を判定する純粋関数。
+/// `Dispatched` だけを `Fired` とし、`Aborted`・`NotFired`・記録なし・未知の腕は `NotFired`
+/// （`LifecycleOutcome` は `#[non_exhaustive]`。偽の値で埋めない。`SEC-2`）。
+fn dom_content_loaded_from(outcome: Option<&LifecycleOutcome>) -> DomContentLoaded {
+    match outcome {
+        Some(LifecycleOutcome::Dispatched) => DomContentLoaded::Fired,
+        _ => DomContentLoaded::NotFired,
+    }
+}
+
+impl ScriptStage {
+    /// この段の結果から見た `DOMContentLoaded` の扱い。`Executed` 以外はページスクリプトを
+    /// 実行していない（または結果を採用していない）ため、取得した HTML は解析済みで `Fired`。
+    pub(crate) fn dom_content_loaded(&self) -> DomContentLoaded {
+        match self {
+            ScriptStage::Executed {
+                dom_content_loaded, ..
+            } => *dom_content_loaded,
+            _ => DomContentLoaded::Fired,
+        }
+    }
 }
 
 /// [`ScriptStage::Failed`] の理由（入力由来の文字列を持たない）。
@@ -140,7 +183,20 @@ fn settle(
     match result {
         Ok(PageScriptOutcome::Executed(out)) => {
             let abort = out.abort().map(|a| a.kind().as_str());
-            (out.into_html(), ScriptStage::Executed { abort })
+            // `into_html()` が out を消費するため、先に発火記録を読む。
+            let dom_content_loaded = dom_content_loaded_from(
+                out.lifecycle()
+                    .iter()
+                    .find(|r| r.event() == LifecycleEvent::DomContentLoaded)
+                    .map(|r| r.outcome()),
+            );
+            (
+                out.into_html(),
+                ScriptStage::Executed {
+                    abort,
+                    dom_content_loaded,
+                },
+            )
         }
         Ok(PageScriptOutcome::Skipped(reason)) => fallback(ScriptStage::Skipped(reason)),
         Err(PageScriptError::Busy { .. }) => fallback(ScriptStage::Failed(ScriptFailure::Busy)),
@@ -166,8 +222,8 @@ fn script_log_line(stage: &ScriptStage, generation: u64) -> Option<String> {
         ScriptStage::NotAttempted
         | ScriptStage::Skipped(_)
         | ScriptStage::Failed(ScriptFailure::Cancelled) => return None,
-        ScriptStage::Executed { abort: None } => return None,
-        ScriptStage::Executed { abort: Some(k) } => ("aborted", Some(*k)),
+        ScriptStage::Executed { abort: None, .. } => return None,
+        ScriptStage::Executed { abort: Some(k), .. } => ("aborted", Some(*k)),
         ScriptStage::BaseUrlRejected => ("base_url_rejected", None),
         ScriptStage::Failed(ScriptFailure::Busy) => ("busy", None),
         ScriptStage::Failed(ScriptFailure::ActorUnavailable(_)) => ("actor_unavailable", None),
@@ -225,6 +281,9 @@ fn monotonic_seconds() -> f64 {
 
 /// 送る `Page.lifecycleEvent` の名前（`init`）。commit の時点でサーバーが確定できる。
 const LIFECYCLE_INIT: &str = "init";
+/// 送る `Page.lifecycleEvent` の名前（`DOMContentLoaded`。#1322）。core が発火を記録した文書（または
+/// JS 未実行の解析済み文書）にだけ送る。
+const LIFECYCLE_DOM_CONTENT_LOADED: &str = "DOMContentLoaded";
 /// 送る `Page.lifecycleEvent` の名前（`load`）。`Page.loadEventFired` と同じ時点で確定できる。
 const LIFECYCLE_LOAD: &str = "load";
 
@@ -233,10 +292,11 @@ const LIFECYCLE_LOAD: &str = "load";
 ///
 /// # 送らない lifecycle 名（`REPAIR-3`）
 ///
-/// `DOMContentLoaded`・`networkAlmostIdle`・`networkIdle`・`commit`・`firstPaint`・`firstContentfulPaint`・
+/// `networkAlmostIdle`・`networkIdle`・`commit`・`firstPaint`・`firstContentfulPaint`・
 /// `firstMeaningfulPaint`・`firstMeaningfulPaintCandidate`・`InteractiveTime` は送らない。対応する実体
-/// （DOM 構築完了通知・ネットワーク静止の計測・描画計測）が無く、偽の値で埋めないため。将来仕様は
-/// core・render の進捗に合わせた送出（TASK-43・TASK-44・`CDP-2`）。
+/// （ネットワーク静止の計測・描画計測）が無く、偽の値で埋めないため。将来仕様は
+/// core・render の進捗に合わせた送出（TASK-43・TASK-44・`CDP-2`）。`DOMContentLoaded` は #1322 から、
+/// core が発火を記録した文書にだけ送る（[`DomContentLoaded`]）。
 fn lifecycle_event(
     frame_id: &str,
     loader_id: &str,
@@ -255,18 +315,63 @@ fn lifecycle_event(
     }
 }
 
+/// `navigation_events` の送出時刻（CDP `MonotonicTime`、秒）。`handle` が送出直前に単調時計を順に読むため
+/// `commit <= dom_content_loaded <= load`（非減少）になる。値は送出時刻で、実際の発火時刻ではない
+/// （スクリプトは commit 前に走る。`REPAIR-3`）。Chromium も DOMContentLoaded 系と load 系で
+/// それぞれ同じ時刻を使う。
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct NavigationTimestamps {
+    commit: f64,
+    dom_content_loaded: f64,
+    load: f64,
+}
+
+impl NavigationTimestamps {
+    /// 単調時計を 3 回順に読む。
+    fn now() -> Self {
+        let commit = monotonic_seconds();
+        let dom_content_loaded = monotonic_seconds();
+        let load = monotonic_seconds();
+        Self {
+            commit,
+            dom_content_loaded,
+            load,
+        }
+    }
+}
+
+/// `navigation_events` の送出条件（`REPAIR-4`: 真偽値を並べず構造体にまとめる）。
+struct NavigationEventOptions<'a> {
+    /// `Page.enable`・lifecycle 有効のゲート（[`TargetRegistry::event_gates`]）。
+    gates: PageEventGates,
+    /// 確定文書で `DOMContentLoaded` が発火したか。
+    dom_content_loaded: DomContentLoaded,
+    /// 評価コンテキストのイベント列（`Some` なら cleared / created を挟む）。
+    runtime: Option<&'a [CdpEvent]>,
+    timestamps: NavigationTimestamps,
+}
+
 /// 確定した遷移の CDP イベント列を作る（TASK-42.3・`CDP-1`）。`PageNavigate::handle` が、遷移が確定し
 /// 結果が公開された場合のみ呼ぶ。`session_id` は `Dispatcher::dispatch` がリクエストの値で補完するため
 /// `None` で返す。
 ///
-/// 順序の正本はここ。`lifecycle` が偽なら `frameNavigated` → `loadEventFired`。真（`Page.enable` 済みかつ
-/// lifecycle 有効のセッション。43.3k・#1039）なら `lifecycle{init}` → `frameNavigated` → `loadEventFired` →
-/// `lifecycle{load}`。`runtime` が `Some`（評価器が有効で、要求セッションが `Runtime.enable` 済み。
-/// TASK-44.6・#1217）なら、`frameNavigated` の前に `Runtime.executionContextsCleared`、後に渡された
-/// `Runtime.executionContextCreated` 列（main → isolated）を挟み、`loadEventFired` はその後に置く
-/// （Playwright が新文書のコンテキストを `load` 前に揃える前提のため）。`None` なら従来の列のまま。`init` は `load` より前、`load` は `frameNavigated` より後でなければならない
-/// （Playwright は新文書の commit で lifecycle をクリアし、Puppeteer は `init` で集合をリセットするため。
-/// ソース読解による推定で未実測）。`timestamp` は 3 イベントで同じ値。
+/// 順序の正本はここ。括弧付きは条件付きで、次の順に並べる。
+/// `[lifecycle{init}]` → `[Runtime.executionContextsCleared]` → `Page.frameNavigated` →
+/// `[Runtime.executionContextCreated…]` → `[Page.domContentEventFired]` → `[lifecycle{DOMContentLoaded}]` →
+/// `Page.loadEventFired` → `[lifecycle{load}]`。
+///
+/// - `lifecycle{*}`: `Page.enable` 済みかつ lifecycle 有効のセッション（43.3k・#1039）。
+/// - `Page.domContentEventFired`・`lifecycle{DOMContentLoaded}`: `DOMContentLoaded` が `Fired` の場合のみ。
+///   `domContentEventFired` はさらに `Page.enable` 済みのセッションに限る（Chromium の規則。新しいイベントは
+///   既存の利用を壊さないためのゲート免除を持たない。#1322・`CDP-2`・`CDP-4`）。打ち切りで発火しなかった文書には
+///   送らない（偽の値で埋めない。`SEC-2`）。Playwright の `waitUntil: 'domcontentloaded'` と Puppeteer の
+///   `LifecycleWatcher` はこのイベントで満たされる。
+/// - Runtime 列: `runtime` が `Some`（評価器が有効で、要求セッションが `Runtime.enable` 済み。TASK-44.6・#1217）。
+///   `loadEventFired` と DOMContentLoaded 系はその後に置く（Playwright が新文書のコンテキストを `load` 前に
+///   揃える前提のため）。
+/// - `init` は `load` より前、`DOMContentLoaded`・`load` は `frameNavigated` より後でなければならない
+///   （Playwright は新文書の commit で lifecycle をクリアし、Puppeteer は `init` で集合をリセットするため。
+///   ソース読解による推定で未実測）。
 ///
 /// 送出順は `DispatchOutcome` の「レスポンス → イベント列」で確定とする。実 Chromium のように
 /// `frameNavigated` を応答より前へ出す並べ替えの要否は TASK-43（`CDP-2`）で判断する。
@@ -276,27 +381,31 @@ fn lifecycle_event(
 /// - `frame.mimeType` は固定値 `text/html`（`NavigationResult` が Content-Type を保持しないため。
 ///   実値化は `CORE-5`・TASK-25 以降）。
 /// - `securityOrigin` 等の他フィールドは出さない。
+/// - `timestamp` は送出時刻（[`NavigationTimestamps`]）。JS を実行しない構成（既定）や `Skipped`・`Failed` では
+///   取得した HTML が解析済みのため `DOMContentLoaded` は `Fired` とみなして送る。JS 実行時に load が
+///   打ち切られても `loadEventFired` は従来どおり送る（DOMContentLoaded との非対称。既存挙動）。
 /// - `Page.enable` は実装済み（43.3i）だが、`Page.frameNavigated`・`Page.loadEventFired` は意図的に
 ///   購読ゲートしない（Chromium との差異。`Page.enable` を送らない既存の利用を壊さないため。`REPAIR-3`）。
-///   `frameStartedLoading`・`domContentEventFired` 等は未実装（TASK-43・`CDP-2`）。
+///   `frameStartedLoading`・`frameStoppedLoading` 等は未実装（TASK-43・`CDP-2`）。
 fn navigation_events(
     frame_id: &str,
     loader_id: &str,
     url: &str,
-    timestamp: f64,
-    lifecycle: bool,
-    runtime: Option<&[CdpEvent]>,
+    opts: &NavigationEventOptions<'_>,
 ) -> Vec<CdpEvent> {
-    let mut events = Vec::with_capacity(5 + runtime.map_or(0, <[CdpEvent]>::len));
+    let lifecycle = opts.gates.lifecycle;
+    let dcl = opts.dom_content_loaded == DomContentLoaded::Fired;
+    let ts = opts.timestamps;
+    let mut events = Vec::with_capacity(7 + opts.runtime.map_or(0, <[CdpEvent]>::len));
     if lifecycle {
         events.push(lifecycle_event(
             frame_id,
             loader_id,
             LIFECYCLE_INIT,
-            timestamp,
+            ts.commit,
         ));
     }
-    if runtime.is_some() {
+    if opts.runtime.is_some() {
         events.push(contexts_cleared_event());
     }
     events.push(CdpEvent {
@@ -312,12 +421,27 @@ fn navigation_events(
         }),
         session_id: None,
     });
-    if let Some(created) = runtime {
+    if let Some(created) = opts.runtime {
         events.extend(created.iter().cloned());
+    }
+    if dcl && opts.gates.page_enabled {
+        events.push(CdpEvent {
+            method: "Page.domContentEventFired",
+            params: json!({ "timestamp": ts.dom_content_loaded }),
+            session_id: None,
+        });
+    }
+    if dcl && lifecycle {
+        events.push(lifecycle_event(
+            frame_id,
+            loader_id,
+            LIFECYCLE_DOM_CONTENT_LOADED,
+            ts.dom_content_loaded,
+        ));
     }
     events.push(CdpEvent {
         method: "Page.loadEventFired",
-        params: json!({ "timestamp": timestamp }),
+        params: json!({ "timestamp": ts.load }),
         session_id: None,
     });
     if lifecycle {
@@ -325,7 +449,7 @@ fn navigation_events(
             frame_id,
             loader_id,
             LIFECYCLE_LOAD,
-            timestamp,
+            ts.load,
         ));
     }
     events
@@ -935,9 +1059,9 @@ impl CommandHandler for PageNavigate {
                         .is_none_or(|(n, g)| n.current_generation() == *g)
                     && recheck_shared.is_none_or(|g| app_nav.current_generation() == g)
                 {
-                    let lifecycle = ctx
-                        .session_id
-                        .is_some_and(|sid| ctx.state.registry().lifecycle_events_active(sid));
+                    let gates = ctx.session_id.map_or_else(PageEventGates::default, |sid| {
+                        ctx.state.registry().event_gates(sid)
+                    });
                     // 評価器が有効なときだけ、要求セッションの実行コンテキストを新しい世代へ作り替える
                     // （古い世代は全セッション分消える）。`gate` を保持したままなので、確認済みの世代と
                     // 食い違わない。Runtime 無効のセッションには cleared も created も送らない。
@@ -957,13 +1081,17 @@ impl CommandHandler for PageNavigate {
                         }
                         _ => None,
                     };
+                    let options = NavigationEventOptions {
+                        gates,
+                        dom_content_loaded: out.script.dom_content_loaded(),
+                        runtime: runtime_events.as_deref(),
+                        timestamps: NavigationTimestamps::now(),
+                    };
                     for ev in navigation_events(
                         main_frame_id(target_id.as_ref()),
                         &out.loader_id,
                         &url,
-                        monotonic_seconds(),
-                        lifecycle,
-                        runtime_events.as_deref(),
+                        &options,
                     ) {
                         output = output.with_event(ev);
                     }
@@ -1175,16 +1303,44 @@ mod tests {
         }
     }
 
+    /// テスト用の送出条件（#1322）。`commit`・`dcl`・`load` の時刻を明示する。
+    fn opts<'a>(
+        page_enabled: bool,
+        lifecycle: bool,
+        dcl: DomContentLoaded,
+        runtime: Option<&'a [CdpEvent]>,
+        t: (f64, f64, f64),
+    ) -> NavigationEventOptions<'a> {
+        NavigationEventOptions {
+            gates: PageEventGates {
+                page_enabled,
+                lifecycle,
+            },
+            dom_content_loaded: dcl,
+            runtime,
+            timestamps: NavigationTimestamps {
+                commit: t.0,
+                dom_content_loaded: t.1,
+                load: t.2,
+            },
+        }
+    }
+
     /// `navigation_events` は `frameNavigated` → `loadEventFired` を具体値で返す（TASK-42.3・`CDP-1`）。
+    /// ゲートなしでは DOMContentLoaded が `Fired` でも `domContentEventFired` は出ない（#1322）。
     #[test]
     fn cdp1_navigation_events_shape() {
         let ev = navigation_events(
             "00000000000000000000000000000001",
             "1",
             "http://example.test/",
-            1.5,
-            false,
-            None,
+            &opts(
+                false,
+                false,
+                DomContentLoaded::Fired,
+                None,
+                (1.0, 1.25, 1.5),
+            ),
         );
         assert_eq!(ev.len(), 2);
         assert_eq!(ev[0].method, "Page.frameNavigated");
@@ -1230,9 +1386,13 @@ mod tests {
                 "T1",
                 "1",
                 "http://example.test/",
-                1.0,
-                lifecycle,
-                Some(&created),
+                &opts(
+                    lifecycle,
+                    lifecycle,
+                    DomContentLoaded::Fired,
+                    Some(&created),
+                    (1.0, 1.0, 1.0),
+                ),
             )
             .iter()
             .map(|e| e.method)
@@ -1248,6 +1408,7 @@ mod tests {
                 "Page.loadEventFired",
             ]
         );
+        // `Page.enable` 済みでは domContentEventFired が created 列の後・loadEventFired の前に入る。
         assert_eq!(
             methods(true),
             [
@@ -1256,16 +1417,28 @@ mod tests {
                 "Page.frameNavigated",
                 "Runtime.executionContextCreated",
                 "Runtime.executionContextCreated",
+                "Page.domContentEventFired",
+                "Page.lifecycleEvent",
                 "Page.loadEventFired",
                 "Page.lifecycleEvent",
             ]
         );
         // Some(空) でも cleared は送る。
-        let empty: Vec<&'static str> =
-            navigation_events("T1", "1", "http://example.test/", 1.0, false, Some(&[]))
-                .iter()
-                .map(|e| e.method)
-                .collect();
+        let empty: Vec<&'static str> = navigation_events(
+            "T1",
+            "1",
+            "http://example.test/",
+            &opts(
+                false,
+                false,
+                DomContentLoaded::Fired,
+                Some(&[]),
+                (1.0, 1.0, 1.0),
+            ),
+        )
+        .iter()
+        .map(|e| e.method)
+        .collect();
         assert_eq!(
             empty,
             [
@@ -1289,17 +1462,88 @@ mod tests {
         );
     }
 
-    /// `lifecycle` 真のとき `init` → `frameNavigated` → `loadEventFired` → `load` の順で、
-    /// lifecycle の params が具体値で一致する（TASK-43.3k・`CDP-2`）。
+    /// `Page.enable`＋lifecycle 有効で DOMContentLoaded が `Fired` のとき、`init` → `frameNavigated` →
+    /// `domContentEventFired` → `lifecycle{DOMContentLoaded}` → `loadEventFired` → `lifecycle{load}` の順で、
+    /// params と timestamp が具体値で一致し非減少（TASK-43.3k・`CDP-2`・`CDP-4`・#1322 AC1・AC2）。
     #[test]
     fn cdp2_navigation_events_with_lifecycle_order_and_shape() {
         let ev = navigation_events(
             "00000000000000000000000000000001",
             "7",
             "http://example.test/",
-            2.5,
-            true,
-            None,
+            &opts(true, true, DomContentLoaded::Fired, None, (2.5, 2.75, 3.0)),
+        );
+        let methods: Vec<&str> = ev.iter().map(|e| e.method).collect();
+        assert_eq!(
+            methods,
+            [
+                "Page.lifecycleEvent",
+                "Page.frameNavigated",
+                "Page.domContentEventFired",
+                "Page.lifecycleEvent",
+                "Page.loadEventFired",
+                "Page.lifecycleEvent"
+            ]
+        );
+        let fid = "00000000000000000000000000000001";
+        assert_eq!(
+            ev[0].params,
+            json!({"frameId": fid, "loaderId": "7", "name": "init", "timestamp": 2.5})
+        );
+        assert_eq!(ev[2].params, json!({"timestamp": 2.75}));
+        assert_eq!(
+            ev[3].params,
+            json!({"frameId": fid, "loaderId": "7", "name": "DOMContentLoaded", "timestamp": 2.75})
+        );
+        assert_eq!(ev[4].params, json!({"timestamp": 3.0}));
+        assert_eq!(
+            ev[5].params,
+            json!({"frameId": fid, "loaderId": "7", "name": "load", "timestamp": 3.0})
+        );
+        let ts: Vec<f64> = ev
+            .iter()
+            .filter_map(|e| e.params["timestamp"].as_f64())
+            .collect();
+        assert_eq!(ts, [2.5, 2.75, 2.75, 3.0, 3.0]);
+        assert!(ts.windows(2).all(|w| w[0] <= w[1]), "{ts:?}");
+        assert!(ev.iter().all(|e| e.session_id.is_none()));
+    }
+
+    /// `Page.enable` のみ（lifecycle 無効）では `domContentEventFired` だけが追加される（#1322）。
+    #[test]
+    fn cdp2_navigation_events_page_enabled_without_lifecycle() {
+        let ev = navigation_events(
+            "T1",
+            "1",
+            "http://example.test/",
+            &opts(true, false, DomContentLoaded::Fired, None, (1.0, 2.0, 3.0)),
+        );
+        let methods: Vec<&str> = ev.iter().map(|e| e.method).collect();
+        assert_eq!(
+            methods,
+            [
+                "Page.frameNavigated",
+                "Page.domContentEventFired",
+                "Page.loadEventFired"
+            ]
+        );
+    }
+
+    /// 打ち切りで DOMContentLoaded が発火しなかった文書では DOMContentLoaded 系を送らず、
+    /// `init`・`frameNavigated`・`loadEventFired`・`load` は残る（#1322 AC3・`SEC-2`）。
+    #[test]
+    fn cdp2_navigation_events_skip_dom_content_loaded_when_not_fired() {
+        let ev = navigation_events(
+            "T1",
+            "1",
+            "http://example.test/",
+            &opts(
+                true,
+                true,
+                DomContentLoaded::NotFired,
+                None,
+                (1.0, 2.0, 3.0),
+            ),
         );
         let methods: Vec<&str> = ev.iter().map(|e| e.method).collect();
         assert_eq!(
@@ -1311,15 +1555,65 @@ mod tests {
                 "Page.lifecycleEvent"
             ]
         );
+        let names: Vec<&str> = ev
+            .iter()
+            .filter_map(|e| e.params["name"].as_str())
+            .collect();
+        assert_eq!(names, ["init", "load"]);
+    }
+
+    /// core の発火記録から `DomContentLoaded` を判定する（`Dispatched` だけが `Fired`。#1322 AC3）。
+    #[test]
+    fn cdp2_dom_content_loaded_from_outcome() {
+        use fandhe_browser_core::AbortKind;
         assert_eq!(
-            ev[0].params,
-            json!({"frameId": "00000000000000000000000000000001", "loaderId": "7", "name": "init", "timestamp": 2.5})
+            dom_content_loaded_from(Some(&LifecycleOutcome::Dispatched)),
+            DomContentLoaded::Fired
         );
         assert_eq!(
-            ev[3].params,
-            json!({"frameId": "00000000000000000000000000000001", "loaderId": "7", "name": "load", "timestamp": 2.5})
+            dom_content_loaded_from(Some(&LifecycleOutcome::Aborted {
+                kind: AbortKind::ResourceLimit
+            })),
+            DomContentLoaded::NotFired
         );
-        assert!(ev.iter().all(|e| e.session_id.is_none()));
+        assert_eq!(
+            dom_content_loaded_from(Some(&LifecycleOutcome::NotFired {
+                kind: AbortKind::ResourceLimit
+            })),
+            DomContentLoaded::NotFired
+        );
+        assert_eq!(dom_content_loaded_from(None), DomContentLoaded::NotFired);
+    }
+
+    /// `Executed` 以外の段は解析済みとして `Fired`、`Executed` は記録の値をそのまま返す（#1322）。
+    #[test]
+    fn cdp2_script_stage_dom_content_loaded() {
+        assert_eq!(
+            ScriptStage::NotAttempted.dom_content_loaded(),
+            DomContentLoaded::Fired
+        );
+        assert_eq!(
+            ScriptStage::Failed(ScriptFailure::Busy).dom_content_loaded(),
+            DomContentLoaded::Fired
+        );
+        assert_eq!(
+            ScriptStage::BaseUrlRejected.dom_content_loaded(),
+            DomContentLoaded::Fired
+        );
+        for dcl in [DomContentLoaded::Fired, DomContentLoaded::NotFired] {
+            let stage = ScriptStage::Executed {
+                abort: None,
+                dom_content_loaded: dcl,
+            };
+            assert_eq!(stage.dom_content_loaded(), dcl);
+        }
+    }
+
+    /// `NavigationTimestamps::now` は commit <= dom_content_loaded <= load（#1322 AC2）。
+    #[test]
+    fn cdp2_navigation_timestamps_are_non_decreasing() {
+        let t = NavigationTimestamps::now();
+        assert!(t.commit <= t.dom_content_loaded && t.dom_content_loaded <= t.load);
     }
 
     #[test]
@@ -1474,6 +1768,7 @@ mod tests {
         let line = script_log_line(
             &ScriptStage::Executed {
                 abort: Some("wall_time"),
+                dom_content_loaded: DomContentLoaded::NotFired,
             },
             3,
         );
@@ -1488,7 +1783,13 @@ mod tests {
         );
         assert_eq!(script_log_line(&ScriptStage::NotAttempted, 1), None);
         assert_eq!(
-            script_log_line(&ScriptStage::Executed { abort: None }, 1),
+            script_log_line(
+                &ScriptStage::Executed {
+                    abort: None,
+                    dom_content_loaded: DomContentLoaded::Fired,
+                },
+                1
+            ),
             None
         );
         assert_eq!(

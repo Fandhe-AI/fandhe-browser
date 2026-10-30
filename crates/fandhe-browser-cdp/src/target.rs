@@ -323,7 +323,7 @@ struct Tables {
     /// ターゲットの閉鎖・context の破棄で消える。件数はターゲット数以下。
     paused: HashMap<TargetId, SessionId>,
     /// `Page.enable` 済みのセッション（43.3i・#1037・`CDP-2`）。`Page.lifecycleEvent` 送出ゲートの片方
-    /// （[`TargetRegistry::lifecycle_events_active`]。43.3k・#1039）。
+    /// （[`TargetRegistry::event_gates`]。43.3k・#1039）。
     /// 寿命は `sessions` と同じで、削除と同じロック内で消す。件数は `MAX_SESSIONS` 以下（`CDP-7`）。
     page_enabled: HashSet<SessionId>,
     /// `Page.setLifecycleEventsEnabled{enabled:true}` 済みのセッション（43.3k・#1039・`CDP-2`）。
@@ -383,6 +383,16 @@ pub(crate) struct CreatedWorld {
     pub(crate) view: ContextView,
     /// `Runtime.executionContextCreated` を送るべきか（新規作成かつ Runtime 有効）。
     pub(crate) announce: bool,
+}
+
+/// `Page.navigate` のイベント送出ゲート（[`TargetRegistry::event_gates`]。`REPAIR-4`: 真偽値を並べず構造体で返す）。
+/// `sessionId` なし・未知のセッションは既定値（両方 false）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct PageEventGates {
+    /// `Page.enable` 済み（`Page.domContentEventFired` の送出条件。#1322）。
+    pub(crate) page_enabled: bool,
+    /// `Page.enable` 済みかつ lifecycle 有効（`Page.lifecycleEvent` の送出条件。43.3k・#1039）。
+    pub(crate) lifecycle: bool,
 }
 
 /// ターゲット表とセッション表。単一 `Mutex` で保護し、
@@ -611,7 +621,7 @@ impl TargetRegistry {
         Ok(())
     }
 
-    /// `Page.enable` 済みか（テスト用。本番の送出ゲートは [`Self::lifecycle_events_active`]）。
+    /// `Page.enable` 済みか（テスト用。本番の送出ゲートは [`Self::event_gates`]）。
     #[cfg(test)]
     pub(crate) fn is_page_enabled(&self, sid: &SessionId) -> bool {
         self.lock().page_enabled.contains(sid)
@@ -636,11 +646,16 @@ impl TargetRegistry {
         Ok(())
     }
 
-    /// `Page.lifecycleEvent` を送ってよいか（`Page.enable` 済みかつ lifecycle 有効）を 1 回のロックで返す。
-    /// `Page.navigate` の送出ゲートが読む（43.3k・#1039）。
-    pub(crate) fn lifecycle_events_active(&self, sid: &SessionId) -> bool {
+    /// `Page.navigate` のイベント送出ゲート（`Page.enable` 済みか・lifecycle を送ってよいか）を
+    /// 1 回のロックで返す（TOCTOU を避ける。43.3k・#1039、`domContentEventFired` 用の `page_enabled` は #1322）。
+    /// 未知のセッションは両方 false。
+    pub(crate) fn event_gates(&self, sid: &SessionId) -> PageEventGates {
         let t = self.lock();
-        t.page_enabled.contains(sid) && t.lifecycle_events_enabled.contains(sid)
+        let page_enabled = t.page_enabled.contains(sid);
+        PageEventGates {
+            page_enabled,
+            lifecycle: page_enabled && t.lifecycle_events_enabled.contains(sid),
+        }
     }
 
     /// lifecycle 有効フラグのみを返す（テスト用）。
@@ -1688,19 +1703,26 @@ mod tests {
     }
 
     #[test]
-    fn cdp2_lifecycle_events_active_requires_page_enable_and_flag() {
+    fn cdp2_event_gates_require_page_enable_and_flag() {
         let r = TargetRegistry::new();
         let t = r.create_target(TargetKind::Page, "about:blank").unwrap();
         let s = r.attach(&t).unwrap();
+        let g = |page_enabled, lifecycle| PageEventGates {
+            page_enabled,
+            lifecycle,
+        };
+        assert_eq!(r.event_gates(&s), g(false, false));
         r.set_lifecycle_events(&s, true).unwrap();
-        assert!(!r.lifecycle_events_active(&s));
+        assert_eq!(r.event_gates(&s), g(false, false));
         r.enable_page(&s).unwrap();
-        assert!(r.lifecycle_events_active(&s));
+        assert_eq!(r.event_gates(&s), g(true, true));
         r.set_lifecycle_events(&s, false).unwrap();
-        assert!(!r.lifecycle_events_active(&s));
+        assert_eq!(r.event_gates(&s), g(true, false));
         let s2 = r.attach(&t).unwrap();
         r.enable_page(&s2).unwrap();
-        assert!(!r.lifecycle_events_active(&s2));
+        assert_eq!(r.event_gates(&s2), g(true, false));
+        let ghost = SessionId::parse("ghost-1").unwrap();
+        assert_eq!(r.event_gates(&ghost), g(false, false));
     }
 
     #[test]

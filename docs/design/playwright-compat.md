@@ -404,7 +404,7 @@ id 7・11・13・15・16・17・18。
   `frameId` は `main`、`loaderId` は応答と `frameNavigated` に一致し、`timestamp` は 3 イベントで同じ値。失敗・中断・追い越された遷移・
   閉じたターゲットでは `frameNavigated` と同じ条件ブロックの中で判定するため送らない。順序の根拠（`init` は `load` より前、`load` は
   `frameNavigated` より後）は Playwright / Puppeteer のソース読解による推定で、**種別 B（未実測）**。
-- **送らない名前**（`REPAIR-3`）: `DOMContentLoaded`・`networkAlmostIdle`・`networkIdle`・`commit`・`firstPaint` 系・`InteractiveTime`。実体が無く、
+- **送らない名前**（`REPAIR-3`。`DOMContentLoaded` は #1322 で送出に変更。下の「DOMContentLoaded の lifecycleEvent 送出」節）: `DOMContentLoaded`・`networkAlmostIdle`・`networkIdle`・`commit`・`firstPaint` 系・`InteractiveTime`。実体が無く、
   偽の値で埋めない。将来仕様は TASK-43・TASK-44（`CDP-2`）。
 - **差異**: 有効化時に現在の文書の lifecycle を再送しない（Chromium は再送する）。送り先は `Page.navigate` を送ったセッションだけ。
   `Runtime.runIfWaitingForDebugger` による初期 `about:blank` の確定では送らない。
@@ -809,6 +809,36 @@ TASK-43.3o（#1050）の取り込み後に再取得した同梱トレース（3 
 #### Claude の提示（推奨。決定ではない）
 
 TASK-71 の対象にダウンロードが無く、spec にも要件が無いため、現時点では B（オプション指定つきで判定し、制限を明記したまま）を提示する。ダウンロードを要する対象タスクや利用者の要望が出た時点で A を見直す。
+
+## DOMContentLoaded の lifecycleEvent 送出（#1322・`CDP-2`・`CDP-4`）
+
+TASK-46（#252）の測定で `page.goto(url, { waitUntil: "domcontentloaded" })` が 28 件すべて時間切れになった。
+Playwright は `Page.lifecycleEvent` の `name == "DOMContentLoaded"` を受けたときだけ domcontentloaded を満たす。
+Puppeteer の `LifecycleWatcher` も同じ。これを受けて `Page.navigate` の確定時に次を送る（`page.rs` の `navigation_events` が正本）。
+
+- **順序**: `[lifecycle{init}]` → `[Runtime.executionContextsCleared]` → `Page.frameNavigated` → `[Runtime.executionContextCreated…]` →
+  `[Page.domContentEventFired]` → `[lifecycle{DOMContentLoaded}]` → `Page.loadEventFired` → `[lifecycle{load}]`。
+- **ゲート**: `lifecycle{DOMContentLoaded}` は `init`・`load` と同じ（`Page.enable` 済みかつ lifecycle 有効）。
+  `Page.domContentEventFired` は `Page.enable` 済みのセッションに限る（Chromium の規則。新しいイベントなので、
+  既存の `frameNavigated`・`loadEventFired` のような互換上のゲート免除は持たない）。ブラウザレベル（`sessionId` なし）の遷移では出ない。
+  ゲートは `target.rs` の `event_gates` が 1 回のロックで返す。
+- **送出条件**: core の `page_runner` が記録した `DOMContentLoaded` の発火結果（`PageRunOutput::lifecycle()`）で決める。
+
+  | 経路 | 送るか | 理由 |
+  | ---- | ------ | ---- |
+  | JS を実行していない（既定設定・`about:blank`・`Skipped`・`BaseUrlRejected`・`Failed`） | 送る | 取得した HTML は解析済みで、リスナーも存在し得ない |
+  | `Executed` で記録が `Dispatched` | 送る | 実際に発火した |
+  | `Executed` で記録が `Aborted`・`NotFired`・無し・未知の結果 | 送らない | 発火したと言えない（fail-closed。偽の値で埋めない。`SEC-2`） |
+
+- **timestamp**: 送出時刻で、`init` ≦ `DOMContentLoaded` 系 ≦ `load` 系の非減少。同種のペア（`domContentEventFired` と
+  `lifecycle{DOMContentLoaded}`、`loadEventFired` と `lifecycle{load}`）は同じ値（Chromium も同様）。実際の発火時刻ではない
+  （スクリプトは commit 前に走る）。厳密増加に見せかける人為的なオフセットは付けない。
+- **差異（`REPAIR-3`）**: load が打ち切りで発火しなかった文書でも `loadEventFired`・`lifecycle{load}` は従来どおり送る
+  （DOMContentLoaded との非対称。変えると `waitUntil: "load"` の待機が止まるため別途判断）。
+- **検証**: 単体テスト・ディスパッチテストで順序・params・timestamp・打ち切り時の非送出を具体値で確認（種別 A）。
+  実 Playwright は `make test-playwright-connect` の goto 段階が `waitUntil: "domcontentloaded"` に続き `waitForLoadState("load")` で通ることを確認した（種別 A、
+  ループバック fixture）。TASK-46 の再測定（成功率の判定）は未実施で、人間担当。
+- フラグ・イベントは fetch・ヘッダ・UA・`navigator`・画面・TLS・locale に触れない（`SEC-2`）。
 
 ## 未確定事項・再現手順
 
