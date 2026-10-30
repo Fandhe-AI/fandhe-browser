@@ -8,6 +8,8 @@
 // オプションは渡さない（SEC-2）。Playwright 既定オプションは Browser.setDownloadBehavior 等で
 // 失敗するため noDefaults / acceptDownloads:false / viewport:null を指定する
 // （harness/playwright-trace/README.md）。
+// goto 段階は waitUntil: "domcontentloaded" で遷移し、続けて waitForLoadState("load") を待つ。
+// DOMContentLoaded の lifecycleEvent を cdp が送ること（#1322・CDP-2・CDP-4）の実クライアントでの確認。
 
 const MAX_LEN = 500;
 export const STAGE_NAMES = ["connect", "newContext", "newPage", "goto", "selector"];
@@ -75,7 +77,8 @@ export async function runStages({
       page = await context.newPage();
     },
     async () => {
-      await page.goto(fixtureUrl, { timeout: stageTimeoutMs });
+      await page.goto(fixtureUrl, { waitUntil: "domcontentloaded", timeout: stageTimeoutMs });
+      await page.waitForLoadState("load", { timeout: stageTimeoutMs });
     },
     async () => {
       const locator = page.locator(expect.selector);

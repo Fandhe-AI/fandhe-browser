@@ -4,7 +4,7 @@ import assert from "node:assert/strict";
 import { FIXTURE_EXPECT, runStages } from "./stages.mjs";
 
 function fake({ failAt, hangAt, lateRejectAt, text = FIXTURE_EXPECT.text, attr = FIXTURE_EXPECT.attribute.value, count = 1 } = {}) {
-  const calls = { connectArgs: null, contextArgs: null, gotoArgs: null, attrArgs: null };
+  const calls = { connectArgs: null, contextArgs: null, gotoArgs: null, loadStateArgs: null, attrArgs: null };
   const maybe = async (name, v) => {
     if (hangAt === name) await new Promise(() => {});
     if (lateRejectAt === name) {
@@ -30,6 +30,10 @@ function fake({ failAt, hangAt, lateRejectAt, text = FIXTURE_EXPECT.text, attr =
   const page = {
     goto: (u, o) => {
       calls.gotoArgs = [u, o];
+      return maybe("goto", null);
+    },
+    waitForLoadState: (s, o) => {
+      calls.loadStateArgs = [s, o];
       return maybe("goto", null);
     },
     locator: (sel) => {
@@ -71,7 +75,11 @@ const ALL = ["connect", "newContext", "newPage", "goto", "selector"];
   assert.equal(r.ok, true);
   assert.equal(r.step, "selector");
   assert.deepEqual(statuses(r), ALL.map((n) => `${n}:ok`));
-  assert.deepEqual(f.calls.gotoArgs, ["http://127.0.0.1:2/index.html", { timeout: 200 }]);
+  assert.deepEqual(f.calls.gotoArgs, [
+    "http://127.0.0.1:2/index.html",
+    { waitUntil: "domcontentloaded", timeout: 200 },
+  ]);
+  assert.deepEqual(f.calls.loadStateArgs, ["load", { timeout: 200 }]);
   assert.equal(f.calls.selector, "#target");
   assert.deepEqual(f.calls.attrArgs, ["data-role", { timeout: 200 }]);
   // 既知の失敗回避オプションが渡ること（harness/playwright-trace/README.md）。

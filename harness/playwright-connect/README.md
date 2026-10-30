@@ -36,6 +36,7 @@ Playwright 接続試験の実行基盤（TASK-44.1・Issue #476・ビヘイビ�
   - `FANDHE_PLAYWRIGHT_MODULE_DIR`: `node_modules/playwright-core` を持つ導入先
   - `FANDHE_FIXTURE_URL`: `goto` 先の fixture ページ URL（必須。ループバック IP リテラルの `http://` 以外は、Playwright 読み込み前に `goto` 段階の結果行つきで拒否）
 - 結果行・`stages` の形式は `harness/puppeteer-connect/README.md` と同じ。段階は `connect` / `newContext` / `newPage` / `goto` / `selector`。
+  `goto` 段階は `waitUntil: "domcontentloaded"` で遷移し、同じ段階内で続けて `waitForLoadState("load")` を待つ（`Page.lifecycleEvent` の `DOMContentLoaded` と `load` の送出確認。#1322・`CDP-2`・`CDP-4`）。
   セレクタ段階は `FIXTURE_EXPECT` と比べ、不一致は `SelectorMismatch`（期待値と実測値をメッセージに含む）、要素なしは `SelectorNotFound` で失敗する
 - 既知の回避策: `connectOverCDP(url, { noDefaults: true })`・`newContext({ acceptDownloads: false, viewport: null })`
   （`harness/playwright-trace/README.md`）。UA・フィンガープリントは変更しない（SEC-2）
