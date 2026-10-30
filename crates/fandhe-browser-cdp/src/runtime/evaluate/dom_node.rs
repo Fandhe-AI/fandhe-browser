@@ -290,9 +290,16 @@ impl CommandHandler for DomResolveNode {
                 limits: &self.limits,
             };
             let text = site.run(&adopt_node_source(epoch, order)).await?;
-            let outcome = match parse_envelope(&text)? {
-                Envelope::Value { result } => {
-                    let ro = remote_object(&result, view.id)?;
+            // 解析・変換の失敗でも `?` で抜けず、コミット済みハンドルを必ず回収する。
+            let envelope = match parse_envelope(&text) {
+                Ok(e) => e,
+                Err(e) => {
+                    let _ = site.run(&discard_source(epoch)).await;
+                    return Err(e);
+                }
+            };
+            let outcome = match envelope {
+                Envelope::Value { result } => remote_object(&result, view.id).and_then(|ro| {
                     let is_node = ro.get("subtype").and_then(Value::as_str) == Some("node")
                         && ro.get("objectId").is_some();
                     if is_node {
@@ -300,7 +307,7 @@ impl CommandHandler for DomResolveNode {
                     } else {
                         Err(CdpError::SERVER_ERROR)
                     }
-                }
+                }),
                 Envelope::NodeUnavailable => return Err(CdpError::NODE_NOT_FOUND),
                 Envelope::HandleLimit => return Err(CdpError::TOO_MANY_REMOTE_OBJECTS),
                 Envelope::Reset => {
