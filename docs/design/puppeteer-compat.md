@@ -12,7 +12,7 @@
 
 `puppeteer.connect({browserWSEndpoint})` → `browser.newPage()` → `page.goto("about:blank")` → `page.$("body")` →
 `browser.disconnect()` の各段階が fandhe-browser の CDP サーバーでどこまで到達するかを記録する。
-本書は記録までで、方針の決定（Playwright と Puppeteer のどちらを主軸にするか）と追加実装は含めない。
+本書は記録までで、主軸の決定（Playwright と Puppeteer のどちらを主軸にするか）と追加実装は含めない。`Target.setAutoAttach` の `filter` の扱いのみ「方針」節で決定している。
 
 **重要: 本節の段階表は実 Puppeteer で実測していない（2026-10-06 時点の読解）。** `puppeteer-core` は測定時の一時導入のみ承認済み（2026-10-29・#252。`harness/endpoint-swap/`）で、
 `package.json`・CI ジョブは追加していない（`harness/puppeteer-connect/README.md`「導入状況」）。
@@ -106,7 +106,7 @@ Playwright と異なり、`browserWSEndpoint` 指定の接続では HTTP の `/j
 | 上限（`MAX_TARGETS`・`MAX_SESSIONS`） | `Target.createTarget`・auto-attach の対応でターゲット数・セッション数の上限を維持する |
 | SSRF | 試験の `goto` は `about:blank` 固定のまま。`FetchOptions` の内部アドレス拒否を緩める案は採らない |
 
-## 対応候補（列挙のみ。優先度・採否は未決定）
+## 対応候補（列挙のみ。優先度・採否は未決定。ただし `Target.setAutoAttach` の `filter` の扱いは「方針」節で決定済み）
 
 | 候補 | 影響範囲 |
 | ---- | -------- |
@@ -117,14 +117,24 @@ Playwright と異なり、`browserWSEndpoint` 指定の接続では HTTP の `/j
 
 ## 方針
 
-（未記入。人間が決定し、ここへ記録する。本書では方針を決めていない。）
+Puppeteer が接続段階で送る `Target.setAutoAttach` の `filter` の扱いについて、オーナーが次のとおり判断した（Issue #1327・2026-10-30。対応ビヘイビア: `CDP-2`・`CDP-3`・`CDP-4`・`CDP-6`・`SEC-2`。対応タスク: TASK-45・TASK-46。マイルストーン: MS-4）。
+
+- **論点**: Puppeteer は root セッションに `Target.setAutoAttach` を `filter: [{type: 'page', exclude: true}, {}]` 付きで送る（Puppeteer `TargetManager.ts:154`）。fandhe-browser は `filter` を `-32602` で拒否しており（`crates/fandhe-browser-cdp/src/playwright_compat.rs:141`、main 165eda0 時点）、Puppeteer は接続段階で止まる
+- **採用**: **案 (a) tab 擬似ターゲットを持ち、Chrome の階層（tab → page）に合わせる**
+- **不採用**:
+  - 案 (b)「`filter` を受けるが page 除外は適用しない」: 除外すべき `page` まで attach してしまい、#908 の「黙って無視しない」方針に反する。また未実装の指定を成功扱いで受け流すフォールバックに当たる。これはセキュリティ規約が検出回避として作用しないか確認を求めるもので、`CDP-6`（未実装メソッドへの応答方針。検討中）の論点とも重なる
+  - 案 (c)「非対応のまま」: Puppeteer で `CDP-4` を満たせない
+- **着手順**: #1321 配下の Playwright 側の不足（例: DOMContentLoaded の lifecycleEvent〔#1322〕）を先に直し、その後に案 (a) に着手する。Playwright で `CDP-4` の成功率を上げる方が効果が大きく、手間も小さいため
+- **案 (a) の実装時の確認事項**: tab ターゲットを `Target.getTargets`・`Target.targetCreated` 等に出すことで、Playwright の接続・`newPage` が後退しないことを `harness/playwright-connect`・`harness/endpoint-swap` で確かめる
+- **測定条件の前提**: Puppeteer は `defaultViewport: null` 以外では `Emulation.setDeviceMetricsOverride` で止まる。これは画面の識別面にあたり `SEC-2` で実装しないため、Puppeteer の測定は `defaultViewport: null` を前提とする
+- **実装状況**: 未着手
 
 ## 未確定事項・再現手順
 
 - 実測が未実施。`puppeteer-core` の導入承認後に次を実測値で更新する: 段階別 status・失敗段階のエラー名とメッセージ・
   `CdpState::received_methods()`・本書の B の予測との差分
 - #8 のうち握りつぶしの有無、#10 の `page.$` の呼び出し連鎖、#11 の切断時の送信有無は精査が不完全
-- `Target.setAutoAttach` の `filter` 引数は `-32602`（`unsupported params`）で拒否すると確定（TASK-43.3c・#908。黙って無視すると除外すべき `page` まで attach するため）。`autoAttach:true` と `waitForDebuggerOnStart:true` の組み合わせは、当初拒否していたが TASK-43.3g（#942）で受理に変わった（保持のみ。新しいターゲットの停止は #910）。`filter` の拒否は残るため Puppeteer の `TargetManager.initialize` の `filter` 付き呼び出しは現状 `-32602` で失敗する（Puppeteer 側の対応は TASK-45 で再判断）
+- `Target.setAutoAttach` の `filter` 引数は `-32602`（`unsupported params`）で拒否すると確定（TASK-43.3c・#908。黙って無視すると除外すべき `page` まで attach するため）。`autoAttach:true` と `waitForDebuggerOnStart:true` の組み合わせは、当初拒否していたが TASK-43.3g（#942）で受理に変わった（保持のみ。新しいターゲットの停止は #910）。`filter` の拒否は残るため Puppeteer の `TargetManager.initialize` の `filter` 付き呼び出しは現状 `-32602` で失敗する（Puppeteer 側の対応は「方針」節のとおり案 (a) を採用。2026-10-30・#1327。未実装）
 - spec（`docs/spec`）は本調査環境で再照合しておらず、C の記述は spec 本文と未照合
 - 再現（ソース確認）: `npm pack puppeteer-core@25.12.0` で得た tarball を一時ディレクトリへ展開し、`src/cdp/` を閲覧のみする（展開物内でスクリプトは実行しない）
 - 再現（実測。承認後）: `harness/puppeteer-connect/README.md` の導入手順に従う
