@@ -21,6 +21,7 @@
 //! `Page.getFrameTree`（メインフレームのみ）を足す。
 //! 43.3j（#1038）で `Log.enable`・`Runtime.enable`・`Network.enable`（セッション単位の有効フラグのみ。
 //! イベントは送らない。`REPAIR-3`）を足す。
+//! #1326 で `Performance.enable`・`Audits.enable`（セッション単位の有効フラグのみ。イベント・計測なし。`REPAIR-3`）を足す。
 //! 43.3k（#1039）で `Page.setLifecycleEventsEnabled`（セッション単位の有効フラグ。`Page.enable` 済みの
 //! セッションの `Page.navigate` が `Page.lifecycleEvent` の `init`・`load` を送る。#1322 で `DOMContentLoaded` も送る）を足す。
 //! 43.3l（#1040）で `Page.addScriptToEvaluateOnNewDocument`（空 `source` のみ受理・非空は拒否）と
@@ -906,7 +907,7 @@ impl CommandHandler for EmulationSetEmulatedMedia {
         })
     }
 }
-/// `Log.enable`・`Runtime.enable`・`Network.enable` の共通本体（`CDP-2`・TASK-43.3j・#1038）。
+/// `Log.enable`・`Runtime.enable`・`Network.enable`（TASK-43.3j・#1038）・`Performance.enable`・`Audits.enable`（#1326）の共通本体（`CDP-2`・`CDP-3`）。
 ///
 /// 検証順は [`PageEnable`] と同じ。`sessionId` なしは `UNSUPPORTED_PARAMS`、未知・閉じたセッションは
 /// `INVALID_PARAMS`、`params` にキーがあれば黙って無視せず `UNSUPPORTED_PARAMS`（フラグは立てない）。
@@ -1004,6 +1005,44 @@ impl CommandHandler for NetworkEnable {
         params: &'a Value,
     ) -> BoxFuture<'a, Result<HandlerOutput, CdpError>> {
         Box::pin(async move { enable_session_domain(ctx, params, SessionDomain::Network) })
+    }
+}
+
+/// `Performance.enable`（`CDP-3`・#1326）。Puppeteer の `newPage()` が page session に送るため受理する。
+///
+/// セッションに有効フラグを立てて `{}` を返す（冪等）。フラグを保持するだけで、イベントも計測も行わない。
+/// 差異（`REPAIR-3`）: `Performance.metrics` は送らず、`Performance.getMetrics`・`Performance.disable` は
+/// 未実装で `-32601`。`timeDomain` 等の params は未実装のため `UNSUPPORTED_PARAMS`。
+/// 実際に状態を変える成功であり、検出回避のための一律成功ではない。フラグは fetch・ヘッダ・UA・
+/// `navigator`・画面を何も変えない（`SEC-2`・`CDP-6`）。検証は [`enable_session_domain`]。
+pub(crate) struct PerformanceEnable;
+
+impl CommandHandler for PerformanceEnable {
+    fn handle<'a>(
+        &'a self,
+        ctx: CommandContext<'a>,
+        params: &'a Value,
+    ) -> BoxFuture<'a, Result<HandlerOutput, CdpError>> {
+        Box::pin(async move { enable_session_domain(ctx, params, SessionDomain::Performance) })
+    }
+}
+
+/// `Audits.enable`（`CDP-3`・#1326）。Puppeteer の `newPage()` が page session に送るため受理する。
+///
+/// セッションに有効フラグを立てて `{}` を返す（冪等）。フラグを保持するだけで、イベントも計測も行わない。
+/// 差異（`REPAIR-3`）: `Audits.issueAdded` は送らず、`Audits.disable`・`Audits.checkContrast` 等は
+/// 未実装で `-32601`。params は未実装のため非空なら `UNSUPPORTED_PARAMS`。
+/// 実際に状態を変える成功であり、検出回避のための一律成功ではない。識別面には影響しない（`SEC-2`・`CDP-6`）。
+/// 検証は [`enable_session_domain`]。
+pub(crate) struct AuditsEnable;
+
+impl CommandHandler for AuditsEnable {
+    fn handle<'a>(
+        &'a self,
+        ctx: CommandContext<'a>,
+        params: &'a Value,
+    ) -> BoxFuture<'a, Result<HandlerOutput, CdpError>> {
+        Box::pin(async move { enable_session_domain(ctx, params, SessionDomain::Audits) })
     }
 }
 
@@ -3544,14 +3583,16 @@ mod tests {
             );
         }
 
-        const DOMAINS: [(&str, SessionDomain); 3] = [
+        const DOMAINS: [(&str, SessionDomain); 5] = [
             ("Log.enable", SessionDomain::Log),
             ("Runtime.enable", SessionDomain::Runtime),
             ("Network.enable", SessionDomain::Network),
+            ("Performance.enable", SessionDomain::Performance),
+            ("Audits.enable", SessionDomain::Audits),
         ];
 
         #[tokio::test]
-        async fn cdp2_log_runtime_network_enable_with_session_return_empty_and_are_idempotent() {
+        async fn cdp2_session_domain_enable_with_session_return_empty_and_are_idempotent() {
             let dir = TempDir::new();
             let st = state(&dir);
             let c = open_conn(&st, 1);
@@ -3572,7 +3613,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn cdp2_log_runtime_network_enable_reject_missing_or_unknown_session() {
+        async fn cdp2_session_domain_enable_reject_missing_or_unknown_session() {
             let dir = TempDir::new();
             let st = state(&dir);
             let c = open_conn(&st, 1);
@@ -3620,6 +3661,88 @@ mod tests {
                 assert_eq!(
                     call(&st, Some(c), &sreq(id, m, &sid, r#"{"x":1}"#)).await,
                     vec![serr(-32602, "unsupported params", id, &sid)]
+                );
+                assert!(!st.registry().is_domain_enabled(&s, d));
+            }
+        }
+
+        #[tokio::test]
+        async fn cdp3_performance_and_audits_enable_reject_non_empty_params() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let c = open_conn(&st, 1);
+            let sid = attached_session(&st, c).await;
+            let s = SessionId::parse(&sid).unwrap();
+            let mut id = 1;
+            for (m, d) in [DOMAINS[3], DOMAINS[4]] {
+                for p in [r#"{"x":1}"#, r#"{"timeDomain":"timeTicks"}"#] {
+                    id += 1;
+                    assert_eq!(
+                        call(&st, Some(c), &sreq(id, m, &sid, p)).await,
+                        vec![serr(-32602, "unsupported params", id, &sid)]
+                    );
+                }
+                assert!(!st.registry().is_domain_enabled(&s, d));
+            }
+        }
+
+        #[tokio::test]
+        async fn cdp6_performance_and_audits_unimplemented_methods_stay_method_not_found() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let c = open_conn(&st, 1);
+            let sid = attached_session(&st, c).await;
+            let mut id = 1;
+            for enabled in [false, true] {
+                if enabled {
+                    for m in ["Performance.enable", "Audits.enable"] {
+                        id += 1;
+                        call(&st, Some(c), &sreq(id, m, &sid, "{}")).await;
+                    }
+                }
+                for m in [
+                    "Performance.getMetrics",
+                    "Performance.disable",
+                    "Audits.disable",
+                    "Audits.checkContrast",
+                ] {
+                    id += 1;
+                    assert_eq!(
+                        call(&st, Some(c), &sreq(id, m, &sid, "{}")).await,
+                        vec![serr(-32601, "method not implemented", id, &sid)],
+                        "{m} enabled={enabled}"
+                    );
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn cdp7_performance_audits_flags_gone_after_close_target() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let c = open_conn(&st, 1);
+            let sid = attached_session(&st, c).await;
+            let s = SessionId::parse(&sid).unwrap();
+            let mut id = 1;
+            for (m, d) in [DOMAINS[3], DOMAINS[4]] {
+                id += 1;
+                call(&st, Some(c), &sreq(id, m, &sid, "{}")).await;
+                assert!(st.registry().is_domain_enabled(&s, d));
+            }
+            let t = target_of(&st, &sid);
+            call(
+                &st,
+                Some(c),
+                &format!(
+                    r#"{{"id":50,"method":"Target.closeTarget","params":{{"targetId":"{t}"}}}}"#
+                ),
+            )
+            .await;
+            for (m, d) in [DOMAINS[3], DOMAINS[4]] {
+                id += 1;
+                assert_eq!(
+                    call(&st, Some(c), &sreq(id, m, &sid, "{}")).await,
+                    vec![serr(-32602, "invalid params", id, &sid)]
                 );
                 assert!(!st.registry().is_domain_enabled(&s, d));
             }
