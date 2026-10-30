@@ -291,15 +291,21 @@ pub(crate) enum SessionDomain {
     Log,
     Runtime,
     Network,
+    /// `Performance.enable`（#1326・`CDP-3`）。印を持つだけ。
+    Performance,
+    /// `Audits.enable`（#1326・`CDP-3`）。印を持つだけ。
+    Audits,
 }
 
-/// ドメインごとの有効フラグ。`Runtime` は実行コンテキストの告知ゲート（TASK-44.6・#1217）。`Log`・`Network` は
+/// ドメインごとの有効フラグ。`Runtime` は実行コンテキストの告知ゲート（TASK-44.6・#1217）。`Log`・`Network`・`Performance`・`Audits` は
 /// イベント送出が未実装で、現時点では印を持つだけ（`REPAIR-3`）。
 #[derive(Debug, Clone, Copy, Default)]
 struct SessionDomains {
     log: bool,
     runtime: bool,
     network: bool,
+    performance: bool,
+    audits: bool,
 }
 
 impl SessionDomains {
@@ -308,6 +314,8 @@ impl SessionDomains {
             SessionDomain::Log => &mut self.log,
             SessionDomain::Runtime => &mut self.runtime,
             SessionDomain::Network => &mut self.network,
+            SessionDomain::Performance => &mut self.performance,
+            SessionDomain::Audits => &mut self.audits,
         }
     }
 }
@@ -329,7 +337,7 @@ struct Tables {
     /// `Page.setLifecycleEventsEnabled{enabled:true}` 済みのセッション（43.3k・#1039・`CDP-2`）。
     /// 寿命は `sessions` と同じで削除と同じロック内で消す。件数は `MAX_SESSIONS` 以下（`CDP-7`）。
     lifecycle_events_enabled: HashSet<SessionId>,
-    /// `Log.enable`・`Runtime.enable`・`Network.enable` 済みのセッション（43.3j・#1038・`CDP-2`）。
+    /// `Log.enable`・`Runtime.enable`・`Network.enable`（43.3j・#1038・`CDP-2`）・`Performance.enable`・`Audits.enable`（#1326・`CDP-3`）済みのセッション。
     /// 寿命は `sessions` と同じで削除と同じロック内で消す。件数は `MAX_SESSIONS` 以下（`CDP-7`）。
     domains_enabled: HashMap<SessionId, SessionDomains>,
     /// `Emulation.setFocusEmulationEnabled`・`setEmulatedMedia` で受理した検証済みの値（43.3m・#1041・`CDP-2`）。
@@ -715,7 +723,7 @@ impl TargetRegistry {
         self.lock().emulation.get(sid).copied()
     }
 
-    /// セッションに `Log`・`Runtime`・`Network` のいずれかの有効印を付ける（冪等。43.3j・#1038・`CDP-2`）。
+    /// セッションに `Log`・`Runtime`・`Network`・`Performance`・`Audits` のいずれかの有効印を付ける（冪等。43.3j・#1038・`CDP-2`）。
     /// 今回の呼び出しで新たに有効化したら `true`、既に有効なら `false`（`Runtime.enable` が初回のときだけ
     /// 実行コンテキストを告知するために使う。TASK-44.6・#1217）。
     ///
@@ -1837,11 +1845,11 @@ mod tests {
 
     #[test]
     fn cdp2_enable_domain_is_idempotent_per_domain_and_rejects_unknown_session() {
-        use SessionDomain::{Log, Network, Runtime};
+        use SessionDomain::{Audits, Log, Network, Performance, Runtime};
         let r = TargetRegistry::new();
         let t = r.create_target(TargetKind::Page, "about:blank").unwrap();
         let s = r.attach(&t).unwrap();
-        for d in [Log, Runtime, Network] {
+        for d in [Log, Runtime, Network, Performance, Audits] {
             assert!(!r.is_domain_enabled(&s, d));
             r.enable_domain(&s, d).unwrap();
             r.enable_domain(&s, d).unwrap();
@@ -1852,6 +1860,8 @@ mod tests {
         assert!(r.is_domain_enabled(&s2, Log));
         assert!(!r.is_domain_enabled(&s2, Runtime));
         assert!(!r.is_domain_enabled(&s2, Network));
+        assert!(!r.is_domain_enabled(&s2, Performance));
+        assert!(!r.is_domain_enabled(&s2, Audits));
         assert!(!r.is_page_enabled(&s2));
         let ghost = SessionId::parse("ghost-1").unwrap();
         assert_eq!(
@@ -1863,14 +1873,14 @@ mod tests {
 
     #[test]
     fn cdp7_domain_flags_are_dropped_on_detach_close_and_dispose() {
-        use SessionDomain::{Log, Network, Runtime};
+        use SessionDomain::{Audits, Log, Network, Performance, Runtime};
         let all = |r: &TargetRegistry, s: &SessionId| {
-            for d in [Log, Runtime, Network] {
+            for d in [Log, Runtime, Network, Performance, Audits] {
                 r.enable_domain(s, d).unwrap();
             }
         };
         let none = |r: &TargetRegistry, s: &SessionId| {
-            for d in [Log, Runtime, Network] {
+            for d in [Log, Runtime, Network, Performance, Audits] {
                 assert!(!r.is_domain_enabled(s, d));
             }
         };
