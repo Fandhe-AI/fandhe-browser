@@ -1332,6 +1332,21 @@
         enumerable: false
     });
 
+    // ランナー（cdp ヘルパー）向けの初期ノード同一性の窓口（#1346・CDP-2・CDP-6）。
+    // アタッチ時の文書順番号（Document = 1。cdp の backendNodeId = base + 番号）とラッパーを相互に引く。
+    // bridge のノード ID は外へ出さず、やり取りするのは番号とラッパーだけ。番号を引く op は
+    // max_ops_per_page を消費しないが、nodeAt はラッパー未作成のノードで初回だけ nodeType op
+    // （予算を 1 消費）を呼ぶ。アタッチ後に作ったノード・範囲外の番号は例外（別のノードへは解決しない）。
+    // cdp ヘルパーが注入時にこのオブジェクトを捕捉して使う想定（DOM.describeNode / resolveNode。後続）。
+    expose('__fandheDomIdentity', Object.freeze({
+        orderOf: function (node) {
+            return op('initialOrder', idOf(node, 'orderOf'));
+        },
+        nodeAt: function (order) {
+            return wrapNode(op('nodeByInitialOrder', order));
+        }
+    }));
+
     expose('Node', Node);
     expose('Element', Element);
     expose('HTMLElement', HTMLElement);

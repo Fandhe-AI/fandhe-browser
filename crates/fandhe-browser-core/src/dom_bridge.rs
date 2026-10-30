@@ -25,6 +25,23 @@
 //! 世代不一致で拒否する。世代が枯渇（2^21 回の `attach`）した後の `attach` は `Err`
 //! （fail-closed。新しい [`DomBridge`] を作る）。
 //!
+//! # 初期の文書順番号（#1346・`CDP-2`・`CDP-3`・`CDP-6`・`CDP-7`）
+//!
+//! [`DomBridge::attach`] は取り付け時点の文書順（root を 1 とし `descendants(root)` の前順。cdp の
+//! `dom.rs` の `number_nodes` と同じ走査）で「番号 ⇔ ノード」の表を作る。cdp の
+//! `backendNodeId` は `base + 番号`（`base` は cdp 側の `IssuedDocuments` が持ち、core は扱わない）。
+//! [`DomBridge::initial_order`] / [`DomBridge::node_by_initial_order`] で引く。
+//!
+//! - 表はアタッチ時のスナップショットで、ノードを移動・削除しても番号は変わらない（arena 添字が不変）。
+//! - アタッチ後に作ったノード、`<template>` の template contents のような木に属さない初期ノード、
+//!   範囲外の番号は固定文言の [`DomBridgeError::InitialOrderUnavailable`] で、別のノードへは解決しない。
+//! - 表の長さはアタッチ時のノード数で、パース時の `ParseOptions::max_nodes` で上限が決まる
+//!   （コンテキストでは既定 1,000,000 ノード・約 8 MB）。アタッチ後は増えない
+//!   （アタッチ後の増加は [`crate::DomLimits::max_nodes`] が縛る）。新しい上限値は足さない。
+//! - JS からは `__dom.op` の `initialOrder` / `nodeByInitialOrder`（引数 1 個）で届く。いずれも
+//!   O(1) の読み取りでアロケーションも DOM の変更も無いため、`max_ops_per_page` を消費しない
+//!   （連打は評価のタイムアウトで縛られる）。引数の検証は通常の op と同じく行う。
+//!
 //! # 上限（`JS-6`）
 //!
 //! [`DomBridgeLimits`]: 文字列引数のバイト数・1 操作の応答バイト数・ページ単位の操作回数。
@@ -258,6 +275,12 @@ pub enum DomBridgeError {
     },
     /// ノードの arena 添字が ID に載る範囲（`u32`）を超えた。
     NodeIndexOutOfRange,
+    /// 初期の文書順番号が無い（アタッチ後に作ったノード・木に属さない初期ノード・範囲外の番号。
+    /// `CDP-6`）。別のノードへは解決しない。
+    InitialOrderUnavailable {
+        /// 静的な理由（JS 由来の値は含めない）。
+        reason: &'static str,
+    },
     /// 未実装の操作（REPAIR-3）。
     Unsupported {
         /// 操作名。
@@ -307,6 +330,9 @@ impl std::fmt::Display for DomBridgeError {
             Self::GenerationExhausted => write!(f, "DOM bridge generation counter is exhausted"),
             Self::InvalidLocation { reason } => write!(f, "invalid location: {reason}"),
             Self::NodeIndexOutOfRange => write!(f, "node index does not fit in a node id"),
+            Self::InitialOrderUnavailable { reason } => {
+                write!(f, "node has no initial document order number: {reason}")
+            }
             Self::Unsupported { operation } => write!(f, "{operation} is not supported yet"),
             Self::StatePoisoned => write!(f, "DOM bridge state is poisoned"),
             Self::Core(source) => write!(f, "DOM operation failed: {source}"),
@@ -679,9 +705,118 @@ impl DocumentReadyState {
     }
 }
 
+/// アタッチ時点の文書順番号（1 始まり。Document ノード = 1）。
+///
+/// cdp の `backendNodeId` は `base + get()`（`base` は cdp 側が持つ。`CDP-2`・`CDP-3`）。
+/// 値は `1..=u32::MAX`（安全整数の範囲に収まる）。戻り値を素の数値にしないための型（REPAIR-4）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct InitialNodeOrder(std::num::NonZeroU32);
+
+impl InitialNodeOrder {
+    /// `1..=u32::MAX` の番号だけを受け付ける（範囲外は `None`）。
+    pub fn new(order: u64) -> Option<Self> {
+        u32::try_from(order)
+            .ok()
+            .and_then(std::num::NonZeroU32::new)
+            .map(Self)
+    }
+
+    /// 番号（1 始まり）。
+    pub fn get(self) -> u64 {
+        u64::from(self.0.get())
+    }
+}
+
+/// アタッチ時点の「文書順番号 ⇔ arena 添字」の表（`DomBridge::attach` が 1 回だけ作る）。
+/// 密な `Vec` 2 本で持ち、アタッチ後に増えない。
+struct InitialOrderTable {
+    /// arena 添字 → 番号（0 は木に属さない初期ノード）。長さはアタッチ時の `node_count()`。
+    order_of: Vec<u32>,
+    /// 番号 - 1 → arena 添字。
+    node_at: Vec<u32>,
+}
+
+impl InitialOrderTable {
+    /// cdp の `number_nodes` と同じ順（root, `descendants(root)` の前順）で採番する。
+    fn build(document: &Document) -> Result<Self, DomBridgeError> {
+        let count = document.node_count();
+        let mut order_of = vec![0u32; count];
+        let mut node_at = Vec::with_capacity(count);
+        let root = document.root();
+        let mut next: u32 = 0;
+        for id in std::iter::once(root).chain(document.descendants(root)) {
+            let index =
+                u32::try_from(id.index()).map_err(|_| DomBridgeError::NodeIndexOutOfRange)?;
+            next = next
+                .checked_add(1)
+                .ok_or(DomBridgeError::NodeIndexOutOfRange)?;
+            if let Some(slot) = order_of.get_mut(id.index()) {
+                *slot = next;
+            }
+            node_at.push(index);
+        }
+        Ok(Self { order_of, node_at })
+    }
+
+    fn order(&self, id: NodeId) -> Result<InitialNodeOrder, DomBridgeError> {
+        let unavailable = |reason| DomBridgeError::InitialOrderUnavailable { reason };
+        let Some(&n) = self.order_of.get(id.index()) else {
+            return Err(unavailable("created after attach"));
+        };
+        std::num::NonZeroU32::new(n)
+            .map(InitialNodeOrder)
+            .ok_or(unavailable("not in the initial tree"))
+    }
+
+    fn node(&self, order: InitialNodeOrder) -> Result<NodeId, DomBridgeError> {
+        let idx = usize::try_from(order.get().saturating_sub(1)).ok();
+        idx.and_then(|i| self.node_at.get(i))
+            .and_then(|&i| usize::try_from(i).ok())
+            .map(NodeId::new)
+            .ok_or(DomBridgeError::InitialOrderUnavailable {
+                reason: "no such order",
+            })
+    }
+}
+
+/// 番号引数（`nodeByInitialOrder`）を検証して取り出す。`decode_node_id` に倣う。
+fn decode_initial_order(
+    value: Option<&JsValue>,
+    index: usize,
+    operation: &'static str,
+) -> Result<InitialNodeOrder, DomBridgeError> {
+    let Some(JsValue::Number(n)) = value else {
+        return Err(DomBridgeError::TypeMismatch {
+            operation,
+            index,
+            expected: "an initial order number",
+        });
+    };
+    let n = *n;
+    let invalid = |reason| DomBridgeError::InvalidNodeId { index, reason };
+    if !n.is_finite() {
+        return Err(invalid("not finite"));
+    }
+    if n.fract() != 0.0 {
+        return Err(invalid("not an integer"));
+    }
+    if n < 0.0 {
+        return Err(invalid("negative"));
+    }
+    if n >= MAX_SAFE_INTEGER_EXCLUSIVE {
+        return Err(invalid("out of range"));
+    }
+    // 0 以上 2^53 未満の整数と検証済みのため切り詰めなく変換できる。
+    InitialNodeOrder::new(n as u64).ok_or(DomBridgeError::InitialOrderUnavailable {
+        reason: "no such order",
+    })
+}
+
 /// 取り付け中のページの状態。
 struct PageState {
     document: Document,
+    /// attach 時点の文書順番号の表（`CDP-2`。#1346）。
+    initial_order: InitialOrderTable,
     /// attach 時点の単調時計（`monotonicNow` op の基準）。
     started: std::time::Instant,
     ready_state: DocumentReadyState,
@@ -1819,9 +1954,11 @@ impl DomBridge {
         if generation >= GENERATION_LIMIT {
             return Err(DomBridgeError::GenerationExhausted);
         }
+        let initial_order = InitialOrderTable::build(&document)?;
         state.next_generation = generation.saturating_add(1);
         state.page = Some(PageState {
             document,
+            initial_order,
             started: std::time::Instant::now(),
             ready_state: DocumentReadyState::Loading,
             current_script: None,
@@ -1857,6 +1994,24 @@ impl DomBridge {
         let state = self.lock()?;
         let page = state.page.as_ref().ok_or(DomBridgeError::Detached)?;
         encode_node_id(page.generation, id)
+    }
+
+    /// 初期ノードの文書順番号を引く（`CDP-2`・`CDP-6`。cdp の `backendNodeId` は `base + 番号`）。
+    /// 番号が無い場合（アタッチ後に作ったノード・木に属さない初期ノード）は
+    /// [`DomBridgeError::InitialOrderUnavailable`]、未取り付けは [`DomBridgeError::Detached`]。
+    /// O(1) でアロケーションしない。
+    pub fn initial_order(&self, id: NodeId) -> Result<InitialNodeOrder, DomBridgeError> {
+        let state = self.lock()?;
+        let page = state.page.as_ref().ok_or(DomBridgeError::Detached)?;
+        page.initial_order.order(id)
+    }
+
+    /// 文書順番号からノードを引く。範囲外は [`DomBridgeError::InitialOrderUnavailable`]
+    /// （別のノードへは解決しない）。O(1) でアロケーションしない。
+    pub fn node_by_initial_order(&self, order: InitialNodeOrder) -> Result<NodeId, DomBridgeError> {
+        let state = self.lock()?;
+        let page = state.page.as_ref().ok_or(DomBridgeError::Detached)?;
+        page.initial_order.node(order)
     }
 
     /// `document.readyState` を更新する（ページ実行ランナー用。TASK-109）。
@@ -2096,6 +2251,40 @@ impl DomBridge {
         if matches!(args, [JsValue::String(name)] if name == "mutationObserverLimit") {
             page.diagnostics.mutation_observer_limit_exceeded = true;
             return Ok(JsValue::Undefined);
+        }
+
+        // 初期の文書順番号の op も予算外で処理する（`CDP-2`・`JS-6`。O(1) の読み取りで
+        // アロケーションも DOM の変更も無く、連打は評価のタイムアウトで縛られる）。
+        // arity・型・長さの検証は通常の op と同様に行う。
+        if let Some(JsValue::String(name)) = args.first()
+            && (name == "initialOrder" || name == "nodeByInitialOrder")
+        {
+            let operation: &'static str = if name == "initialOrder" {
+                "initialOrder"
+            } else {
+                "nodeByInitialOrder"
+            };
+            let rest = args.get(1..).unwrap_or(&[]);
+            if rest.len() != 1 {
+                return Err(DomBridgeError::ArityMismatch {
+                    operation,
+                    expected: 1,
+                    actual: rest.len(),
+                });
+            }
+            if operation == "initialOrder" {
+                let id = decode_node_id(
+                    rest.first(),
+                    1,
+                    operation,
+                    page.generation,
+                    page.document.node_count(),
+                )?;
+                return Ok(JsValue::Number(page.initial_order.order(id)?.get() as f64));
+            }
+            let order = decode_initial_order(rest.first(), 1, operation)?;
+            let id = page.initial_order.node(order)?;
+            return Ok(JsValue::Number(encode_node_id(page.generation, id)?));
         }
 
         // 検証より前に数える（shim を迂回した不正呼び出しの連打も対象）。
@@ -4026,5 +4215,203 @@ mod tests {
         assert!(d.net_callback_errors[0].truncated);
         assert_eq!(d.net_callback_errors[0].raw_stack(), None);
         assert_eq!(d.net_options_ignored, 2);
+    }
+    // ---- 初期の文書順番号（#1346・CDP-2・CDP-6） ----
+
+    fn find_by_id_attr(b: &DomBridge, value: &str) -> NodeId {
+        b.with_document(|doc| {
+            (0..doc.node_count())
+                .map(NodeId::new)
+                .find(|&id| doc.attribute(id, "id") == Some(value))
+        })
+        .expect("lock")
+        .expect("attached")
+        .expect("id を持つノードがある")
+    }
+
+    fn unavailable_reason(r: Result<impl std::fmt::Debug, DomBridgeError>) -> &'static str {
+        match r.expect_err("番号が無いはず") {
+            DomBridgeError::InitialOrderUnavailable { reason } => reason,
+            other => panic!("InitialOrderUnavailable を期待: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cdp_2_initial_order_round_trips_for_every_initial_node() {
+        let b = bridge();
+        let count = b.with_document(|d| d.node_count()).unwrap().unwrap();
+        let mut seen = Vec::new();
+        for i in 0..count {
+            let id = NodeId::new(i);
+            let order = b.initial_order(id).expect("木に属する");
+            assert_eq!(b.node_by_initial_order(order).expect("逆引き"), id);
+            seen.push(order.get());
+        }
+        seen.sort_unstable();
+        // doctype なしの HTML: document=1, html=2, head=3, body=4, div=5。
+        assert_eq!(seen, vec![1, 2, 3, 4, 5]);
+        let root = b.with_document(|d| d.root()).unwrap().unwrap();
+        assert_eq!(b.initial_order(root).unwrap().get(), 1);
+        let div = find_by_id_attr(&b, "a");
+        assert_eq!(b.initial_order(div).unwrap().get(), 5);
+    }
+
+    #[test]
+    fn cdp_2_initial_order_survives_node_move() {
+        let b = bridge();
+        let a = find_by_id_attr(&b, "a");
+        let before = b.initial_order(a).unwrap();
+        assert_eq!(before.get(), 5);
+        let head = num(call(&b, &[s("head")]));
+        let a_js = b.encode_node_id(a).unwrap();
+        // body 配下の div を head へ移動する。
+        call(&b, &[s("appendChild"), n(head), n(a_js)]).expect("move");
+        assert_eq!(b.initial_order(a).unwrap(), before);
+        assert_eq!(b.node_by_initial_order(before).unwrap(), a);
+        // 移動後の前順で数え直すと 4（head の子）になり、初期番号 5 とは食い違う。
+        let renumbered = b
+            .with_document(|d| {
+                std::iter::once(d.root())
+                    .chain(d.descendants(d.root()))
+                    .position(|id| id == a)
+                    .map(|p| p + 1)
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(renumbered, Some(4));
+        // 切り離しても（arena に残るため）番号は変わらない。
+        call(&b, &[s("removeChild"), n(head), n(a_js)]).expect("remove");
+        assert_eq!(b.initial_order(a).unwrap(), before);
+        assert_eq!(b.node_by_initial_order(before).unwrap(), a);
+    }
+
+    #[test]
+    fn cdp_6_node_created_after_attach_has_no_initial_order() {
+        let b = bridge();
+        let div = num(call(&b, &[s("createElement"), s("div")]));
+        let text = num(call(&b, &[s("createTextNode"), s("x")]));
+        let a = num(call(&b, &[s("getElementById"), s("a")]));
+        call(&b, &[s("setInnerHTML"), n(a), s("<i></i>")]).expect("innerHTML");
+        let last = b
+            .with_document(|d| NodeId::new(d.node_count() - 1))
+            .unwrap()
+            .unwrap();
+        for raw in [div, text] {
+            let id = NodeId::new((raw as u64 & 0xFFFF_FFFF) as usize);
+            assert_eq!(
+                unavailable_reason(b.initial_order(id)),
+                "created after attach"
+            );
+        }
+        assert_eq!(
+            unavailable_reason(b.initial_order(last)),
+            "created after attach"
+        );
+        let err = b.initial_order(last).expect_err("none");
+        assert_eq!(
+            err.to_string(),
+            "node has no initial document order number: created after attach"
+        );
+    }
+
+    #[test]
+    fn cdp_6_template_contents_have_no_initial_order() {
+        let b = bridge_with_html(
+            "<html><head></head><body><template><p id=\"t\"></p></template></body></html>",
+            DomBridgeLimits::default(),
+        );
+        let p = find_by_id_attr(&b, "t");
+        assert_eq!(
+            unavailable_reason(b.initial_order(p)),
+            "not in the initial tree"
+        );
+    }
+
+    #[test]
+    fn sec_2_node_by_initial_order_rejects_out_of_range() {
+        let b = bridge();
+        assert!(InitialNodeOrder::new(0).is_none());
+        assert!(InitialNodeOrder::new(u64::MAX).is_none());
+        assert!(InitialNodeOrder::new(u64::from(u32::MAX) + 1).is_none());
+        for k in [6u64, u64::from(u32::MAX)] {
+            let o = InitialNodeOrder::new(k).expect("範囲内の値");
+            assert_eq!(
+                unavailable_reason(b.node_by_initial_order(o)),
+                "no such order"
+            );
+        }
+        for bad in [f64::NAN, -1.0, 1.5, 9_007_199_254_740_992.0, f64::INFINITY] {
+            let err = call(&b, &[s("nodeByInitialOrder"), n(bad)]).expect_err("不正値");
+            assert!(
+                matches!(err, DomBridgeError::InvalidNodeId { index: 1, .. }),
+                "{bad}"
+            );
+        }
+        let err = call(&b, &[s("nodeByInitialOrder"), s("1")]).expect_err("型違反");
+        assert!(matches!(err, DomBridgeError::TypeMismatch { .. }));
+        let err = call(&b, &[s("nodeByInitialOrder"), n(0.0)]).expect_err("0");
+        assert!(matches!(
+            err,
+            DomBridgeError::InitialOrderUnavailable { .. }
+        ));
+    }
+
+    #[test]
+    fn js_6_initial_order_ops_do_not_consume_op_budget() {
+        let b = bridge_with(DomBridgeLimits::default().with_max_ops_per_page(1));
+        let root = b
+            .encode_node_id(b.with_document(|d| d.root()).unwrap().unwrap())
+            .unwrap();
+        for _ in 0..5 {
+            assert_eq!(num(call(&b, &[s("initialOrder"), n(root)])), 1.0);
+            let id = num(call(&b, &[s("nodeByInitialOrder"), n(1.0)]));
+            assert_eq!(id, root);
+        }
+        // 予算 1 回分はまだ残っている。使い切った後も番号 op は引ける。
+        call(&b, &[s("body")]).expect("1 回目");
+        assert!(matches!(
+            call(&b, &[s("body")]),
+            Err(DomBridgeError::OpLimitExceeded { .. })
+        ));
+        assert_eq!(num(call(&b, &[s("initialOrder"), n(root)])), 1.0);
+        // arity 不一致・世代違い。
+        assert!(matches!(
+            call(&b, &[s("initialOrder")]),
+            Err(DomBridgeError::ArityMismatch {
+                expected: 1,
+                actual: 0,
+                ..
+            })
+        ));
+        assert!(matches!(
+            call(&b, &[s("initialOrder"), n(1.0)]),
+            Err(DomBridgeError::StaleGeneration { index: 1 })
+        ));
+        b.detach().unwrap();
+        assert!(matches!(
+            call(&b, &[s("initialOrder"), n(root)]),
+            Err(DomBridgeError::Detached)
+        ));
+        assert!(matches!(
+            b.node_by_initial_order(InitialNodeOrder::new(1).unwrap()),
+            Err(DomBridgeError::Detached)
+        ));
+    }
+
+    #[test]
+    fn cdp_2_reattach_resets_initial_order_table() {
+        let b = bridge();
+        let a = find_by_id_attr(&b, "a");
+        assert_eq!(b.initial_order(a).unwrap().get(), 5);
+        let o = InitialNodeOrder::new(6).unwrap();
+        assert_eq!(
+            unavailable_reason(b.node_by_initial_order(o)),
+            "no such order"
+        );
+        b.attach(parse("<p id=\"a\"></p><span id=\"b\"></span>"))
+            .expect("attach");
+        let span = find_by_id_attr(&b, "b");
+        assert_eq!(b.node_by_initial_order(o).unwrap(), span);
+        assert_eq!(b.initial_order(span).unwrap(), o);
     }
 }

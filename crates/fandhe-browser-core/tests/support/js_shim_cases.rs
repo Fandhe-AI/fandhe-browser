@@ -87,6 +87,40 @@ fn check(page: &mut Page, script: &str, expected: &str) {
 
 /// 全ケースを `engine`（`"v8"` / `"boa"`）で実行する。
 pub fn run(engine: &str) {
+    eprintln!("case: CDP-2 initial order identity (__fandheDomIdentity. #1346)");
+    let mut p = setup(engine, None);
+    check(&mut p, "typeof __fandheDomIdentity", "object");
+    check(&mut p, "Object.isFrozen(__fandheDomIdentity)", "true");
+    check(&mut p, "__fandheDomIdentity.orderOf(document)", "1");
+    check(
+        &mut p,
+        "var el = document.querySelector('#a'); __fandheDomIdentity.nodeAt(__fandheDomIdentity.orderOf(el)) === el",
+        "true",
+    );
+    // 移動後も同一性が保たれる。
+    check(
+        &mut p,
+        "var n = __fandheDomIdentity.orderOf(el); document.body.appendChild(el); document.head.appendChild(el); __fandheDomIdentity.nodeAt(n) === el && __fandheDomIdentity.orderOf(el) === n",
+        "true",
+    );
+    check(
+        &mut p,
+        "try { __fandheDomIdentity.orderOf(document.createElement('div')); 'no' } catch (e) { String(e.message).indexOf('created after attach') >= 0 }",
+        "true",
+    );
+    for bad in ["0", "-1", "1.5", "99999"] {
+        check(
+            &mut p,
+            &format!("try {{ __fandheDomIdentity.nodeAt({bad}); 'no' }} catch (e) {{ 'threw' }}"),
+            "threw",
+        );
+    }
+    check(
+        &mut p,
+        "try { __fandheDomIdentity.orderOf({}); 'no' } catch (e) { e instanceof TypeError }",
+        "true",
+    );
+
     eprintln!("case: JS-5 document basics (readyState / currentScript)");
     let mut p = setup(engine, None);
     check(&mut p, "typeof document", "object");
