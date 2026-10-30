@@ -4,11 +4,11 @@
 
 ## 位置づけ
 
-- 本書は設計案である。実装は §9 の分割案で進める。分割案 1（`executionContextId` 指定の `Runtime.callFunctionOn`）は #1345、分割案 2（段階 1: main world を確定 DOM の再パースで評価する）は #1347、分割案 3（core の初期の文書順番号）は #1346、分割案 4（`DOM.describeNode`・`DOM.resolveNode`）は #1348 で実装済み
+- 本書は設計案である。実装は §9 の分割案で進める。分割案 1（`executionContextId` 指定の `Runtime.callFunctionOn`）は #1345、分割案 2（段階 1: main world を確定 DOM の再パースで評価する）は #1347、分割案 3（core の初期の文書順番号）は #1346、分割案 4（`DOM.describeNode`・`DOM.resolveNode`）は #1348、分割案 5（Puppeteer `page.$` の実測と `puppeteer-compat.md` の更新）は #1349 で実施済み
 - 段階 2（ページランタイムの保持）は**未実装**で、保留している（`REPAIR-3`）。これについて以下に書く挙動は設計案である
 - 「オーナー判断待ち」と書いた箇所は、推奨案を置いたうえで決定を保留している。段階 1 の判断は §3 に記録した
 - 本書の §1 と §2 は #1347 の時点で一部更新したが、基準コミットの記述（`MAIN_WORLD_EVALUATION_UNSUPPORTED` など）は設計時点の履歴として残している。定数は #1347 で削除した
-- 確度の区分は [puppeteer-compat.md](./puppeteer-compat.md) と同じ。A は実測、B はソースの読解（未実測）。§2 の Puppeteer の記述は **B**
+- 確度の区分は [puppeteer-compat.md](./puppeteer-compat.md) と同じ。A は実測、B はソースの読解（未実測）。§2 の連鎖は #1349 で実測（A）と照合した（2026-10-30・`683ca65a`）。実測結果は [puppeteer-compat.md](./puppeteer-compat.md)「`page.$` の呼び出し連鎖」にあり、**停止点は `Runtime.evaluate` の `userGesture`**（§2 の段 3）
 - 基準コミットは origin/main `04a9d4e2`。シンボル名は基準コミットのもので、実装時に再確認する
 
 ## 1. 現状と停止点
@@ -34,25 +34,31 @@
 - `core::page_actor` / `page_runner`（`JS-4`）は、遷移中に `<script>` を 1 回実行し、ランタイムを破棄する。確定する HTML はスクリプト実行**後**の DOM をシリアライズしたもの（`execute_page_scripts = true` のとき）
 - 帰結: 確定 HTML から作るコンテキストは、スクリプト実行後の **DOM** を見られる。ページ JS の**ヒープ**（グローバル変数・クロージャ・リスナー）は失われている
 
-## 2. Puppeteer `page.$` の CDP 連鎖（確度 B）
+## 2. Puppeteer `page.$` の CDP 連鎖（読解 B を実測 A と照合）
 
-puppeteer-core 25.12.0 の `src/` を一時ディレクトリに展開して読んだ（閲覧のみ。スクリプトは実行していない。展開物は削除済み）。実測は #1334 の tab モデルの後に行う（§8）。
+puppeteer-core 25.12.0 の `src/` を一時ディレクトリに展開して読んだ（閲覧のみ。スクリプトは実行していない。展開物は削除済み）。#1349 で実機（puppeteer-core 25.12.0・debug ビルド・`about:blank`）を実測して照合した。
+下表の「実測の順」は実際の送信順で、読解の段の番号とは一致しない。
 
-| 段 | 送るメソッド | 必須の引数 | fandhe の現状 |
-| -- | ------------ | ---------- | ------------- |
-| 1 | `Runtime.callFunctionOn`（`Frame.#document()` の `evaluateHandle(() => document)`） | main の `executionContextId`、`functionDeclaration`、`returnByValue: false`、`awaitPromise`、`userGesture`。`objectId` は使わない | isolated world は受理（#1345）。main world は #1347 で受理（設計時点では `MAIN_WORLD_EVALUATION_UNSUPPORTED` の停止点） |
-| 2 | `Runtime.addBinding`（`executionContextName` 指定） | 失敗はログだけで握りつぶされる | `-32601`。成功を装わない（§5） |
-| 3 | `Runtime.evaluate`（`puppeteerUtil` の注入） | isolated の `contextId` | 実装済み |
-| 4 | `DOM.describeNode {objectId}` → `DOM.resolveNode {backendNodeId, executionContextId: isolated}`（`@bindIsolatedHandle` の `adoptHandle`） | | 実装済み（#1348） |
-| 5 | `Runtime.callFunctionOn`（`QueryHandler.queryOne`） | isolated の `executionContextId`。引数は `[{objectId: 要素}, {value: selector}, {objectId: puppeteerUtil}]` | `UNSUPPORTED_PARAMS` で拒否 |
-| 6 | `DOM.describeNode` → `DOM.resolveNode {backendNodeId, executionContextId: main}` → 元のハンドルを `Runtime.releaseObject`（`transferHandle`） | | 実装済み（#1348） |
+| 段 | 送るメソッド | 必須の引数 | 実測（A）と fandhe の現状 |
+| -- | ------------ | ---------- | ------------------------- |
+| 1 | `Runtime.callFunctionOn`（`Frame.#document()` の `evaluateHandle(() => document)`） | main の `executionContextId`、`functionDeclaration`、`returnByValue: false`、`awaitPromise`、`userGesture`。`objectId` は使わない | 実測の順 1。読解どおりの引数で、成功（`objectId:"3.1"`・`Document`）。#1345・#1347 |
+| 2 | `Runtime.addBinding`（`executionContextName` 指定） | 失敗はログだけで握りつぶされる | 実測の順 4。`-32601` が握りつぶされて進行を止めなかった。成功を装わない（§5） |
+| 3 | `Runtime.evaluate`（`puppeteerUtil` の注入） | isolated の `contextId` | 実測の順 5。**`userGesture:true` も送られ、`-32602 unsupported params` で停止**（読解の食い違い。§2 の要点参照）。他の引数は `expression`（約 10.5KB）・`contextId`・`returnByValue:false`・`awaitPromise:true` |
+| 4 | `DOM.describeNode {objectId}` → `DOM.resolveNode {backendNodeId, executionContextId: isolated}`（`@bindIsolatedHandle` の `adoptHandle`） | | 実測の順 2・3。成功（#1348）。**段 3 より前、段 2 より前に送られる**（読解の順と異なる） |
+| 5 | `Runtime.callFunctionOn`（`QueryHandler.queryOne`） | isolated の `executionContextId`。引数は `[{objectId: 要素}, {value: selector}, {objectId: puppeteerUtil}]` | 未到達（段 3 で停止）。#1345 後の現状は B のまま。旧記述の「`UNSUPPORTED_PARAMS` で拒否」は #1345 で変わっている可能性が高いが未実測 |
+| 6 | `DOM.describeNode` → `DOM.resolveNode {backendNodeId, executionContextId: main}` → 元のハンドルを `Runtime.releaseObject`（`transferHandle`） | | 未到達。#1348 でメソッドは実装済み（B） |
+
+読解と実測の食い違い:
+
+- 段 3 の `Runtime.evaluate` は `userGesture` も送る（読解では `contextId` 中心と記録し、`userGesture` を見落としていた）。fandhe の `Runtime.evaluate` は `userGesture` を未知キーとして拒否する（`Runtime.callFunctionOn` は受理して効果なし）
+- 送信順は 段 1 → 段 4 → 段 2（`addBinding`）→ 段 3 → 段 5 → 段 6。段 4 は `puppeteerUtil` を注入する前の isolated ハンドルの用意として先に行われる
 
 要点は次のとおり。
 
 - 文字列の評価（`Runtime.evaluate`）は `contextId` を常に明示して送る。`uniqueContextId` と `serializationOptions` は送らない
 - 「ハンドル表の統合」の本題は、**world をまたぐノードの受け渡し**（`backendNodeId` 経由）にある。fandhe-browser は world ごとに `Document` が別でノードの同一性が無いため、world 共通のノード ID 空間（または対応表）が要る
 - `executionContextId` の受理は main だけでなく isolated world でも要る
-- Playwright の main world の評価（`page.evaluate`）も同じ制限に当たると読めるが、**要確認**（未確認。§8）
+- Playwright の main world の評価（`page.evaluate`）も同じ制限に当たると読めるが、**要確認**（#1349 では未確認。§8）
 
 ## 3. 論点 1: main world のページ JS 状態
 
@@ -140,9 +146,9 @@ puppeteer-core 25.12.0 の `src/` を一時ディレクトリに展開して読�
 
 ## 8. 未確定事項と確認手順
 
-- Puppeteer の実測（#1334 の tab モデルの後）。本書の §2 は読解（確度 B）
-- Playwright の main world 評価の連鎖の確認
-- Chromium での `objectId` と `executionContextId` の排他エラーの照合
+- Puppeteer の実測: **実施済み**（#1349。2026-10-30）。`page.$("body")` は `Runtime.evaluate` の `userGesture` で停止した。結果は [puppeteer-compat.md](./puppeteer-compat.md)。§2 の連鎖の読解は、送信順と `userGesture` の点で実測と食い違った（§2）。`selector` の後半は未到達で未確認
+- Playwright の main world 評価の連鎖の確認: **未確認**（#1349 では実施していない）
+- Chromium での `objectId` と `executionContextId` の排他エラーの照合: **未確認**（#1349 では Chromium 実機を使っていない）
 
 ## 9. 実装 issue 分割案（起票はオーナー承認後。本 PR では起票しない）
 
@@ -152,5 +158,5 @@ puppeteer-core 25.12.0 の `src/` を一時ディレクトリに展開して読�
 | 2 | cdp | 段階 1: main world の評価（`Runtime.evaluate` の main の contextId と `contextId` 省略・`releaseObject`・`callFunctionOn` の `World::Main` 許可・既存テスト `tests/support/runtime_evaluate_cases.rs` の main world エラー期待の更新・`MAIN_WORLD_EVALUATION_UNSUPPORTED` の扱い）。**#1347 で実装済み**（定数は削除。オーナー判断は §3） | 段階 1 の既定有効・opt-in のオーナー判断（済） |
 | 3 | core（設計は main） | 初期の文書順番号によるノード同一性の API（`DomBridge` / `ScriptContextHandle`）。**#1346 で実装済み** | なし（2 と並行可） |
 | 4 | cdp | `DOM.describeNode`（`objectId`）・`DOM.resolveNode`（`backendNodeId` + `executionContextId`）。DOM ドメインの採番と統一する。**#1348 で実装済み** | 3、main world を対象にするなら 2 |
-| 5 | docs / harness | Puppeteer `page.$` の段階の実測と `puppeteer-compat.md` の該当行の更新（本書へのポインタ追記を含む。#1341 との衝突回避のため本 PR では編集しない） | 1・2・4 と #1334 |
+| 5 | docs / harness | Puppeteer `page.$` の段階の実測と `puppeteer-compat.md` の該当行の更新（本書へのポインタ追記を含む）。**#1349 で実施済み**（停止点は `Runtime.evaluate` の `userGesture`） | 1・2・4 と #1334 |
 | 6 | オーナー判断 | 段階 2（ページランタイムの保持）を採るか。判断用の Issue は実装ツリー（#10 配下）に入れない | 5 の実測結果 |
