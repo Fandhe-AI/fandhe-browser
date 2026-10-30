@@ -27,6 +27,10 @@
   var BigIntCtor = typeof BigInt === "function" ? BigInt : null;
   // shim の microtask キューを流す関数（checkpoint が呼ぶ。無ければ checkpoint は何もしない）。
   var runMicrotasks = typeof G.__fandheRunMicrotasks === "function" ? G.__fandheRunMicrotasks : null;
+  // core が dom.js で定義する初期ノード同一性の窓口（#1346・#1348。orderOf / nodeAt）。注入時点の関数参照を退避する。
+  var domIdentity = typeof G.__fandheDomIdentity === "object" && G.__fandheDomIdentity !== null ? G.__fandheDomIdentity : null;
+  var identityOrderOf = domIdentity !== null && typeof domIdentity.orderOf === "function" ? domIdentity.orderOf : null;
+  var identityNodeAt = domIdentity !== null && typeof domIdentity.nodeAt === "function" ? domIdentity.nodeAt : null;
   var objectIs = Object.is;
   var objToString = Object.prototype.toString;
   var isArray = Array.isArray;
@@ -547,6 +551,51 @@
     }
   }
 
+  var NODE_UNAVAILABLE = '{"kind":"nodeUnavailable"}';
+  var NOT_NODE = '{"kind":"notNode"}';
+
+  // DOM.describeNode: ハンドルのノードの初期の文書順番号を返す（ハンドルは作らない）。
+  function nodeOrder(text) {
+    try {
+      var p = jsonParse(text);
+      if (p.epoch !== epoch) return RESET;
+      if (apply(mapHas, handles, [p.handle]) !== true) return NOT_FOUND;
+      var v = apply(mapGet, handles, [p.handle]);
+      if (!isNode(v)) return NOT_NODE;
+      if (identityOrderOf === null) return INTERNAL_ERROR;
+      var n;
+      try {
+        n = apply(identityOrderOf, domIdentity, [v]);
+      } catch (e) {
+        return NODE_UNAVAILABLE;
+      }
+      if (typeof n !== "number" || n !== n || n < 1 || n > 4294967295 || n % 1 !== 0) return NODE_UNAVAILABLE;
+      return '{"kind":"order","order":' + StringCtor(n) + "}";
+    } catch (e) {
+      return INTERNAL_ERROR;
+    }
+  }
+
+  // DOM.resolveNode: 初期の文書順番号のノードのハンドルをちょうど 1 つ払い出す。
+  function adoptNode(text) {
+    evalStart = nextHandle;
+    try {
+      var p = jsonParse(text);
+      if (p.epoch !== epoch) return RESET;
+      if (identityNodeAt === null) return INTERNAL_ERROR;
+      var node;
+      try {
+        node = apply(identityNodeAt, domIdentity, [p.order]);
+      } catch (e) {
+        return NODE_UNAVAILABLE;
+      }
+      if (!isNode(node)) return NODE_UNAVAILABLE;
+      return commit(render(node, false, false));
+    } catch (e) {
+      return failure(e);
+    }
+  }
+
   // microtask を流す（awaitPromise の 1 段目。Rust 側は評価を分けて呼ぶ）。
   function checkpoint(text) {
     try {
@@ -637,6 +686,8 @@
     release: release,
     discard: discard,
     callFunctionOn: callFunctionOn,
+    nodeOrder: nodeOrder,
+    adoptNode: adoptNode,
     checkpoint: checkpoint,
     settle: settle,
     dropSlot: dropSlot

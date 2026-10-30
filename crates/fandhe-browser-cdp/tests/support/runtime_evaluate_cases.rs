@@ -1,5 +1,5 @@
 //! V8 / boa 共通の `Runtime.evaluate`・`Runtime.releaseObject`・`Runtime.callFunctionOn`・`awaitPromise` の
-//! 結合テストケース（TASK-44.7・#1218・TASK-44.8・#1219・
+//! 結合テストケース（TASK-44.7・#1218・TASK-44.8・#1219・`DOM.describeNode`/`resolveNode`（#1348）・
 //! ビヘイビア `CDP-2`・`CDP-6`・`CDP-7`・`SEC-2`・`REPAIR-3`・関連 `JS-6`・`PERF-7`）。
 //!
 //! `tests/runtime_evaluate_v8.rs` と `tests/runtime_evaluate_boa.rs` が `#[path]` で取り込む。実エンジンの
@@ -278,6 +278,8 @@ pub fn run(engine: &str) {
     rt.block_on(call_function_on_execution_context(engine));
     eprintln!("case: awaitPromise");
     rt.block_on(await_promise(engine));
+    eprintln!("case: DOM.describeNode / DOM.resolveNode");
+    rt.block_on(dom_node(engine));
 }
 
 async fn primitives(engine: &str) {
@@ -965,6 +967,10 @@ pub fn run_disabled() {
         c.navigate(&p).await;
         let f = c.eval(&p, 1, "1", false).await;
         assert!(is_err(&f, -32000, "execution contexts unavailable"), "{f}");
+        let f = c.describe(&p, "1.1").await;
+        assert!(is_err(&f, -32000, "execution contexts unavailable"), "{f}");
+        let f = c.resolve(&p, json!({"backendNodeId": 1})).await;
+        assert!(is_err(&f, -32000, "execution contexts unavailable"), "{f}");
         assert_eq!(c.worker_spawns(), 0);
     });
 }
@@ -1493,4 +1499,364 @@ async fn call_function_on_execution_context(engine: &str) {
         )
         .await;
     assert_eq!(ro(&f), &json!({"type":"number","value":1}));
+}
+/// `objectId` の `<contextId>.<n>` の `n`。
+fn handle_no(object_id: &str) -> u64 {
+    object_id
+        .split_once('.')
+        .and_then(|(_, n)| n.parse().ok())
+        .expect("objectId")
+}
+
+impl Cdp {
+    /// `DOM.describeNode {objectId}` の応答フレーム。
+    async fn describe(&mut self, p: &Page, object_id: &str) -> Value {
+        self.call(p, "DOM.describeNode", json!({"objectId": object_id}))
+            .await
+            .pop()
+            .expect("response frame")
+    }
+
+    /// `DOM.resolveNode` の応答フレーム。
+    async fn resolve(&mut self, p: &Page, params: Value) -> Value {
+        self.call(p, "DOM.resolveNode", params)
+            .await
+            .pop()
+            .expect("response frame")
+    }
+}
+
+/// 応答の `result.node.backendNodeId`（成功を要求する）。
+fn backend_of(frame: &Value) -> i64 {
+    assert!(frame.get("error").is_none(), "unexpected error: {frame}");
+    let node = &frame["result"]["node"];
+    assert_eq!(node["nodeId"], node["backendNodeId"], "{frame}");
+    node["backendNodeId"].as_i64().expect("backendNodeId")
+}
+
+/// 応答の `result.object`（成功を要求する）。
+fn object_of(frame: &Value) -> &Value {
+    assert!(frame.get("error").is_none(), "unexpected error: {frame}");
+    &frame["result"]["object"]
+}
+
+/// `DOM.describeNode` / `DOM.resolveNode`（world をまたぐノード同一性。#1348・`CDP-2`・`CDP-3`・`CDP-6`・`SEC-2`・`JS-4`）。
+async fn dom_node(engine: &str) {
+    let mut c = Cdp::new(engine);
+    let p = c.page().await;
+    let nav = c.navigate(&p).await;
+    let main_id = main_context_id(&nav);
+    let iso = c.isolated(&p, "u").await;
+
+    // 前提: 両 world に初期ノード同一性の窓口がある。
+    for ctx in [main_id, iso] {
+        let f = c.eval(&p, ctx, "typeof __fandheDomIdentity", true).await;
+        assert_eq!(ro(&f), &json!({"type":"string","value":"object"}), "{f}");
+        let f = c
+            .eval(&p, ctx, "__fandheDomIdentity.orderOf(document)", true)
+            .await;
+        assert_eq!(ro(&f), &json!({"type":"number","value":1}), "{f}");
+    }
+
+    // (a) Puppeteer の第 1 手: DOM.getDocument なしで main の document を describe する。
+    let doc_handle = c.handle(&p, main_id, "document").await;
+    let f = c.describe(&p, &doc_handle).await;
+    assert_eq!(backend_of(&f), 1, "{f}");
+    assert_eq!(f["result"]["node"]["nodeName"], "#document");
+    assert_eq!(f["result"]["node"]["nodeType"], 9);
+    let f = c
+        .call(&p, "DOM.getDocument", json!({}))
+        .await
+        .pop()
+        .expect("frame");
+    assert_eq!(f["result"]["root"]["nodeId"], 1, "{f}");
+
+    // (b) 往復（AC1）: isolated → DOM ドメインの ID → main。
+    let x_iso = c.handle(&p, iso, "document.getElementById('x')").await;
+    let f = c.describe(&p, &x_iso).await;
+    let x_backend = backend_of(&f);
+    assert_eq!(x_backend, 5, "{f}");
+    assert_eq!(f["result"]["node"]["nodeName"], "P");
+    assert_eq!(f["result"]["node"]["attributes"], json!(["id", "x"]));
+    assert_eq!(f["result"]["node"]["parentId"], 4);
+    let f = c
+        .call(
+            &p,
+            "DOM.querySelector",
+            json!({"nodeId": 1, "selector": "#x"}),
+        )
+        .await
+        .pop()
+        .expect("frame");
+    assert_eq!(f["result"]["nodeId"], x_backend, "{f}");
+    let f = c
+        .resolve(
+            &p,
+            json!({"backendNodeId": x_backend, "executionContextId": main_id}),
+        )
+        .await;
+    let obj = object_of(&f);
+    assert_eq!(obj["type"], "object");
+    assert_eq!(obj["subtype"], "node");
+    assert_eq!(obj["description"], "p");
+    let x_main = obj["objectId"].as_str().expect("objectId").to_owned();
+    assert!(x_main.starts_with(&format!("{main_id}.")), "{x_main}");
+    let f = c
+        .callf(
+            &p,
+            json!({"functionDeclaration": "function () { return this.id; }", "objectId": x_main, "returnByValue": true}),
+        )
+        .await;
+    assert_eq!(ro(&f), &json!({"type":"string","value":"x"}), "{f}");
+    // 逆向き（main → isolated）も同じ backendNodeId。
+    let f = c.describe(&p, &x_main).await;
+    assert_eq!(backend_of(&f), x_backend, "{f}");
+    let f = c
+        .resolve(&p, json!({"nodeId": x_backend, "executionContextId": iso}))
+        .await;
+    let x_back = object_of(&f)["objectId"]
+        .as_str()
+        .expect("objectId")
+        .to_owned();
+    assert!(x_back.starts_with(&format!("{iso}.")), "{x_back}");
+
+    // (c) 1 回の resolve で払い出すハンドルは 1 つだけ。
+    let r1 = c
+        .resolve(
+            &p,
+            json!({"backendNodeId": x_backend, "executionContextId": main_id}),
+        )
+        .await;
+    let r2 = c
+        .resolve(
+            &p,
+            json!({"backendNodeId": x_backend, "executionContextId": main_id}),
+        )
+        .await;
+    let (id1, id2) = (
+        object_of(&r1)["objectId"].as_str().expect("id").to_owned(),
+        object_of(&r2)["objectId"].as_str().expect("id").to_owned(),
+    );
+    assert_ne!(id1, id2);
+    assert_eq!(handle_no(&id2), handle_no(&id1) + 1);
+    let next = c.handle(&p, main_id, "({})").await;
+    assert_eq!(handle_no(&next), handle_no(&id2) + 1);
+    let f = c.release(&p, &id1).await;
+    assert_eq!(f["result"], json!({}));
+    let f = c.release(&p, &id1).await;
+    assert!(is_err(&f, -32000, "remote object not found"), "{f}");
+
+    // (d) 他セッション。
+    let sid2 = c.st.registry().attach(&p.tid).expect("attach 2");
+    let p2 = Page {
+        tid: p.tid.clone(),
+        sid: sid2,
+    };
+    let f = c.describe(&p2, &x_iso).await;
+    assert!(is_err(&f, -32000, "remote object not found"), "{f}");
+    let f = c.resolve(&p2, json!({"backendNodeId": x_backend})).await;
+    assert!(is_err(&f, -32000, "node not found"), "{f}");
+    let doc2 = eval_default(&mut c, &p2, "document", false).await;
+    let doc2_handle = ro(&doc2)["objectId"].as_str().expect("objectId").to_owned();
+    let f = c.describe(&p2, &doc2_handle).await;
+    let doc2_backend = backend_of(&f);
+    assert!(doc2_backend > 6, "second session gets its own range: {f}");
+    // 2 つ目のセッションが払い出した後でも、1 つ目の範囲の ID と逆向きの ID は拒否される。
+    let f = c.resolve(&p2, json!({"backendNodeId": x_backend})).await;
+    assert!(is_err(&f, -32000, "node not found"), "{f}");
+    let f = c
+        .resolve(
+            &p,
+            json!({"backendNodeId": doc2_backend, "executionContextId": main_id}),
+        )
+        .await;
+    assert!(is_err(&f, -32000, "node not found"), "{f}");
+    let f = c
+        .resolve(
+            &p2,
+            json!({"backendNodeId": doc2_backend, "executionContextId": main_id}),
+        )
+        .await;
+    assert!(is_err(&f, -32602, "invalid params"), "{f}");
+    let f = c.resolve(&p2, json!({"backendNodeId": doc2_backend})).await;
+    assert_eq!(object_of(&f)["subtype"], "node", "{f}");
+
+    // (e) 世代違い。
+    let nav2 = c.navigate(&p).await;
+    let main2 = main_context_id(&nav2);
+    assert_ne!(main2, main_id);
+    let f = c.describe(&p, &x_iso).await;
+    // 遷移で旧世代の contextId は表から落ちる（存在を区別しない固定の拒否）。
+    assert!(is_err(&f, -32000, "remote object not found"), "{f}");
+    let f = c
+        .resolve(
+            &p,
+            json!({"backendNodeId": x_backend, "executionContextId": iso}),
+        )
+        .await;
+    assert!(is_err(&f, -32602, "invalid params"), "{f}");
+    let f = c
+        .resolve(
+            &p,
+            json!({"backendNodeId": x_backend, "executionContextId": main2}),
+        )
+        .await;
+    assert!(is_err(&f, -32000, "node not found"), "{f}");
+
+    // (f) 確定後に作られたノードと非ノード。
+    let created = c.handle(&p, main2, "document.createElement('div')").await;
+    let f = c.describe(&p, &created).await;
+    assert!(is_err(&f, -32000, "node has no backend node id"), "{f}");
+    let appended = c
+        .handle(
+            &p,
+            main2,
+            "(function () { var d = document.createElement('div'); document.body.appendChild(d); return d; })()",
+        )
+        .await;
+    let f = c.describe(&p, &appended).await;
+    assert!(is_err(&f, -32000, "node has no backend node id"), "{f}");
+    let plain = c.handle(&p, main2, "({})").await;
+    let f = c.describe(&p, &plain).await;
+    assert!(is_err(&f, -32000, "object is not a node"), "{f}");
+    // 未払い出しの文書では、どの backendNodeId も解決しない。
+    let f = c
+        .resolve(&p, json!({"backendNodeId": 5, "executionContextId": main2}))
+        .await;
+    assert!(is_err(&f, -32000, "node not found"), "{f}");
+
+    // (g) 範囲外。
+    let doc_h = c.handle(&p, main2, "document").await;
+    let base = backend_of(&c.describe(&p, &doc_h).await) - 1;
+    for bad in [
+        json!(0),
+        json!(-1),
+        json!(1.5),
+        json!("5"),
+        json!(9_007_199_254_740_992_i64),
+    ] {
+        let f = c
+            .resolve(
+                &p,
+                json!({"backendNodeId": bad, "executionContextId": main2}),
+            )
+            .await;
+        assert!(is_err(&f, -32602, "invalid params"), "{bad}: {f}");
+    }
+    for out in [base, base + 1000, base + 4_294_967_296] {
+        let f = c
+            .resolve(
+                &p,
+                json!({"backendNodeId": out, "executionContextId": main2}),
+            )
+            .await;
+        assert!(is_err(&f, -32000, "node not found"), "{out}: {f}");
+    }
+
+    // (h) world 間で DOM の変更は共有されない（R6）。
+    let iso2 = c.isolated(&p, "w").await;
+    let x2 = c.handle(&p, iso2, "document.getElementById('x')").await;
+    let f = c
+        .eval(
+            &p,
+            iso2,
+            "document.getElementById('x').setAttribute('data-k', '1')",
+            true,
+        )
+        .await;
+    assert!(f.get("error").is_none(), "{f}");
+    let f = c.describe(&p, &x2).await;
+    assert_eq!(f["result"]["node"]["attributes"], json!(["id", "x"]), "{f}");
+    let x2_backend = backend_of(&f);
+    assert_eq!(x2_backend, base + 5);
+    let f = c
+        .resolve(
+            &p,
+            json!({"backendNodeId": x2_backend, "executionContextId": main2}),
+        )
+        .await;
+    let x2_main = object_of(&f)["objectId"].as_str().expect("id").to_owned();
+    let f = c
+        .callf(
+            &p,
+            json!({"functionDeclaration": "function () { return this.getAttribute('data-k'); }", "objectId": x2_main, "returnByValue": true}),
+        )
+        .await;
+    assert_eq!(
+        ro(&f),
+        &json!({"type":"object","subtype":"null","value":null}),
+        "{f}"
+    );
+
+    // (i) その他のキー。
+    let f = c
+        .call(
+            &p,
+            "DOM.describeNode",
+            json!({"objectId": x2, "pierce": true}),
+        )
+        .await
+        .pop()
+        .expect("frame");
+    assert!(is_err(&f, -32602, "unsupported params"), "{f}");
+    let f = c
+        .call(&p, "DOM.describeNode", json!({"nodeId": 1}))
+        .await
+        .pop()
+        .expect("frame");
+    assert!(is_err(&f, -32602, "unsupported params"), "{f}");
+    let f = c
+        .call(
+            &p,
+            "DOM.describeNode",
+            json!({"objectId": doc_h, "depth": 0}),
+        )
+        .await
+        .pop()
+        .expect("frame");
+    let node = &f["result"]["node"];
+    assert!(node.get("children").is_none(), "{f}");
+    assert_eq!(node["childNodeCount"], 1, "{f}");
+    let f = c.describe(&p, &doc_h).await;
+    assert_eq!(
+        f["result"]["node"]["children"][0]["nodeName"], "HTML",
+        "{f}"
+    );
+    let f = c
+        .resolve(
+            &p,
+            json!({"backendNodeId": x2_backend, "executionContextId": main2, "objectGroup": "g"}),
+        )
+        .await;
+    assert!(is_err(&f, -32602, "unsupported params"), "{f}");
+    let f = c.resolve(&p, json!({"backendNodeId": x2_backend})).await;
+    assert!(
+        object_of(&f)["objectId"]
+            .as_str()
+            .expect("id")
+            .starts_with(&format!("{main2}.")),
+        "default is the main world: {f}"
+    );
+    // 未知・他セッションの contextId は存在を区別しない。
+    let f = c
+        .resolve(
+            &p,
+            json!({"backendNodeId": x2_backend, "executionContextId": 999_999}),
+        )
+        .await;
+    assert!(is_err(&f, -32602, "invalid params"), "{f}");
+
+    // (j) sessionId なし。
+    let req = json!({"id": 9001, "method": "DOM.describeNode", "params": {"objectId": "1.1"}});
+    let frames = c.d.dispatch(&c.st, &req.to_string()).await;
+    let v: Value = serde_json::from_str(frames.last().expect("frame")).expect("json");
+    assert!(is_err(&v, -32602, "unsupported params"), "{v}");
+
+    // Runtime.addBinding は未実装のまま（成功を装わない。CDP-6）。
+    let f = c
+        .call(&p, "Runtime.addBinding", json!({"name": "b"}))
+        .await
+        .pop()
+        .expect("frame");
+    assert!(is_err(&f, -32601, "method not implemented"), "{f}");
 }

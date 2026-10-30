@@ -55,7 +55,8 @@ use serde_json::{Value, json};
 mod evaluate;
 
 pub(crate) use evaluate::{
-    EvalLimits, RuntimeCallFunctionOn, RuntimeEvaluate, RuntimeReleaseObject,
+    DomDescribeNode, DomResolveNode, EvalLimits, RuntimeCallFunctionOn, RuntimeEvaluate,
+    RuntimeReleaseObject,
 };
 
 use crate::page::main_frame_id;
