@@ -7,7 +7,7 @@
 
 ## 目的と位置づけ
 
-合成 fixture 17 ページの削減率は 85% 目標に未達で、最終判定は実ページ測定で行う（オーナー判断 2026-10-12・#97）。
+合成 fixture 17 ページの削減率は 85% 目標に未達で、最終判定は実ページ測定で行う（オーナー判断 2026-10-12・#97）。その後 AISNAP-1 の目標は 2026-10-29 に 70% 以上へ見直された（#97。AISNAP-4 は中央値 3,500 未満）。
 本書は、人間がローカルに保存した実ページ HTML を、既存の 2 ベンチ（`token_reduction`・`raw_dom_serialize_reduction`）で測るための手順を定める。
 合成 fixture は回帰指標として残す。**本書と実装は測定の口を用意するだけで、達成可否の判断は #97・#131 が行う。**
 
@@ -36,7 +36,7 @@ FANDHE_BROWSER_BENCH_HTML_DIR=/path/to/pages cargo bench -p fandhe-browser-ai --
 
 - `input` 行は入力の種別（`fixtures` / `external`）と、絶対化後のディレクトリを示す。
 - ページ別の TSV に続き、`pages`・`meanReductionPct`・`medianReductionPct`・`minReductionPct`・`maxReductionPct` を出す。`token_reduction` は `medianSnapshotTokens`（AISNAP-4 の参考値）も出す。
-- `met` は 85% に対する参考表示で、終了コードには反映しない。
+- `met` は参考表示で、終了コードには反映しない。基準は AISNAP-1 が 70%（2026-10-29 の見直し・#97。ベンチへの反映は #1332）、AISNAP-5・AISNAP-15 が 85%。
 - 外部ディレクトリ指定時、同梱 fixture の名前に依存する `AISNAP-3`（情報保持チェック）と `AISNAP-5`（巨大静的ページ）は実行せず、`skipped` 行を出す。
 
 ## エラー終了する条件
