@@ -67,6 +67,8 @@ SEC-3 は「本項は実測対象の選定基準であり、ブラウザ本体�
 
 この例外は 2 メソッドの既定値に限る。保持値を実処理（CSSOM の media 評価・フォーカス管理など）に接続する際は、改めて SEC-2 の観点でレビューする。
 
+補足（#1325）: `Page.addScriptToEvaluateOnNewDocument` は空 `source` と、`//# sourceURL=<ASCII 印字可能 1 文字以上>` の 1 行（256 バイト以下）だけの `source`（Puppeteer の `newPage()`）を no-op で受理する。実行経路は無く値も保持しない。実行内容を 1 文字でも含む `source` は `-32602` のまま。
+
 ## 確認記録
 
 | 日付 | 確認内容 | 結果 |
@@ -78,3 +80,4 @@ SEC-3 は「本項は実測対象の選定基準であり、ブラウザ本体�
 | 2026-10-16 | TASK-43.3l（#1040）: Page.addScriptToEvaluateOnNewDocument は空 source だけを受理し（実行経路なし）、非空 source は -32602。セッション付き Target.setAutoAttach は状態を保持するだけで子 attach は 0 件。UA・ヘッダ・navigator・画面・TLS・locale に触れない。Emulation.setUserAgentOverride・Network.setUserAgentOverride は -32601 のまま（tests/devtools_browser.rs・cdp6_builtin_other_methods_remain_unimplemented の固定を維持） | 偽装機能なし |
 | 2026-10-16 | TASK-43.3m（#1041）: セッション付き Emulation.setFocusEmulationEnabled と Emulation.setEmulatedMedia（Playwright 既定値のみ）の受理。保持値はどの API からも読まれず（読み取りは cfg(test) のみ）、UA・ヘッダ・navigator・画面・TLS・locale・タイムゾーンに触れない。Emulation.setUserAgentOverride・setLocaleOverride・setTimezoneOverride・setDeviceMetricsOverride と Network.setUserAgentOverride は -32601 のまま（tests/devtools_browser.rs・cdp6_* の固定を維持）。確認は実装担当による自己確認で、security-auditor のレビューは本セッションでは未実施 | 偽装機能なし（自己確認） |
 | 2026-10-30 | #1322: Page.lifecycleEvent（DOMContentLoaded）と Page.domContentEventFired を固定名・固定形（数値 timestamp のみ）で送出。送出条件は core の発火記録（型付き列挙）に基づき、打ち切り・記録なし・未知の結果では送らない。UA・ヘッダ・navigator・画面・TLS・locale に触れない。確認は実装担当による自己確認 | 偽装機能なし（自己確認） |
+| 2026-10-30 | #1325: Page.addScriptToEvaluateOnNewDocument が `//# sourceURL=<ASCII 印字可能 1 文字以上>` の 1 行（256 バイト以下）だけの source を空 source と同じ no-op で受理（Puppeteer の newPage 用）。実行経路なし・値は保持せず、改行・LS/PS・空白・非 ASCII・旧形式・長さ超過は -32602。UA・ヘッダ・navigator・画面・TLS・locale に触れない。確認は実装担当による自己確認で、security-auditor のレビューは本セッションでは未実施 | 偽装機能なし（自己確認） |

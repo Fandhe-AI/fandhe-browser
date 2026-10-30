@@ -44,7 +44,7 @@ const MAX_LINE_BYTES: usize = 64 * 1024;
 /// セッション付きの初期化で、`Page.enable`・`Page.getFrameTree`（43.3i）が成功する（`docs/design/playwright-compat.md`）。
 /// `Log.enable`・`Runtime.enable`・`Network.enable`（43.3j）は有効フラグを立てて `{}` を返す（イベントは送らない。`REPAIR-3`）。
 /// `Page.setLifecycleEventsEnabled`（43.3k）は有効フラグを立てて `{}` を返す。この trace は遷移を含まないため
-/// `Page.lifecycleEvent` は現れない。`Page.addScriptToEvaluateOnNewDocument`（空 `source` のみ。43.3l）は
+/// `Page.lifecycleEvent` は現れない。`Page.addScriptToEvaluateOnNewDocument`（空 `source` と sourceURL コメントだけの `source` のみ。43.3l・#1325）は
 /// `{"identifier":"1"}`、セッション付き `Target.setAutoAttach`（43.3l）は状態を保持して `{}`（子 attach は 0 件）を返す。
 /// `Emulation.setFocusEmulationEnabled`・`Emulation.setEmulatedMedia`（43.3m・#1041）は Playwright 既定値だけを受理して保持し
 /// `{}` を返す（保持値は読まれない。`REPAIR-3`）。収集は `newContext({viewport:null})` で行うため `Browser.getWindowForTarget`・

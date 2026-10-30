@@ -34,6 +34,9 @@ const MAX_ID_LEN: usize = 64;
 pub const MAX_URL_LEN: usize = 8192;
 /// `Page.addScriptToEvaluateOnNewDocument` の `worldName` の最大バイト長（`CDP-7`。無制限入力の防止）。
 pub(crate) const MAX_WORLD_NAME_LEN: usize = 256;
+/// `Page.addScriptToEvaluateOnNewDocument` で受理する sourceURL コメントだけの `source` の最大バイト長
+/// （`CDP-7`・#1325。走査前に判定して無制限入力を防ぐ。`//# sourceURL=` の 14 バイトと URL 242 バイト）。
+pub(crate) const MAX_SOURCE_URL_COMMENT_LEN: usize = 256;
 /// 1 セッションあたりの `Page.addScriptToEvaluateOnNewDocument` 登録数の上限（`CDP-7`）。
 pub(crate) const MAX_INIT_SCRIPTS_PER_SESSION: u32 = 64;
 /// 1 セッションが `worldName` として保持できる異なる非空の名前数の上限（`CDP-7`）。遷移のたびに
