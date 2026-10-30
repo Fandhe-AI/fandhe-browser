@@ -29,8 +29,8 @@
 //!
 //! unix・Windows の両方で実行する（Issue #954・`XOS-10`）。Windows ではテストのルートを
 //! 既知フォルダ配下（[`fandhe_browser_profile::test_base_dir`]）に置き、書き込みは
-//! `tests/support/mod.rs` の `open_data_file`（Windows は検証済みパスを std で開く。
-//! `Profile::create_file_in` の Windows 版は #948 配下の完了まで未実装。`REPAIR-3`）を使う。
+//! `tests/support/mod.rs` の `open_data_file`（unix・Windows とも製品の
+//! `Profile::create_file_in`。Windows 版は #1313）を使う。
 //! `prof_3_dangling_symlink_is_reported_as_missing` は unix のみ（Windows に対応が無い理由は
 //! そのテストの doc 参照）。
 

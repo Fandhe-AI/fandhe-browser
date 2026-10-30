@@ -11,7 +11,9 @@
 //!
 //! 呼び出し元は `local_root.rs` の継ぎ目（`open_or_create_child_dir`・`open_or_create_child_file`）
 //! で、`Profile::open`（Windows）のルートまでの各要素・`profile.lock`・データ種別ディレクトリの
-//! 作成と open はすべて本モジュール経由（Issue #950）。既知フォルダ API による基準ディレクトリの
+//! 作成と open はすべて本モジュール経由（Issue #950）。`Profile::create_file_in`（Windows）の
+//! データファイルの open も `local_root::open_data_file` を介して本モジュールの
+//! `open_or_create_file_at` を使う（Issue #1313）。既知フォルダ API による基準ディレクトリの
 //! 取得（[`known_local_app_data`]。Issue #951）も本モジュールにあり、`local_root.rs`・`store.rs` が
 //! 呼ぶ。DACL（#952・#953）の `unsafe` も本モジュールに置く。既存ルートを開く場合は所有者と DACL を
 //! ハンドルから読んで検証する（#953）。通常の子の `SecurityDescriptor` は

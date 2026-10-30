@@ -29,7 +29,7 @@
 //! ## `create_file_in` が `TRUNC` しないことと上書き手順（[`write_entry`] の根拠）
 //!
 //! [`fandhe_browser_profile::Profile::create_file_in`] は
-//! `RDWR | CREATE | NOFOLLOW | CLOEXEC | NONBLOCK` で開き、`TRUNC` を
+//! `RDWR | CREATE | NOFOLLOW | CLOEXEC | NONBLOCK`（Windows は `FILE_OPEN_IF`）で開き、`TRUNC` を
 //! 付けない。`P2-09`（上書き）を適用する [`write_entry`] は、2 回目の書き込み前に
 //! `File::set_len(0)` を呼んでから `write_all` する必要がある。そうしないと
 //! 1 回目の内容が末尾に残り、「最終状態 = 最後に書いた値」という
@@ -41,12 +41,10 @@
 //!
 //! - テストのルートは [`fandhe_browser_profile::test_base_dir`] を基点にする。Windows では既知フォルダ
 //!   （`FOLDERID_LocalAppData`）配下で、`TMPDIR`・`TEMP` は効かない
-//! - 書き込みは `tests/support/mod.rs` の `open_data_file` を使う。unix は
-//!   `Profile::create_file_in`、Windows は検証済みパスを std で開く。Windows の
-//!   `create_file_in`（ハンドル相対の書き込み）は #948 配下の Issue の完了まで未実装のため、
-//!   Windows で確かめているのは `Profile::open` が作るレイアウト・ロック・DACL・ルートの
-//!   ハンドル保持と、ディスク上でプロファイルが分離されていることで、製品の書き込み API
-//!   そのものではない（`REPAIR-3`）
+//! - 書き込みは `tests/support/mod.rs` の `open_data_file` を使い、unix・Windows とも製品の
+//!   `Profile::create_file_in` を通る（Windows は保持するデータ種別ディレクトリのハンドル相対。
+//!   Issue #1313）。Windows の `create_file_in` は既存ファイルの所有者・ハードリンク数を検査しない
+//!   ため、その差は本テストの範囲外（`REPAIR-3`）
 //! - Windows 専用に、DACL の継承（`prof_2_prof_6_windows_roots_have_protected_dacl_and_data_inherits_it`）
 //!   とルートのハンドル保持（`prof_2_windows_open_profile_root_cannot_be_swapped`）を検証する。
 //!   unix のパーミッションビット・`openat` 系ハンドルに相当する検証である

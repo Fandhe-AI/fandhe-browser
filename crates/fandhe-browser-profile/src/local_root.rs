@@ -21,7 +21,8 @@
 //!   保持している間、その要素の**改名・削除**は共有違反で失敗する。再解析ポイントは
 //!   `FILE_OPEN_REPARSE_POINT` でリンク自体を開き、属性で検出して `InvalidLayout` にする。
 //!   固定した後に `canonicalize` の結果も事後に再確認する（検出専用の [`verify_created_root`]）。
-//! - 固定後: `profile.lock`（[`open_lock_file`]）とデータ種別ディレクトリ（[`ensure_data_dirs`]）も
+//! - 固定後: `profile.lock`（[`open_lock_file`]）・データ種別ディレクトリ（[`ensure_data_dirs`]）・
+//!   データファイル（[`open_data_file`]）も
 //!   ルートのハンドル相対で作成・open する。ロックは常にルートの実体の `profile.lock` に取られる。
 //!   `profile.lock` は `FILE_SHARE_DELETE` なしで開き、ロックの生存中は改名・削除による別実体への
 //!   差し替えを防ぐ。ルートのハンドルは `Profile` が生存中保持し、途中の要素のハンドルは `open` の
@@ -63,11 +64,13 @@
 //! - 固定後に要素が再解析ポイント化された場合、作成はハンドル相対で配下に留まる。
 //!   [`verify_created_root`] の `canonicalize` が食い違いを検出すると `InvalidLayout` になり、
 //!   作ったものは配下に残る。実機の FSCTL では未検証。
-//! - 作成直後で空のデータ種別ディレクトリは再解析ポイント化され得る。ただし Windows の
-//!   `Profile` にはパス基準の書き込み API が無く、本モジュールの範囲では配下外への書き込みに
-//!   ならない。書き込み系を Windows で有効にする際（#813 の第 2 段階）はハンドル基準が必須。
-//! - `open` の成功後に保持するのはルートのハンドルだけ。データ種別ディレクトリのハンドルは
-//!   確認後に閉じる。
+//! - 作成直後で空のデータ種別ディレクトリは再解析ポイント化され得る。書き込み
+//!   （`Profile::create_file_in`。Issue #1313）は、確認後も保持するデータ種別ディレクトリの
+//!   ハンドルを親にした相対 open のため、配下外への書き込みにならない。
+//! - `open` の成功後に保持するのはルートと 4 つのデータ種別ディレクトリのハンドル
+//!   （[`DataDirHandles`]）。いずれも DELETE を共有しないため、`Profile` の生存中は改名・削除できない。
+//! - `create_file_in`（[`open_data_file`]）は既存ファイルの所有者・ハードリンク数を検査しない
+//!   （unix は検査する。新しい `unsafe` が要るため未実装。DACL はルートの保護付き DACL を継承する）。
 //! - 既存の要素にも名前の検査（`validate_single_component`）がかかる。Win32 で通常は作れない
 //!   名前（予約名・末尾の `.` 等）の既存要素は `InvalidComponent` で拒否される（fail-closed）。
 //! - 入力パスの中に `%LOCALAPPDATA%` の内側へ向くジャンクションがある場合は、`plan_root` が
@@ -651,8 +654,8 @@ fn open_or_create_protected_dir(
     }
 }
 
-/// 親ハンドル `parent` の直下にファイル `name`（`profile.lock`）を読み書き可能で作成する
-/// （既にあれば開く）。[`open_lock_file`] から呼ばれる継ぎ目で、方針は
+/// 親ハンドル `parent` の直下にファイル `name`（`profile.lock`・データファイル）を読み書き可能で作成する
+/// （既にあれば開く）。[`open_lock_file`]・[`open_data_file`] から呼ばれる継ぎ目で、方針は
 /// [`open_or_create_child_dir`] と同じ（Windows は `win32::open_or_create_file_at`、
 /// 非 Windows はパスで解決するテスト用の骨格）。通常ファイルでなければ `InvalidLayout`。
 fn open_or_create_child_file(
@@ -786,16 +789,36 @@ pub(crate) fn open_lock_file(
     Ok((file, root_path.join(LOCK_FILE_NAME)))
 }
 
+/// [`ensure_data_dirs`] が返す、4 つのデータ種別ディレクトリのハンドル。
+///
+/// フィールドを種別ごとに明示し、`DataKind` にバリアントが増えたときにコンパイラが
+/// 追加漏れを検出できるようにする（unix の `DataDirFds` と同じ方針）。Windows の `Profile` が
+/// 保持し、`Profile::create_file_in` が親ハンドルとして使う（`PROF-1`・`PROF-2`）。
+/// 非 Windows の骨格はテスト用で、`Profile` は保持しない。
+#[cfg_attr(not(windows), allow(dead_code))]
+#[derive(Debug)]
+pub(crate) struct DataDirHandles {
+    pub(crate) cookies: File,
+    pub(crate) storage: File,
+    pub(crate) cache: File,
+    pub(crate) history: File,
+}
+
 /// ルートのハンドル `root_dir` の直下に 4 つのデータ種別ディレクトリを作り（既にあれば開き）、
-/// 通常のディレクトリであることを確認する（確認後はハンドルを閉じる）。
+/// 通常のディレクトリであることを確認して、そのハンドルを返す。
 ///
 /// `root_path` は表示とエラー用。Windows ではハンドル相対のため構造上ルートの直下になり、
 /// パスの `canonicalize` による確認は行わない。非 Windows の骨格はパスで解決するため、
 /// `canonicalize` の結果が `root_path` の直下であることを確認する。
-pub(crate) fn ensure_data_dirs(root_dir: &File, root_path: &Path) -> Result<(), ProfileError> {
-    for kind in DataKind::ALL {
+/// 返したハンドルは削除・改名を共有しないため、保持している間はデータ種別ディレクトリを
+/// 別実体へ差し替えられない（Windows。`PROF-1`）。
+pub(crate) fn ensure_data_dirs(
+    root_dir: &File,
+    root_path: &Path,
+) -> Result<DataDirHandles, ProfileError> {
+    let open_kind = |kind: DataKind| -> Result<File, ProfileError> {
         let name = OsStr::new(kind.dir_name());
-        let _dir = open_or_create_child_dir(root_dir, root_path, name)?;
+        let dir = open_or_create_child_dir(root_dir, root_path, name)?;
         #[cfg(not(windows))]
         {
             let path = root_path.join(name);
@@ -811,8 +834,28 @@ pub(crate) fn ensure_data_dirs(root_dir: &File, root_path: &Path) -> Result<(), 
                 });
             }
         }
-    }
-    Ok(())
+        Ok(dir)
+    };
+    Ok(DataDirHandles {
+        cookies: open_kind(DataKind::Cookies)?,
+        storage: open_kind(DataKind::Storage)?,
+        cache: open_kind(DataKind::Cache)?,
+        history: open_kind(DataKind::History)?,
+    })
+}
+
+/// データ種別ディレクトリのハンドル `dir` の直下にデータファイル `name` を読み書き可能で
+/// 作成する（既にあれば切り詰めずに開く）。`Profile::create_file_in`（Windows）から呼ばれる
+/// 継ぎ目で、`win32` を直接呼ばせないために置く（`PROF-2`・`PROF-4`・`XOS-10`）。
+/// 名前の検査・再解析ポイントの拒否・非 TRUNC は [`open_or_create_child_file`] 側（`win32`）が担い、
+/// 所有者・ハードリンク数の検査は行わない（REPAIR-3）。`dir_path` はエラー表示にだけ使う。
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn open_data_file(
+    dir: &File,
+    dir_path: &Path,
+    name: &OsStr,
+) -> Result<File, ProfileError> {
+    open_or_create_child_file(dir, dir_path, name)
 }
 
 #[cfg(test)]

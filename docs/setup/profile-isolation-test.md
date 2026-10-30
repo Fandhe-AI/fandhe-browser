@@ -27,11 +27,10 @@ Linux ext4・macOS APFS・Windows NTFS の実機で確認する（`XOS-10`・`ME
 - 分離テスト（`tests/isolation.rs`・`tests/concurrent_isolation.rs`）は Issue #954 で Windows でも
   実行されるようになった。テストのルートは既知フォルダ配下の `fandhe-test-tmp`
   （`fandhe_browser_profile::test_base_dir()`）で、`TMPDIR`・`TEMP` は効かない
-- **限界 1**: Windows の `Profile::create_file_in`（ハンドル相対の書き込み）は #948 配下の Issue の完了まで
-  未実装のため、Windows のテストは `tests/support/mod.rs` のアダプタ経由（検証済みパスを std で開く）で
-  書き込む。確かめているのは `Profile::open` が作るレイアウト・ロック・DACL・ルートのハンドル保持と、
-  ディスク上の分離であり、製品の書き込み API そのものではない（`REPAIR-3`）。#948 の完了後に
-  アダプタを製品 API へ置き換える
+- **限界 1**: Windows の書き込みは #1313 で製品の `Profile::create_file_in`（保持するデータ種別ディレクトリの
+  ハンドル相対。`tests/support/mod.rs` はそれを呼ぶだけ）を通るようになった。ただし Windows 版は既存
+  ファイルの所有者・ハードリンク数を検査しない（unix は検査する。新しい `unsafe` が要るため未実装。
+  `REPAIR-3`）。この差は本テストでは確かめられない
 - **限界 2**: `prof_3_dangling_symlink_is_reported_as_missing` は unix のみ（Windows のファイル symlink
   作成には特権が要り、ジャンクションでは「リンク先の無いファイル symlink」を模擬できない）
 - Windows 専用に、DACL の継承（`prof_2_prof_6_windows_roots_have_protected_dacl_and_data_inherits_it`）、
@@ -187,7 +186,7 @@ PROF-2 on <OS / FS>: 合格 / 不合格（理由）
 
 - Windows の分離テストは Issue #954 で `cfg` の方針が決まった（共通の検証は 3 OS で実行し、unix 専用の
   検証は `cfg(unix)` に残し、Windows には DACL・ハンドル保持の対応する検証を足した）。限界は上記
-  「Windows NTFS での実行と限界」のとおりで、結果を記録するときも書き込みがアダプタ経由であることを併記する
+  「Windows NTFS での実行と限界」のとおりで、結果を記録するときも所有者・ハードリンク数を検査しない差を併記する
 - #295 の実機実施は担当: 人間の別作業で、本書は手順書であって結果ではない
 - #295 のコメントにある、Windows での Playwright トレース収集経路（`CDP-3` 系・
   `make trace-playwright` が Windows で失敗する件）の有効化確認も、実機実施の機会に行う
