@@ -713,6 +713,16 @@ fn auto_attach_events(
 /// ハンドラ生成の `attachedToTarget` より前に置く（Chromium の順。例: 他接続のページ作成後の
 /// `Target.setAutoAttach`。#1324・`CDP-3`・`CDP-7`）。`detachedFromTarget` は `targetDestroyed` より先のまま。
 fn insert_auto_events(events: &mut Vec<CdpEvent>, auto: Vec<CdpEvent>) {
+    // reconcile 生成の `detachedFromTarget` は、ハンドラ生成の `targetDestroyed` より先に置く
+    // （discover 再送等でハンドラ側が先に destroyed を作る場合の順序逆転を防ぐ。#1324・`CDP-3`・`CDP-7`）。
+    let (detached, auto): (Vec<CdpEvent>, Vec<CdpEvent>) = auto
+        .into_iter()
+        .partition(|e| e.method == "Target.detachedFromTarget");
+    let dpos = events
+        .iter()
+        .position(|e| e.method == "Target.targetDestroyed" || e.method == "Target.attachedToTarget")
+        .unwrap_or(events.len());
+    events.splice(dpos..dpos, detached);
     let split = auto
         .iter()
         .position(|e| e.method == "Target.attachedToTarget")
@@ -778,6 +788,14 @@ mod tests {
                 "Target.attachedToTarget",
                 "Target.attachedToTarget"
             ]
+        );
+        // discover 再送: ハンドラ側が先に targetDestroyed を生成していても detached が先になる。
+        let mut events = vec![ev("Target.targetDestroyed")];
+        insert_auto_events(&mut events, vec![ev("Target.detachedFromTarget")]);
+        let m: Vec<_> = events.iter().map(|e| e.method).collect();
+        assert_eq!(
+            m,
+            vec!["Target.detachedFromTarget", "Target.targetDestroyed"]
         );
         let mut events = Vec::new();
         let auto = vec![
