@@ -7,7 +7,7 @@
 //! 結果を `snapshot_text` で暫定テキスト化したもの）のトークン量（`cl100k_base`）、
 //! 生 HTML 比の削減率、全ページ平均を TSV で出力し、続けて情報保持チェック
 //! （7 種・TASK-14.4・`AISNAP-3`・Issue #95）の判別結果を出力する。件数は spec 上の
-//! 14 ページではなくディレクトリ内の全件。目標値（85%）と情報保持チェックの達成判断は
+//! 14 ページではなくディレクトリ内の全件。目標値（`AISNAP-1` は 70%・Issue #97 の見直し後）と情報保持チェックの達成判断は
 //! 人間担当（#97）のため終了コードには反映しない。
 //! さらに巨大静的ページ単体の生 DOM 比削減率（TASK-14.5・`AISNAP-5`・Issue #96）を出す。
 //! 分母は生 HTML ではなく生 DOM シリアライズ（`raw_dom.rs`）。
@@ -34,7 +34,15 @@ mod huge_static;
 use std::process::ExitCode;
 
 /// `AISNAP-1` の目標削減率（%）。参考表示専用。
-const TARGET_PCT: f64 = 85.0;
+///
+/// 旧値 85% は spec の見直し（オーナー判断 2026-10-29・Issue #97・spec#38）で 70% 以上に
+/// 変わった。巨大静的ページの `AISNAP-5`（`huge_static::TARGET_PCT`）は 85% のまま別管理。
+const TARGET_PCT: f64 = 70.0;
+
+/// `AISNAP-4`（14 ページ横断のトークン中央値）の目標上限。この値「未満」が目標。参考表示専用。
+///
+/// 旧値 1,000 は同じ見直し（Issue #97・spec#38）で 3,500 未満に変わった。
+const TARGET_MEDIAN_SNAPSHOT_TOKENS: f64 = 3500.0;
 
 fn run(input: &tokens::InputSource) -> Result<(), Box<dyn std::error::Error>> {
     let counter = tokens::TokenCounter::new()?;
@@ -63,6 +71,9 @@ fn run(input: &tokens::InputSource) -> Result<(), Box<dyn std::error::Error>> {
     println!(
         "medianSnapshotTokens\t{:.1}\t(AISNAP-4 reference)",
         summary.median_snapshot_tokens
+    );
+    println!(
+        "targetMedianSnapshotTokens\t{TARGET_MEDIAN_SNAPSHOT_TOKENS:.1}\t(AISNAP-4, must be below)"
     );
     println!("targetPct\t{TARGET_PCT:.1}");
     println!("met\t{}", summary.mean_reduction_pct >= TARGET_PCT);

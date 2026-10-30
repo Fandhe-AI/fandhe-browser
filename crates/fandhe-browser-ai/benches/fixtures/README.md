@@ -59,7 +59,7 @@ TASK-14（MS-2）の測定対象となる、14 ページ相当以上・5 類型�
 ## 削減率の測定
 
 `cargo bench -p fandhe-browser-ai --bench token_reduction` で生 HTML と snapshot のトークン量・削減率・平均を出力する（TASK-14.3・`AISNAP-1`・Issue #94）。
-snapshot のテキスト化は測定用の暫定形式で、`/ai/snapshot` の確定応答形式ではない（TASK-19・`AISNAP-6`）。85% 目標の判定は #97 の担当。
+snapshot のテキスト化は測定用の暫定形式で、`/ai/snapshot` の確定応答形式ではない（TASK-19・`AISNAP-6`）。`AISNAP-1` の目標（70% 以上。旧 85% から Issue #97・spec#38 で見直し）と `AISNAP-4` の目標（中央値 3,500 未満。旧 1,000 未満）の判定は #97 の担当。
 
 `AISNAP-5`（巨大静的ページ単体・TASK-14.5・Issue #96）は同コマンドの `# huge static page reduction vs raw DOM (AISNAP-5)` セクションに出力する。分母は生 HTML ではなく生 DOM シリアライズ（PoC-4 `rawDomSerialize` と同じく `script` / `style` / `noscript` / `svg` / `link` / `meta` を除去した `body` の outerHTML 相当。実装は `benches/token_reduction/raw_dom.rs`）で、対象は `wikipedia-article.html` 1 件。
 `AISNAP-15`（TASK-23.1・Issue #129）の分母となる全フィクスチャの生 DOM シリアライズのトークン量は `cargo bench -p fandhe-browser-ai --bench raw_dom_serialize_reduction` で TSV 出力する（`name` / `bytes` / `rawHtmlTokens` / `rawDomTokens`、続けて TASK-23.2・Issue #130 で追加した `snapshotTokens` / `reductionVsRawDomPct` / `reductionVsRawHtmlPct` / `truncated`）。生 DOM の定義は `raw_dom.rs` と同一。対生 DOM 比の削減率と全ページ平均は同コマンドの `# token reduction vs raw DOM serialize (AISNAP-15)` セクションに出力する（`met` は参考表示で終了コードに反映しない）。TASK-23.3〜23.7 の改善後（`5383534`）の実測は 17 件の平均 40.2%（最小 -28.8%・最大 69.3%）で、最小は ssr-next-prerendered。改善前は平均 -56.4%（最小 -147.2%・最大 19.0%）。達成判断は #131 の担当。対照表は [再測定レポート](../../../../docs/design/token-reduction-remeasurement-report.md) を参照。対象は実ディレクトリの 17 件で、spec の「14 ページ」とは食い違う。
