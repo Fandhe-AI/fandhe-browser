@@ -60,8 +60,8 @@
 //!   NT API（`win32` モジュール。`unsafe` はこのモジュールに限る。Issue #949・#950）で行い、
 //!   作成の途中の再解析ポイント化でも配下外に作らない（残る限界は `local_root.rs` の「限界」。
 //!   実機の FSCTL では未検証）。`Profile::create_file_in` は
-//!   Windows でも実装済み（保持するデータ種別ディレクトリのハンドル基準。所有者・ハードリンク数は
-//!   検査しない。Issue #1313）。Windows のハンドル基準の走査・`Profile::delete` は未実装
+//!   Windows でも実装済み（保持するデータ種別ディレクトリのハンドル基準。既存ファイルのハードリンク数・
+//!   所有者・DACL を検証する。Issue #1313）。Windows のハンドル基準の走査・`Profile::delete` は未実装
 
 pub mod normalize;
 pub mod profile;

@@ -43,8 +43,8 @@
 //!   （`FOLDERID_LocalAppData`）配下で、`TMPDIR`・`TEMP` は効かない
 //! - 書き込みは `tests/support/mod.rs` の `open_data_file` を使い、unix・Windows とも製品の
 //!   `Profile::create_file_in` を通る（Windows は保持するデータ種別ディレクトリのハンドル相対。
-//!   Issue #1313）。Windows の `create_file_in` は既存ファイルの所有者・ハードリンク数を検査しない
-//!   ため、その差は本テストの範囲外（`REPAIR-3`）
+//!   Issue #1313）。Windows の `create_file_in` は既存ファイルのハードリンク数・所有者・DACL を検証する
+//!   （unix は所有者・ハードリンク数）。その検証の細部は本テストの範囲外
 //! - Windows 専用に、DACL の継承（`prof_2_prof_6_windows_roots_have_protected_dacl_and_data_inherits_it`）
 //!   とルートのハンドル保持（`prof_2_windows_open_profile_root_cannot_be_swapped`）を検証する。
 //!   unix のパーミッションビット・`openat` 系ハンドルに相当する検証である
