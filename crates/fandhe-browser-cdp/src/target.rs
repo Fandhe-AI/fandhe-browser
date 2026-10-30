@@ -512,6 +512,22 @@ impl TargetRegistry {
         Some((info, attached))
     }
 
+    /// 全ターゲットと「セッションが 1 つ以上 attach 中か」を、1 回のロックで ID 昇順に返す
+    /// （`Target.setDiscoverTargets` の `targetCreated` の `attached`。#1324）。
+    pub(crate) fn targets_with_attached(&self) -> Vec<(TargetInfo, bool)> {
+        let t = self.lock();
+        let mut v: Vec<(TargetInfo, bool)> = t
+            .targets
+            .values()
+            .map(|info| {
+                let attached = t.sessions.values().any(|tid| tid == info.target_id());
+                (info.clone(), attached)
+            })
+            .collect();
+        v.sort_by(|a, b| a.0.target_id.as_str().cmp(b.0.target_id.as_str()));
+        v
+    }
+
     /// 全ターゲットを ID 昇順（= 作成順）で返す。
     pub fn targets(&self) -> Vec<TargetInfo> {
         let mut v: Vec<TargetInfo> = self.lock().targets.values().cloned().collect();
@@ -1352,6 +1368,19 @@ mod tests {
             r.target_with_attached(&TargetId::parse("nope").unwrap())
                 .is_none()
         );
+    }
+
+    #[test]
+    fn cdp3_targets_with_attached_lists_in_id_order_with_attach_state() {
+        let r = TargetRegistry::new();
+        let (a, b) = (page(&r), page(&r));
+        r.attach(&b).unwrap();
+        let v: Vec<(TargetId, bool)> = r
+            .targets_with_attached()
+            .into_iter()
+            .map(|(i, at)| (i.target_id().clone(), at))
+            .collect();
+        assert_eq!(v, vec![(a, false), (b, true)]);
     }
 
     #[test]

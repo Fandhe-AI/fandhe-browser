@@ -116,6 +116,14 @@ struct Entry {
     /// この接続が `Target.createBrowserContext` で作った browser context（切断で破棄する）。
     /// 件数は registry 側の `MAX_BROWSER_CONTEXTS` で抑えられる。
     owned_contexts: Vec<BrowserContextId>,
+    /// `Target.setDiscoverTargets` が有効か（#1324・`CDP-3`）。
+    discover_enabled: bool,
+    /// この接続へ `Target.targetCreated` を通知済みで、まだ `Target.targetDestroyed` を通知していない
+    /// ターゲット（ID 昇順）。discover 有効の間、enable・reconcile のたびに registry の可視ターゲット
+    /// （既定 context と自接続所有 context のページ。件数は `MAX_TARGETS` 以下）と同期するため、
+    /// 件数は `MAX_TARGETS` に 1 件（`create_target` が直後の reconcile までに足す分）を足した値で抑えられる。
+    /// TargetId は単調増加で再利用されないので、「記録 − 現在の可視集合」の差分が消滅の通知対象になる。
+    discovered: Vec<TargetId>,
 }
 
 /// [`ConnectionScoped::release`] が返す、切断時に解放すべき資源。
@@ -136,6 +144,17 @@ pub(crate) struct CreatedTarget {
     pub session: Option<SessionId>,
     /// `waitForDebuggerOnStart` で止めたか（`Target.attachedToTarget` の `waitingForDebugger`）。
     pub waiting_for_debugger: bool,
+    /// 呼び出し接続が discover 有効で、`Target.targetCreated` を送出すべきか（#1324・`CDP-3`）。
+    pub announce_created: bool,
+}
+
+/// [`ConnectionScoped::close_target`] の結果。
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct ClosedTarget {
+    /// 自接続の自動 attach から外したセッション（ID 昇順。`Target.detachedFromTarget` の送出対象）。
+    pub sessions: Vec<SessionId>,
+    /// 呼び出し接続が discover 有効でこのターゲットを通知済みか（`Target.targetDestroyed` の送出要否。#1324）。
+    pub announce_destroyed: bool,
 }
 
 /// 接続操作の失敗。
@@ -154,6 +173,11 @@ pub(crate) struct Reconciled {
     pub attached: Vec<(TargetInfo, SessionId)>,
     /// 消失した `(targetId, sessionId)`（`Target.detachedFromTarget` の送出対象）。
     pub detached: Vec<(TargetId, SessionId)>,
+    /// discover 有効な接続へ新たに通知すべき `(targetInfo, attached)`（`Target.targetCreated`。#1324・`CDP-3`）。
+    /// `attached` は通知時点で何らかのセッションが attach 中か（この呼び出しの自動 attach より前の実値）。
+    pub created: Vec<(TargetInfo, bool)>,
+    /// discover 有効な接続へ通知すべき消滅ターゲット（`Target.targetDestroyed`。#1324）。
+    pub destroyed: Vec<TargetId>,
     /// attach の途中失敗（セッション枠の枯渇等）。
     pub error: Option<ConnStateError>,
 }
@@ -240,10 +264,12 @@ impl ConnectionScoped {
                 .target(&tid)
                 .ok_or(ConnStateError::Registry(CdpStateError::UnknownTarget))?;
             entry.auto_attached.push((tid, sid.clone()));
+            let announce_created = Self::record_discovered(entry, &info);
             Ok(CreatedTarget {
                 info,
                 session: Some(sid),
                 waiting_for_debugger: pause,
+                announce_created,
             })
         } else {
             let tid = match context {
@@ -254,10 +280,12 @@ impl ConnectionScoped {
             let info = registry
                 .target(&tid)
                 .ok_or(ConnStateError::Registry(CdpStateError::UnknownTarget))?;
+            let announce_created = Self::record_discovered(entry, &info);
             Ok(CreatedTarget {
                 info,
                 session: None,
                 waiting_for_debugger: false,
+                announce_created,
             })
         }
     }
@@ -298,21 +326,101 @@ impl ConnectionScoped {
         attach_new: bool,
     ) -> Reconciled {
         let mut map = self.lock();
-        match map.get_mut(&conn) {
-            Some(entry) if entry.auto_attach_enabled => {
-                let (attached, error) = Self::attach_missing(entry, registry, false, attach_new);
-                Reconciled {
-                    attached,
-                    detached: std::mem::take(&mut entry.pending_detached),
-                    error,
-                }
-            }
-            Some(entry) => Reconciled {
+        let Some(entry) = map.get_mut(&conn) else {
+            return Reconciled::default();
+        };
+        // discover の差分は attach より前に計算する（`attached` を自動 attach 前の実値にするため。#1324）。
+        let (created, destroyed) = Self::discover_diff(entry, registry);
+        if entry.auto_attach_enabled {
+            let (attached, error) = Self::attach_missing(entry, registry, false, attach_new);
+            Reconciled {
+                attached,
                 detached: std::mem::take(&mut entry.pending_detached),
+                created,
+                destroyed,
+                error,
+            }
+        } else {
+            Reconciled {
+                detached: std::mem::take(&mut entry.pending_detached),
+                created,
+                destroyed,
                 ..Reconciled::default()
-            },
-            None => Reconciled::default(),
+            }
         }
+    }
+
+    /// `Target.setDiscoverTargets {discover:true}` の本体（#1324・`CDP-3`）。discover を有効にし、
+    /// まだ通知していない可視ターゲット（既定 context と自接続所有 context のページ）を ID 昇順で
+    /// `(targetInfo, attached)` として返す。冪等（2 回目以降は新規分のみ）。
+    /// 他接続の context のターゲットは通知対象にしない（`Target.getBrowserContexts` と同じ接続間分離。`CDP-7`）。
+    pub(crate) fn enable_discover(
+        &self,
+        conn: ConnId,
+        registry: &TargetRegistry,
+    ) -> Result<Vec<(TargetInfo, bool)>, ConnStateError> {
+        let mut map = self.lock();
+        let entry = map.get_mut(&conn).ok_or(ConnStateError::NotLive)?;
+        entry.discover_enabled = true;
+        let (created, _destroyed) = Self::discover_diff(entry, registry);
+        Ok(created)
+    }
+
+    /// `Target.setDiscoverTargets {discover:false}` の本体。通知済みの記録を捨てる
+    /// （Chromium も無効化時に `Target.targetDestroyed` は送らない）。再度有効にすると全件を通知し直す。
+    pub(crate) fn disable_discover(&self, conn: ConnId) -> Result<(), ConnStateError> {
+        let mut map = self.lock();
+        let entry = map.get_mut(&conn).ok_or(ConnStateError::NotLive)?;
+        entry.discover_enabled = false;
+        entry.discovered.clear();
+        Ok(())
+    }
+
+    /// ターゲットが接続から見えるか（既定 context か自接続所有 context。`Target.createTarget` の作成先規則と同じ）。
+    fn is_visible(entry: &Entry, registry: &TargetRegistry, info: &TargetInfo) -> bool {
+        let c = info.browser_context_id();
+        *c == registry.default_browser_context() || entry.owned_contexts.contains(c)
+    }
+
+    /// discover 有効なら、記録と registry の可視ターゲットの差分を返して記録を同期する。
+    /// 戻りは `(新規 (info, attached), 消滅 ID)`。無効なら空（記録も持たない）。
+    fn discover_diff(
+        entry: &mut Entry,
+        registry: &TargetRegistry,
+    ) -> (Vec<(TargetInfo, bool)>, Vec<TargetId>) {
+        if !entry.discover_enabled {
+            return (Vec::new(), Vec::new());
+        }
+        let visible: Vec<(TargetInfo, bool)> = registry
+            .targets_with_attached()
+            .into_iter()
+            .filter(|(i, _)| Self::is_visible(entry, registry, i))
+            .collect();
+        let created: Vec<(TargetInfo, bool)> = visible
+            .iter()
+            .filter(|(i, _)| !entry.discovered.contains(i.target_id()))
+            .cloned()
+            .collect();
+        let destroyed: Vec<TargetId> = entry
+            .discovered
+            .iter()
+            .filter(|t| !visible.iter().any(|(i, _)| i.target_id() == *t))
+            .cloned()
+            .collect();
+        entry.discovered = visible.iter().map(|(i, _)| i.target_id().clone()).collect();
+        (created, destroyed)
+    }
+
+    /// `create_target` が作ったターゲットを通知済みとして記録する。discover 無効なら記録せず `false`。
+    fn record_discovered(entry: &mut Entry, info: &TargetInfo) -> bool {
+        if !entry.discover_enabled {
+            return false;
+        }
+        if !entry.discovered.contains(info.target_id()) {
+            entry.discovered.push(info.target_id().clone());
+            entry.discovered.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+        }
+        true
     }
 
     /// 未 attach のターゲットへ attach する。`atomic` なら失敗時にこの呼び出しの attach を全て巻き戻して
@@ -416,7 +524,7 @@ impl ConnectionScoped {
     }
 
     /// 接続が閉じてよいターゲットを閉じ、自接続の自動 attach 記録から該当セッションを落として
-    /// その SessionId を昇順で返す（`Target.closeTarget`・TASK-43.3h・`CDP-2`・`CDP-7`）。
+    /// その SessionId を昇順で返す。discover 有効で通知済みなら `announce_destroyed` も返す（`Target.closeTarget`・TASK-43.3h・`CDP-2`・`CDP-7`）。
     /// 落とした分は `pending_detached` に積まない（`Target.detachedFromTarget` の送出は呼び出し側の
     /// ハンドラに一本化し、続く `reconcile_auto_attach` での二重送出を防ぐ）。他接続のセッションは
     /// その接続の次の reconcile で通知される。ロック順序は本表 → registry。
@@ -425,7 +533,7 @@ impl ConnectionScoped {
         conn: ConnId,
         registry: &TargetRegistry,
         tid: &TargetId,
-    ) -> Result<Vec<SessionId>, ConnStateError> {
+    ) -> Result<ClosedTarget, ConnStateError> {
         let mut map = self.lock();
         let entry = map.get_mut(&conn).ok_or(ConnStateError::NotLive)?;
         registry
@@ -441,7 +549,13 @@ impl ConnectionScoped {
             }
         });
         own.sort_by(|a, b| a.as_str().cmp(b.as_str()));
-        Ok(own)
+        // 通知済みなら記録から外し、続く reconcile で `targetDestroyed` を二重に送らない（#1324）。
+        let before = entry.discovered.len();
+        entry.discovered.retain(|t| t != tid);
+        Ok(ClosedTarget {
+            sessions: own,
+            announce_destroyed: entry.discovered.len() != before,
+        })
     }
 
     /// この接続が所有する非既定 browser context を作成順（ID 昇順）で返す。
@@ -667,7 +781,7 @@ mod tests {
         let t = page(&r);
         c.enable_auto_attach(a, &r, false).unwrap();
         c.enable_auto_attach(b, &r, false).unwrap();
-        let sa = c.close_target(a, &r, &t).unwrap();
+        let sa = c.close_target(a, &r, &t).unwrap().sessions;
         assert_eq!(sa.len(), 1);
         assert!(c.reconcile_auto_attach(a, &r, true).detached.is_empty());
         assert_eq!(c.reconcile_auto_attach(b, &r, true).detached.len(), 1);
@@ -694,7 +808,7 @@ mod tests {
             c.close_target(ConnId::new(9), &r, &t),
             Err(ConnStateError::NotLive)
         );
-        assert_eq!(c.close_target(a, &r, &t), Ok(vec![]));
+        assert_eq!(c.close_target(a, &r, &t).unwrap().sessions, vec![]);
     }
 
     #[test]

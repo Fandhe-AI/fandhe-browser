@@ -8,7 +8,7 @@
 //!
 //! 公開入口は無く crate 内部専用。後続タスクは [`builtin_handlers`] へメソッドを
 //! 追加するだけでよい（`Page.navigate` は 42.2 で登録済み、イベント送出は 42.3 で実装済み、
-//! `DOM.getDocument`・`DOM.querySelector` は 42.4・42.5、`DOM.requestChildNodes` は #657、`Browser.getVersion` は TASK-43.3a、`Target.getTargetInfo` は TASK-43.3b、`Target.setAutoAttach`・`Browser.setDownloadBehavior` は TASK-43.3c、`Target.createBrowserContext` は TASK-43.3d、`Target.getBrowserContexts` は #1323、`Target.closeTarget` は TASK-43.3h、`Target.createTarget`・`Runtime.runIfWaitingForDebugger` は TASK-43.3e、`Page.enable`・`Page.getFrameTree` は TASK-43.3i、`Log.enable`・`Runtime.enable`・`Network.enable` は TASK-43.3j、`Page.setLifecycleEventsEnabled` は TASK-43.3k、`Emulation.setFocusEmulationEnabled`・`Emulation.setEmulatedMedia` は TASK-43.3m、`Page.createIsolatedWorld` は TASK-44.6（#1217）で登録済み）。
+//! `DOM.getDocument`・`DOM.querySelector` は 42.4・42.5、`DOM.requestChildNodes` は #657、`Browser.getVersion` は TASK-43.3a、`Target.getTargetInfo` は TASK-43.3b、`Target.setAutoAttach`・`Browser.setDownloadBehavior` は TASK-43.3c、`Target.createBrowserContext` は TASK-43.3d、`Target.getBrowserContexts` は #1323、`Target.setDiscoverTargets` は #1324、`Target.closeTarget` は TASK-43.3h、`Target.createTarget`・`Runtime.runIfWaitingForDebugger` は TASK-43.3e、`Page.enable`・`Page.getFrameTree` は TASK-43.3i、`Log.enable`・`Runtime.enable`・`Network.enable` は TASK-43.3j、`Page.setLifecycleEventsEnabled` は TASK-43.3k、`Emulation.setFocusEmulationEnabled`・`Emulation.setEmulatedMedia` は TASK-43.3m、`Page.createIsolatedWorld` は TASK-44.6（#1217）で登録済み）。
 //!
 //! # 入力の扱い
 //!
@@ -22,7 +22,7 @@
 //!
 //! [`builtin_handlers`] には `Page.navigate`（TASK-42.2）・`DOM.getDocument`（TASK-42.4）・
 //! `DOM.querySelector`（TASK-42.5）・`DOM.requestChildNodes`（#657）・
-//! `Browser.getVersion`（TASK-43.3a・`CDP-2`）・`Target.getTargetInfo`（TASK-43.3b・`CDP-2`）・`Target.setAutoAttach`・`Browser.setDownloadBehavior`（TASK-43.3c・`CDP-2`）・`Target.createBrowserContext`（TASK-43.3d・`CDP-2`）・`Target.getBrowserContexts`（#1323・`CDP-3`）・`Target.closeTarget`（TASK-43.3h・`CDP-2`）・`Target.createTarget`・`Runtime.runIfWaitingForDebugger`（TASK-43.3e・#910・`CDP-2`）・`Page.enable`・`Page.getFrameTree`（TASK-43.3i・#1037・`CDP-2`）・`Log.enable`・`Runtime.enable`・`Network.enable`（TASK-43.3j・#1038・`CDP-2`）・`Page.setLifecycleEventsEnabled`（TASK-43.3k・#1039・`CDP-2`）・`Emulation.setFocusEmulationEnabled`・`Emulation.setEmulatedMedia`（TASK-43.3m・#1041・`CDP-2`）・`Page.createIsolatedWorld`（TASK-44.6・#1217・`CDP-2`）・`Runtime.evaluate`・`Runtime.releaseObject`（TASK-44.7・#1218・`CDP-2`）のみ登録済みで、
+//! `Browser.getVersion`（TASK-43.3a・`CDP-2`）・`Target.getTargetInfo`（TASK-43.3b・`CDP-2`）・`Target.setAutoAttach`・`Browser.setDownloadBehavior`（TASK-43.3c・`CDP-2`）・`Target.createBrowserContext`（TASK-43.3d・`CDP-2`）・`Target.getBrowserContexts`（#1323・`CDP-3`）・`Target.setDiscoverTargets`（#1324・`CDP-3`）・`Target.closeTarget`（TASK-43.3h・`CDP-2`）・`Target.createTarget`・`Runtime.runIfWaitingForDebugger`（TASK-43.3e・#910・`CDP-2`）・`Page.enable`・`Page.getFrameTree`（TASK-43.3i・#1037・`CDP-2`）・`Log.enable`・`Runtime.enable`・`Network.enable`（TASK-43.3j・#1038・`CDP-2`）・`Page.setLifecycleEventsEnabled`（TASK-43.3k・#1039・`CDP-2`）・`Emulation.setFocusEmulationEnabled`・`Emulation.setEmulatedMedia`（TASK-43.3m・#1041・`CDP-2`）・`Page.createIsolatedWorld`（TASK-44.6・#1217・`CDP-2`）・`Runtime.evaluate`・`Runtime.releaseObject`（TASK-44.7・#1218・`CDP-2`）のみ登録済みで、
 //! それ以外のメソッドは JSON-RPC の「method not implemented」（`-32601`）エラーを返す。
 //! 汎用の空 success フォールバック（PoC-5 の暫定挙動）は採らない。理由は次のとおり。
 //!
@@ -260,7 +260,7 @@ pub(crate) struct HandlerOutput {
     /// 応答の**後**に送出するイベント（順序どおり。既定）。
     pub events: Vec<CdpEvent>,
     /// 応答の**前**に送出するイベント（順序どおり。opt-in）。`Target.createTarget` の
-    /// `Target.attachedToTarget` 用で、Playwright は応答を受けた時点で当該ターゲットのページが
+    /// `Target.targetCreated`・`Target.attachedToTarget` 用で、Playwright は応答を受けた時点で当該ターゲットのページが
     /// 存在する前提で動くため（`CDP-5`・`CDP-2`・#910）。他のハンドラは使わない。
     pub pre_events: Vec<CdpEvent>,
 }
@@ -437,7 +437,7 @@ type HandlerTable = Vec<(&'static str, Box<dyn CommandHandler>)>;
 
 /// 組込みハンドラ表。`Page.navigate`（TASK-42.2）・`DOM.getDocument`（TASK-42.4）・
 /// `DOM.querySelector`（TASK-42.5）・`DOM.requestChildNodes`（#657）・`Browser.getVersion`（TASK-43.3a）・
-/// `Target.getTargetInfo`（TASK-43.3b）・`Target.setAutoAttach`・`Browser.setDownloadBehavior`（TASK-43.3c。実体に接続済み）・`Target.createBrowserContext`（TASK-43.3d）・`Target.getBrowserContexts`（#1323）・`Target.closeTarget`（TASK-43.3h）・`Target.createTarget`・`Runtime.runIfWaitingForDebugger`（TASK-43.3e）・`Page.enable`・`Page.getFrameTree`（TASK-43.3i・#1037）・`Log.enable`・`Runtime.enable`・`Network.enable`（TASK-43.3j・#1038）・`Page.setLifecycleEventsEnabled`（TASK-43.3k・#1039）・`Page.addScriptToEvaluateOnNewDocument`（空 source のみ。TASK-43.3l・#1040）・`Emulation.setFocusEmulationEnabled`・`Emulation.setEmulatedMedia`（TASK-43.3m・#1041）・`Page.createIsolatedWorld`（TASK-44.6・#1217）・`Runtime.evaluate`・`Runtime.releaseObject`（TASK-44.7・#1218。isolated world のみ）を登録済み（`CDP-1`・`CDP-2`）。
+/// `Target.getTargetInfo`（TASK-43.3b）・`Target.setAutoAttach`・`Browser.setDownloadBehavior`（TASK-43.3c。実体に接続済み）・`Target.createBrowserContext`（TASK-43.3d）・`Target.getBrowserContexts`（#1323）・`Target.setDiscoverTargets`（#1324）・`Target.closeTarget`（TASK-43.3h）・`Target.createTarget`・`Runtime.runIfWaitingForDebugger`（TASK-43.3e）・`Page.enable`・`Page.getFrameTree`（TASK-43.3i・#1037）・`Log.enable`・`Runtime.enable`・`Network.enable`（TASK-43.3j・#1038）・`Page.setLifecycleEventsEnabled`（TASK-43.3k・#1039）・`Page.addScriptToEvaluateOnNewDocument`（空 source のみ。TASK-43.3l・#1040）・`Emulation.setFocusEmulationEnabled`・`Emulation.setEmulatedMedia`（TASK-43.3m・#1041）・`Page.createIsolatedWorld`（TASK-44.6・#1217）・`Runtime.evaluate`・`Runtime.releaseObject`（TASK-44.7・#1218。isolated world のみ）を登録済み（`CDP-1`・`CDP-2`）。
 ///
 /// `Page.navigate` は既定の `FetchOptions`（内部アドレス拒否）で `Fetcher` を構築する。
 pub(crate) fn builtin_handlers() -> Result<HandlerTable, DispatcherError> {
@@ -474,6 +474,10 @@ pub(crate) fn builtin_handlers_with(fetch: FetchOptions) -> Result<HandlerTable,
         (
             "Target.getBrowserContexts",
             Box::new(crate::playwright_compat::TargetGetBrowserContexts),
+        ),
+        (
+            "Target.setDiscoverTargets",
+            Box::new(crate::playwright_compat::TargetSetDiscoverTargets),
         ),
         (
             "Target.closeTarget",
@@ -665,6 +669,7 @@ impl Dispatcher {
 }
 
 /// 自動 attach 有効中の接続について、新ターゲットの attach と消失セッションの回収を行い、
+/// discover 有効中の接続について `Target.targetCreated`・`Target.targetDestroyed` の差分も求め（#1324・`CDP-3`）、
 /// ブラウザレベルのイベントとして返す（push 経路が無いため次のコマンド応答に同伴する。
 /// 成功・失敗・未実装メソッドの全経路から呼び、取りこぼしを防ぐ（ハンドラ失敗時は `attach_new=false` で回収のみ）。`CDP-2`・`CDP-7`）。
 /// セッション枠の枯渇は応答を失敗にせず stderr へ記録し、次回に再試行する。
@@ -687,6 +692,15 @@ fn auto_attach_events(
     let mut events = Vec::new();
     for (target_id, sid) in &rec.detached {
         events.push(crate::playwright_compat::detached_event(target_id, sid));
+    }
+    // discover の通知は detached の後・attached の前（Chromium の順。#1324・`CDP-3`）。
+    for tid in &rec.destroyed {
+        events.push(crate::playwright_compat::target_destroyed_event(tid));
+    }
+    for (info, attached) in &rec.created {
+        events.push(crate::playwright_compat::target_created_event(
+            info, *attached,
+        ));
     }
     for (info, sid) in &rec.attached {
         events.push(crate::playwright_compat::attached_event(info, sid, false));
