@@ -1338,14 +1338,20 @@
     // max_ops_per_page を消費しないが、nodeAt はラッパー未作成のノードで初回だけ nodeType op
     // （予算を 1 消費）を呼ぶ。アタッチ後に作ったノード・範囲外の番号は例外（別のノードへは解決しない）。
     // cdp ヘルパーが注入時にこのオブジェクトを捕捉して使う想定（DOM.describeNode / resolveNode。後続）。
-    expose('__fandheDomIdentity', Object.freeze({
-        orderOf: function (node) {
-            return op('initialOrder', idOf(node, 'orderOf'));
-        },
-        nodeAt: function (order) {
-            return wrapNode(op('nodeByInitialOrder', order));
-        }
-    }));
+    // 名前自体も書き換え・削除できないようロックする（ページ JS による差し替えを防ぐ）。
+    Object.defineProperty(global, '__fandheDomIdentity', {
+        value: Object.freeze({
+            orderOf: function (node) {
+                return op('initialOrder', idOf(node, 'orderOf'));
+            },
+            nodeAt: function (order) {
+                return wrapNode(op('nodeByInitialOrder', order));
+            }
+        }),
+        writable: false,
+        configurable: false,
+        enumerable: false
+    });
 
     expose('Node', Node);
     expose('Element', Element);

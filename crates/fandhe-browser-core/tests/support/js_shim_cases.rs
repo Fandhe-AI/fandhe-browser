@@ -91,6 +91,16 @@ pub fn run(engine: &str) {
     let mut p = setup(engine, None);
     check(&mut p, "typeof __fandheDomIdentity", "object");
     check(&mut p, "Object.isFrozen(__fandheDomIdentity)", "true");
+    check(
+        &mut p,
+        "var d = Object.getOwnPropertyDescriptor(globalThis, '__fandheDomIdentity'); d.writable === false && d.configurable === false",
+        "true",
+    );
+    check(
+        &mut p,
+        "var keep = __fandheDomIdentity; try { __fandheDomIdentity = 1; } catch (e) {} delete globalThis.__fandheDomIdentity; __fandheDomIdentity === keep",
+        "true",
+    );
     check(&mut p, "__fandheDomIdentity.orderOf(document)", "1");
     check(
         &mut p,
