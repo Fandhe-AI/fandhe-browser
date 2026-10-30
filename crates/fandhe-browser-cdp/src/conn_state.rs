@@ -390,11 +390,13 @@ impl ConnectionScoped {
                 .ok_or(ConnStateError::Registry(CdpStateError::UnknownTarget))?;
             entry.auto_attached.push((tid, sid.clone()));
             let announce_created = Self::record_discovered(entry, &info);
+            // discover が tab を含むなら tab の作成通知も先に送る（通知順序は tab → ページ → attach。`CDP-3`）。
+            let announce_tab_created = Self::record_discovered_tab(entry, &info);
             Ok(CreatedTarget {
                 info,
                 session: Some(sid),
                 tab: false,
-                announce_tab_created: false,
+                announce_tab_created,
                 waiting_for_debugger: pause,
                 announce_created,
             })
@@ -1309,6 +1311,20 @@ mod tests {
         );
         assert_eq!(r.session_count(), before);
         assert_eq!(cs.auto_attach_kind(c), None);
+    }
+
+    #[test]
+    fn cdp3_page_auto_attach_create_announces_discovered_tab_first() {
+        let r = TargetRegistry::new();
+        let cs = ConnectionScoped::new();
+        let c = ConnId::new(1);
+        cs.open(c);
+        cs.enable_discover(c, &r, true).unwrap();
+        cs.enable_auto_attach(c, &r, false).unwrap();
+        let created = cs.create_target(c, &r, None, "about:blank").unwrap();
+        assert!(!created.tab);
+        assert!(created.announce_tab_created);
+        assert!(created.announce_created);
     }
 
     #[test]

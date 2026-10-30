@@ -825,7 +825,8 @@ impl CommandHandler for RuntimeRunIfWaitingForDebugger {
                 let owned = ctx
                     .conn
                     .is_some_and(|c| state.conn_scoped().owns_tab_session(c, sid));
-                if !owned {
+                // 他接続がページを閉じて registry から消えた tab セッションは所有記録が残っていても拒否する。
+                if !owned || !registry.is_tab_session(sid) {
                     return Err(CdpError::INVALID_PARAMS);
                 }
                 if let Some(tid) = registry.resume_by_session(sid) {
