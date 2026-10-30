@@ -123,10 +123,6 @@ impl CdpError {
     /// `Runtime.evaluate` の `expression`（または評価用に包んだソース）が上限を超えた（`CDP-7`・`SEC-2`。
     /// 評価器を起動しない。TASK-44.7・#1218）。
     pub const EXPRESSION_TOO_LARGE: Self = Self::new(-32000, "expression too large");
-    /// main world（既定コンテキスト）への評価は未対応（`Runtime.evaluate`。成功を装わず固定文言で拒否する。
-    /// `REPAIR-3`・TASK-44.7・#1218）。
-    pub const MAIN_WORLD_EVALUATION_UNSUPPORTED: Self =
-        Self::new(-32000, "evaluation in the main world is not supported");
     /// 評価が時間切れになった（JS の例外ではない。`CDP-7`・#1218）。
     pub const EVALUATION_TIMED_OUT: Self = Self::new(-32000, "evaluation timed out");
     /// 評価が資源上限（ヒープ・コンテキスト数・待ち行列）に達した（JS の例外ではない。`CDP-7`・#1218）。

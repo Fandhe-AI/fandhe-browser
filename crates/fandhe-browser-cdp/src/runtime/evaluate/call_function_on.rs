@@ -24,11 +24,11 @@
 //! # 差異・スタブ（`REPAIR-3`）
 //!
 //! - `userGesture` は受け入れるが効果は無い（ユーザー活性化の概念を持たない）。`silent` も同様。型（bool）だけ検査する。
-//! - `executionContextId`（Puppeteer の経路。#1345）は isolated world の contextId だけを受理し、`this` は undefined
+//! - `executionContextId`（Puppeteer の経路。#1345）は main・isolated world の contextId を受理し（main は確定 DOM の
+//!   再パースで評価する段階 1。#1347。ページ JS のヒープは無い）、`this` は undefined
 //!   （ヘルパーが `Reflect.apply` の thisArgument に undefined を渡す。`functionDeclaration` が sloppy mode の関数なら
 //!   JS の仕様どおり `this` は `globalThis` に置き換わる。Chromium と同じ）。未知・他セッションの contextId は
-//!   `INVALID_PARAMS`（存在を区別しない）、世代違いは `EXECUTION_CONTEXT_STALE`、main world は
-//!   `MAIN_WORLD_EVALUATION_UNSUPPORTED`（評価器を起動しない。設計 §9 分割案 2 で受理予定）。この経路はヘルパー未注入でも
+//!   `INVALID_PARAMS`（存在を区別しない）、世代違いは `EXECUTION_CONTEXT_STALE`。この経路はヘルパー未注入でも
 //!   注入して評価する（引数にハンドルがあれば存在し得ないので `REMOTE_OBJECT_NOT_FOUND`）。
 //! - `objectGroup`・`generatePreview`・`throwOnSideEffect`・`uniqueContextId`・`serializationOptions` 等は
 //!   `UNSUPPORTED_PARAMS`（成功を装わない。`CDP-6`）。
@@ -46,8 +46,7 @@ use serde_json::{Map, Value, json};
 
 use super::{
     ContextLookupError, EvalLimits, EvalSite, LocateError, MAX_CONTEXT_ID, UNSERIALIZABLE_NUMBERS,
-    World, bool_param, ensure_helper, helper_call_source, is_bigint_literal, locate,
-    parse_object_id,
+    bool_param, ensure_helper, helper_call_source, is_bigint_literal, locate, parse_object_id,
 };
 use crate::protocol::{BoxFuture, CdpError, CommandContext, CommandHandler, HandlerOutput};
 use crate::runtime::ContextView;
@@ -117,26 +116,20 @@ fn map_locate_error(target: &CallTarget, e: LocateError) -> CdpError {
             CallTarget::Context { .. } => CdpError::INVALID_PARAMS,
         },
         LocateError::Lookup(l) => l.to_cdp(),
+        LocateError::Create(c) => c.to_cdp(),
     }
 }
 
-/// 解決した view から評価対象を選ぶ。`objectId` 経路は isolated かつヘルパー注入済みでなければ
-/// `REMOTE_OBJECT_NOT_FOUND`（ハンドルが存在し得ない）。`executionContextId` 経路は main world を
-/// `MAIN_WORLD_EVALUATION_UNSUPPORTED` とし、ヘルパー未注入（`None`）は呼び出し側が注入する。
+/// 解決した view から評価対象と注入済みヘルパーの epoch を選ぶ（main・isolated を問わない。#1347）。
+/// `objectId` 経路はヘルパー未注入ならハンドルが存在し得ないので `REMOTE_OBJECT_NOT_FOUND`。
+/// `executionContextId` 経路は未注入（`None`）を許し、呼び出し側が注入する。
 fn select_view(
     target: &CallTarget,
-    view: Option<&ContextView>,
+    view: &ContextView,
 ) -> Result<(ContextView, Option<u64>), CdpError> {
-    match (target, view) {
-        (CallTarget::Object { .. }, Some(v)) if v.world != World::Main => match v.helper_epoch {
-            Some(e) => Ok((v.clone(), Some(e))),
-            None => Err(CdpError::REMOTE_OBJECT_NOT_FOUND),
-        },
-        (CallTarget::Object { .. }, _) => Err(CdpError::REMOTE_OBJECT_NOT_FOUND),
-        (CallTarget::Context { .. }, Some(v)) if v.world != World::Main => {
-            Ok((v.clone(), v.helper_epoch))
-        }
-        (CallTarget::Context { .. }, _) => Err(CdpError::MAIN_WORLD_EVALUATION_UNSUPPORTED),
+    match (target, view.helper_epoch) {
+        (CallTarget::Object { .. }, None) => Err(CdpError::REMOTE_OBJECT_NOT_FOUND),
+        (_, epoch) => Ok((view.clone(), epoch)),
     }
 }
 
@@ -334,9 +327,8 @@ impl CommandHandler for RuntimeCallFunctionOn {
             }
             let located = locate(state, sid, &tid, Some(p.target.context_id()))
                 .map_err(|e| map_locate_error(&p.target, e))?;
-            // `objectId` 経路は main world・ヘルパー未注入を、`this` のハンドルが存在し得ないので評価せずに
-            // 「無い」とする。`executionContextId` 経路は main world を固定エラーにする。
-            let (view, epoch) = select_view(&p.target, located.view.as_ref())?;
+            // `objectId` 経路はヘルパー未注入を、`this` のハンドルが存在し得ないので評価せずに「無い」とする。
+            let (view, epoch) = select_view(&p.target, &located.view)?;
             let key = ScriptContextKey::new(located.scope, located.generation, view.id);
             let epoch = match epoch {
                 Some(e) => e,
@@ -374,7 +366,7 @@ impl CommandHandler for RuntimeCallFunctionOn {
 
 #[cfg(test)]
 mod tests {
-    use super::super::MAX_AWAITING_SLOTS;
+    use super::super::{MAX_AWAITING_SLOTS, World};
     use super::*;
 
     fn args(v: Value) -> Result<Vec<CallArg>, CdpError> {
@@ -664,27 +656,27 @@ mod tests {
             helper_epoch,
         };
         let iso = || World::Isolated("u".to_owned());
+        // main world も isolated world と同じ扱い（#1347）。
+        assert_eq!(select_view(&ctx, &view(World::Main, None)).unwrap().1, None);
         assert_eq!(
-            select_view(&ctx, Some(&view(World::Main, None))).unwrap_err(),
-            CdpError::MAIN_WORLD_EVALUATION_UNSUPPORTED
-        );
-        assert_eq!(select_view(&ctx, Some(&view(iso(), None))).unwrap().1, None);
-        assert_eq!(
-            select_view(&ctx, Some(&view(iso(), Some(5)))).unwrap().1,
+            select_view(&ctx, &view(World::Main, Some(5))).unwrap().1,
             Some(5)
         );
         assert_eq!(
-            select_view(&obj, Some(&view(iso(), None))).unwrap_err(),
+            select_view(&obj, &view(World::Main, None)).unwrap_err(),
             CdpError::REMOTE_OBJECT_NOT_FOUND
         );
         assert_eq!(
-            select_view(&obj, Some(&view(World::Main, Some(5)))).unwrap_err(),
-            CdpError::REMOTE_OBJECT_NOT_FOUND
-        );
-        assert_eq!(
-            select_view(&obj, Some(&view(iso(), Some(5)))).unwrap().1,
+            select_view(&obj, &view(World::Main, Some(5))).unwrap().1,
             Some(5)
         );
+        assert_eq!(select_view(&ctx, &view(iso(), None)).unwrap().1, None);
+        assert_eq!(select_view(&ctx, &view(iso(), Some(5))).unwrap().1, Some(5));
+        assert_eq!(
+            select_view(&obj, &view(iso(), None)).unwrap_err(),
+            CdpError::REMOTE_OBJECT_NOT_FOUND
+        );
+        assert_eq!(select_view(&obj, &view(iso(), Some(5))).unwrap().1, Some(5));
     }
 
     #[test]

@@ -31,8 +31,8 @@
 //! 式が 1 MiB 超 → `EXPRESSION_TOO_LARGE`（評価器を起動しない）→ 未知セッション → `INVALID_PARAMS` →
 //! 止めたターゲット → `TARGET_WAITING_FOR_DEBUGGER` → 評価器が無効 → `EXECUTION_CONTEXTS_UNAVAILABLE` →
 //! 確定文書なし・世代の食い違い → `TARGET_DOCUMENT_UNAVAILABLE` → contextId の解決失敗（未知・他セッションは
-//! `INVALID_PARAMS`、世代違いは `EXECUTION_CONTEXT_STALE`）→ main world・`contextId` 省略 →
-//! `MAIN_WORLD_EVALUATION_UNSUPPORTED`。
+//! `INVALID_PARAMS`、世代違いは `EXECUTION_CONTEXT_STALE`）。`contextId` 省略時はセッションの現在の文書の
+//! main world を対象にする（無ければ作る。ID 枯渇は `SERVER_ERROR`。#1347）。
 //!
 //! `Runtime.callFunctionOn`（`call_function_on` モジュール）: `sessionId` なし → `UNSUPPORTED_PARAMS` →
 //! 非オブジェクト → `INVALID_PARAMS` → 未知キー → `UNSUPPORTED_PARAMS` → `functionDeclaration` の型の誤り →
@@ -43,19 +43,27 @@
 //! → `functionDeclaration` が 1 MiB 超 → `EXPRESSION_TOO_LARGE` → 未知セッション → `INVALID_PARAMS` →
 //! 止めたターゲット → `TARGET_WAITING_FOR_DEBUGGER` → 評価器が無効 → `EXECUTION_CONTEXTS_UNAVAILABLE` →
 //! 確定文書なし → `TARGET_DOCUMENT_UNAVAILABLE` → contextId の解決。`objectId` 経路は `Runtime.releaseObject` と同じ
-//! （未知・他セッション・main world・ヘルパー未注入は `REMOTE_OBJECT_NOT_FOUND`、世代違いは `EXECUTION_CONTEXT_STALE`）。
-//! `executionContextId` 経路は未知・他セッションが `INVALID_PARAMS`、世代違いが `EXECUTION_CONTEXT_STALE`、main world が
-//! `MAIN_WORLD_EVALUATION_UNSUPPORTED`（評価器を起動しない）で、ヘルパー未注入なら引数にハンドルがあれば
+//! （未知・他セッション・ヘルパー未注入は `REMOTE_OBJECT_NOT_FOUND`、世代違いは `EXECUTION_CONTEXT_STALE`）。
+//! `executionContextId` 経路は未知・他セッションが `INVALID_PARAMS`、世代違いが `EXECUTION_CONTEXT_STALE` で、
+//! main world も isolated world と同じに扱い（#1347）、ヘルパー未注入なら引数にハンドルがあれば
 //! `REMOTE_OBJECT_NOT_FOUND`、無ければ注入してから評価する。
 //!
 //! `Runtime.releaseObject`: `sessionId` なし → `UNSUPPORTED_PARAMS` → 非オブジェクト → `INVALID_PARAMS` →
 //! `objectId` 以外のキー → `UNSUPPORTED_PARAMS` → `objectId` 無し・非文字列・書式不正 → `INVALID_PARAMS` →
 //! 未知セッション → `INVALID_PARAMS` → 評価器が無効 → `EXECUTION_CONTEXTS_UNAVAILABLE` → 確定文書なし →
-//! `TARGET_DOCUMENT_UNAVAILABLE` → contextId の解決（未知・他セッション・main world・ヘルパー未注入は
+//! `TARGET_DOCUMENT_UNAVAILABLE` → contextId の解決（未知・他セッション・ヘルパー未注入は
 //! `REMOTE_OBJECT_NOT_FOUND` で存在を区別せず、評価もしない。世代違いは `EXECUTION_CONTEXT_STALE`）。
 //!
 //! # 差異・スタブ（`REPAIR-3`）
 //!
+//! - main world（#1347・段階 1。設計 `docs/design/main-world-evaluation.md` §3）: isolated world と同じく、core が
+//!   確定 HTML を再パースしたコンテキスト（キーの world は main の contextId）で評価する。ページ JS のヒープ
+//!   （グローバル・クロージャ・リスナー）は持たず、ページのグローバルの参照は `ReferenceError` 等が
+//!   `exceptionDetails` に出る（偽の値は返さない。`SEC-2`）。DOM の変更は world 間で共有せず `NavigationResult` へ
+//!   書き戻さない。`execute_page_scripts = false` では元の HTML を見る（`JS-4`）。ページスクリプトは実行しないので、
+//!   ヘルパーが退避する組込みは改竄されていない。1 セッションで main と utility の 2 コンテキストを使い、core の
+//!   上限（scope あたり 4 枠）には 2 セッションで届き得る（以後の初回評価は `EVALUATION_RESOURCE_LIMIT`）。
+//!   `auxData` に非標準のフィールドは足さない（オーナー判断 2026-10-30）。
 //! - `awaitPromise: true`（#1219）: 結果が native Promise なら、別の評価で microtask checkpoint
 //!   （shim の `__fandheRunMicrotasks`）を 1 回流してから決着を読む。checkpoint の後も pending なら
 //!   `PROMISE_NOT_SETTLED`（`-32000`。偽の値を返さない）。待機スロットは決着・未決着のどちらでも削除する。
@@ -64,7 +72,7 @@
 //!   `silent` は受け入れるが効果は無い。
 //!   `getProperties`・`releaseObjectGroup` は未登録（`-32601`）。`objectGroup`・
 //!   `generatePreview`・`includeCommandLineAPI` 等の未知キーも `UNSUPPORTED_PARAMS`（成功を装わない。`CDP-6`）。
-//! - main world への評価はエラー（上記）。`exceptionDetails` の `lineNumber`・`columnNumber` は 0 固定で
+//! - `exceptionDetails` の `lineNumber`・`columnNumber` は 0 固定で
 //!   `text` は固定文言 `uncaught exception`（Chromium の文言は使わない）。
 //! - `returnByValue` で関数・symbol は `VALUE_NOT_SERIALIZABLE`（Chromium は `{}`）。循環参照・入れ子の
 //!   bigint も同じ。入れ子が 128 を超える値は serde の再帰上限で `SERVER_ERROR`。
@@ -93,7 +101,7 @@ mod call_function_on;
 
 pub(crate) use call_function_on::RuntimeCallFunctionOn;
 
-use super::{ContextLookupError, ContextView, MAX_CONTEXT_ID, World};
+use super::{ContextError, ContextLookupError, ContextView, MAX_CONTEXT_ID, World};
 use crate::protocol::{BoxFuture, CdpError, CommandContext, CommandHandler, HandlerOutput};
 use crate::server::CdpState;
 use crate::target::{SessionId, TargetId};
@@ -526,8 +534,9 @@ struct Located {
     scope: NavigationScope,
     generation: NavigationGeneration,
     doc: Arc<NavigationResult>,
-    /// `contextId` を指定したときだけ `Some`。
-    view: Option<ContextView>,
+    /// 解決した評価コンテキスト。`contextId` 省略時はセッションの現在の文書の main world（無ければ作る。
+    /// イベントは送らない。Chromium と同じく `Runtime.enable` なしでも評価できる。#1347）。
+    view: ContextView,
 }
 
 /// 確定文書の確認と contextId の解決の失敗。呼び出し側が自分の検証順に合わせて CDP エラーへ写す。
@@ -536,6 +545,8 @@ enum LocateError {
     Document,
     /// contextId の解決に失敗した。
     Lookup(ContextLookupError),
+    /// `contextId` 省略時の main world の用意に失敗した（ID 枯渇など。`ContextError::to_cdp` で写す）。
+    Create(ContextError),
 }
 
 /// 確定文書を確認し（世代は current → latest → current の順に読み、食い違えば文書なし）、`context_id` が
@@ -557,13 +568,19 @@ fn locate(
         _ => return Err(LocateError::Document),
     };
     let view = match context_id {
-        None => None,
-        Some(id) => Some(
-            state
-                .registry()
-                .resolve_context(sid, id, after)
-                .map_err(LocateError::Lookup)?,
-        ),
+        // 省略時は現在の文書の main world。`document_contexts` は main が無いときだけ作る（冪等）。
+        // isolated world は作らず（`include_init_worlds = false`）、イベントも送らない（#1347・`CDP-2`）。
+        None => state
+            .registry()
+            .document_contexts(sid, after, false)
+            .map_err(LocateError::Create)?
+            .into_iter()
+            .find(|v| v.world == World::Main)
+            .ok_or(LocateError::Create(ContextError::StaleDocument))?,
+        Some(id) => state
+            .registry()
+            .resolve_context(sid, id, after)
+            .map_err(LocateError::Lookup)?,
     };
     Ok(Located {
         scope: nav.scope(),
@@ -759,7 +776,7 @@ impl EvalSite<'_> {
 
 /// `Runtime.evaluate`（`CDP-2`・`CDP-6`・`CDP-7`・`SEC-2`・`REPAIR-3`・TASK-44.7・#1218）。
 ///
-/// isolated world の contextId の上で式を評価し、`{"result": RemoteObject}`、JS の例外は成功応答の中の
+/// main・isolated world の contextId（省略時は main）の上で式を評価し、`{"result": RemoteObject}`、JS の例外は成功応答の中の
 /// `exceptionDetails`（`result` は例外の RemoteObject）で返す。タイムアウト・資源上限は例外を装わず
 /// `-32000` の固定文言で返す。検証順・差異は本モジュールのドキュメント参照。
 pub(crate) struct RuntimeEvaluate {
@@ -823,11 +840,9 @@ impl CommandHandler for RuntimeEvaluate {
             let located = locate(state, sid, &tid, context_id).map_err(|e| match e {
                 LocateError::Document => CdpError::TARGET_DOCUMENT_UNAVAILABLE,
                 LocateError::Lookup(l) => l.to_cdp(),
+                LocateError::Create(c) => c.to_cdp(),
             })?;
-            let view = match &located.view {
-                Some(v) if v.world != World::Main => v.clone(),
-                _ => return Err(CdpError::MAIN_WORLD_EVALUATION_UNSUPPORTED),
-            };
+            let view = located.view.clone();
             let key = ScriptContextKey::new(located.scope, located.generation, view.id);
             let epoch = ensure_helper(state, sid, &view, &located, key, &self.limits).await?;
             let site = EvalSite {
@@ -853,7 +868,7 @@ impl CommandHandler for RuntimeEvaluate {
 /// `Runtime.releaseObject`（`CDP-2`・`CDP-6`・`CDP-7`・`SEC-2`・TASK-44.7・#1218）。
 ///
 /// `objectId`（`"<contextId>.<n>"`）のハンドルを解放して `{}` を返す。他セッション・未知の contextId・
-/// main world・ヘルパー未注入・解放済みは `REMOTE_OBJECT_NOT_FOUND`（存在を区別して漏らさない。
+/// ヘルパー未注入・解放済みは `REMOTE_OBJECT_NOT_FOUND`（存在を区別して漏らさない。
 /// ヘルパー未注入では評価器を起動しない）。検証順は本モジュールのドキュメント参照。
 pub(crate) struct RuntimeReleaseObject;
 
@@ -889,14 +904,11 @@ impl CommandHandler for RuntimeReleaseObject {
                     CdpError::REMOTE_OBJECT_NOT_FOUND
                 }
                 LocateError::Lookup(l) => l.to_cdp(),
+                LocateError::Create(c) => c.to_cdp(),
             })?;
-            let (view, epoch) = match &located.view {
-                Some(v) if v.world != World::Main => match v.helper_epoch {
-                    Some(e) => (v.clone(), e),
-                    None => return Err(CdpError::REMOTE_OBJECT_NOT_FOUND),
-                },
-                _ => return Err(CdpError::REMOTE_OBJECT_NOT_FOUND),
-            };
+            // ヘルパー未注入ならハンドルが存在し得ないので、評価器を起動せず「無い」とする。
+            let view = located.view.clone();
+            let epoch = view.helper_epoch.ok_or(CdpError::REMOTE_OBJECT_NOT_FOUND)?;
             let key = ScriptContextKey::new(located.scope, located.generation, view.id);
             let timeout = DEFAULT_SCRIPT_EVAL_TIMEOUT;
             let text = match run_script(
@@ -1278,10 +1290,6 @@ mod tests {
         assert_eq!(
             CdpError::EXPRESSION_TOO_LARGE.message,
             "expression too large"
-        );
-        assert_eq!(
-            CdpError::MAIN_WORLD_EVALUATION_UNSUPPORTED.message,
-            "evaluation in the main world is not supported"
         );
         assert_eq!(
             CdpError::EVALUATION_TIMED_OUT.message,

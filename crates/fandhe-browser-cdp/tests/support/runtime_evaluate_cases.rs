@@ -119,6 +119,12 @@ impl Cdp {
         }
     }
 
+    /// 配信する HTML を差し替える（`PageScriptHandle` は持たないので、ページの `<script>` は実行されない）。
+    fn with_html(mut self, body: &'static str) -> Self {
+        self.port = serve(body);
+        self
+    }
+
     fn worker_spawns(&self) -> u64 {
         self.st
             .app_state()
@@ -246,6 +252,10 @@ pub fn run(engine: &str) {
     rt.block_on(exceptions(engine));
     eprintln!("case: main world, stale and unsupported params");
     rt.block_on(gating(engine));
+    eprintln!("case: main world (stage 1)");
+    rt.block_on(main_world(engine));
+    eprintln!("case: main world sees the original HTML (JS-4)");
+    rt.block_on(main_world_js4(engine));
     eprintln!("case: envelope hardening");
     rt.block_on(hardening(engine));
     eprintln!("case: lone surrogates");
@@ -587,25 +597,20 @@ async fn gating(engine: &str) {
         })
         .and_then(|f| f["params"]["context"]["id"].as_u64())
         .expect("main context announced");
+    // main world も確定 DOM の再パースで評価できる（段階 1。#1347）。
     let f = c.eval(&p, main_id, "1", false).await;
-    assert!(
-        is_err(&f, -32000, "evaluation in the main world is not supported"),
-        "{f}"
-    );
-    // contextId 省略は既定（main）world 扱い。
+    assert_eq!(ro(&f), &json!({"type":"number","value":1}));
+    // contextId 省略は現在の文書の main world。
     let f = c
         .call(&p, "Runtime.evaluate", json!({"expression": "1"}))
         .await
         .pop()
         .expect("frame");
-    assert!(
-        is_err(&f, -32000, "evaluation in the main world is not supported"),
-        "{f}"
-    );
-    assert_eq!(c.worker_spawns(), 0, "main world 評価は評価器を起動しない");
+    assert_eq!(ro(&f), &json!({"type":"number","value":1}));
 
     // 未対応・未知のパラメータは成功を装わず拒否する。
     let iso = c.isolated(&p, "u").await;
+    let spawns = c.worker_spawns();
     for params in [
         json!({"expression":"1","contextId":iso,"objectGroup":"g"}),
         json!({"expression":"1","contextId":iso,"generatePreview":true}),
@@ -618,7 +623,7 @@ async fn gating(engine: &str) {
             .expect("frame");
         assert!(is_err(&f, -32602, "unsupported params"), "{f}");
     }
-    assert_eq!(c.worker_spawns(), 0);
+    assert_eq!(c.worker_spawns(), spawns);
 
     // getProperties・releaseObjectGroup は未実装のまま。
     for m in ["Runtime.getProperties", "Runtime.releaseObjectGroup"] {
@@ -632,6 +637,176 @@ async fn gating(engine: &str) {
     c.navigate(&p).await;
     let f = c.eval(&p, iso, "1", false).await;
     assert!(is_err(&f, -32602, "invalid params"), "{f}");
+}
+
+/// Runtime.enable 後の遷移で告知された main world の contextId。
+fn main_context_id(nav: &[Value]) -> u64 {
+    nav.iter()
+        .find(|f| {
+            f["method"] == "Runtime.executionContextCreated"
+                && f["params"]["context"]["auxData"]["isDefault"] == true
+        })
+        .and_then(|f| f["params"]["context"]["id"].as_u64())
+        .expect("main context announced")
+}
+
+/// `contextId` 省略の `Runtime.evaluate`（現在の文書の main world）。
+async fn eval_default(c: &mut Cdp, p: &Page, expr: &str, by_value: bool) -> Value {
+    c.call(
+        p,
+        "Runtime.evaluate",
+        json!({"expression": expr, "returnByValue": by_value}),
+    )
+    .await
+    .pop()
+    .expect("response frame")
+}
+
+/// main world の評価（段階 1。#1347・`CDP-2`・`CDP-7`・`SEC-2`・`REPAIR-3`）。
+async fn main_world(engine: &str) {
+    let mut c = Cdp::new(engine);
+    let p = c.page().await;
+    let nav = c.navigate(&p).await;
+    let main_id = main_context_id(&nav);
+
+    // (a) 確定 DOM。明示 id と省略の両方。
+    let f = c
+        .eval(
+            &p,
+            main_id,
+            "document.getElementById('x').textContent",
+            true,
+        )
+        .await;
+    assert_eq!(ro(&f), &json!({"type":"string","value":"hello"}));
+    let f = eval_default(&mut c, &p, "document.getElementById('x').textContent", true).await;
+    assert_eq!(ro(&f), &json!({"type":"string","value":"hello"}));
+
+    // (b) ページのグローバル参照は ReferenceError（偽の値を返さない）。
+    let f = c
+        .eval(&p, main_id, "pageGlobalThatDoesNotExist", false)
+        .await;
+    assert!(f.get("error").is_none(), "{f}");
+    let d = &f["result"]["exceptionDetails"];
+    assert_eq!(d["exception"]["className"], "ReferenceError");
+    assert_eq!(d["exception"]["subtype"], "error");
+
+    // (c) ハンドルと releaseObject。
+    let f = c.eval(&p, main_id, "({})", false).await;
+    let id = ro(&f)["objectId"].as_str().expect("objectId").to_owned();
+    // (b) の例外オブジェクトが 1 番を使っているので、次の番号になる。
+    assert_eq!(id, format!("{main_id}.2"));
+    let f = c.release(&p, &id).await;
+    assert_eq!(f["result"], json!({}));
+    let f = c.release(&p, &id).await;
+    assert!(is_err(&f, -32000, "remote object not found"), "{f}");
+
+    // (d) callFunctionOn の objectId 経路。
+    let doc = c.handle(&p, main_id, "document").await;
+    let f = c
+        .callf(
+            &p,
+            json!({
+                "functionDeclaration": "function () { return this.querySelector('#x') !== null; }",
+                "objectId": doc,
+                "returnByValue": true,
+            }),
+        )
+        .await;
+    assert_eq!(ro(&f), &json!({"type":"boolean","value":true}));
+
+    // (e) callFunctionOn の executionContextId 経路（Puppeteer の Frame.#document() 型）。
+    let f = c
+        .callf(
+            &p,
+            json!({
+                "functionDeclaration": "function () { 'use strict'; return this === undefined; }",
+                "executionContextId": main_id,
+                "returnByValue": true,
+            }),
+        )
+        .await;
+    assert_eq!(ro(&f), &json!({"type":"boolean","value":true}));
+    let f = c
+        .callf(
+            &p,
+            json!({
+                "functionDeclaration": "function () { return document; }",
+                "executionContextId": main_id,
+            }),
+        )
+        .await;
+    assert_eq!(ro(&f)["subtype"], "node");
+    let oid = ro(&f)["objectId"].as_str().expect("objectId");
+    assert!(oid.starts_with(&format!("{main_id}.")), "{oid}");
+
+    // (f) world の分離。
+    let f = c.eval(&p, main_id, "globalThis.__m = 1", false).await;
+    assert_eq!(ro(&f), &json!({"type":"number","value":1}));
+    let iso = c.isolated(&p, "u").await;
+    let f = c.eval(&p, iso, "typeof __m", true).await;
+    assert_eq!(ro(&f), &json!({"type":"string","value":"undefined"}));
+    c.eval(&p, iso, "globalThis.__i = 1", false).await;
+    let f = c.eval(&p, main_id, "typeof __i", true).await;
+    assert_eq!(ro(&f), &json!({"type":"string","value":"undefined"}));
+
+    // (g) main のハンドルを isolated の呼び出しへ渡すと contextId の不一致。
+    let h = c.handle(&p, main_id, "({})").await;
+    let f = c
+        .callf(
+            &p,
+            json!({
+                "functionDeclaration": "function (a) { return 1; }",
+                "executionContextId": iso,
+                "arguments": [{"objectId": h}],
+            }),
+        )
+        .await;
+    assert!(
+        is_err(&f, -32000, "argument belongs to another execution context"),
+        "{f}"
+    );
+
+    // (h) 他セッションの main の contextId・objectId は存在を区別せず拒否する。
+    let other = c.page().await;
+    c.navigate(&other).await;
+    let f = c.eval(&other, main_id, "1", false).await;
+    assert!(is_err(&f, -32602, "invalid params"), "{f}");
+    let live = c.handle(&p, main_id, "({})").await;
+    let f = c.release(&other, &live).await;
+    assert!(is_err(&f, -32000, "remote object not found"), "{f}");
+
+    // (i) 遷移後、古い main の contextId は未知。省略なら新しい文書の main で評価できる。
+    c.navigate(&p).await;
+    let f = c.eval(&p, main_id, "1", false).await;
+    assert!(is_err(&f, -32602, "invalid params"), "{f}");
+    let f = eval_default(&mut c, &p, "document.getElementById('x').textContent", true).await;
+    assert_eq!(ro(&f), &json!({"type":"string","value":"hello"}));
+}
+
+/// ページスクリプトを持つ HTML（`PageScriptHandle` なし = `execute_page_scripts` は実効で false）。
+const SCRIPT_PAGE_HTML: &str = "<html><body><p id=\"x\">hello</p><script>var pageGlobal=1;var q=document.createElement('p');q.id='added';document.body.appendChild(q)</script></body></html>";
+
+/// `JS-4`: `execute_page_scripts = false` では main world は元の HTML を見る（スクリプトの効果は無い）。
+async fn main_world_js4(engine: &str) {
+    let mut c = Cdp::new(engine).with_html(SCRIPT_PAGE_HTML);
+    let p = c.page().await;
+    c.navigate(&p).await;
+    let f = eval_default(
+        &mut c,
+        &p,
+        "document.getElementById('added') === null",
+        true,
+    )
+    .await;
+    assert_eq!(ro(&f), &json!({"type":"boolean","value":true}));
+    let f = eval_default(&mut c, &p, "document.querySelectorAll('p').length", true).await;
+    assert_eq!(ro(&f), &json!({"type":"number","value":1}));
+    let f = eval_default(&mut c, &p, "pageGlobal", false).await;
+    assert_eq!(
+        f["result"]["exceptionDetails"]["exception"]["className"],
+        "ReferenceError"
+    );
 }
 
 async fn release_object(engine: &str) {
@@ -1299,7 +1474,7 @@ async fn call_function_on_execution_context(engine: &str) {
         .await;
     assert!(is_err(&f, -32602, "invalid params"), "{f}");
 
-    // main world は評価器を起動せず固定エラー。
+    // main world も評価できる（#1347）。
     let mut c = Cdp::new(engine);
     let p = c.page().await;
     let nav = c.navigate(&p).await;
@@ -1317,9 +1492,5 @@ async fn call_function_on_execution_context(engine: &str) {
             json!({"functionDeclaration": "function () { return 1; }", "executionContextId": main_id}),
         )
         .await;
-    assert!(
-        is_err(&f, -32000, "evaluation in the main world is not supported"),
-        "{f}"
-    );
-    assert_eq!(c.worker_spawns(), 0, "main world 評価は評価器を起動しない");
+    assert_eq!(ro(&f), &json!({"type":"number","value":1}));
 }

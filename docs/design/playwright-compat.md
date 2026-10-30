@@ -379,7 +379,7 @@ id 9（`Page.getFrameTree`）は `frameTree.frame = {id:"main", loaderId:"2", ur
   無効な構成では 0 件のまま（使えない `context.id` を見せると偽の応答になるため）。有効な構成では、`Runtime.enable` の初回（確定文書があるとき）・
   `Runtime.runIfWaitingForDebugger` の再開時・`Page.navigate` の確定時に、main と `Page.addScriptToEvaluateOnNewDocument` の `worldName`
   の isolated world を告知する（遷移時は `Runtime.executionContextsCleared` → `Page.frameNavigated` → created → `Page.loadEventFired`）。
-  main world の評価（`Runtime.evaluate`）は未実装で CDP エラーになる（#1218）。`Page.createIsolatedWorld` は有効な構成で contextId を返し、
+  main world の評価（`Runtime.evaluate`）は未実装で CDP エラーになる（#1218。その後 #1347 で確定 DOM の再パースによる評価〔段階 1〕を実装した。`main-world-evaluation.md` 参照）。`Page.createIsolatedWorld` は有効な構成で contextId を返し、
   無効な構成では `-32000 execution contexts unavailable`。`consoleAPICalled` は送らない。`Network.*`（`requestWillBeSent`・`responseReceived`・
   `loadingFinished`・`loadingFailed`）と `Log.entryAdded` も送らない（後続 issue で追跡）。「イベントが来ない」ために生じる待ち（`page.evaluate` 等）は TASK-44 の課題。
 - 3 メソッドのフラグは fetch・ヘッダ・UA・`navigator` を何も変えない（`SEC-2`）。`*.disable`・`Network.setUserAgentOverride`・
@@ -635,7 +635,7 @@ TASK-43.3o（#1050）の取り込み後に再取得した同梱トレース（3 
 #### 扱い・未達の明示
 
 - #250 の受入基準（セレクタで要素を取得すること）は未達。universal selector の対応（#1237）後の再実測は次節
-- 残る差異（`REPAIR-3`）: main world の評価は未対応（固定文言で拒否）、`Runtime.getProperties` は未実装、評価中の DOM 変更は `NavigationResult` へ書き戻さない、イベントループ・タイマーは回さない。#1237 の対応後に他の未対応 API が出た場合は同じ手順で追跡する
+- 残る差異（`REPAIR-3`）: main world の評価はページ JS のヒープを持たない段階 1（#1347 で実装。`main-world-evaluation.md` 参照。当時は固定文言で拒否）、`Runtime.getProperties` は未実装、評価中の DOM 変更は `NavigationResult` へ書き戻さない、イベントループ・タイマーは回さない。#1237 の対応後に他の未対応 API が出た場合は同じ手順で追跡する
 
 #### 再現手順
 
