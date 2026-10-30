@@ -3,10 +3,10 @@
 - **対応ビヘイビア**: CDP-3（関連: CDP-2・CDP-6・SEC-2・REPAIR-3。`docs/spec/04-behavior/` が SSOT）
 - **対応タスク**: TASK-45（サブ 45.3・Issue #482）。入力は TASK-45.1（Issue #480）・TASK-45.2（Issue #481）の試験基盤
 - **マイルストーン**: MS-4
-- **基準コミット**: `42ce7c0`（`origin/main`）
-- **調査日**: 2026-10-06
+- **基準コミット**: 読解（B）は `42ce7c0`（2026-10-06）。実測（A）は `683ca65a`（`origin/main`。2026-10-30・Issue #1349）
+- **調査日**: 2026-10-06（読解）・2026-10-30（実測）
 - **調査対象の版**: puppeteer-core 25.12.0（npm の最新版。integrity `sha512-z6LQUt5SH7jwGtGA+nMtJuEjZIsqPiwQ+EFHCYuVDQrJpvifNmmGuyDvTzAKPyFzihxgHc5f3aMzu2kn8Ps37A==`）・node v24.21.0。
-  これは読解した公開物の記録であり、依存としての採用・固定ではない（測定時の一時導入のみ承認済み〔2026-10-29・#252〕。CI への組み込み・lockfile のコミットは未承認）
+  これは読解した公開物の記録であり、依存としての採用・固定ではない（測定時の一時導入のみ承認済み〔2026-10-29・#252〕。CI への組み込み・lockfile のコミットは未承認。実測は一時導入で行い、削除済み）
 
 ## 目的・前提
 
@@ -14,13 +14,14 @@
 `browser.disconnect()` の各段階が fandhe-browser の CDP サーバーでどこまで到達するかを記録する。
 本書は記録までで、主軸の決定（Playwright と Puppeteer のどちらを主軸にするか）と追加実装は含めない。`Target.setAutoAttach` の `filter` の扱いのみ「方針」節で決定している。
 
-**重要: 本節の段階表は実 Puppeteer で実測していない（2026-10-06 時点の読解）。** `puppeteer-core` は測定時の一時導入のみ承認済み（2026-10-29・#252。`harness/endpoint-swap/`）で、
-`package.json`・CI ジョブは追加していない（`harness/puppeteer-connect/README.md`「導入状況」）。
-段階別 status は「未実測」であり、「到達 0 段階」という実測結果ではない。以下の停止点はすべてソース読解に基づく予測である（`REPAIR-3`）。
+**重要: 実測（A）は `page.$("body")` の途中（`selector` 段階）までである（2026-10-30・Issue #1349）。** `connect`・`newPage`・`goto` は ok、`selector` は
+`Runtime.evaluate` の `-32602 unsupported params` で failed、`disconnect` は未到達だった。`puppeteer-core` は測定時の一時導入のみ承認済み（2026-10-29・#252。`harness/endpoint-swap/`）で、
+`package.json`・CI ジョブは追加していない（`harness/puppeteer-connect/README.md`「導入状況」）。実測した範囲は A、その先（`selector` の失敗以降）と、実測していない行（不足箇所一覧の B の行）は
+ソース読解に基づく予測のままで、実測済みとは書かない（`REPAIR-3`）。
 
 | 種別 | 内容 | 確度 |
 | ---- | ---- | ---- |
-| A（実測） | 実 Puppeteer による段階別 status・CDP トレース | **該当なし（未実行）** |
+| A（実測） | 実 Puppeteer（puppeteer-core 25.12.0）による段階別 status・CDP トレース（`NODE_DEBUG='puppeteer:*'`）。1 回実行（再現手順は末尾の節） | 実測。ただし 1 回・`about:blank` のみ・debug ビルド・Linux のみ。成功を保証する範囲は実行した経路に限る |
 | B（ソース読解） | npm 公開物 puppeteer-core 25.12.0 の `src/cdp/` 配下（`BrowserConnector.ts`・`Browser.ts`・`TargetManager.ts`・`FrameManager.ts`・`Page.ts`・`Frame.ts` 等）の該当箇所を読んだ結果 | 実測していない。ソース上そう読める、という記録 |
 | C（二次情報） | spec の PoC-5（`docs/spec/03-poc/cdp-compat/`）の「Puppeteer は Playwright より CDP 依存が薄いとされる」（推測・未検証） | 本調査環境では `docs/spec` を再照合していない |
 
@@ -30,13 +31,16 @@ Puppeteer のソースは長く引用せず、クラス・関数名と要約に�
 
 試験基盤の段階は `harness/puppeteer-connect/stages.mjs` の `connect` → `newPage` → `goto` → `selector` → `disconnect`。
 
-| 段階 | 実測 | 予測（B） | 予測の根拠 |
-| ---- | ---- | --------- | ---------- |
-| `connect` | ok（#1334・手動実測 1 回） | 到達する見込み | `Target.getBrowserContexts`（#1323）→ `Target.setDiscoverTargets`（#1324）→ root の `Target.setAutoAttach`（#1334。`filter` は「tab 擬似ターゲットと `filter`」節の受理表）まで通り、`puppeteer.connect` が完了した（`defaultViewport: null`。`puppeteer-core@25.12.0` の一時導入） |
-| `newPage` | failed（同上） | 未到達の見込み | `Target.createTarget` と tab → ページの attach までは進み、次の停止点は `Page.addScriptToEvaluateOnNewDocument`（Puppeteer は非空の `source` を送るため `-32602 unsupported params`。本 issue のスコープ外。#1340 の系統）。以降の初期化メソッド（`Runtime.*`・`Network.*` 等）は未確認 |
-| `goto` | 未実測 | 未到達の見込み | `newPage` が先に失敗するため |
-| `selector` | 未実測 | 未到達の見込み | 同上 |
-| `disconnect` | 未実測 | 先行段階の失敗後は後始末のみ | `stages.mjs` の仕様（先行失敗時は結果を上書きしない） |
+| 段階 | 実測（A。2026-10-30・683ca65a） | 予測（B。2026-10-06 時点） | 予測の根拠と実測との差 |
+| ---- | ------------------------------ | ------------------------- | ---------------------- |
+| `connect` | ok | 到達する見込み | 的中。`Target.getBrowserContexts`（#1323）→ `Target.setDiscoverTargets`（#1324）→ root の `Target.setAutoAttach`（#1334）が通り、`puppeteer.connect` が完了した（`defaultViewport: null`） |
+| `newPage` | ok | 未到達の見込み（`Page.addScriptToEvaluateOnNewDocument` で停止すると予測） | 外れ（#1340・#1334 の後は到達する）。`Target.createTarget` → tab → ページの attach、`Page.enable`・`Page.getFrameTree`・`Runtime.enable` 等の初期化、`Page.addScriptToEvaluateOnNewDocument`（sourceURL のみの source）、`Page.createIsolatedWorld` が成功した。`WebMCP.enable` は `-32601` だが Puppeteer は握りつぶして進んだ |
+| `goto` | ok | 未到達の見込み | 外れ。`Page.navigate` の応答後に `Page.lifecycleEvent`（`init`・`DOMContentLoaded`・`load`）・`Page.frameNavigated`・`Runtime.executionContextsCleared` と新しい contextId の `executionContextCreated`（main・isolated 各 1）が届き、完了した |
+| `selector` | **failed**: `ProtocolError`「Protocol error (Runtime.evaluate): unsupported params」（期限切れではない。サーバーの応答を受けた即時のエラー） | 未到達の見込み（`Runtime` なしで停止すると予測） | 外れ。main world の `Runtime.callFunctionOn`（#1345・#1347）→ `DOM.describeNode` → `DOM.resolveNode`（#1348）は成功し、isolated world への `puppeteerUtil` 注入の `Runtime.evaluate` が `userGesture` キーを `-32602` で拒否して停止した（下記「`page.$` の呼び出し連鎖」） |
+| `disconnect` | 未到達（`not_reached`） | 先行段階の失敗後は後始末のみ | `stages.mjs` の仕様どおり（先行失敗時は結果を上書きしない）。切断自体の実測は未実施 |
+
+実測の出力（`FANDHE_SCRIPT_RESULT` 行の要旨）: `ok:false`・`step:"selector"`・`stages` は connect/newPage/goto が `ok`、selector が `failed`（上記エラー）、disconnect が `not_reached`。
+段階の期限（既定 10 秒）には当たっていない（エラーはプロトコル応答で、`StageTimeout` ではない）。
 
 `-32601` は未実装メソッドへ成功を捏造しない `CDP-6`・`SEC-2` の方針どおりの挙動で、バグではない。
 Playwright と異なり、`browserWSEndpoint` 指定の接続では HTTP の `/json/version` を使わない
@@ -45,27 +49,54 @@ Playwright と異なり、`browserWSEndpoint` 指定の接続では HTTP の `/j
 
 ## 不足箇所一覧
 
-「現状の応答」は `crates/fandhe-browser-cdp/src/` の現実装（組込みハンドラは `Page.navigate`・`DOM.getDocument`・
-`DOM.querySelector`・`DOM.requestChildNodes` のみ。`protocol.rs` の `builtin_handlers`）に基づく。
+「現状の応答」は 2026-10-30（`683ca65a`）時点の `crates/fandhe-browser-cdp/src/` の現実装に基づく。種別 A の行は実測で確認した応答、B の行は実測していない（コード上の記述）。
+2026-10-06 時点の初版にあった `-32601` の記述は、その後の実装（#1323〜#1354）で陳腐化したため、実測またはコードに合わせて訂正した。
 
 | # | 段階 | Puppeteer の箇所 | 送る CDP メソッド | 読む応答・待つイベント | 現状の応答 | 不足 | 種別 |
 | - | ---- | ---------------- | ----------------- | ---------------------- | ---------- | ---- | ---- |
-| 1 | connect | `_connectToCdpBrowser` | `Target.getBrowserContexts`（root。接続後の最初の送信） | `browserContextIds`（配列。既存 context の把握） | 実装済み（#1323）。自接続が所有する非既定 context の `browserContextIds` を作成順に返す（context 未作成なら空配列。既定 context は含めず、他接続の context も返さない） | なし（`TargetInfo` は `browserContextId` を持たない点は別途） | B |
-| 2 | connect | `TargetManager.initialize` | `Target.setDiscoverTargets` `{discover:true, filter}` | 応答は読み捨て。以後 `Target.targetCreated`・`targetInfoChanged`・`targetDestroyed` を購読 | #1324 で実装済み（`-32601` ではない）。`filter` は省略（ページのみ通知）か `[{}]`（ページと tab を通知。#1334）。既存ターゲットの通知は応答の後（Chromium は前。tab → 子ページの attach で初期化待ちが空になるため `initialize()` は完了する。ソース読解で、実測の範囲は `connect` の完了まで）。`targetInfoChanged` と browser 型の通知は未実装 | ハンドラと `Target.targetCreated`・`targetDestroyed` の送出（実装済み。`targetInfoChanged` は未実装） | B |
-| 3 | connect | `TargetManager.initialize` | `Target.setAutoAttach` `{autoAttach:true, waitForDebuggerOnStart:true, flatten:true, filter}`（root。`page` を除外するフィルタ付き） | 応答は読み捨て。以後 `Target.attachedToTarget` を購読し、既存 `tab` ターゲットの初期化完了まで `connect` が待つ | #1334 で実装済み: `[{type:page,exclude:true},{}]` を受理して tab 擬似ターゲットを attach し、tab のセッションの `Target.setAutoAttach` で子のページを attach する。受理しない `filter` は `-32602` | 実装済み（一般の TargetFilter の評価は未実装） | B |
-| 4 | newPage | `CdpBrowser._createPageInContext` | `Target.createTarget` `{url:"about:blank", browserContextId?}` | 応答の `targetId`。その後 `waitForTarget` で、同 `targetId` のターゲットが `targetCreated`／attach 経由で現れるのを待つ | `-32601` | ハンドラ（`TargetRegistry::create_target` は存在するが未接続。上限 `MAX_TARGETS`=64） | B |
-| 5 | newPage | `TargetManager.#onAttachedToTarget` | イベント `Target.attachedToTarget`（`sessionId`・`targetInfo`）。受信後に `Target.setAutoAttach`（子 session）・`Runtime.runIfWaitingForDebugger` を送る | `targetInfo.targetId`・`type`・`url`・`browserContextId`。`waitForDebugger` 中のターゲットは `runIfWaitingForDebugger` で解放される | 送出経路なし。現実装のイベントはコマンド応答に同伴する形のみ（`HandlerOutput.events`） | `Target.attachedToTarget` の生成、子 session 向けの 2 メソッド | B |
-| 6 | newPage | `CdpPage.#initialize`・`FrameManager.initialize` | page session で `Page.enable`・`Page.getFrameTree`・`Page.setLifecycleEventsEnabled`・`Runtime.enable`・`Network.enable`（`NetworkManager.addClient`）・`Performance.enable`・`Log.enable`・`Audits.enable`（既定で有効）を並行送信 | `Page.getFrameTree` の `frameTree.frame` で frame を構築。いずれかが失敗するとページ初期化が失敗する（ターゲットが閉じた場合のエラーのみ握りつぶし） | `Performance.enable`・`Audits.enable` は #1326 で実装済み（セッション単位の有効フラグを立てて `{}` を返すだけ。イベント・計測なし。`Performance.getMetrics`・`disable` 系は `-32601`）。他は個別に追跡 | 上記メソッド群のハンドラとフレームツリーのモデル | B |
-| 6b | newPage | `CdpPage.#initialize`・`FrameManager` 系 | page session で `Page.addScriptToEvaluateOnNewDocument` `{source:"//# sourceURL=pptr:internal", worldName:"__puppeteer_utility_world__<版>"}`（実行内容なし） | 応答の `identifier` を保持。失敗するとページ初期化が失敗する | #1325 で実装済み。`//# sourceURL=<ASCII 印字可能 1 文字以上>` の 1 行（256 バイト以下）だけを no-op 登録で受理し、実行内容を持つ `source` は `-32602`（`SEC-2`・`CDP-6`）。送信文字列は Issue 記載に基づき、puppeteer-core 25.12.0 での実測は未検証 | 実行経路（`JS-4`・TASK-112）は未実装 | B |
-| 7 | newPage | `FrameManager.#createIsolatedWorld` | `Page.createIsolatedWorld` `{frameId, worldName, grantUniveralAccess:true}`（`Runtime.enable` の後。失敗はログのみで握りつぶし） | `Runtime.executionContextCreated` を待って実行コンテキストを構築 | `-32601`（握りつぶされる） | 未実装でも初期化は進むとソース上読めるが、実行コンテキストが作られず #11 に影響 | B |
-| 8 | newPage | `EmulationManager`（`defaultViewport` 既定 800x600） | `Emulation.setDeviceMetricsOverride`・`Emulation.setTouchEmulationEnabled` 等 | 結果は使わない（失敗でページ作成が失敗する経路。握りつぶしの有無は個別には未確認） | `-32601` | ハンドラ。`defaultViewport: null` で回避できる可能性があるが、試験基盤は既定値を使用 | B |
-| 9 | goto | `Frame.goto`（`about:blank`） | `Page.navigate` `{url, referrer, frameId, referrerPolicy}` | 応答の `loaderId`・`errorText`。完了は `Page.lifecycleEvent`（`load` 等）・`Page.frameNavigated` を `LifecycleWatcher` が待つ | `Page.navigate` は実装済み（`Page.frameNavigated`・`Page.loadEventFired` を同伴）。ただし `Page.lifecycleEvent` は出さない | `Page.lifecycleEvent` の送出（`about:blank` の完了判定に必要とソース上読める） | B |
-| 10 | selector | `Page.$("body")` | `Runtime.callFunctionOn` 等で isolated world の実行コンテキスト越しに評価（`ExecutionContext` の送信は確認。`page.$` の呼び出し連鎖は完全には追跡していない） | `Runtime.executionContextCreated`・`RemoteObject` | `-32601`（`Runtime.*` なし）。`DOM.querySelector` だけでは足りない見込み | `Runtime` ドメインの実行コンテキストとリモートオブジェクトのモデル | B |
+| 1 | connect | `_connectToCdpBrowser` | `Target.getBrowserContexts`（root。接続後の最初の送信） | `browserContextIds`（配列。既存 context の把握） | 実装済み（#1323）。自接続が所有する非既定 context の `browserContextIds` を作成順に返す（context 未作成なら空配列。既定 context は含めず、他接続の context も返さない） | なし（`TargetInfo` は `browserContextId` を持たない点は別途） | A（応答はトレースで確認。`connect` の完了） |
+| 2 | connect | `TargetManager.initialize` | `Target.setDiscoverTargets` `{discover:true, filter}` | 応答は読み捨て。以後 `Target.targetCreated`・`targetInfoChanged`・`targetDestroyed` を購読 | #1324 で実装済み（`-32601` ではない）。`filter` は省略（ページのみ通知）か `[{}]`（ページと tab を通知。#1334）。既存ターゲットの通知は応答の後（Chromium は前。tab → 子ページの attach で初期化待ちが空になるため `initialize()` は完了する。ソース読解で、実測の範囲は `connect` の完了まで）。`targetInfoChanged` と browser 型の通知は未実装 | ハンドラと `Target.targetCreated`・`targetDestroyed` の送出（実装済み。`targetInfoChanged` は未実装） | A（応答はトレースで確認。`connect` の完了） |
+| 3 | connect | `TargetManager.initialize` | `Target.setAutoAttach` `{autoAttach:true, waitForDebuggerOnStart:true, flatten:true, filter}`（root。`page` を除外するフィルタ付き） | 応答は読み捨て。以後 `Target.attachedToTarget` を購読し、既存 `tab` ターゲットの初期化完了まで `connect` が待つ | #1334 で実装済み: `[{type:page,exclude:true},{}]` を受理して tab 擬似ターゲットを attach し、tab のセッションの `Target.setAutoAttach` で子のページを attach する。受理しない `filter` は `-32602` | 実装済み（一般の TargetFilter の評価は未実装） | A（応答はトレースで確認。`connect` の完了） |
+| 4 | newPage | `CdpBrowser._createPageInContext` | `Target.createTarget` `{url:"about:blank"}` | 応答の `targetId`。その後 `waitForTarget` で、同 `targetId` のターゲットが `targetCreated`／attach 経由で現れるのを待つ | 実測で成功。応答の前に `targetCreated`（tab → ページ）と `attachedToTarget`（tab）を送り、応答の `targetId` はページの ID（「tab 擬似ターゲットと `filter`」節。#1334） | なし | A |
+| 5 | newPage | `TargetManager.#onAttachedToTarget` | イベント `Target.attachedToTarget`（`sessionId`・`targetInfo`）。受信後に `Target.setAutoAttach`（子 session）・`Runtime.runIfWaitingForDebugger` を送る | `targetInfo.targetId`・`type`・`url`・`browserContextId`。`waitForDebugger` 中のターゲットは `runIfWaitingForDebugger` で解放される | 実測で成功。tab（root のイベント）→ ページ（tab のセッションのイベント）の順に attach し、いずれの `setAutoAttach`・`runIfWaitingForDebugger` も `{}` で応答した（#1334） | なし | A |
+| 6 | newPage | `CdpPage.#initialize`・`FrameManager.initialize` | page session で `Network.enable`・`Page.enable`・`Page.getFrameTree`・`Page.setLifecycleEventsEnabled`・`Runtime.enable`・`Audits.enable`・`Performance.enable`・`Log.enable`・`WebMCP.enable` を並行送信（実測の送信順） | `Page.getFrameTree` の `frameTree.frame` で frame を構築。いずれかが失敗するとページ初期化が失敗する（ターゲットが閉じた場合のエラーのみ握りつぶし） | 実測で、`WebMCP.enable` を除く 8 メソッドが成功（`Performance.enable`・`Audits.enable` は #1326。フラグ保持のみ・イベントなし）。`WebMCP.enable` は `-32601`（Puppeteer 25.12.0 が送る。実装していないため成功を装わない）で、Puppeteer は握りつぶして進んだ。`Runtime.enable` の応答後に main の `executionContextCreated` を送る | `WebMCP.enable` は未実装のまま（ページ初期化は止まらない） | A |
+| 6b | newPage | `CdpPage.#initialize`・`FrameManager` 系 | page session で `Page.addScriptToEvaluateOnNewDocument` `{source:"//# sourceURL=pptr:internal", worldName:"__puppeteer_utility_world__25.12.0"}`（実行内容なし） | 応答の `identifier` を保持。失敗するとページ初期化が失敗する | 実測で成功（`identifier:"1"`）。#1325・#1340 で sourceURL コメントだけの `source` を no-op 登録で受理し、実行内容を持つ `source` は `-32602`（`SEC-2`・`CDP-6`） | 実行経路（`JS-4`・TASK-112）は未実装 | A |
+| 7 | newPage | `FrameManager.#createIsolatedWorld` | `Page.createIsolatedWorld` `{frameId, worldName, grantUniveralAccess:true}` | `Runtime.executionContextCreated` を待って実行コンテキストを構築 | 実測で成功（`executionContextId:2`・直前に isolated の `executionContextCreated`）。遷移後は main・isolated の contextId が作り直される（3・4） | なし | A |
+| 8 | newPage | `EmulationManager`（`defaultViewport` 既定 800x600） | `Emulation.setDeviceMetricsOverride`・`Emulation.setTouchEmulationEnabled` 等 | 結果は使わない（失敗でページ作成が失敗する経路） | 実測では `defaultViewport: null` のため送信されなかった（未実測）。`Emulation.*` は実装しない（画面の識別面。`SEC-2`） | `defaultViewport: null` を前提とする（「測定条件」） | B |
+| 9 | goto | `Frame.goto`（`about:blank`） | `Page.navigate` `{url, frameId}`（実測では `referrer` 等は送られなかった） | 応答の `loaderId`・`errorText`。完了は `Page.lifecycleEvent`（`load` 等）・`Page.frameNavigated` を `LifecycleWatcher` が待つ | 実測で成功。応答の後に `Page.lifecycleEvent`（`init`）・`Runtime.executionContextsCleared`・`Page.frameNavigated`・main／isolated の `executionContextCreated`・`Page.domContentEventFired`・`lifecycleEvent`（`DOMContentLoaded`）・`Page.loadEventFired`・`lifecycleEvent`（`load`）の順に届いた（#1322 ほか） | なし | A |
+| 10 | selector | `Page.$("body")` | `Runtime.callFunctionOn`（main）→ `DOM.describeNode` → `DOM.resolveNode`（isolated）→ `Runtime.addBinding` ×2 → `Runtime.evaluate`（`puppeteerUtil`）→ `Runtime.callFunctionOn`（`queryOne`）→ …（実測の送信順。後半は未到達） | `RemoteObject`・`DOM.describeNode` の `node`・`resolveNode` の `object` | 実測で、前半は成功（main の `callFunctionOn` が `objectId:"3.1"`・`subtype:"node"`・`className:"Document"` を返し、describeNode／resolveNode が通った）。`Runtime.addBinding` は `-32601` で握りつぶされた。`puppeteerUtil` 注入の `Runtime.evaluate` が **`-32602 unsupported params`** で停止した（下記「`page.$` の呼び出し連鎖」） | `Runtime.evaluate` が `userGesture` を受理していない（`callFunctionOn` は受理する）。以降（`queryOne` 等）は未実測（B） | A（停止点まで）・B（以降） |
 | 11 | disconnect | `CdpBrowser.disconnect` | CDP メッセージ送信なしで transport を閉じると読める（未精査） | — | — | なし（見込み） | B |
 
 ### 実測で確認できた停止点と予測の境界
 
-実測で確認できた停止点は 0 件。#1〜#11 はすべて B の予測で、`puppeteer-core` 導入承認後に実行して確認する。
+実測（A）で確認できた停止点は 1 件。
+
+- **`Runtime.evaluate` の `userGesture`**: Puppeteer 25.12.0 は `puppeteerUtil`（約 10.5KB の式）の注入で `{expression, contextId:<isolated>, returnByValue:false, awaitPromise:true, userGesture:true}` を送る。
+  `Runtime.evaluate` の許可キーは `expression`・`contextId`・`returnByValue`・`awaitPromise`・`silent` で、`userGesture` が未知キーとして `-32602 unsupported params` になる（`crates/fandhe-browser-cdp/src/runtime/evaluate.rs`）。
+  式の長さ（10513 文字）は上限（`MAX_SCRIPT_CONTEXT_SOURCE_BYTES`=1MiB）内で、上限は原因ではない（読解。エラーは `unsupported params` で、長さ超過の文言ではない）。
+  `Runtime.callFunctionOn` は `userGesture` を受理して効果なしで流す（ユーザー活性化の概念を持たないため。`REPAIR-3`）。同じ扱いにするかは本書では決めない（修正は本 issue の範囲外）
+
+読解（B）の予測との差:
+
+- 予測した停止点（#1〜#11 のうち `newPage` の `addScriptToEvaluateOnNewDocument`、`goto` の `lifecycleEvent`、`selector` の `Runtime` 全般）は、#1340・#1322・#1345・#1347・#1348 等で解消済みで、実測では停止点にならなかった
+- `Runtime.addBinding`・`WebMCP.enable` の `-32601` は握りつぶされて進行を止めない（読解と一致。前者は #7 の「握りつぶし」の読みと同じ型）
+- `disconnect`（#11）と、`selector` の後半（`puppeteerUtil` の注入以降）は未実測。`userGesture` を受理した後に新たな停止点が出うる（`puppeteerUtil` の注入式が評価できるか、`queryOne` の `callFunctionOn` が引数 3 つ〔要素・selector・`puppeteerUtil` のハンドル〕を受理するか）
+
+### `page.$` の呼び出し連鎖（実測。A）
+
+セッション種別は root／tab／ページ（ページ session）、world は main／isolated。順序は実測のトレースによる（`main-world-evaluation.md` §2 の読解との照合結果もそちらに記す）。
+
+| 順 | セッション | メソッド | world | 結果 |
+| -- | ---------- | -------- | ----- | ---- |
+| 1 | ページ | `Runtime.callFunctionOn` `{functionDeclaration:"() => { return document; }", executionContextId:<main>, arguments:[], returnByValue:false, awaitPromise:true, userGesture:true}` | main | 成功。`RemoteObject{type:object, subtype:node, className:Document, description:#document, objectId:"3.1"}` |
+| 2 | ページ | `DOM.describeNode {objectId:"3.1"}` | main | 成功。`backendNodeId:1` 等 |
+| 3 | ページ | `DOM.resolveNode {backendNodeId:1, executionContextId:<isolated>}` | isolated | 成功。`objectId:"4.1"` |
+| 4 | ページ | `Runtime.addBinding {name:"puppeteer___ariaQuerySelector" と "puppeteer___ariaQuerySelectorAll", executionContextName:"__puppeteer_utility_world__25.12.0"}` ×2 | — | `-32601`。Puppeteer は握りつぶして進んだ |
+| 5 | ページ | `Runtime.evaluate {expression:<puppeteerUtil 約 10.5KB>, contextId:<isolated>, returnByValue:false, awaitPromise:true, userGesture:true}` | isolated | **`-32602 unsupported params`**（停止） |
+| 6 以降 | — | 未到達: `Runtime.callFunctionOn`（`queryOne`）、`DOM.describeNode`／`resolveNode`（isolated → main）、`Runtime.releaseObject` | — | 未実測（B） |
+
+main の `executionContextId` に送られた `functionDeclaration` は、この実行では順 1 の `() => { return document; }` の 1 件だけで、ページのグローバルを参照しない。
+ソース上のコメント（`//# sourceURL=pptr:evaluateHandle;…`）が末尾に付く。
 
 ## イベント順序の前提
 
@@ -128,7 +159,7 @@ Puppeteer が接続段階で送る `Target.setAutoAttach` の `filter` の扱い
 - **着手順**: #1321 配下の Playwright 側の不足（例: DOMContentLoaded の lifecycleEvent〔#1322。`Page.navigate` が確定時に送出するようになった。`playwright-compat.md` の該当節〕）を先に直し、その後に案 (a) に着手する。Playwright で `CDP-4` の成功率を上げる方が効果が大きく、手間も小さいため
 - **案 (a) の実装時の確認事項**: tab ターゲットを `Target.getTargets`・`Target.targetCreated` 等に出すことで、Playwright の接続・`newPage` が後退しないことを `harness/playwright-connect`・`harness/endpoint-swap` で確かめる
 - **測定条件の前提**: Puppeteer は `defaultViewport: null` 以外では `Emulation.setDeviceMetricsOverride` で止まる。これは画面の識別面にあたり `SEC-2` で実装しないため、Puppeteer の測定は `defaultViewport: null` を前提とする
-- **実装状況**: 実装済み（#1334）。tab 擬似ターゲット・root と tab のセッションの `Target.setAutoAttach` の `filter`・`Target.setDiscoverTargets` の `filter:[{}]` への tab 通知を実装した。実機は `puppeteer-core@25.12.0` を一時導入して 1 回だけ手動実測し、`connect` は ok、`newPage` は `Page.addScriptToEvaluateOnNewDocument`（非空の `source`）で失敗した（上記の到達段階。`newPage` の完了は本 issue の範囲外の不足が残るため未達）。Playwright 側は Rust の結合テスト（`playwright_flow` 等）が後退していないことを確認した範囲で、実 Playwright での再測定は未実施。詳細は次節
+- **実装状況**: 実装済み（#1334）。tab 擬似ターゲット・root と tab のセッションの `Target.setAutoAttach` の `filter`・`Target.setDiscoverTargets` の `filter:[{}]` への tab 通知を実装した。#1334 の時点では、`puppeteer-core@25.12.0` を一時導入して 1 回だけ手動実測し、`connect` は ok、`newPage` は `Page.addScriptToEvaluateOnNewDocument` で失敗した（履歴。その後 #1340 ほかで解消）。最新の実測は Issue #1349 の再実測（`connect`・`newPage`・`goto` が ok、`selector` が `Runtime.evaluate` の `userGesture` で停止）で、「到達段階のまとめ」を参照。Playwright 側は Rust の結合テスト（`playwright_flow` 等）が後退していないことを確認した範囲で、実 Playwright での再測定は未実施。詳細は次節
 
 ## tab 擬似ターゲットと `filter`
 
@@ -184,12 +215,32 @@ root で自動 attach が有効な間に別種別（ページ ↔ tab）で指�
 画面の識別面を変える実装はしない。`SEC-2`）。実機の測定は `puppeteer-core` の一時導入（`mktemp -d`・`--no-save --ignore-scripts`・版は `scripts/versions.sh`）による手動で、
 リポジトリには `package.json`・lockfile・`node_modules` を残さない。
 
+## main world 評価と段階 2（#1350）の判断材料
+
+実測（Issue #1349）の結果を、段階 2（ページランタイムの保持。owner:human の #1350 で採否を判断）への材料として整理する。判断そのものは本書では行わない。
+設計は [main-world-evaluation.md](./main-world-evaluation.md)（段階 1 は確定 DOM の再パースで評価するため、ページ JS のヒープは無い。§3）。
+
+- **(a) 実測で main に送られた関数（A）**: `() => { return document; }` の 1 件のみで、ページのグローバルを参照しない。確定 DOM の再パースで足りた（段階 1 で `page.$("body")` の前半が成功）。`selector` の後半（`queryOne`）は isolated world で実行され、main には送られない設計（読解。実測は未到達）
+- **(b) 試験基盤の `page.$` 以外の関数（B）**: `harness/endpoint-swap/adapters.mjs` の `PAGE_FN_*`（`textContent` の取得、`name` 属性の数え上げ）は DOM の読み取りで、読解上はページの JS ヒープ（グローバル変数・クロージャ）を要しない。未実測
+- **(c) ページのグローバルを要しうる API（B）**: 利用者が `page.evaluate` 等で `window.<ページ定義の変数>` を参照する場合は、段階 1 では `exceptionDetails`（`ReferenceError` 等）になる。偽の値は返さない（`SEC-2`・`CDP-6`）。確定 HTML に残る DOM 状態の参照は動く
+- **(d) 限界（A）**: 実測は `about:blank` のみで、ページスクリプトが無い。段階 1 のヒープ欠落（JS が作る変数・イベントリスナーの状態）は、この実測では表に出ない。実サイトでの影響は `harness/endpoint-swap` の実サイト計測（`tasks.json` の対象）でも未確認
+- 実測の範囲では「main world でページのグローバルを必要とする操作」は見つかっていない。ただし `selector` の後半が未到達のため、`page.$` 全体の結論ではない
+
 ## 未確定事項・再現手順
 
-- 実測が未実施。`puppeteer-core` の導入承認後に次を実測値で更新する: 段階別 status・失敗段階のエラー名とメッセージ・
-  `CdpState::received_methods()`・本書の B の予測との差分
-- #8 のうち握りつぶしの有無、#10 の `page.$` の呼び出し連鎖、#11 の切断時の送信有無は精査が不完全
+- 実測（Issue #1349）は 1 回・`about:blank`・debug ビルド・Linux のみ。再現性（複数回の安定性）と他 OS は未確認。残る未確定事項:
+  - `userGesture` を受理した後の `selector` 後半（`puppeteerUtil` の評価、`queryOne` の `callFunctionOn`、isolated → main のハンドル移送、`Runtime.releaseObject`）と `disconnect`
+  - #8（`defaultViewport` 既定時の `Emulation.*`。`SEC-2` で実装しない）と #11（切断時の送信有無）
+  - `CdpState::received_methods()` の値は取得していない（トレースはクライアント側の `NODE_DEBUG` の送受信列）
+  - Chromium 実機との照合（`objectId` と `executionContextId` の排他エラー等。`main-world-evaluation.md` §8）。実機が手元に無く未確認
 - `Target.setAutoAttach` の `filter` 引数は `-32602`（`unsupported params`）で拒否すると確定（TASK-43.3c・#908。黙って無視すると除外すべき `page` まで attach するため）。`autoAttach:true` と `waitForDebuggerOnStart:true` の組み合わせは、当初拒否していたが TASK-43.3g（#942）で受理に変わった（保持のみ。新しいターゲットの停止は #910）。Puppeteer の `TargetManager.initialize` の `filter` 付き呼び出しは、#1334 で案 (a)（tab 擬似ターゲット）により受理に変わった（受理表は「tab 擬似ターゲットと `filter`」節。表にない形の拒否は残る）
 - spec（`docs/spec`）は本調査環境で再照合しておらず、C の記述は spec 本文と未照合
 - 再現（ソース確認）: `npm pack puppeteer-core@25.12.0` で得た tarball を一時ディレクトリへ展開し、`src/cdp/` を閲覧のみする（展開物内でスクリプトは実行しない）
-- 再現（実測。承認後）: `harness/puppeteer-connect/README.md` の導入手順に従う
+- 再現（実測。2026-10-30 に実施した手順）: すべて隔離ディレクトリ（`mktemp -d`）で行い、リポジトリには何も残さない。
+  1. `cargo build -p fandhe-browser-cli`（debug）
+  2. 空きを確認（`127.0.0.1:9333` が応答すれば中止）。npm 導入用ディレクトリで `PUPPETEER_SKIP_DOWNLOAD=1 npm install --no-save --no-audit --no-fund --ignore-scripts puppeteer-core@25.12.0`（版は `scripts/versions.sh`）。
+     `node harness/endpoint-swap/verify_install.mjs <導入先> puppeteer-core 25.12.0 <PUPPETEER_INTEGRITY> --allow-transitive` で版と integrity を検証（推移的依存 25 件。`ws@8.22.0`・`chromium-bidi@17.0.2`・`zod@3.25.76` 等）
+  3. プロファイルを `mktemp -d` に向け（`XDG_DATA_HOME`・`HOME`）、`FANDHE_BROWSER_CONFIG` を外して `target/debug/fandhe-browser` を起動し、`/json/version` の `webSocketDebuggerUrl` を得る
+  4. `NODE_PATH=<導入先>/node_modules FANDHE_CDP_WS_ENDPOINT=<ws URL> NODE_DEBUG='puppeteer:*' node harness/puppeteer-connect/connect.mjs`（stdout の `FANDHE_SCRIPT_RESULT` 行が段階別 status、stderr がトレース。`puppeteer-core` 25.12.0 のトレースは `DEBUG` ではなく `NODE_DEBUG` で有効になる）
+  5. サーバーを停止し、作った一時ディレクトリをすべて削除する。生のトレースはコミットしない
+  測定条件は `defaultViewport: null` のみで、UA・ヘッダ・`Emulation.*` は変えない（`SEC-2`）。サーバー側の stderr には `WebMCP.enable` と `Runtime.addBinding` の「unimplemented method」だけが出た
