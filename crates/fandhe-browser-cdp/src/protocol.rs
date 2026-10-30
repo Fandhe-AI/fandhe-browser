@@ -647,7 +647,7 @@ impl Dispatcher {
                 };
                 let pre_events: Vec<CdpEvent> = out.pre_events.into_iter().map(fill).collect();
                 let mut events: Vec<CdpEvent> = out.events.into_iter().map(fill).collect();
-                events.extend(auto_attach_events(state, conn, true));
+                insert_auto_events(&mut events, auto_attach_events(state, conn, true));
                 let mut o = outcome(
                     Some(req.id),
                     req.session_id.clone(),
@@ -706,6 +706,21 @@ fn auto_attach_events(
         events.push(crate::playwright_compat::attached_event(info, sid, false));
     }
     events
+}
+
+/// ハンドラ生成のイベント列へ reconcile 生成分を足す。discover の通知（`targetDestroyed`・`targetCreated`）は
+/// ハンドラ生成の `attachedToTarget` より前に置く（Chromium の順。例: 他接続のページ作成後の
+/// `Target.setAutoAttach`。#1324・`CDP-3`）。
+fn insert_auto_events(events: &mut Vec<CdpEvent>, auto: Vec<CdpEvent>) {
+    let is_discovery =
+        |e: &CdpEvent| matches!(e.method, "Target.targetCreated" | "Target.targetDestroyed");
+    let (discovery, rest): (Vec<_>, Vec<_>) = auto.into_iter().partition(is_discovery);
+    let pos = events
+        .iter()
+        .position(|e| e.method == "Target.attachedToTarget")
+        .unwrap_or(events.len());
+    events.splice(pos..pos, discovery);
+    events.extend(rest);
 }
 
 fn outcome(

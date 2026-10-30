@@ -99,6 +99,9 @@ pub(crate) fn validate_download_path(s: &str) -> Option<PathBuf> {
     Some(p.to_path_buf())
 }
 
+/// discover の差分 `(新規 (info, attached), 消滅 ID)`（#1324）。
+type DiscoverDiff = (Vec<(TargetInfo, bool)>, Vec<TargetId>);
+
 /// 接続 1 本分の状態。
 #[derive(Default)]
 struct Entry {
@@ -352,18 +355,18 @@ impl ConnectionScoped {
 
     /// `Target.setDiscoverTargets {discover:true}` の本体（#1324・`CDP-3`）。discover を有効にし、
     /// まだ通知していない可視ターゲット（既定 context と自接続所有 context のページ）を ID 昇順で
-    /// `(targetInfo, attached)` として返す。冪等（2 回目以降は新規分のみ）。
+    /// `(targetInfo, attached)` として返す。記録済みで既に消えたターゲットは第 2 要素で返す。冪等（2 回目以降は新規分のみ）。
     /// 他接続の context のターゲットは通知対象にしない（`Target.getBrowserContexts` と同じ接続間分離。`CDP-7`）。
     pub(crate) fn enable_discover(
         &self,
         conn: ConnId,
         registry: &TargetRegistry,
-    ) -> Result<Vec<(TargetInfo, bool)>, ConnStateError> {
+    ) -> Result<DiscoverDiff, ConnStateError> {
         let mut map = self.lock();
         let entry = map.get_mut(&conn).ok_or(ConnStateError::NotLive)?;
         entry.discover_enabled = true;
-        let (created, _destroyed) = Self::discover_diff(entry, registry);
-        Ok(created)
+        // 消滅分も返す（再送時に捨てると、記録が可視集合へ同期されて `targetDestroyed` が永久に欠落する）。
+        Ok(Self::discover_diff(entry, registry))
     }
 
     /// `Target.setDiscoverTargets {discover:false}` の本体。通知済みの記録を捨てる

@@ -307,10 +307,14 @@ impl CommandHandler for TargetSetDiscoverTargets {
             let state = ctx.state;
             let mut out = HandlerOutput::result(json!({}));
             if discover {
-                let created = state
+                let (created, destroyed) = state
                     .conn_scoped()
                     .enable_discover(conn, state.registry())
                     .map_err(conn_error)?;
+                // 消滅 → 新規の順（`auto_attach_events` と同じ。`CDP-3`・`CDP-7`）。
+                for tid in &destroyed {
+                    out = out.with_event(target_destroyed_event(tid));
+                }
                 for (info, attached) in &created {
                     out = out.with_event(target_created_event(info, *attached));
                 }
@@ -1987,6 +1991,43 @@ mod tests {
             assert_eq!(f.len(), 2);
             assert_eq!(f[1], destroyed_ev(&tid));
             assert_eq!(call(&st, Some(b), &ping(5)).await.len(), 1);
+        }
+
+        #[tokio::test]
+        async fn cdp7_discover_reenable_reports_destroyed_targets() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let a = open_conn(&st, 1);
+            let t = new_page(&st, "about:blank");
+            call(&st, Some(a), &discover(1, DISCOVER_ON)).await;
+            // 他接続が閉じた後に discover:true を再送しても targetDestroyed が届く。
+            st.registry().close_target(&t).unwrap();
+            let f = call(&st, Some(a), &discover(2, DISCOVER_ON)).await;
+            assert_eq!(f, vec![json!({"id":2,"result":{}}), destroyed_ev(&t)]);
+            assert_eq!(call(&st, Some(a), &ping(3)).await.len(), 1);
+        }
+
+        #[tokio::test]
+        async fn cdp3_discover_notifications_precede_handler_attached_events() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let c = open_conn(&st, 1);
+            call(&st, Some(c), &discover(1, DISCOVER_ON)).await;
+            let _t = new_page(&st, "about:blank");
+            let f = call(
+                &st,
+                Some(c),
+                &auto_attach(
+                    2,
+                    r#""autoAttach":true,"waitForDebuggerOnStart":false,"flatten":true"#,
+                ),
+            )
+            .await;
+            let methods: Vec<&str> = f.iter().filter_map(|v| v["method"].as_str()).collect();
+            assert_eq!(
+                methods,
+                vec!["Target.targetCreated", "Target.attachedToTarget"]
+            );
         }
 
         #[tokio::test]
