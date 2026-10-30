@@ -279,6 +279,47 @@ impl CommandHandler for TargetCreateBrowserContext {
     }
 }
 
+/// `Target.getBrowserContexts`（`CDP-3`・`CDP-7`・`CDP-6`・`SEC-2`・`REPAIR-3`・TASK-45・TASK-46・#1323）。
+///
+/// Puppeteer の `connect()`（`_connectToCdpBrowser`）が接続直後に最初に root セッションへ送る
+/// （params は省略される）。返すのは呼び出した接続が所有する非既定 context（`Target.createBrowserContext`
+/// で作ったもの）だけで、作成順に `{"browserContextIds":[...]}` とする。既定 context
+/// （`00000000000000000000000000000001`）は含めない（Chromium も返さず、Puppeteer は暗黙に扱う）。
+///
+/// Chromium との差異（`REPAIR-3`）: Chromium はブラウザ全体の context を返すが、本実装は接続ごとに
+/// 分離し、他接続の context の存在を漏らさない（`Target.createTarget`・`Target.closeTarget` の
+/// 「既定か自接続所有だけ」と揃える）。状態を変えない読み取りで、一律の成功ではない。
+/// `sessionId` 付きと非空の params は `UNSUPPORTED_PARAMS`、params が object でなければ
+/// `INVALID_PARAMS`、接続なし・切断済みは `NO_CONNECTION`。
+pub(crate) struct TargetGetBrowserContexts;
+
+impl CommandHandler for TargetGetBrowserContexts {
+    fn handle<'a>(
+        &'a self,
+        ctx: CommandContext<'a>,
+        params: &'a Value,
+    ) -> BoxFuture<'a, Result<HandlerOutput, CdpError>> {
+        Box::pin(async move {
+            if ctx.session_id.is_some() {
+                return Err(CdpError::UNSUPPORTED_PARAMS);
+            }
+            match params.as_object() {
+                Some(o) if o.is_empty() => {}
+                Some(_) => return Err(CdpError::UNSUPPORTED_PARAMS),
+                None => return Err(CdpError::INVALID_PARAMS),
+            }
+            let conn = ctx.conn.ok_or(CdpError::NO_CONNECTION)?;
+            let ids = ctx
+                .state
+                .conn_scoped()
+                .owned_contexts(conn)
+                .map_err(conn_error)?;
+            let ids: Vec<&str> = ids.iter().map(|i| i.as_str()).collect();
+            Ok(HandlerOutput::result(json!({ "browserContextIds": ids })))
+        })
+    }
+}
+
 /// `Target.closeTarget`（`CDP-2`・`CDP-7`・`SEC-2`・`REPAIR-3`・TASK-43.3h・#1028）。
 ///
 /// Playwright は `newPage()` の初期化失敗時に `page._close()` でこれを送り、応答の成否は見ずに
@@ -1647,6 +1688,127 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn cdp3_get_browser_contexts_returns_empty_without_contexts() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let c = open_conn(&st, 1);
+            let f = call(
+                &st,
+                Some(c),
+                r#"{"id":1,"method":"Target.getBrowserContexts"}"#,
+            )
+            .await;
+            assert_eq!(f, vec![json!({"id":1,"result":{"browserContextIds":[]}})]);
+            let f = call(
+                &st,
+                Some(c),
+                r#"{"id":2,"method":"Target.getBrowserContexts","params":{}}"#,
+            )
+            .await;
+            assert_eq!(f, vec![json!({"id":2,"result":{"browserContextIds":[]}})]);
+        }
+
+        #[tokio::test]
+        async fn cdp3_get_browser_contexts_returns_created_context_ids() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let c = open_conn(&st, 1);
+            make_context(&st, c).await;
+            make_context(&st, c).await;
+            let f = call(
+                &st,
+                Some(c),
+                r#"{"id":5,"method":"Target.getBrowserContexts"}"#,
+            )
+            .await;
+            assert_eq!(
+                f,
+                vec![json!({"id":5,"result":{"browserContextIds":[
+                    "00000000000000000000000000000002",
+                    "00000000000000000000000000000003"
+                ]}})]
+            );
+        }
+
+        #[tokio::test]
+        async fn cdp7_get_browser_contexts_excludes_other_connections_contexts() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let c1 = open_conn(&st, 1);
+            let c2 = open_conn(&st, 2);
+            make_context(&st, c1).await;
+            let f = call(
+                &st,
+                Some(c2),
+                r#"{"id":1,"method":"Target.getBrowserContexts"}"#,
+            )
+            .await;
+            assert_eq!(f, vec![json!({"id":1,"result":{"browserContextIds":[]}})]);
+            let f = call(
+                &st,
+                Some(c1),
+                r#"{"id":2,"method":"Target.getBrowserContexts"}"#,
+            )
+            .await;
+            assert_eq!(
+                f,
+                vec![
+                    json!({"id":2,"result":{"browserContextIds":["00000000000000000000000000000002"]}})
+                ]
+            );
+        }
+
+        #[tokio::test]
+        async fn cdp7_get_browser_contexts_after_release_returns_no_connection() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let c = open_conn(&st, 1);
+            make_context(&st, c).await;
+            st.release_connection(c);
+            let f = call(
+                &st,
+                Some(c),
+                r#"{"id":1,"method":"Target.getBrowserContexts"}"#,
+            )
+            .await;
+            assert_eq!(f, vec![err(-32000, "no connection", 1)]);
+        }
+
+        #[tokio::test]
+        async fn cdp2_get_browser_contexts_rejects_session_params_and_requires_connection() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let c = open_conn(&st, 1);
+            let f = call(
+                &st,
+                Some(c),
+                r#"{"id":1,"sessionId":"S1","method":"Target.getBrowserContexts"}"#,
+            )
+            .await;
+            assert_eq!(
+                f,
+                vec![
+                    json!({"id":1,"sessionId":"S1","error":{"code":-32602,"message":"unsupported params"}})
+                ]
+            );
+            let f = call(
+                &st,
+                Some(c),
+                r#"{"id":1,"method":"Target.getBrowserContexts","params":{"x":1}}"#,
+            )
+            .await;
+            assert_eq!(f, vec![err(-32602, "unsupported params", 1)]);
+            let f = call(
+                &st,
+                None,
+                r#"{"id":1,"method":"Target.getBrowserContexts"}"#,
+            )
+            .await;
+            assert_eq!(f, vec![err(-32000, "no connection", 1)]);
+            assert_eq!(st.registry().browser_context_count(), 0);
+        }
+
+        #[tokio::test]
         async fn cdp2_create_browser_context_returns_id_and_registers_owned_context() {
             let dir = TempDir::new();
             let st = state(&dir);
@@ -1660,7 +1822,7 @@ mod tests {
             );
             let id = BrowserContextId::parse("00000000000000000000000000000002").unwrap();
             assert!(st.registry().has_browser_context(&id));
-            assert_eq!(st.conn_scoped().owned_contexts(c), vec![id]);
+            assert_eq!(st.conn_scoped().owned_contexts(c), Ok(vec![id]));
             // 2 つ目は別 ID。
             let f = call(&st, Some(c), &create_ctx(11)).await;
             assert_eq!(

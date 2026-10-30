@@ -274,7 +274,7 @@ Playwright が応答を待つ `Page.enable`・`Page.getFrameTree` 以降のセ�
   `eventsEnabled` なしの `default`）。設定は context 単位で保持し（Chromium と同じ）、context の破棄で消える。`downloadPath` は検証のみで、
   `deny` では保持せずファイル操作もしない。不正・未知の `browserContextId` は `-32602`（`invalid params`）
 - 上限: 新規 context は 64 件（`MAX_BROWSER_CONTEXTS`。既定 context を除く）。`MAX_TARGETS`・`MAX_SESSIONS` は全 context 共通で維持する
-- 未実装のまま: `Target.disposeBrowserContext`・`Target.getBrowserContexts`（`Target.createTarget` は段階 2e〔#910〕で実装）
+- 未実装のまま: `Target.disposeBrowserContext`（`Target.createTarget` は段階 2e〔#910〕、`Target.getBrowserContexts` は #1323 で実装済み。後者は自接続所有の非既定 context のみ返す）
 
 実測（`make trace-playwright`。2 回の実行で同一出力）: `Target.createBrowserContext` → `{"browserContextId":"…0002"}`、
 `Browser.setDownloadBehavior`（`deny`・`browserContextId`・`downloadPath`・`eventsEnabled:true`）→ `{}` で `newContext()` が成功し、
