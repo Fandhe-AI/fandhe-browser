@@ -24,7 +24,7 @@ Rust 製の軽量・ミニマムなブラウザの実装リポジトリです。
 以下はロードマップ上の**目標値**であり、現時点でこれらを達成していることを意味しません（実装状況は「ステータス」節を参照）。詳細・全体は spec リポの [`06-roadmap.md`](https://github.com/Fandhe-AI/fandhe-browser-spec/blob/main/06-roadmap.md)「成功指標」を参照してください。
 
 - アイドル RSS を Chromium 比 85% 以上削減（`PERF-6`、TASK-27・MS-3）
-- AI 向けスナップショットのトークン削減率 85% 以上（`AISNAP-1`、TASK-11・MS-2）
+- AI 向けスナップショットのトークン削減率 70% 以上（`AISNAP-1`、TASK-11・MS-2。2026-10-29 に 85% から見直し・#97）
 - 要素参照破損率 10% 以下（`AISNAP-10`、TASK-17・MS-2）
 - 全体動作率 70% 以上（`COMPAT-4`、TASK-71/74・MS-6）
 - 3 OS 間の動作率差 10 ポイント以内（`XOS-2`、TASK-59・MS-5）
