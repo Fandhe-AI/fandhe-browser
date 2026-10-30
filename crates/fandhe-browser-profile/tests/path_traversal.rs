@@ -20,10 +20,12 @@
 //!
 //! ## cfg 方針
 //!
-//! `create_file_in` は unix 限定（Windows の `Profile::open` は `%LOCALAPPDATA%`
-//! 配下のみ成功する）のため、ファイルシステムを使うテストと補助コードだけ `#[cfg(unix)]` とする。
-//! 字句検証のテストは 3 OS で実行する（XOS 系）。そのため兄弟ファイルと違い
-//! ファイル全体には `#![cfg(unix)]` を置かない。
+//! 字句検証と、全データ種別での `create_file_in` の拒否テストは 3 OS で実行する（XOS 系。
+//! Windows の `Profile::open` は `%LOCALAPPDATA%` 配下のみ成功するため、基点は
+//! `fandhe_browser_profile::test_base_dir`）。symlink の P4-14・P4-15 は Windows では作成に
+//! 特権が要るため `#[cfg(unix)]` のままにする。Windows の再解析ポイント（ジャンクション）相当は
+//! `src/profile.rs` の単体テスト（`prof4_xos10_windows_create_file_in_rejects_junction_...`）が担う。
+//! そのため兄弟ファイルと違いファイル全体には `#![cfg(unix)]` を置かない。
 //!
 //! 削除機能（`PROF-5`）は #188（TASK-53.2）の範囲であり、本ファイルでは扱わない。
 
@@ -31,13 +33,10 @@ use fandhe_browser_profile::{ProfileError, assert_within_root, sanitize_componen
 use std::collections::BTreeSet;
 use std::ffi::OsString;
 
-#[cfg(unix)]
 use fandhe_browser_profile::{DataKind, Profile};
 #[cfg(unix)]
 use std::os::unix::fs::symlink;
-#[cfg(unix)]
 use std::path::{Path, PathBuf};
-#[cfg(unix)]
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// `PROF-4` が要求する入力パターン数の下限。
@@ -193,23 +192,20 @@ fn prof_4_sanitize_component_rejects_windows_prefixed_inputs() {
     }
 }
 
-#[cfg(unix)]
 static COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 /// 一意な一時ディレクトリ（drop 時に削除）。作成は各テストが明示的に行う。
-#[cfg(unix)]
 struct TempDir {
     path: PathBuf,
 }
 
-#[cfg(unix)]
 impl TempDir {
     fn new() -> Self {
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
         // macOS の `/var` -> `/private/var` を `Profile::open` が弾くため canonicalize する。
-        let base = std::env::temp_dir()
-            .canonicalize()
-            .unwrap_or_else(|_| std::env::temp_dir());
+        // Windows は `%LOCALAPPDATA%` 配下でないと `Profile::open` が拒否するため、既知フォルダ
+        // 配下を返す `test_base_dir` を基点にする。
+        let base = fandhe_browser_profile::test_base_dir();
         let path = base.join(format!(
             "fandhe-profile-traversal-test-{}-{n}",
             std::process::id()
@@ -222,7 +218,6 @@ impl TempDir {
     }
 }
 
-#[cfg(unix)]
 impl Drop for TempDir {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.path);
@@ -230,7 +225,6 @@ impl Drop for TempDir {
 }
 
 /// `dir` 直下のエントリ名集合。symlink を見つけたら panic する（fail-closed）。
-#[cfg(unix)]
 fn entry_names(dir: &Path) -> BTreeSet<OsString> {
     let mut names = BTreeSet::new();
     for entry in std::fs::read_dir(dir).unwrap_or_else(|e| panic!("read_dir 失敗: {e}")) {
@@ -244,12 +238,10 @@ fn entry_names(dir: &Path) -> BTreeSet<OsString> {
     names
 }
 
-#[cfg(unix)]
 fn names(list: &[&str]) -> BTreeSet<OsString> {
     list.iter().map(OsString::from).collect()
 }
 
-#[cfg(unix)]
 #[test]
 fn prof_4_create_file_in_rejects_every_traversal_case_for_all_kinds_and_writes_nothing_outside() {
     let tmp = TempDir::new();

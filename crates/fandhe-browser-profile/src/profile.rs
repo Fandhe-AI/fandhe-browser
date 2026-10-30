@@ -27,12 +27,14 @@
 //!   ハンドルを起点にした NT API（`win32` モジュール。Issue #950）で行い、パスの再解決で
 //!   配下外に作られる経路は無い。作成前は `canonicalize` による判定で守る。ハンドル
 //!   （`root_fd`・`data_dir_fd`）は unix でも crate 内部の実装詳細で公開しない（#839）。
-//!   `create_file_in` 相当の書き込み系のハンドル基準の操作は Windows に無い（REPAIR-3）
+//!   Windows の書き込みは、保持するデータ種別ディレクトリのハンドルを親にした
+//!   `Profile::create_file_in`（`local_root::open_data_file` 経由。Issue #1313）で行う。
+//!   Windows のハンドル基準の走査（`Profile::delete`）は無い（REPAIR-3）
 //!
 //! 並行アクセス時のデータ分離はデータディレクトリ分離（`PROF-6`）自体で成立し、
 //! `PROF-2`（`tests/isolation.rs`）・`PROF-3`（`tests/concurrent_isolation.rs`。
-//! TASK-51・TASK-52）が 3 OS で確認する（Windows の書き込みはテスト側のアダプタ経由で、
-//! `create_file_in` 相当は未実装。#954）。
+//! TASK-51・TASK-52）が 3 OS で確認する（書き込みは 3 OS とも製品の
+//! `Profile::create_file_in` 経由。Windows は #1313）。
 //!
 //! `Profile::open` はルート直下の `profile.lock` に advisory lock を取ることで
 //! 同一プロファイルへの二重 open を拒否する（`PROF-1`、TASK-50（50.3）・#178。
@@ -62,17 +64,13 @@
 //! 検証済みハンドル（`root_fd`・`data_dir_fd`。unix 限定の `pub(crate)`）を
 //! 起点に `openat` 系 API で行う。上位 crate（Cookie・Storage 等の実データ
 //! 操作を担う後続タスク）はハンドルに直接触れず、`Profile::create_file_in`
-//! 系の API を使う（#839・TASK-4 P-2・XOS 系）。`create_file_in` 自体も現状は
-//! unix 限定で、OS 非依存の境界内アクセス API は XOS-7〜XOS-10 の後続課題
-//! （#813）であり未実装。Windows の `open` は、`canonicalize` による事前判定に加え、
+//! 系の API を使う（#839・TASK-4 P-2・XOS 系）。`create_file_in` は unix と Windows で
+//! 実装済み（それ以外の OS は `Unsupported`）。Windows の `open` は、`canonicalize` による事前判定に加え、
 //! ルートまでの各ディレクトリと `profile.lock` を `FILE_SHARE_DELETE` なしで開いて保持し
-//! （`Profile` はルートのディレクトリハンドルと `profile.lock` のハンドルを生存中持つ）、
-//! 改名・削除による別実体への差し替えを防ぐ。ただし保持するハンドルを起点にした
-//! 書き込み系 API（`create_file_in` 相当）は Windows に無く
-//! （`open` 内の作成・open はハンドル相対だが、`open` 後に保持するのはルートのハンドルだけ。
-//! データ種別ディレクトリのハンドルは閉じる）、書き込み系のハンドル基準の操作は第 2 段階
-//! （後続。#813）の要件のため、この契約は unix 限定である
-//! （残る限界は `local_root.rs` のモジュール doc「限界」）。
+//! （`Profile` はルート・4 つのデータ種別ディレクトリのハンドルと `profile.lock` のハンドルを
+//! 生存中持つ）、改名・削除による別実体への差し替えを防ぐ。`create_file_in` は保持する
+//! データ種別ディレクトリのハンドルを親にして開く。Windows では開いたハンドルで
+//! ハードリンク数 1・所有者・DACL を検証する（Issue #1313。残る限界は `local_root.rs` のモジュール doc「限界」）。
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -524,6 +522,11 @@ pub struct Profile {
     // PROF-1、TASK-50（50.3）・#178）。
     #[cfg(any(unix, windows))]
     _lock: lock::ProfileLock,
+    /// Windows 限定: 検証済みの 4 つのデータ種別ディレクトリのハンドル（削除・改名を共有しない）。
+    /// `create_file_in` が親ハンドルとして使い、`Profile` の生存中は別実体への差し替えを防ぐ。
+    /// 子のハンドルがルートの固定より先に落ちるよう、`_root_dir` より前に宣言する。
+    #[cfg(windows)]
+    data_dirs: crate::local_root::DataDirHandles,
     /// Windows 限定: 検証済みルートのディレクトリハンドル（削除・改名を共有しない）。
     /// `Profile` の生存中、ルートを改名・削除によって別実体へ差し替えられないように
     /// 固定する（`local_root.rs` の「限界」）。`_lock` の後に宣言して、先にロックを解放し、その後にルートの固定を解く。
@@ -778,13 +781,14 @@ impl Profile {
         let (lock_file, lock_path) = local_root::open_lock_file(root_handle, plan.expected())?;
         let profile_lock = lock::try_acquire(lock_file, &lock_path)?;
 
-        local_root::ensure_data_dirs(root_handle, plan.expected())?;
+        let data_dirs = local_root::ensure_data_dirs(root_handle, plan.expected())?;
 
         // 途中の要素のハンドルはここで閉じ、ルートのハンドルだけを `Profile` が保持する。
         let root_dir = pinned.into_root_handle()?;
         Ok(Profile {
             root: display_root,
             _lock: profile_lock,
+            data_dirs,
             _root_dir: root_dir,
         })
     }
@@ -793,8 +797,8 @@ impl Profile {
     ///
     /// このパスを再度 `open`/`symlink_metadata` 等で解決すると、`open` 時に
     /// 検証した実体と異なるものを指す可能性がある（PR #437 P1 レビュー指摘。
-    /// モジュール doc 参照）。crate 外のファイル操作には unix 限定の
-    /// [`Profile::create_file_in`] を使う（crate 内では検証済みの `root_fd` を
+    /// モジュール doc 参照）。crate 外のファイル操作には
+    /// [`Profile::create_file_in`]（unix・Windows）を使う（crate 内では検証済みの `root_fd` を
     /// 起点にする。#839）。
     pub fn root(&self) -> &Path {
         &self.root
@@ -805,8 +809,8 @@ impl Profile {
     ///
     /// パスの生成のみを行い、存在確認はしない。このパスを再度解決する
     /// ファイル操作は行わないこと（[`Profile::root`] と同じ理由。PR #437 P1
-    /// レビュー指摘）。crate 外のファイル操作には unix 限定の
-    /// [`Profile::create_file_in`] を使う（crate 内では `data_dir_fd` を起点に
+    /// レビュー指摘）。crate 外のファイル操作には
+    /// [`Profile::create_file_in`]（unix・Windows）を使う（crate 内では `data_dir_fd` を起点に
     /// する。#839）。
     pub fn data_dir(&self, kind: DataKind) -> PathBuf {
         self.root.join(kind.dir_name())
@@ -843,7 +847,19 @@ impl Profile {
         }
     }
 
-    /// unix 限定: 指定データ種別ディレクトリ直下に `name` という名前の
+    /// Windows 限定: `open` が検証済みの、指定データ種別ディレクトリのハンドル。
+    /// `create_file_in` が親ハンドルとして使う crate 内部の実装詳細（unix の `data_dir_fd` 相当）。
+    #[cfg(windows)]
+    pub(crate) fn data_dir_handle(&self, kind: DataKind) -> &std::fs::File {
+        match kind {
+            DataKind::Cookies => &self.data_dirs.cookies,
+            DataKind::Storage => &self.data_dirs.storage,
+            DataKind::Cache => &self.data_dirs.cache,
+            DataKind::History => &self.data_dirs.history,
+        }
+    }
+
+    /// 指定データ種別ディレクトリ直下に `name` という名前の
     /// ファイルを作成（既存なら開く）する最小のヘルパー。
     ///
     /// crate 内で保持する `data_dir_fd` のハンドルを起点に `openat` するため、
@@ -893,7 +909,25 @@ impl Profile {
     /// `root_fd`/`data_dir_fd`）を drop した後も有効なまま使い続けられる
     /// （逆に、`Profile` を drop すると `root_fd`/`data_fds` のディレクトリ
     /// ハンドルは閉じるが、既に返した `File` には影響しない）。
-    #[cfg(unix)]
+    ///
+    /// # Windows
+    ///
+    /// 保持するデータ種別ディレクトリのハンドルを親に、NT API（`win32::open_or_create_file_at`。
+    /// `local_root::open_data_file` 経由。Issue #1313）で開く。unix との対応は次のとおり。
+    ///
+    /// - 名前の位置のリンク: `FILE_OPEN_REPARSE_POINT` でリンク自体を開き、属性を見て
+    ///   `InvalidLayout`（ジャンクション・symlink を辿らない）
+    /// - 名前の位置のディレクトリ: `InvalidLayout`
+    /// - 切り詰め: `FILE_OPEN_IF`（既存ファイルを切り詰めない）
+    /// - 名前: 上記の検査に加え `validate_single_component` が予約デバイス名・末尾の `.` と空白・
+    ///   `:`（ストリーム）・制御文字を `InvalidComponent` で拒否する（unix より厳しい）
+    /// - 大文字小文字: 区別しない（`SID` と `sid` は同じファイル。衝突の扱いは `normalize.rs` の担当）
+    /// - ハードリンク数: 開いたハンドルで 1 でなければ `InvalidLayout`（Issue #1313）
+    /// - 所有者・DACL: 開いたハンドルで検証し、本人・SYSTEM・Administrators の外なら `InvalidLayout`
+    ///   （ACL は書き換えず拒否する。新規作成分はルートの保護付き DACL を継承する）。
+    ///   unix の 0600 への締め直しとは異なる
+    ///
+    /// Windows・unix 以外の OS では [`ProfileError::Unsupported`] を返す（成功を装わない）。
     pub fn create_file_in(
         &self,
         kind: DataKind,
@@ -909,10 +943,31 @@ impl Profile {
         // 変更した際の回帰を検出する境界検証として維持する）。
         assert_within_root(&self.root, &display_path)?;
 
-        // 実体の検証・パーミッション締め直しは `open_verified_regular_file`
-        // （#178 で切り出し。ロックファイルの作成と共有する）に委譲する。
-        // 所有者比較の基準は常に検証済みのプロファイルルート（`root_fd`）。
-        open_verified_regular_file(self.data_dir_fd(kind), self.root_fd(), name, display_path)
+        #[cfg(unix)]
+        {
+            // 実体の検証・パーミッション締め直しは `open_verified_regular_file`
+            // （#178 で切り出し。ロックファイルの作成と共有する）に委譲する。
+            // 所有者比較の基準は常に検証済みのプロファイルルート（`root_fd`）。
+            open_verified_regular_file(self.data_dir_fd(kind), self.root_fd(), name, display_path)
+        }
+        #[cfg(windows)]
+        {
+            // 保持するデータ種別ディレクトリのハンドルを親にして開く。パスは再解決しない
+            // （`display_path` はエラー表示用の親パスの導出にだけ使う）。
+            let _ = display_path;
+            crate::local_root::open_data_file(
+                self.data_dir_handle(kind),
+                &self.data_dir(kind),
+                safe_name.as_os_str(),
+            )
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = (display_path, kind);
+            Err(ProfileError::Unsupported {
+                reason: "create_file_in is not supported on this platform",
+            })
+        }
     }
 
     /// プロファイルを削除する。ロックを解放したうえで、ルートディレクトリごと
@@ -3095,6 +3150,144 @@ mod tests {
         drop(Profile::open_under_local_app_data(&root, env).expect("削除後の再 open"));
     }
 
+    /// Windows 用: `tmp` 配下の偽 `LOCALAPPDATA` に `p` を開く共通手順。
+    #[cfg(windows)]
+    fn open_windows_profile(tmp: &TempDir) -> (PathBuf, Profile) {
+        let lad = fake_local_app_data(tmp);
+        let root = lad.join("p");
+        let profile =
+            Profile::open_under_local_app_data(&root, Some(lad.into_os_string())).expect("open");
+        (root, profile)
+    }
+
+    /// PROF-4（Windows）: 区切り・`..`・空・予約デバイス名・末尾の `.` と空白・ストリームは、
+    /// 全データ種別で `InvalidComponent` になり、何も作られない。
+    #[cfg(windows)]
+    #[test]
+    fn prof4_windows_create_file_in_rejects_traversal_and_windows_specific_names() {
+        let tmp = TempDir::new();
+        let (root, profile) = open_windows_profile(&tmp);
+        for name in [
+            "../escape",
+            "a/b",
+            "a\\b",
+            "..",
+            "",
+            "CON",
+            "foo.",
+            "foo ",
+            "a:b",
+        ] {
+            for &kind in DataKind::ALL {
+                let err = profile
+                    .create_file_in(kind, std::ffi::OsStr::new(name))
+                    .expect_err("拒否される");
+                assert!(
+                    matches!(err, ProfileError::InvalidComponent { .. }),
+                    "{name:?} {kind:?}: {err:?}"
+                );
+            }
+        }
+        for &kind in DataKind::ALL {
+            assert_eq!(
+                std::fs::read_dir(profile.data_dir(kind)).unwrap().count(),
+                0,
+                "{kind:?} が非空"
+            );
+        }
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 5);
+    }
+
+    /// PROF-1（Windows）: 名前の位置がディレクトリなら `InvalidLayout`。
+    #[cfg(windows)]
+    #[test]
+    fn prof1_windows_create_file_in_rejects_directory_in_name_position() {
+        let tmp = TempDir::new();
+        let (_root, profile) = open_windows_profile(&tmp);
+        let dir = profile.data_dir(DataKind::Cookies).join("sub");
+        std::fs::create_dir(&dir).unwrap();
+        let err = profile
+            .create_file_in(DataKind::Cookies, std::ffi::OsStr::new("sub"))
+            .expect_err("ディレクトリは拒否される");
+        assert!(matches!(err, ProfileError::InvalidLayout { .. }), "{err:?}");
+    }
+
+    /// PROF-4・XOS-10（Windows）: 名前の位置の外部ディレクトリへのジャンクションは辿らず、
+    /// `InvalidLayout` で拒否する。リンク先には何も作られない。
+    #[cfg(windows)]
+    #[test]
+    fn prof4_xos10_windows_create_file_in_rejects_junction_in_name_position_without_following() {
+        let tmp = TempDir::new();
+        let (_root, profile) = open_windows_profile(&tmp);
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        make_junction(
+            &profile.data_dir(DataKind::Cookies).join("session"),
+            &outside,
+        );
+        let err = profile
+            .create_file_in(DataKind::Cookies, std::ffi::OsStr::new("session"))
+            .expect_err("ジャンクションは拒否される");
+        assert!(matches!(err, ProfileError::InvalidLayout { .. }), "{err:?}");
+        assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0);
+    }
+
+    /// PROF-1（Windows）: 既存ファイルを切り詰めない（`FILE_OPEN_IF`）。
+    #[cfg(windows)]
+    #[test]
+    fn prof1_windows_create_file_in_does_not_truncate_existing_file() {
+        use std::io::{Read, Seek, SeekFrom, Write};
+        let tmp = TempDir::new();
+        let (_root, profile) = open_windows_profile(&tmp);
+        let name = std::ffi::OsStr::new("session");
+        let mut first = profile.create_file_in(DataKind::Cookies, name).unwrap();
+        first.write_all(b"original").unwrap();
+        drop(first);
+        let mut again = profile.create_file_in(DataKind::Cookies, name).unwrap();
+        let mut buf = Vec::new();
+        again.seek(SeekFrom::Start(0)).unwrap();
+        again.read_to_end(&mut buf).unwrap();
+        assert_eq!(buf, b"original");
+    }
+
+    /// PROF-1（Windows）: 正当な名前でデータ種別ディレクトリ配下に通常ファイルができ、
+    /// `Profile` を drop した後も返した `File` へ書き込める。
+    #[cfg(windows)]
+    #[test]
+    fn prof1_windows_create_file_in_creates_under_data_dir_and_survives_profile_drop() {
+        use std::io::Write;
+        let tmp = TempDir::new();
+        let (_root, profile) = open_windows_profile(&tmp);
+        let mut file = profile
+            .create_file_in(DataKind::Storage, std::ffi::OsStr::new("example.com"))
+            .unwrap();
+        let path = profile.data_dir(DataKind::Storage).join("example.com");
+        assert!(std::fs::symlink_metadata(&path).unwrap().is_file());
+        drop(profile);
+        file.write_all(b"after-drop").unwrap();
+        drop(file);
+        assert_eq!(std::fs::read(&path).unwrap(), b"after-drop");
+    }
+
+    /// PROF-1（Windows）: `Profile` の生存中はデータ種別ディレクトリを改名できず、
+    /// drop 後は改名できる（保持するハンドルによる固定）。
+    #[cfg(windows)]
+    #[test]
+    fn prof1_windows_data_dirs_are_pinned_while_profile_is_alive() {
+        let tmp = TempDir::new();
+        let (root, profile) = open_windows_profile(&tmp);
+        let moved = root.join("moved");
+        for &kind in DataKind::ALL {
+            let dir = root.join(kind.dir_name());
+            assert!(
+                std::fs::rename(&dir, &moved).is_err(),
+                "{kind:?} を改名できた"
+            );
+        }
+        drop(profile);
+        std::fs::rename(root.join("cookies"), &moved).expect("drop 後は改名できる");
+    }
+
     /// XOS-10（Windows）: verbatim 表記の予約デバイス名・代替データストリーム `name:stream`・
     /// 末尾ドット／空白の要素を含むルートは `Unsupported` で、何も作られない。
     #[cfg(windows)]
@@ -3213,6 +3406,56 @@ mod tests {
             std::fs::read_dir(&outside).unwrap().count(),
             0,
             "配下外に作られた"
+        );
+    }
+
+    /// PROF-1（Windows、Issue #1313）: データディレクトリの外のファイルへのハードリンクは
+    /// `InvalidLayout` で拒否され、外側のファイルは変更されない。
+    #[cfg(windows)]
+    #[test]
+    fn prof1_windows_create_file_in_rejects_hard_linked_file() {
+        let tmp = TempDir::new();
+        let (_root, profile) = open_windows_profile(&tmp);
+        let outside = tmp.path().join("outside.txt");
+        std::fs::write(&outside, b"secret").unwrap();
+        let link = profile.data_dir(DataKind::Cookies).join("session");
+        std::fs::hard_link(&outside, &link).unwrap();
+        let err = profile
+            .create_file_in(DataKind::Cookies, std::ffi::OsStr::new("session"))
+            .expect_err("ハードリンクは拒否される");
+        assert!(
+            matches!(&err, ProfileError::InvalidLayout { reason, .. }
+                if *reason == crate::local_root::REASON_DATA_FILE_LINKS),
+            "{err:?}"
+        );
+        assert_eq!(std::fs::read(&outside).unwrap(), b"secret");
+    }
+
+    /// PROF-1・PROF-6（Windows、Issue #1313）: Everyone に読み取りを許可した既存データファイルは
+    /// `InvalidLayout` で拒否される（ACL は書き換えない）。
+    #[cfg(windows)]
+    #[test]
+    fn prof1_prof6_windows_create_file_in_rejects_file_granting_everyone() {
+        let tmp = TempDir::new();
+        let (_root, profile) = open_windows_profile(&tmp);
+        let name = std::ffi::OsStr::new("session");
+        drop(profile.create_file_in(DataKind::Cookies, name).unwrap());
+        let path = profile.data_dir(DataKind::Cookies).join("session");
+        let plain = PathBuf::from(path.to_string_lossy().trim_start_matches(r"\\?\"));
+        let out = std::process::Command::new("cmd")
+            .args(["/C", "icacls"])
+            .arg(&plain)
+            .args(["/grant", "*S-1-1-0:R"])
+            .output()
+            .expect("icacls を起動できる");
+        assert!(out.status.success(), "icacls failed: {out:?}");
+        let err = profile
+            .create_file_in(DataKind::Cookies, name)
+            .expect_err("Everyone を許可したファイルは拒否される");
+        assert!(
+            matches!(&err, ProfileError::InvalidLayout { reason, .. }
+                if *reason == crate::local_root::REASON_DATA_FILE_DACL),
+            "{err:?}"
         );
     }
 

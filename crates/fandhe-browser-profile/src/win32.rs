@@ -11,7 +11,9 @@
 //!
 //! 呼び出し元は `local_root.rs` の継ぎ目（`open_or_create_child_dir`・`open_or_create_child_file`）
 //! で、`Profile::open`（Windows）のルートまでの各要素・`profile.lock`・データ種別ディレクトリの
-//! 作成と open はすべて本モジュール経由（Issue #950）。既知フォルダ API による基準ディレクトリの
+//! 作成と open はすべて本モジュール経由（Issue #950）。`Profile::create_file_in`（Windows）の
+//! データファイルの open も `local_root::open_data_file` を介して本モジュールの
+//! `open_or_create_file_at` を使う（Issue #1313）。既知フォルダ API による基準ディレクトリの
 //! 取得（[`known_local_app_data`]。Issue #951）も本モジュールにあり、`local_root.rs`・`store.rs` が
 //! 呼ぶ。DACL（#952・#953）の `unsafe` も本モジュールに置く。既存ルートを開く場合は所有者と DACL を
 //! ハンドルから読んで検証する（#953）。通常の子の `SecurityDescriptor` は
@@ -60,8 +62,8 @@ use windows_sys::Win32::Security::{
     TOKEN_INFORMATION_CLASS, TOKEN_OWNER, TOKEN_QUERY, TOKEN_USER, TokenOwner, TokenUser,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    FILE_ATTRIBUTE_NORMAL, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_SHARE_READ,
-    FILE_SHARE_WRITE, FILE_TRAVERSE,
+    BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_NORMAL, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
+    FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TRAVERSE, GetFileInformationByHandle,
 };
 use windows_sys::Win32::System::Com::CoTaskMemFree;
 use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
@@ -174,6 +176,50 @@ pub(crate) fn open_or_create_file_at(
         return Err(invalid_layout(name, REASON_NOT_FILE));
     }
     Ok(child)
+}
+
+/// データファイル `name` を [`open_or_create_file_at`] で開き、開いたハンドルで検証して返す
+/// （`Profile::create_file_in`〔Windows〕用。Issue #1313・`PROF-1`・`PROF-6`）。
+///
+/// 検証（満たさなければ `InvalidLayout`。ファイルは返さない・削除もしない）:
+/// - ハードリンク数が 1（データディレクトリの外の実体への別名を拒否する）
+/// - 所有者と DACL が許可リスト（本人・SYSTEM・Administrators）の内側
+///   （[`verify_existing_root_security`] と同じ判定。ACL は書き換えない）
+pub(crate) fn open_or_create_data_file_at(
+    parent: &File,
+    name: &OsStr,
+) -> Result<File, ProfileError> {
+    let opened = open_or_create_file_at(parent, name)?;
+    if link_count(&opened.file)? != 1 {
+        return Err(invalid_layout(
+            name,
+            crate::local_root::REASON_DATA_FILE_LINKS,
+        ));
+    }
+    verify_existing_root_security(&opened.file).map_err(|err| match err {
+        ProfileError::InvalidLayout { reason, .. } => {
+            let reason = if reason == crate::local_root::REASON_EXISTING_ROOT_OWNER {
+                crate::local_root::REASON_DATA_FILE_OWNER
+            } else if reason == crate::local_root::REASON_EXISTING_ROOT_DACL {
+                crate::local_root::REASON_DATA_FILE_DACL
+            } else {
+                reason
+            };
+            invalid_layout(name, reason)
+        }
+        other => other,
+    })?;
+    Ok(opened.file)
+}
+
+/// ハンドルのハードリンク数（`GetFileInformationByHandle` の `nNumberOfLinks`）。
+fn link_count(file: &File) -> Result<u32, ProfileError> {
+    let mut info = BY_HANDLE_FILE_INFORMATION::default();
+    // SAFETY: `file` は有効なハンドルで、`info` は書き込み可能な構造体。
+    if unsafe { GetFileInformationByHandle(file.as_raw_handle() as HANDLE, &mut info) } == 0 {
+        return Err(last_os_error());
+    }
+    Ok(info.nNumberOfLinks)
 }
 
 fn invalid_layout(name: &OsStr, reason: &'static str) -> ProfileError {
