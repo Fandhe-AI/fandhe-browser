@@ -1339,19 +1339,55 @@
     // （予算を 1 消費）を呼ぶ。アタッチ後に作ったノード・範囲外の番号は例外（別のノードへは解決しない）。
     // cdp ヘルパーが注入時にこのオブジェクトを捕捉して使う想定（DOM.describeNode / resolveNode。後続）。
     // 名前自体も書き換え・削除できないようロックする（ページ JS による差し替えを防ぐ）。
-    Object.defineProperty(global, '__fandheDomIdentity', {
-        value: Object.freeze({
+    // 再注入（同じ JS コンテキストへの dom.js の再 install）に備え、固定の窓口は初回だけ定義し、
+    // 実体（今回の注入の ids・wrappers を使う関数）は再 install のたびに差し替える（events.js と同方式）。
+    // 差し替えは shim 注入中だけ true の op `lifecycleInstallOpen` が true のときに限り、ページ JS からは呼べない。
+    var identityImpl = {
+        orderOf: function (node) {
+            return op('initialOrder', idOf(node, 'orderOf'));
+        },
+        nodeAt: function (order) {
+            return wrapNode(op('nodeByInitialOrder', order));
+        }
+    };
+    var identityExisting = Object.prototype.hasOwnProperty.call(global, '__fandheDomIdentity')
+        ? global.__fandheDomIdentity
+        : null;
+    if (identityExisting !== null && typeof identityExisting === 'object'
+        && typeof identityExisting.__fandheSetImpl === 'function') {
+        identityExisting.__fandheSetImpl(identityImpl);
+    } else if (identityExisting === null) {
+        var currentIdentity = identityImpl;
+        var identityEntry = {
             orderOf: function (node) {
-                return op('initialOrder', idOf(node, 'orderOf'));
+                return currentIdentity.orderOf(node);
             },
             nodeAt: function (order) {
-                return wrapNode(op('nodeByInitialOrder', order));
+                return currentIdentity.nodeAt(order);
             }
-        }),
-        writable: false,
-        configurable: false,
-        enumerable: false
-    });
+        };
+        Object.defineProperty(identityEntry, '__fandheSetImpl', {
+            value: function (impl) {
+                var open = false;
+                try {
+                    open = op('lifecycleInstallOpen') === true;
+                } catch (e) {
+                    open = false;
+                }
+                if (open) {
+                    currentIdentity = impl;
+                }
+            },
+            enumerable: false
+        });
+        Object.freeze(identityEntry);
+        Object.defineProperty(global, '__fandheDomIdentity', {
+            value: identityEntry,
+            writable: false,
+            configurable: false,
+            enumerable: false
+        });
+    }
 
     expose('Node', Node);
     expose('Element', Element);

@@ -131,6 +131,30 @@ pub fn run(engine: &str) {
         "true",
     );
 
+    eprintln!("case: CDP-2 identity window survives reinstall (#1346)");
+    let mut p = setup(engine, None);
+    check(
+        &mut p,
+        "var firstWindow = __fandheDomIdentity; var firstDoc = document; __fandheDomIdentity.orderOf(document)",
+        "1",
+    );
+    p.rt.install_dom_shim(&p.bridge).expect("reinstall");
+    // 窓口オブジェクトは同一のまま、実体は 2 回目の注入（新しい ids・wrappers）に差し替わる。
+    check(&mut p, "__fandheDomIdentity === firstWindow", "true");
+    check(&mut p, "document !== firstDoc", "true");
+    check(&mut p, "__fandheDomIdentity.orderOf(document)", "1");
+    check(
+        &mut p,
+        "__fandheDomIdentity.nodeAt(1) === document && __fandheDomIdentity.nodeAt(1) !== firstDoc",
+        "true",
+    );
+    // ページ JS からは実体を差し替えられない（注入中でなければ無視）。
+    check(
+        &mut p,
+        "__fandheDomIdentity.__fandheSetImpl({ orderOf: function () { return 99; }, nodeAt: function () { return null; } }); __fandheDomIdentity.orderOf(document)",
+        "1",
+    );
+
     eprintln!("case: JS-5 document basics (readyState / currentScript)");
     let mut p = setup(engine, None);
     check(&mut p, "typeof document", "object");
