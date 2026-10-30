@@ -254,11 +254,16 @@ if [ "$n_expect" -ge 24 ]; then ok "expectations: scanned $n_expect call sites";
 # self-test 内の jq は関数のため、実体は type -P で引く（command -v だと関数名が返り、シムが自分自身を呼んで無限再帰する）
 REAL_JQ="$(type -P jq)"
 mkdir -p "$WORK/crlf-bin"
-printf '#!/usr/bin/env bash\nset -o pipefail\n"%s" "$@" | sed "s/\\$/$(printf "\\r")/"\n' "$REAL_JQ" >"$WORK/crlf-bin/jq"
+printf '#!/usr/bin/env bash\nset -o pipefail\n"%s" "$@" | tr -d "\\r" | sed "s/\\$/$(printf "\\r")/"\n' "$REAL_JQ" >"$WORK/crlf-bin/jq"
 chmod +x "$WORK/crlf-bin/jq"
-# シム自体が CR を出すこと（出さないとこの回帰テストが何も検証しない）と、素の比較が崩れること
-raw_cmp="$(PATH="$WORK/crlf-bin:$PATH" command jq -rn '"pass"')"
-expect_eq "jq-crlf: shim emits CR (raw comparison breaks without CR removal)" "$(printf 'pass\r')" "$raw_cmp"
+# シムは実 jq の出力から CR を一度落としてから 1 つだけ付け直す（Windows のネイティブ jq は元から CRLF で出すため、
+# 落とさないと CR が 2 つ付き、出力が OS で変わる）。出力は 3 OS とも `pass\r\n` の 6 バイトに揃う。
+# シム自体が CR を出すこと（出さないとこの回帰テストが何も検証しない）。
+# コマンド置換で受けて比較しない: Git Bash（MSYS2）の bash はコマンド置換で改行直前の CR を落とす（windows-latest で実測。
+# `x=$(printf 'pass\r\n')` は 4 文字）ため、CR が出ていても見えない。ファイルへ書いてバイト列を数える（3 OS 共通）
+PATH="$WORK/crlf-bin:$PATH" command jq -rn '"pass"' >"$WORK/shim.out"
+expect_eq "jq-crlf: shim emits CR (1 CR byte in 'pass' + CRLF)" "1" "$(tr -cd '\r' <"$WORK/shim.out" | wc -c | tr -d ' ')"
+expect_eq "jq-crlf: shim output size (pass + CR + LF)" "6" "$(wc -c <"$WORK/shim.out" | tr -d ' ')"
 SAVED_PATH="$PATH"
 PATH="$WORK/crlf-bin:$PATH"
 FAKE_MODE="" FAKE_FIXTURE=ok run_suite jqcrlf --render-host "$WORK/bin/fake-host$EXE" --strict
