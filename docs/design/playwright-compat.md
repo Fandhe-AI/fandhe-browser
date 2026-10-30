@@ -170,7 +170,7 @@ TASK-43.h1（Issue #248）のオーナー判断（2026-10-10）を記録する�
     `Target.attachedToTarget` は当該接続の次のコマンド応答の後に送出する（`ConnectionScoped::reconcile_auto_attach`）
   - `autoAttach:false` はこの接続が attach したセッションを外し、`Target.detachedFromTarget` を送出する
   - セッションの所有は接続スコープで、切断（`ws.rs` の `on_close`）で解放する
-  - 拒否（`-32602`）: `filter`（Puppeteer の除外フィルタ。黙って無視すると除外すべきターゲットまで attach するため）、
+  - 拒否（`-32602`）: 受理表にない `filter`（`filter` 省略は従来どおりで Playwright は送らない。`[{type:page,exclude:true},{}]` は Puppeteer 経路の tab 擬似ターゲットとして #1334 で受理に変わった。受理表は `puppeteer-compat.md`「tab 擬似ターゲットと `filter`」。黙って無視すると除外すべきターゲットまで attach するため）、
     `flatten` が `true` 以外（`sendMessageToTarget` 方式は未実装）、`sessionId` 付き（子ターゲットのモデルが無い）。
     `waitForDebuggerOnStart:true`（`autoAttach:true` 時）も当初は拒否していた（成功を装わないため。`REPAIR-3`・`CDP-6`）。**段階 2g（#942）で受理に変わった**（後述）
   - 接続なしの直接 dispatch は `-32000`（`no connection`）
@@ -199,7 +199,7 @@ TASK-43.h1（Issue #248）のオーナー判断（2026-10-10）を記録する�
   対象は「以後に attach される新しいターゲット」で、既存ターゲットは止めない（Chromium の `target_handler.cc` も既存を
   `AutoAttach(..., false)` で attach する）。既存ターゲットの `Target.attachedToTarget` は `waitingForDebugger:false`。
   新しいターゲットを実際に止める処理は `Target.createTarget`（段階 2e・#910）で実装した。
-  `filter`・`flatten` が `true` 以外・`sessionId` 付き・型不正は従来どおり拒否する
+  受理表にない `filter`・`flatten` が `true` 以外・型不正は従来どおり拒否する（`filter` 省略時の挙動は #1334 の後も変わらない）
 - `Browser.setDownloadBehavior` は `deny`（`eventsEnabled` は省略・`true`・`false` のいずれも）と、`eventsEnabled` なしの `default` だけを
   受理する。`deny` ではダウンロードが起きないため、`eventsEnabled:true` を受理してもダウンロードのイベントは送出しない。
   `downloadPath` は検証のみで、`deny` では保持もしない。`allow`・`allowAndName` は保存の実行系が無いため `-32602` で拒否のまま
@@ -425,7 +425,7 @@ id 7・11・13・15・16・17・18。
 | メソッド | 受理条件 | エラー |
 | -------- | -------- | ------ |
 | `Page.addScriptToEvaluateOnNewDocument` | 生存セッションの `sessionId` 付き・`params` が `source`（空文字列のみ）と任意の `worldName`（文字列）だけ。`{"identifier":"<10 進連番>"}` を返す。止めたターゲットでも受理する | `sessionId` なし・非空 `source`・`source`／`worldName` 以外のキー（`runImmediately`・`includeCommandLineAPI` 等）は `-32602 unsupported params`、`source` 欠落・型違い・`worldName` の型違い／NUL・未知セッションは `-32602 invalid params`、`worldName` が 256 バイト超は `-32000 world name too long`、セッションあたり 64 件超は `-32000 too many init scripts` |
-| `Target.setAutoAttach`（`sessionId` 付き） | 生存セッション・`autoAttach` が bool。`autoAttach:true` は `flatten:true` 必須。`{}` を返し、`waitForDebuggerOnStart` とともに状態を保持する（`autoAttach:false` で解除）。イベントは 0 件 | `filter` 付き・`autoAttach:true` で `flatten` が `true` 以外は `-32602 unsupported params`、`autoAttach` 欠落・型違い・未知セッションは `-32602 invalid params` |
+| `Target.setAutoAttach`（`sessionId` 付き） | 生存セッション・`autoAttach` が bool。`autoAttach:true` は `flatten:true` 必須。`{}` を返し、`waitForDebuggerOnStart` とともに状態を保持する（`autoAttach:false` で解除）。イベントは 0 件 | 受理表にない `filter` 付き（ページのセッションでは `[{type:page,exclude:true},{}]` も）・`autoAttach:true` で `flatten` が `true` 以外は `-32602 unsupported params`、`autoAttach` 欠落・型違い・未知セッションは `-32602 invalid params` |
 
 - 状態は `target.rs` の `Tables`（`init_scripts`・`next_init_script`・`child_auto_attach`）に置く（Issue 記載の `conn_state.rs` から外れる。理由は段階 3a と同じ）。
   セッション削除と同じロックで消え、切断・ターゲットの close・context の破棄で漏れない（付随状態の削除は `drop_session_state` に集約）。
