@@ -198,6 +198,30 @@ async fn cdp1_devtools_browser_ws_handshake_and_roundtrip() {
 }
 
 #[tokio::test]
+async fn cdp3_get_browser_contexts_over_ws_returns_empty_list() {
+    let dir = TempDir::new();
+    let addr = start(&dir).await;
+    tokio::task::spawn_blocking(move || {
+        let mut s = connect(addr);
+        let head = upgrade(
+            &mut s,
+            "/devtools/browser/fixed-1",
+            &format!("127.0.0.1:{}", addr.port()),
+            "",
+        );
+        assert_eq!(status_of(&head), 101, "head: {head}");
+        // Puppeteer の connect() と同じく params を省略する。
+        send_text(&mut s, r#"{"id":1,"method":"Target.getBrowserContexts"}"#);
+        assert_eq!(
+            read_text_json(&mut s),
+            json!({"id": 1, "result": {"browserContextIds": []}})
+        );
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
 async fn cdp6_unimplemented_method_over_ws_is_error_and_logged() {
     let dir = TempDir::new();
     let (addr, st) = start_with_state(&dir).await;

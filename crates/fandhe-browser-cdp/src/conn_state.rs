@@ -444,13 +444,19 @@ impl ConnectionScoped {
         Ok(own)
     }
 
-    /// この接続が所有する browser context（テスト用）。
-    #[cfg(test)]
-    pub(crate) fn owned_contexts(&self, conn: ConnId) -> Vec<BrowserContextId> {
+    /// この接続が所有する非既定 browser context を作成順（ID 昇順）で返す。
+    ///
+    /// `Target.getBrowserContexts`（#1323・`CDP-3`・`CDP-7`）から呼ばれる。既定 context は含まない。
+    /// 本表だけを引き registry には触れない（ロック順序は本表 → registry のまま）。
+    /// 未登録・切断済みの接続は `NotLive`（`release` と競合した場合も fail-closed）。
+    pub(crate) fn owned_contexts(
+        &self,
+        conn: ConnId,
+    ) -> Result<Vec<BrowserContextId>, ConnStateError> {
         self.lock()
             .get(&conn)
             .map(|e| e.owned_contexts.clone())
-            .unwrap_or_default()
+            .ok_or(ConnStateError::NotLive)
     }
 
     /// 生存中の接続数（テスト用）。
@@ -692,6 +698,21 @@ mod tests {
     }
 
     #[test]
+    fn cdp7_owned_contexts_requires_live_connection_and_keeps_creation_order() {
+        let r = TargetRegistry::new();
+        let cs = ConnectionScoped::new();
+        let c = ConnId::new(1);
+        assert_eq!(cs.owned_contexts(c), Err(ConnStateError::NotLive));
+        cs.open(c);
+        assert_eq!(cs.owned_contexts(c), Ok(vec![]));
+        let a = cs.create_owned_browser_context(c, &r).unwrap();
+        let b = cs.create_owned_browser_context(c, &r).unwrap();
+        assert_eq!(cs.owned_contexts(c), Ok(vec![a, b]));
+        cs.release(c);
+        assert_eq!(cs.owned_contexts(c), Err(ConnStateError::NotLive));
+    }
+
+    #[test]
     fn cdp7_owned_browser_contexts_are_returned_on_release_only_for_owner() {
         let r = TargetRegistry::new();
         let cs = ConnectionScoped::new();
@@ -700,11 +721,12 @@ mod tests {
         cs.open(c2);
         let a = cs.create_owned_browser_context(c1, &r).unwrap();
         let b = cs.create_owned_browser_context(c2, &r).unwrap();
-        assert_eq!(cs.owned_contexts(c1), vec![a.clone()]);
+        assert_eq!(cs.owned_contexts(c1), Ok(vec![a.clone()]));
         let rel = cs.release(c1);
         assert_eq!(rel.contexts, vec![a]);
         assert!(rel.sessions.is_empty());
-        assert_eq!(cs.owned_contexts(c2), vec![b]);
+        assert_eq!(cs.owned_contexts(c2), Ok(vec![b]));
+        assert_eq!(cs.owned_contexts(c1), Err(ConnStateError::NotLive));
     }
 
     #[test]
