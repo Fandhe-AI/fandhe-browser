@@ -3,7 +3,7 @@
 //!
 //! 実測値（フィクスチャの snapshot トークン数）は `build_snapshot` の現行挙動を
 //! 固定したもので、TASK-15・16 等で snapshot の形が変われば更新が要る。
-//! 85% 目標の達成可否は #97 の担当で、ここでは判定しない。
+//! `AISNAP-1` の 70% 目標（旧 85%・Issue #97・spec#38 で見直し）の達成可否は #97 の担当で、ここでは判定しない。
 
 #[path = "tokens.rs"]
 mod tokens;
@@ -198,7 +198,7 @@ fn fixtures_measured_with_concrete_values() {
     let s = summarize(&rows).expect("summary");
     assert_eq!(s.pages, 17);
     // 実測値（小数 1 桁。#1221 の区別子 ` #n` 付与後）。row・cell の name の重複除去と無名 listitem の折り畳み（TASK-23.6・#828）後も
-    // 85% 目標（AISNAP-1）には届かない。判定は #97。
+    // 70% 目標（AISNAP-1。旧 85% から Issue #97・spec#38 で見直し）にも届かない。判定は #97。
     assert!((s.mean_reduction_pct - 48.8).abs() < 0.05, "{s:?}");
     assert!((s.min_reduction_pct - 11.2).abs() < 0.05, "{s:?}");
     assert!((s.max_reduction_pct - 96.7).abs() < 0.05, "{s:?}");
