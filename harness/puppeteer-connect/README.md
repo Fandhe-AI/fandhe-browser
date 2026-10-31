@@ -64,8 +64,8 @@ TASK-46・#252。`mktemp -d` へ導入して削除し、版は `scripts/versions
 
 - 実試験ターゲット（実測した段階別 status・失敗段階のエラー・`CdpState::received_methods()` を
   具体値で固定する。TASK-45.2 の受入基準の完全達成はこの実行で満たされる）と `make test-puppeteer-connect`。
-  サーバーの実装済みメソッドは `Page.navigate`・`DOM.*` の一部のみのため、`connect` 段階で失敗する
-  可能性が高い（未実測。到達 0 段階でも記録された結果として扱う）
+  `connect` から `disconnect` までの 5 段階は、一時導入での手動実測（2026-10-31・#1358）で
+  すべて ok だった（結果は `docs/design/puppeteer-compat.md`）。実試験ターゲットとしての固定は承認待ち
 
 - `package.json`（`puppeteer-core` を完全固定）と `package-lock.json`、`.gitignore` の `node_modules/`
 - 導入済み版の照合（`preflight_puppeteer`）
