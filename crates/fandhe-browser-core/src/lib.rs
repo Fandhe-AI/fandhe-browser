@@ -191,7 +191,8 @@ pub use parse::{
     parse_document_bytes,
 };
 pub use query::{
-    element_matches, query_selector, query_selector_all, query_selector_all_str, query_selector_str,
+    element_matches, element_matches_str, query_selector, query_selector_all,
+    query_selector_all_str, query_selector_str,
 };
 pub use script_context::{
     DEFAULT_MAX_LIVE_SCRIPT_CONTEXTS, DEFAULT_MAX_SCRIPT_CONTEXTS_PER_SCOPE,

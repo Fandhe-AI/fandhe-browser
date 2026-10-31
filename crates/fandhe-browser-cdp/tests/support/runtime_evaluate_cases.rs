@@ -274,6 +274,8 @@ pub fn run(engine: &str) {
     rt.block_on(call_function_on(engine));
     eprintln!("case: callFunctionOn rejections");
     rt.block_on(call_function_on_rejections(engine));
+    eprintln!("case: CDP-2 compound selector via matches (#1363)");
+    rt.block_on(compound_selector(engine));
     eprintln!("case: callFunctionOn executionContextId");
     rt.block_on(call_function_on_execution_context(engine));
     eprintln!("case: awaitPromise");
@@ -1887,4 +1889,70 @@ async fn dom_node(engine: &str) {
         .pop()
         .expect("frame");
     assert!(is_err(&f, -32601, "method not implemented"), "{f}");
+}
+
+const COMPOUND_HTML: &str = "<html><body><span class=\"titleline\"><a href=\"/x\">X</a></span><a href=\"/y\">Y</a><table id=\"example\"><tbody><tr><td>1</td></tr><tr><td>2</td></tr></tbody></table><table class=\"waffle\"><tbody><tr><td>w</td></tr></tbody></table></body></html>";
+
+/// Playwright の `page.$` が複合セレクタで通る経路（#1363・`CDP-2`・`JS-5`）。
+/// 末尾の simple を `querySelectorAll` で取り、親・祖先を `Element.matches` で絞る
+/// （`_matchesParents` → `_matchesSimple` → `_matchesCSS`）形を、セレクタを引数で渡して再現する。
+async fn compound_selector(engine: &str) {
+    let mut c = Cdp::new(engine).with_html(COMPOUND_HTML);
+    let (p, ctx) = c.ready().await;
+    let h = c.handle(&p, ctx, "document").await;
+    let decl = "function (last, parent, combinator) { \
+        var out = []; \
+        var list = this.querySelectorAll(last); \
+        for (var i = 0; i < list.length; i++) { \
+            var el = list[i]; var ok = false; \
+            if (combinator === '>') { var q = el.parentElement; ok = !!q && q.matches(parent); } \
+            else { for (var q2 = el.parentElement; q2 && !ok; q2 = q2.parentElement) { ok = q2.matches(parent); } } \
+            if (ok) out.push(el); \
+        } \
+        return out; }";
+    let run = |last: &str, parent: &str, comb: &str, by_value: bool| {
+        json!({
+            "functionDeclaration": decl,
+            "objectId": h,
+            "arguments": [{"value": last}, {"value": parent}, {"value": comb}],
+            "returnByValue": by_value,
+        })
+    };
+
+    // `.titleline > a`: 要素ハンドルが返り、/y 側の a は除外される。
+    let f = c.callf(&p, run("a", ".titleline", ">", false)).await;
+    assert_eq!(ro(&f)["type"], "object", "{f}");
+    assert!(
+        f.get("result")
+            .and_then(|r| r.get("exceptionDetails"))
+            .is_none(),
+        "{f}"
+    );
+    let arr = ro(&f)["objectId"]
+        .as_str()
+        .expect("array objectId")
+        .to_owned();
+    let f = c
+        .callf(
+            &p,
+            json!({"functionDeclaration": "function () { return this.length + ':' + this[0].textContent + ':' + this[0].tagName; }", "objectId": arr, "returnByValue": true}),
+        )
+        .await;
+    assert_eq!(ro(&f), &json!({"type":"string","value":"1:X:A"}), "{f}");
+
+    // `#example tbody tr` は 2 件、`table.waffle tr` は 1 件。
+    let f = c.callf(&p, run("tr", "#example", " ", true)).await;
+    assert_eq!(ro(&f)["value"].as_array().map(Vec::len), Some(2), "{f}");
+    let f = c.callf(&p, run("tr", "table.waffle", " ", false)).await;
+    let arr = ro(&f)["objectId"]
+        .as_str()
+        .expect("array objectId")
+        .to_owned();
+    let f = c
+        .callf(
+            &p,
+            json!({"functionDeclaration": "function () { return this.length + ':' + this[0].textContent; }", "objectId": arr, "returnByValue": true}),
+        )
+        .await;
+    assert_eq!(ro(&f), &json!({"type":"string","value":"1:w"}), "{f}");
 }

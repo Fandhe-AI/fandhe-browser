@@ -90,7 +90,7 @@ use crate::dom::NodeData;
 use crate::dom::{Document, NodeId, SerializeScope};
 use crate::error::DomError;
 use crate::error::Error;
-use crate::query::{query_selector_all_str_bounded, query_selector_str};
+use crate::query::{element_matches_str, query_selector_all_str_bounded, query_selector_str};
 
 mod focus;
 mod node_equal;
@@ -417,6 +417,9 @@ enum DomOp {
     /// 2 ノードが DOM 標準の意味で等しいか（`Node.prototype.isEqualNode` の土台。JS-5・#1227）。
     /// 読み取り専用。比較は `node_equal.rs`（明示スタック・反復上限つき）。
     IsEqualNode,
+    /// 要素がセレクタに一致するか（`Element.prototype.matches` の土台。JS-5・#1363）。読み取り専用。
+    /// Playwright の複合セレクタ照合（`_matchesCSS`）が使う。不正なセレクタはエラー（false にしない。REPAIR-3）。
+    Matches,
     /// 親ノードを返す（`Node.prototype.parentNode` の土台。JS-5・#1203）。読み取り専用。
     /// 親が Element か文書ルートなら ID、親が無い・DocumentFragment なら null（shim にラッパー型が
     /// 無いため。簡略版の差異。REPAIR-3）。
@@ -512,6 +515,7 @@ impl DomOp {
             "netCancel" => Self::NetCancel,
             "isInclusiveAncestor" => Self::IsInclusiveAncestor,
             "isEqualNode" => Self::IsEqualNode,
+            "matches" => Self::Matches,
             "parentNode" => Self::ParentNode,
             "isFocusable" => Self::IsFocusable,
             "htmlLocalName" => Self::HtmlLocalName,
@@ -587,6 +591,7 @@ impl DomOp {
             Self::NetCancel => "netCancel",
             Self::IsInclusiveAncestor => "isInclusiveAncestor",
             Self::IsEqualNode => "isEqualNode",
+            Self::Matches => "matches",
             Self::ParentNode => "parentNode",
             Self::IsFocusable => "isFocusable",
             Self::HtmlLocalName => "htmlLocalName",
@@ -670,6 +675,7 @@ impl DomOp {
             | Self::TimerOrigin
             | Self::IsInclusiveAncestor
             | Self::IsEqualNode
+            | Self::Matches
             | Self::AttributeNameAt
             | Self::AttributeValueAt
             | Self::UrlParse => 2,
@@ -1725,6 +1731,24 @@ fn execute(
             let selector = string_arg(op, args, 2, limits)?;
             let found = query_selector_str(&page.document, scope, selector)?;
             page.encode_optional(found)
+        }
+        // 要素とセレクタの照合（#1363・JS-5。`Element.prototype.matches` の土台）。読み取り専用。
+        // 要素以外は false で返さず型エラーにする（shim 経由では届かないが、成功を装わない）。
+        DomOp::Matches => {
+            let node = page.node_arg(op, args, 1)?;
+            let selector = string_arg(op, args, 2, limits)?;
+            if !page.document.is_element(node) {
+                return Err(DomBridgeError::TypeMismatch {
+                    operation: op.name(),
+                    index: 1,
+                    expected: "an element node id",
+                });
+            }
+            Ok(JsValue::Bool(element_matches_str(
+                &page.document,
+                node,
+                selector,
+            )?))
         }
         DomOp::QuerySelectorAll => {
             let scope = page.node_arg(op, args, 1)?;
@@ -3620,6 +3644,27 @@ mod tests {
         call(&b, &[s("isEqualNode"), n(1e12), n(body)]).expect_err("invalid id");
         call(&b, &[s("isEqualNode"), s("1"), n(body)]).expect_err("type");
         call(&b, &[s("isEqualNode"), n(body)]).expect_err("arity");
+    }
+
+    /// JS-5・#1363: `matches` は単純・子・子孫結合子の照合、不正入力はエラー（入力文字列を漏らさない）。
+    #[test]
+    fn js_5_matches_op() {
+        let b = bridge();
+        let body = num(call(&b, &[s("body")]));
+        let p = num(call(&b, &[s("createElement"), s("p")]));
+        call(&b, &[s("appendChild"), n(body), n(p)]).expect("append");
+        let m = |sel: &str| call(&b, &[s("matches"), n(p), s(sel)]);
+        assert_eq!(m("p").expect("ok"), JsValue::Bool(true));
+        assert_eq!(m("body > p").expect("ok"), JsValue::Bool(true));
+        assert_eq!(m("html p").expect("ok"), JsValue::Bool(true));
+        assert_eq!(m("div p").expect("ok"), JsValue::Bool(false));
+        let err = m("a[SECRET").expect_err("invalid selector");
+        assert!(!err.to_string().contains("SECRET"), "{err}");
+        call(&b, &[s("matches"), n(1e12), s("p")]).expect_err("invalid id");
+        call(&b, &[s("matches"), n(p), n(1.0)]).expect_err("type");
+        call(&b, &[s("matches"), n(p)]).expect_err("arity");
+        let t = num(call(&b, &[s("createTextNode"), s("x")]));
+        call(&b, &[s("matches"), n(t), s("p")]).expect_err("text node");
     }
 
     /// JS-5・#1203: `parentNode` は body の子で body、html で文書ルート、ルートと切り離しで null、

@@ -30,6 +30,8 @@
 // - getElementsByTagName は簡略版（#1200）: live でない静的な Array で HTMLCollection（item / namedItem）
 //   ではない。照合は要素の名前空間ごと（HTML は小文字化・それ以外は大文字小文字を区別）。
 //   getElementsByTagNameNS・getElementsByClassName は未実装。
+// - Element.prototype.matches は実装済み（#1363。op `matches`）。closest・webkitMatchesSelector は未実装。
+//   不正なセレクタは DOMException SyntaxError ではなく bridge の Error になる。
 // - NodeList / HTMLCollection 互換（querySelectorAll は素の Array を返す）。
 // - Element の tagName / localName / nodeName は実装済み（#1236）。op `elementLocalName` と
 //   `htmlLocalName` から求め、HTML 名前空間の要素の tagName・nodeName は大文字。接頭辞付きの要素は
@@ -1095,6 +1097,18 @@
         writable: true,
         value: function (selector) {
             return querySelector(idOf(this, 'querySelector'), selector);
+        }
+    });
+    // matches（#1363）: Playwright の複合セレクタ照合（_matchesCSS）が使う。不正なセレクタは
+    // DOMException SyntaxError ではなく bridge の Error になる（querySelector と同じ差異）。
+    // closest・webkitMatchesSelector は未実装。
+    define(Element.prototype, 'matches', {
+        writable: true,
+        value: function matches(selectors) {
+            if (arguments.length < 1) {
+                throw new TypeError("Failed to execute 'matches' on 'Element': 1 argument required, but only 0 present.");
+            }
+            return op('matches', idOf(this, 'matches'), String(selectors)) === true;
         }
     });
     define(Element.prototype, 'querySelectorAll', {

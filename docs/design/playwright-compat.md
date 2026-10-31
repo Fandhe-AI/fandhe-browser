@@ -853,3 +853,23 @@ Puppeteer の `LifecycleWatcher` も同じ。これを受けて `Page.navigate` 
 - spec（`docs/spec`）は本調査環境で未取得のため、C の記述は spec 本文と未照合
 - 再現: `make trace-playwright`（`harness/playwright-trace/README.md`。ネットワークと node/npm が必要）。
   ソース確認は `npm pack playwright-core@1.63.0` で得た `lib/coreBundle.js` を一時ディレクトリで読む
+
+## 複合セレクタの `page.$`（#1363）
+
+`playwright-core@1.63.0` の `page.$` が複合セレクタ（#252 の c6 `.titleline > a`・e2 `#example tbody tr`・
+e3 `table.waffle tr`）で `TypeError: element.matches is not a function` になる問題（`CDP-2`・`CDP-4`・`JS-5`・TASK-44・TASK-46）。
+
+- **原因（種別 A: 再現テストで実証）**: DOM shim（`dom.js`）に `Element.prototype.matches` が無かった。
+  Playwright の注入スクリプト `SelectorEvaluatorImpl.query` は複合セレクタの末尾の simple だけを `querySelectorAll` で取得し
+  （shim にあるため単純セレクタは成功していた）、`_matchesParents`（`>` は親 1 つ、空白は祖先を順に）→ `_matchesSimple` →
+  `_matchesCSS` で `element.matches(css)` を呼ぶ（種別 B: `lib/coreBundle.js` の読解）。ノードは正しい Element で、
+  main / utility どちらの world でも同じ `dom.js` を注入するため world の違いは関係ない。
+  Puppeteer の `queryOne` はセレクタ全体を `querySelector` に渡し `matches` を呼ばないため、同じ 3 件が成功していた。
+- **修正**: core に読み取り専用の bridge op `matches`（`query::element_matches_str`）を足し、`Element.prototype.matches` として公開した。
+  不正なセレクタ・Element 以外の `this`・引数なしは例外（`false` にしない。`REPAIR-3`）。DOMException への写像は未対応で `querySelector` と同じ差異。
+- **確認（種別 A）**: `runtime_evaluate_cases.rs` の `compound_selector`（V8・boa）が Playwright と同じ手順を `Runtime.callFunctionOn` で再現し、
+  修正前は `q.matches is not a function` で失敗、修正後は `.titleline > a` が要素ハンドル（`1:X:A`）・`#example tbody tr` が 2 件・
+  `table.waffle tr` が 1 件（`1:w`）になることを確認した。`js_shim_cases.rs` と `dom_bridge.rs` に具体値のテストを置いた。
+- **未確認**: 実 Playwright での `page.$` の再実行と、#252 の c6・e2・e3 の再測定（外部サイト・人間担当）は未実施。
+- **残る差異（`REPAIR-3`）**: 兄弟結合子（`+`・`~`）は shim に `previousElementSibling` が無く、例外にならず不一致になる。
+  `closest`・`Node.prototype.contains`・`webkitMatchesSelector` も未実装。いずれも今回の `page.$` の経路外で、別 Issue で追跡する。
