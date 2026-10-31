@@ -278,8 +278,39 @@ fn plug4_refused_host_port_is_outside_ephemeral_range() {
 #[test]
 fn plug4_refused_host_port_has_no_wildcard_shadow() {
     let listener = common::bind_non_ephemeral_loopback();
-    let addr = listener.local_addr().expect("addr");
-    drop(listener);
+    let addr = common::close_and_wait_refused(listener);
     let wildcard = TcpListener::bind(("0.0.0.0", addr.port())).expect("wildcard bind");
     assert_eq!(wildcard.local_addr().expect("addr").port(), addr.port());
+}
+
+/// PLUG-4・Issue #1356: 並列の `Command::spawn`（fork から exec までの子が fd を保持する）があっても、
+/// `close_and_wait_refused` が返った時点と少し後のどちらでも、閉じたポートは拒否のままである。
+/// 待機をやめて単純な `drop` に戻すと、この競合で閉じたはずのポートが不定期に接続を受ける。
+#[test]
+fn plug4_closed_port_stays_refused_under_concurrent_spawns() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let stop = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&stop);
+    let spawner = thread::spawn(move || {
+        let exe = std::env::current_exe().expect("exe");
+        while !flag.load(Ordering::SeqCst) {
+            if let Ok(mut c) = Command::new(&exe)
+                .arg("--list")
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+            {
+                let _ = c.wait();
+            }
+        }
+    });
+    for _ in 0..20 {
+        let addr = common::close_and_wait_refused(common::bind_non_ephemeral_loopback());
+        assert_eq!(common::probe_listening(addr), common::ProbeOutcome::Closed);
+        thread::sleep(Duration::from_millis(10));
+        assert_eq!(common::probe_listening(addr), common::ProbeOutcome::Closed);
+    }
+    stop.store(true, Ordering::SeqCst);
+    spawner.join().expect("spawner thread");
 }
