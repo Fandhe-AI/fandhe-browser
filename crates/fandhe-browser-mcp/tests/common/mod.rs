@@ -94,7 +94,6 @@ pub enum ProbeOutcome {
 /// listen していないとみなす。範囲内のポートは同一プロセスの別テストの接続と衝突するため panic する。
 #[allow(dead_code)]
 pub fn probe_listening(addr: std::net::SocketAddr) -> ProbeOutcome {
-    use std::io::ErrorKind::ConnectionRefused;
     let (lo, hi) = ephemeral_port_range();
     assert!(
         !(lo..=hi).contains(&u32::from(addr.port())),
@@ -110,7 +109,6 @@ pub fn probe_listening(addr: std::net::SocketAddr) -> ProbeOutcome {
     }
     let _ = stream.set_write_timeout(Some(std::time::Duration::from_millis(500)));
     match stream.write_all(b"\r\n") {
-        Err(e) if e.kind() == ConnectionRefused => ProbeOutcome::Closed,
         Err(_) => ProbeOutcome::Closed,
         Ok(()) => ProbeOutcome::Listening,
     }
