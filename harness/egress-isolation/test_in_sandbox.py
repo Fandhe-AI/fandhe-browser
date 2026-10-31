@@ -34,6 +34,11 @@ def make_fake_host(tmp: Path, connect: list[list[object]]) -> Path:
     path.write_text(f"#!{sys.executable}\n{script}", encoding="utf-8")
     path.chmod(0o755)
     (tmp / "fake_host.config.json").write_text(json.dumps({"connect": connect}), encoding="utf-8")
+    if sys.platform == "win32":
+        # Windows の CreateProcess は shebang を解釈しないため、sys.executable 経由で起動する .cmd ラッパーを返す。
+        wrapper = tmp / "fake_host.cmd"
+        wrapper.write_text(f'@"{sys.executable}" "%~dp0fake_host.py" %*\r\n', encoding="utf-8")
+        return wrapper
     return path
 
 
@@ -217,12 +222,16 @@ class MeasureTest(unittest.TestCase):
             measure.validate_host("/nonexistent/host")
 
     def test_outer_listeners_are_loopback_only(self) -> None:
-        # macOS の lo0 は既定で 127.0.0.1 のみ。alias が無ければ bind できないため skip する
-        # （実測側は ensure_loopback_aliases が案内つきで止める）。
+        # macOS の lo0 は既定で 127.0.0.1 のみ。alias 不在（EADDRNOTAVAIL）の macOS に限って skip する
+        # （実測側は ensure_loopback_aliases が案内つきで止める）。Linux・Windows や想定外の bind エラーは失敗のまま。
         try:
             measure.ensure_loopback_aliases()
         except ValueError as exc:
-            self.skipTest(str(exc))
+            cause = exc.__cause__
+            if (sys.platform == "darwin" and isinstance(cause, OSError)
+                    and cause.errno == errno.EADDRNOTAVAIL):
+                self.skipTest(str(exc))
+            raise
         recs, ports = measure.start_outer_listeners()
         try:
             self.assertEqual(set(ports), {"redirect", "img", "fetch", "ws", "internal", "udp_direct"})
