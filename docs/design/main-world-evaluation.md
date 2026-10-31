@@ -50,7 +50,7 @@ puppeteer-core 25.12.0 の `src/` を一時ディレクトリに展開して読�
 
 読解と実測の食い違い:
 
-- 段 3 の `Runtime.evaluate` は `userGesture` も送る（読解では `contextId` 中心と記録し、`userGesture` を見落としていた）。fandhe の `Runtime.evaluate` は `userGesture` を未知キーとして拒否する（`Runtime.callFunctionOn` は受理して効果なし）
+- 段 3 の `Runtime.evaluate` は `userGesture` も送る（読解では `contextId` 中心と記録し、`userGesture` を見落としていた）。fandhe の `Runtime.evaluate` は `userGesture` を未知キーとして拒否する（`Runtime.callFunctionOn` は受理して効果なし）。実測当時の事実で、#1357 で受理済み（効果なし）
 - 送信順は 段 1 → 段 4 → 段 2（`addBinding`）→ 段 3 → 段 5 → 段 6。段 4 は `puppeteerUtil` を注入する前の isolated ハンドルの用意として先に行われる
 
 要点は次のとおり。

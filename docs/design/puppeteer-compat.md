@@ -36,7 +36,7 @@ Puppeteer のソースは長く引用せず、クラス・関数名と要約に�
 | `connect` | ok | 到達する見込み | 的中。`Target.getBrowserContexts`（#1323）→ `Target.setDiscoverTargets`（#1324）→ root の `Target.setAutoAttach`（#1334）が通り、`puppeteer.connect` が完了した（`defaultViewport: null`） |
 | `newPage` | ok | 未到達の見込み（`Page.addScriptToEvaluateOnNewDocument` で停止すると予測） | 外れ（#1340・#1334 の後は到達する）。`Target.createTarget` → tab → ページの attach、`Page.enable`・`Page.getFrameTree`・`Runtime.enable` 等の初期化、`Page.addScriptToEvaluateOnNewDocument`（sourceURL のみの source）、`Page.createIsolatedWorld` が成功した。`WebMCP.enable` は `-32601` だが Puppeteer は握りつぶして進んだ |
 | `goto` | ok | 未到達の見込み | 外れ。`Page.navigate` の応答後に `Page.lifecycleEvent`（`init`・`DOMContentLoaded`・`load`）・`Page.frameNavigated`・`Runtime.executionContextsCleared` と新しい contextId の `executionContextCreated`（main・isolated 各 1）が届き、完了した |
-| `selector` | **failed**: `ProtocolError`「Protocol error (Runtime.evaluate): unsupported params」（期限切れではない。サーバーの応答を受けた即時のエラー） | 未到達の見込み（`Runtime` なしで停止すると予測） | 外れ。main world の `Runtime.callFunctionOn`（#1345・#1347）→ `DOM.describeNode` → `DOM.resolveNode`（#1348）は成功し、isolated world への `puppeteerUtil` 注入の `Runtime.evaluate` が `userGesture` キーを `-32602` で拒否して停止した（下記「`page.$` の呼び出し連鎖」） |
+| `selector` | **failed**: `ProtocolError`「Protocol error (Runtime.evaluate): unsupported params」（期限切れではない。サーバーの応答を受けた即時のエラー） | 未到達の見込み（`Runtime` なしで停止すると予測） | 外れ。main world の `Runtime.callFunctionOn`（#1345・#1347）→ `DOM.describeNode` → `DOM.resolveNode`（#1348）は成功し、isolated world への `puppeteerUtil` 注入の `Runtime.evaluate` が `userGesture` キーを `-32602` で拒否して停止した（下記「`page.$` の呼び出し連鎖」）。#1357 で受理済み（再実測は未実施） |
 | `disconnect` | 未到達（`not_reached`） | 先行段階の失敗後は後始末のみ | `stages.mjs` の仕様どおり（先行失敗時は結果を上書きしない）。切断自体の実測は未実施 |
 
 実測の出力（`FANDHE_SCRIPT_RESULT` 行の要旨）: `ok:false`・`step:"selector"`・`stages` は connect/newPage/goto が `ok`、selector が `failed`（上記エラー）、disconnect が `not_reached`。
@@ -64,7 +64,7 @@ Playwright と異なり、`browserWSEndpoint` 指定の接続では HTTP の `/j
 | 7 | newPage | `FrameManager.#createIsolatedWorld` | `Page.createIsolatedWorld` `{frameId, worldName, grantUniveralAccess:true}` | `Runtime.executionContextCreated` を待って実行コンテキストを構築 | 実測で成功（`executionContextId:2`・直前に isolated の `executionContextCreated`）。遷移後は main・isolated の contextId が作り直される（3・4） | なし | A |
 | 8 | newPage | `EmulationManager`（`defaultViewport` 既定 800x600） | `Emulation.setDeviceMetricsOverride`・`Emulation.setTouchEmulationEnabled` 等 | 結果は使わない（失敗でページ作成が失敗する経路） | 実測では `defaultViewport: null` のため送信されなかった（未実測）。`Emulation.*` は実装しない（画面の識別面。`SEC-2`） | `defaultViewport: null` を前提とする（「測定条件」） | B |
 | 9 | goto | `Frame.goto`（`about:blank`） | `Page.navigate` `{url, frameId}`（実測では `referrer` 等は送られなかった） | 応答の `loaderId`・`errorText`。完了は `Page.lifecycleEvent`（`load` 等）・`Page.frameNavigated` を `LifecycleWatcher` が待つ | 実測で成功。応答の後に `Page.lifecycleEvent`（`init`）・`Runtime.executionContextsCleared`・`Page.frameNavigated`・main／isolated の `executionContextCreated`・`Page.domContentEventFired`・`lifecycleEvent`（`DOMContentLoaded`）・`Page.loadEventFired`・`lifecycleEvent`（`load`）の順に届いた（#1322 ほか） | なし | A |
-| 10 | selector | `Page.$("body")` | `Runtime.callFunctionOn`（main）→ `DOM.describeNode` → `DOM.resolveNode`（isolated）→ `Runtime.addBinding` ×2 → `Runtime.evaluate`（`puppeteerUtil`）→ `Runtime.callFunctionOn`（`queryOne`）→ …（実測の送信順。後半は未到達） | `RemoteObject`・`DOM.describeNode` の `node`・`resolveNode` の `object` | 実測で、前半は成功（main の `callFunctionOn` が `objectId:"3.1"`・`subtype:"node"`・`className:"Document"` を返し、describeNode／resolveNode が通った）。`Runtime.addBinding` は `-32601` で握りつぶされた。`puppeteerUtil` 注入の `Runtime.evaluate` が **`-32602 unsupported params`** で停止した（下記「`page.$` の呼び出し連鎖」） | `Runtime.evaluate` が `userGesture` を受理していない（`callFunctionOn` は受理する）。以降（`queryOne` 等）は未実測（B） | A（停止点まで）・B（以降） |
+| 10 | selector | `Page.$("body")` | `Runtime.callFunctionOn`（main）→ `DOM.describeNode` → `DOM.resolveNode`（isolated）→ `Runtime.addBinding` ×2 → `Runtime.evaluate`（`puppeteerUtil`）→ `Runtime.callFunctionOn`（`queryOne`）→ …（実測の送信順。後半は未到達） | `RemoteObject`・`DOM.describeNode` の `node`・`resolveNode` の `object` | 実測で、前半は成功（main の `callFunctionOn` が `objectId:"3.1"`・`subtype:"node"`・`className:"Document"` を返し、describeNode／resolveNode が通った）。`Runtime.addBinding` は `-32601` で握りつぶされた。`puppeteerUtil` 注入の `Runtime.evaluate` が **`-32602 unsupported params`** で停止した（下記「`page.$` の呼び出し連鎖」） | `Runtime.evaluate` の `userGesture` は #1357 で受理済み（効果なし。`REPAIR-3`）。`puppeteerUtil` の評価以降（`queryOne` 等）は未実測（B） | A（停止点まで）・B（以降） |
 | 11 | disconnect | `CdpBrowser.disconnect` | CDP メッセージ送信なしで transport を閉じると読める（未精査） | — | — | なし（見込み） | B |
 
 ### 実測で確認できた停止点と予測の境界
@@ -72,15 +72,15 @@ Playwright と異なり、`browserWSEndpoint` 指定の接続では HTTP の `/j
 実測（A）で確認できた停止点は 1 件。
 
 - **`Runtime.evaluate` の `userGesture`**: Puppeteer 25.12.0 は `puppeteerUtil`（約 10.5KB の式）の注入で `{expression, contextId:<isolated>, returnByValue:false, awaitPromise:true, userGesture:true}` を送る。
-  `Runtime.evaluate` の許可キーは `expression`・`contextId`・`returnByValue`・`awaitPromise`・`silent` で、`userGesture` が未知キーとして `-32602 unsupported params` になる（`crates/fandhe-browser-cdp/src/runtime/evaluate.rs`）。
+  実測当時の `Runtime.evaluate` の許可キーは `expression`・`contextId`・`returnByValue`・`awaitPromise`・`silent` で、`userGesture` が未知キーとして `-32602 unsupported params` になった。#1357 で `userGesture` を許可キーに加えた（`crates/fandhe-browser-cdp/src/runtime/evaluate.rs`）。
   式の長さ（10513 文字）は上限（`MAX_SCRIPT_CONTEXT_SOURCE_BYTES`=1MiB）内で、上限は原因ではない（読解。エラーは `unsupported params` で、長さ超過の文言ではない）。
-  `Runtime.callFunctionOn` は `userGesture` を受理して効果なしで流す（ユーザー活性化の概念を持たないため。`REPAIR-3`）。同じ扱いにするかは本書では決めない（修正は本 issue の範囲外）
+  `Runtime.callFunctionOn` は `userGesture` を受理して効果なしで流す（ユーザー活性化の概念を持たないため。`REPAIR-3`）。#1357 で `callFunctionOn` と同じ扱い（bool の型検査だけ・効果なし）にそろえた。他の未知キーは `-32602` のまま。再実測は未実施
 
 読解（B）の予測との差:
 
 - 予測した停止点（#1〜#11 のうち `newPage` の `addScriptToEvaluateOnNewDocument`、`goto` の `lifecycleEvent`、`selector` の `Runtime` 全般）は、#1340・#1322・#1345・#1347・#1348 等で解消済みで、実測では停止点にならなかった
 - `Runtime.addBinding`・`WebMCP.enable` の `-32601` は握りつぶされて進行を止めない（読解と一致。前者は #7 の「握りつぶし」の読みと同じ型）
-- `disconnect`（#11）と、`selector` の後半（`puppeteerUtil` の注入以降）は未実測。`userGesture` を受理した後に新たな停止点が出うる（`puppeteerUtil` の注入式が評価できるか、`queryOne` の `callFunctionOn` が引数 3 つ〔要素・selector・`puppeteerUtil` のハンドル〕を受理するか）
+- `disconnect`（#11）と、`selector` の後半（`puppeteerUtil` の注入以降）は未実測。#1357 で `userGesture` を受理したため、受理後に新たな停止点が出うる（`puppeteerUtil` の注入式が評価できるか、`queryOne` の `callFunctionOn` が引数 3 つ〔要素・selector・`puppeteerUtil` のハンドル〕を受理するか）
 
 ### `page.$` の呼び出し連鎖（実測。A）
 
@@ -92,7 +92,7 @@ Playwright と異なり、`browserWSEndpoint` 指定の接続では HTTP の `/j
 | 2 | ページ | `DOM.describeNode {objectId:"3.1"}` | main | 成功。`backendNodeId:1` 等 |
 | 3 | ページ | `DOM.resolveNode {backendNodeId:1, executionContextId:<isolated>}` | isolated | 成功。`objectId:"4.1"` |
 | 4 | ページ | `Runtime.addBinding {name:"puppeteer___ariaQuerySelector" と "puppeteer___ariaQuerySelectorAll", executionContextName:"__puppeteer_utility_world__25.12.0"}` ×2 | — | `-32601`。Puppeteer は握りつぶして進んだ |
-| 5 | ページ | `Runtime.evaluate {expression:<puppeteerUtil 約 10.5KB>, contextId:<isolated>, returnByValue:false, awaitPromise:true, userGesture:true}` | isolated | **`-32602 unsupported params`**（停止） |
+| 5 | ページ | `Runtime.evaluate {expression:<puppeteerUtil 約 10.5KB>, contextId:<isolated>, returnByValue:false, awaitPromise:true, userGesture:true}` | isolated | **`-32602 unsupported params`**（停止。#1357 で受理済み・再実測は未実施） |
 | 6 以降 | — | 未到達: `Runtime.callFunctionOn`（`queryOne`）、`DOM.describeNode`／`resolveNode`（isolated → main）、`Runtime.releaseObject` | — | 未実測（B） |
 
 main の `executionContextId` に送られた `functionDeclaration` は、この実行では順 1 の `() => { return document; }` の 1 件だけで、ページのグローバルを参照しない。
@@ -159,7 +159,7 @@ Puppeteer が接続段階で送る `Target.setAutoAttach` の `filter` の扱い
 - **着手順**: #1321 配下の Playwright 側の不足（例: DOMContentLoaded の lifecycleEvent〔#1322。`Page.navigate` が確定時に送出するようになった。`playwright-compat.md` の該当節〕）を先に直し、その後に案 (a) に着手する。Playwright で `CDP-4` の成功率を上げる方が効果が大きく、手間も小さいため
 - **案 (a) の実装時の確認事項**: tab ターゲットを `Target.getTargets`・`Target.targetCreated` 等に出すことで、Playwright の接続・`newPage` が後退しないことを `harness/playwright-connect`・`harness/endpoint-swap` で確かめる
 - **測定条件の前提**: Puppeteer は `defaultViewport: null` 以外では `Emulation.setDeviceMetricsOverride` で止まる。これは画面の識別面にあたり `SEC-2` で実装しないため、Puppeteer の測定は `defaultViewport: null` を前提とする
-- **実装状況**: 実装済み（#1334）。tab 擬似ターゲット・root と tab のセッションの `Target.setAutoAttach` の `filter`・`Target.setDiscoverTargets` の `filter:[{}]` への tab 通知を実装した。#1334 の時点では、`puppeteer-core@25.12.0` を一時導入して 1 回だけ手動実測し、`connect` は ok、`newPage` は `Page.addScriptToEvaluateOnNewDocument` で失敗した（履歴。その後 #1340 ほかで解消）。最新の実測は Issue #1349 の再実測（`connect`・`newPage`・`goto` が ok、`selector` が `Runtime.evaluate` の `userGesture` で停止）で、「到達段階のまとめ」を参照。Playwright 側は Rust の結合テスト（`playwright_flow` 等）が後退していないことを確認した範囲で、実 Playwright での再測定は未実施。詳細は次節
+- **実装状況**: 実装済み（#1334）。tab 擬似ターゲット・root と tab のセッションの `Target.setAutoAttach` の `filter`・`Target.setDiscoverTargets` の `filter:[{}]` への tab 通知を実装した。#1334 の時点では、`puppeteer-core@25.12.0` を一時導入して 1 回だけ手動実測し、`connect` は ok、`newPage` は `Page.addScriptToEvaluateOnNewDocument` で失敗した（履歴。その後 #1340 ほかで解消）。`userGesture` は #1357 で受理済みで、`selector` 後半は未実測。最新の実測は Issue #1349 の再実測（`connect`・`newPage`・`goto` が ok、`selector` が `Runtime.evaluate` の `userGesture` で停止）で、「到達段階のまとめ」を参照。Playwright 側は Rust の結合テスト（`playwright_flow` 等）が後退していないことを確認した範囲で、実 Playwright での再測定は未実施。詳細は次節
 
 ## tab 擬似ターゲットと `filter`
 
