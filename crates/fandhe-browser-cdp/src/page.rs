@@ -12,6 +12,8 @@
 //! - イベントは確定した遷移（結果が公開されたもの）に限り `Page.frameNavigated` →
 //!   `Page.loadEventFired` を送出する（TASK-42.3・#241）。失敗・中断・追い越された遷移では
 //!   送出しない。残るスタブは [`navigation_events`] を参照。
+//! - `Network.enable` 済みセッションには、実際に取得した文書の `Network.requestWillBeSent`・`responseReceived`・
+//!   `loadingFinished` を送る（`page.goto()` の `Response` のステータス用。#1364・`CDP-4`。差異は [`navigation_events`]）。
 //! - 評価器（core の `ScriptContextHandle`）が有効で、要求セッションが `Runtime.enable` 済みなら、確定時に
 //!   `Runtime.executionContextsCleared` を `frameNavigated` の前、`Runtime.executionContextCreated`
 //!   （main と `worldName` の isolated world）を後ろに挟む（TASK-44.6・#1217。順序は [`navigation_events`]）。
@@ -93,7 +95,7 @@ pub(crate) fn main_frame_id(target: Option<&TargetId>) -> &str {
 pub(crate) const MAIN_FRAME_MIME_TYPE: &str = "text/html";
 
 /// [`navigate`] の結果。将来の拡張（イベント用情報など）に備えて構造体にする（`REPAIR-4`）。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct NavigateOutcome {
     /// 払い出した世代番号から決定的に作る `loaderId`。
     pub loader_id: String,
@@ -108,6 +110,72 @@ pub(crate) struct NavigateOutcome {
     pub began: Option<NavigationGeneration>,
     /// ページ JS 実行段の結果（どの経路を通ったか。`REPAIR-4`）。
     pub script: ScriptStage,
+    /// core が実際に取得して commit した文書の取得結果（`Network.*` イベントの根拠。#1364・`CDP-4`）。
+    /// `about:blank`・検証失敗・取得失敗・中断（`Superseded`）では `None`（値を捏造しない。`CDP-6`・`SEC-2`）。
+    pub document: Option<DocumentResponse>,
+}
+
+/// `Content-Type` 生値の長さ上限（バイト）。超過・制御文字を含む値は切り詰めずに捨てる（`SEC-2`）。
+const MAX_CONTENT_TYPE_LEN: usize = 1024;
+
+/// commit した文書について core が実際に観測した取得結果（#1364・`CDP-4`・`CDP-6`・`SEC-2`）。
+///
+/// `navigate_gated` が `Fetcher::get` の結果から作り、`PageNavigate::handle` が
+/// `Network.requestWillBeSent`・`Network.responseReceived`・`Network.loadingFinished` の
+/// 組み立てに使う。Playwright・Puppeteer は `page.goto()` の `Response`（ステータス）を
+/// これらのイベントから作る。観測していない値（他の応答ヘッダ・reason phrase・タイミング内訳）は持たない。
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct DocumentResponse {
+    /// 最後のホップの HTTP ステータス。
+    pub status: u16,
+    /// 応答の `Content-Type` 生値。長さ上限超過・制御文字を含む場合は `None`。
+    pub content_type: Option<String>,
+    /// `Content-Type` の `;` より前を trim して ASCII 小文字にした値（無ければ空文字）。
+    pub mime_type: String,
+    /// 受信した本文のバイト数（reqwest は展開しないためワイヤ上の本文長と同じ。ヘッダ長は含まない）。
+    pub encoded_body_len: u64,
+    /// 取得開始直前の単調時計（秒）。
+    pub request_time: f64,
+    /// 取得開始直前の壁時計（UNIX 秒）。
+    pub wall_time: f64,
+    /// 取得完了直後の単調時計（秒）。
+    pub response_time: f64,
+}
+
+impl DocumentResponse {
+    /// `Content-Type` 生値を検査し、本文長などと合わせて組み立てる。`times` は
+    /// （取得開始の単調時計、取得開始の壁時計、取得完了の単調時計）。
+    fn new(
+        status: u16,
+        content_type: Option<&str>,
+        encoded_body_len: usize,
+        times: (f64, f64, f64),
+    ) -> Self {
+        let content_type = content_type
+            .filter(|c| c.len() <= MAX_CONTENT_TYPE_LEN && !c.chars().any(char::is_control))
+            .map(str::to_owned);
+        let mime_type = content_type
+            .as_deref()
+            .and_then(|c| c.split(';').next())
+            .map(|m| m.trim().to_ascii_lowercase())
+            .unwrap_or_default();
+        Self {
+            status,
+            content_type,
+            mime_type,
+            encoded_body_len: u64::try_from(encoded_body_len).unwrap_or(u64::MAX),
+            request_time: times.0,
+            wall_time: times.1,
+            response_time: times.2,
+        }
+    }
+}
+
+/// 壁時計の UNIX 秒（CDP `TimeSinceEpoch`）。時計が epoch 前なら 0。
+fn wall_clock_seconds() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0.0, |d| d.as_secs_f64())
 }
 
 /// ページ JS 実行段の結果。テストと診断が通った経路を具体値で確認できるようにする（`REPAIR-4`）。
@@ -315,6 +383,73 @@ fn lifecycle_event(
     }
 }
 
+/// 文書リクエストの `Network.requestWillBeSent`（#1364・`CDP-4`）。`requestId` は `loaderId` と同じ値
+/// （Playwright・Puppeteer のナビゲーション要求判定は `requestId === loaderId && type === "Document"`）。
+/// `url` は確定 URL（userinfo 除去済み）。`request.headers` は実際に送った `User-Agent` だけ
+/// （他のヘッダは観測していないため推測で埋めない。`SEC-2`）。
+fn request_will_be_sent_event(
+    frame_id: &str,
+    loader_id: &str,
+    url: &str,
+    doc: &DocumentResponse,
+) -> CdpEvent {
+    CdpEvent {
+        method: "Network.requestWillBeSent",
+        params: json!({
+            "requestId": loader_id,
+            "loaderId": loader_id,
+            "documentURL": url,
+            "frameId": frame_id,
+            "type": "Document",
+            "timestamp": doc.request_time,
+            "wallTime": doc.wall_time,
+            "initiator": { "type": "other" },
+            "redirectHasExtraInfo": false,
+            "hasUserGesture": false,
+            "request": {
+                "url": url,
+                "method": "GET",
+                "headers": { "User-Agent": fandhe_browser_core::USER_AGENT },
+            },
+        }),
+        session_id: None,
+    }
+}
+
+/// 文書リクエストの `Network.responseReceived`（#1364・`CDP-4`）。`hasExtraInfo` は必ず `false`
+/// （`true` だと Puppeteer・Playwright は `responseReceivedExtraInfo` を待って応答を保留する）。
+/// `statusText` は wire 上の値を観測していないため空文字。`headers` は観測した `Content-Type` だけ。
+fn response_received_event(
+    frame_id: &str,
+    loader_id: &str,
+    url: &str,
+    doc: &DocumentResponse,
+) -> CdpEvent {
+    let mut headers = serde_json::Map::new();
+    if let Some(ct) = &doc.content_type {
+        headers.insert("Content-Type".to_owned(), json!(ct));
+    }
+    CdpEvent {
+        method: "Network.responseReceived",
+        params: json!({
+            "requestId": loader_id,
+            "loaderId": loader_id,
+            "frameId": frame_id,
+            "type": "Document",
+            "timestamp": doc.response_time,
+            "hasExtraInfo": false,
+            "response": {
+                "url": url,
+                "status": doc.status,
+                "statusText": "",
+                "headers": Value::Object(headers),
+                "mimeType": doc.mime_type,
+            },
+        }),
+        session_id: None,
+    }
+}
+
 /// `navigation_events` の送出時刻（CDP `MonotonicTime`、秒）。`handle` が送出直前に単調時計を順に読むため
 /// `commit <= dom_content_loaded <= load`（非減少）になる。値は送出時刻で、実際の発火時刻ではない
 /// （スクリプトは commit 前に走る。`REPAIR-3`）。Chromium も DOMContentLoaded 系と load 系で
@@ -349,6 +484,8 @@ struct NavigationEventOptions<'a> {
     /// 評価コンテキストのイベント列（`Some` なら cleared / created を挟む）。
     runtime: Option<&'a [CdpEvent]>,
     timestamps: NavigationTimestamps,
+    /// `Some` なら文書の `Network.*` 3 イベントを挟む（`Network.enable` 済みで実際に取得した場合のみ。#1364）。
+    network: Option<&'a DocumentResponse>,
 }
 
 /// 確定した遷移の CDP イベント列を作る（TASK-42.3・`CDP-1`）。`PageNavigate::handle` が、遷移が確定し
@@ -356,9 +493,22 @@ struct NavigationEventOptions<'a> {
 /// `None` で返す。
 ///
 /// 順序の正本はここ。括弧付きは条件付きで、次の順に並べる。
-/// `[lifecycle{init}]` → `[Runtime.executionContextsCleared]` → `Page.frameNavigated` →
-/// `[Runtime.executionContextCreated…]` → `[Page.domContentEventFired]` → `[lifecycle{DOMContentLoaded}]` →
-/// `Page.loadEventFired` → `[lifecycle{load}]`。
+/// `[Network.requestWillBeSent]` → `[Network.responseReceived]` → `[lifecycle{init}]` →
+/// `[Runtime.executionContextsCleared]` → `Page.frameNavigated` →
+/// `[Runtime.executionContextCreated…]` → `[Network.loadingFinished]` → `[Page.domContentEventFired]` →
+/// `[lifecycle{DOMContentLoaded}]` → `Page.loadEventFired` → `[lifecycle{load}]`。
+///
+/// - `Network.*`（#1364・`CDP-4`・`CDP-6`）: `Network.enable` 済みセッションで、core が実際に文書を取得して
+///   commit した場合のみ（`about:blank`・取得失敗では送らない）。Playwright・Puppeteer の `page.goto()` の
+///   `Response`（ステータス）はこれらから作られる。`requestId` は `loaderId` と同じ値、`hasExtraInfo` は
+///   `false`。`requestWillBeSent` は同じ `loaderId` の `frameNavigated` より前（Playwright が保留文書へ結び付ける
+///   ため）。値は取得結果の実測のみで、観測していないヘッダ等は出さない（`SEC-2`）。差異（`REPAIR-3`）:
+///   リダイレクトの途中ホップは通知しない（core がチェーンを畳むため `redirectChain()` は空。`request.url` と
+///   `response.url` は最終 URL と最終ステータスの組）、`response.headers` は `Content-Type` のみ、
+///   `statusText` は空、`responseReceived` の時刻は応答全体の取得完了時刻、`encodedDataLength` は本文のみ、
+///   取得失敗時の `Network.loadingFailed` は未実装、要求元セッションにだけ送る。
+///   ソース読解（playwright-core 1.63.0・puppeteer-core 25.12.0）で `timing`・`remoteIPAddress` 等の欠落が
+///   許容されることを確認済み。
 ///
 /// - `lifecycle{*}`: `Page.enable` 済みかつ lifecycle 有効のセッション（43.3k・#1039）。
 /// - `Page.domContentEventFired`・`lifecycle{DOMContentLoaded}`: `DOMContentLoaded` が `Fired` の場合のみ。
@@ -396,7 +546,11 @@ fn navigation_events(
     let lifecycle = opts.gates.lifecycle;
     let dcl = opts.dom_content_loaded == DomContentLoaded::Fired;
     let ts = opts.timestamps;
-    let mut events = Vec::with_capacity(7 + opts.runtime.map_or(0, <[CdpEvent]>::len));
+    let mut events = Vec::with_capacity(10 + opts.runtime.map_or(0, <[CdpEvent]>::len));
+    if let Some(doc) = opts.network {
+        events.push(request_will_be_sent_event(frame_id, loader_id, url, doc));
+        events.push(response_received_event(frame_id, loader_id, url, doc));
+    }
     if lifecycle {
         events.push(lifecycle_event(
             frame_id,
@@ -423,6 +577,17 @@ fn navigation_events(
     });
     if let Some(created) = opts.runtime {
         events.extend(created.iter().cloned());
+    }
+    if let Some(doc) = opts.network {
+        events.push(CdpEvent {
+            method: "Network.loadingFinished",
+            params: json!({
+                "requestId": loader_id,
+                "timestamp": doc.response_time,
+                "encodedDataLength": doc.encoded_body_len,
+            }),
+            session_id: None,
+        });
     }
     if dcl && opts.gates.page_enabled {
         events.push(CdpEvent {
@@ -510,6 +675,7 @@ pub(crate) async fn navigate_gated(
             committed: None,
             began: None,
             script: ScriptStage::NotAttempted,
+            document: None,
         });
     }
     // 世代の払い出しは `gate` のロック内で行う。呼び出し側（`PageNavigate::handle`）は世代確認から
@@ -529,6 +695,7 @@ pub(crate) async fn navigate_gated(
         committed: None,
         began: Some(generation),
         script: ScriptStage::NotAttempted,
+        document: None,
     };
     // 評価コンテキスト（`Runtime.evaluate` の世代別コンテキスト）も同じ世代で失効させる。失敗は取得の
     // 失敗と同じ後処理（直近結果の無効化・URL を試行 URL へ）に乗せる。
@@ -564,8 +731,11 @@ pub(crate) async fn navigate_gated(
         };
     }
 
+    let request_time = monotonic_seconds();
+    let wall_time = wall_clock_seconds();
     match fetcher.get(url).await {
         Ok(resp) => {
+            let response_time = monotonic_seconds();
             // 共有状態・ターゲット表を更新する前に確定 URL の長さを検証する。超過分を commit
             // したうえでターゲット表だけ古いまま成功を返す不整合を作らない（`CDP-1`・`SEC-2`）。
             if resp.final_url().len() > MAX_URL_LEN {
@@ -578,6 +748,12 @@ pub(crate) async fn navigate_gated(
                 outcome.error_text = Some("net::ERR_ABORTED");
                 return Ok(outcome);
             }
+            let document = DocumentResponse::new(
+                resp.status(),
+                resp.content_type(),
+                resp.body().len(),
+                (request_time, wall_time, response_time),
+            );
             let fetched = resp.body_text_lossy();
             // ページ JS 実行段。アクターの待機中は `gate` を保持しない（他ターゲットを塞がない）。
             // 確定の審判は従来どおり `commit_navigation`（追い越された場合は `Superseded`）。
@@ -613,6 +789,7 @@ pub(crate) async fn navigate_gated(
                         seq: *seq,
                         result: nav.latest(),
                     });
+                    outcome.document = Some(document);
                 }
                 Err(StateError::Superseded { .. }) => {
                     outcome.error_text = Some("net::ERR_ABORTED");
@@ -1081,11 +1258,24 @@ impl CommandHandler for PageNavigate {
                         }
                         _ => None,
                     };
+                    // 実際に取得した文書があり、要求セッションが `Network.enable` 済みの場合だけ通知する。
+                    let network = match ctx.session_id {
+                        Some(sid)
+                            if ctx
+                                .state
+                                .registry()
+                                .is_domain_enabled(sid, SessionDomain::Network) =>
+                        {
+                            out.document.as_ref()
+                        }
+                        _ => None,
+                    };
                     let options = NavigationEventOptions {
                         gates,
                         dom_content_loaded: out.script.dom_content_loaded(),
                         runtime: runtime_events.as_deref(),
                         timestamps: NavigationTimestamps::now(),
+                        network,
                     };
                     for ev in navigation_events(
                         main_frame_id(target_id.as_ref()),
@@ -1323,7 +1513,61 @@ mod tests {
                 dom_content_loaded: t.1,
                 load: t.2,
             },
+            network: None,
         }
+    }
+
+    /// `Content-Type` から `mimeType` を導く境界値と、上限超過・制御文字の破棄（#1364・`SEC-2`）。
+    #[test]
+    fn cdp4_document_response_mime_type_and_content_type_validation() {
+        let t = (1.0, 2.0, 3.0);
+        let d = DocumentResponse::new(403, Some("Text/HTML ; charset=utf-8"), 7, t);
+        assert_eq!(d.status, 403);
+        assert_eq!(d.mime_type, "text/html");
+        assert_eq!(d.content_type.as_deref(), Some("Text/HTML ; charset=utf-8"));
+        assert_eq!(d.encoded_body_len, 7);
+        assert_eq!(
+            (d.request_time, d.wall_time, d.response_time),
+            (1.0, 2.0, 3.0)
+        );
+        let none = DocumentResponse::new(200, None, 0, t);
+        assert_eq!((none.content_type, none.mime_type.as_str()), (None, ""));
+        let long = "a".repeat(MAX_CONTENT_TYPE_LEN + 1);
+        let d = DocumentResponse::new(200, Some(&long), 0, t);
+        assert_eq!((d.content_type, d.mime_type.as_str()), (None, ""));
+        let d = DocumentResponse::new(200, Some("text/html\u{7}x"), 0, t);
+        assert_eq!((d.content_type, d.mime_type.as_str()), (None, ""));
+    }
+
+    /// `network` が `Some` のとき Network 3 イベントが正しい位置に入り、`None` なら従来の列と同じ（#1364）。
+    #[test]
+    fn cdp4_navigation_events_network_order_and_absence() {
+        let doc = DocumentResponse::new(200, Some("text/html"), 5, (1.0, 2.0, 3.0));
+        let mut o = opts(true, true, DomContentLoaded::Fired, None, (1.0, 2.0, 3.0));
+        let without: Vec<&str> = navigation_events("f", "1", "http://x/", &o)
+            .iter()
+            .map(|e| e.method)
+            .collect();
+        assert!(!without.iter().any(|m| m.starts_with("Network.")));
+        o.network = Some(&doc);
+        let with: Vec<&str> = navigation_events("f", "1", "http://x/", &o)
+            .iter()
+            .map(|e| e.method)
+            .collect();
+        assert_eq!(
+            with,
+            [
+                "Network.requestWillBeSent",
+                "Network.responseReceived",
+                "Page.lifecycleEvent",
+                "Page.frameNavigated",
+                "Network.loadingFinished",
+                "Page.domContentEventFired",
+                "Page.lifecycleEvent",
+                "Page.loadEventFired",
+                "Page.lifecycleEvent",
+            ]
+        );
     }
 
     /// `navigation_events` は `frameNavigated` → `loadEventFired` を具体値で返す（TASK-42.3・`CDP-1`）。
@@ -2340,6 +2584,172 @@ mod tests {
             assert!(st.app_state().navigation().latest().is_none());
             // ターゲット表の URL も、文書を持たない状態と食い違わないよう試行 URL へ揃う。
             assert_eq!(st.registry().target(&tid).unwrap().url(), dead);
+        }
+
+        /// `Network.*` イベントの method 名だけを順に取り出す。
+        fn network_methods(f: &[Value]) -> Vec<String> {
+            f.iter()
+                .filter_map(|v| v["method"].as_str())
+                .filter(|m| m.starts_with("Network."))
+                .map(str::to_owned)
+                .collect()
+        }
+
+        /// `Network.enable` 済みセッションで `page.goto()` する前提を作り、遷移結果のフレーム列を返す。
+        async fn navigate_with_network(url: &str, enable_network: bool) -> Vec<Value> {
+            use crate::target::TargetKind;
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let d = allowed_dispatcher();
+            let tid = st
+                .registry()
+                .create_target(TargetKind::Page, "about:blank")
+                .unwrap();
+            let sid = st.registry().attach(&tid).unwrap();
+            if enable_network {
+                st.registry()
+                    .enable_domain(&sid, SessionDomain::Network)
+                    .unwrap();
+            }
+            let req = json!({"id": 1, "method": "Page.navigate",
+                "sessionId": sid.as_str(), "params": {"url": url}});
+            frames(d.dispatch(&st, &req.to_string()).await)
+        }
+
+        /// `page.goto()` の `Response.status()` の根拠になる `Network.responseReceived` が、実際のステータス
+        /// （200・403・404）を運ぶ。`requestId`・`loaderId`・`frameNavigated` の組と順序も具体値で確かめる
+        /// （#1364・`CDP-4`・`CDP-6`）。
+        #[tokio::test]
+        async fn cdp4_network_events_report_actual_document_status_200_403_404() {
+            for (status_line, code) in [
+                ("200 OK", 200u16),
+                ("403 Forbidden", 403),
+                ("404 Not Found", 404),
+            ] {
+                let body = "<p>doc</p>";
+                let url = format!("http://127.0.0.1:{}/", serve(status_line, body));
+                let f = navigate_with_network(&url, true).await;
+                assert_eq!(
+                    network_methods(&f),
+                    [
+                        "Network.requestWillBeSent",
+                        "Network.responseReceived",
+                        "Network.loadingFinished"
+                    ]
+                );
+                let by = |m: &str| f.iter().find(|v| v["method"] == m).unwrap().clone();
+                let loader = f[0]["result"]["loaderId"].as_str().unwrap().to_owned();
+                let sent = by("Network.requestWillBeSent");
+                let recv = by("Network.responseReceived");
+                let fin = by("Network.loadingFinished");
+                let nav = by("Page.frameNavigated");
+                assert_eq!(sent["params"]["requestId"], json!(loader));
+                assert_eq!(sent["params"]["loaderId"], json!(loader));
+                assert_eq!(nav["params"]["frame"]["loaderId"], json!(loader));
+                assert_eq!(sent["params"]["type"], json!("Document"));
+                assert_eq!(sent["params"]["request"]["method"], json!("GET"));
+                assert_eq!(sent["params"]["request"]["url"], json!(url));
+                assert_eq!(
+                    sent["params"]["request"]["headers"],
+                    json!({"User-Agent": fandhe_browser_core::USER_AGENT})
+                );
+                assert_eq!(recv["params"]["requestId"], json!(loader));
+                assert_eq!(recv["params"]["hasExtraInfo"], json!(false));
+                assert_eq!(recv["params"]["response"]["status"], json!(code));
+                assert_eq!(recv["params"]["response"]["statusText"], json!(""));
+                assert_eq!(recv["params"]["response"]["url"], json!(url));
+                assert_eq!(recv["params"]["response"]["mimeType"], json!("text/html"));
+                assert_eq!(
+                    recv["params"]["response"]["headers"],
+                    json!({"Content-Type": "text/html"})
+                );
+                assert_eq!(fin["params"]["requestId"], json!(loader));
+                assert_eq!(fin["params"]["encodedDataLength"], json!(body.len()));
+                // requestWillBeSent は frameNavigated より前（Playwright の保留文書の結び付け）。
+                let pos = |m: &str| f.iter().position(|v| v["method"] == m).unwrap();
+                assert!(pos("Network.requestWillBeSent") < pos("Page.frameNavigated"));
+                assert!(pos("Network.responseReceived") < pos("Page.frameNavigated"));
+                assert!(pos("Page.frameNavigated") < pos("Network.loadingFinished"));
+                assert!(pos("Network.loadingFinished") < pos("Page.loadEventFired"));
+            }
+        }
+
+        /// `Network.enable` していないセッションには `Network.*` を送らない（#1364・既存のイベント列は不変）。
+        #[tokio::test]
+        async fn cdp4_network_events_not_sent_without_network_enable() {
+            let url = format!("http://127.0.0.1:{}/", serve("200 OK", "x"));
+            let f = navigate_with_network(&url, false).await;
+            assert_eq!(network_methods(&f), Vec::<String>::new());
+            assert!(f.iter().any(|v| v["method"] == "Page.frameNavigated"));
+        }
+
+        /// `about:blank` と取得失敗では取得していないため `Network.*` を送らない（`CDP-6`・`SEC-2`）。
+        #[tokio::test]
+        async fn cdp4_network_events_not_sent_for_about_blank_and_failed_fetch() {
+            let f = navigate_with_network("about:blank", true).await;
+            assert_eq!(network_methods(&f), Vec::<String>::new());
+            let f = navigate_with_network(&dead_url(), true).await;
+            assert_eq!(network_methods(&f), Vec::<String>::new());
+            assert!(f[0]["result"]["errorText"].is_string());
+        }
+
+        /// ブラウザレベル（`sessionId` なし）の遷移では `Network.*` を送らない（#1364）。
+        #[tokio::test]
+        async fn cdp4_network_events_not_sent_for_browser_level_navigation() {
+            let dir = TempDir::new();
+            let st = state(&dir);
+            let d = allowed_dispatcher();
+            let url = format!("http://127.0.0.1:{}/", serve("200 OK", "x"));
+            let req = json!({"id": 1, "method": "Page.navigate", "params": {"url": url}});
+            let f = frames(d.dispatch(&st, &req.to_string()).await);
+            assert_eq!(network_methods(&f), Vec::<String>::new());
+        }
+
+        /// リダイレクトでは最終 URL と最終ステータスの組だけを 1 件通知する（途中ホップは通知しない。`REPAIR-3`）。
+        #[tokio::test]
+        async fn cdp4_network_events_report_final_hop_after_redirect() {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+            let port = listener.local_addr().expect("addr").port();
+            thread::spawn(move || {
+                for mut s in listener.incoming().flatten() {
+                    thread::spawn(move || {
+                        let head = drain_request_head(&mut s);
+                        let resp = if head.starts_with("GET /final") {
+                            "HTTP/1.1 404 Not Found\r\nContent-Type: text/plain; charset=UTF-8\r\nContent-Length: 4\r\nConnection: close\r\n\r\ngone".to_owned()
+                        } else {
+                            "HTTP/1.1 302 Found\r\nLocation: /final\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_owned()
+                        };
+                        let _ = s.write_all(resp.as_bytes());
+                    });
+                }
+            });
+            let f = navigate_with_network(&format!("http://127.0.0.1:{port}/start"), true).await;
+            assert_eq!(
+                network_methods(&f),
+                [
+                    "Network.requestWillBeSent",
+                    "Network.responseReceived",
+                    "Network.loadingFinished"
+                ]
+            );
+            let sent = f
+                .iter()
+                .find(|v| v["method"] == "Network.requestWillBeSent")
+                .unwrap();
+            let recv = f
+                .iter()
+                .find(|v| v["method"] == "Network.responseReceived")
+                .unwrap();
+            let final_url = format!("http://127.0.0.1:{port}/final");
+            assert_eq!(sent["params"]["request"]["url"], json!(final_url));
+            assert!(sent["params"].get("redirectResponse").is_none());
+            assert_eq!(recv["params"]["response"]["url"], json!(final_url));
+            assert_eq!(recv["params"]["response"]["status"], json!(404));
+            assert_eq!(recv["params"]["response"]["mimeType"], json!("text/plain"));
+            assert_eq!(
+                recv["params"]["response"]["headers"],
+                json!({"Content-Type": "text/plain; charset=UTF-8"})
+            );
         }
 
         /// 閉じたポートの URL を返す。

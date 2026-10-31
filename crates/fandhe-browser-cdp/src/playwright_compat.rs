@@ -19,8 +19,8 @@
 //! `Runtime.runIfWaitingForDebugger` を足す。
 //! 43.3i（#1037）で `Page.enable`（セッション単位の有効フラグ。実効果は `Page.lifecycleEvent` 送出ゲートの片方のみ）と
 //! `Page.getFrameTree`（メインフレームのみ）を足す。
-//! 43.3j（#1038）で `Log.enable`・`Runtime.enable`・`Network.enable`（セッション単位の有効フラグのみ。
-//! イベントは送らない。`REPAIR-3`）を足す。
+//! 43.3j（#1038）で `Log.enable`・`Runtime.enable`・`Network.enable`（セッション単位の有効フラグ。
+//! `Network.*` は #1364 で `Page.navigate` が取得した文書の 3 イベントのみ送る。`REPAIR-3`）を足す。
 //! #1326 で `Performance.enable`・`Audits.enable`（セッション単位の有効フラグのみ。イベント・計測なし。`REPAIR-3`）を足す。
 //! 43.3k（#1039）で `Page.setLifecycleEventsEnabled`（セッション単位の有効フラグ。`Page.enable` 済みの
 //! セッションの `Page.navigate` が `Page.lifecycleEvent` の `init`・`load` を送る。#1322 で `DOMContentLoaded` も送る）を足す。
@@ -1249,9 +1249,10 @@ impl CommandHandler for RuntimeEnable {
 
 /// `Network.enable`（`CDP-2`・TASK-43.3j・#1038）。
 ///
-/// セッションに有効フラグを立てて `{}` を返す（冪等）。差異（`REPAIR-3`）: `Network.requestWillBeSent`・
-/// `responseReceived`・`loadingFinished`・`loadingFailed` は送らない（将来仕様は `Page.navigate` の fetch に
-/// 対する送出。後続 issue で追跡）。バッファ系 params（`maxTotalBufferSize`・`maxResourceBufferSize`・
+/// セッションに有効フラグを立てて `{}` を返す（冪等）。差異（`REPAIR-3`）: 有効化したセッションには、
+/// `Page.navigate` が実際に取得した文書について `Network.requestWillBeSent`・`responseReceived`・
+/// `loadingFinished` だけを送る（#1364・`CDP-4`。条件・順序・差異は `page::navigation_events`）。
+/// `loadingFailed`・サブリソース・リダイレクト途中ホップは送らない（後続 issue で追跡）。バッファ系 params（`maxTotalBufferSize`・`maxResourceBufferSize`・
 /// `maxPostDataSize`・`reportDirectSocketTraffic` 等）は未実装のため `UNSUPPORTED_PARAMS`。
 /// フラグは fetch の挙動・ヘッダ・UA を何も変えない（`SEC-2`）。検証は [`enable_session_domain`]。
 pub(crate) struct NetworkEnable;

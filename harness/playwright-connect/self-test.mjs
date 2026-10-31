@@ -30,7 +30,7 @@ function fake({ failAt, hangAt, lateRejectAt, text = FIXTURE_EXPECT.text, attr =
   const page = {
     goto: (u, o) => {
       calls.gotoArgs = [u, o];
-      return maybe("goto", null);
+      return maybe("goto", { status: () => 200 });
     },
     waitForLoadState: (s, o) => {
       calls.loadStateArgs = [s, o];
