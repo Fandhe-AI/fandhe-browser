@@ -1,7 +1,7 @@
 # Servo ホストの egress 隔離方式: 3 OS の比較設計と実測計画
 
-- **状態**: 設計（比較と実測計画）。**方式の採否は決めない**。決定は実測の後にオーナーが行う（#1003）
-- **対応**: TASK-38・MS-4・`RENDER-3`・`SEC-2`・`PLUG-1`・`XOS-1`・Issue #1368（親判断 #1003）。関連は `RENDER-1`
+- **状態**: 設計（比較と実測計画）。**方式の最終決定は実測の後にオーナーが行う**（#1003）。2026-10-31 の暫定判断（Linux を先行・macOS と Windows は実測まで D の扱い）を §8 に、Linux の実測結果を §6.4 に記録した
+- **対応**: TASK-38・MS-4・`RENDER-3`・`SEC-2`・`PLUG-1`・`XOS-1`・Issue #1368（親判断 #1003）。関連は `RENDER-1`。後続は #1386（docker 経路の再実測）・#1387（macOS・Windows の実測ハーネス）
 - **入力資料**: [servo-host-egress-options.md](./servo-host-egress-options.md)（#1317。手段ごとの詳細表・Servo 0.7 の net 層の事実・承認事項の洗い出し。以下「options §n」と書く）。設計の親は [servo-host-design.md](./servo-host-design.md) §2.5・§13 項目 6
 - **確度の表記**: 「確認済み」は原文またはコードを確認した事項、「推測」は読んだ範囲からの推論、「未確認」は調べていない事項。一次情報は options の出典（参照日 2026-10-29、Servo は `v0.7.0` タグ）に従い、判断の前に原文で再確認する。本書では新たな外部ページの再取得はしていない
 - **spec 側の課題**（本リポからは編集しない。要報告）: egress 方針に専用のビヘイビア ID が無い。`RENDER-3` の本文はホストのサイズ・ビルド時間とオプトイン配布の設計材料で egress を扱わない。対応づけの確認は spec 側で行う
@@ -54,7 +54,7 @@ B の具体形は次の 2 つ。外部 http/https に出る要件があるため
 
 | 手段 | ① 宛先の粒度 | ② 被覆 | ③ 権限 | ④ 配布 | ⑤ PNA | ⑥ PLUG-1 |
 | ---- | ------------ | ------ | ------ | ------ | ----- | -------- |
-| netns（user ns + net ns。`unshare` / `bwrap`） | 全遮断。プロキシへは中継プロセスが要る（options §3.1。推測） | 全経路（WebSocket・UDP・DNS 含む） | カーネル上は非特権。Ubuntu 24.04 の AppArmor 制限で ns 内 capability が拒否される（options の記述） | Docker 既定 seccomp で `unshare` が拒否されうる（未確認） | 変えない | `pre_exec` + `unshare` は `unsafe`。`bwrap` は外部バイナリ |
+| netns（user ns + net ns。`unshare` / `bwrap`） | 全遮断。プロキシへは中継プロセスが要る（options §3.1。推測） | 全経路（WebSocket・UDP・DNS 含む） | カーネル上は非特権。Ubuntu 24.04 の AppArmor 制限で ns 内 capability が拒否される（options の記述）。カーネル 7.0.0-34 の Ubuntu では `unshare -n` が EPERM、`bwrap --unshare-net` は成功（確認済み。§6.4） | Docker 既定 seccomp 下で `unshare -n` は EPERM（確認済み。§6.4）。イメージに bwrap が無く、Docker 内での bwrap の可否は未確認 | 変えない | `pre_exec` + `unshare` は `unsafe`。`bwrap` は外部バイナリ |
 | コンテナ外部の netns（`docker run --network none` 等） | 全遮断。プロキシへは別途経路が要る（未設計） | 全経路 | docker 権限（ホスト側の運用） | 前例あり（`isolation_check.py`。#55 の判断。保存済みページ撮影のみ） | 変えない | 本体の外側の隔離で、ホスト本体のコードは増えない |
 | Landlock net（ABI 4、6.7 以降） | TCP のポート単位。宛先 IP は不可（options §3.1。確認済みとして記載） | TCP は被覆。ABI 4 は UDP・DNS を制限しない | 非特権（`no_new_privs`）。userns 不要 | Docker 既定 seccomp は `landlock_*` を許可（options の記述） | プロキシと同ポートの別 IP への直接接続は塞げない | 依存（`landlock` 等）と syscall の `unsafe` が候補（承認事項） |
 | seccomp-bpf（socket 種別） | `socket()` の domain・type のみ。`connect()` の宛先は見えない | UDP・RAW を禁止して補完する役 | 非特権 | 同上 | 宛先 IP は絞れない | BPF 組み立ての依存か自前（承認事項） |
@@ -83,11 +83,11 @@ B の具体形は次の 2 つ。外部 http/https に出る要件があるため
 
 | OS | 見立て | 決める未確認事項 |
 | -- | ------ | ---------------- |
-| Linux | 見込みあり（条件付き）。Landlock + seccomp + プロキシ、またはコンテナ外部の netns。後者は運用側で隔離する前提 | 6.7 未満のカーネルでの扱い。宛先 IP を絞れない限界（options §4.1）。Docker 既定 seccomp と Ubuntu の AppArmor 制限下の挙動 |
+| Linux | 見込みあり（条件付き）。Landlock + seccomp + プロキシ、またはコンテナ外部の netns。後者は運用側で隔離する前提。2026-10-31 の暫定判断で bwrap `--unshare-net` を主方式とした（§8） | 6.7 未満のカーネルでの扱い。宛先 IP を絞れない限界（options §4.1）。Docker 既定 seccomp と Ubuntu の AppArmor 制限下の netns の作り方は §6.4 で確認済み（Docker 内での bwrap の可否は未確認） |
 | macOS | 条件付き。`(deny network*)` + loopback のプロキシのポートだけ許可 | `remote ip "localhost:<port>"` の実動作。非推奨 API が将来の OS で消える可能性。ヘッドレスでの GPU・フォントの動作（`RENDER-4` の前歴） |
 | Windows | 不成立の公算が高い | AppContainer の loopback 例外に管理者権限が要るか。ホストが AppContainer 内で動くか |
 
-B が成立しない OS の既知の制約として明記する文言（D）の置き場所の候補は、設計 §2.5 と README。文言は実測の後に決める。
+B が成立しない OS の既知の制約として明記する文言（D）の置き場所の候補は、設計 §2.5 と README。文言の方針は §8 の 2（2026-10-31 の暫定判断）で決まった。置き場所は未定。
 
 ## 5. 補助 A の位置づけ
 
@@ -123,8 +123,50 @@ loopback で配信するフィクスチャページ（`harness/render-screenshot
 
 ### 6.3 実施の扱い
 
-- `xos-measure.yml`（手動専用・required ではない）への suite 追加と測定ハーネスの実装は後続 issue（infra-builder・render-builder）とする。本 issue では計画を書くだけにする
+- `xos-measure.yml`（手動専用・required ではない）への suite 追加と測定ハーネスの実装は後続 issue（infra-builder・render-builder）とする。本 issue では計画を書くだけにする。Linux 版のハーネスは `harness/egress-isolation/`（#1377・#1380）で実装済み（結果は §6.4）
 - 依存・`unsafe` を要する測定用コードは承認の後にする
+
+### 6.4 Linux の実測結果（c56f11c2・2026-10-31）
+
+`harness/egress-isolation/`（#1377・#1380）で Linux を 1 回測った結果の要約（TASK-38・`RENDER-1`）。依存・`unsafe` を使わない範囲の測定で、値は #1003 のコメント「Linux の egress 隔離の実測（c56f11c2・2026-10-31）」の範囲に限る。生データと根拠の詳細はそちらを正とする。測定は事実の記録で、方式の採否はここで決めない（判断は §8）。
+
+環境:
+
+| 項目 | 値 |
+| ---- | -- |
+| コミット | `c56f11c2`（origin/main） |
+| OS・カーネル | Ubuntu・カーネル 7.0.0-34-generic（x86_64・glibc 2.43） |
+| sysctl | `kernel.apparmor_restrict_unprivileged_userns=1`・`kernel.unprivileged_userns_clone=1`・`user.max_user_namespaces=102024`・`net.ipv4.ip_unprivileged_port_start=1024` |
+| ツール | bubblewrap 0.11.1・Docker 29.8.1 |
+| Landlock | LSM に有効・ABI 8（バージョンの問い合わせのみ。ルールの適用は未測定） |
+| netns の作り方 | `bwrap --unshare-net` は成功。特権なしの `unshare -n`・`unshare -rn` は EPERM（AppArmor の制限下）。bwrap の ns 内には `CAP_NET_ADMIN` が無く、`ip addr add` は EPERM（veth は作れない） |
+| Docker 既定 seccomp 下 | `unshare -n` は EPERM、Landlock ABI の問い合わせは成功、イメージに bwrap は無い（a5770058 時点の測定。#1003 のコメント「Linux 実測の記録（#1377 のハーネス）」） |
+| ホスト | `servo-host` の dev ビルド（`cargo build --manifest-path servo-host/Cargo.toml --locked`）。プロキシ系環境変数なし |
+
+モード別の結果（経路の記号は §6.1）:
+
+| 経路 | ベースラインの外側受信（陽性対照） | bwrap `--unshare-net` | docker `--network none` | 観測手段 |
+| ---- | ---------------------------------- | --------------------- | ----------------------- | -------- |
+| redirect（i） | 1 | pass | unobservable | 外側・内側の listener |
+| img（ii） | 1 | pass | unobservable | 同上 |
+| fetch（ii） | 1 | pass | unobservable | 同上 |
+| ws（iii） | 1 | pass | unobservable | 同上 |
+| internal（iv。代替宛先 127.0.0.3） | 1 | pass | unobservable | 同上 |
+| udp_direct（v） | 1 | pass | unobservable | ハーネスの UDP プローブ（Servo の送信ではない） |
+| internal_real（iv。`10.255.255.1`・`169.254.169.254`・`fd00::1`） | 対象外 | pass（connect が `ENETUNREACH`） | unobservable | 経路表と connect のみの構造検査（外部からの観測ではない） |
+| dns（v） | 対象外 | pass（固定 nameserver への UDP connect が `ENETUNREACH`・`getaddrinfo` は `gaierror:-3`） | unobservable | 経路表とハーネスの `getaddrinfo` による構造検査（Servo 自身の DNS は観測していない） |
+
+- bwrap `--unshare-net`: 8 経路すべて pass。全経路で外側 listener の受信 0 件・内側 listener の試行 1 件。`egress_guard` は 856 回走査して違反なし（補助の位置づけ）。隔離の事前検査は「lo のみ」、ホストの sha256 はベースラインと一致した
+- docker `--network none`: 全経路 unobservable で、判定できていない。1 回目はイメージ `fandhe-render-screenshot:local` に同梱のホストがベースラインのビルドと別のバイナリで、ハーネスが同一性の不一致として unobservable にした（生データは外側 0・内側 1）。2 回目は今回のビルドを入れた一時イメージで、ホストが `GLIBC_2.43` を要求し、イメージ（Debian 13・glibc 2.41）で起動できなかった（`--selftest` rc=1。正の対照の失敗として全経路 unobservable）。glibc をそろえた再実測は #1386
+- 正の対照: bwrap と docker（1 回目）のどちらでも `--selftest` は rc=0、loopback ページの `load` は成功した。`redirect` のページの `load` は baseline を含む全モードで timeout で、隔離に起因する差ではない（外側の受信は baseline で 1 件）
+- 先行測定: a5770058 時点の測定（#1003 のコメント「Linux 実測の記録（#1377 のハーネス）」）では、2026-10-27 ビルドのイメージから取り出したホストをベースラインと隔離の両方に使い、docker `--network none` でも外側の受信は 0 件だった。ホストが現在のコミットのビルドではないため、本節は c56f11c2 の測定を記録とする
+
+未測定（残りの追跡は §9.2）:
+
+- docker `--network none` での同一バイナリによる判定（#1386）
+- Servo 自身の DNS・UDP 送信の外部観測（root か `CAP_NET_ADMIN` が要る）
+- Landlock ルールの適用・seccomp・許可リスト付きプロキシとの併用（§7 の承認事項）
+- macOS・Windows（#1387）、AppArmor の制限が無い環境・古いカーネル
 
 ## 7. 承認事項（実装しない）
 
@@ -138,23 +180,41 @@ loopback で配信するフィクスチャページ（`harness/render-screenshot
 | 変更 | `servo-host/src/engine.rs` の `fixed_preferences`（proxy pref の注入。クライアントから任意引数を渡さない方針〔設計 §2.6〕と整合させる） |
 | CI | `xos-measure.yml` への suite 追加（required ではないため ruleset への影響なし） |
 
-## 8. オーナー判断が要る点
+## 8. オーナー判断（2026-10-31・暫定）
 
-- GA で必須とする成立範囲（3 OS 揃えるか、Linux を先行するか）
-- B が成立しない OS の既知の制約の文言（D）
-- Windows の扱い（弱い保証にとどめるか、対象外とするか）
+- **判断日**: 2026-10-31。根拠は #1003 のコメント「オーナー判断（2026-10-31）: §8 の 3 点」で、Linux の実測（§6.4）を受けたもの
+- **macOS・Windows の実測前の暫定判断**で、実測の後に見直す。方式の最終決定（§1）は引き続き実測の後に行う
+- 対応: TASK-38・`RENDER-1`・`SEC-2`・`XOS-1`
+
+| 論点（判断前の問い） | 判断 | 後続 |
+| -------------------- | ---- | ---- |
+| 1. GA で必須とする成立範囲（3 OS 揃えるか、Linux を先行するか） | Linux を先行する。Linux は B（OS 隔離）として bwrap `--unshare-net` を主方式にする（§6.4 で 8 経路すべて pass）。docker `--network none` は、配布コンテナとホストの glibc をそろえてから測り直す | #1386 |
+| 2. B が成立しない OS・環境での既知の制約の文言（D） | OS 隔離が使えない環境では A（アプリ側の検知）だけで動作し、「egress を完全には遮断できない」と明記する。既定ではそのことを警告する | 文言の置き場所は §4 の候補（設計 §2.5・README）から選ぶ（未定） |
+| 3. Windows の扱い（弱い保証にとどめるか、対象外とするか） | macOS・Windows の実測が済むまで GA の成立範囲から外し、D の扱いとする | #1387 |
+
+- 「8 経路すべて pass」のうち `internal_real`・`dns` は構造検査で、Servo 自身の DNS・UDP 送信は外部から観測していない（§6.4）
 
 ## 9. 未確認事項
 
-options §7 を引き継ぐ。本書で新たに加わる未確認事項はない。ただし Docker 既定 seccomp 下での `unshare` の挙動と、Landlock の実機の対応カーネルは、実測計画（§6.2）で確かめる。
+options §7 を引き継ぐ。本書で新たに加わる未確認事項はない。§6.2 で確かめるとしていた Docker 既定 seccomp 下での `unshare` の挙動と Landlock の実機の対応は、Linux（カーネル 7.0.0-34）について §6.4 で確かめた。
 
-### 9.1 2026-10-31 の Linux 実測で確認できた事項（#1377）
+### 9.1 2026-10-31 の Linux 実測で解消した事項
 
-`harness/egress-isolation/`（#1377）で、依存・`unsafe` を使わない範囲を測った。結果の詳細は #1003 のコメントに記録している。方式の採否はここでも決めない。
+詳細は §6.4（TASK-38・`RENDER-1`）。
 
-- 環境: Ubuntu 26.04・カーネル 7.0.0-34・x86_64・`kernel.apparmor_restrict_unprivileged_userns=1`。ホストバイナリは 2026-10-27 ビルドの Docker イメージ由来（現在のコミットのビルドではない）。
-- Landlock: LSM に有効で、ABI は 8（`landlock_create_ruleset` のバージョン問い合わせのみ。ルールセットの適用は未測定）。
-- netns の作り方: AppArmor の制限下では `unshare -n`・`unshare -rn` は EPERM、`bwrap --unshare-net` は成功する。bwrap の ns 内に CAP_NET_ADMIN は無く（`ip addr add` は EPERM）、veth や 10.x のエイリアスは作れない。
-- Docker 既定 seccomp 下（`--network none`）: `unshare -n` は EPERM。Landlock ABI の問い合わせは成功する。イメージに bwrap が無く、bwrap の可否は未確認。
-- 隔離下の経路: bwrap の netns と `docker run --network none` のどちらでも、リダイレクト・img・fetch・WebSocket・内部アドレスの代替宛先は外側 listener に 0 件で、ベースライン（`--unshare-net` だけ無し）では各 1 件届いた。ホストの `--selftest` と loopback ページの `load` は両モードで成功した。実在の内部アドレス（IPv4・IPv6）への connect は ENETUNREACH。
-- 残った未確認: Servo 自身の DNS・UDP 送信の外部観測、Landlock ルール適用下の動作、seccomp、許可リスト付きプロキシとの併用、macOS・Windows、AppArmor の制限が無い環境・古いカーネル、現在のコミットのホストでの再測定。
+- Docker 既定 seccomp 下の `unshare -n`: EPERM
+- Ubuntu の AppArmor 制限（`kernel.apparmor_restrict_unprivileged_userns=1`）下での netns の作り方: 特権なしの `unshare -n`・`unshare -rn` は EPERM、`bwrap --unshare-net` は成功。ns 内に `CAP_NET_ADMIN` は無い
+- Landlock の対応: カーネル 7.0.0-34 で LSM に有効・ABI 8（問い合わせのみ）
+- 現在のコミットのホストでの再測定: c56f11c2 の dev ビルドで測り、bwrap `--unshare-net` は 8 経路すべて pass
+
+### 9.2 残る未確認事項と追跡先
+
+| 未確認事項 | 追跡先 |
+| ---------- | ------ |
+| docker `--network none` での判定（配布コンテナとホストの glibc をそろえた同一バイナリ） | #1386 |
+| macOS・Windows での成立性（§3.2・§3.3・§6.2） | #1387 |
+| Docker 内での bwrap の可否（イメージに bwrap が無い） | 未起票 |
+| Servo 自身の DNS・UDP 送信の外部観測（root か `CAP_NET_ADMIN` が要る） | 未起票 |
+| Landlock ルール適用下の動作・seccomp・許可リスト付きプロキシとの併用 | §7 の承認事項 |
+| AppArmor の制限が無い環境・6.7 未満のカーネル | 未起票 |
+| net 層の直接接続の網羅 | options §7 の 1 |
