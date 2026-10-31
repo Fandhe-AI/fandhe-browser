@@ -749,6 +749,38 @@ pub fn element_matches_str(document: &Document, element: NodeId, selector: &str)
     })
 }
 
+/// `element` 自身から祖先方向へ、`selector` に最初に一致する要素を返す（`Element.prototype.closest` の土台）。
+///
+/// `dom_bridge` の op `closest`（dom.js の `closest`。`JS-5`・#1375）から呼ばれる。
+/// セレクタは祖先の有無にかかわらず最初に 1 回だけ解析し、不正・未対応の構文（兄弟結合子 `+`・`~` 等）は
+/// `None` にせずエラーを返す（成功を装わない。`REPAIR-3`）。祖先の走査は [`Document::ancestors`] が
+/// ノード数で打ち切り、`MatchCache` の上限超過はそのままエラーで返す。`element` が要素でなければ `None`。
+///
+/// # エラー
+///
+/// [`parse_selector_list`] のエラーと [`Error::MatchCacheLimitExceeded`] をそのまま返す。
+pub fn closest_str(document: &Document, element: NodeId, selector: &str) -> Result<Option<NodeId>> {
+    instrumented(document, || {
+        let selectors = parse_selector_list(selector)?;
+        if !document.is_element(element) {
+            return Ok(None);
+        }
+        let mut cache = MatchCache::new();
+        if list_matches(document, element, &selectors, &mut cache)? {
+            return Ok(Some(element));
+        }
+        for ancestor in document.ancestors(element) {
+            if !document.is_element(ancestor) {
+                break;
+            }
+            if list_matches(document, ancestor, &selectors, &mut cache)? {
+                return Ok(Some(ancestor));
+            }
+        }
+        Ok(None)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1616,5 +1648,23 @@ mod tests {
                 kind: FailureKind::InvalidInput
             }
         );
+    }
+
+    /// JS-5・#1375: `closest_str` は自身・祖先の一致、不一致、不正・未対応セレクタ、要素以外を扱う。
+    #[test]
+    fn js_5_closest_str() {
+        let doc = parse("<div id=a><section><p id=b>x</p></section></div>");
+        let root = doc.root();
+        let p = find_by_local_name(&doc, root, "p");
+        let section = find_by_local_name(&doc, root, "section");
+        let div = find_by_local_name(&doc, root, "div");
+        assert_eq!(closest_str(&doc, p, "p").expect("ok"), Some(p));
+        assert_eq!(closest_str(&doc, p, "section").expect("ok"), Some(section));
+        assert_eq!(closest_str(&doc, p, "div#a").expect("ok"), Some(div));
+        assert_eq!(closest_str(&doc, p, "table").expect("ok"), None);
+        closest_str(&doc, p, "a[").expect_err("invalid selector");
+        closest_str(&doc, p, "h1 + p").expect_err("sibling combinator is unsupported");
+        let t = doc.descendants(p).next().expect("text child");
+        assert_eq!(closest_str(&doc, t, "p").expect("ok"), None);
     }
 }

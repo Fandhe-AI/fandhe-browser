@@ -616,6 +616,7 @@ pub fn run(engine: &str) {
     attributes_cases(engine);
     is_equal_node_cases(engine);
     element_matches_cases(engine);
+    element_sibling_closest_contains_cases(engine);
     element_name_cases(engine);
     document_element_cases(engine);
     class_list_cases(engine);
@@ -3854,6 +3855,115 @@ fn element_matches_cases(engine: &str) {
         (
             "String(h.querySelector('a').matches('div > span > a')) + '|' + h.querySelector('a').matches('body > span > a')",
             "true|false",
+        ),
+    ];
+    for (body, want) in cases {
+        check(&mut p, &format!("{pre}{body}"), want);
+    }
+}
+
+/// `previousElementSibling` / `nextElementSibling` / `closest` / `contains` / `webkitMatchesSelector`
+/// （#1375・`JS-5`・`CDP-2`・`REPAIR-3`）。Playwright の兄弟結合子（`_matchesParents`）と
+/// `closestCrossShadow`・`isInsideScope` が使う形を具体値で確認する。
+fn element_sibling_closest_contains_cases(engine: &str) {
+    eprintln!("case: JS-5 sibling / closest / contains / webkitMatchesSelector (#1375)");
+    let mut p = setup(engine, None);
+    let pre = "var h = document.createElement('div'); document.body.appendChild(h); \
+        h.innerHTML = '<h1>A</h1>text<!--c--><p>B</p><p>C</p>'; \
+        var h1 = h.firstChild, p1 = h.querySelectorAll('p')[0], p2 = h.querySelectorAll('p')[1]; ";
+    let cases: [(&str, &str); 28] = [
+        (
+            "p1.previousElementSibling.textContent + '|' + p2.previousElementSibling.textContent",
+            "A|B",
+        ),
+        (
+            "String(h1.previousElementSibling) + '|' + String(p2.nextElementSibling)",
+            "null|null",
+        ),
+        (
+            "h1.nextElementSibling === p1 && p1.previousElementSibling === h1",
+            "true",
+        ),
+        (
+            "h.childNodes[1].nextElementSibling === p1 && h.childNodes[2].previousElementSibling === h1",
+            "true",
+        ),
+        (
+            "String(document.previousElementSibling) + '|' + String(document.nextElementSibling)",
+            "undefined|undefined",
+        ),
+        (
+            "try { Object.getOwnPropertyDescriptor(Element.prototype, 'previousElementSibling').get.call({}); 'ok' } catch (e) { 'threw' }",
+            "threw",
+        ),
+        // Playwright の `_matchesParents` の `+`（直前の兄弟 1 つ）と `~`（遡り続ける）の再現。
+        (
+            "[].filter.call(h.querySelectorAll('p'), function (e) { var s = e.previousElementSibling; return !!s && s.matches('h1'); }).map(function (e) { return e.textContent; }).join(',')",
+            "B",
+        ),
+        (
+            "[].filter.call(h.querySelectorAll('p'), function (e) { for (var s = e.previousElementSibling; s; s = s.previousElementSibling) { if (s.matches('h1')) return true; } return false; }).map(function (e) { return e.textContent; }).join(',')",
+            "B,C",
+        ),
+        // 結合子を直接渡すと黙って不一致にせず例外になる（REPAIR-3）。
+        (
+            "try { h.querySelectorAll('h1 + p'); 'ok' } catch (e) { 'threw' }",
+            "threw",
+        ),
+        (
+            "try { p1.matches('h1 ~ p'); 'ok' } catch (e) { 'threw' }",
+            "threw",
+        ),
+        (
+            "try { p1.closest('h1 + p'); 'ok' } catch (e) { 'threw' }",
+            "threw",
+        ),
+        ("p1.closest('p') === p1 && p1.closest('div') === h", "true"),
+        ("String(p1.closest('table'))", "null"),
+        ("try { p1.closest(); 'ok' } catch (e) { 'threw' }", "threw"),
+        (
+            "try { p1.closest('a['); 'ok' } catch (e) { 'threw' }",
+            "threw",
+        ),
+        (
+            "try { Element.prototype.closest.call({}, 'a'); 'ok' } catch (e) { 'threw' }",
+            "threw",
+        ),
+        (
+            "h.contains(h) + '|' + h.contains(p1) + '|' + p1.contains(h) + '|' + h.contains(document.createElement('p'))",
+            "true|true|false|false",
+        ),
+        (
+            "document.contains(p1) + '|' + String(h.contains(null)) + '|' + String(h.contains(undefined))",
+            "true|false|false",
+        ),
+        (
+            "h.contains(h.childNodes[1]) + '|' + h.childNodes[1].contains(h.childNodes[1]) + '|' + h.childNodes[1].contains(p1)",
+            "true|true|false",
+        ),
+        (
+            "try { h.contains({}); 'ok' } catch (e) { 'threw' }",
+            "threw",
+        ),
+        ("try { h.contains(); 'ok' } catch (e) { 'threw' }", "threw"),
+        (
+            "p1.webkitMatchesSelector('p') + '|' + p1.webkitMatchesSelector('.nope')",
+            "true|false",
+        ),
+        (
+            "try { p1.webkitMatchesSelector(); 'ok' } catch (e) { 'threw' }",
+            "threw",
+        ),
+        (
+            "try { p1.webkitMatchesSelector('a['); 'ok' } catch (e) { 'threw' }",
+            "threw",
+        ),
+        ("typeof Element.prototype.webkitMatchesSelector", "function"),
+        ("typeof Element.prototype.closest", "function"),
+        ("typeof Node.prototype.contains", "function"),
+        (
+            "String(document.createTextNode('x').closest === undefined)",
+            "true",
         ),
     ];
     for (body, want) in cases {

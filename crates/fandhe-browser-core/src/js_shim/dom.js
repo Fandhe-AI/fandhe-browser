@@ -30,8 +30,13 @@
 // - getElementsByTagName は簡略版（#1200）: live でない静的な Array で HTMLCollection（item / namedItem）
 //   ではない。照合は要素の名前空間ごと（HTML は小文字化・それ以外は大文字小文字を区別）。
 //   getElementsByTagNameNS・getElementsByClassName は未実装。
-// - Element.prototype.matches は実装済み（#1363。op `matches`）。closest・webkitMatchesSelector は未実装。
-//   不正なセレクタは DOMException SyntaxError ではなく bridge の Error になる。
+// - Element.prototype.matches（#1363）・closest・webkitMatchesSelector（#1375。op `matches` / `closest`）は
+//   実装済み。不正なセレクタは DOMException SyntaxError ではなく bridge の Error になる。core のセレクタは
+//   兄弟結合子（`+`・`~`）に未対応で、querySelector / matches / closest に直接渡すと Unsupported の例外になる
+//   （不一致を装わない）。Playwright の兄弟結合子は previousElementSibling を辿るため動く。
+// - previousElementSibling / nextElementSibling は実装済み（#1375。Element と CharacterData に置く）。
+//   Node.prototype.contains も実装済み（#1375。op `isInclusiveAncestor`）。ParentNode の children・
+//   firstElementChild・lastElementChild・childElementCount は未実装（未定義のまま）。
 // - NodeList / HTMLCollection 互換（querySelectorAll は素の Array を返す）。
 // - Element の tagName / localName / nodeName は実装済み（#1236）。op `elementLocalName` と
 //   `htmlLocalName` から求め、HTML 名前空間の要素の tagName・nodeName は大文字。接頭辞付きの要素は
@@ -50,7 +55,7 @@
 //   （`attr instanceof Node` は false）、prefix 付き属性の localName は qualified name のまま・prefix と
 //   namespaceURI は null。名前付きプロパティアクセス（`attrs.id`）・setNamedItem / removeNamedItem /
 //   getNamedItemNS・Attr.value の代入・グローバルの NamedNodeMap / Attr は未実装。
-// - namespaceURI / isConnected / contains / compareDocumentPosition。対応する op が無く未定義のまま。
+// - namespaceURI / isConnected / compareDocumentPosition。対応する op が無く未定義のまま。
 // - HTMLElement・HTMLIFrameElement は名前だけ（instanceof / typeof 判定が通るため。常に false。
 //   `new` は Illegal constructor。継承は Element ← HTMLElement ← HTMLIFrameElement）。他の
 //   サブクラスは未定義のまま（#1168・#1184）。要素名を返す op（`elementLocalName`）は追加済みだがラッパーは常に Element で作る。将来は HTML
@@ -392,6 +397,39 @@
     define(Node.prototype, 'lastChild', traversalGetter('lastChild'));
     define(Node.prototype, 'nextSibling', traversalGetter('nextSibling'));
     define(Node.prototype, 'previousSibling', traversalGetter('previousSibling'));
+    // previousElementSibling / nextElementSibling（#1375）: WebIDL の NonDocumentTypeChildNode に合わせ
+    // Element と CharacterData だけに置く。op が必ず Element の ID を返すため nodeType の問い合わせは要らない。
+    function elementSiblingGetter(opName) {
+        return {
+            get: function () {
+                if (!ids.has(this)) {
+                    throw new TypeError("Illegal invocation");
+                }
+                return wrap(op(opName, ids.get(this)), Element);
+            }
+        };
+    }
+    define(Element.prototype, 'previousElementSibling', elementSiblingGetter('previousElementSibling'));
+    define(Element.prototype, 'nextElementSibling', elementSiblingGetter('nextElementSibling'));
+    define(CharacterData.prototype, 'previousElementSibling', elementSiblingGetter('previousElementSibling'));
+    define(CharacterData.prototype, 'nextElementSibling', elementSiblingGetter('nextElementSibling'));
+    // contains（#1375）: 自身と子孫に対して true。null / undefined は false、Node でない値は TypeError。
+    function containsImpl(self, other) {
+        var selfId = idOf(self, 'contains');
+        if (other === null || other === undefined) {
+            return false;
+        }
+        return op('isInclusiveAncestor', selfId, idOf(other, 'contains')) === true;
+    }
+    define(Node.prototype, 'contains', {
+        writable: true,
+        value: function contains(other) {
+            if (arguments.length < 1) {
+                throw new TypeError("Failed to execute 'contains' on 'Node': 1 argument required, but only 0 present.");
+            }
+            return containsImpl(this, other);
+        }
+    });
     // 簡略版（REPAIR-3）: live でない静的な Array（item() つき）。呼ぶたびに新しい配列になる。
     define(Node.prototype, 'childNodes', {
         get: function () {
@@ -1101,14 +1139,33 @@
     });
     // matches（#1363）: Playwright の複合セレクタ照合（_matchesCSS）が使う。不正なセレクタは
     // DOMException SyntaxError ではなく bridge の Error になる（querySelector と同じ差異）。
-    // closest・webkitMatchesSelector は未実装。
+    // webkitMatchesSelector（#1375）は matches のレガシー別名で、同じ照合を別の関数として持つ。
+    function matchesImpl(self, selectors, methodName, argCount) {
+        if (argCount < 1) {
+            throw new TypeError("Failed to execute '" + methodName + "' on 'Element': 1 argument required, but only 0 present.");
+        }
+        return op('matches', idOf(self, methodName), String(selectors)) === true;
+    }
     define(Element.prototype, 'matches', {
         writable: true,
         value: function matches(selectors) {
+            return matchesImpl(this, selectors, 'matches', arguments.length);
+        }
+    });
+    define(Element.prototype, 'webkitMatchesSelector', {
+        writable: true,
+        value: function webkitMatchesSelector(selectors) {
+            return matchesImpl(this, selectors, 'webkitMatchesSelector', arguments.length);
+        }
+    });
+    // closest（#1375）: 自身から祖先方向の最初の一致。無ければ null。兄弟結合子は core が Unsupported を返す。
+    define(Element.prototype, 'closest', {
+        writable: true,
+        value: function closest(selectors) {
             if (arguments.length < 1) {
-                throw new TypeError("Failed to execute 'matches' on 'Element': 1 argument required, but only 0 present.");
+                throw new TypeError("Failed to execute 'closest' on 'Element': 1 argument required, but only 0 present.");
             }
-            return op('matches', idOf(this, 'matches'), String(selectors)) === true;
+            return wrap(op('closest', idOf(this, 'closest'), String(selectors)), Element);
         }
     });
     define(Element.prototype, 'querySelectorAll', {
@@ -1306,7 +1363,7 @@
             },
             // 祖先関係の判定（MutationObserver の subtree 用）。ID はここで解決し外へ出さない。
             contains: function (ancestor, node) {
-                return op('isInclusiveAncestor', idOf(ancestor, 'contains'), idOf(node, 'contains')) === true;
+                return containsImpl(ancestor, node);
             }
         }),
         writable: true,

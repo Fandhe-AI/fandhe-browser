@@ -191,7 +191,7 @@ pub use parse::{
     parse_document_bytes,
 };
 pub use query::{
-    element_matches, element_matches_str, query_selector, query_selector_all,
+    closest_str, element_matches, element_matches_str, query_selector, query_selector_all,
     query_selector_all_str, query_selector_str,
 };
 pub use script_context::{

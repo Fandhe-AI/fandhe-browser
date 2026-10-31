@@ -871,5 +871,24 @@ e3 `table.waffle tr`）で `TypeError: element.matches is not a function` にな
   修正前は `q.matches is not a function` で失敗、修正後は `.titleline > a` が要素ハンドル（`1:X:A`）・`#example tbody tr` が 2 件・
   `table.waffle tr` が 1 件（`1:w`）になることを確認した。`js_shim_cases.rs` と `dom_bridge.rs` に具体値のテストを置いた。
 - **未確認**: 実 Playwright での `page.$` の再実行と、#252 の c6・e2・e3 の再測定（外部サイト・人間担当）は未実施。
-- **残る差異（`REPAIR-3`）**: 兄弟結合子（`+`・`~`）は shim に `previousElementSibling` が無く、例外にならず不一致になる。
-  `closest`・`Node.prototype.contains`・`webkitMatchesSelector` も未実装。いずれも今回の `page.$` の経路外で、別 Issue で追跡する。
+- **残る差異（`REPAIR-3`）**: 兄弟結合子（`+`・`~`）で不一致になる問題と `closest`・`Node.prototype.contains`・`webkitMatchesSelector` の未実装は #1375 で解消した（次節）。
+
+## DOM shim の兄弟要素・closest・contains（#1375）
+
+Playwright の兄弟結合子（`h1 + p`・`h1 ~ p`）が、例外にならず不一致になる問題（`CDP-2`・`JS-5`・`REPAIR-3`・TASK-44）。
+
+- **原因（種別 B: playwright-core 1.63.0 の `lib/coreBundle.js` の読解）**: `_matchesParents` は `+` で `previousSiblingInContext(element)`
+  （`element.previousElementSibling || void 0`）を 1 つ見て、`~` では同じ関数で遡り続け、各兄弟に `matches(<単純セレクタ>)` を呼ぶ。
+  shim に `previousElementSibling` が無く値が `undefined` になり、`!previousSibling` で false（不一致）になっていた。
+  `closestCrossShadow` は `element.closest(css)` と `closest.contains(scope)`、`isInsideScope` は `scope.contains(element)` を使う。
+  `webkitMatchesSelector` は coreBundle 1.63.0 に出現しない。DOM 標準のレガシー別名として互換のために足した。
+- **修正**: core の bridge に読み取り専用の op `previousElementSibling`・`nextElementSibling`・`closest`（`query::closest_str`）を足した。
+  shim は `previousElementSibling` / `nextElementSibling`（Element と CharacterData）・`Element.prototype.closest`・`Node.prototype.contains`
+  （既存 op `isInclusiveAncestor`）・`Element.prototype.webkitMatchesSelector` を公開した。値は実際の DOM から求める。
+- **確認（種別 A）**: `runtime_evaluate_cases.rs` の `sibling_combinator_selector`（V8・boa）が `Runtime.callFunctionOn` で `+` と `~` の手順を再現し、
+  `h2.t + p` が `1:first:P`、`h2.t ~ p` が `2:second`、`closest('div')`・`contains` が `DIV:null:true:false` になることを確認した。
+  `js_shim_cases.rs`（`element_sibling_closest_contains_cases`）と `dom_bridge.rs` / `query.rs` に具体値のテストを置いた。
+- **未確認**: 実 Playwright での `page.$` の再実行（`make test-playwright-connect`。node と playwright-core が必要）は未実施。
+- **残る差異（`REPAIR-3`）**: core のセレクタは兄弟結合子に未対応で、`querySelector`・`matches`・`closest` に直接渡すと `Unsupported` の例外になる
+  （不一致を装わない）。Puppeteer の `queryOne` はセレクタ全体を `querySelector` に渡すため、兄弟結合子は例外になる。
+  ParentNode の `children`・`firstElementChild`・`lastElementChild`・`childElementCount` は未実装。不正なセレクタは DOMException ではなく bridge の Error になる。
