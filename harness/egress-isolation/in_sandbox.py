@@ -240,7 +240,9 @@ def dns_attempt_observed(dns: dict[str, Any]) -> bool:
     1 件以上あり、そのすべてへの UDP connect が「経路なし」の errno で失敗した（`/run` の隠蔽による
     resolv.conf 欠落では nameserver が空になり、この条件を満たさない）。
     """
-    if dns.get("result", "resolved") == "resolved" or dns.get("resolver_sockets"):
+    result = dns.get("result", "resolved")
+    # 解決プローブ自体が観測不能（例外）なら、後続の nameserver 観測が成功しても試行ありとは言えない（fail-closed）。
+    if result == "resolved" or str(result).startswith("unobservable:") or dns.get("resolver_sockets"):
         return False
     servers = dns.get("nameservers") or {}
     if not servers or any(ip.startswith("127.") or ip == "::1" for ip in servers):

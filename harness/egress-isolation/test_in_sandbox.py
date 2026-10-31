@@ -305,12 +305,9 @@ class ProbeFailureTest(unittest.TestCase):
             self.assertEqual(in_sandbox.reachable_resolver_sockets(), [])
 
     def test_ipv6_disabled_does_not_count_as_attempt(self) -> None:
-        real_socket = socket.socket
-
-        def fake(family: int = socket.AF_INET, *a: object, **k: object) -> socket.socket:
-            if family == socket.AF_INET6:
-                raise OSError(errno.EAFNOSUPPORT, "no ipv6")
-            return real_socket(family, *a, **k)
+        def fake_connect(family: int, addr: tuple[object, ...]) -> str:
+            # 実ネットワークへは出ない。IPv6 無効カーネルを模擬し、IPv4 は「経路なし」を返す。
+            return "unobservable:EAFNOSUPPORT" if family == socket.AF_INET6 else "ENETUNREACH"
 
         tmp = Path(tempfile.mkdtemp(prefix="egress-test-"))
         self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
@@ -320,7 +317,9 @@ class ProbeFailureTest(unittest.TestCase):
         self.assertIn("bwrap-netns", judge.ISOLATED_MODES)
         with mock.patch.object(in_sandbox, "SETTLE_S", 0.01), \
                 mock.patch.object(in_sandbox.judge, "check_isolation", return_value=(True, "")), \
-                mock.patch.object(in_sandbox.socket, "socket", side_effect=fake), \
+                mock.patch.object(in_sandbox, "probe_connect", side_effect=fake_connect), \
+                mock.patch.object(in_sandbox, "reachable_resolver_sockets", return_value=[]), \
+                mock.patch.object(in_sandbox, "probe_nameservers", return_value={"nameservers": {}}), \
                 mock.patch.object(in_sandbox, "probe_dns", return_value={"result": "gaierror:-2", "elapsed_s": 0}):
             rc = in_sandbox.main(["--mode", "bwrap-netns", "--host", str(host),
                                   "--ports", json.dumps(ports), "--out", str(args.out)])
@@ -330,6 +329,34 @@ class ProbeFailureTest(unittest.TestCase):
         self.assertFalse(data["attempts"]["internal_real"])
         verdicts = judge.judge_all("bwrap-netns", data, {"internal_real": 0}, {"internal": 1})
         self.assertEqual(verdicts["internal_real"]["verdict"], judge.UNOBSERVABLE)
+
+    def test_unobservable_dns_probe_is_not_an_observed_attempt(self) -> None:
+        dns = {"result": "unobservable:RuntimeError", "nameservers": {"192.0.2.53": "ENETUNREACH"}}
+        self.assertFalse(in_sandbox.dns_attempt_observed(dns))
+        # 対照: 同じ nameserver 観測でも解決が通常の失敗なら試行ありとなる
+        self.assertTrue(in_sandbox.dns_attempt_observed({**dns, "result": "gaierror:-3"}))
+
+    def test_run_with_raising_probe_dns_is_unobservable(self) -> None:
+        tmp = Path(tempfile.mkdtemp(prefix="egress-test-"))
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        host = make_fake_host(tmp, [])
+        ports = {k: 20300 + i for i, k in enumerate(("redirect", "img", "fetch", "ws", "internal", "udp_direct"))}
+        out = tmp / "o.json"
+        with mock.patch.object(in_sandbox, "SETTLE_S", 0.01), \
+                mock.patch.object(in_sandbox.judge, "check_isolation", return_value=(True, "")), \
+                mock.patch.object(in_sandbox, "probe_connect", return_value="ENETUNREACH"), \
+                mock.patch.object(in_sandbox, "probe_dns", side_effect=RuntimeError("boom")), \
+                mock.patch.object(in_sandbox, "reachable_resolver_sockets", return_value=[]), \
+                mock.patch.object(in_sandbox, "probe_nameservers",
+                                  return_value={"nameservers": {"192.0.2.53": "ENETUNREACH"}}):
+            rc = in_sandbox.main(["--mode", "bwrap-netns", "--host", str(host),
+                                  "--ports", json.dumps(ports), "--out", str(out)])
+        self.assertEqual(rc, 0)
+        data = json.loads(out.read_text(encoding="utf-8"))
+        self.assertEqual(data["probes"]["dns"]["result"], "unobservable:RuntimeError")
+        self.assertFalse(data["attempts"]["dns"])
+        verdicts = judge.judge_all("bwrap-netns", data, {"dns": 0}, {"udp_direct": 1})
+        self.assertEqual(verdicts["dns"]["verdict"], judge.UNOBSERVABLE)
 
     def test_unhandled_exception_still_writes_unobservable_json(self) -> None:
         tmp = Path(tempfile.mkdtemp(prefix="egress-test-"))
