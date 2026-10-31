@@ -67,20 +67,34 @@ def start_outer_listeners() -> tuple[dict[str, Any], dict[str, int]]:
     return recs, {k: v.port for k, v in recs.items()}
 
 
+def resolv_bind_args(resolv_file: Path) -> list[str]:
+    """`/etc/resolv.conf` の実体の位置に固定の resolv.conf を重ねる bwrap 引数。
+
+    `/run` を空の tmpfs にするとシンボリックリンク（例: ../run/systemd/resolve/stub-resolv.conf）が切れ、
+    DNS の失敗が netns と無関係になる。実体の位置に非ループバックの固定 nameserver を置いて、
+    失敗が netns 由来かを内側で判別できるようにする（両モード共通）。実体が /etc か /run 以外なら何もしない。
+    """
+    dest = os.path.realpath("/etc/resolv.conf")
+    if dest.startswith("/run/"):
+        return ["--dir", os.path.dirname(dest), "--ro-bind", str(resolv_file), dest]
+    if dest.startswith("/etc/"):
+        return ["--ro-bind", str(resolv_file), dest]
+    return []
+
+
 def build_argv(mode: str, *, host: Path, ports: dict[str, int], out_dir: Path, hosts_file: Path,
-               image: str | None) -> list[str]:
+               image: str | None, resolv_file: Path | None = None, name: str | None = None) -> list[str]:
     """内側ランナーを起動する固定 argv。ポートは int を文字列化したものだけが入る。"""
     inner_args = ["--mode", mode, "--ports", json.dumps(ports, sort_keys=True)]
     if mode in ("baseline", "bwrap-netns"):
         argv = ["bwrap", "--die-with-parent"]
         if mode == "bwrap-netns":
-            # （baseline と同条件にするため /run の tmpfs は両モード共通。下の argv 参照）、ホスト側 resolver（systemd-resolved・nscd 等）の
-            # Unix ソケット経由で netns の外へ名前解決が出る経路を断つ。
             argv += ["--unshare-net"]
         argv += ["--dev-bind", "/", "/",
                  # /run を空の tmpfs にし、ホスト側 resolver（systemd-resolved・nscd 等）の Unix ソケット経由で
                  # netns の外へ名前解決が出る経路を断つ（baseline と同条件）。
                  "--tmpfs", "/run",
+                 *(resolv_bind_args(resolv_file) if resolv_file is not None else []),
                  "--ro-bind", str(hosts_file), "/etc/hosts", "--",
                  sys.executable, "-I", "-B", str(_HERE / "in_sandbox.py"),
                  "--host", str(host), "--out", str(out_dir / f"{mode}.json"), *inner_args]
@@ -89,7 +103,7 @@ def build_argv(mode: str, *, host: Path, ports: dict[str, int], out_dir: Path, h
         if image is None:
             raise ValueError("docker-none needs --docker-image")
         argv = ["docker", "run", "--rm", "--network", "none", "--user", f"{os.getuid()}:{os.getgid()}",
-                "--tmpfs", "/tmp"]
+                "--tmpfs", "/tmp", *(["--name", name] if name else [])]
         for name, ip in (("pages.test", judge.IP_ALLOWED), (judge.HOST_BLOCKED, judge.IP_BLOCKED),
                          (judge.HOST_INTERNAL_STANDIN, judge.IP_INTERNAL_STANDIN)):
             argv += ["--add-host", f"{name}:{ip}"]
@@ -110,8 +124,31 @@ def docker_image_id(image: str) -> str | None:
     return out.stdout.strip()[:100] if out.returncode == 0 else None
 
 
-def run_argv(argv: list[str]) -> tuple[int | None, str]:
-    """argv を実行する（シェル不使用・タイムアウトつき・プロセスグループごと終了）。"""
+def remove_container(name: str) -> None:
+    """名前つきコンテナを強制削除する（ローカルの SIGKILL では daemon 管理のコンテナが止まらないため）。
+
+    存在しない場合の失敗は無視する（`--rm` で既に消えている通常ケース）。
+    """
+    try:
+        subprocess.run(["docker", "rm", "-f", name], stdin=subprocess.DEVNULL,  # noqa: S603,S607
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60, check=False)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
+def run_argv(argv: list[str], container: str | None = None) -> tuple[int | None, str]:
+    """argv を実行する（シェル不使用・タイムアウトつき・プロセスグループごと終了）。
+
+    `container` を渡すと、正常終了・タイムアウト・例外のいずれでも finally で `docker rm -f` する。
+    """
+    try:
+        return _run_argv(argv)
+    finally:
+        if container:
+            remove_container(container)
+
+
+def _run_argv(argv: list[str]) -> tuple[int | None, str]:
     proc = subprocess.Popen(  # noqa: S603
         argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
         start_new_session=True,
@@ -129,10 +166,13 @@ def run_argv(argv: list[str]) -> tuple[int | None, str]:
 
 
 def run_mode(mode: str, *, host: Path, ports: dict[str, int], recs: dict[str, Any], out_dir: Path,
-             hosts_file: Path, image: str | None) -> dict[str, Any]:
+             hosts_file: Path, image: str | None, resolv_file: Path | None = None) -> dict[str, Any]:
     before = {k: r.count for k, r in recs.items()}
-    argv = build_argv(mode, host=host, ports=ports, out_dir=out_dir, hosts_file=hosts_file, image=image)
-    rc, err = run_argv(argv)
+    # docker はコンテナ名を付けて、タイムアウト・例外時にも確実に後始末する（名前は pid 由来の固定形式）。
+    name = f"egress-iso-{os.getpid()}" if mode == "docker-none" else None
+    argv = build_argv(mode, host=host, ports=ports, out_dir=out_dir, hosts_file=hosts_file, image=image,
+                      resolv_file=resolv_file, name=name)
+    rc, err = run_argv(argv, container=name)
     outer = {k: r.count - before[k] for k, r in recs.items()}
     result_path = out_dir / f"{mode}.json"
     inner: dict[str, Any] = {}
@@ -215,6 +255,8 @@ def main(argv: list[str] | None = None) -> int:
     with tempfile.TemporaryDirectory(prefix="egress-hosts-") as td:
         hosts_file = Path(td) / "hosts"
         hosts_file.write_text(judge.HOSTS_FILE, encoding="utf-8")
+        resolv_file = Path(td) / "resolv.conf"
+        resolv_file.write_text(judge.RESOLV_CONF, encoding="utf-8")
         recs, ports = start_outer_listeners()
         results: dict[str, Any] = {"modes": {}}
         try:
@@ -232,7 +274,8 @@ def main(argv: list[str] | None = None) -> int:
             }
             for mode in modes:
                 results["modes"][mode] = run_mode(mode, host=host, ports=ports, recs=recs, out_dir=out_dir,
-                                                  hosts_file=hosts_file, image=image)
+                                                  hosts_file=hosts_file, image=image,
+                                                  resolv_file=resolv_file)
                 if mode == "docker-none" and image is not None:
                     results["modes"][mode]["image_id"] = docker_image_id(image)
         finally:

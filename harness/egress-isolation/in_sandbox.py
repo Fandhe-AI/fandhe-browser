@@ -12,7 +12,8 @@
       exit 2 で中止する（実在の内部アドレスを含むページを読み込む前の安全側の検査）。
     - 隔離モードでは外側と同じ宛先（127.0.0.2:<port> 等）の写し listener を内側にも立て、ページが実際に
       接続を試みたこと（試行の観測）を確かめる。ベースラインは外側の listener が直接受ける。
-    - 同ディレクトリの `render-screenshot` の `servo_bbox_driver`（HostChannel 等）と `egress_guard` を流用する。
+    - 同ディレクトリの `render-screenshot` の `servo_bbox_driver`（HostChannel 等）を流用し、送信先の監視は
+      `monitor.DestinationMonitor`（既知のダミー宛先を除外して監視を継続する。`EgressGuard` は最初の試行で止まるため使わない）。
 
 信頼境界: 受け取る引数は検証済みの固定集合・int ポート・実行可能ファイルの絶対パスのみ。ホストに渡す環境変数は
 `build_host_env` の許可リスト（`*_PROXY`・`LD_*` は渡さない。`SEC-2`）。UA・ヘッダ・ビューポートは触らない。
@@ -40,7 +41,7 @@ from typing import Any
 _HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(_HERE))
 sys.path.insert(0, str(_HERE.parent / "render-screenshot"))
-import egress_guard  # noqa: E402
+import monitor  # noqa: E402
 import page_templates as fixtures  # noqa: E402
 import judge  # noqa: E402
 import listeners  # noqa: E402
@@ -177,6 +178,55 @@ def reachable_resolver_sockets() -> list[str]:
     return found
 
 
+def probe_nameservers() -> dict[str, Any]:
+    """`/etc/resolv.conf` の nameserver 宛に UDP の connect だけを試し（送信なし）、errno 名を返す。
+
+    名前解決の失敗が netns による遮断由来であることの根拠にする。resolv.conf が読めない・切れている
+    （例: `/run` の隠蔽でシンボリックリンクが切れる）場合は nameserver が空になり、試行は観測できない扱い。
+    """
+    servers: list[str] = []
+    try:
+        text = Path("/etc/resolv.conf").read_text(encoding="ascii", errors="replace")[:4096]
+    except OSError:
+        text = ""
+    for line in text.splitlines():
+        fields = line.split()
+        if len(fields) >= 2 and fields[0] == "nameserver" and len(servers) < 3:
+            servers.append(fields[1][:64])
+    results: dict[str, str] = {}
+    for ip in servers:
+        family = socket.AF_INET6 if ":" in ip else socket.AF_INET
+        sock = socket.socket(family, socket.SOCK_DGRAM)
+        try:
+            sock.connect((ip, 53))
+            results[ip] = "connected"
+        except OSError as exc:
+            results[ip] = errno.errorcode.get(exc.errno or 0, "oserror")
+        except ValueError:
+            results[ip] = "invalid"
+        finally:
+            sock.close()
+    return {"nameservers": results}
+
+
+NS_UNREACHABLE = frozenset({"ENETUNREACH", "EHOSTUNREACH", "ENETDOWN", "EADDRNOTAVAIL", "EAFNOSUPPORT"})
+
+
+def dns_attempt_observed(dns: dict[str, Any]) -> bool:
+    """DNS の失敗が netns による遮断由来と言えるときだけ True（区別できなければ観測不能）。
+
+    条件: 解決が失敗した・ホスト側 resolver のソケットに届かない・resolv.conf に非ループバックの nameserver が
+    1 件以上あり、そのすべてへの UDP connect が「経路なし」の errno で失敗した（`/run` の隠蔽による
+    resolv.conf 欠落では nameserver が空になり、この条件を満たさない）。
+    """
+    if dns.get("result", "resolved") == "resolved" or dns.get("resolver_sockets"):
+        return False
+    servers = dns.get("nameservers") or {}
+    if not servers or any(ip.startswith("127.") or ip == "::1" for ip in servers):
+        return False
+    return all(v in NS_UNREACHABLE for v in servers.values())
+
+
 def host_identity(host: str) -> dict[str, Any]:
     """サンドボックス内で実際に実行するホストバイナリの SHA256 と version（baseline との同一性判定用）。"""
     import hashlib
@@ -264,7 +314,7 @@ def run(args: argparse.Namespace, ports: dict[str, int]) -> dict[str, Any]:
 
     workdir = Path(tempfile.mkdtemp(prefix="egress-isolation-"))
     proc: subprocess.Popen[bytes] | None = None
-    guard: egress_guard.EgressGuard | None = None
+    guard: monitor.DestinationMonitor | None = None
     try:
         for sub in ("home", "tmp", "xdg-config", "xdg-cache", "xdg-data"):
             (workdir / sub).mkdir()
@@ -282,8 +332,10 @@ def run(args: argparse.Namespace, ports: dict[str, int]) -> dict[str, Any]:
             [args.host, "--stdio"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL, env=env,
         )
-        violations: list[str] = []
-        guard = egress_guard.EgressGuard(proc.pid, page_port, lambda: violations.append("violation"))
+        # ハーネスが意図的に接続させるダミー宛先（127.0.0.2 / 127.0.0.3）は想定内の試行として除外し、監視を続ける。
+        expected = {f"{judge.IP_INTERNAL_STANDIN if r == 'internal' else judge.IP_BLOCKED}:{ports[r]}"
+                    for r in TCP_ROUTES} | {f"{judge.IP_BLOCKED}:{ports['udp_direct']}"}
+        guard = monitor.DestinationMonitor(proc.pid, page_port, expected)
         guard.start()
         chan = sbd.HostChannel(proc)
         info = sbd.validate_hello(chan.recv(sbd.HANDSHAKE_TIMEOUT_S))  # bounding_box 必須の検査を含む
@@ -294,10 +346,14 @@ def run(args: argparse.Namespace, ports: dict[str, int]) -> dict[str, Any]:
         loopback = load_route(chan, next_id, info, f"{base}/ok")
         result["loopback_load"] = loopback
         loads: dict[str, Any] = {}
+        guard_polls: dict[str, int] = {}
         for r in (x for x in PAGE_ROUTES if x in result["routes"]):
+            polls_before = guard.snapshot_polls()
             loads[r] = load_route(chan, next_id, info, base + fixtures.ROUTE_PATH[r])
             time.sleep(SETTLE_S)
+            guard_polls[r] = guard.snapshot_polls() - polls_before  # 経路ごとに完了した走査の回数
         result["loads"] = loads
+        result["guard_polls"] = guard_polls
         try:
             sbd.call(chan, next_id, "shutdown", None, sbd.SHUTDOWN_GRACE_S + sbd.TIMEOUT_SLACK_S,
                      max_frame=info.response_max)
@@ -308,7 +364,8 @@ def run(args: argparse.Namespace, ports: dict[str, int]) -> dict[str, Any]:
     finally:
         if guard is not None:
             guard.stop()
-            result["guard"] = {"violation": guard.violation, "unavailable": guard.unavailable}
+            result["guard"] = {"violation": guard.violation, "unavailable": guard.unavailable,
+                               "polls": guard.snapshot_polls(), "expected_seen": sorted(guard.expected_seen)}
         if proc is not None:
             sbd._stop_host(proc, graceful=False)
         shutil.rmtree(workdir, ignore_errors=True)
@@ -323,6 +380,7 @@ def run(args: argparse.Namespace, ports: dict[str, int]) -> dict[str, Any]:
         }
         probes["dns"] = probe_dns()
         probes["dns"]["resolver_sockets"] = reachable_resolver_sockets()
+        probes["dns"].update(probe_nameservers())
     result["probes"] = probes
     time.sleep(0.5)
 
@@ -338,8 +396,7 @@ def run(args: argparse.Namespace, ports: dict[str, int]) -> dict[str, Any]:
         # 構造的な経路は「経路なし」を示す errno が出たことを試行の根拠とする。
         "internal_real": bool(real) and all(v in unreachable for v in real.values()),
         # 失敗種別だけでは送信遮断の証拠にならない。ホスト側 resolver のソケットに届く環境では試行を観測できない扱い。
-        "dns": isolated and probes.get("dns", {}).get("result", "resolved") not in ("resolved",)
-        and not probes.get("dns", {}).get("resolver_sockets"),
+        "dns": isolated and dns_attempt_observed(probes.get("dns", {})),
     }
     for rec in inner.values():
         rec.stop()

@@ -56,7 +56,8 @@ python3 -I -B harness/egress-isolation/platform_probe.py [--docker-image <image>
 
 - `dns` / `udp_direct` はハーネス自身のプローブで、Servo 自身の DNS・UDP 送信は外から観測していない
   （root か CAP_NET_ADMIN が要る。承認事項）。
-- `egress_guard` は接続済みソケットを 25 ms 間隔で走査するため、短命な接続は拾えない。補助の観測手段。
+- 送信先の監視は `monitor.py`（`egress_guard` の走査関数を流用し、ハーネスが意図的に接続させるダミー宛先を除外して継続する）。接続済みソケットを 25 ms 間隔で走査するため短命な接続は拾えず、経路ごとに走査が 1 回以上完了していなければ合格にしない。補助の観測手段。
+- `dns` は `/etc/resolv.conf` の実体位置に固定の非ループバック nameserver（192.0.2.53）を重ね、その宛先への UDP connect が経路なしで失敗したときだけ試行を観測した扱いにする（`/run` の隠蔽による resolv.conf 欠落と netns 由来の失敗を区別する。区別できなければ unobservable）。docker-none は resolv.conf を差し替えないため、nameserver が得られなければ unobservable になる。
 - AppArmor の `apparmor_restrict_unprivileged_userns=1` の環境では `unshare -rn` が使えず、bwrap（setuid 相当の
   プロファイル）経由でのみ netns を作れる。ns 内に CAP_NET_ADMIN は無く、veth は作れない。
 - 内側の `/etc/hosts` は bind マウント（docker は `--add-host`）。Servo が参照することはベースラインの受信で確認する。

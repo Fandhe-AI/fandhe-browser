@@ -38,6 +38,10 @@ HOSTS_FILE = (
 # 隔離下だけで試す「実在の内部アドレス」。接続先に何も届かないこと（経路なし）を前提検査した後にだけ使う。
 REAL_INTERNAL_V4 = ("10.255.255.1", "169.254.169.254")
 REAL_INTERNAL_V6 = "fd00::1"
+# DNS 経路の判定用に、サンドボックスへ固定で見せる resolv.conf（非ループバックの TEST-NET-1 宛。RFC 5737）。
+# 実環境の resolv.conf が `/run` の隠蔽で切れて DNS が失敗しても netns の効果と取り違えないための足場。
+IP_DNS_STANDIN = "192.0.2.53"
+RESOLV_CONF = f"nameserver {IP_DNS_STANDIN}\n"
 
 MODES = ("baseline", "bwrap-netns", "docker-none")
 ISOLATED_MODES = ("bwrap-netns", "docker-none")
@@ -45,6 +49,8 @@ ISOLATED_MODES = ("bwrap-netns", "docker-none")
 # 宛先 listener があるもの（TCP/UDP）と、構造的に観測する経路（実在アドレス・DNS）。
 LISTENER_ROUTES = ("redirect", "img", "fetch", "ws", "internal", "udp_direct")
 STRUCTURAL_ROUTES = ("internal_real", "dns")
+# ホストにページを読み込ませる経路。egress guard の走査が完了していなければ観測できていない。
+LOADED_ROUTES = ("redirect", "img", "fetch", "ws", "internal")
 # 構造的な経路の陽性対照（隔離なしで届くことを確かめた経路）。
 CONTROL_ROUTE = {"internal_real": "internal", "dns": "udp_direct"}
 
@@ -63,15 +69,21 @@ def judge_route(
     attempt_observed: bool,
     guard_unavailable: bool,
     positive_ok: bool,
+    guard_monitored: bool = True,
+    guard_violation: str | None = None,
 ) -> tuple[str, str]:
     """1 経路の判定。(verdict, reason) を返す。
 
     fail: 隔離の下で外側の宛先が受信した（漏れ）。
     pass: 受信 0 件・陽性対照が届いた・試行を観測した・guard が使え・ホストが動いた、をすべて満たす。
     unobservable: それ以外（合格とは扱わない）。
+    guard_monitored: この経路の間に guard の走査が 1 回以上完了したか（止まった監視を合格にしない）。
+    guard_violation: guard が想定外の宛先（ハーネスの既知ダミー以外）への接続を検知した場合の宛先。
     """
     if outer_count >= 1:
         return FAIL, f"outer destination received {outer_count} connection(s)"
+    if guard_violation is not None:
+        return FAIL, "egress guard saw a connection to an unexpected destination"
     if not positive_ok:
         return UNOBSERVABLE, "positive check failed (selftest or loopback load)"
     if control_count < 1:
@@ -80,6 +92,8 @@ def judge_route(
         return UNOBSERVABLE, "no attempt was observed inside the sandbox"
     if guard_unavailable:
         return UNOBSERVABLE, "egress guard could not monitor"
+    if not guard_monitored:
+        return UNOBSERVABLE, "egress guard completed no scan during this route"
     return PASS, "no outer receipt; attempt observed; control reached"
 
 
@@ -131,6 +145,8 @@ def judge_all(
     positive_ok = bool(inner.get("positive_ok"))
     guard = inner.get("guard") or {}
     guard_unavailable = guard.get("unavailable") is not None
+    guard_violation = guard.get("violation")
+    guard_polls: dict[str, int] = inner.get("guard_polls") or {}
     attempts: dict[str, bool] = inner.get("attempts") or {}
     out: dict[str, dict[str, Any]] = {}
     for route in routes_for_mode(mode):
@@ -141,6 +157,8 @@ def judge_all(
             attempt_observed=bool(attempts.get(route)),
             guard_unavailable=guard_unavailable,
             positive_ok=positive_ok,
+            guard_monitored=route not in LOADED_ROUTES or int(guard_polls.get(route, 0)) >= 1,
+            guard_violation=guard_violation if isinstance(guard_violation, str) else None,
         )
         method = (
             "route table + connect probe (structural; not observed from outside)"

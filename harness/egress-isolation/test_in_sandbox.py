@@ -22,6 +22,7 @@ import in_sandbox  # noqa: E402
 import judge  # noqa: E402
 import listeners  # noqa: E402
 import measure  # noqa: E402
+import monitor  # noqa: E402
 import platform_probe  # noqa: E402
 
 
@@ -59,6 +60,11 @@ class InnerRunnerTest(unittest.TestCase):
         self.assertEqual(set(result["loads"]), {"redirect", "img", "fetch", "ws", "internal"})
         self.assertEqual(outer.count, 5)  # 経路ごとの load で 1 回ずつ到達（/ok では接続しない）
         self.assertNotIn("secret", json.dumps(result) + repr(outer.records()))
+        # 想定内のダミー宛先への接続後も監視が続き、全経路で走査が完了している（EgressGuard なら最初の接続で止まる）
+        self.assertIsNone(result["guard"]["violation"])
+        self.assertIsNone(result["guard"]["unavailable"])
+        self.assertTrue(all(n >= 1 for n in result["guard_polls"].values()), result["guard_polls"])
+        self.assertEqual(set(result["guard_polls"]), {"redirect", "img", "fetch", "ws", "internal"})
 
     def test_host_that_never_connects_leaves_outer_empty(self) -> None:
         outer = listeners.TcpRecorder("o", "127.0.0.2").start()
@@ -97,6 +103,60 @@ class InnerRunnerTest(unittest.TestCase):
                 in_sandbox.validate_args(argparse.Namespace(**{**vars(good), **patch}))
 
 
+class DestinationMonitorTest(unittest.TestCase):
+    """既知のダミー宛先への試行では監視が止まらず、後続の経路も走査されること（codex P1 の回帰）。"""
+
+    def test_expected_destination_does_not_stop_monitoring(self) -> None:
+        import time
+
+        results = iter([["127.0.0.2:2001"], ["127.0.0.2:2001"], ["10.9.9.9:80"]])
+        mon = monitor.DestinationMonitor(1, 80, {"127.0.0.2:2001"},
+                                         scanner=lambda *_a: next(results, []), interval_s=0.001)
+        mon.start()
+        deadline = time.monotonic() + 5
+        while mon.snapshot_polls() < 10 and time.monotonic() < deadline:
+            time.sleep(0.005)
+        mon.stop()
+        self.assertGreaterEqual(mon.polls, 10)  # 最初の想定内の接続後も走査が続く
+        self.assertEqual(mon.expected_seen, {"127.0.0.2:2001"})
+        self.assertEqual(mon.violation, "10.9.9.9:80")
+        self.assertIsNone(mon.unavailable)
+
+    def test_scan_failure_sets_unavailable(self) -> None:
+        def boom(*_a: object) -> list[str]:
+            raise OSError("proc unreadable")
+
+        mon = monitor.DestinationMonitor(1, 80, set(), scanner=boom, interval_s=0.001)
+        mon.start()
+        mon.stop()
+        self.assertIn("proc unreadable", mon.unavailable or "")
+        self.assertEqual(mon.polls, 0)
+
+
+class DnsAttemptTest(unittest.TestCase):
+    """resolv.conf が切れた環境の DNS 失敗を netns の効果と取り違えないこと（Bugbot Medium の回帰）。"""
+
+    def test_broken_resolv_conf_is_not_an_observed_attempt(self) -> None:
+        self.assertFalse(in_sandbox.dns_attempt_observed({"result": "gaierror:-3", "nameservers": {}}))
+
+    def test_loopback_nameserver_is_not_an_observed_attempt(self) -> None:
+        dns = {"result": "gaierror:-3", "nameservers": {"127.0.0.53": "ECONNREFUSED"}}
+        self.assertFalse(in_sandbox.dns_attempt_observed(dns))
+
+    def test_reachable_resolver_socket_is_not_an_observed_attempt(self) -> None:
+        dns = {"result": "gaierror:-3", "nameservers": {"192.0.2.53": "ENETUNREACH"},
+               "resolver_sockets": ["/run/nscd/socket"]}
+        self.assertFalse(in_sandbox.dns_attempt_observed(dns))
+
+    def test_nameserver_unreachable_is_an_observed_attempt(self) -> None:
+        dns = {"result": "gaierror:-3", "nameservers": {"192.0.2.53": "ENETUNREACH"}, "resolver_sockets": []}
+        self.assertTrue(in_sandbox.dns_attempt_observed(dns))
+
+    def test_nameserver_connect_success_is_not_an_observed_attempt(self) -> None:
+        dns = {"result": "gaierror:-3", "nameservers": {"192.0.2.53": "connected"}}
+        self.assertFalse(in_sandbox.dns_attempt_observed(dns))
+
+
 class MeasureTest(unittest.TestCase):
     def build(self, mode: str) -> list[str]:
         return measure.build_argv(mode, host=Path("/h"), ports={"img": 2001}, out_dir=Path("/o"),
@@ -112,6 +172,37 @@ class MeasureTest(unittest.TestCase):
         self.assertEqual(argv[argv.index("--network") + 1], "none")
         self.assertIn(":/harness:ro", " ".join(argv))
         self.assertNotIn("--privileged", argv)
+
+    def test_docker_container_is_named_and_removed_on_timeout_and_error(self) -> None:
+        argv = measure.build_argv("docker-none", host=Path("/h"), ports={"img": 2001}, out_dir=Path("/o"),
+                                  hosts_file=Path("/hosts"), image="img:tag", name="egress-iso-1")
+        self.assertEqual(argv[argv.index("--name") + 1], "egress-iso-1")
+        with mock.patch.object(measure, "remove_container") as rm, \
+                mock.patch.object(measure, "_run_argv", return_value=(None, "timed out")):
+            self.assertEqual(measure.run_argv(["docker"], container="c1"), (None, "timed out"))
+        rm.assert_called_once_with("c1")
+        with mock.patch.object(measure, "remove_container") as rm, \
+                mock.patch.object(measure, "_run_argv", side_effect=OSError("x")):
+            with self.assertRaises(OSError):
+                measure.run_argv(["docker"], container="c2")
+        rm.assert_called_once_with("c2")
+        with mock.patch.object(measure, "remove_container") as rm, \
+                mock.patch.object(measure, "_run_argv", return_value=(0, "")):
+            measure.run_argv(["bwrap"])
+        rm.assert_not_called()
+
+    def test_bwrap_binds_fixed_resolv_conf_after_run_tmpfs_in_both_modes(self) -> None:
+        with mock.patch.object(measure.os.path, "realpath", return_value="/run/systemd/resolve/stub-resolv.conf"):
+            base = measure.build_argv("baseline", host=Path("/h"), ports={"img": 2001}, out_dir=Path("/o"),
+                                      hosts_file=Path("/hosts"), image=None, resolv_file=Path("/rc"))
+            iso = measure.build_argv("bwrap-netns", host=Path("/h"), ports={"img": 2001}, out_dir=Path("/o"),
+                                     hosts_file=Path("/hosts"), image=None, resolv_file=Path("/rc"))
+        for argv in (base, iso):
+            i = argv.index("/rc")
+            self.assertEqual(argv[i - 1], "--ro-bind")
+            self.assertEqual(argv[i + 1], "/run/systemd/resolve/stub-resolv.conf")
+            self.assertLess(argv.index("--tmpfs"), i)
+        self.assertEqual([a.replace("bwrap-netns", "baseline") for a in iso if a != "--unshare-net"], base)
 
     def test_validation(self) -> None:
         for bad in ("", "UPPER", "a b", "x;rm", "$(id)", "-v/x:/y"):

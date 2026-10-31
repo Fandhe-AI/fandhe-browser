@@ -40,6 +40,7 @@ class JudgeRouteTest(unittest.TestCase):
 class JudgeAllTest(unittest.TestCase):
     def inner(self, **over: object) -> dict:
         base = {"positive_ok": True, "guard": {"unavailable": None},
+                "guard_polls": {r: 40 for r in judge.LOADED_ROUTES},
                 "attempts": {r: True for r in judge.LISTENER_ROUTES + judge.STRUCTURAL_ROUTES}}
         base.update(over)
         return base
@@ -77,6 +78,30 @@ class JudgeAllTest(unittest.TestCase):
         control = {r: 1 for r in judge.LISTENER_ROUTES}
         out = judge.judge_all("bwrap-netns", self.inner(guard={"unavailable": "x"}), {}, control)
         self.assertTrue(all(v["verdict"] == judge.UNOBSERVABLE for v in out.values()))
+
+
+    def test_route_without_completed_guard_scan_is_not_pass(self) -> None:
+        # 監視が途中で止まった（走査が 0 回）経路は、他の条件が揃っていても合格にしない。
+        control = {r: 1 for r in judge.LISTENER_ROUTES}
+        polls = {r: 40 for r in judge.LOADED_ROUTES}
+        polls["fetch"] = 0
+        del polls["ws"]
+        out = judge.judge_all("bwrap-netns", self.inner(guard_polls=polls), {}, control)
+        self.assertEqual(out["fetch"]["verdict"], judge.UNOBSERVABLE)
+        self.assertEqual(out["ws"]["verdict"], judge.UNOBSERVABLE)
+        self.assertEqual(out["img"]["verdict"], judge.PASS)
+        self.assertEqual(out["dns"]["verdict"], judge.PASS)  # ページを読み込まない経路は走査回数を要しない
+
+    def test_missing_guard_polls_is_unobservable_for_loaded_routes(self) -> None:
+        control = {r: 1 for r in judge.LISTENER_ROUTES}
+        out = judge.judge_all("bwrap-netns", self.inner(guard_polls=None), {}, control)
+        self.assertTrue(all(out[r]["verdict"] == judge.UNOBSERVABLE for r in judge.LOADED_ROUTES))
+
+    def test_guard_violation_to_unexpected_destination_is_fail(self) -> None:
+        control = {r: 1 for r in judge.LISTENER_ROUTES}
+        out = judge.judge_all("bwrap-netns", self.inner(guard={"unavailable": None, "violation": "10.0.0.9:80"}),
+                              {}, control)
+        self.assertTrue(all(v["verdict"] == judge.FAIL for v in out.values()))
 
 
 class ModeAllowlistTest(unittest.TestCase):
