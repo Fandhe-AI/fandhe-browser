@@ -385,8 +385,9 @@ fn lifecycle_event(
 
 /// 文書リクエストの `Network.requestWillBeSent`（#1364・`CDP-4`）。`requestId` は `loaderId` と同じ値
 /// （Playwright・Puppeteer のナビゲーション要求判定は `requestId === loaderId && type === "Document"`）。
-/// `url` は確定 URL（userinfo 除去済み）。`request.headers` は実際に送った `User-Agent` だけ
-/// （他のヘッダは観測していないため推測で埋めない。`SEC-2`）。
+/// `url` は確定 URL（userinfo 除去済み）。`request.headers` は実際に送ったヘッダのうち
+/// `User-Agent` だけを載せる（HTTP クライアントが既定で付ける `Accept` 等は観測していないため、推測で
+/// 埋めず省略する。送信ヘッダの全体ではない。`SEC-2`）。
 fn request_will_be_sent_event(
     frame_id: &str,
     loader_id: &str,
