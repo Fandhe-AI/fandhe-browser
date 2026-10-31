@@ -1064,13 +1064,18 @@ sp_case() {
   local pid rc=0 alive=0
   : >"$SP/log"
   (
-    export PATH="$SP/bin:$PATH" FAKE_UNAME="$1" FAKE_TASKKILL_KILLS="$2" SP_LOG="$SP/log" SP_TARGET="$SP/target.pid" FC_STOP_POLLS=3
+    export PATH="$SP/bin:$PATH" FAKE_UNAME="$1" FAKE_TASKKILL_KILLS="$2" SP_LOG="$SP/log" SP_TARGET="$SP/target.pid" FC_STOP_POLLS=3 FC_PROC_ROOT="$SP/proc"
     if [ "$3" = "0" ]; then
       kill() { if [ "$1" = "-0" ]; then builtin kill "$@"; else return 0; fi; }
     fi
     sleep 30 &
     pid=$!
     echo "$pid" >"$SP/target.pid"
+    # SP_WINPID_CONTENT が非空なら偽 root に <pid>/winpid を置く（/proc 経路の優先と CR/LF 除去の検証）
+    if [ -n "${SP_WINPID_CONTENT:-}" ]; then
+      mkdir -p "$SP/proc/$pid"
+      printf '%b' "$SP_WINPID_CONTENT" >"$SP/proc/$pid/winpid"
+    fi
     stop_spawned "$pid" 2>"$SP/stderr" || rc=$?
     builtin kill -0 "$pid" 2>/dev/null && alive=1
     builtin kill -KILL "$pid" 2>/dev/null || true
@@ -1084,6 +1089,11 @@ expect_eq "$(sp_case Darwin 0 1)" "rc=0 alive=0" "stop_spawned (macOS) stops the
 # Windows 経路: signal が効かなくても taskkill /F /T /PID <WINPID> で止める
 expect_eq "$(sp_case MINGW64_NT-10.0 1 0)" "rc=0 alive=0" "stop_spawned (windows) stops a signal-proof child via taskkill"
 expect_eq "$(cat "$SP/log")" "/F /T /PID 4242" "stop_spawned (windows) passes the WINPID to taskkill /F /T"
+# Windows 経路: <root>/<pid>/winpid があれば ps より優先し、CR/LF を除いて使う（実 Windows の /proc 相当）
+rm -rf "$SP/proc"
+expect_eq "$(SP_WINPID_CONTENT='5151\r\n' sp_case MINGW64_NT-10.0 1 0)" "rc=0 alive=0" "stop_spawned (windows) stops via the /proc winpid"
+expect_eq "$(cat "$SP/log")" "/F /T /PID 5151" "stop_spawned (windows) prefers /proc winpid over ps and strips CR/LF"
+rm -rf "$SP/proc"
 # Windows 経路: 止まらない場合は wait で詰まらず（有界）、警告して非 0 を返す
 expect_eq "$(sp_case MSYS_NT-10.0 0 0)" "rc=1 alive=1" "stop_spawned (windows) gives up instead of hanging when the child survives"
 expect_contains "$(cat "$SP/stderr")" "could not stop spawned process (pid=" "stop_spawned (windows) warns on giving up"

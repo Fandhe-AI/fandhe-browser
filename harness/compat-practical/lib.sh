@@ -247,14 +247,16 @@ sha256_of() {
 #   `/proc/<pid>/winpid`（無ければ `ps -p` の WINPID 列）で引き、`taskkill /F /T` でプロセスツリーごと止める。
 #   終了確認は有界ポーリング（約 10 秒）で、止まらなければ `wait` せず警告して非 0 を返す（ハングより失敗を選ぶ）。
 #   ポーリング回数（既定 50 回 × 0.2 秒）は環境変数 FC_STOP_POLLS で変えられる（self-test 専用。実測では設定しない）。
+#   `/proc` の位置は環境変数 FC_PROC_ROOT で差し替えられる（self-test 専用。実測では設定しない。実 Windows では
+#   本物の `/proc/<pid>/winpid` が存在し偽の ps が参照されないため、self-test は存在しない場所か偽の root を指す）。
 #   実 Windows での動作は workflow_dispatch（xos-measure.yml）でしか確認できない。分岐の論理は self-test が偽コマンドで通す。
 stop_spawned() {
   local pid="$1" winpid=""
   case "$(uname -s)" in
     MINGW* | MSYS* | CYGWIN*)
       kill -0 "$pid" 2>/dev/null || { wait "$pid" 2>/dev/null || true; return 0; }
-      if [ -r "/proc/$pid/winpid" ]; then
-        winpid="$(tr -d '\r\n' <"/proc/$pid/winpid")"
+      if [ -r "${FC_PROC_ROOT:-/proc}/$pid/winpid" ]; then
+        winpid="$(tr -d '\r\n' <"${FC_PROC_ROOT:-/proc}/$pid/winpid")"
       fi
       if [ -z "$winpid" ]; then
         winpid="$(ps -p "$pid" 2>/dev/null | awk 'NR == 2 { print $4 }' | tr -d '\r\n')"
