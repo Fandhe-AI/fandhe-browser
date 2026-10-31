@@ -54,7 +54,7 @@ pub fn register_then_close() -> String {
     addr
 }
 
-/// listener を所有し、成功応答の直前に閉じて（応答後に閉じると、バイナリの次の接続が
+/// listener を所有し、成功応答の直前に閉じて拒否を確認してから応答し（応答後に閉じると、バイナリの次の接続が
 /// 閉じる前に accept キューへ入り Io エラーに分類される競合が起きる）自己申告を 1 回だけ処理する。
 fn serve_register_with_owned(listener: TcpListener) -> String {
     let Ok((mut s, _)) = listener.accept() else {
@@ -67,34 +67,144 @@ fn serve_register_with_owned(listener: TcpListener) -> String {
         raw.extend_from_slice(&buf[..n]);
         let text = String::from_utf8_lossy(&raw).to_string();
         if n == 0 || body_complete(&text) {
-            let addr = listener.local_addr().ok();
-            drop(listener);
-            diagnose_refused(addr);
+            close_and_wait_refused(listener);
             let _ = s.write_all(REGISTER_OK.as_bytes());
             return text;
         }
     }
 }
 
-/// listener を閉じた直後のポートへ短い期限で 1 回接続し、拒否以外なら観測結果を stderr に残す。
-/// macOS の不定期失敗（Issue #1187）で wildcard listener の影が原因かを失敗ログから判別するための
-/// 診断で、テストの合否には使わない。connect 成功は wildcard の影（H1）と、閉じたポートでも
-/// connect が成功する macOS の挙動（H2）のどちらでも起きるため、ログ上は区別せず両義のまま残す。
-/// エフェメラル範囲内のポートは同一プロセスの別テストへ再割り当てされ得て、診断の接続が干渉するため
-/// 探査しない（範囲外のポートに限る）。
-fn diagnose_refused(addr: Option<std::net::SocketAddr>) {
-    let Some(addr) = addr else { return };
+/// 閉じたはずのポートに対する 1 回の探査結果（PLUG-3・PLUG-4・Issue #1356）。
+/// 真偽値にせず、将来の判定追加（部分的に成立等）に備えて enum にする（REPAIR-4）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+pub enum ProbeOutcome {
+    /// 接続が拒否された、または確立しなかった（listen していない）。
+    Closed,
+    /// 接続が確立し、最初の書き込みも拒否されなかった（listen ソケットが生きている）。
+    Listening,
+}
+
+/// `addr`（エフェメラル範囲の外の loopback）が今 listen しているかを 1 回探査する。
+///
+/// 「拒否」の判定は `src/host.rs` の分類と同じ基準にする。macOS では閉じたポートへの
+/// `connect_timeout` が `Ok` を返し、拒否が `take_error` や最初の書き込みで初めて現れる
+/// （Issue #1187）。Windows では SYN の再送で `TimedOut` になり得るが、生きている loopback の
+/// listener ならカーネルが即座にハンドシェイクを完了するため、期限内に確立しなければ
+/// listen していないとみなす。範囲内のポートは同一プロセスの別テストの接続と衝突するため panic する。
+#[allow(dead_code)]
+pub fn probe_listening(addr: std::net::SocketAddr) -> ProbeOutcome {
     let (lo, hi) = ephemeral_port_range();
-    if (lo..=hi).contains(&u32::from(addr.port())) {
-        return;
+    assert!(
+        !(lo..=hi).contains(&u32::from(addr.port())),
+        "probe target {addr} is inside the ephemeral range {lo}-{hi}"
+    );
+    let Ok(mut stream) =
+        std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(500))
+    else {
+        return ProbeOutcome::Closed;
+    };
+    if !matches!(stream.take_error(), Ok(None)) {
+        return ProbeOutcome::Closed;
     }
-    match std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(500)) {
-        Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {}
-        Ok(_) => eprintln!(
-            "diagnostic: closed port {addr} connect succeeded (wildcard shadow or OS-level connect success; indistinguishable here)"
-        ),
-        Err(e) => eprintln!("diagnostic: closed port {addr} probe: {:?}", e.kind()),
+    let _ = stream.set_write_timeout(Some(std::time::Duration::from_millis(500)));
+    match stream.write_all(b"\r\n") {
+        Err(_) => ProbeOutcome::Closed,
+        Ok(()) => ProbeOutcome::Listening,
     }
+}
+
+/// `close_and_wait_refused` が拒否を確認するまで待つ上限。CI の負荷で fork 済み・exec 前の
+/// 子プロセスが fd を保持する窓が ms 単位に広がっても収まる余裕を見た値。
+const REFUSE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// `listener` を閉じ、そのポートが実際に接続を拒否する状態になるまで待って、ポートのアドレスを返す。
+///
+/// 並列テストの `Command::spawn` は fd テーブルを複製して fork し exec まで子が保持するため、
+/// 親が `drop` してもカーネル上の listen ソケットは子の exec まで生き残る。その間に張られた
+/// 接続は確立して `HostError::Io` に分類され、接続拒否のテストが不定期に落ちる（Issue #1356。
+/// #843・#1187 の再発）。拒否を確認してから先へ進めば、以後の fork は閉じた fd を複製しない。
+/// 期限を超えたら黙って通さず panic する（fail-closed）。
+#[allow(dead_code)]
+pub fn close_and_wait_refused(listener: TcpListener) -> std::net::SocketAddr {
+    let addr = listener.local_addr().expect("local addr");
+    drop(listener);
+    let start = std::time::Instant::now();
+    let mut attempts = 0u32;
+    while probe_listening(addr) == ProbeOutcome::Listening {
+        attempts += 1;
+        if start.elapsed() >= REFUSE_DEADLINE {
+            panic!(
+                "port {addr} still accepts connections after {attempts} probes in {:?}; holders: {}",
+                start.elapsed(),
+                describe_listen_holders(addr.port())
+            );
+        }
+        thread::sleep(std::time::Duration::from_millis(5));
+    }
+    if attempts > 0 {
+        eprintln!(
+            "closed port {addr} stayed listening for {attempts} probes ({:?})",
+            start.elapsed()
+        );
+    }
+    addr
+}
+
+/// `port` を LISTEN している pid と cmdline を `/proc` から調べた文字列（診断用・Linux のみ）。
+#[cfg(target_os = "linux")]
+fn describe_listen_holders(port: u16) -> String {
+    let hex = format!(":{port:04X} ");
+    let mut inodes = Vec::new();
+    for file in ["/proc/net/tcp", "/proc/net/tcp6"] {
+        let Ok(text) = std::fs::read_to_string(file) else {
+            continue;
+        };
+        for line in text.lines().skip(1) {
+            let f: Vec<&str> = line.split_whitespace().collect();
+            if let (Some(local), Some(st), Some(inode)) = (f.get(1), f.get(3), f.get(9))
+                && *st == "0A"
+                && format!("{local} ").contains(&hex)
+            {
+                inodes.push(inode.to_string());
+            }
+        }
+    }
+    let mut out = format!("listen inodes {inodes:?}");
+    let Ok(procs) = std::fs::read_dir("/proc") else {
+        return out;
+    };
+    for p in procs.flatten() {
+        let name = p.file_name().to_string_lossy().to_string();
+        if !name.chars().all(|c| c.is_ascii_digit()) {
+            continue;
+        }
+        let Ok(fds) = std::fs::read_dir(p.path().join("fd")) else {
+            continue;
+        };
+        let held = fds.flatten().any(|fd| {
+            std::fs::read_link(fd.path())
+                .map(|t| {
+                    let t = t.to_string_lossy().to_string();
+                    inodes.iter().any(|i| t == format!("socket:[{i}]"))
+                })
+                .unwrap_or(false)
+        });
+        if held {
+            let cmd = std::fs::read(p.path().join("cmdline")).unwrap_or_default();
+            let cmd: String = String::from_utf8_lossy(&cmd).replace('\0', " ");
+            out.push_str(&format!(
+                "; pid {name} cmdline {}",
+                cmd.chars().take(200).collect::<String>()
+            ));
+        }
+    }
+    out
+}
+
+#[cfg(not(target_os = "linux"))]
+fn describe_listen_holders(_port: u16) -> String {
+    "unavailable on this OS".to_string()
 }
 
 /// wildcard（`0.0.0.0`・`[::]`）で `port` を bind できるか。
