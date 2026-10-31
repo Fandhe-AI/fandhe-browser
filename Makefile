@@ -27,7 +27,7 @@
 	check-workspace-manifest fmt fmt-check lint test test-harness lint-rendering test-rendering \
 	check-render-isolation check-js-engine-isolation check-publish-private deny deny-servo-host license-inventory license-inventory-servo-host check-deny-license-reject ci \
 	check-compat-practical check-cli-conformance measure-cli-conformance check-compat-regression bench-record check-ci-changes check-bench-record \
-	check-binary-size check-static-link check-dynamic-link-macos check-dynamic-link-windows measure-mcp-envelope check-mcp-envelope measure-plugin-overhead check-plugin-overhead measure-js-binary-size measure-container-size check-container-smoke check-container-js-smoke check-container-memory measure-container-memory compare-container-memory measure-cssom-profile-cost \
+	check-binary-size check-static-link check-dynamic-link-macos check-dynamic-link-windows measure-mcp-envelope check-mcp-envelope measure-plugin-overhead check-plugin-overhead measure-js-binary-size measure-container-size check-container-smoke check-container-js-smoke check-container-memory check-egress-isolation measure-container-memory compare-container-memory measure-cssom-profile-cost \
 	docker-build docker-shell docker-ci trace-playwright check-playwright-trace check-puppeteer-connect check-playwright-connect test-playwright-connect
 
 help: ## ターゲット一覧を表示する（Make 非依存の一覧: scripts/help.sh）
@@ -178,6 +178,9 @@ check-cli-conformance: ## CLI コンフォーマンステスト実行スクリ�
 
 measure-cli-conformance: ## 実バイナリで CLI コンフォーマンステストを実行する（TASK-49・CLI-1。example.com へ出る。CLI_CONFORMANCE_ARGS で --render-host 等を指定。3 OS の実測は手動 workflow xos-measure.yml）
 	@scripts/harness.sh measure-cli-conformance
+
+check-egress-isolation: ## Servo ホストの egress 隔離実測ハーネスの自己テスト（TASK-38・RENDER-3・#1377。Linux のみ。要 python3。実ホスト・bwrap・docker 不要）
+	@scripts/harness.sh check-egress-isolation
 
 check-container-memory: ## コンテナ同時起動の集約メモリ測定スクリプトの自己テスト（TASK-67・CTR-3・CTR-7。Linux のみ。要 jq。docker 不要）
 	@scripts/harness.sh check-container-memory
