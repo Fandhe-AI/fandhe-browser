@@ -292,6 +292,19 @@ fn plug4_closed_port_stays_refused_under_concurrent_spawns() {
     use std::sync::atomic::{AtomicBool, Ordering};
     let stop = Arc::new(AtomicBool::new(false));
     let flag = Arc::clone(&stop);
+    // panic 経路でも Drop で stop を立てて join し、spawner を確実に回収するガード。
+    struct SpawnerGuard {
+        stop: Arc<AtomicBool>,
+        handle: Option<thread::JoinHandle<()>>,
+    }
+    impl Drop for SpawnerGuard {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::SeqCst);
+            if let Some(h) = self.handle.take() {
+                let _ = h.join();
+            }
+        }
+    }
     let spawner = thread::spawn(move || {
         let exe = std::env::current_exe().expect("exe");
         while !flag.load(Ordering::SeqCst) {
@@ -305,12 +318,14 @@ fn plug4_closed_port_stays_refused_under_concurrent_spawns() {
             }
         }
     });
+    let _guard = SpawnerGuard {
+        stop,
+        handle: Some(spawner),
+    };
     for _ in 0..20 {
         let addr = common::close_and_wait_refused(common::bind_non_ephemeral_loopback());
         assert_eq!(common::probe_listening(addr), common::ProbeOutcome::Closed);
         thread::sleep(Duration::from_millis(10));
         assert_eq!(common::probe_listening(addr), common::ProbeOutcome::Closed);
     }
-    stop.store(true, Ordering::SeqCst);
-    spawner.join().expect("spawner thread");
 }
