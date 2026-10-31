@@ -7,9 +7,11 @@
 from __future__ import annotations
 
 import argparse
+import errno
 import json
 import os
 import shutil
+import socket
 import sys
 import tempfile
 import unittest
@@ -289,6 +291,61 @@ class PlatformProbeTest(unittest.TestCase):
         self.assertEqual(probe(0, "not json"), "unobservable: malformed JSON on stdout")
         self.assertEqual(probe(0, "[1]"), "unobservable: unexpected JSON shape")
         self.assertEqual(probe(0, '{"ret": -1, "errno": 0}'), "unobservable: unexpected JSON shape")
+
+
+class ProbeFailureTest(unittest.TestCase):
+    """AF_INET6 等のソケット作成失敗でも結果 JSON が残り、判定が観測不能に倒れること（Bugbot 指摘・#1380）。"""
+
+    def test_probe_connect_socket_creation_failure_is_unobservable(self) -> None:
+        err = OSError(errno.EAFNOSUPPORT, "no ipv6")
+        with mock.patch.object(in_sandbox.socket, "socket", side_effect=err):
+            self.assertEqual(in_sandbox.probe_connect(socket.AF_INET6, ("fd00::1", 80, 0, 0)),
+                             "unobservable:EAFNOSUPPORT")
+            self.assertEqual(in_sandbox.probe_udp("127.0.0.3", 9), "unobservable:EAFNOSUPPORT")
+            self.assertEqual(in_sandbox.reachable_resolver_sockets(), [])
+
+    def test_ipv6_disabled_does_not_count_as_attempt(self) -> None:
+        real_socket = socket.socket
+
+        def fake(family: int = socket.AF_INET, *a: object, **k: object) -> socket.socket:
+            if family == socket.AF_INET6:
+                raise OSError(errno.EAFNOSUPPORT, "no ipv6")
+            return real_socket(family, *a, **k)
+
+        tmp = Path(tempfile.mkdtemp(prefix="egress-test-"))
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        host = make_fake_host(tmp, [])
+        ports = {k: 20100 + i for i, k in enumerate(("redirect", "img", "fetch", "ws", "internal", "udp_direct"))}
+        args = argparse.Namespace(mode="bwrap-netns", host=str(host), ports=json.dumps(ports), out=tmp / "o.json")
+        self.assertIn("bwrap-netns", judge.ISOLATED_MODES)
+        with mock.patch.object(in_sandbox, "SETTLE_S", 0.01), \
+                mock.patch.object(in_sandbox.judge, "check_isolation", return_value=(True, "")), \
+                mock.patch.object(in_sandbox.socket, "socket", side_effect=fake), \
+                mock.patch.object(in_sandbox, "probe_dns", return_value={"result": "gaierror:-2", "elapsed_s": 0}):
+            rc = in_sandbox.main(["--mode", "bwrap-netns", "--host", str(host),
+                                  "--ports", json.dumps(ports), "--out", str(args.out)])
+        self.assertEqual(rc, 0)
+        data = json.loads(args.out.read_text(encoding="utf-8"))
+        self.assertEqual(data["probes"]["internal_real"][judge.REAL_INTERNAL_V6], "unobservable:EAFNOSUPPORT")
+        self.assertFalse(data["attempts"]["internal_real"])
+        verdicts = judge.judge_all("bwrap-netns", data, {"internal_real": 0}, {"internal": 1})
+        self.assertEqual(verdicts["internal_real"]["verdict"], judge.UNOBSERVABLE)
+
+    def test_unhandled_exception_still_writes_unobservable_json(self) -> None:
+        tmp = Path(tempfile.mkdtemp(prefix="egress-test-"))
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        host = make_fake_host(tmp, [])
+        ports = {k: 20200 + i for i, k in enumerate(("redirect", "img", "fetch", "ws", "internal", "udp_direct"))}
+        out = tmp / "o.json"
+        with mock.patch.object(in_sandbox, "run", side_effect=RuntimeError("boom")):
+            rc = in_sandbox.main(["--mode", "baseline", "--host", str(host),
+                                  "--ports", json.dumps(ports), "--out", str(out)])
+        self.assertEqual(rc, 0)
+        data = json.loads(out.read_text(encoding="utf-8"))
+        self.assertEqual(data["fatal"], "RuntimeError: boom")
+        self.assertIs(data["positive_ok"], False)
+        verdicts = judge.judge_all("bwrap-netns", data, {}, {})
+        self.assertEqual({v["verdict"] for v in verdicts.values()}, {judge.UNOBSERVABLE})
 
 
 if __name__ == "__main__":

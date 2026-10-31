@@ -103,9 +103,20 @@ def read_proc(name: str) -> str | None:
         return None
 
 
+def errno_name(exc: OSError) -> str:
+    return errno.errorcode.get(exc.errno or 0, "oserror")
+
+
 def probe_connect(family: int, addr: tuple[Any, ...]) -> str:
-    """connect だけを試し（何も送らない）、結果を errno 名で返す。成功なら "connected"。"""
-    sock = socket.socket(family, socket.SOCK_STREAM)
+    """connect だけを試し（何も送らない）、結果を errno 名で返す。成功なら "connected"。
+
+    ソケットを作れない（例: `ipv6.disable=1` の `AF_INET6` は EAFNOSUPPORT）場合は "unobservable:<errno>"。
+    試行そのものが起きていないため `attempts` の根拠にならず、隔離の合格証拠として扱われない（fail-closed）。
+    """
+    try:
+        sock = socket.socket(family, socket.SOCK_STREAM)
+    except OSError as exc:
+        return f"unobservable:{errno_name(exc)}"
     sock.settimeout(PROBE_TIMEOUT_S)
     try:
         sock.connect(addr)
@@ -120,7 +131,10 @@ def probe_connect(family: int, addr: tuple[Any, ...]) -> str:
 
 def probe_udp(ip: str, port: int) -> str:
     """UDP の sendto（DNS 形式の固定バイト列）を 1 回送る。宛先は外側/内側のダミー listener。"""
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    except OSError as exc:
+        return f"unobservable:{errno_name(exc)}"
     try:
         sock.sendto(b"\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x00\x00\x01\x00\x01", (ip, port))
         return "sent"
@@ -166,7 +180,10 @@ def reachable_resolver_sockets() -> list[str]:
     """
     found: list[str] = []
     for path in RESOLVER_SOCKETS:
-        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        except OSError:
+            continue
         sock.settimeout(1.0)
         try:
             sock.connect(path)
@@ -196,7 +213,11 @@ def probe_nameservers() -> dict[str, Any]:
     results: dict[str, str] = {}
     for ip in servers:
         family = socket.AF_INET6 if ":" in ip else socket.AF_INET
-        sock = socket.socket(family, socket.SOCK_DGRAM)
+        try:
+            sock = socket.socket(family, socket.SOCK_DGRAM)
+        except OSError as exc:
+            results[ip] = f"unobservable:{errno_name(exc)}"
+            continue
         try:
             sock.connect((ip, 53))
             results[ip] = "connected"
@@ -372,15 +393,34 @@ def run(args: argparse.Namespace, ports: dict[str, int]) -> dict[str, Any]:
 
     # --- (iv)(v) のプローブ（connect だけ・固定宛先） -----------------------------------
     probes: dict[str, Any] = {}
-    probes["udp_direct"] = probe_udp(judge.IP_BLOCKED, ports["udp_direct"])
+    probe_errors: dict[str, str] = {}
+
+    def guarded(name: str, fn: Any) -> Any:
+        """想定外の例外はそのプローブだけを観測不能にし、結果 JSON の出力を妨げない。"""
+        try:
+            return fn()
+        except Exception as exc:  # noqa: BLE001  (最後の砦。型名のみ記録)
+            probe_errors[name] = type(exc).__name__
+            return f"unobservable:{type(exc).__name__}"
+
+    probes["udp_direct"] = guarded("udp_direct", lambda: probe_udp(judge.IP_BLOCKED, ports["udp_direct"]))
     if isolated:
         probes["internal_real"] = {
-            **{ip: probe_connect(socket.AF_INET, (ip, 80)) for ip in judge.REAL_INTERNAL_V4},
-            judge.REAL_INTERNAL_V6: probe_connect(socket.AF_INET6, (judge.REAL_INTERNAL_V6, 80, 0, 0)),
+            **{ip: guarded("internal_real", lambda ip=ip: probe_connect(socket.AF_INET, (ip, 80)))
+               for ip in judge.REAL_INTERNAL_V4},
+            judge.REAL_INTERNAL_V6: guarded(
+                "internal_real",
+                lambda: probe_connect(socket.AF_INET6, (judge.REAL_INTERNAL_V6, 80, 0, 0))),
         }
-        probes["dns"] = probe_dns()
-        probes["dns"]["resolver_sockets"] = reachable_resolver_sockets()
-        probes["dns"].update(probe_nameservers())
+        dns = guarded("dns", probe_dns)
+        probes["dns"] = dns if isinstance(dns, dict) else {"result": str(dns)}
+        # 失敗時は resolver 到達不明（非空）・nameserver 空として扱い、dns の試行を観測不能に倒す。
+        res_socks = guarded("dns", reachable_resolver_sockets)
+        probes["dns"]["resolver_sockets"] = res_socks if isinstance(res_socks, list) else [str(res_socks)]
+        ns = guarded("dns", probe_nameservers)
+        probes["dns"].update(ns if isinstance(ns, dict) else {"nameservers": {}})
+    if probe_errors:
+        result["probe_errors"] = probe_errors
     result["probes"] = probes
     time.sleep(0.5)
 
@@ -416,7 +456,11 @@ def main(argv: list[str] | None = None) -> int:
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
-    result = run(args, ports)
+    try:
+        result = run(args, ports)
+    except Exception as exc:  # noqa: BLE001  (最後の砦: 結果 JSON を必ず残し、モード全体を観測不能にする)
+        result = {"mode": args.mode, "fatal": f"{type(exc).__name__}: {str(exc)[:120]}",
+                  "positive_ok": False, "attempts": {}}
     args.out.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return 2 if result.get("aborted") else 0
 
