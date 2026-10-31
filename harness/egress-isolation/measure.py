@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Servo ホストの egress 隔離を Linux で実測する外側の計測ランナー。
+"""Servo ホストの egress 隔離を Linux・macOS・Windows で実測する外側の計測ランナー。
 
 役割・責務境界:
     Issue #1377（TASK-38・`RENDER-3`・`SEC-2`・`PLUG-1`・`XOS-1`）。親判断 #1003 の比較設計
@@ -11,6 +11,11 @@
     2. モードごとに内側ランナー（`in_sandbox.py`）を bwrap / docker の固定 argv で起動する。
        baseline は `--unshare-net` だけを外した同条件（陽性対照）。docker-none は `--network none`。
     3. 外側の受信件数と内側の結果を `judge.py` で突き合わせる。観測できなければ不合格（fail-closed）。
+
+OS 別のモード（#1387）:
+    Linux は bwrap / docker。macOS は `sandbox-exec`（Seatbelt。`seatbelt.py`）で、試行の観測はサンドボックスの
+    拒否ログ。Windows は baseline のみ実測し、`appcontainer` は起動に FFI（ctypes）が要るため承認事項として
+    保留し、全経路を理由つきの `unobservable` で出す（設計 §7）。macOS・Windows にはプロセス単位の監視が無い。
 
 安全上の規則:
     - 宛先は 127.0.0.0/8 のダミーだけ。実在のアドレスへ向けたプローブは、隔離下の内側で
@@ -24,13 +29,17 @@
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 import json
 import os
+import platform
 import re
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 from typing import Any
 
@@ -38,6 +47,12 @@ _HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(_HERE))
 import judge  # noqa: E402
 import listeners  # noqa: E402
+import seatbelt  # noqa: E402
+
+APPCONTAINER_UNAVAILABLE = (
+    "AppContainer launcher needs FFI (CreateProcessW with SECURITY_CAPABILITIES via ctypes); "
+    "approval item (design section 7); not implemented"
+)
 
 RUN_TIMEOUT_S = 240
 DOCKER_IMAGE_RE = re.compile(r"^[a-z0-9][a-z0-9._/:@-]{0,127}$")
@@ -82,10 +97,59 @@ def resolv_bind_args(resolv_file: Path) -> list[str]:
     return []
 
 
+def ensure_loopback_aliases() -> None:
+    """127.0.0.2 / 127.0.0.3 に bind できることを確かめる（できなければ ValueError）。
+
+    macOS の lo0 は既定で 127.0.0.1 だけを持つ。ハーネスは sudo を使わないため、案内だけ出して止める。
+    """
+    for ip in (judge.IP_BLOCKED, judge.IP_INTERNAL_STANDIN):
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            s.bind((ip, 0))
+        except OSError as exc:
+            raise ValueError(
+                f"cannot bind {ip} ({type(exc).__name__}); on macOS run: sudo ifconfig lo0 alias {ip} up") from exc
+        finally:
+            s.close()
+
+
+def mac_version() -> str | None:
+    """`sw_vers -productVersion`（記録のみ）。取得できなければ None。"""
+    try:
+        done = subprocess.run(["/usr/bin/sw_vers", "-productVersion"], capture_output=True, text=True,  # noqa: S603
+                              timeout=20, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return done.stdout.strip()[:40] or None
+
+
+def free_port() -> int:
+    """空きの loopback ポートを 1 つ確保して返す（Seatbelt のプロファイルが起動前にポートを要るため）。"""
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        s.bind((judge.IP_ALLOWED, 0))
+        return int(s.getsockname()[1])
+    finally:
+        s.close()
+
+
 def build_argv(mode: str, *, host: Path, ports: dict[str, int], out_dir: Path, hosts_file: Path,
-               image: str | None, resolv_file: Path | None = None, name: str | None = None) -> list[str]:
+               image: str | None, resolv_file: Path | None = None, name: str | None = None,
+               page_port: int = 0, platform_name: str | None = None) -> list[str]:
     """内側ランナーを起動する固定 argv。ポートは int を文字列化したものだけが入る。"""
     inner_args = ["--mode", mode, "--ports", json.dumps(ports, sort_keys=True)]
+    plat = platform_name or sys.platform
+    if not plat.startswith("linux"):
+        # macOS・Windows: 内側ランナーを（Seatbelt があれば包んで）直接起動する。
+        inner_args += ["--page-port", str(page_port)]
+        runner = [sys.executable, "-I", "-B", str(_HERE / "in_sandbox.py"),
+                  "--host", str(host), "--out", str(out_dir / f"{mode}.json"), *inner_args]
+        if mode == "baseline":
+            return ([seatbelt.SANDBOX_EXEC, "-p", seatbelt.BASELINE_PROFILE, *runner]
+                    if plat == "darwin" else runner)
+        if mode == "seatbelt" and plat == "darwin":
+            return [seatbelt.SANDBOX_EXEC, "-p", seatbelt.isolated_profile(page_port), *runner]
+        raise ValueError(f"mode {mode} is not runnable on {plat}")
     if mode in ("baseline", "bwrap-netns"):
         argv = ["bwrap", "--die-with-parent"]
         if mode == "bwrap-netns":
@@ -149,29 +213,54 @@ def run_argv(argv: list[str], container: str | None = None) -> tuple[int | None,
 
 
 def _run_argv(argv: list[str]) -> tuple[int | None, str]:
+    windows = sys.platform == "win32"
+    kwargs: dict[str, Any] = (
+        {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if windows else {"start_new_session": True})
     proc = subprocess.Popen(  # noqa: S603
-        argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
-        start_new_session=True,
+        argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, **kwargs,
     )
     try:
         _, err = proc.communicate(timeout=RUN_TIMEOUT_S)
         return proc.returncode, err.decode("utf-8", errors="replace")[-400:]
     except subprocess.TimeoutExpired:
-        try:
-            os.killpg(proc.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
+        if windows:
+            # プロセスツリーごと終了する（PID は int。固定 argv）。
+            subprocess.run(["taskkill", "/PID", str(int(proc.pid)), "/T", "/F"],  # noqa: S603,S607
+                           stdin=subprocess.DEVNULL, capture_output=True, timeout=30, check=False)
+        else:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
         proc.communicate()
         return None, "timed out"
 
 
+def collect_denies(start: str) -> tuple[dict[str, int], dict[str, Any]]:
+    """macOS のサンドボックス拒否ログを集計する。(宛先 -> 件数, 取得状況)。読めなければ空と理由。"""
+    try:
+        done = subprocess.run(seatbelt.log_show_argv(start), stdin=subprocess.DEVNULL,  # noqa: S603
+                              capture_output=True, text=True, timeout=180, check=False)
+    except (OSError, subprocess.SubprocessError, ValueError) as exc:
+        return {}, {"available": False, "reason": type(exc).__name__}
+    if done.returncode != 0:
+        return {}, {"available": False, "reason": f"log show rc={done.returncode}"}
+    counts = seatbelt.parse_denies(done.stdout)
+    return dict(counts), {"available": True, "deny_lines": sum(counts.values())}
+
+
 def run_mode(mode: str, *, host: Path, ports: dict[str, int], recs: dict[str, Any], out_dir: Path,
-             hosts_file: Path, image: str | None, resolv_file: Path | None = None) -> dict[str, Any]:
+             hosts_file: Path, image: str | None, resolv_file: Path | None = None, page_port: int = 0) -> dict[str, Any]:
+    if mode == "appcontainer":
+        return {"mode": mode, "exit_code": None, "binary_sha256": None, "binary_version": None,
+                "stderr_tail": "", "inner": {}, "outer_counts": {k: 0 for k in recs},
+                "unavailable": APPCONTAINER_UNAVAILABLE}
     before = {k: r.count for k, r in recs.items()}
     # docker はコンテナ名を付けて、タイムアウト・例外時にも確実に後始末する（名前は pid 由来の固定形式）。
     name = f"egress-iso-{os.getpid()}" if mode == "docker-none" else None
     argv = build_argv(mode, host=host, ports=ports, out_dir=out_dir, hosts_file=hosts_file, image=image,
-                      resolv_file=resolv_file, name=name)
+                      resolv_file=resolv_file, name=name, page_port=page_port)
+    started = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time() - 2))
     rc, err = run_argv(argv, container=name)
     outer = {k: r.count - before[k] for k, r in recs.items()}
     result_path = out_dir / f"{mode}.json"
@@ -183,14 +272,28 @@ def run_mode(mode: str, *, host: Path, ports: dict[str, int], recs: dict[str, An
             inner = json.loads(result_path.read_text(encoding="utf-8"))
         except ValueError:
             inner = {}
-    return {"mode": mode, "exit_code": rc, "binary_sha256": inner.get("host_sha256"),
+    data = {"mode": mode, "exit_code": rc, "binary_sha256": inner.get("host_sha256"),
             "binary_version": inner.get("host_version"), "stderr_tail": err if rc != 0 else "", "inner": inner,
             "outer_counts": outer}
+    if mode == "seatbelt" and inner:
+        # 共有 loopback のため内側の写し listener が無い。TCP の試行は拒否ログ（宛先 ip:port）で観測する。
+        denies, status = collect_denies(started)
+        dest = {r: f"{judge.IP_INTERNAL_STANDIN if r == 'internal' else judge.IP_BLOCKED}:{ports[r]}"
+                for r in ("redirect", "img", "fetch", "ws", "internal")}
+        attempts = dict(inner.get("attempts") or {})
+        for route, seen in seatbelt.attempts_from_denies(
+                Counter(denies), dest).items():
+            attempts[route] = seen
+        udp = f"{judge.IP_BLOCKED}:{ports['udp_direct']}"
+        attempts["udp_direct"] = bool(attempts.get("udp_direct")) or denies.get(udp, 0) >= 1
+        inner["attempts"] = attempts
+        data["deny_log"] = {**status, "dest_counts": {d: denies.get(d, 0) for d in (*dest.values(), udp)}}
+    return data
 
 
 def summarize(results: dict[str, Any]) -> str:
-    lines = ["# egress isolation measurement (Linux)", ""]
     meta = results["meta"]
+    lines = [f"# egress isolation measurement ({meta.get('platform_name', 'Linux')})", ""]
     lines.append(f"- date (UTC): {meta['date_utc']}")
     lines.append(f"- kernel: {meta['kernel']}")
     lines.append(f"- host binary sha256: {meta['host_sha256']}")
@@ -211,6 +314,10 @@ def summarize(results: dict[str, Any]) -> str:
         lines.append(f"- exit code: {data.get('exit_code')}; positive_ok: {inner.get('positive_ok')}; "
                      f"selftest_rc: {inner.get('selftest_rc')}; aborted: {inner.get('aborted', False)}")
         lines.append(f"- guard: {inner.get('guard')}")
+        if data.get("unavailable"):
+            lines.append(f"- mode unavailable: {data['unavailable']}")
+        if data.get("deny_log"):
+            lines.append(f"- sandbox deny log: {data['deny_log']}")
         lines.append(f"- isolation precheck: {inner.get('isolation_precheck')}")
         lines.append(f"- binary sha256 (inside sandbox): {data.get('binary_sha256')}; "
                      f"matches baseline: {data.get('binary_match')}")
@@ -223,23 +330,28 @@ def summarize(results: dict[str, Any]) -> str:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Measure Servo host egress isolation on Linux.")
+    parser = argparse.ArgumentParser(description="Measure Servo host egress isolation (Linux, macOS, Windows).")
     parser.add_argument("--host", required=True, help="Absolute path to fandhe-browser-servo-host.")
     parser.add_argument("--modes", default="baseline,bwrap-netns",
-                        help="Comma separated subset of baseline,bwrap-netns,docker-none (baseline first).")
+                        help="Comma separated modes allowed on this OS (baseline first): linux baseline,bwrap-netns,docker-none; "
+                        "darwin baseline,seatbelt; win32 baseline,appcontainer.")
     parser.add_argument("--docker-image", help="Image containing the host at " + DOCKER_HOST_PATH)
     parser.add_argument("--out", required=True, type=Path, help="Existing empty directory for results.")
     args = parser.parse_args(argv)
     try:
-        if not sys.platform.startswith("linux"):
-            raise ValueError("Linux only")
+        plat = "linux" if sys.platform.startswith("linux") else sys.platform
+        allowed = judge.PLATFORM_MODES.get(plat)
+        if allowed is None:
+            raise ValueError(f"unsupported platform: {sys.platform}")
         host = validate_host(args.host)
         modes = args.modes.split(",")
-        if not modes or modes[0] != "baseline" or any(m not in judge.MODES for m in modes):
+        if not modes or modes[0] != "baseline" or any(m not in allowed for m in modes):
             raise ValueError("--modes must start with baseline and use known modes")
         image = validate_image(args.docker_image) if args.docker_image else None
         if "docker-none" in modes and image is None:
             raise ValueError("docker-none needs --docker-image")
+        if plat == "darwin":
+            ensure_loopback_aliases()
         if not args.out.is_dir():
             raise ValueError("--out must be an existing directory")
         if any(args.out.iterdir()):
@@ -258,6 +370,7 @@ def main(argv: list[str] | None = None) -> int:
         resolv_file = Path(td) / "resolv.conf"
         resolv_file.write_text(judge.RESOLV_CONF, encoding="utf-8")
         recs, ports = start_outer_listeners()
+        page_port = 0 if sys.platform.startswith("linux") else free_port()
         results: dict[str, Any] = {"modes": {}}
         try:
             version = subprocess.run([str(host), "--version"], capture_output=True, text=True,  # noqa: S603
@@ -269,13 +382,14 @@ def main(argv: list[str] | None = None) -> int:
 
             results["meta"] = {
                 "date_utc": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-                "kernel": os.uname().release, "host_sha256": sha, "host_version": version,
+                "kernel": platform.release(), "platform_name": platform.platform(),
+                "sw_vers": mac_version() if sys.platform == "darwin" else None, "host_sha256": sha, "host_version": version,
                 "proxy_env_present": any(k.lower().endswith("_proxy") for k in os.environ),
             }
             for mode in modes:
                 results["modes"][mode] = run_mode(mode, host=host, ports=ports, recs=recs, out_dir=out_dir,
                                                   hosts_file=hosts_file, image=image,
-                                                  resolv_file=resolv_file)
+                                                  resolv_file=resolv_file, page_port=page_port)
                 if mode == "docker-none" and image is not None:
                     results["modes"][mode]["image_id"] = docker_image_id(image)
         finally:
@@ -288,7 +402,8 @@ def main(argv: list[str] | None = None) -> int:
             # 陽性対照（baseline）と同一バイナリでなければ、対照が当該モードの根拠にならない。
             data["binary_match"] = bool(base_sha) and data.get("binary_sha256") == base_sha
             data["verdicts"] = judge.judge_all(mode, data["inner"], data["outer_counts"], control,
-                                               binary_match=data["binary_match"])
+                                               binary_match=data["binary_match"],
+                                               mode_unavailable=data.get("unavailable"))
     (out_dir / "result.json").write_text(json.dumps(results, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     summary = summarize(results)
     (out_dir / "summary.md").write_text(summary, encoding="utf-8")

@@ -145,7 +145,7 @@ gh api repos/Fandhe-AI/fandhe-browser/actions/runs/<run-id>/jobs --paginate   # 
 | `ai-review.yml` | pull_request | 約 1〜2 分 | |
 | `update-external.yml` | schedule・dispatch | 約 2 分 | 日次 |
 | `bench-competitor.yml` | schedule・dispatch | 約 2〜3 分 | 週次・3 OS。対象バイナリ未配線のため skipped が多い |
-| `xos-measure.yml` | workflow_dispatch | 未計測（初回実行後に記入） | 手動のみ・3 OS・cache なし。timeout は cli-conformance が ubuntu 75・macOS 80・Windows 90 分、compat-practical が 150 分（`repeat` 最大 5 回 × run_core.sh の全体期限 1200 秒）。実測で見直す |
+| `xos-measure.yml` | workflow_dispatch | 未計測（初回実行後に記入） | 手動のみ・3 OS・cache なし。timeout は cli-conformance が ubuntu 75・macOS 80・Windows 90 分、egress-isolation（#1387）が macOS 55・Windows 90 分、compat-practical が 150 分（`repeat` 最大 5 回 × run_core.sh の全体期限 1200 秒）。実測で見直す |
 | `release.yml` | workflow_dispatch | 実績少 | 手動のみ |
 
 短縮余地は残るが、`rust-features-ubuntu` を複数ジョブに分割すると required checks の追加（ruleset 更新）が要るため、実施する場合はユーザー判断とする。

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # egress 隔離ハーネス（harness/egress-isolation/）の自己テスト。
 # Issue #1377・TASK-38・RENDER-3・SEC-2。実ホスト・bwrap・docker は使わない（偽ホストと loopback のみ）。
-# 実行件数が 0 件なら失敗にする（fail-closed）。要 python3。Linux 以外では egress_guard 依存のテストが skip される。
+# 実行件数が 0 件なら失敗にする（fail-closed）。要 python3。Linux 以外では /proc 依存のテストが skip される。
 set -euo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")/../.."

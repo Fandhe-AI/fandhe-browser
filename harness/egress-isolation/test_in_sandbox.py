@@ -50,7 +50,7 @@ class InnerRunnerTest(unittest.TestCase):
         return {k: 20000 + i for i, k in enumerate(("redirect", "img", "fetch", "ws", "internal", "udp_direct"))}
 
     def args(self, mode: str, host: Path) -> argparse.Namespace:
-        return argparse.Namespace(mode=mode, host=str(host), ports=json.dumps(self.ports()), out=self.tmp / "o.json")
+        return argparse.Namespace(mode=mode, host=str(host), ports=json.dumps(self.ports()), out=self.tmp / "o.json", page_port=0)
 
     def test_baseline_reaching_outer_listener_is_recorded(self) -> None:
         outer = listeners.TcpRecorder("o", "127.0.0.2").start()
@@ -313,7 +313,7 @@ class ProbeFailureTest(unittest.TestCase):
         self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
         host = make_fake_host(tmp, [])
         ports = {k: 20100 + i for i, k in enumerate(("redirect", "img", "fetch", "ws", "internal", "udp_direct"))}
-        args = argparse.Namespace(mode="bwrap-netns", host=str(host), ports=json.dumps(ports), out=tmp / "o.json")
+        args = argparse.Namespace(mode="bwrap-netns", host=str(host), ports=json.dumps(ports), out=tmp / "o.json", page_port=0)
         self.assertIn("bwrap-netns", judge.ISOLATED_MODES)
         with mock.patch.object(in_sandbox, "SETTLE_S", 0.01), \
                 mock.patch.object(in_sandbox.judge, "check_isolation", return_value=(True, "")), \

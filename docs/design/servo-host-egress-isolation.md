@@ -123,7 +123,7 @@ loopback で配信するフィクスチャページ（`harness/render-screenshot
 
 ### 6.3 実施の扱い
 
-- `xos-measure.yml`（手動専用・required ではない）への suite 追加と測定ハーネスの実装は後続 issue（infra-builder・render-builder）とする。本 issue では計画を書くだけにする。Linux 版のハーネスは `harness/egress-isolation/`（#1377・#1380）で実装済み（結果は §6.4）
+- `xos-measure.yml`（手動専用・required ではない）への suite 追加と測定ハーネスの実装は後続 issue（infra-builder・render-builder）とする。本 issue では計画を書くだけにする。Linux 版のハーネスは `harness/egress-isolation/`（#1377・#1380）で実装済み（結果は §6.4）。macOS・Windows 版は #1387 で同ハーネスを拡張し、`xos-measure.yml` の suite `egress-isolation` として実装した（macOS は Seatbelt の `seatbelt`、Windows は `baseline` のみ実測し AppContainer のランチャーは FFI が要る承認事項のため `unobservable`。結果は #1003 に記録し、実測後に本書へ要約する）
 - 依存・`unsafe` を要する測定用コードは承認の後にする
 
 ### 6.4 Linux の実測結果（c56f11c2・2026-10-31）
@@ -177,7 +177,7 @@ loopback で配信するフィクスチャページ（`harness/render-screenshot
 | `unsafe` | `pre_exec`、`sandbox_init` の FFI、`CreateProcess` の属性リスト |
 | 新設 | 本体側の許可リスト付きプロキシ（CONNECT。loopback 限定 bind・接続時の IP 再検査） |
 | 変更 | `servo-host/src/engine.rs` の `fixed_preferences`（proxy pref の注入。クライアントから任意引数を渡さない方針〔設計 §2.6〕と整合させる） |
-| CI | `xos-measure.yml` への suite 追加（required ではないため ruleset への影響なし） |
+| CI | `xos-measure.yml` への suite 追加（required ではないため ruleset への影響なし。`egress-isolation` は #1387 の指定で追加済み） |
 
 ## 8. オーナー判断（2026-10-31・暫定）
 

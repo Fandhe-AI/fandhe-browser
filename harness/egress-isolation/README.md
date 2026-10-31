@@ -1,6 +1,6 @@
-# egress-isolation（Servo ホストの egress 隔離の Linux 実測）
+# egress-isolation（Servo ホストの egress 隔離の実測。Linux・macOS・Windows）
 
-Issue #1377・TASK-38・`RENDER-3`・`SEC-2`・`PLUG-1`・`XOS-1`。親判断 #1003 の比較設計
+Issue #1377（Linux）・#1387（macOS・Windows）・TASK-38・`RENDER-3`・`SEC-2`・`PLUG-1`・`XOS-1`。親判断 #1003 の比較設計
 `docs/design/servo-host-egress-isolation.md` §6（実測計画）のうち、**依存・`unsafe`・pip を使わずに測れる
 Linux の範囲**を測るハーネス。**方式の採否は決めない**。結果は測定条件つきの事実として記録する。
 
@@ -80,7 +80,31 @@ measure.py は全モードで同一バイナリ（sha256 一致。`binary_match`
   プロファイル）経由でのみ netns を作れる。ns 内に CAP_NET_ADMIN は無く、veth は作れない。
 - 内側の `/etc/hosts` は bind マウント（docker は `--add-host`）。Servo が参照することはベースラインの受信で確認する。
 
+## macOS・Windows（#1387）
+
+`xos-measure.yml` の suite `egress-isolation`（`gh workflow run xos-measure.yml -f suite=egress-isolation`。
+macOS・Windows の GitHub ホステッドランナー。結果は #1003 に記録する）か、手元の実機で `measure.py` を実行する。
+判定語彙（`pass` / `fail` / `unobservable`）と fail-closed は Linux と同じ。OS ごとのモードは `judge.PLATFORM_MODES`。
+
+| OS | モード | 内容 |
+| -- | ------ | ---- |
+| macOS | `baseline` / `seatbelt` | baseline は `sandbox-exec -p "(version 1)(allow default)"`（隔離と無関係な失敗の切り分け）。`seatbelt` は `(deny network-outbound (remote ip))` ＋ページ配信用 loopback 1 ポートの許可（`seatbelt.py`） |
+| Windows | `baseline` / `appcontainer` | baseline は直接起動。`appcontainer` は**未実装**（起動に `CreateProcessW` の `SECURITY_CAPABILITIES` を ctypes で呼ぶ FFI が要り、設計 §7 の承認事項。全経路を理由つきの `unobservable` で出す） |
+
+観測手段が Linux と異なる点（`method` 列にも出る）:
+
+- プロセス単位の監視（`egress_guard`）が無い。pass の条件から外す代わりに、外側 listener の受信 0 件・baseline の到達・
+  試行の観測・`--selftest` と loopback の `load` の成功をすべて要する。
+- 試行の観測は、macOS の TCP 経路はサンドボックス拒否ログ（`log show`。ip:port と件数だけ記録）、`udp_direct` は
+  `sendto` が拒否された errno。ログが読めない・0 件なら試行は未観測（unobservable）。
+- 共有 loopback で内側の写し listener を立てられない。hosts も変えないため、ページは IP リテラル（127.0.0.x）で配る。
+- `internal_real` / `dns` は netns 前提の構造検査で、Seatbelt・AppContainer では成り立たないため `unobservable`
+  （実在の内部アドレスにも向けない）。
+- macOS は lo0 に 127.0.0.2 / 127.0.0.3 の alias が要る（`sudo ifconfig lo0 alias 127.0.0.2 up`）。ハーネスは sudo を
+  使わず、bind できなければ exit 2 で案内する。workflow は使い捨て runner で固定 argv の alias 追加を行う。
+- Windows の runner は管理者で動くため、「非管理者で loopback 例外を作れるか」には答えられない（設計 §6.2）。
+
 ## 承認事項（この issue では実装しない）
 
 Landlock ルールの適用（`landlock` クレートまたは `unsafe`）・seccomp-bpf・許可リスト付きプロキシと netns 内への中継・
-Servo 自身の DNS/UDP の外部観測・`xos-measure.yml` への suite 追加・macOS / Windows・古いカーネルでの再測定。
+Servo 自身の DNS/UDP の外部観測・Windows の AppContainer ランチャー（ctypes による FFI）・`CheckNetIsolation LoopbackExempt` の設定変更・古いカーネルでの再測定。

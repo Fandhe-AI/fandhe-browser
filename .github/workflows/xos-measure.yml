@@ -6,6 +6,9 @@ name: XOS Measure
 #                          （仕様 docs/design/cli-conformance-tests.md・実体 harness/cli-conformance/run.sh。CLI-1）
 #   suite=compat-practical TASK-59（#294）。PoC-1 の代表タスクを 3 OS で実行し動作率の差を見る
 #                          （harness/compat-practical/repeat_core.sh。22 件と 28 件の両方の成功数を出す。MEAS-4・COMPAT-4）
+#   suite=egress-isolation Servo ホストの egress 隔離を macOS・Windows で実測する（#1387・TASK-38・RENDER-3。
+#                          harness/egress-isolation/measure.py。macOS は Seatbelt、Windows は baseline のみ
+#                          〔AppContainer ランチャーは FFI が要る承認事項のため unobservable で記録〕。ubuntu は対象外）
 # 本 workflow は計測結果を出すだけで、合否・OS 間の差の判定はしない（判定は人間。.claude/rules/delegation-impl.md）。
 #
 # 設計上の位置づけ:
@@ -13,7 +16,7 @@ name: XOS Measure
 #   ここで出る check-run は required に登録しない（登録すると PR で pending のままになりマージできなくなる）。
 # - ci.yml とは別 workflow にする理由: ci.yml が出す check-run はすべて required にする規約のため、非 required の
 #   補助ジョブを足せない（.claude/rules/ci.md「ジョブ構成と required checks」）。bench-competitor.yml と同じ事情。
-# - ジョブは OS × suite の明示ジョブ 6 本。required にしないので matrix でもよいが、OS ごとに前提ステップの形が
+# - ジョブは OS × suite の明示ジョブ 8 本（egress-isolation は macOS・Windows のみ）。required にしないので matrix でもよいが、OS ごとに前提ステップの形が
 #   大きく違う（Windows は Servo の MSVC v143・ATL・MozTools・ANGLE、macOS は LLVM_OBJDUMP）ため、
 #   matrix にすると `if: runner.os` だらけになる。timeout も suite × OS で違う。
 # - concurrency は設けない。計測はジョブごとに別 VM で、固定ポート（9333）は VM 内で閉じる。途中キャンセルしない。
@@ -32,12 +35,13 @@ on:
   workflow_dispatch:
     inputs:
       suite:
-        description: "実行する計測（cli-conformance: TASK-49 / compat-practical: TASK-59）"
+        description: "実行する計測（cli-conformance: TASK-49 / compat-practical: TASK-59 / egress-isolation: #1387）"
         type: choice
         required: true
         options:
           - cli-conformance
           - compat-practical
+          - egress-isolation
       repeat:
         description: "compat-practical の繰り返し回数（1〜5。cli-conformance では使わない）"
         type: string
@@ -509,6 +513,377 @@ jobs:
         with:
           name: cli-conformance-windows
           path: ${{ runner.temp }}\cli-conformance
+          retention-days: 30
+          if-no-files-found: error
+
+  # --------------------------------------------------
+  # egress-isolation（#1387・TASK-38・RENDER-3）
+  # --------------------------------------------------
+  egress-isolation-macos:
+    if: ${{ inputs.suite == 'egress-isolation' }}
+    runs-on: macos-latest
+    # servo-host-macos の release 込み 35.3 分（release ビルド 23.9 分。run 40396545036）× 約 1.5。計測自体は数分
+    timeout-minutes: 55
+    permissions:
+      contents: read
+    env:
+      CARGO_INCREMENTAL: "0"
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: false
+      - name: "出力先の決定（runner context は job env で使えないため GITHUB_ENV 経由）"
+        run: |
+          echo "SERVO_HOST_TARGET_DIR=$RUNNER_TEMP/servo-host-release" >> "$GITHUB_ENV"
+          echo "OUT_DIR=$RUNNER_TEMP/egress-isolation" >> "$GITHUB_ENV"
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
+        with:
+          toolchain: stable
+      - name: "Servo ホストの system 依存の確認"
+        run: |
+          df -h /
+          # servo-host-macos と同じ。mozjs_sys の configure（LLVM_OBJDUMP）は llvm-objdump を要求する。
+          # Xcode 同梱の LLVM 系 objdump を xcrun で探し、LLVM_OBJDUMP でパスを渡す（PATH は変えない）
+          objdump=""
+          for name in llvm-objdump objdump; do
+            if found="$(xcrun --find "$name" 2>/dev/null)" && [ -x "$found" ]; then
+              objdump="$found"
+              break
+            fi
+          done
+          if [ -z "$objdump" ]; then
+            echo "error: neither llvm-objdump nor objdump was found via xcrun" >&2
+            exit 1
+          fi
+          echo "LLVM_OBJDUMP=$objdump" >> "$GITHUB_ENV"
+          echo "LLVM_OBJDUMP: $objdump"
+          for t in clang cmake pkg-config python3 make jq curl; do
+            if ! command -v "$t" >/dev/null 2>&1; then
+              echo "error: $t is required but was not found on PATH" >&2
+              exit 1
+            fi
+          done
+      - name: "[servo-host] cargo build --release"
+        run: cargo build --manifest-path servo-host/Cargo.toml --locked --release --target-dir "$SERVO_HOST_TARGET_DIR"
+      - name: "[servo-host] --selftest"
+        run: |
+          out="$("$SERVO_HOST_TARGET_DIR/release/fandhe-browser-servo-host" --selftest)"
+          echo "$out"
+          case "$out" in "selftest ok:"*) ;; *) echo "error: unexpected --selftest output" >&2; exit 1 ;; esac
+      - name: "[egress-isolation] 自己テスト"
+        run: bash harness/egress-isolation/self-test.sh
+      - name: "[egress-isolation] プラットフォームの記録（読み取りのみ）"
+        run: python3 -I -B harness/egress-isolation/platform_probe.py
+      - name: "[egress-isolation] lo0 に 127.0.0.2・127.0.0.3 の alias を追加（使い捨て runner。固定 argv）"
+        run: |
+          # macOS の lo0 は既定で 127.0.0.1 しか持たない。ダミー宛先の listener に必要（ハーネス自身は sudo を使わない）
+          sudo ifconfig lo0 alias 127.0.0.2 up
+          sudo ifconfig lo0 alias 127.0.0.3 up
+          echo "loopback aliases added: 127.0.0.2 127.0.0.3" >> "$GITHUB_STEP_SUMMARY"
+      - name: "[egress-isolation] 実行"
+        run: |
+          mkdir -p "$OUT_DIR"
+          python3 -I -B harness/egress-isolation/measure.py \
+            --host "$SERVO_HOST_TARGET_DIR/release/fandhe-browser-servo-host" \
+            --modes baseline,seatbelt --out "$OUT_DIR"
+      - name: "[egress-isolation] 結果表を Step Summary へ"
+        if: ${{ !cancelled() }}
+        run: |
+          if [ -f "$OUT_DIR/summary.md" ]; then
+            cat "$OUT_DIR/summary.md" >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: "[egress-isolation] 結果をアーティファクトへ"
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: egress-isolation-macos
+          path: ${{ runner.temp }}/egress-isolation
+          retention-days: 30
+          if-no-files-found: error
+
+  # Windows 版。前提検証は cli-conformance-windows と同一内容（更新時は両方を揃える）。AppContainer は未実装（unobservable）
+  egress-isolation-windows:
+    if: ${{ inputs.suite == 'egress-isolation' }}
+    runs-on: windows-latest
+    # cli-conformance-windows と同じ根拠（servo-host-windows の release 込み 57.6 分 × 約 1.5）
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      CARGO_INCREMENTAL: "0"
+      # Servo ホストの release の出力先。C: の空きが少ないため D:（空きの多い短いパス。servo-host-windows と同じ）
+      SERVO_HOST_TARGET_DIR: D:\sr
+      # Servo の Windows 前提の下限（XOS-6）
+      MIN_WINDOWS_SDK: "10.0.19041.0"
+      # v143 向け C++ ATL の VS コンポーネント ID（VS 2026 の 14.44 サイドバイサイド）
+      ATL_V143_COMPONENT: Microsoft.VisualStudio.Component.VC.14.44.17.14.ATL
+      # uv は完全固定（win_amd64 wheel の sha256 で完全性を検証）
+      UV_VERSION: "0.12.20"
+      UV_WHEEL_SHA256: 1502e03f4da3280cbb493d356d59bdd401bf23197cd71df64e1c6feac156090c
+      # MozTools は完全固定（zip の sha256 で検証）。build.rs の MOZTOOLS_VERSION と版を揃える
+      MOZTOOLS_VERSION: "4.0"
+      MOZTOOLS_URL: https://github.com/servo/servo-build-deps/releases/download/msvc-deps/moztools-4.0.zip
+      MOZTOOLS_ZIP_SHA256: cceb354767ef3dad8813e63cb95ed081814225bf5fa15bfa083aa8b31a339153
+    steps:
+      - name: "長パスの有効化と空き容量の記録"
+        run: |
+          git config --global core.longpaths true
+          Get-PSDrive -PSProvider FileSystem | Format-Table Name, Used, Free
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
+        with:
+          toolchain: stable
+      - name: Windows SDK の検証
+        run: |
+          $min = [version]$env:MIN_WINDOWS_SDK
+          $root = Join-Path ${env:ProgramFiles(x86)} 'Windows Kits\10\Include'
+          $found = @()
+          if (Test-Path $root) {
+            $found = Get-ChildItem $root -Directory |
+              Where-Object { $_.Name -match '^10\.\d+\.\d+\.\d+$' } |
+              ForEach-Object { [version]$_.Name } |
+              Where-Object { $_ -ge $min } | Sort-Object -Descending
+          }
+          if ($found.Count -eq 0) {
+            Write-Host "::error::Windows SDK >= $min not found under $root"
+            exit 1
+          }
+          Write-Host "Windows SDK: $($found[0])"
+      - name: VS と MSVC v143 ツールセットの検証
+        run: |
+          $vsInstaller = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer'
+          $vswhere = Join-Path $vsInstaller 'vswhere.exe'
+          $installPath = & $vswhere -products * -latest `
+            -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+            -property installationPath
+          if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($installPath)) {
+            Write-Host "::error::Visual Studio with the MSVC toolset not found"
+            exit 1
+          }
+          $installPath = $installPath.Trim()
+          $msvcRoot = Join-Path $installPath 'VC\Tools\MSVC'
+          # v143 のうち ATL 導入対象（ATL_V143_COMPONENT）と対になる 14.44 系のみを
+          # 検証対象にする（ATL は 14.44 固定のため、別版を選ぶと atlbase.h が見つからない）
+          $v143 = @()
+          if (Test-Path $msvcRoot) {
+            $v143 = Get-ChildItem $msvcRoot -Directory |
+              Where-Object { $_.Name -match '^\d+\.\d+\.\d+$' } |
+              Where-Object { [version]$_.Name -ge [version]'14.44' } |
+              Where-Object { [version]$_.Name -lt [version]'14.45' } |
+              Sort-Object { [version]$_.Name } -Descending
+          }
+          if ($v143.Count -eq 0) {
+            Write-Host "::error::MSVC v143 toolset 14.44 (paired with the ATL component) not found under $msvcRoot"
+            exit 1
+          }
+          Write-Host "VS: $installPath"
+          Write-Host "MSVC v143 toolset: $($v143[0].Name)"
+          "VS_INSTALL_PATH=$installPath" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "MSVC_V143_DIR=$($v143[0].FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      - name: v143 向け C++ ATL の検証（無ければ導入）
+        run: |
+          $header = Join-Path $env:MSVC_V143_DIR 'atlmfc\include\atlbase.h'
+          if (-not (Test-Path $header)) {
+            Write-Host "ATL for v143 not found; installing $env:ATL_V143_COMPONENT"
+            $setup = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\setup.exe'
+            $p = Start-Process -FilePath $setup -Wait -PassThru -ArgumentList @(
+              'modify', '--installPath', "`"$env:VS_INSTALL_PATH`"",
+              '--add', $env:ATL_V143_COMPONENT,
+              '--quiet', '--norestart', '--nocache')
+            if ($p.ExitCode -ne 0 -and $p.ExitCode -ne 3010) {
+              Write-Host "::error::VS Installer failed with exit code $($p.ExitCode)"
+              exit 1
+            }
+          }
+          if (-not (Test-Path $header)) {
+            Write-Host "::error::C++ ATL for v143 (atlbase.h) not found under $env:MSVC_V143_DIR"
+            exit 1
+          }
+          Write-Host "C++ ATL for v143: $header"
+      - name: Python の検証
+        run: |
+          $out = python --version
+          if ($LASTEXITCODE -ne 0 -or $out -notmatch '^Python 3\.') {
+            Write-Host "::error::Python 3.x not found (got: $out)"
+            exit 1
+          }
+          Write-Host $out
+      - name: uv の導入（バージョン・ハッシュ固定）
+        run: |
+          # 導入済みの uv があっても sha256 検証を必ず通すため、まず wheel を
+          # 明示取得（--require-hashes で検証）し、その wheel を強制再導入する
+          $work = Join-Path $env:RUNNER_TEMP 'uv-wheel'
+          New-Item -ItemType Directory -Force -Path $work | Out-Null
+          $req = Join-Path $work 'uv-requirements.txt'
+          "uv==$env:UV_VERSION --hash=sha256:$env:UV_WHEEL_SHA256" | Out-File -FilePath $req -Encoding ascii
+          python -m pip download --disable-pip-version-check --no-cache-dir `
+            --require-hashes --only-binary=:all: --no-deps -d $work -r $req
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "::error::hash-verified download of pinned uv failed"
+            Remove-Item $work -Recurse -Force -ErrorAction SilentlyContinue
+            exit 1
+          }
+          python -m pip install --disable-pip-version-check --no-cache-dir `
+            --require-hashes --only-binary=:all: --no-deps --force-reinstall `
+            --no-index --find-links $work -r $req
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "::error::pip install of pinned uv failed"
+            Remove-Item $work -Recurse -Force -ErrorAction SilentlyContinue
+            exit 1
+          }
+          Remove-Item $work -Recurse -Force -ErrorAction SilentlyContinue
+          # 出力は "uv 0.12.20 (<hash> <date> <target>)" 形式のため前方一致で比較する
+          $ver = python -m uv --version
+          if ($LASTEXITCODE -ne 0 -or $ver -notlike "uv $env:UV_VERSION *") {
+            Write-Host "::error::unexpected uv version: $ver"
+            exit 1
+          }
+          Write-Host $ver
+      - name: "MSVC v143 環境の選択（vcvarsall -vcvars_ver）"
+        run: |
+          $vcvars = Join-Path $env:VS_INSTALL_PATH 'VC\Auxiliary\Build\vcvarsall.bat'
+          if (-not (Test-Path $vcvars)) {
+            Write-Host "::error::vcvarsall.bat not found: $vcvars"
+            exit 1
+          }
+          $ver = Split-Path $env:MSVC_V143_DIR -Leaf
+          $allowed = @('PATH', 'INCLUDE', 'LIB', 'LIBPATH', 'VCToolsVersion', 'VCToolsInstallDir',
+            'VCINSTALLDIR', 'VSINSTALLDIR', 'WindowsSdkDir', 'WindowsSDKVersion', 'UCRTVersion',
+            'UniversalCRTSdkDir', 'WindowsLibPath', 'WindowsSdkBinPath', 'WindowsSdkVerBinPath')
+          $lines = cmd /c "`"$vcvars`" x64 -vcvars_ver=$ver >nul && set"
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "::error::vcvarsall.bat failed with exit code $LASTEXITCODE"
+            exit 1
+          }
+          $tools = $null
+          foreach ($line in $lines) {
+            if ($line -match '^([A-Za-z0-9_]+)=(.*)$' -and $allowed -contains $Matches[1]) {
+              "$($Matches[1])=$($Matches[2])" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+              if ($Matches[1] -eq 'VCToolsVersion') { $tools = [version]$Matches[2].Trim() }
+            }
+          }
+          if ($null -eq $tools -or $tools -lt [version]'14.30' -or $tools -ge [version]'14.50') {
+            Write-Host "::error::VCToolsVersion is not v143 (got: $tools)"
+            exit 1
+          }
+          Write-Host "VCToolsVersion: $tools"
+      - name: "libclang の検出（bindgen 用）"
+        run: |
+          $dirs = @("$env:ProgramFiles\LLVM\bin", "${env:ProgramFiles(x86)}\LLVM\bin")
+          $found = $dirs | Where-Object { Test-Path (Join-Path $_ 'libclang.dll') } | Select-Object -First 1
+          if (-not $found) {
+            Write-Host "::error::libclang.dll not found under $($dirs -join ', ')"
+            exit 1
+          }
+          Write-Host "LIBCLANG_PATH: $found"
+          "LIBCLANG_PATH=$found" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          # mozjs_sys の build.rs が llvm-objdump を要求するため、同じ LLVM の bin を PATH に足す
+          if (-not (Get-Command llvm-objdump -ErrorAction SilentlyContinue)) {
+            "$found" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          }
+      - name: "MozTools の導入（バージョン・ハッシュ固定）"
+        run: |
+          # mozjs_sys の build.rs（find_moztools）は MOZTOOLS_PATH を最優先で使う。zip を取得・sha256 照合・展開して指す
+          $work = Join-Path $env:RUNNER_TEMP 'moztools'
+          New-Item -ItemType Directory -Force -Path $work | Out-Null
+          $zip = Join-Path $work 'moztools.zip'
+          Invoke-WebRequest -Uri $env:MOZTOOLS_URL -OutFile $zip -MaximumRetryCount 3 -RetryIntervalSec 5
+          $hash = (Get-FileHash -Algorithm SHA256 -Path $zip).Hash.ToLowerInvariant()
+          if ($hash -ne $env:MOZTOOLS_ZIP_SHA256) {
+            Write-Host "::error::moztools zip sha256 mismatch (got: $hash)"
+            Remove-Item $work -Recurse -Force -ErrorAction SilentlyContinue
+            exit 1
+          }
+          $dest = Join-Path $work 'x'
+          Expand-Archive -Path $zip -DestinationPath $dest
+          Remove-Item $zip -Force
+          # zip の最上位は moztools-<版> ディレクトリ（msys2/ と bin/mozmake.exe を含む）
+          $root = Join-Path $dest "moztools-$env:MOZTOOLS_VERSION"
+          foreach ($rel in @('bin\mozmake.exe', 'msys2\usr\bin')) {
+            if (-not (Test-Path (Join-Path $root $rel))) {
+              Write-Host "::error::unexpected moztools layout: missing $rel under $root"
+              exit 1
+            }
+          }
+          Write-Host "MOZTOOLS_PATH: $root"
+          "MOZTOOLS_PATH=$root" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      - name: "[servo-host] cargo build --release"
+        env:
+          # ルート .cargo/config.toml の +crt-static（本体向け。#917）を Servo ホストでは打ち消す。mozjs_sys は動的 CRT 前提で
+          # 静的 CRT ではリンクできない（LNK2019）。本体のビルドには効かせないため、ジョブ env ではなくこのステップだけに置く
+          CARGO_ENCODED_RUSTFLAGS: "-Ctarget-feature=-crt-static"
+        run: |
+          cargo build --manifest-path servo-host/Cargo.toml --locked --release `
+            --target-dir $env:SERVO_HOST_TARGET_DIR
+      - name: "[servo-host] ANGLE の DLL を配置（libEGL.dll・libGLESv2.dll）"
+        run: |
+          # Windows は `no-wgl`（ANGLE）で動く。mozangle の build.rs が OUT_DIR に作る DLL は、実行時に exe の隣か PATH に要る。
+          # 実行するため release の exe の隣へ置く。OUT_DIR を持つ mozangle-* ディレクトリが 1 件でない・DLL が欠けるときは fail する
+          $build = Join-Path $env:SERVO_HOST_TARGET_DIR 'release\build'
+          $outs = @(Get-ChildItem -Path $build -Directory -Filter 'mozangle-*' |
+            ForEach-Object { Join-Path $_.FullName 'out' } |
+            Where-Object {
+              (Test-Path (Join-Path $_ 'libEGL.dll')) -and
+              (Test-Path (Join-Path $_ 'libGLESv2.dll'))
+            })
+          if ($outs.Count -ne 1) {
+            Write-Host "::error::expected 1 mozangle OUT_DIR with the ANGLE DLLs under $build (found: $($outs.Count))"
+            exit 1
+          }
+          $dir = Join-Path $env:SERVO_HOST_TARGET_DIR 'release'
+          foreach ($dll in @('libEGL.dll', 'libGLESv2.dll')) {
+            Copy-Item -Path (Join-Path $outs[0] $dll) -Destination $dir -Force
+            if (-not (Test-Path (Join-Path $dir $dll))) {
+              Write-Host "::error::failed to place $dll in $dir"
+              exit 1
+            }
+          }
+          Write-Host "ANGLE DLLs placed in $dir"
+      - name: "[servo-host] --selftest"
+        run: |
+          $bin = Join-Path $env:SERVO_HOST_TARGET_DIR 'release\fandhe-browser-servo-host.exe'
+          if (-not (Test-Path $bin)) {
+            Write-Host "::error::servo host binary not found: $bin"
+            exit 1
+          }
+          $out = (& $bin --selftest) -join "`n"
+          $code = $LASTEXITCODE
+          Write-Host $out
+          if ($code -ne 0 -or -not $out.StartsWith('selftest ok:')) {
+            Write-Host "::error::--selftest failed (exit code $code)"
+            exit 1
+          }
+      - name: "[egress-isolation] 自己テスト"
+        shell: bash
+        run: bash harness/egress-isolation/self-test.sh
+      - name: "[egress-isolation] プラットフォームの記録（読み取りのみ）"
+        run: python -I -B harness/egress-isolation/platform_probe.py
+      - name: "[egress-isolation] 実行（baseline の正の対照。appcontainer は unobservable）"
+        run: |
+          $out = Join-Path $env:RUNNER_TEMP 'egress-isolation'
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+          $bin = Join-Path $env:SERVO_HOST_TARGET_DIR 'release\fandhe-browser-servo-host.exe'
+          python -I -B harness/egress-isolation/measure.py --host $bin --modes baseline,appcontainer --out $out
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: "[egress-isolation] 結果表を Step Summary へ"
+        if: ${{ !cancelled() }}
+        run: |
+          $f = Join-Path $env:RUNNER_TEMP 'egress-isolation\summary.md'
+          if (Test-Path $f) { Get-Content $f | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8 }
+      - name: "[egress-isolation] 結果をアーティファクトへ"
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: egress-isolation-windows
+          path: ${{ runner.temp }}\egress-isolation
           retention-days: 30
           if-no-files-found: error
 

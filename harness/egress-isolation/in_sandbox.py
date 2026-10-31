@@ -230,6 +230,8 @@ def probe_nameservers() -> dict[str, Any]:
     return {"nameservers": results}
 
 
+# サンドボックス（Seatbelt 等）が送信を拒否したときの errno 名。実測で観測した値に合わせて見直す（#1387）。
+SANDBOX_DENY_ERRNOS = frozenset({"EPERM", "EACCES"})
 NS_UNREACHABLE = frozenset({"ENETUNREACH", "EHOSTUNREACH", "ENETDOWN", "EADDRNOTAVAIL", "EAFNOSUPPORT"})
 
 
@@ -268,6 +270,8 @@ def host_identity(host: str) -> dict[str, Any]:
 def validate_args(args: argparse.Namespace) -> dict[str, int]:
     if args.mode not in judge.MODES:
         raise ValueError("unknown mode")
+    if args.page_port != 0 and not (1024 <= args.page_port <= 65535):
+        raise ValueError("--page-port must be 0 or an int in [1024, 65535]")
     host = Path(args.host)
     if not host.is_absolute() or not host.is_file() or not os.access(host, os.X_OK):
         raise ValueError("--host must be an absolute path to an executable file")
@@ -310,26 +314,30 @@ def load_route(chan: sbd.HostChannel, next_id: list[int], info: sbd.HostInfo, ur
 
 def run(args: argparse.Namespace, ports: dict[str, int]) -> dict[str, Any]:
     isolated = args.mode in judge.ISOLATED_MODES
+    # netns を前提にする検査・写し listener・構造的な経路は bwrap / docker のモードだけ（#1387）。
+    netns = args.mode in judge.NETNS_MODES
+    linux = sys.platform.startswith("linux")
+    literal = not linux  # macOS・Windows は hosts を変えられないので IP リテラルのページを配る
     result: dict[str, Any] = {"mode": args.mode, "routes": list(judge.routes_for_mode(args.mode))}
     result.update(host_identity(args.host))
 
     dev, route4, route6 = read_proc("dev"), read_proc("route"), read_proc("ipv6_route")
-    if isolated:
+    if netns:
         ok, why = judge.check_isolation(dev, route4, route6)
         result["isolation_precheck"] = {"ok": ok, "reason": why}
         if not ok:
             result["aborted"] = True
             return result
 
-    server = http.server.ThreadingHTTPServer((judge.IP_ALLOWED, 0), _PageHandler)
+    server = http.server.ThreadingHTTPServer((judge.IP_ALLOWED, args.page_port), _PageHandler)
     server.daemon_threads = True
     page_port = server.server_address[1]
-    _PageHandler.pages = fixtures.build_pages(ports)
-    _PageHandler.redirect_to = fixtures.redirect_location(ports)
+    _PageHandler.pages = fixtures.build_pages(ports, literal=literal)
+    _PageHandler.redirect_to = fixtures.redirect_location(ports, literal=literal)
     threading.Thread(target=server.serve_forever, daemon=True).start()
 
     inner: dict[str, Any] = {}
-    if isolated:
+    if netns:
         for r in TCP_ROUTES:
             ip = judge.IP_INTERNAL_STANDIN if r == "internal" else judge.IP_BLOCKED
             inner[r] = listeners.TcpRecorder(r, ip, ports[r]).start()
@@ -358,23 +366,24 @@ def run(args: argparse.Namespace, ports: dict[str, int]) -> dict[str, Any]:
         # ハーネスが意図的に接続させるダミー宛先（127.0.0.2 / 127.0.0.3）は想定内の試行として除外し、監視を続ける。
         expected = {f"{judge.IP_INTERNAL_STANDIN if r == 'internal' else judge.IP_BLOCKED}:{ports[r]}"
                     for r in TCP_ROUTES} | {f"{judge.IP_BLOCKED}:{ports['udp_direct']}"}
-        guard = monitor.DestinationMonitor(proc.pid, page_port, expected)
-        guard.start()
+        if linux:
+            guard = monitor.DestinationMonitor(proc.pid, page_port, expected)
+            guard.start()
         chan = sbd.HostChannel(proc)
         info = sbd.validate_hello(chan.recv(sbd.HANDSHAKE_TIMEOUT_S))  # bounding_box 必須の検査を含む
         chan.request_max = info.request_max
         next_id = [1]
-        base = f"http://{judge.HOST_ALLOWED}:{page_port}"
+        base = f"http://{judge.IP_ALLOWED if literal else judge.HOST_ALLOWED}:{page_port}"
 
         loopback = load_route(chan, next_id, info, f"{base}/ok")
         result["loopback_load"] = loopback
         loads: dict[str, Any] = {}
         guard_polls: dict[str, int] = {}
-        for r in (x for x in PAGE_ROUTES if x in result["routes"]):
-            polls_before = guard.snapshot_polls()
+        for r in (x for x in PAGE_ROUTES if x in result["routes"] and (netns or x in TCP_ROUTES)):
+            polls_before = guard.snapshot_polls() if guard is not None else 0
             loads[r] = load_route(chan, next_id, info, base + fixtures.ROUTE_PATH[r])
             time.sleep(SETTLE_S)
-            guard_polls[r] = guard.snapshot_polls() - polls_before  # 経路ごとに完了した走査の回数
+            guard_polls[r] = (guard.snapshot_polls() - polls_before) if guard is not None else 0  # 経路ごとに完了した走査の回数
         result["loads"] = loads
         result["guard_polls"] = guard_polls
         try:
@@ -385,7 +394,9 @@ def run(args: argparse.Namespace, ports: dict[str, int]) -> dict[str, Any]:
     except (sbd.HostError, OSError, subprocess.SubprocessError) as exc:
         result["error"] = f"{type(exc).__name__}: {str(exc)[:120]}"
     finally:
-        if guard is not None:
+        if guard is None:
+            result["guard"] = {"unavailable": f"process-level monitor not supported on {sys.platform}"}
+        else:
             guard.stop()
             result["guard"] = {"violation": guard.violation, "unavailable": guard.unavailable,
                                "polls": guard.snapshot_polls(), "expected_seen": sorted(guard.expected_seen)}
@@ -406,7 +417,7 @@ def run(args: argparse.Namespace, ports: dict[str, int]) -> dict[str, Any]:
             return f"unobservable:{type(exc).__name__}"
 
     probes["udp_direct"] = guarded("udp_direct", lambda: probe_udp(judge.IP_BLOCKED, ports["udp_direct"]))
-    if isolated:
+    if netns:
         probes["internal_real"] = {
             **{ip: guarded("internal_real", lambda ip=ip: probe_connect(socket.AF_INET, (ip, 80)))
                for ip in judge.REAL_INTERNAL_V4},
@@ -438,8 +449,12 @@ def run(args: argparse.Namespace, ports: dict[str, int]) -> dict[str, Any]:
         # 構造的な経路は「経路なし」を示す errno が出たことを試行の根拠とする。
         "internal_real": bool(real) and all(v in unreachable for v in real.values()),
         # 失敗種別だけでは送信遮断の証拠にならない。ホスト側 resolver のソケットに届く環境では試行を観測できない扱い。
-        "dns": isolated and dns_attempt_observed(probes.get("dns", {})),
+        "dns": netns and dns_attempt_observed(probes.get("dns", {})),
     }
+    if isolated and not netns:
+        # 写し listener が無いモード: UDP はサンドボックスが sendto を拒否した errno を試行の根拠にする。
+        # TCP の経路は measure.py が拒否ログ（macOS）から補う。errno は実測で観測した値（EPERM 等）を許可集合に入れる。
+        result["attempts"]["udp_direct"] = probes.get("udp_direct") in SANDBOX_DENY_ERRNOS
     for rec in inner.values():
         rec.stop()
     server.shutdown()
@@ -452,6 +467,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--host", required=True)
     parser.add_argument("--ports", required=True)
     parser.add_argument("--out", required=True, type=Path)
+    parser.add_argument("--page-port", type=int, default=0,
+                        help="Fixed port for the allowed page server (Seatbelt profile needs it before launch).")
     args = parser.parse_args(argv)
     try:
         ports = validate_args(args)
