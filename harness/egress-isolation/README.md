@@ -37,12 +37,28 @@ python3 -I -B harness/egress-isolation/measure.py \
   --modes baseline,bwrap-netns [,docker-none --docker-image <image>] \
   --out "$(mktemp -d)"
 
+# docker-none の準備（glibc をそろえたホストを Debian trixie のイメージ内でビルドして取り出す。#1386）
+bash harness/egress-isolation/container/prepare.sh build fandhe-egress-isolation:local
+bash harness/egress-isolation/container/prepare.sh extract fandhe-egress-isolation:local "$(mktemp -d)"
+# 続けて、表示された取り出し先のバイナリを --host に渡す:
+#   measure.py --host <取り出したバイナリ> --modes baseline,bwrap-netns,docker-none \
+#     --docker-image fandhe-egress-isolation:local --out "$(mktemp -d)"
+
 # Landlock ABI・netns の作り方ごとの可否・sysctl（読み取りのみ）
 python3 -I -B harness/egress-isolation/platform_probe.py [--docker-image <image>]
 ```
 
 `--out` に `result.json`・`summary.md`・モードごとの内側結果が出る。`make ci` と CI には含めない
 （実測は人間の判断材料。後続の候補: `harness-ubuntu` への自己テストのステップ追加）。
+
+### docker-none で glibc をそろえる理由
+
+measure.py は全モードで同一バイナリ（sha256 一致。`binary_match`）を要求する。ホストの新しい glibc でビルドした
+バイナリをイメージ（Debian trixie・glibc 2.41）へ COPY すると `GLIBC_2.43` 等を要求して起動できない
+（#1377 の再実測 run 2）。そこで `container/Dockerfile` が trixie 内でホストをビルドし、`prepare.sh extract` が
+同じファイルを取り出して全モードの `--host` に使う（glibc 2.41 でリンクしたバイナリは新しいホストでも動く）。
+イメージは push・配布しない（MPL-2.0 部分を含む）。ベースイメージのダイジェストは
+`harness/render-screenshot/container/Dockerfile` と同値で、`test_container.py` がドリフトを検査する。
 
 ## 安全上の規則
 
@@ -58,6 +74,8 @@ python3 -I -B harness/egress-isolation/platform_probe.py [--docker-image <image>
   （root か CAP_NET_ADMIN が要る。承認事項）。
 - 送信先の監視は `monitor.py`（`egress_guard` の走査関数を流用し、ハーネスが意図的に接続させるダミー宛先を除外して継続する）。接続済みソケットを 25 ms 間隔で走査するため短命な接続は拾えず、経路ごとに走査が 1 回以上完了していなければ合格にしない。補助の観測手段。
 - `dns` は `/etc/resolv.conf` の実体位置に固定の非ループバック nameserver（192.0.2.53）を重ね、その宛先への UDP connect が経路なしで失敗したときだけ試行を観測した扱いにする（`/run` の隠蔽による resolv.conf 欠落と netns 由来の失敗を区別する。区別できなければ unobservable）。docker-none は resolv.conf を差し替えないため、nameserver が得られなければ unobservable になる。
+- docker-none の不採用案: render-screenshot のイメージの流用（Chromium の導入で遅く無関係な依存が入る）、
+  測定機の OS にそろえたベースイメージへのローカルビルドの COPY（配布コンテナと同じ glibc という目的から外れる）。
 - AppArmor の `apparmor_restrict_unprivileged_userns=1` の環境では `unshare -rn` が使えず、bwrap（setuid 相当の
   プロファイル）経由でのみ netns を作れる。ns 内に CAP_NET_ADMIN は無く、veth は作れない。
 - 内側の `/etc/hosts` は bind マウント（docker は `--add-host`）。Servo が参照することはベースラインの受信で確認する。

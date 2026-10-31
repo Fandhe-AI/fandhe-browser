@@ -1,0 +1,9 @@
+# BuildKit は Dockerfile ごとに <Dockerfile>.dockerignore を読む。ルートに .dockerignore を
+# 作ると既存の docker build に影響するため、egress 隔離の実測用コンテナ専用のこのファイルを使う。
+target/
+servo-host/target/
+.git/
+docs/spec/
+_/
+node_modules/
+**/__pycache__/
