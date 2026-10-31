@@ -19,6 +19,7 @@
 #   measure-js-binary-size   JS エンジン構成別バイナリサイズ計測（JS-3・PERF-1。要 jq）
 #   measure-container-size   既定・軽量コンテナと比較対象（Playwright 公式）のイメージサイズ計測（CTR-1・CTR-5。要 docker・jq）
 #   check-container-memory   コンテナ同時起動の集約メモリ測定スクリプトの自己テスト（TASK-67・CTR-3・CTR-7。Linux のみ。要 jq）
+#   check-egress-isolation   Servo ホストの egress 隔離実測ハーネスの自己テスト（TASK-38・RENDER-3・#1377。Linux のみ。要 python3。実測は harness/egress-isolation/measure.py を直接実行）
 #   measure-container-memory コンテナを N 個同時起動したときの集約メモリ測定（TASK-67。Linux のみ。要 docker・jq・cgroup v2。`--target chromium` で比較対象の Chromium も測る）
 #   compare-container-memory 2 つの測定結果 JSON から同じ N・同じ条件での削減率を算出（TASK-67・CTR-3・CTR-6。要 jq。docker 不要）
 #   check-container-smoke    コンテナ（軽量 / 既定）でローカルフィクスチャ 12 種の代表タスクを確認（CTR-2。要 docker・jq）
@@ -347,6 +348,15 @@ case "${name}" in
       --default-image "${CONTAINER_SIZE_DEFAULT_IMAGE}" \
       --lite-image "${CONTAINER_SIZE_LITE_IMAGE}" \
       ${cs_args[@]+"${cs_args[@]}"}
+    ;;
+  check-egress-isolation)
+    # 偽ホストと loopback だけを使う自己テスト。bwrap の egress_guard が /proc 依存のため Linux のみ。
+    if [ "$(uname -s)" != Linux ]; then
+      echo "skip: ${name} supports Linux only"
+      exit 0
+    fi
+    require_cmd python3 "required by ${name}"
+    bash harness/egress-isolation/self-test.sh
     ;;
   check-container-memory)
     # 測定対象（ホストの cgroup v2・/proc）が Linux 固有のため Linux のみ。macOS・Windows では何もしない

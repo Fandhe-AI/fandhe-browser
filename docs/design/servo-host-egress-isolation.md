@@ -147,3 +147,14 @@ loopback で配信するフィクスチャページ（`harness/render-screenshot
 ## 9. 未確認事項
 
 options §7 を引き継ぐ。本書で新たに加わる未確認事項はない。ただし Docker 既定 seccomp 下での `unshare` の挙動と、Landlock の実機の対応カーネルは、実測計画（§6.2）で確かめる。
+
+### 9.1 2026-10-31 の Linux 実測で確認できた事項（#1377）
+
+`harness/egress-isolation/`（#1377）で、依存・`unsafe` を使わない範囲を測った。結果の詳細は #1003 のコメントに記録している。方式の採否はここでも決めない。
+
+- 環境: Ubuntu 26.04・カーネル 7.0.0-34・x86_64・`kernel.apparmor_restrict_unprivileged_userns=1`。ホストバイナリは 2026-10-27 ビルドの Docker イメージ由来（現在のコミットのビルドではない）。
+- Landlock: LSM に有効で、ABI は 8（`landlock_create_ruleset` のバージョン問い合わせのみ。ルールセットの適用は未測定）。
+- netns の作り方: AppArmor の制限下では `unshare -n`・`unshare -rn` は EPERM、`bwrap --unshare-net` は成功する。bwrap の ns 内に CAP_NET_ADMIN は無く（`ip addr add` は EPERM）、veth や 10.x のエイリアスは作れない。
+- Docker 既定 seccomp 下（`--network none`）: `unshare -n` は EPERM。Landlock ABI の問い合わせは成功する。イメージに bwrap が無く、bwrap の可否は未確認。
+- 隔離下の経路: bwrap の netns と `docker run --network none` のどちらでも、リダイレクト・img・fetch・WebSocket・内部アドレスの代替宛先は外側 listener に 0 件で、ベースライン（`--unshare-net` だけ無し）では各 1 件届いた。ホストの `--selftest` と loopback ページの `load` は両モードで成功した。実在の内部アドレス（IPv4・IPv6）への connect は ENETUNREACH。
+- 残った未確認: Servo 自身の DNS・UDP 送信の外部観測、Landlock ルール適用下の動作、seccomp、許可リスト付きプロキシとの併用、macOS・Windows、AppArmor の制限が無い環境・古いカーネル、現在のコミットのホストでの再測定。

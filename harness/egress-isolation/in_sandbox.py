@@ -1,0 +1,471 @@
+#!/usr/bin/env python3
+"""サンドボックスの内側で Servo ホストを駆動し、5 経路の試行を行う内側ランナー。
+
+役割・責務境界:
+    Issue #1377（TASK-38・`RENDER-3`・`SEC-2`・`XOS-1`）。`measure.py` が bwrap（`--unshare-net` の有無）または
+    `docker run --network none` の中で起動する。許可オリジン（pages.test -> 127.0.0.1）を自前で配信し、
+    ホスト（`fandhe-browser-servo-host --stdio`）へ経路ごとの `load` を送り、(iv)(v) のプローブを行い、
+    結果を `--out` の JSON に書く。外側の listener の受信件数は `measure.py` が数える（ここでは数えない）。
+
+呼び出し文脈:
+    - 隔離モードでは実行前に `/proc/net/*` で lo 以外の経路が無いことを確かめ、満たさなければ何も読み込まず
+      exit 2 で中止する（実在の内部アドレスを含むページを読み込む前の安全側の検査）。
+    - 隔離モードでは外側と同じ宛先（127.0.0.2:<port> 等）の写し listener を内側にも立て、ページが実際に
+      接続を試みたこと（試行の観測）を確かめる。ベースラインは外側の listener が直接受ける。
+    - 同ディレクトリの `render-screenshot` の `servo_bbox_driver`（HostChannel 等）を流用し、送信先の監視は
+      `monitor.DestinationMonitor`（既知のダミー宛先を除外して監視を継続する。`EgressGuard` は最初の試行で止まるため使わない）。
+
+信頼境界: 受け取る引数は検証済みの固定集合・int ポート・実行可能ファイルの絶対パスのみ。ホストに渡す環境変数は
+`build_host_env` の許可リスト（`*_PROXY`・`LD_*` は渡さない。`SEC-2`）。UA・ヘッダ・ビューポートは触らない。
+
+終了コード: 0（結果 JSON を書いた。経路判定は含まない）／2（引数・前提検査の不成立）。
+"""
+
+from __future__ import annotations
+
+import argparse
+import errno
+import http.server
+import json
+import os
+import shutil
+import socket
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+from pathlib import Path
+from typing import Any
+
+_HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(_HERE))
+sys.path.insert(0, str(_HERE.parent / "render-screenshot"))
+import monitor  # noqa: E402
+import page_templates as fixtures  # noqa: E402
+import judge  # noqa: E402
+import listeners  # noqa: E402
+import servo_bbox_driver as sbd  # noqa: E402
+
+LOAD_TIMEOUT_MS = 8000
+SETTLE_S = 2.5
+PROBE_TIMEOUT_S = 2.0
+DNS_TIMEOUT_S = 5.0
+TCP_ROUTES = ("redirect", "img", "fetch", "ws", "internal")
+PAGE_ROUTES = ("redirect", "img", "fetch", "ws", "internal", "internal_real", "dns")
+
+
+class _PageHandler(http.server.BaseHTTPRequestHandler):
+    """固定の辞書から HTML を返す（ディスクを読まない）。クエリは無視し、GET/HEAD 以外は 405。"""
+
+    pages: dict[str, str] = {}
+    redirect_to = ""
+    timeout = 10.0
+
+    def _path(self) -> str:
+        return self.path.split("?", 1)[0].split("#", 1)[0]
+
+    def do_GET(self) -> None:  # noqa: N802
+        path = self._path()
+        if path == fixtures.REDIRECT_PATH:
+            self.send_response(302)
+            self.send_header("Location", self.redirect_to)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        body = self.pages.get(path)
+        if body is None:
+            self.send_error(404)
+            return
+        data = body.encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _no(self) -> None:
+        self.send_response(405)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    do_POST = do_PUT = do_DELETE = do_PATCH = do_HEAD = do_OPTIONS = _no  # noqa: N815
+
+    def log_message(self, format: str, *args: object) -> None:  # noqa: A002
+        return  # URL（クエリ）をログへ出さない
+
+
+def read_proc(name: str) -> str | None:
+    """`/proc/net/<name>` を読む。読めなければ None（空文字列と区別し、前提検査を fail-closed にする）。"""
+    try:
+        return Path("/proc/net", name).read_text(encoding="ascii", errors="replace")[:65536]
+    except OSError:
+        return None
+
+
+def errno_name(exc: OSError) -> str:
+    return errno.errorcode.get(exc.errno or 0, "oserror")
+
+
+def probe_connect(family: int, addr: tuple[Any, ...]) -> str:
+    """connect だけを試し（何も送らない）、結果を errno 名で返す。成功なら "connected"。
+
+    ソケットを作れない（例: `ipv6.disable=1` の `AF_INET6` は EAFNOSUPPORT）場合は "unobservable:<errno>"。
+    試行そのものが起きていないため `attempts` の根拠にならず、隔離の合格証拠として扱われない（fail-closed）。
+    """
+    try:
+        sock = socket.socket(family, socket.SOCK_STREAM)
+    except OSError as exc:
+        return f"unobservable:{errno_name(exc)}"
+    sock.settimeout(PROBE_TIMEOUT_S)
+    try:
+        sock.connect(addr)
+        return "connected"
+    except socket.timeout:
+        return "timeout"
+    except OSError as exc:
+        return errno.errorcode.get(exc.errno or 0, "oserror")
+    finally:
+        sock.close()
+
+
+def probe_udp(ip: str, port: int) -> str:
+    """UDP の sendto（DNS 形式の固定バイト列）を 1 回送る。宛先は外側/内側のダミー listener。"""
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    except OSError as exc:
+        return f"unobservable:{errno_name(exc)}"
+    try:
+        sock.sendto(b"\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x00\x00\x01\x00\x01", (ip, port))
+        return "sent"
+    except OSError as exc:
+        return errno.errorcode.get(exc.errno or 0, "oserror")
+    finally:
+        sock.close()
+
+
+def probe_dns() -> dict[str, Any]:
+    """hosts に無い名前の解決を試み、所要時間と失敗種別を返す（隔離下専用。上流の DNS へ出うるため）。"""
+    started = time.monotonic()
+    result = "resolved"
+    holder: list[str] = []
+
+    def _run() -> None:
+        try:
+            socket.getaddrinfo(judge.HOST_NXDOMAIN, 80)
+            holder.append("resolved")
+        except socket.gaierror as exc:
+            holder.append(f"gaierror:{exc.errno}")
+        except OSError as exc:
+            holder.append(errno.errorcode.get(exc.errno or 0, "oserror"))
+
+    thread = threading.Thread(target=_run, daemon=True)
+    thread.start()
+    thread.join(DNS_TIMEOUT_S)
+    result = holder[0] if holder else "timeout"
+    return {"result": result, "elapsed_s": round(time.monotonic() - started, 2)}
+
+
+RESOLVER_SOCKETS = (
+    "/run/systemd/resolve/io.systemd.Resolve", "/run/systemd/resolve/resolv.conf",
+    "/run/nscd/socket", "/var/run/nscd/socket", "/run/dbus/system_bus_socket",
+    "/run/avahi-daemon/socket",
+)
+
+
+def reachable_resolver_sockets() -> list[str]:
+    """ホスト側 resolver の Unix ソケットへ接続できる経路を返す（netns で遮断されない名前解決経路）。
+
+    1 件でもあれば DNS の失敗は「送信遮断」の証拠にならない（pass にしない）。
+    """
+    found: list[str] = []
+    for path in RESOLVER_SOCKETS:
+        try:
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        except OSError:
+            continue
+        sock.settimeout(1.0)
+        try:
+            sock.connect(path)
+            found.append(path)
+        except OSError:
+            pass
+        finally:
+            sock.close()
+    return found
+
+
+def probe_nameservers() -> dict[str, Any]:
+    """`/etc/resolv.conf` の nameserver 宛に UDP の connect だけを試し（送信なし）、errno 名を返す。
+
+    名前解決の失敗が netns による遮断由来であることの根拠にする。resolv.conf が読めない・切れている
+    （例: `/run` の隠蔽でシンボリックリンクが切れる）場合は nameserver が空になり、試行は観測できない扱い。
+    """
+    servers: list[str] = []
+    try:
+        text = Path("/etc/resolv.conf").read_text(encoding="ascii", errors="replace")[:4096]
+    except OSError:
+        text = ""
+    for line in text.splitlines():
+        fields = line.split()
+        if len(fields) >= 2 and fields[0] == "nameserver" and len(servers) < 3:
+            servers.append(fields[1][:64])
+    results: dict[str, str] = {}
+    for ip in servers:
+        family = socket.AF_INET6 if ":" in ip else socket.AF_INET
+        try:
+            sock = socket.socket(family, socket.SOCK_DGRAM)
+        except OSError as exc:
+            results[ip] = f"unobservable:{errno_name(exc)}"
+            continue
+        try:
+            sock.connect((ip, 53))
+            results[ip] = "connected"
+        except OSError as exc:
+            results[ip] = errno.errorcode.get(exc.errno or 0, "oserror")
+        except ValueError:
+            results[ip] = "invalid"
+        finally:
+            sock.close()
+    return {"nameservers": results}
+
+
+NS_UNREACHABLE = frozenset({"ENETUNREACH", "EHOSTUNREACH", "ENETDOWN", "EADDRNOTAVAIL", "EAFNOSUPPORT"})
+
+
+def dns_attempt_observed(dns: dict[str, Any]) -> bool:
+    """DNS の失敗が netns による遮断由来と言えるときだけ True（区別できなければ観測不能）。
+
+    条件: 解決が失敗した・ホスト側 resolver のソケットに届かない・resolv.conf に非ループバックの nameserver が
+    1 件以上あり、そのすべてへの UDP connect が「経路なし」の errno で失敗した（`/run` の隠蔽による
+    resolv.conf 欠落では nameserver が空になり、この条件を満たさない）。
+    """
+    result = dns.get("result", "resolved")
+    # 解決プローブ自体が観測不能（例外）なら、後続の nameserver 観測が成功しても試行ありとは言えない（fail-closed）。
+    if result == "resolved" or str(result).startswith("unobservable:") or dns.get("resolver_sockets"):
+        return False
+    servers = dns.get("nameservers") or {}
+    if not servers or any(ip.startswith("127.") or ip == "::1" for ip in servers):
+        return False
+    return all(v in NS_UNREACHABLE for v in servers.values())
+
+
+def host_identity(host: str) -> dict[str, Any]:
+    """サンドボックス内で実際に実行するホストバイナリの SHA256 と version（baseline との同一性判定用）。"""
+    import hashlib
+
+    ident: dict[str, Any] = {}
+    try:
+        ident["host_sha256"] = hashlib.sha256(Path(host).read_bytes()).hexdigest()
+        ident["host_version"] = subprocess.run(  # noqa: S603
+            [host, "--version"], capture_output=True, text=True, timeout=20, check=False,
+            stdin=subprocess.DEVNULL).stdout.strip()[:80]
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return ident
+
+
+def validate_args(args: argparse.Namespace) -> dict[str, int]:
+    if args.mode not in judge.MODES:
+        raise ValueError("unknown mode")
+    host = Path(args.host)
+    if not host.is_absolute() or not host.is_file() or not os.access(host, os.X_OK):
+        raise ValueError("--host must be an absolute path to an executable file")
+    try:
+        ports = json.loads(args.ports)
+    except ValueError as exc:
+        raise ValueError("--ports must be JSON") from exc
+    needed = (*TCP_ROUTES, "udp_direct")
+    if not isinstance(ports, dict) or any(k not in ports for k in needed):
+        raise ValueError("--ports must contain every route")
+    for key in needed:
+        value = ports[key]
+        if isinstance(value, bool) or not isinstance(value, int) or not (1024 <= value <= 65535):
+            raise ValueError(f"port for {key} must be an int in [1024, 65535]")
+    return {k: ports[k] for k in needed}
+
+
+def load_route(chan: sbd.HostChannel, next_id: list[int], info: sbd.HostInfo, url: str) -> dict[str, Any]:
+    """`load` を 1 件送り、結果の種別だけを返す（URL は載せない。final_url はホスト名のみ）。"""
+    try:
+        res = sbd.call(
+            chan, next_id, "load", {"url": url, "timeout_ms": LOAD_TIMEOUT_MS},
+            LOAD_TIMEOUT_MS / 1000 + sbd.TIMEOUT_SLACK_S, max_frame=info.response_max,
+        )
+    except sbd.RpcError as exc:
+        return {"ok": False, "kind": exc.kind}
+    except sbd.HostError as exc:
+        return {"ok": False, "kind": "host_error", "detail": str(exc)[:120]}
+    final = res.get("final_url")
+    host = None
+    if isinstance(final, str):
+        try:
+            from urllib.parse import urlsplit
+
+            host = urlsplit(final).hostname
+        except ValueError:
+            host = None
+    return {"ok": True, "final_host": host}
+
+
+def run(args: argparse.Namespace, ports: dict[str, int]) -> dict[str, Any]:
+    isolated = args.mode in judge.ISOLATED_MODES
+    result: dict[str, Any] = {"mode": args.mode, "routes": list(judge.routes_for_mode(args.mode))}
+    result.update(host_identity(args.host))
+
+    dev, route4, route6 = read_proc("dev"), read_proc("route"), read_proc("ipv6_route")
+    if isolated:
+        ok, why = judge.check_isolation(dev, route4, route6)
+        result["isolation_precheck"] = {"ok": ok, "reason": why}
+        if not ok:
+            result["aborted"] = True
+            return result
+
+    server = http.server.ThreadingHTTPServer((judge.IP_ALLOWED, 0), _PageHandler)
+    server.daemon_threads = True
+    page_port = server.server_address[1]
+    _PageHandler.pages = fixtures.build_pages(ports)
+    _PageHandler.redirect_to = fixtures.redirect_location(ports)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+
+    inner: dict[str, Any] = {}
+    if isolated:
+        for r in TCP_ROUTES:
+            ip = judge.IP_INTERNAL_STANDIN if r == "internal" else judge.IP_BLOCKED
+            inner[r] = listeners.TcpRecorder(r, ip, ports[r]).start()
+        inner["udp_direct"] = listeners.UdpRecorder("udp_direct", judge.IP_BLOCKED, ports["udp_direct"]).start()
+
+    workdir = Path(tempfile.mkdtemp(prefix="egress-isolation-"))
+    proc: subprocess.Popen[bytes] | None = None
+    guard: monitor.DestinationMonitor | None = None
+    try:
+        for sub in ("home", "tmp", "xdg-config", "xdg-cache", "xdg-data"):
+            (workdir / sub).mkdir()
+        env = sbd.build_host_env(workdir)
+        env_notes = sorted(k for k in os.environ if k.lower().endswith("_proxy"))
+        result["proxy_env_present"] = bool(env_notes)  # 値は記録しない（有無のみ）
+
+        st = subprocess.run(  # noqa: S603  (argv 固定・シェル不使用)
+            [args.host, "--selftest"], env=env, stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=90, check=False,
+        )
+        result["selftest_rc"] = st.returncode
+
+        proc = subprocess.Popen(  # noqa: S603
+            [args.host, "--stdio"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL, env=env,
+        )
+        # ハーネスが意図的に接続させるダミー宛先（127.0.0.2 / 127.0.0.3）は想定内の試行として除外し、監視を続ける。
+        expected = {f"{judge.IP_INTERNAL_STANDIN if r == 'internal' else judge.IP_BLOCKED}:{ports[r]}"
+                    for r in TCP_ROUTES} | {f"{judge.IP_BLOCKED}:{ports['udp_direct']}"}
+        guard = monitor.DestinationMonitor(proc.pid, page_port, expected)
+        guard.start()
+        chan = sbd.HostChannel(proc)
+        info = sbd.validate_hello(chan.recv(sbd.HANDSHAKE_TIMEOUT_S))  # bounding_box 必須の検査を含む
+        chan.request_max = info.request_max
+        next_id = [1]
+        base = f"http://{judge.HOST_ALLOWED}:{page_port}"
+
+        loopback = load_route(chan, next_id, info, f"{base}/ok")
+        result["loopback_load"] = loopback
+        loads: dict[str, Any] = {}
+        guard_polls: dict[str, int] = {}
+        for r in (x for x in PAGE_ROUTES if x in result["routes"]):
+            polls_before = guard.snapshot_polls()
+            loads[r] = load_route(chan, next_id, info, base + fixtures.ROUTE_PATH[r])
+            time.sleep(SETTLE_S)
+            guard_polls[r] = guard.snapshot_polls() - polls_before  # 経路ごとに完了した走査の回数
+        result["loads"] = loads
+        result["guard_polls"] = guard_polls
+        try:
+            sbd.call(chan, next_id, "shutdown", None, sbd.SHUTDOWN_GRACE_S + sbd.TIMEOUT_SLACK_S,
+                     max_frame=info.response_max)
+        except (sbd.HostError, sbd.RpcError):
+            pass
+    except (sbd.HostError, OSError, subprocess.SubprocessError) as exc:
+        result["error"] = f"{type(exc).__name__}: {str(exc)[:120]}"
+    finally:
+        if guard is not None:
+            guard.stop()
+            result["guard"] = {"violation": guard.violation, "unavailable": guard.unavailable,
+                               "polls": guard.snapshot_polls(), "expected_seen": sorted(guard.expected_seen)}
+        if proc is not None:
+            sbd._stop_host(proc, graceful=False)
+        shutil.rmtree(workdir, ignore_errors=True)
+
+    # --- (iv)(v) のプローブ（connect だけ・固定宛先） -----------------------------------
+    probes: dict[str, Any] = {}
+    probe_errors: dict[str, str] = {}
+
+    def guarded(name: str, fn: Any) -> Any:
+        """想定外の例外はそのプローブだけを観測不能にし、結果 JSON の出力を妨げない。"""
+        try:
+            return fn()
+        except Exception as exc:  # noqa: BLE001  (最後の砦。型名のみ記録)
+            probe_errors[name] = type(exc).__name__
+            return f"unobservable:{type(exc).__name__}"
+
+    probes["udp_direct"] = guarded("udp_direct", lambda: probe_udp(judge.IP_BLOCKED, ports["udp_direct"]))
+    if isolated:
+        probes["internal_real"] = {
+            **{ip: guarded("internal_real", lambda ip=ip: probe_connect(socket.AF_INET, (ip, 80)))
+               for ip in judge.REAL_INTERNAL_V4},
+            judge.REAL_INTERNAL_V6: guarded(
+                "internal_real",
+                lambda: probe_connect(socket.AF_INET6, (judge.REAL_INTERNAL_V6, 80, 0, 0))),
+        }
+        dns = guarded("dns", probe_dns)
+        probes["dns"] = dns if isinstance(dns, dict) else {"result": str(dns)}
+        # 失敗時は resolver 到達不明（非空）・nameserver 空として扱い、dns の試行を観測不能に倒す。
+        res_socks = guarded("dns", reachable_resolver_sockets)
+        probes["dns"]["resolver_sockets"] = res_socks if isinstance(res_socks, list) else [str(res_socks)]
+        ns = guarded("dns", probe_nameservers)
+        probes["dns"].update(ns if isinstance(ns, dict) else {"nameservers": {}})
+    if probe_errors:
+        result["probe_errors"] = probe_errors
+    result["probes"] = probes
+    time.sleep(0.5)
+
+    counts = {k: rec.count for k, rec in inner.items()}
+    result["inner_counts"] = counts
+    result["positive_ok"] = (
+        result.get("selftest_rc") == 0 and bool(result.get("loopback_load", {}).get("ok"))
+    )
+    unreachable = {"ENETUNREACH", "EHOSTUNREACH", "ENETDOWN", "EADDRNOTAVAIL", "EAFNOSUPPORT"}
+    real = probes.get("internal_real", {})
+    result["attempts"] = {
+        **{k: counts.get(k, 0) >= 1 for k in (*TCP_ROUTES, "udp_direct")},
+        # 構造的な経路は「経路なし」を示す errno が出たことを試行の根拠とする。
+        "internal_real": bool(real) and all(v in unreachable for v in real.values()),
+        # 失敗種別だけでは送信遮断の証拠にならない。ホスト側 resolver のソケットに届く環境では試行を観測できない扱い。
+        "dns": isolated and dns_attempt_observed(probes.get("dns", {})),
+    }
+    for rec in inner.values():
+        rec.stop()
+    server.shutdown()
+    return result
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Inner runner for the egress isolation measurement.")
+    parser.add_argument("--mode", required=True)
+    parser.add_argument("--host", required=True)
+    parser.add_argument("--ports", required=True)
+    parser.add_argument("--out", required=True, type=Path)
+    args = parser.parse_args(argv)
+    try:
+        ports = validate_args(args)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    try:
+        result = run(args, ports)
+    except Exception as exc:  # noqa: BLE001  (最後の砦: 結果 JSON を必ず残し、モード全体を観測不能にする)
+        result = {"mode": args.mode, "fatal": f"{type(exc).__name__}: {str(exc)[:120]}",
+                  "positive_ok": False, "attempts": {}}
+    args.out.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return 2 if result.get("aborted") else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

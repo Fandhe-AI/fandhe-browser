@@ -44,7 +44,7 @@ Harnesses, benches, measurements (scripts/harness.sh <name>)
   test-harness  check-compat-practical  check-cli-conformance  measure-cli-conformance  check-compat-regression  bench-record  check-ci-changes
   check-bench-record  check-binary-size  check-static-link  check-dynamic-link-macos  check-dynamic-link-windows  measure-mcp-envelope  check-mcp-envelope
   measure-plugin-overhead  check-plugin-overhead
-  measure-js-binary-size  measure-container-size  check-container-smoke  check-container-js-smoke  check-container-memory  measure-container-memory  compare-container-memory  measure-cssom-profile-cost  trace-playwright  check-playwright-trace
+  measure-js-binary-size  measure-container-size  check-container-smoke  check-container-js-smoke  check-container-memory  check-egress-isolation  measure-container-memory  compare-container-memory  measure-cssom-profile-cost  trace-playwright  check-playwright-trace
   check-puppeteer-connect  check-playwright-connect  test-playwright-connect
 
 Docker (one-line calls, not wrapped in scripts/)
