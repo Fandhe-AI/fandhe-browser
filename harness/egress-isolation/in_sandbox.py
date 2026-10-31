@@ -206,6 +206,9 @@ def reachable_resolver_sockets() -> list[str]:
     1 件でもあれば DNS の失敗は「送信遮断」の証拠にならない（pass にしない）。
     """
     found: list[str] = []
+    if not hasattr(socket, "AF_UNIX"):
+        # 古い Windows の Python には AF_UNIX が無い。Unix ソケットの resolver 経路自体が存在しない。
+        return found
     for path in RESOLVER_SOCKETS:
         try:
             sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)

@@ -343,7 +343,7 @@ class ProbeFailureTest(unittest.TestCase):
                                   "--ports", json.dumps(ports), "--out", str(args.out)])
         self.assertEqual(rc, 0)
         data = json.loads(args.out.read_text(encoding="utf-8"))
-        self.assertEqual(data["probes"]["internal_real"][judge.REAL_INTERNAL_V6], f"unobservable:{errno.errorcode[errno.EAFNOSUPPORT]}")
+        self.assertEqual(data["probes"]["internal_real"][judge.REAL_INTERNAL_V6], "unobservable:EAFNOSUPPORT")  # fake_connect の固定値
         self.assertFalse(data["attempts"]["internal_real"])
         verdicts = judge.judge_all("bwrap-netns", data, {"internal_real": 0}, {"internal": 1})
         self.assertEqual(verdicts["internal_real"]["verdict"], judge.UNOBSERVABLE)
