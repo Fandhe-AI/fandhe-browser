@@ -23,7 +23,7 @@
 | 決定済み | core の `Renderer` にページ指定メソッドを追加する | オーナー判断 2026-10-15（#228。本書 §3） |
 | 決定済み | CI は明示ジョブ 3 本を追加する（ジョブ 16 → 19、required 合計 20 → 23）。ruleset はジョブ追加 PR のマージ時に更新する | オーナー判断 2026-10-15（#228。本書 §6） |
 | 決定済み | ホストのビルド cache は ubuntu のみ | オーナー判断 2026-10-15（#228。本書 §6.3） |
-| 保留 | egress 方針（Servo 内部通信の制限）は GA 前に判断する | #1003（本書 §2.5） |
+| 保留 | egress 方針（Servo 内部通信の制限）は GA 前に判断する | #1003（本書 §2.5。比較設計と実測計画は [servo-host-egress-isolation.md](./servo-host-egress-isolation.md)） |
 | 保留 | 配布方式は spec の整理（`TASK-64`・`CTR-4`）後に起票する | 本書 §8.2・§10 |
 
 オーナー判断の結果は §13 に記録する。
@@ -123,7 +123,7 @@ servo-host/
 ### 2.5 URL・セレクタの検証
 
 - URL はクライアントで送信前に検証し、ホストでも再検証する（二重化）。scheme は `http` / `https` のみ。`file:`・`data:`・`javascript:`・`about:` と userinfo は拒否。ループバック・プライベート IP・`localhost` は core の fetch と同じポリシー（`allow_private_network_access`、既定 false）に従う。
-- **残存リスク**: Servo 内部のリダイレクト・サブリソース・DNS リバインディングはクライアント検証だけでは防げない。対策候補は egress ガード（`harness/render-screenshot/egress_guard.py` の方式）、OS ネットワーク隔離、core が取得済みの HTML を渡す方式。いずれも**未検証**で、GA 前のオーナー判断事項（§13）とする。
+- **残存リスク**: Servo 内部のリダイレクト・サブリソース・DNS リバインディングはクライアント検証だけでは防げない。対策候補は egress ガード（`harness/render-screenshot/egress_guard.py` の方式）、OS ネットワーク隔離、core が取得済みの HTML を渡す方式。いずれも**未検証**で、GA 前のオーナー判断事項（§13）とする。2026-10-31 のオーナー判断（#1003）で OS 隔離を本命・事後検知を補助とする枠組みが決まり、3 OS の比較設計と実測計画は [servo-host-egress-isolation.md](./servo-host-egress-isolation.md) にある（方式の採否は実測後）。
 - 可視性・境界ボックスの取得に JS 評価を使う場合、セレクタは JSON エスケープした文字列リテラルとしてのみ埋め込み、連結しない。長さと文字種も検証する。取得手段（埋込 API のレイアウト取得か JS 評価か）は**未検証**で、実装 Issue の先頭ステップで確認する。
 
 ### 2.6 起動
@@ -422,7 +422,7 @@ AGENTS.md の変更はレビュー基準の変更として AI レビューで P0
 3. core `Renderer` に描画対象ページを指定するメソッドを追加する（§3.3）: 決定
 4. ホストのビルド cache は ubuntu のみ（§6.3）: 決定
 5. `ci.yml` のジョブは 16 → 19、required の合計は 20 → 23。ruleset はジョブ追加 PR のマージ時に更新する（§6.2）: 決定
-6. egress 方針（Servo 内部のリダイレクト・サブリソース・DNS リバインディング。§2.5）: GA 前に判断する（#1003）
+6. egress 方針（Servo 内部のリダイレクト・サブリソース・DNS リバインディング。§2.5）: GA 前に判断する（#1003。比較設計と実測計画は [servo-host-egress-isolation.md](./servo-host-egress-isolation.md)）
 7. 配布方式（ホスト単体 release・コンテナ。§8.2・§10）: spec の整理（`TASK-64`・`CTR-4`）後に起票する
 
 2026-10-29 の判断（項目 8・9）は Issue #1001 による。実測の根拠は §7.1 と §5。
