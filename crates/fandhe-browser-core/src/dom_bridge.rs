@@ -90,7 +90,9 @@ use crate::dom::NodeData;
 use crate::dom::{Document, NodeId, SerializeScope};
 use crate::error::DomError;
 use crate::error::Error;
-use crate::query::{element_matches_str, query_selector_all_str_bounded, query_selector_str};
+use crate::query::{
+    closest_str, element_matches_str, query_selector_all_str_bounded, query_selector_str,
+};
 
 mod focus;
 mod node_equal;
@@ -420,6 +422,14 @@ enum DomOp {
     /// 要素がセレクタに一致するか（`Element.prototype.matches` の土台。JS-5・#1363）。読み取り専用。
     /// Playwright の複合セレクタ照合（`_matchesCSS`）が使う。不正なセレクタはエラー（false にしない。REPAIR-3）。
     Matches,
+    /// 自身から祖先方向で最初にセレクタへ一致する要素（`Element.prototype.closest` の土台。JS-5・#1375）。
+    /// 読み取り専用。不正・未対応のセレクタはエラー（null にしない。REPAIR-3）。
+    Closest,
+    /// 前の兄弟要素（`previousElementSibling` の土台。O(親の子数)。JS-5・#1375）。読み取り専用。
+    /// Playwright の兄弟結合子（`+`・`~`）の照合が使う。返す ID は必ず Element で、無ければ null。
+    PreviousElementSibling,
+    /// 次の兄弟要素（`nextElementSibling` の土台。O(親の子数)。JS-5・#1375）。読み取り専用。返す ID は必ず Element。
+    NextElementSibling,
     /// 親ノードを返す（`Node.prototype.parentNode` の土台。JS-5・#1203）。読み取り専用。
     /// 親が Element か文書ルートなら ID、親が無い・DocumentFragment なら null（shim にラッパー型が
     /// 無いため。簡略版の差異。REPAIR-3）。
@@ -516,6 +526,9 @@ impl DomOp {
             "isInclusiveAncestor" => Self::IsInclusiveAncestor,
             "isEqualNode" => Self::IsEqualNode,
             "matches" => Self::Matches,
+            "closest" => Self::Closest,
+            "previousElementSibling" => Self::PreviousElementSibling,
+            "nextElementSibling" => Self::NextElementSibling,
             "parentNode" => Self::ParentNode,
             "isFocusable" => Self::IsFocusable,
             "htmlLocalName" => Self::HtmlLocalName,
@@ -592,6 +605,9 @@ impl DomOp {
             Self::IsInclusiveAncestor => "isInclusiveAncestor",
             Self::IsEqualNode => "isEqualNode",
             Self::Matches => "matches",
+            Self::Closest => "closest",
+            Self::PreviousElementSibling => "previousElementSibling",
+            Self::NextElementSibling => "nextElementSibling",
             Self::ParentNode => "parentNode",
             Self::IsFocusable => "isFocusable",
             Self::HtmlLocalName => "htmlLocalName",
@@ -655,6 +671,8 @@ impl DomOp {
             | Self::LastChild
             | Self::NextSibling
             | Self::PreviousSibling
+            | Self::PreviousElementSibling
+            | Self::NextElementSibling
             | Self::ChildNodes
             | Self::NodeType
             | Self::DoctypeName
@@ -676,6 +694,7 @@ impl DomOp {
             | Self::IsInclusiveAncestor
             | Self::IsEqualNode
             | Self::Matches
+            | Self::Closest
             | Self::AttributeNameAt
             | Self::AttributeValueAt
             | Self::UrlParse => 2,
@@ -1448,6 +1467,34 @@ fn execute(
             let node = page.node_arg(op, args, 1)?;
             page.encode_optional(page.document.next_sibling(node))
         }
+        // 前後の兄弟要素（#1375・JS-5）。親の子を 1 回走査し、確保しない。Text・Comment は飛ばす。
+        // 親が無い（文書ルート・切り離し）ノードは null。
+        DomOp::PreviousElementSibling => {
+            let node = page.node_arg(op, args, 1)?;
+            let mut found = None;
+            if let Some(parent) = page.document.parent(node) {
+                for child in page.document.children(parent) {
+                    if child == node {
+                        break;
+                    }
+                    if page.document.is_element(child) {
+                        found = Some(child);
+                    }
+                }
+            }
+            page.encode_optional(found)
+        }
+        DomOp::NextElementSibling => {
+            let node = page.node_arg(op, args, 1)?;
+            let found = page.document.parent(node).and_then(|parent| {
+                page.document
+                    .children(parent)
+                    .skip_while(|&child| child != node)
+                    .skip(1)
+                    .find(|&child| page.document.is_element(child))
+            });
+            page.encode_optional(found)
+        }
         DomOp::PreviousSibling => {
             let node = page.node_arg(op, args, 1)?;
             page.encode_optional(page.document.prev_sibling(node))
@@ -1749,6 +1796,20 @@ fn execute(
                 node,
                 selector,
             )?))
+        }
+        // 自身から祖先方向の最初の一致（#1375・JS-5。`Element.prototype.closest` の土台）。読み取り専用。
+        // 要素以外は null で返さず型エラーにする（`Matches` と同じ）。
+        DomOp::Closest => {
+            let node = page.node_arg(op, args, 1)?;
+            let selector = string_arg(op, args, 2, limits)?;
+            if !page.document.is_element(node) {
+                return Err(DomBridgeError::TypeMismatch {
+                    operation: op.name(),
+                    index: 1,
+                    expected: "an element node id",
+                });
+            }
+            page.encode_optional(closest_str(&page.document, node, selector)?)
         }
         DomOp::QuerySelectorAll => {
             let scope = page.node_arg(op, args, 1)?;
@@ -3665,6 +3726,56 @@ mod tests {
         call(&b, &[s("matches"), n(p)]).expect_err("arity");
         let t = num(call(&b, &[s("createTextNode"), s("x")]));
         call(&b, &[s("matches"), n(t), s("p")]).expect_err("text node");
+    }
+
+    /// JS-5・#1375: `previousElementSibling` / `nextElementSibling` は Text・Comment を飛ばし、両端と親なしは null。
+    #[test]
+    fn js_5_element_sibling_ops() {
+        let b = bridge();
+        let body = num(call(&b, &[s("createElement"), s("div")]));
+        let a = num(call(&b, &[s("createElement"), s("h1")]));
+        let t = num(call(&b, &[s("createTextNode"), s("x")]));
+        let c = num(call(&b, &[s("createElement"), s("p")]));
+        let d = num(call(&b, &[s("createElement"), s("p")]));
+        for id in [a, t, c, d] {
+            call(&b, &[s("appendChild"), n(body), n(id)]).expect("append");
+        }
+        let prev = |x: f64| call(&b, &[s("previousElementSibling"), n(x)]);
+        let next = |x: f64| call(&b, &[s("nextElementSibling"), n(x)]);
+        assert_eq!(num(prev(c)), a);
+        assert_eq!(num(prev(d)), c);
+        assert_eq!(prev(a).expect("ok"), JsValue::Null);
+        assert_eq!(num(next(a)), c);
+        assert_eq!(num(next(t)), c);
+        assert_eq!(next(d).expect("ok"), JsValue::Null);
+        let detached = num(call(&b, &[s("createElement"), s("p")]));
+        assert_eq!(prev(detached).expect("ok"), JsValue::Null);
+        assert_eq!(next(detached).expect("ok"), JsValue::Null);
+        for op in ["previousElementSibling", "nextElementSibling"] {
+            call(&b, &[s(op), n(1e12)]).expect_err("invalid id");
+            call(&b, &[s(op), s("1")]).expect_err("type");
+            call(&b, &[s(op)]).expect_err("arity");
+        }
+    }
+
+    /// JS-5・#1375: `closest` は自身・祖先の一致、null、不正入力・未対応の兄弟結合子のエラー。
+    #[test]
+    fn js_5_closest_op() {
+        let b = bridge();
+        let body = num(call(&b, &[s("body")]));
+        let p = num(call(&b, &[s("createElement"), s("p")]));
+        call(&b, &[s("appendChild"), n(body), n(p)]).expect("append");
+        let cl = |sel: &str| call(&b, &[s("closest"), n(p), s(sel)]);
+        assert_eq!(num(cl("p")), p);
+        assert_eq!(num(cl("body")), body);
+        assert_eq!(cl("table").expect("ok"), JsValue::Null);
+        cl("a[").expect_err("invalid selector");
+        cl("a + b").expect_err("sibling combinator");
+        call(&b, &[s("closest"), n(1e12), s("p")]).expect_err("invalid id");
+        call(&b, &[s("closest"), n(p), n(1.0)]).expect_err("type");
+        call(&b, &[s("closest"), n(p)]).expect_err("arity");
+        let t = num(call(&b, &[s("createTextNode"), s("x")]));
+        call(&b, &[s("closest"), n(t), s("p")]).expect_err("text node");
     }
 
     /// JS-5・#1203: `parentNode` は body の子で body、html で文書ルート、ルートと切り離しで null、

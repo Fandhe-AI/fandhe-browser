@@ -276,6 +276,7 @@ pub fn run(engine: &str) {
     rt.block_on(call_function_on_rejections(engine));
     eprintln!("case: CDP-2 compound selector via matches (#1363)");
     rt.block_on(compound_selector(engine));
+    rt.block_on(sibling_combinator_selector(engine));
     eprintln!("case: callFunctionOn executionContextId");
     rt.block_on(call_function_on_execution_context(engine));
     eprintln!("case: awaitPromise");
@@ -1955,4 +1956,85 @@ async fn compound_selector(engine: &str) {
         )
         .await;
     assert_eq!(ro(&f), &json!({"type":"string","value":"1:w"}), "{f}");
+}
+
+const SIBLING_HTML: &str = "<html><body><h2 class=\"t\">T</h2><p>first</p><p>second</p><div><span>s</span></div></body></html>";
+
+/// Playwright の `page.$` が兄弟結合子（`+`・`~`）で通る経路（#1375・`CDP-2`・`JS-5`）。
+/// 末尾の simple を `querySelectorAll` で取り、`previousElementSibling` を辿って `matches` で絞る
+/// （`_matchesParents` の `previousSiblingInContext`）形と、`closestCrossShadow`・`isInsideScope` が使う
+/// `closest`・`contains` を、引数で渡して再現する。
+async fn sibling_combinator_selector(engine: &str) {
+    eprintln!("case: CDP-2 sibling combinator via previousElementSibling (#1375)");
+    let mut c = Cdp::new(engine).with_html(SIBLING_HTML);
+    let (p, ctx) = c.ready().await;
+    let h = c.handle(&p, ctx, "document").await;
+    let decl = "function (last, prev, combinator) { \
+        var out = []; \
+        var list = this.querySelectorAll(last); \
+        for (var i = 0; i < list.length; i++) { \
+            var el = list[i]; var ok = false; \
+            if (combinator === '+') { var s = el.previousElementSibling; ok = !!s && s.matches(prev); } \
+            else { for (var s2 = el.previousElementSibling; s2 && !ok; s2 = s2.previousElementSibling) { ok = s2.matches(prev); } } \
+            if (ok) out.push(el); \
+        } \
+        return out; }";
+    let run = |last: &str, prev: &str, comb: &str| {
+        json!({
+            "functionDeclaration": decl,
+            "objectId": h,
+            "arguments": [{"value": last}, {"value": prev}, {"value": comb}],
+            "returnByValue": false,
+        })
+    };
+    let summary =
+        "function () { return this.length + ':' + this[0].textContent + ':' + this[0].tagName; }";
+
+    // `h2.t + p`: 直前の兄弟が h2 の p だけ。要素ハンドルが返り、例外は出ない。
+    let f = c.callf(&p, run("p", "h2.t", "+")).await;
+    assert_eq!(ro(&f)["type"], "object", "{f}");
+    assert!(
+        f.get("result")
+            .and_then(|r| r.get("exceptionDetails"))
+            .is_none(),
+        "{f}"
+    );
+    let arr = ro(&f)["objectId"]
+        .as_str()
+        .expect("array objectId")
+        .to_owned();
+    let f = c
+        .callf(
+            &p,
+            json!({"functionDeclaration": summary, "objectId": arr, "returnByValue": true}),
+        )
+        .await;
+    assert_eq!(ro(&f), &json!({"type":"string","value":"1:first:P"}), "{f}");
+
+    // `h2.t ~ p`: 後続の兄弟 p は 2 件。
+    let f = c.callf(&p, run("p", "h2.t", "~")).await;
+    let arr = ro(&f)["objectId"]
+        .as_str()
+        .expect("array objectId")
+        .to_owned();
+    let f = c
+        .callf(
+            &p,
+            json!({"functionDeclaration": "function () { return this.length + ':' + this[1].textContent; }", "objectId": arr, "returnByValue": true}),
+        )
+        .await;
+    assert_eq!(ro(&f), &json!({"type":"string","value":"2:second"}), "{f}");
+
+    // `closestCrossShadow`・`isInsideScope` 相当の `closest`・`contains`。
+    let f = c
+        .callf(
+            &p,
+            json!({"functionDeclaration": "function () { var s = this.querySelector('span'); return s.closest('div').tagName + ':' + String(s.closest('table')) + ':' + this.contains(s) + ':' + s.contains(this); }", "objectId": h, "returnByValue": true}),
+        )
+        .await;
+    assert_eq!(
+        ro(&f),
+        &json!({"type":"string","value":"DIV:null:true:false"}),
+        "{f}"
+    );
 }
