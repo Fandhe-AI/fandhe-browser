@@ -1,0 +1,322 @@
+#!/usr/bin/env python3
+"""サンドボックスの内側で Servo ホストを駆動し、5 経路の試行を行う内側ランナー。
+
+役割・責務境界:
+    Issue #1377（TASK-38・`RENDER-3`・`SEC-2`・`XOS-1`）。`measure.py` が bwrap（`--unshare-net` の有無）または
+    `docker run --network none` の中で起動する。許可オリジン（pages.test -> 127.0.0.1）を自前で配信し、
+    ホスト（`fandhe-browser-servo-host --stdio`）へ経路ごとの `load` を送り、(iv)(v) のプローブを行い、
+    結果を `--out` の JSON に書く。外側の listener の受信件数は `measure.py` が数える（ここでは数えない）。
+
+呼び出し文脈:
+    - 隔離モードでは実行前に `/proc/net/*` で lo 以外の経路が無いことを確かめ、満たさなければ何も読み込まず
+      exit 2 で中止する（実在の内部アドレスを含むページを読み込む前の安全側の検査）。
+    - 隔離モードでは外側と同じ宛先（127.0.0.2:<port> 等）の写し listener を内側にも立て、ページが実際に
+      接続を試みたこと（試行の観測）を確かめる。ベースラインは外側の listener が直接受ける。
+    - 同ディレクトリの `render-screenshot` の `servo_bbox_driver`（HostChannel 等）と `egress_guard` を流用する。
+
+信頼境界: 受け取る引数は検証済みの固定集合・int ポート・実行可能ファイルの絶対パスのみ。ホストに渡す環境変数は
+`build_host_env` の許可リスト（`*_PROXY`・`LD_*` は渡さない。`SEC-2`）。UA・ヘッダ・ビューポートは触らない。
+
+終了コード: 0（結果 JSON を書いた。経路判定は含まない）／2（引数・前提検査の不成立）。
+"""
+
+from __future__ import annotations
+
+import argparse
+import errno
+import http.server
+import json
+import os
+import shutil
+import socket
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+from pathlib import Path
+from typing import Any
+
+_HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(_HERE))
+sys.path.insert(0, str(_HERE.parent / "render-screenshot"))
+import egress_guard  # noqa: E402
+import page_templates as fixtures  # noqa: E402
+import judge  # noqa: E402
+import listeners  # noqa: E402
+import servo_bbox_driver as sbd  # noqa: E402
+
+LOAD_TIMEOUT_MS = 8000
+SETTLE_S = 2.5
+PROBE_TIMEOUT_S = 2.0
+DNS_TIMEOUT_S = 5.0
+TCP_ROUTES = ("redirect", "img", "fetch", "ws", "internal")
+PAGE_ROUTES = ("redirect", "img", "fetch", "ws", "internal", "internal_real", "dns")
+
+
+class _PageHandler(http.server.BaseHTTPRequestHandler):
+    """固定の辞書から HTML を返す（ディスクを読まない）。クエリは無視し、GET/HEAD 以外は 405。"""
+
+    pages: dict[str, str] = {}
+    redirect_to = ""
+    timeout = 10.0
+
+    def _path(self) -> str:
+        return self.path.split("?", 1)[0].split("#", 1)[0]
+
+    def do_GET(self) -> None:  # noqa: N802
+        path = self._path()
+        if path == fixtures.REDIRECT_PATH:
+            self.send_response(302)
+            self.send_header("Location", self.redirect_to)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        body = self.pages.get(path)
+        if body is None:
+            self.send_error(404)
+            return
+        data = body.encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _no(self) -> None:
+        self.send_response(405)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    do_POST = do_PUT = do_DELETE = do_PATCH = do_HEAD = do_OPTIONS = _no  # noqa: N815
+
+    def log_message(self, format: str, *args: object) -> None:  # noqa: A002
+        return  # URL（クエリ）をログへ出さない
+
+
+def read_proc(name: str) -> str:
+    try:
+        return Path("/proc/net", name).read_text(encoding="ascii", errors="replace")[:65536]
+    except OSError:
+        return ""
+
+
+def probe_connect(family: int, addr: tuple[Any, ...]) -> str:
+    """connect だけを試し（何も送らない）、結果を errno 名で返す。成功なら "connected"。"""
+    sock = socket.socket(family, socket.SOCK_STREAM)
+    sock.settimeout(PROBE_TIMEOUT_S)
+    try:
+        sock.connect(addr)
+        return "connected"
+    except socket.timeout:
+        return "timeout"
+    except OSError as exc:
+        return errno.errorcode.get(exc.errno or 0, "oserror")
+    finally:
+        sock.close()
+
+
+def probe_udp(ip: str, port: int) -> str:
+    """UDP の sendto（DNS 形式の固定バイト列）を 1 回送る。宛先は外側/内側のダミー listener。"""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sock.sendto(b"\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x00\x00\x01\x00\x01", (ip, port))
+        return "sent"
+    except OSError as exc:
+        return errno.errorcode.get(exc.errno or 0, "oserror")
+    finally:
+        sock.close()
+
+
+def probe_dns() -> dict[str, Any]:
+    """hosts に無い名前の解決を試み、所要時間と失敗種別を返す（隔離下専用。上流の DNS へ出うるため）。"""
+    started = time.monotonic()
+    result = "resolved"
+    holder: list[str] = []
+
+    def _run() -> None:
+        try:
+            socket.getaddrinfo(judge.HOST_NXDOMAIN, 80)
+            holder.append("resolved")
+        except socket.gaierror as exc:
+            holder.append(f"gaierror:{exc.errno}")
+        except OSError as exc:
+            holder.append(errno.errorcode.get(exc.errno or 0, "oserror"))
+
+    thread = threading.Thread(target=_run, daemon=True)
+    thread.start()
+    thread.join(DNS_TIMEOUT_S)
+    result = holder[0] if holder else "timeout"
+    return {"result": result, "elapsed_s": round(time.monotonic() - started, 2)}
+
+
+def validate_args(args: argparse.Namespace) -> dict[str, int]:
+    if args.mode not in judge.MODES:
+        raise ValueError("unknown mode")
+    host = Path(args.host)
+    if not host.is_absolute() or not host.is_file() or not os.access(host, os.X_OK):
+        raise ValueError("--host must be an absolute path to an executable file")
+    try:
+        ports = json.loads(args.ports)
+    except ValueError as exc:
+        raise ValueError("--ports must be JSON") from exc
+    needed = (*TCP_ROUTES, "udp_direct")
+    if not isinstance(ports, dict) or any(k not in ports for k in needed):
+        raise ValueError("--ports must contain every route")
+    for key in needed:
+        value = ports[key]
+        if isinstance(value, bool) or not isinstance(value, int) or not (1024 <= value <= 65535):
+            raise ValueError(f"port for {key} must be an int in [1024, 65535]")
+    return {k: ports[k] for k in needed}
+
+
+def load_route(chan: sbd.HostChannel, next_id: list[int], info: sbd.HostInfo, url: str) -> dict[str, Any]:
+    """`load` を 1 件送り、結果の種別だけを返す（URL は載せない。final_url はホスト名のみ）。"""
+    try:
+        res = sbd.call(
+            chan, next_id, "load", {"url": url, "timeout_ms": LOAD_TIMEOUT_MS},
+            LOAD_TIMEOUT_MS / 1000 + sbd.TIMEOUT_SLACK_S, max_frame=info.response_max,
+        )
+    except sbd.RpcError as exc:
+        return {"ok": False, "kind": exc.kind}
+    except sbd.HostError as exc:
+        return {"ok": False, "kind": "host_error", "detail": str(exc)[:120]}
+    final = res.get("final_url")
+    host = None
+    if isinstance(final, str):
+        try:
+            from urllib.parse import urlsplit
+
+            host = urlsplit(final).hostname
+        except ValueError:
+            host = None
+    return {"ok": True, "final_host": host}
+
+
+def run(args: argparse.Namespace, ports: dict[str, int]) -> dict[str, Any]:
+    isolated = args.mode in judge.ISOLATED_MODES
+    result: dict[str, Any] = {"mode": args.mode, "routes": list(judge.routes_for_mode(args.mode))}
+
+    dev, route4, route6 = read_proc("dev"), read_proc("route"), read_proc("ipv6_route")
+    if isolated:
+        ok, why = judge.check_isolation(dev, route4, route6)
+        result["isolation_precheck"] = {"ok": ok, "reason": why}
+        if not ok:
+            result["aborted"] = True
+            return result
+
+    server = http.server.ThreadingHTTPServer((judge.IP_ALLOWED, 0), _PageHandler)
+    server.daemon_threads = True
+    page_port = server.server_address[1]
+    _PageHandler.pages = fixtures.build_pages(ports)
+    _PageHandler.redirect_to = fixtures.redirect_location(ports)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+
+    inner: dict[str, Any] = {}
+    if isolated:
+        for r in TCP_ROUTES:
+            ip = judge.IP_INTERNAL_STANDIN if r == "internal" else judge.IP_BLOCKED
+            inner[r] = listeners.TcpRecorder(r, ip, ports[r]).start()
+        inner["udp_direct"] = listeners.UdpRecorder("udp_direct", judge.IP_BLOCKED, ports["udp_direct"]).start()
+
+    workdir = Path(tempfile.mkdtemp(prefix="egress-isolation-"))
+    proc: subprocess.Popen[bytes] | None = None
+    guard: egress_guard.EgressGuard | None = None
+    try:
+        for sub in ("home", "tmp", "xdg-config", "xdg-cache", "xdg-data"):
+            (workdir / sub).mkdir()
+        env = sbd.build_host_env(workdir)
+        env_notes = sorted(k for k in os.environ if k.lower().endswith("_proxy"))
+        result["proxy_env_present"] = bool(env_notes)  # 値は記録しない（有無のみ）
+
+        st = subprocess.run(  # noqa: S603  (argv 固定・シェル不使用)
+            [args.host, "--selftest"], env=env, stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=90, check=False,
+        )
+        result["selftest_rc"] = st.returncode
+
+        proc = subprocess.Popen(  # noqa: S603
+            [args.host, "--stdio"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL, env=env,
+        )
+        violations: list[str] = []
+        guard = egress_guard.EgressGuard(proc.pid, page_port, lambda: violations.append("violation"))
+        guard.start()
+        chan = sbd.HostChannel(proc)
+        info = sbd.validate_hello(chan.recv(sbd.HANDSHAKE_TIMEOUT_S))  # bounding_box 必須の検査を含む
+        chan.request_max = info.request_max
+        next_id = [1]
+        base = f"http://{judge.HOST_ALLOWED}:{page_port}"
+
+        loopback = load_route(chan, next_id, info, f"{base}/ok")
+        result["loopback_load"] = loopback
+        loads: dict[str, Any] = {}
+        for r in (x for x in PAGE_ROUTES if x in result["routes"]):
+            loads[r] = load_route(chan, next_id, info, base + fixtures.ROUTE_PATH[r])
+            time.sleep(SETTLE_S)
+        result["loads"] = loads
+        try:
+            sbd.call(chan, next_id, "shutdown", None, sbd.SHUTDOWN_GRACE_S + sbd.TIMEOUT_SLACK_S,
+                     max_frame=info.response_max)
+        except (sbd.HostError, sbd.RpcError):
+            pass
+    except (sbd.HostError, OSError, subprocess.SubprocessError) as exc:
+        result["error"] = f"{type(exc).__name__}: {str(exc)[:120]}"
+    finally:
+        if guard is not None:
+            guard.stop()
+            result["guard"] = {"violation": guard.violation, "unavailable": guard.unavailable}
+        if proc is not None:
+            sbd._stop_host(proc, graceful=False)
+        shutil.rmtree(workdir, ignore_errors=True)
+
+    # --- (iv)(v) のプローブ（connect だけ・固定宛先） -----------------------------------
+    probes: dict[str, Any] = {}
+    probes["udp_direct"] = probe_udp(judge.IP_BLOCKED, ports["udp_direct"])
+    if isolated:
+        probes["internal_real"] = {
+            **{ip: probe_connect(socket.AF_INET, (ip, 80)) for ip in judge.REAL_INTERNAL_V4},
+            judge.REAL_INTERNAL_V6: probe_connect(socket.AF_INET6, (judge.REAL_INTERNAL_V6, 80, 0, 0)),
+        }
+        probes["dns"] = probe_dns()
+    result["probes"] = probes
+    time.sleep(0.5)
+
+    counts = {k: rec.count for k, rec in inner.items()}
+    result["inner_counts"] = counts
+    result["positive_ok"] = (
+        result.get("selftest_rc") == 0 and bool(result.get("loopback_load", {}).get("ok"))
+    )
+    unreachable = {"ENETUNREACH", "EHOSTUNREACH", "ENETDOWN", "EADDRNOTAVAIL", "EAFNOSUPPORT"}
+    real = probes.get("internal_real", {})
+    result["attempts"] = {
+        **{k: counts.get(k, 0) >= 1 for k in (*TCP_ROUTES, "udp_direct")},
+        # 構造的な経路は「経路なし」を示す errno が出たことを試行の根拠とする。
+        "internal_real": bool(real) and all(v in unreachable for v in real.values()),
+        "dns": isolated and probes.get("dns", {}).get("result", "resolved") not in ("resolved",),
+    }
+    for rec in inner.values():
+        rec.stop()
+    server.shutdown()
+    return result
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Inner runner for the egress isolation measurement.")
+    parser.add_argument("--mode", required=True)
+    parser.add_argument("--host", required=True)
+    parser.add_argument("--ports", required=True)
+    parser.add_argument("--out", required=True, type=Path)
+    args = parser.parse_args(argv)
+    try:
+        ports = validate_args(args)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    result = run(args, ports)
+    args.out.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return 2 if result.get("aborted") else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
