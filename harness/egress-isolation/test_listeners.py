@@ -46,7 +46,7 @@ class TcpRecorderTest(unittest.TestCase):
     def test_records_http_request_without_query_or_body(self) -> None:
         rec = listeners.TcpRecorder("t", "127.0.0.2").start()
         try:
-            with socket.create_connection(("127.0.0.2", rec.port), timeout=2) as c:
+            with socket.create_connection(("127.0.0.2", rec.port), timeout=2, source_address=("127.0.0.1", 0)) as c:
                 c.sendall(b"POST /p?secret=1 HTTP/1.1\r\nHost: x\r\n\r\nbody-secret")
                 self.assertTrue(c.recv(100).startswith(b"HTTP/1.1 204"))
             wait_count(rec, 1)
@@ -86,6 +86,8 @@ class UdpRecorderTest(unittest.TestCase):
         rec = listeners.UdpRecorder("u", "127.0.0.2").start()
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            # 送信元の選ばれ方は OS ごとに違う（macOS は宛先と同じ 127.0.0.2）ため明示的に固定する。
+            s.bind(("127.0.0.1", 0))
             s.sendto(b"abcdef", ("127.0.0.2", rec.port))
             s.close()
             wait_count(rec, 1)

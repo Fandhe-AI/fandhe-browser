@@ -12,7 +12,8 @@ out="$(python3 -B -m unittest discover -s harness/egress-isolation -p 'test_*.py
   exit 1
 }
 printf '%s\n' "$out"
-ran="$(printf '%s\n' "$out" | sed -n 's/^Ran \([0-9][0-9]*\) tests\? in .*/\1/p' | tail -n 1)"
+# BSD sed（macOS）は `\?` を解釈しないため awk で取り出す。
+ran="$(printf '%s\n' "$out" | awk '/^Ran [0-9]+ tests? in /{n=$2} END{print n}')"
 if [ -z "$ran" ] || [ "$ran" -lt 1 ]; then
   echo "egress-isolation self-test: no tests were run" >&2
   exit 1

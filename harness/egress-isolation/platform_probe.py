@@ -130,6 +130,11 @@ def netns_capabilities(run: Runner = default_runner) -> dict[str, str]:
     return {name: classify(*run(argv)) for name, argv in cases.items()}
 
 
+# コンテナ内（常に Linux）で得た errno 番号を名前にする表。ホストの `errno.errorcode` は macOS・Windows で
+# 番号が Linux と異なる（例: 38 が ENOTSOCK・ENAMETOOLONG）ため、ホストの表では引かない。
+LINUX_ERRNO_NAMES = {1: "EPERM", 2: "ENOENT", 7: "E2BIG", 13: "EACCES", 22: "EINVAL", 38: "ENOSYS", 95: "EOPNOTSUPP"}
+
+
 def parse_landlock_json(rc: int | None, stdout: str, stderr: str) -> str:
     """コンテナ内の Landlock ABI 問い合わせ結果（標準出力の JSON 1 行）を判定語彙の文字列にする。
 
@@ -153,7 +158,7 @@ def parse_landlock_json(rc: int | None, stdout: str, stderr: str) -> str:
     if isinstance(ret, int) and not isinstance(ret, bool) and ret >= 0 and err == 0:
         return "ok"
     if isinstance(ret, int) and not isinstance(ret, bool) and ret < 0 and isinstance(err, int) and err > 0:
-        return f"errno {errno.errorcode.get(err, err)}"
+        return f"errno {LINUX_ERRNO_NAMES.get(err, err)}"
     return "unobservable: unexpected JSON shape"
 
 
