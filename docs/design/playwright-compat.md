@@ -568,9 +568,9 @@ TASK-43.3o（#1050）の取り込み後に再取得した同梱トレース（3 
 | `newContext` | 成功 | なし | A |
 | `newPage` | 成功 | なし | A |
 | `goto` | 成功 | なし（`Page.navigate` が `loaderId` を返し、`Page.frameNavigated`・`Page.loadEventFired` が届く） | A |
-
-#1364: `Network.enable` 済みセッションには `Page.navigate` が取得した文書の `Network.requestWillBeSent`・`responseReceived`・`loadingFinished` も届き、`page.goto()` の `Response.status()` が実ステータスを返す。`make test-playwright-connect` の goto 段階で `Response` 非 null かつ `status() === 200` を照合し通った（A）。ソース読解（B。playwright-core 1.63.0 の `crNetworkManager`）: ナビゲーション要求は `requestId === loaderId && type === "Document"`、`timing`・`remoteIPAddress` 等の欠落は許容。差異（`REPAIR-3`）: リダイレクト途中ホップ・`loadingFailed`・`statusText`・`Content-Type` 以外の応答ヘッダは未通知。
 | `selector` | 失敗 | `StageTimeout`: `stage timed out after 10000 ms` | A |
+
+Issue #1364: `Network.enable` 済みセッションには `Page.navigate` が取得した文書の `Network.requestWillBeSent`・`responseReceived`・`loadingFinished` も届き、`page.goto()` の `Response.status()` が実ステータスを返す。`make test-playwright-connect` の goto 段階で `Response` 非 null かつ `status() === 200` を照合し通った（A）。ソース読解（B。playwright-core 1.63.0 の `crNetworkManager`）: ナビゲーション要求は `requestId === loaderId && type === "Document"`、`timing`・`remoteIPAddress` 等の欠落は許容。差異（`REPAIR-3`）: リダイレクト途中ホップ・`loadingFailed`・`statusText`・`Content-Type` 以外の応答ヘッダは未通知。
 
 `make test-playwright-connect` は `cdp2_real_playwright_goto_and_selector` が `selector` 段階の失敗で終了コード 2 になる。これは現状の正しい結果であり、skip・期待値の弱体化・成功フォールバックは入れていない（`CDP-6`・`SEC-2`）。
 
