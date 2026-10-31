@@ -30,6 +30,9 @@ _ISOLATED_TEMPLATE = (
 LOG_PREDICATE = 'sender == "Sandbox"'
 MAX_LOG_LINES = 20000
 MAX_LINE_LEN = 4096
+# `log show` を逐次読む際の打ち切り上限（読み取った行数・総バイト数）。超えたら収集を諦める（unobservable）。
+MAX_SCAN_LINES = 500000
+MAX_SCAN_BYTES = 64 * 1024 * 1024
 _DENY_RE = re.compile(r"deny\(\d+\) network-outbound (\d{1,3}(?:\.\d{1,3}){3}):(\d{1,5})\b")
 
 
@@ -47,6 +50,16 @@ def log_show_argv(start: str) -> list[str]:
     return [LOG_BIN, "show", "--style", "ndjson", "--start", start, "--predicate", LOG_PREDICATE]
 
 
+def parse_deny_line(line: str) -> str | None:
+    """1 行から拒否の宛先 "ip:port" を取り出す。該当しない・長すぎる行は None。"""
+    if len(line) > MAX_LINE_LEN:
+        return None
+    m = _DENY_RE.search(line)
+    if m and int(m.group(2)) <= 65535:
+        return f"{m.group(1)}:{int(m.group(2))}"
+    return None
+
+
 def parse_denies(text: str) -> Counter[str]:
     """ndjson 本文から network-outbound の拒否を数え、`"ip:port" -> 件数` を返す。
 
@@ -57,11 +70,9 @@ def parse_denies(text: str) -> Counter[str]:
     for i, line in enumerate(text.splitlines()):
         if i >= MAX_LOG_LINES:
             break
-        if len(line) > MAX_LINE_LEN:
-            continue
-        m = _DENY_RE.search(line)
-        if m and int(m.group(2)) <= 65535:
-            counts[f"{m.group(1)}:{int(m.group(2))}"] += 1
+        dest = parse_deny_line(line)
+        if dest:
+            counts[dest] += 1
     return counts
 
 

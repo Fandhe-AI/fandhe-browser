@@ -39,6 +39,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -237,15 +238,56 @@ def _run_argv(argv: list[str]) -> tuple[int | None, str]:
 
 
 def collect_denies(start: str) -> tuple[dict[str, int], dict[str, Any]]:
-    """macOS のサンドボックス拒否ログを集計する。(宛先 -> 件数, 取得状況)。読めなければ空と理由。"""
+    """macOS のサンドボックス拒否ログを逐次読んで集計する。(宛先 -> 件数, 取得状況)。読めなければ空と理由。
+
+    出力を全量メモリに載せず、1 行ずつ上限つきで読む。行数・総バイト数が上限に達したら
+    プロセスを止めて unobservable（available=False）にする（リソース枯渇の防止）。
+    """
     try:
-        done = subprocess.run(seatbelt.log_show_argv(start), stdin=subprocess.DEVNULL,  # noqa: S603
-                              capture_output=True, text=True, timeout=180, check=False)
+        argv = seatbelt.log_show_argv(start)
+        proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,  # noqa: S603
+                                stderr=subprocess.DEVNULL)
     except (OSError, subprocess.SubprocessError, ValueError) as exc:
         return {}, {"available": False, "reason": type(exc).__name__}
-    if done.returncode != 0:
-        return {}, {"available": False, "reason": f"log show rc={done.returncode}"}
-    counts = seatbelt.parse_denies(done.stdout)
+    timer = threading.Timer(180, proc.kill)
+    timer.start()
+    counts: Counter[str] = Counter()
+    lines = total = 0
+    over = False
+    try:
+        assert proc.stdout is not None
+        while True:
+            raw = proc.stdout.readline(seatbelt.MAX_LINE_LEN + 1)
+            if not raw:
+                break
+            total += len(raw)
+            if not raw.endswith(b"\n") and len(raw) > seatbelt.MAX_LINE_LEN:
+                # 長すぎる行は残りを捨てる（メモリに溜めない）。
+                while True:
+                    rest = proc.stdout.readline(seatbelt.MAX_LINE_LEN)
+                    total += len(rest)
+                    if not rest or rest.endswith(b"\n") or total > seatbelt.MAX_SCAN_BYTES:
+                        break
+                lines += 1
+            else:
+                lines += 1
+                dest = seatbelt.parse_deny_line(raw.decode("utf-8", errors="replace"))
+                if dest and sum(counts.values()) < seatbelt.MAX_LOG_LINES:
+                    counts[dest] += 1
+            if lines > seatbelt.MAX_SCAN_LINES or total > seatbelt.MAX_SCAN_BYTES:
+                over = True
+                break
+    finally:
+        timer.cancel()
+        if proc.poll() is None:
+            proc.kill()
+        proc.wait()
+        if proc.stdout:
+            proc.stdout.close()
+    if over:
+        return {}, {"available": False, "reason": "log show output exceeded scan limit"}
+    if proc.returncode != 0:
+        return {}, {"available": False, "reason": f"log show rc={proc.returncode}"}
     return dict(counts), {"available": True, "deny_lines": sum(counts.values())}
 
 
@@ -329,11 +371,15 @@ def summarize(results: dict[str, Any]) -> str:
     return "\n".join(lines) + "\n"
 
 
+DEFAULT_MODES = {"linux": ("baseline", "bwrap-netns"), "darwin": ("baseline", "seatbelt"),
+                 "win32": ("baseline", "appcontainer")}
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Measure Servo host egress isolation (Linux, macOS, Windows).")
     parser.add_argument("--host", required=True, help="Absolute path to fandhe-browser-servo-host.")
-    parser.add_argument("--modes", default="baseline,bwrap-netns",
-                        help="Comma separated modes allowed on this OS (baseline first): linux baseline,bwrap-netns,docker-none; "
+    parser.add_argument("--modes", default=None,
+                        help="Comma separated modes allowed on this OS (baseline first; default per OS: linux baseline,bwrap-netns / darwin baseline,seatbelt / win32 baseline,appcontainer): linux baseline,bwrap-netns,docker-none; "
                         "darwin baseline,seatbelt; win32 baseline,appcontainer.")
     parser.add_argument("--docker-image", help="Image containing the host at " + DOCKER_HOST_PATH)
     parser.add_argument("--out", required=True, type=Path, help="Existing empty directory for results.")
@@ -344,7 +390,7 @@ def main(argv: list[str] | None = None) -> int:
         if allowed is None:
             raise ValueError(f"unsupported platform: {sys.platform}")
         host = validate_host(args.host)
-        modes = args.modes.split(",")
+        modes = args.modes.split(",") if args.modes else list(DEFAULT_MODES[plat])
         if not modes or modes[0] != "baseline" or any(m not in allowed for m in modes):
             raise ValueError("--modes must start with baseline and use known modes")
         image = validate_image(args.docker_image) if args.docker_image else None
@@ -370,7 +416,6 @@ def main(argv: list[str] | None = None) -> int:
         resolv_file = Path(td) / "resolv.conf"
         resolv_file.write_text(judge.RESOLV_CONF, encoding="utf-8")
         recs, ports = start_outer_listeners()
-        page_port = 0 if sys.platform.startswith("linux") else free_port()
         results: dict[str, Any] = {"modes": {}}
         try:
             version = subprocess.run([str(host), "--version"], capture_output=True, text=True,  # noqa: S603
@@ -387,6 +432,8 @@ def main(argv: list[str] | None = None) -> int:
                 "proxy_env_present": any(k.lower().endswith("_proxy") for k in os.environ),
             }
             for mode in modes:
+                # モードごとにポートを取り直す（close 直後の再 bind が EADDRINUSE になるのを避ける）。
+                page_port = 0 if sys.platform.startswith("linux") else free_port()
                 results["modes"][mode] = run_mode(mode, host=host, ports=ports, recs=recs, out_dir=out_dir,
                                                   hosts_file=hosts_file, image=image,
                                                   resolv_file=resolv_file, page_port=page_port)

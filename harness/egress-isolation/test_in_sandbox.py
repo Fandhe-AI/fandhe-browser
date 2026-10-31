@@ -217,6 +217,12 @@ class MeasureTest(unittest.TestCase):
             measure.validate_host("/nonexistent/host")
 
     def test_outer_listeners_are_loopback_only(self) -> None:
+        # macOS の lo0 は既定で 127.0.0.1 のみ。alias が無ければ bind できないため skip する
+        # （実測側は ensure_loopback_aliases が案内つきで止める）。
+        try:
+            measure.ensure_loopback_aliases()
+        except ValueError as exc:
+            self.skipTest(str(exc))
         recs, ports = measure.start_outer_listeners()
         try:
             self.assertEqual(set(ports), {"redirect", "img", "fetch", "ws", "internal", "udp_direct"})
