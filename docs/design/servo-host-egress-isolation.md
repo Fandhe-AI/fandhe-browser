@@ -1,7 +1,7 @@
 # Servo ホストの egress 隔離方式: 3 OS の比較設計と実測計画
 
 - **状態**: 設計（比較と実測計画）。**方式の最終決定は実測の後にオーナーが行う**（#1003）。2026-10-31 の暫定判断（Linux を先行・macOS と Windows は実測まで D の扱い）を §8 に、Linux の実測結果を §6.4 に記録した
-- **対応**: TASK-38・MS-4・`RENDER-3`・`SEC-2`・`PLUG-1`・`XOS-1`・Issue #1368（親判断 #1003）。関連は `RENDER-1`。後続は #1386（docker 経路の再実測）・#1387（macOS・Windows の実測ハーネス）
+- **対応**: TASK-38・MS-4・`RENDER-3`・`SEC-2`・`PLUG-1`・`XOS-1`・Issue #1368（親判断 #1003）。関連は `RENDER-1`。docker 経路は #1386 で再実測した（§6.4）。後続は #1387（macOS・Windows の実測ハーネス）
 - **入力資料**: [servo-host-egress-options.md](./servo-host-egress-options.md)（#1317。手段ごとの詳細表・Servo 0.7 の net 層の事実・承認事項の洗い出し。以下「options §n」と書く）。設計の親は [servo-host-design.md](./servo-host-design.md) §2.5・§13 項目 6
 - **確度の表記**: 「確認済み」は原文またはコードを確認した事項、「推測」は読んだ範囲からの推論、「未確認」は調べていない事項。一次情報は options の出典（参照日 2026-10-29、Servo は `v0.7.0` タグ）に従い、判断の前に原文で再確認する。本書では新たな外部ページの再取得はしていない
 - **spec 側の課題**（本リポからは編集しない。要報告）: egress 方針に専用のビヘイビア ID が無い。`RENDER-3` の本文はホストのサイズ・ビルド時間とオプトイン配布の設計材料で egress を扱わない。対応づけの確認は spec 側で行う
@@ -147,23 +147,22 @@ loopback で配信するフィクスチャページ（`harness/render-screenshot
 
 | 経路 | ベースラインの外側受信（陽性対照） | bwrap `--unshare-net` | docker `--network none` | 観測手段 |
 | ---- | ---------------------------------- | --------------------- | ----------------------- | -------- |
-| redirect（i） | 1 | pass | unobservable | 外側・内側の listener |
-| img（ii） | 1 | pass | unobservable | 同上 |
-| fetch（ii） | 1 | pass | unobservable | 同上 |
-| ws（iii） | 1 | pass | unobservable | 同上 |
-| internal（iv。代替宛先 127.0.0.3） | 1 | pass | unobservable | 同上 |
-| udp_direct（v） | 1 | pass | unobservable | ハーネスの UDP プローブ（Servo の送信ではない） |
-| internal_real（iv。`10.255.255.1`・`169.254.169.254`・`fd00::1`） | 対象外 | pass（connect が `ENETUNREACH`） | unobservable | 経路表と connect のみの構造検査（外部からの観測ではない） |
-| dns（v） | 対象外 | pass（固定 nameserver への UDP connect が `ENETUNREACH`・`getaddrinfo` は `gaierror:-3`） | unobservable | 経路表とハーネスの `getaddrinfo` による構造検査（Servo 自身の DNS は観測していない） |
+| redirect（i） | 1 | pass | pass | 外側・内側の listener |
+| img（ii） | 1 | pass | pass | 同上 |
+| fetch（ii） | 1 | pass | pass | 同上 |
+| ws（iii） | 1 | pass | pass | 同上 |
+| internal（iv。代替宛先 127.0.0.3） | 1 | pass | pass | 同上 |
+| udp_direct（v） | 1 | pass | pass | ハーネスの UDP プローブ（Servo の送信ではない） |
+| internal_real（iv。`10.255.255.1`・`169.254.169.254`・`fd00::1`） | 対象外 | pass（connect が `ENETUNREACH`） | pass（構造検査） | 経路表と connect のみの構造検査（外部からの観測ではない） |
+| dns（v） | 対象外 | pass（固定 nameserver への UDP connect が `ENETUNREACH`・`getaddrinfo` は `gaierror:-3`） | pass（構造検査） | 経路表とハーネスの `getaddrinfo` による構造検査（Servo 自身の DNS は観測していない） |
 
 - bwrap `--unshare-net`: 8 経路すべて pass。全経路で外側 listener の受信 0 件・内側 listener の試行 1 件。`egress_guard` は 856 回走査して違反なし（補助の位置づけ）。隔離の事前検査は「lo のみ」、ホストの sha256 はベースラインと一致した
-- docker `--network none`: 全経路 unobservable で、判定できていない。1 回目はイメージ `fandhe-render-screenshot:local` に同梱のホストがベースラインのビルドと別のバイナリで、ハーネスが同一性の不一致として unobservable にした（生データは外側 0・内側 1）。2 回目は今回のビルドを入れた一時イメージで、ホストが `GLIBC_2.43` を要求し、イメージ（Debian 13・glibc 2.41）で起動できなかった（`--selftest` rc=1。正の対照の失敗として全経路 unobservable）。glibc をそろえた再実測は #1386
-- 正の対照: bwrap と docker（1 回目）のどちらでも `--selftest` は rc=0、loopback ページの `load` は成功した。`redirect` のページの `load` は baseline を含む全モードで timeout で、隔離に起因する差ではない（外側の受信は baseline で 1 件）
-- 先行測定: a5770058 時点の測定（#1003 のコメント「Linux 実測の記録（#1377 のハーネス）」）では、2026-10-27 ビルドのイメージから取り出したホストをベースラインと隔離の両方に使い、docker `--network none` でも外側の受信は 0 件だった。ホストが現在のコミットのビルドではないため、本節は c56f11c2 の測定を記録とする
+- docker `--network none`（#1386。2026-10-31 に再実測）: 8 経路すべて pass。配布コンテナと同じ Debian 13（glibc 2.41）のイメージ内でホストを release ビルドして取り出し（`harness/egress-isolation/container/prepare.sh`）、baseline・bwrap・docker の全モードに同一バイナリ（sha256 889cb467…865f4・GLIBC の最大要求 2.39）を使った。イメージ ID は sha256:cded5685…89e8。全経路で外側 listener の受信 0 件・内側 listener の試行 1 件、隔離の事前検査は「lo のみ」、`egress_guard` は 941 回走査して違反なし。測定値は #1003 のコメントに記録した
+- 正の対照: bwrap と docker（上記の再実測）のどちらでも `--selftest` は rc=0、loopback ページの `load` は成功した。`redirect` のページの `load` は baseline を含む全モードで timeout で、隔離に起因する差ではない（外側の受信は baseline で 1 件）
+- 先行測定（参考。再実測で置き換え済み）: a5770058 時点の測定（#1003 のコメント「Linux 実測の記録（#1377 のハーネス）」）では、2026-10-27 ビルドのイメージから取り出したホストをベースラインと隔離の両方に使い、docker `--network none` でも外側の受信は 0 件だった。ホストが現在のコミットのビルドではないため、本節は c56f11c2 の測定を記録とする
 
 未測定（残りの追跡は §9.2）:
 
-- docker `--network none` での同一バイナリによる判定（#1386）
 - Servo 自身の DNS・UDP 送信の外部観測（root か `CAP_NET_ADMIN` が要る）
 - Landlock ルールの適用・seccomp・許可リスト付きプロキシとの併用（§7 の承認事項）
 - macOS・Windows（#1387）、AppArmor の制限が無い環境・古いカーネル
@@ -188,7 +187,7 @@ loopback で配信するフィクスチャページ（`harness/render-screenshot
 
 | 論点（判断前の問い） | 判断 | 後続 |
 | -------------------- | ---- | ---- |
-| 1. GA で必須とする成立範囲（3 OS 揃えるか、Linux を先行するか） | Linux を先行する。Linux は B（OS 隔離）として bwrap `--unshare-net` を主方式にする（§6.4 で 8 経路すべて pass）。docker `--network none` は、配布コンテナとホストの glibc をそろえてから測り直す | #1386 |
+| 1. GA で必須とする成立範囲（3 OS 揃えるか、Linux を先行するか） | Linux を先行する。Linux は B（OS 隔離）として bwrap `--unshare-net` を主方式にする（§6.4 で 8 経路すべて pass）。docker `--network none` は、配布コンテナとホストの glibc をそろえてから測り直す | #1386（測定済み。§6.4・§9.1） |
 | 2. B が成立しない OS・環境での既知の制約の文言（D） | OS 隔離が使えない環境では A（アプリ側の検知）だけで動作し、「egress を完全には遮断できない」と明記する。既定ではそのことを警告する | 文言の置き場所は §4 の候補（設計 §2.5・README）から選ぶ（未定） |
 | 3. Windows の扱い（弱い保証にとどめるか、対象外とするか） | macOS・Windows の実測が済むまで GA の成立範囲から外し、D の扱いとする | #1387 |
 
@@ -206,12 +205,12 @@ options §7 を引き継ぐ。本書で新たに加わる未確認事項はな�
 - Ubuntu の AppArmor 制限（`kernel.apparmor_restrict_unprivileged_userns=1`）下での netns の作り方: 特権なしの `unshare -n`・`unshare -rn` は EPERM、`bwrap --unshare-net` は成功。ns 内に `CAP_NET_ADMIN` は無い
 - Landlock の対応: カーネル 7.0.0-34 で LSM に有効・ABI 8（問い合わせのみ）
 - 現在のコミットのホストでの再測定: c56f11c2 の dev ビルドで測り、bwrap `--unshare-net` は 8 経路すべて pass
+- docker `--network none` の判定（配布コンテナとホストの glibc をそろえた同一バイナリ。#1386）: 8 経路すべて pass（§6.4）
 
 ### 9.2 残る未確認事項と追跡先
 
 | 未確認事項 | 追跡先 |
 | ---------- | ------ |
-| docker `--network none` での判定（配布コンテナとホストの glibc をそろえた同一バイナリ） | #1386 |
 | macOS・Windows での成立性（§3.2・§3.3・§6.2） | #1387 |
 | Docker 内での bwrap の可否（イメージに bwrap が無い） | 未起票 |
 | Servo 自身の DNS・UDP 送信の外部観測（root か `CAP_NET_ADMIN` が要る） | 未起票 |
