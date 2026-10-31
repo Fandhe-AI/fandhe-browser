@@ -124,7 +124,8 @@ def check_isolation(net_dev: str | None, route: str | None, ipv6_route: str | No
 
 
 def judge_all(
-    mode: str, inner: dict[str, Any], outer_counts: dict[str, int], control_counts: dict[str, int]
+    mode: str, inner: dict[str, Any], outer_counts: dict[str, int], control_counts: dict[str, int],
+    binary_match: bool = True,
 ) -> dict[str, dict[str, Any]]:
     """内側ランナーの結果 JSON と外側の件数から、隔離モードの全経路を判定する。"""
     positive_ok = bool(inner.get("positive_ok"))
@@ -146,6 +147,8 @@ def judge_all(
             if route in STRUCTURAL_ROUTES
             else "outer listener receipt + inner listener attempt + egress_guard"
         )
+        if not binary_match and verdict == PASS:
+            verdict, reason = UNOBSERVABLE, "binary inside the sandbox differs from the baseline control binary"
         out[route] = {
             "verdict": verdict,
             "reason": reason,

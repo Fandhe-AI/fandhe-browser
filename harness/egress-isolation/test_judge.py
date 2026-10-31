@@ -68,6 +68,11 @@ class JudgeAllTest(unittest.TestCase):
         out = judge.judge_all("bwrap-netns", self.inner(positive_ok=False), {}, control)
         self.assertTrue(all(v["verdict"] == judge.UNOBSERVABLE for v in out.values()))
 
+    def test_binary_mismatch_downgrades_pass(self) -> None:
+        control = {r: 1 for r in judge.LISTENER_ROUTES}
+        out = judge.judge_all("docker-none", self.inner(), {}, control, binary_match=False)
+        self.assertTrue(all(v["verdict"] == judge.UNOBSERVABLE for v in out.values()))
+
     def test_guard_unavailable_is_unobservable(self) -> None:
         control = {r: 1 for r in judge.LISTENER_ROUTES}
         out = judge.judge_all("bwrap-netns", self.inner(guard={"unavailable": "x"}), {}, control)

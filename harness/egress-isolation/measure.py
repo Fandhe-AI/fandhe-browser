@@ -74,8 +74,14 @@ def build_argv(mode: str, *, host: Path, ports: dict[str, int], out_dir: Path, h
     if mode in ("baseline", "bwrap-netns"):
         argv = ["bwrap", "--die-with-parent"]
         if mode == "bwrap-netns":
-            argv.append("--unshare-net")
-        argv += ["--dev-bind", "/", "/", "--ro-bind", str(hosts_file), "/etc/hosts", "--",
+            # （baseline と同条件にするため /run の tmpfs は両モード共通。下の argv 参照）、ホスト側 resolver（systemd-resolved・nscd 等）の
+            # Unix ソケット経由で netns の外へ名前解決が出る経路を断つ。
+            argv += ["--unshare-net"]
+        argv += ["--dev-bind", "/", "/",
+                 # /run を空の tmpfs にし、ホスト側 resolver（systemd-resolved・nscd 等）の Unix ソケット経由で
+                 # netns の外へ名前解決が出る経路を断つ（baseline と同条件）。
+                 "--tmpfs", "/run",
+                 "--ro-bind", str(hosts_file), "/etc/hosts", "--",
                  sys.executable, "-I", "-B", str(_HERE / "in_sandbox.py"),
                  "--host", str(host), "--out", str(out_dir / f"{mode}.json"), *inner_args]
         return argv
@@ -92,6 +98,16 @@ def build_argv(mode: str, *, host: Path, ports: dict[str, int], out_dir: Path, h
                  "--out", f"/out/{mode}.json", *inner_args]
         return argv
     raise ValueError(f"unknown mode: {mode}")
+
+
+def docker_image_id(image: str) -> str | None:
+    """実測に使ったイメージの ID（digest）。取得できなければ None（記録のみ。判定は内側の SHA256 で行う）。"""
+    try:
+        out = subprocess.run(["docker", "image", "inspect", "--format", "{{.Id}}", image],  # noqa: S603,S607
+                             capture_output=True, text=True, timeout=30, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return out.stdout.strip()[:100] if out.returncode == 0 else None
 
 
 def run_argv(argv: list[str]) -> tuple[int | None, str]:
@@ -120,13 +136,15 @@ def run_mode(mode: str, *, host: Path, ports: dict[str, int], recs: dict[str, An
     outer = {k: r.count - before[k] for k, r in recs.items()}
     result_path = out_dir / f"{mode}.json"
     inner: dict[str, Any] = {}
-    # ランナーが正常終了（rc == 0）した場合の今回の結果だけを使う。失敗時は空 = 判定不能（合格にしない）。
-    if rc == 0 and result_path.is_file():
+    # 内側ランナーが正常終了（0）または隔離 abort（2。理由つきの JSON を書く）した場合の今回の結果だけを使う。
+    # それ以外の失敗は空 = 判定不能（合格にしない）。--out は空ディレクトリ検査済みで古い結果は混ざらない。
+    if rc in (0, 2) and result_path.is_file():
         try:
             inner = json.loads(result_path.read_text(encoding="utf-8"))
         except ValueError:
             inner = {}
-    return {"mode": mode, "exit_code": rc, "stderr_tail": err if rc != 0 else "", "inner": inner,
+    return {"mode": mode, "exit_code": rc, "binary_sha256": inner.get("host_sha256"),
+            "binary_version": inner.get("host_version"), "stderr_tail": err if rc != 0 else "", "inner": inner,
             "outer_counts": outer}
 
 
@@ -153,6 +171,11 @@ def summarize(results: dict[str, Any]) -> str:
         lines.append(f"- exit code: {data.get('exit_code')}; positive_ok: {inner.get('positive_ok')}; "
                      f"selftest_rc: {inner.get('selftest_rc')}; aborted: {inner.get('aborted', False)}")
         lines.append(f"- guard: {inner.get('guard')}")
+        lines.append(f"- isolation precheck: {inner.get('isolation_precheck')}")
+        lines.append(f"- binary sha256 (inside sandbox): {data.get('binary_sha256')}; "
+                     f"matches baseline: {data.get('binary_match')}")
+        if data.get("image_id"):
+            lines.append(f"- docker image id: {data['image_id']}")
         lines += ["", "| route | verdict | outer | control | method | reason |", "| --- | --- | --- | --- | --- | --- |"]
         for r, v in data.get("verdicts", {}).items():
             lines.append(f"| {r} | {v['verdict']} | {v['outer_count']} | {v['control_count']} | {v['method']} | {v['reason']} |")
@@ -186,7 +209,9 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     out_dir = args.out.resolve()
-    os.chmod(out_dir, 0o777)  # docker の --user でも書けるように（結果にはクエリ・本文を含まない）
+    # 所有者のみ書き込み可。docker は --user でホストの UID/GID を指定するため全ユーザー書き込みは不要
+    # （別ユーザーによる結果 JSON の差し替え・symlink 先行作成を防ぐ）。
+    os.chmod(out_dir, 0o700)
     with tempfile.TemporaryDirectory(prefix="egress-hosts-") as td:
         hosts_file = Path(td) / "hosts"
         hosts_file.write_text(judge.HOSTS_FILE, encoding="utf-8")
@@ -208,13 +233,19 @@ def main(argv: list[str] | None = None) -> int:
             for mode in modes:
                 results["modes"][mode] = run_mode(mode, host=host, ports=ports, recs=recs, out_dir=out_dir,
                                                   hosts_file=hosts_file, image=image)
+                if mode == "docker-none" and image is not None:
+                    results["modes"][mode]["image_id"] = docker_image_id(image)
         finally:
             for r in recs.values():
                 r.stop()
     control = results["modes"]["baseline"]["outer_counts"]
+    base_sha = results["modes"]["baseline"].get("binary_sha256")
     for mode, data in results["modes"].items():
         if mode in judge.ISOLATED_MODES:
-            data["verdicts"] = judge.judge_all(mode, data["inner"], data["outer_counts"], control)
+            # 陽性対照（baseline）と同一バイナリでなければ、対照が当該モードの根拠にならない。
+            data["binary_match"] = bool(base_sha) and data.get("binary_sha256") == base_sha
+            data["verdicts"] = judge.judge_all(mode, data["inner"], data["outer_counts"], control,
+                                               binary_match=data["binary_match"])
     (out_dir / "result.json").write_text(json.dumps(results, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     summary = summarize(results)
     (out_dir / "summary.md").write_text(summary, encoding="utf-8")

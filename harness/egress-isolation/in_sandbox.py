@@ -151,6 +151,47 @@ def probe_dns() -> dict[str, Any]:
     return {"result": result, "elapsed_s": round(time.monotonic() - started, 2)}
 
 
+RESOLVER_SOCKETS = (
+    "/run/systemd/resolve/io.systemd.Resolve", "/run/systemd/resolve/resolv.conf",
+    "/run/nscd/socket", "/var/run/nscd/socket", "/run/dbus/system_bus_socket",
+    "/run/avahi-daemon/socket",
+)
+
+
+def reachable_resolver_sockets() -> list[str]:
+    """ホスト側 resolver の Unix ソケットへ接続できる経路を返す（netns で遮断されない名前解決経路）。
+
+    1 件でもあれば DNS の失敗は「送信遮断」の証拠にならない（pass にしない）。
+    """
+    found: list[str] = []
+    for path in RESOLVER_SOCKETS:
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.settimeout(1.0)
+        try:
+            sock.connect(path)
+            found.append(path)
+        except OSError:
+            pass
+        finally:
+            sock.close()
+    return found
+
+
+def host_identity(host: str) -> dict[str, Any]:
+    """サンドボックス内で実際に実行するホストバイナリの SHA256 と version（baseline との同一性判定用）。"""
+    import hashlib
+
+    ident: dict[str, Any] = {}
+    try:
+        ident["host_sha256"] = hashlib.sha256(Path(host).read_bytes()).hexdigest()
+        ident["host_version"] = subprocess.run(  # noqa: S603
+            [host, "--version"], capture_output=True, text=True, timeout=20, check=False,
+            stdin=subprocess.DEVNULL).stdout.strip()[:80]
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return ident
+
+
 def validate_args(args: argparse.Namespace) -> dict[str, int]:
     if args.mode not in judge.MODES:
         raise ValueError("unknown mode")
@@ -197,6 +238,7 @@ def load_route(chan: sbd.HostChannel, next_id: list[int], info: sbd.HostInfo, ur
 def run(args: argparse.Namespace, ports: dict[str, int]) -> dict[str, Any]:
     isolated = args.mode in judge.ISOLATED_MODES
     result: dict[str, Any] = {"mode": args.mode, "routes": list(judge.routes_for_mode(args.mode))}
+    result.update(host_identity(args.host))
 
     dev, route4, route6 = read_proc("dev"), read_proc("route"), read_proc("ipv6_route")
     if isolated:
@@ -280,6 +322,7 @@ def run(args: argparse.Namespace, ports: dict[str, int]) -> dict[str, Any]:
             judge.REAL_INTERNAL_V6: probe_connect(socket.AF_INET6, (judge.REAL_INTERNAL_V6, 80, 0, 0)),
         }
         probes["dns"] = probe_dns()
+        probes["dns"]["resolver_sockets"] = reachable_resolver_sockets()
     result["probes"] = probes
     time.sleep(0.5)
 
@@ -294,7 +337,9 @@ def run(args: argparse.Namespace, ports: dict[str, int]) -> dict[str, Any]:
         **{k: counts.get(k, 0) >= 1 for k in (*TCP_ROUTES, "udp_direct")},
         # 構造的な経路は「経路なし」を示す errno が出たことを試行の根拠とする。
         "internal_real": bool(real) and all(v in unreachable for v in real.values()),
-        "dns": isolated and probes.get("dns", {}).get("result", "resolved") not in ("resolved",),
+        # 失敗種別だけでは送信遮断の証拠にならない。ホスト側 resolver のソケットに届く環境では試行を観測できない扱い。
+        "dns": isolated and probes.get("dns", {}).get("result", "resolved") not in ("resolved",)
+        and not probes.get("dns", {}).get("resolver_sockets"),
     }
     for rec in inner.values():
         rec.stop()
