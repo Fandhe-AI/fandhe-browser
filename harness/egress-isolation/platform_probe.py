@@ -36,6 +36,10 @@ SYSCTLS = (
 DOCKER_IMAGE_RE = re.compile(r"^[a-z0-9][a-z0-9._/:@-]{0,127}$")
 
 Runner = Callable[[list[str]], tuple[int | None, str]]
+# 標準出力も受け取る実行関数 (終了コード, stdout, stderr の末尾)。コンテナ内の問い合わせ結果を構造化して取るために使う。
+OutRunner = Callable[[list[str]], tuple[int | None, str, str]]
+# `docker run` 自身が使う終了コード（125: docker の失敗、126: 実行不可、127: コマンドなし）。コンテナ内の結果とは別扱いにする。
+DOCKER_OWN_EXIT_CODES = (125, 126, 127)
 
 
 def default_runner(argv: list[str]) -> tuple[int | None, str]:
@@ -47,6 +51,17 @@ def default_runner(argv: list[str]) -> tuple[int | None, str]:
     except subprocess.TimeoutExpired:
         return None, "timed out"
     return done.returncode, done.stderr.strip()[-200:]
+
+
+def default_out_runner(argv: list[str]) -> tuple[int | None, str, str]:
+    """固定 argv を実行し (終了コード, stdout, stderr の末尾) を返す。見つからない・タイムアウトは (None, "", 理由)。"""
+    try:
+        done = subprocess.run(argv, capture_output=True, text=True, timeout=30, check=False)  # noqa: S603
+    except FileNotFoundError:
+        return None, "", "not installed"
+    except subprocess.TimeoutExpired:
+        return None, "", "timed out"
+    return done.returncode, done.stdout, done.stderr.strip()[-200:]
 
 
 def classify(rc: int | None, err: str) -> str:
@@ -115,21 +130,47 @@ def netns_capabilities(run: Runner = default_runner) -> dict[str, str]:
     return {name: classify(*run(argv)) for name, argv in cases.items()}
 
 
-def docker_probe(image: str, run: Runner = default_runner) -> dict[str, str]:
+def parse_landlock_json(rc: int | None, stdout: str, stderr: str) -> str:
+    """コンテナ内の Landlock ABI 問い合わせ結果（標準出力の JSON 1 行）を判定語彙の文字列にする。
+
+    終了コードは docker run 自身の失敗（125・126・127 等）の判別にだけ使い、Landlock の errno とは混ぜない。
+    docker の失敗・出力なし・壊れた JSON・想定外の形はすべて `unobservable`（fail-closed。judge の語彙に合わせる）。
+    """
+    if rc is None:
+        return f"unobservable: {stderr}"
+    if rc in DOCKER_OWN_EXIT_CODES or rc != 0:
+        return f"unobservable: docker run exited with rc={rc}"
+    lines = [ln for ln in stdout.splitlines() if ln.strip()]
+    if len(lines) != 1:
+        return "unobservable: no single JSON line on stdout"
+    try:
+        data = json.loads(lines[0])
+    except ValueError:
+        return "unobservable: malformed JSON on stdout"
+    if not isinstance(data, dict):
+        return "unobservable: unexpected JSON shape"
+    ret, err = data.get("ret"), data.get("errno")
+    if isinstance(ret, int) and not isinstance(ret, bool) and ret >= 0 and err == 0:
+        return "ok"
+    if isinstance(ret, int) and not isinstance(ret, bool) and ret < 0 and isinstance(err, int) and err > 0:
+        return f"errno {errno.errorcode.get(err, err)}"
+    return "unobservable: unexpected JSON shape"
+
+
+def docker_probe(image: str, run: Runner = default_runner, run_out: OutRunner = default_out_runner) -> dict[str, str]:
     """`--network none` の Docker 内で unshare・bwrap・Landlock の問い合わせがどうなるかを記録する。"""
     if not DOCKER_IMAGE_RE.match(image):
         raise ValueError("unexpected image name format")
     base = ["docker", "run", "--rm", "--network", "none", "--entrypoint"]
     code = (
-        "import ctypes;l=ctypes.CDLL(None,use_errno=True);r=l.syscall(444,None,0,1);"
-        "import sys;sys.exit(0 if r>=0 else 10+ctypes.get_errno())"
+        "import ctypes,json;l=ctypes.CDLL(None,use_errno=True);r=l.syscall(444,None,0,1);"
+        "print(json.dumps({'ret':r,'errno':ctypes.get_errno() if r<0 else 0}))"
     )
     out = {
         "unshare -n": classify(*run([*base, "unshare", image, "-n", "true"])),
         "bwrap --unshare-net": classify(*run([*base, "bwrap", image, "--dev-bind", "/", "/", "--unshare-net", "true"])),
     }
-    rc, err = run([*base, "python3", image, "-c", code])
-    out["landlock ABI query"] = "ok" if rc == 0 else (f"errno {rc - 10}" if rc and rc >= 10 else classify(rc, err))
+    out["landlock ABI query"] = parse_landlock_json(*run_out([*base, "python3", image, "-c", code]))
     return out
 
 

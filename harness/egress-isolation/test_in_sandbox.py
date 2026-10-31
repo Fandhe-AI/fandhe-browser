@@ -273,6 +273,23 @@ class PlatformProbeTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             platform_probe.docker_probe("x; rm -rf /")
 
+    def test_docker_landlock_query_parses_json_and_fails_closed(self) -> None:
+        """docker の終了コード 125・126・127 を Landlock の errno と取り違えず、壊れた出力は unobservable にする。"""
+        def probe(rc: int | None, out: str, err: str = "") -> str:
+            return platform_probe.docker_probe(
+                "img", run=lambda argv: (0, ""), run_out=lambda argv: (rc, out, err))["landlock ABI query"]
+
+        self.assertEqual(probe(0, '{"ret": 8, "errno": 0}\n'), "ok")
+        self.assertEqual(probe(0, '{"ret": -1, "errno": 38}\n'), "errno ENOSYS")
+        for rc in (125, 126, 127, 1, 15):
+            self.assertEqual(probe(rc, "", "docker: error"), f"unobservable: docker run exited with rc={rc}")
+        self.assertEqual(probe(125, '{"ret": 8, "errno": 0}'), "unobservable: docker run exited with rc=125")
+        self.assertEqual(probe(None, "", "timed out"), "unobservable: timed out")
+        self.assertEqual(probe(0, ""), "unobservable: no single JSON line on stdout")
+        self.assertEqual(probe(0, "not json"), "unobservable: malformed JSON on stdout")
+        self.assertEqual(probe(0, "[1]"), "unobservable: unexpected JSON shape")
+        self.assertEqual(probe(0, '{"ret": -1, "errno": 0}'), "unobservable: unexpected JSON shape")
+
 
 if __name__ == "__main__":
     unittest.main()
