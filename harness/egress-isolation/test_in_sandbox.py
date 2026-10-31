@@ -50,7 +50,7 @@ class InnerRunnerTest(unittest.TestCase):
         return {k: 20000 + i for i, k in enumerate(("redirect", "img", "fetch", "ws", "internal", "udp_direct"))}
 
     def args(self, mode: str, host: Path) -> argparse.Namespace:
-        return argparse.Namespace(mode=mode, host=str(host), ports=json.dumps(self.ports()), out=self.tmp / "o.json")
+        return argparse.Namespace(mode=mode, host=str(host), ports=json.dumps(self.ports()), out=self.tmp / "o.json", page_port=0)
 
     def test_baseline_reaching_outer_listener_is_recorded(self) -> None:
         outer = listeners.TcpRecorder("o", "127.0.0.2").start()
@@ -103,6 +103,12 @@ class InnerRunnerTest(unittest.TestCase):
                       {"ports": json.dumps({**self.ports(), "ws": 22})}):
             with self.assertRaises(ValueError, msg=str(patch)):
                 in_sandbox.validate_args(argparse.Namespace(**{**vars(good), **patch}))
+
+
+class HostArgvTest(unittest.TestCase):
+    def test_py_host_runs_via_current_interpreter(self) -> None:
+        self.assertEqual(in_sandbox.host_argv("/x/fake_host.py"), [sys.executable, "/x/fake_host.py"])
+        self.assertEqual(in_sandbox.host_argv("/x/servo-host"), ["/x/servo-host"])
 
 
 class DestinationMonitorTest(unittest.TestCase):
@@ -162,7 +168,7 @@ class DnsAttemptTest(unittest.TestCase):
 class MeasureTest(unittest.TestCase):
     def build(self, mode: str) -> list[str]:
         return measure.build_argv(mode, host=Path("/h"), ports={"img": 2001}, out_dir=Path("/o"),
-                                  hosts_file=Path("/hosts"), image="img:tag")
+                                  hosts_file=Path("/hosts"), image="img:tag", platform_name="linux")
 
     def test_baseline_differs_from_netns_only_by_unshare_net_and_output_name(self) -> None:
         base, iso = self.build("baseline"), self.build("bwrap-netns")
@@ -177,7 +183,7 @@ class MeasureTest(unittest.TestCase):
 
     def test_docker_container_is_named_and_removed_on_timeout_and_error(self) -> None:
         argv = measure.build_argv("docker-none", host=Path("/h"), ports={"img": 2001}, out_dir=Path("/o"),
-                                  hosts_file=Path("/hosts"), image="img:tag", name="egress-iso-1")
+                                  hosts_file=Path("/hosts"), image="img:tag", name="egress-iso-1", platform_name="linux")
         self.assertEqual(argv[argv.index("--name") + 1], "egress-iso-1")
         with mock.patch.object(measure, "remove_container") as rm, \
                 mock.patch.object(measure, "_run_argv", return_value=(None, "timed out")):
@@ -196,9 +202,9 @@ class MeasureTest(unittest.TestCase):
     def test_bwrap_binds_fixed_resolv_conf_after_run_tmpfs_in_both_modes(self) -> None:
         with mock.patch.object(measure.os.path, "realpath", return_value="/run/systemd/resolve/stub-resolv.conf"):
             base = measure.build_argv("baseline", host=Path("/h"), ports={"img": 2001}, out_dir=Path("/o"),
-                                      hosts_file=Path("/hosts"), image=None, resolv_file=Path("/rc"))
+                                      hosts_file=Path("/hosts"), image=None, resolv_file=Path("/rc"), platform_name="linux")
             iso = measure.build_argv("bwrap-netns", host=Path("/h"), ports={"img": 2001}, out_dir=Path("/o"),
-                                     hosts_file=Path("/hosts"), image=None, resolv_file=Path("/rc"))
+                                     hosts_file=Path("/hosts"), image=None, resolv_file=Path("/rc"), platform_name="linux")
         for argv in (base, iso):
             i = argv.index("/rc")
             self.assertEqual(argv[i - 1], "--ro-bind")
@@ -217,6 +223,16 @@ class MeasureTest(unittest.TestCase):
             measure.validate_host("/nonexistent/host")
 
     def test_outer_listeners_are_loopback_only(self) -> None:
+        # macOS の lo0 は既定で 127.0.0.1 のみ。alias 不在（EADDRNOTAVAIL）の macOS に限って skip する
+        # （実測側は ensure_loopback_aliases が案内つきで止める）。Linux・Windows や想定外の bind エラーは失敗のまま。
+        try:
+            measure.ensure_loopback_aliases()
+        except ValueError as exc:
+            cause = exc.__cause__
+            if (sys.platform == "darwin" and isinstance(cause, OSError)
+                    and cause.errno == errno.EADDRNOTAVAIL):
+                self.skipTest(str(exc))
+            raise
         recs, ports = measure.start_outer_listeners()
         try:
             self.assertEqual(set(ports), {"redirect", "img", "fetch", "ws", "internal", "udp_direct"})
@@ -313,7 +329,7 @@ class ProbeFailureTest(unittest.TestCase):
         self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
         host = make_fake_host(tmp, [])
         ports = {k: 20100 + i for i, k in enumerate(("redirect", "img", "fetch", "ws", "internal", "udp_direct"))}
-        args = argparse.Namespace(mode="bwrap-netns", host=str(host), ports=json.dumps(ports), out=tmp / "o.json")
+        args = argparse.Namespace(mode="bwrap-netns", host=str(host), ports=json.dumps(ports), out=tmp / "o.json", page_port=0)
         self.assertIn("bwrap-netns", judge.ISOLATED_MODES)
         with mock.patch.object(in_sandbox, "SETTLE_S", 0.01), \
                 mock.patch.object(in_sandbox.judge, "check_isolation", return_value=(True, "")), \

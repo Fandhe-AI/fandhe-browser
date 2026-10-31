@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Linux の egress 隔離手段の可否を問い合わせる読み取り専用プローブ。
+"""egress 隔離手段の可否（Linux・macOS・Windows）を問い合わせる読み取り専用プローブ。
 
 役割・責務境界:
     Issue #1377（TASK-38・`RENDER-3`・`SEC-2`・`XOS-1`）。設計 `docs/design/servo-host-egress-isolation.md`
@@ -200,15 +200,66 @@ def collect(image: str | None = None) -> dict[str, Any]:
     return result
 
 
+def can_bind(ip: str) -> str:
+    """ip に TCP で bind できるか（できれば "ok"、できなければ errno 名）。bind するだけで接続しない。"""
+    import socket
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        sock.bind((ip, 0))
+        return "ok"
+    except OSError as exc:
+        return errno.errorcode.get(exc.errno or 0, "oserror")
+    finally:
+        sock.close()
+
+
+def collect_macos(run: Runner = default_runner, run_out: OutRunner = default_out_runner) -> dict[str, Any]:
+    """macOS の項目（#1387）。sandbox-exec の可否・OS 版・127.0.0.2/.3 を bind できるか。読み取りのみ。"""
+    _, ver, _ = run_out(["/usr/bin/sw_vers", "-productVersion"])
+    return {
+        "platform": "darwin",
+        "machine": platform.machine(),
+        "sw_vers": ver.strip()[:40],
+        "sandbox_exec_allow_default": classify(*run(
+            ["/usr/bin/sandbox-exec", "-p", "(version 1)(allow default)", "/usr/bin/true"])),
+        "bind_127.0.0.2": can_bind("127.0.0.2"),
+        "bind_127.0.0.3": can_bind("127.0.0.3"),
+    }
+
+
+def collect_windows(run: Runner = default_runner, run_out: OutRunner = default_out_runner) -> dict[str, Any]:
+    """Windows の項目（#1387）。昇格状態・CheckNetIsolation の有無と一覧表示の終了コード・OS ビルド。読み取りのみ。
+
+    loopback 例外の設定・ファイアウォール規則の変更は行わない。runner は管理者で動くため、
+    「非管理者で loopback 例外を作れるか」には答えられない（設計 §6.2）。
+    """
+    rc, out, err = run_out(["whoami", "/groups"])
+    elevated = None if rc != 0 else ("S-1-16-12288" in out)
+    return {
+        "platform": "win32",
+        "machine": platform.machine(),
+        "build": platform.version()[:40],
+        "high_integrity_level": elevated,
+        "CheckNetIsolation LoopbackExempt -s": classify(*run(["CheckNetIsolation.exe", "LoopbackExempt", "-s"])),
+        "whoami_error": err if rc != 0 else "",
+    }
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Read-only probe of Linux egress isolation primitives.")
     parser.add_argument("--docker-image", help="Optional image for the --network none probe.")
     args = parser.parse_args(argv)
-    if not sys.platform.startswith("linux"):
-        print("error: Linux only", file=sys.stderr)
-        return 2
     try:
-        result = collect(args.docker_image)
+        if sys.platform == "darwin":
+            result = collect_macos()
+        elif sys.platform == "win32":
+            result = collect_windows()
+        elif sys.platform.startswith("linux"):
+            result = collect(args.docker_image)
+        else:
+            print(f"error: unsupported platform: {sys.platform}", file=sys.stderr)
+            return 2
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2

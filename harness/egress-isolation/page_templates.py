@@ -67,10 +67,25 @@ def _subst(template: str, ports: dict[str, Any]) -> str:
     return string.Template(template).substitute(mapping)
 
 
-def build_pages(ports: dict[str, Any]) -> dict[str, str]:
-    """パス -> HTML。`ports` に不足があれば KeyError、int 以外は ValueError。"""
-    return {path: _subst(body, ports) for path, body in _PAGES.items()}
+def _literal(text: str) -> str:
+    """ホスト名を 127.0.0.0/8 の IP リテラルへ置き換える（macOS・Windows 用。#1387）。
+
+    システムの hosts を変えられない（root / admin が要る）OS では名前解決に頼れないため、
+    宛先名は `judge.py` の定数どおり固定のダミー IP に対応づける。
+    """
+    for name, ip in ((judge.HOST_BLOCKED, judge.IP_BLOCKED),
+                     (judge.HOST_INTERNAL_STANDIN, judge.IP_INTERNAL_STANDIN)):
+        text = text.replace(name, ip)
+    return text
 
 
-def redirect_location(ports: dict[str, Any]) -> str:
-    return _subst(_REDIRECT_LOCATION, ports)
+def build_pages(ports: dict[str, Any], *, literal: bool = False) -> dict[str, str]:
+    """パス -> HTML。`ports` に不足があれば KeyError、int 以外は ValueError。
+
+    `literal=True` はダミー宛先を IP リテラルにする（DNS 経路の `/dns` は NXDOMAIN 名のまま）。
+    """
+    return {path: _subst(_literal(body) if literal else body, ports) for path, body in _PAGES.items()}
+
+
+def redirect_location(ports: dict[str, Any], *, literal: bool = False) -> str:
+    return _subst(_literal(_REDIRECT_LOCATION) if literal else _REDIRECT_LOCATION, ports)

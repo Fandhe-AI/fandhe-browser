@@ -179,7 +179,7 @@ check-cli-conformance: ## CLI コンフォーマンステスト実行スクリ�
 measure-cli-conformance: ## 実バイナリで CLI コンフォーマンステストを実行する（TASK-49・CLI-1。example.com へ出る。CLI_CONFORMANCE_ARGS で --render-host 等を指定。3 OS の実測は手動 workflow xos-measure.yml）
 	@scripts/harness.sh measure-cli-conformance
 
-check-egress-isolation: ## Servo ホストの egress 隔離実測ハーネスの自己テスト（TASK-38・RENDER-3・#1377。Linux のみ。要 python3。実ホスト・bwrap・docker 不要）
+check-egress-isolation: ## Servo ホストの egress 隔離実測ハーネスの自己テスト（TASK-38・RENDER-3・#1377・#1387。要 python3。実ホスト・bwrap・docker 不要）
 	@scripts/harness.sh check-egress-isolation
 
 check-container-memory: ## コンテナ同時起動の集約メモリ測定スクリプトの自己テスト（TASK-67・CTR-3・CTR-7。Linux のみ。要 jq。docker 不要）
