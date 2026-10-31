@@ -92,11 +92,23 @@ def _iface_names(net_dev_text: str) -> list[str]:
     return names
 
 
-def check_isolation(net_dev: str, route: str, ipv6_route: str) -> tuple[bool, str]:
+def check_isolation(net_dev: str | None, route: str | None, ipv6_route: str | None) -> tuple[bool, str]:
     """`/proc/net/{dev,route,ipv6_route}` の本文から、lo 以外の経路が無いことを確かめる。
 
-    実在の内部アドレスを含むページを読み込む前の安全側の前提検査。満たさなければ (False, 理由)。
+    実在の内部アドレスを含むページを読み込む前の安全側の前提検査（fail-closed）。
+    読めない（None）・形式が不正・lo が無い場合は隔離を確認できないため (False, 理由)。
+    例外は `ipv6_route` の不在（None）のみで、IPv6 無効のカーネルとして許容する。
     """
+    if net_dev is None or route is None:
+        return False, "/proc/net/dev or /proc/net/route unreadable"
+    dev_lines = net_dev.splitlines()
+    if len(dev_lines) < 3 or "|" not in dev_lines[1]:
+        return False, "/proc/net/dev has an unexpected format"
+    if "lo" not in _iface_names(net_dev):
+        return False, "loopback interface not found in /proc/net/dev"
+    route_lines = route.splitlines()
+    if not route_lines or not route_lines[0].startswith("Iface"):
+        return False, "/proc/net/route has an unexpected format"
     extra = [n for n in _iface_names(net_dev) if n != "lo"]
     if extra:
         return False, f"non-loopback interfaces present: {','.join(extra)[:80]}"
@@ -104,7 +116,7 @@ def check_isolation(net_dev: str, route: str, ipv6_route: str) -> tuple[bool, st
         fields = line.split()
         if fields and fields[0] != "lo":
             return False, "IPv4 route table has a non-loopback route"
-    for line in ipv6_route.splitlines():
+    for line in (ipv6_route or "").splitlines():
         fields = line.split()
         if len(fields) >= 10 and fields[-1] != "lo":
             return False, "IPv6 route table has a non-loopback route"

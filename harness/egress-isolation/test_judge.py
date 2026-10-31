@@ -100,6 +100,21 @@ class IsolationPrecheckTest(unittest.TestCase):
     def test_loopback_only_is_ok(self) -> None:
         self.assertTrue(judge.check_isolation(DEV_LO, ROUTE_EMPTY, V6_LO)[0])
 
+    def test_unreadable_proc_aborts(self) -> None:
+        self.assertFalse(judge.check_isolation(None, ROUTE_EMPTY, V6_LO)[0])
+        self.assertFalse(judge.check_isolation(DEV_LO, None, V6_LO)[0])
+
+    def test_empty_or_malformed_proc_aborts(self) -> None:
+        self.assertFalse(judge.check_isolation("", "", "")[0])
+        self.assertFalse(judge.check_isolation(DEV_LO, "garbage\n", V6_LO)[0])
+
+    def test_missing_loopback_aborts(self) -> None:
+        dev = "Inter-|   Receive\n face |bytes\n  eth0: 1 2\n"
+        self.assertFalse(judge.check_isolation(dev, ROUTE_EMPTY, V6_LO)[0])
+
+    def test_ipv6_absent_is_tolerated(self) -> None:
+        self.assertTrue(judge.check_isolation(DEV_LO, ROUTE_EMPTY, None)[0])
+
     def test_extra_interface_aborts(self) -> None:
         dev = DEV_LO + "  eth0: 1 2\n"
         ok, why = judge.check_isolation(dev, ROUTE_EMPTY, V6_LO)

@@ -120,7 +120,8 @@ def run_mode(mode: str, *, host: Path, ports: dict[str, int], recs: dict[str, An
     outer = {k: r.count - before[k] for k, r in recs.items()}
     result_path = out_dir / f"{mode}.json"
     inner: dict[str, Any] = {}
-    if result_path.is_file():
+    # ランナーが正常終了（rc == 0）した場合の今回の結果だけを使う。失敗時は空 = 判定不能（合格にしない）。
+    if rc == 0 and result_path.is_file():
         try:
             inner = json.loads(result_path.read_text(encoding="utf-8"))
         except ValueError:
@@ -178,6 +179,8 @@ def main(argv: list[str] | None = None) -> int:
             raise ValueError("docker-none needs --docker-image")
         if not args.out.is_dir():
             raise ValueError("--out must be an existing directory")
+        if any(args.out.iterdir()):
+            raise ValueError("--out must be an empty directory (stale results must not be reused)")
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2

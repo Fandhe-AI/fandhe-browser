@@ -94,11 +94,12 @@ class _PageHandler(http.server.BaseHTTPRequestHandler):
         return  # URL（クエリ）をログへ出さない
 
 
-def read_proc(name: str) -> str:
+def read_proc(name: str) -> str | None:
+    """`/proc/net/<name>` を読む。読めなければ None（空文字列と区別し、前提検査を fail-closed にする）。"""
     try:
         return Path("/proc/net", name).read_text(encoding="ascii", errors="replace")[:65536]
     except OSError:
-        return ""
+        return None
 
 
 def probe_connect(family: int, addr: tuple[Any, ...]) -> str:
