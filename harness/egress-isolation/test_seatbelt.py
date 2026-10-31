@@ -48,6 +48,14 @@ class DenyLogTest(unittest.TestCase):
         ])
         self.assertEqual(seatbelt.parse_denies(text), Counter({"127.0.0.2:2001": 2, "127.0.0.3:2005": 1}))
 
+    def test_denies_are_attributed_to_target_pids(self) -> None:
+        text = "\n".join([
+            '{"eventMessage":"Sandbox: host(101) deny(1) network-outbound 127.0.0.2:2001"}',
+            '{"eventMessage":"Sandbox: other(999) deny(1) network-outbound 127.0.0.2:2001"}',
+            '{"eventMessage":"Sandbox: deny(1) network-outbound 127.0.0.3:2005"}',
+        ])
+        self.assertEqual(seatbelt.parse_denies(text, frozenset({101})), Counter({"127.0.0.2:2001": 1}))
+
     def test_long_lines_and_bad_ports_are_ignored(self) -> None:
         long_line = "deny(1) network-outbound 127.0.0.2:2001 " + "x" * (seatbelt.MAX_LINE_LEN + 1)
         self.assertEqual(seatbelt.parse_denies(long_line), Counter())

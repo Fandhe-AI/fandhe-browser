@@ -34,11 +34,6 @@ def make_fake_host(tmp: Path, connect: list[list[object]]) -> Path:
     path.write_text(f"#!{sys.executable}\n{script}", encoding="utf-8")
     path.chmod(0o755)
     (tmp / "fake_host.config.json").write_text(json.dumps({"connect": connect}), encoding="utf-8")
-    if sys.platform == "win32":
-        # Windows の CreateProcess は shebang を解釈しないため、sys.executable 経由で起動する .cmd ラッパーを返す。
-        wrapper = tmp / "fake_host.cmd"
-        wrapper.write_text(f'@"{sys.executable}" "%~dp0fake_host.py" %*\r\n', encoding="utf-8")
-        return wrapper
     return path
 
 
@@ -108,6 +103,12 @@ class InnerRunnerTest(unittest.TestCase):
                       {"ports": json.dumps({**self.ports(), "ws": 22})}):
             with self.assertRaises(ValueError, msg=str(patch)):
                 in_sandbox.validate_args(argparse.Namespace(**{**vars(good), **patch}))
+
+
+class HostArgvTest(unittest.TestCase):
+    def test_py_host_runs_via_current_interpreter(self) -> None:
+        self.assertEqual(in_sandbox.host_argv("/x/fake_host.py"), [sys.executable, "/x/fake_host.py"])
+        self.assertEqual(in_sandbox.host_argv("/x/servo-host"), ["/x/servo-host"])
 
 
 class DestinationMonitorTest(unittest.TestCase):

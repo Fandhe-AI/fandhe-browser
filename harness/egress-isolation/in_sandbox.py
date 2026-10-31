@@ -103,6 +103,33 @@ def read_proc(name: str) -> str | None:
         return None
 
 
+def host_argv(host: str) -> list[str]:
+    """ホストの起動 argv。`.py` は Windows の CreateProcess が shebang を解釈しないため同じ interpreter 経由で起動する。
+
+    実ホストは実行可能バイナリ（`.py` ではない）。`.py` は自己テストの偽ホスト用。
+    """
+    return [sys.executable, host] if host.endswith(".py") else [host]
+
+
+def descendant_pids(root: int) -> set[int]:
+    """`root` とその子孫の pid（`ps` の 1 回のスナップショット）。取得できなければ `root` のみ。"""
+    pids = {root}
+    try:
+        out = subprocess.run(["ps", "-axo", "pid=,ppid="], stdin=subprocess.DEVNULL,  # noqa: S603,S607
+                             capture_output=True, text=True, timeout=5, check=False).stdout
+        pairs = [tuple(int(x) for x in line.split()[:2]) for line in out.splitlines() if len(line.split()) >= 2]
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return pids
+    grew = True
+    while grew:
+        grew = False
+        for pid, ppid in pairs:
+            if ppid in pids and pid not in pids:
+                pids.add(pid)
+                grew = True
+    return pids
+
+
 def errno_name(exc: OSError) -> str:
     return errno.errorcode.get(exc.errno or 0, "oserror")
 
@@ -354,13 +381,13 @@ def run(args: argparse.Namespace, ports: dict[str, int]) -> dict[str, Any]:
         result["proxy_env_present"] = bool(env_notes)  # 値は記録しない（有無のみ）
 
         st = subprocess.run(  # noqa: S603  (argv 固定・シェル不使用)
-            [args.host, "--selftest"], env=env, stdin=subprocess.DEVNULL,
+            [*host_argv(args.host), "--selftest"], env=env, stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=90, check=False,
         )
         result["selftest_rc"] = st.returncode
 
         proc = subprocess.Popen(  # noqa: S603
-            [args.host, "--stdio"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            [*host_argv(args.host), "--stdio"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL, env=env,
         )
         # ハーネスが意図的に接続させるダミー宛先（127.0.0.2 / 127.0.0.3）は想定内の試行として除外し、監視を続ける。
@@ -378,11 +405,14 @@ def run(args: argparse.Namespace, ports: dict[str, int]) -> dict[str, Any]:
         loopback = load_route(chan, next_id, info, f"{base}/ok")
         result["loopback_load"] = loopback
         loads: dict[str, Any] = {}
+        host_pids = {os.getpid()} | descendant_pids(proc.pid)
         guard_polls: dict[str, int] = {}
         for r in (x for x in PAGE_ROUTES if x in result["routes"] and (netns or x in TCP_ROUTES)):
             polls_before = guard.snapshot_polls() if guard is not None else 0
             loads[r] = load_route(chan, next_id, info, base + fixtures.ROUTE_PATH[r])
             time.sleep(SETTLE_S)
+            host_pids |= descendant_pids(proc.pid)  # 子プロセスを後から起こす場合も拾う（拒否ログの帰属用）
+            result["host_pids"] = sorted(host_pids)
             guard_polls[r] = (guard.snapshot_polls() - polls_before) if guard is not None else 0  # 経路ごとに完了した走査の回数
         result["loads"] = loads
         result["guard_polls"] = guard_polls

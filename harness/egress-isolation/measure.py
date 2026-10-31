@@ -237,8 +237,11 @@ def _run_argv(argv: list[str]) -> tuple[int | None, str]:
         return None, "timed out"
 
 
-def collect_denies(start: str) -> tuple[dict[str, int], dict[str, Any]]:
+def collect_denies(start: str, pids: frozenset[int] | None = None) -> tuple[dict[str, int], dict[str, Any]]:
     """macOS のサンドボックス拒否ログを逐次読んで集計する。(宛先 -> 件数, 取得状況)。読めなければ空と理由。
+
+    `pids` は対象ホストとその子孫の pid。拒否ログの `proc(<pid>)` が含まれる行だけを数える（無関係な
+    プロセスの同宛先の拒否を試行の根拠にしない）。
 
     出力を全量メモリに載せず、1 行ずつ上限つきで読む。行数・総バイト数が上限に達したら
     プロセスを止めて unobservable（available=False）にする（リソース枯渇の防止）。
@@ -271,7 +274,7 @@ def collect_denies(start: str) -> tuple[dict[str, int], dict[str, Any]]:
                 lines += 1
             else:
                 lines += 1
-                dest = seatbelt.parse_deny_line(raw.decode("utf-8", errors="replace"))
+                dest = seatbelt.parse_deny_line(raw.decode("utf-8", errors="replace"), pids)
                 if dest and sum(counts.values()) < seatbelt.MAX_LOG_LINES:
                     counts[dest] += 1
             if lines > seatbelt.MAX_SCAN_LINES or total > seatbelt.MAX_SCAN_BYTES:
@@ -279,8 +282,15 @@ def collect_denies(start: str) -> tuple[dict[str, int], dict[str, Any]]:
                 break
     finally:
         timer.cancel()
-        if proc.poll() is None:
+        if over:
             proc.kill()
+        else:
+            # 通常の EOF では子プロセスの終了処理が済むまで期限付きで待つ（直後の poll() が None でも
+            # 正常終了した log show を kill して集計済みの拒否記録を捨てない）。超過時だけ kill する。
+            try:
+                proc.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                proc.kill()
         proc.wait()
         if proc.stdout:
             proc.stdout.close()
@@ -319,7 +329,14 @@ def run_mode(mode: str, *, host: Path, ports: dict[str, int], recs: dict[str, An
             "outer_counts": outer}
     if mode == "seatbelt" and inner:
         # 共有 loopback のため内側の写し listener が無い。TCP の試行は拒否ログ（宛先 ip:port）で観測する。
-        denies, status = collect_denies(started)
+        raw_pids = inner.get("host_pids")
+        pids = frozenset(p for p in raw_pids if isinstance(p, int) and not isinstance(p, bool)) \
+            if isinstance(raw_pids, list) else frozenset()
+        if pids:
+            denies, status = collect_denies(started, pids)
+        else:
+            # 対象 PID を特定できないときは帰属を確認できないため、拒否ログを試行の根拠にしない（unobservable）。
+            denies, status = {}, {"available": False, "reason": "host pid not recorded"}
         dest = {r: f"{judge.IP_INTERNAL_STANDIN if r == 'internal' else judge.IP_BLOCKED}:{ports[r]}"
                 for r in ("redirect", "img", "fetch", "ws", "internal")}
         attempts = dict(inner.get("attempts") or {})

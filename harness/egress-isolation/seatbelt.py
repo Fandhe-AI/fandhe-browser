@@ -33,7 +33,7 @@ MAX_LINE_LEN = 4096
 # `log show` を逐次読む際の打ち切り上限（読み取った行数・総バイト数）。超えたら収集を諦める（unobservable）。
 MAX_SCAN_LINES = 500000
 MAX_SCAN_BYTES = 64 * 1024 * 1024
-_DENY_RE = re.compile(r"deny\(\d+\) network-outbound (\d{1,3}(?:\.\d{1,3}){3}):(\d{1,5})\b")
+_DENY_RE = re.compile(r"(?:\((\d+)\)\s+)?deny\(\d+\) network-outbound (\d{1,3}(?:\.\d{1,3}){3}):(\d{1,5})\b")
 
 
 def isolated_profile(page_port: object) -> str:
@@ -50,17 +50,23 @@ def log_show_argv(start: str) -> list[str]:
     return [LOG_BIN, "show", "--style", "ndjson", "--start", start, "--predicate", LOG_PREDICATE]
 
 
-def parse_deny_line(line: str) -> str | None:
-    """1 行から拒否の宛先 "ip:port" を取り出す。該当しない・長すぎる行は None。"""
+def parse_deny_line(line: str, pids: frozenset[int] | None = None) -> str | None:
+    """1 行から拒否の宛先 "ip:port" を取り出す。該当しない・長すぎる行は None。
+
+    `pids` を渡すと、拒否ログの `proc(<pid>)` が集合に含まれる行だけを採る（対象の Servo ホストとその子孫に
+    帰属する拒否に限る。pid が読めない行も除外する）。None は帰属を問わない（自己テスト・後方互換）。
+    """
     if len(line) > MAX_LINE_LEN:
         return None
     m = _DENY_RE.search(line)
-    if m and int(m.group(2)) <= 65535:
-        return f"{m.group(1)}:{int(m.group(2))}"
+    if m and int(m.group(3)) <= 65535:
+        if pids is not None and (m.group(1) is None or int(m.group(1)) not in pids):
+            return None
+        return f"{m.group(2)}:{int(m.group(3))}"
     return None
 
 
-def parse_denies(text: str) -> Counter[str]:
+def parse_denies(text: str, pids: frozenset[int] | None = None) -> Counter[str]:
     """ndjson 本文から network-outbound の拒否を数え、`"ip:port" -> 件数` を返す。
 
     行数・1 行の長さに上限を設ける。不正な行・拒否以外の行は無視する。ip:port 以外は記録しない
@@ -70,7 +76,7 @@ def parse_denies(text: str) -> Counter[str]:
     for i, line in enumerate(text.splitlines()):
         if i >= MAX_LOG_LINES:
             break
-        dest = parse_deny_line(line)
+        dest = parse_deny_line(line, pids)
         if dest:
             counts[dest] += 1
     return counts
