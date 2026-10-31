@@ -615,6 +615,7 @@ pub fn run(engine: &str) {
     child_traversal_cases(engine);
     attributes_cases(engine);
     is_equal_node_cases(engine);
+    element_matches_cases(engine);
     element_name_cases(engine);
     document_element_cases(engine);
     class_list_cases(engine);
@@ -3800,6 +3801,59 @@ fn is_equal_node_cases(engine: &str) {
         (
             "try { Node.prototype.isEqualNode.call({}, a); 'ok' } catch (e) { 'threw' }",
             "threw",
+        ),
+    ];
+    for (body, want) in cases {
+        check(&mut p, &format!("{pre}{body}"), want);
+    }
+}
+
+/// `Element.prototype.matches`（#1363・`JS-5`・`CDP-2`）。Playwright の複合セレクタ照合
+/// （`_matchesParents` → `_matchesCSS`）が使う形を具体値で確認する。
+fn element_matches_cases(engine: &str) {
+    eprintln!("case: JS-5 Element.prototype.matches (#1363)");
+    let mut p = setup(engine, None);
+    let pre = "var h = document.createElement('div'); document.body.appendChild(h); \
+        h.innerHTML = '<span class=titleline><a href=/x>X</a></span><a href=/y>Y</a>\
+        <table id=example><tbody><tr><td>1</td></tr><tr><td>2</td></tr></tbody></table>\
+        <table class=waffle><tbody><tr><td>w</td></tr></tbody></table>'; ";
+    let cases: [(&str, &str); 10] = [
+        (
+            "document.body.matches('body') + '|' + document.body.matches('.nope')",
+            "true|false",
+        ),
+        (
+            "[].filter.call(h.querySelectorAll('a'), function (e) { return e.parentElement && e.parentElement.matches('.titleline'); }).length",
+            "1",
+        ),
+        (
+            "[].filter.call(h.querySelectorAll('tr'), function (e) { for (var q = e.parentElement; q; q = q.parentElement) { if (q.matches('#example')) return true; } return false; }).length",
+            "2",
+        ),
+        (
+            "var trs = h.querySelectorAll('tr'); trs[0].matches('#example tbody tr') + '|' + trs[2].matches('#example tbody tr') + '|' + trs[2].matches('table.waffle tr')",
+            "true|false|true",
+        ),
+        (
+            "try { document.body.matches(); 'ok' } catch (e) { 'threw' }",
+            "threw",
+        ),
+        (
+            "try { document.body.matches('a['); 'ok' } catch (e) { 'threw' }",
+            "threw",
+        ),
+        (
+            "try { Element.prototype.matches.call({}, 'a'); 'ok' } catch (e) { 'threw' }",
+            "threw",
+        ),
+        ("typeof Element.prototype.matches", "function"),
+        (
+            "String(document.createTextNode('x').matches === undefined)",
+            "true",
+        ),
+        (
+            "String(h.querySelector('a').matches('div > span > a')) + '|' + h.querySelector('a').matches('body > span > a')",
+            "true|false",
         ),
     ];
     for (body, want) in cases {

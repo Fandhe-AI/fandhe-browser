@@ -733,6 +733,22 @@ pub fn query_selector_str(
     })
 }
 
+/// `selector` 文字列を解析して [`element_matches`] を呼ぶ薄いラッパー。
+///
+/// `dom_bridge` の op `matches`（dom.js の `Element.prototype.matches` の土台。
+/// `JS-5`・#1363）から呼ばれる。不正なセレクタは `false` にせずエラーを返す
+/// （成功を装わない。`REPAIR-3`）。
+///
+/// # エラー
+///
+/// [`parse_selector_list`] のエラーと [`Error::MatchCacheLimitExceeded`] をそのまま返す。
+pub fn element_matches_str(document: &Document, element: NodeId, selector: &str) -> Result<bool> {
+    instrumented(document, || {
+        let selectors = parse_selector_list(selector)?;
+        element_matches_inner(document, element, &selectors)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
