@@ -610,10 +610,38 @@ async fn gating(engine: &str) {
         .expect("frame");
     assert_eq!(ro(&f), &json!({"type":"number","value":1}));
 
-    // 未対応・未知のパラメータは成功を装わず拒否する。
+    // userGesture は効果なしで受理され、結果は有無で変わらない（#1357）。
     let iso = c.isolated(&p, "u").await;
+    for ug in [false, true] {
+        for params in [
+            json!({"expression":"1+1","contextId":iso,"userGesture":ug}),
+            json!({"expression":"1+1","userGesture":ug}),
+            json!({"expression":"1+1","contextId":iso,"returnByValue":false,"awaitPromise":true,"userGesture":ug}),
+        ] {
+            let f = c
+                .call(&p, "Runtime.evaluate", params.clone())
+                .await
+                .pop()
+                .expect("frame");
+            assert_eq!(ro(&f), &json!({"type":"number","value":2}), "{params}: {f}");
+        }
+    }
+    let f = c
+        .call(
+            &p,
+            "Runtime.evaluate",
+            json!({"expression":"1","contextId":iso,"userGesture":"yes"}),
+        )
+        .await
+        .pop()
+        .expect("frame");
+    assert!(is_err(&f, -32602, "invalid params"), "{f}");
+
+    // 未対応・未知のパラメータは成功を装わず拒否する。
     let spawns = c.worker_spawns();
     for params in [
+        json!({"expression":"1","contextId":iso,"timeout":1000}),
+        json!({"expression":"1","contextId":iso,"uniqueContextId":"x"}),
         json!({"expression":"1","contextId":iso,"objectGroup":"g"}),
         json!({"expression":"1","contextId":iso,"generatePreview":true}),
         json!({"expression":"1","contextId":iso,"includeCommandLineAPI":true}),

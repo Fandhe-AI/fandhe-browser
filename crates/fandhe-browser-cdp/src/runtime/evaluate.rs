@@ -29,7 +29,7 @@
 //! # 検証順
 //!
 //! `Runtime.evaluate`: `sessionId` なし → `UNSUPPORTED_PARAMS` → `params` が非オブジェクト → `INVALID_PARAMS`
-//! → 未知キー（既知は `expression`・`contextId`・`returnByValue`・`awaitPromise`・`silent`）→
+//! → 未知キー（既知は `expression`・`contextId`・`returnByValue`・`awaitPromise`・`silent`・`userGesture`）→
 //! `UNSUPPORTED_PARAMS` → 型の誤り → `INVALID_PARAMS` →
 //! 式が 1 MiB 超 → `EXPRESSION_TOO_LARGE`（評価器を起動しない）→ 未知セッション → `INVALID_PARAMS` →
 //! 止めたターゲット → `TARGET_WAITING_FOR_DEBUGGER` → 評価器が無効 → `EXECUTION_CONTEXTS_UNAVAILABLE` →
@@ -72,7 +72,8 @@
 //!   `PROMISE_NOT_SETTLED`（`-32000`。偽の値を返さない）。待機スロットは決着・未決着のどちらでも削除する。
 //!   native Promise の反応ジョブ自体を流せるかはエンジンに依存する（`call_function_on` モジュールの差異節）。
 //!   所要時間は評価が最大 3 回（本体・checkpoint・決着）になるため `timeout` の最大 3 倍になり得る。
-//!   `silent` は受け入れるが効果は無い。
+//!   `userGesture`・`silent` は受け入れるが効果は無い（ユーザー活性化・ポップアップ許可・フォーカスの概念を持たず、
+//!   値は評価に渡さない。型〔bool〕だけ検査する。`callFunctionOn` と同じ。#1357・`REPAIR-3`）。
 //!   `getProperties`・`releaseObjectGroup` は未登録（`-32601`）。`objectGroup`・
 //!   `generatePreview`・`includeCommandLineAPI` 等の未知キーも `UNSUPPORTED_PARAMS`（成功を装わない。`CDP-6`）。
 //! - `exceptionDetails` の `lineNumber`・`columnNumber` は 0 固定で
@@ -827,7 +828,12 @@ impl CommandHandler for RuntimeEvaluate {
             if obj.keys().any(|k| {
                 !matches!(
                     k.as_str(),
-                    "expression" | "contextId" | "returnByValue" | "awaitPromise" | "silent"
+                    "expression"
+                        | "contextId"
+                        | "returnByValue"
+                        | "awaitPromise"
+                        | "silent"
+                        | "userGesture"
                 )
             }) {
                 return Err(CdpError::UNSUPPORTED_PARAMS);
@@ -846,8 +852,10 @@ impl CommandHandler for RuntimeEvaluate {
             };
             let return_by_value = bool_param(obj, "returnByValue")?;
             let await_promise = bool_param(obj, "awaitPromise")?;
-            // `silent` は受け入れるが効果は無い（`REPAIR-3`）。型だけ検査する。
+            // `userGesture`・`silent` は受け入れるが効果は無い（ユーザー活性化の概念を持たない。
+            // `REPAIR-3`・#1357）。型だけ検査し、値は評価へ渡さない。
             bool_param(obj, "silent")?;
+            bool_param(obj, "userGesture")?;
             if expression.len() > self.limits.max_expression_bytes {
                 return Err(CdpError::EXPRESSION_TOO_LARGE);
             }
@@ -1535,6 +1543,9 @@ mod dispatch_tests {
             r#"{"expression":"1","returnByValue":"yes"}"#,
             r#"{"expression":"1","awaitPromise":1}"#,
             r#"{"expression":"1","silent":null}"#,
+            r#"{"expression":"1","userGesture":"true"}"#,
+            r#"{"expression":"1","userGesture":1}"#,
+            r#"{"expression":"1","userGesture":null}"#,
         ] {
             let v = call(&st, Some(&sid), m, p).await;
             assert_eq!(error(&v), invalid, "{p}");
@@ -1544,6 +1555,30 @@ mod dispatch_tests {
         let p = format!(r#"{{"expression":"{big}","contextId":1,"awaitPromise":true}}"#);
         let v = call(&st, Some(&sid), m, &p).await;
         assert_eq!(error(&v), (-32000, "expression too large"));
+        // userGesture は bool なら受理され（#1357）、サイズ検査・評価器の無効判定まで進む。
+        for ug in ["true", "false"] {
+            let p = format!(r#"{{"expression":"{big}","contextId":1,"userGesture":{ug}}}"#);
+            let v = call(&st, Some(&sid), m, &p).await;
+            assert_eq!(error(&v), (-32000, "expression too large"), "{ug}");
+            let p = format!(r#"{{"expression":"1","contextId":1,"userGesture":{ug}}}"#);
+            let v = call(&st, Some(&sid), m, &p).await;
+            assert_eq!(
+                error(&v),
+                (-32000, "execution contexts unavailable"),
+                "{ug}"
+            );
+        }
+        // 未知キーは型の誤りより先、他の未知キーは従来どおり拒否。
+        for p in [
+            r#"{"expression":"1","userGesture":1,"generatePreview":true}"#,
+            r#"{"expression":"1","includeCommandLineAPI":true}"#,
+            r#"{"expression":"1","timeout":1000}"#,
+            r#"{"expression":"1","uniqueContextId":"x"}"#,
+            r#"{"expression":"1","objectGroup":"g"}"#,
+        ] {
+            let v = call(&st, Some(&sid), m, p).await;
+            assert_eq!(error(&v), unsupported, "{p}");
+        }
         // 未知のセッション。
         let ghost = SessionId::parse("NOPE").unwrap();
         let v = call(&st, Some(&ghost), m, r#"{"expression":"1","contextId":1}"#).await;
