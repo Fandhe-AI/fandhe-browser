@@ -162,7 +162,7 @@ class DnsAttemptTest(unittest.TestCase):
 class MeasureTest(unittest.TestCase):
     def build(self, mode: str) -> list[str]:
         return measure.build_argv(mode, host=Path("/h"), ports={"img": 2001}, out_dir=Path("/o"),
-                                  hosts_file=Path("/hosts"), image="img:tag")
+                                  hosts_file=Path("/hosts"), image="img:tag", platform_name="linux")
 
     def test_baseline_differs_from_netns_only_by_unshare_net_and_output_name(self) -> None:
         base, iso = self.build("baseline"), self.build("bwrap-netns")
@@ -177,7 +177,7 @@ class MeasureTest(unittest.TestCase):
 
     def test_docker_container_is_named_and_removed_on_timeout_and_error(self) -> None:
         argv = measure.build_argv("docker-none", host=Path("/h"), ports={"img": 2001}, out_dir=Path("/o"),
-                                  hosts_file=Path("/hosts"), image="img:tag", name="egress-iso-1")
+                                  hosts_file=Path("/hosts"), image="img:tag", name="egress-iso-1", platform_name="linux")
         self.assertEqual(argv[argv.index("--name") + 1], "egress-iso-1")
         with mock.patch.object(measure, "remove_container") as rm, \
                 mock.patch.object(measure, "_run_argv", return_value=(None, "timed out")):
@@ -196,9 +196,9 @@ class MeasureTest(unittest.TestCase):
     def test_bwrap_binds_fixed_resolv_conf_after_run_tmpfs_in_both_modes(self) -> None:
         with mock.patch.object(measure.os.path, "realpath", return_value="/run/systemd/resolve/stub-resolv.conf"):
             base = measure.build_argv("baseline", host=Path("/h"), ports={"img": 2001}, out_dir=Path("/o"),
-                                      hosts_file=Path("/hosts"), image=None, resolv_file=Path("/rc"))
+                                      hosts_file=Path("/hosts"), image=None, resolv_file=Path("/rc"), platform_name="linux")
             iso = measure.build_argv("bwrap-netns", host=Path("/h"), ports={"img": 2001}, out_dir=Path("/o"),
-                                     hosts_file=Path("/hosts"), image=None, resolv_file=Path("/rc"))
+                                     hosts_file=Path("/hosts"), image=None, resolv_file=Path("/rc"), platform_name="linux")
         for argv in (base, iso):
             i = argv.index("/rc")
             self.assertEqual(argv[i - 1], "--ro-bind")
