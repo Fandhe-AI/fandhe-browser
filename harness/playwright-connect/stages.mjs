@@ -77,7 +77,14 @@ export async function runStages({
       page = await context.newPage();
     },
     async () => {
-      await page.goto(fixtureUrl, { waitUntil: "domcontentloaded", timeout: stageTimeoutMs });
+      const resp = await page.goto(fixtureUrl, { waitUntil: "domcontentloaded", timeout: stageTimeoutMs });
+      // 文書取得時のステータスが Response に届くこと（#1364・CDP-4）。null は Network イベント未通知。
+      if (resp === null || resp === undefined) {
+        throw stageError("StatusMismatch", "goto returned no Response (document status not reported)");
+      }
+      if (resp.status() !== (expect.status ?? 200)) {
+        throw stageError("StatusMismatch", `expected status ${expect.status ?? 200} got ${resp.status()}`);
+      }
       await page.waitForLoadState("load", { timeout: stageTimeoutMs });
     },
     async () => {

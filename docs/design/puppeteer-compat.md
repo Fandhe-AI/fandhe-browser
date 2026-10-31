@@ -253,3 +253,7 @@ root で自動 attach が有効な間に別種別（ページ ↔ tab）で指�
   4. 3 回繰り返す。`NODE_PATH=<導入先>/node_modules FANDHE_CDP_WS_ENDPOINT=<ws URL> NODE_DEBUG='puppeteer:*' node harness/puppeteer-connect/connect.mjs`（stdout の `FANDHE_SCRIPT_RESULT` 行が段階別 status、stderr がトレース。`puppeteer-core` 25.12.0 のトレースは `DEBUG` ではなく `NODE_DEBUG` で有効になる）
   5. サーバーを停止し、作った一時ディレクトリをすべて削除する。生のトレースはコミットしない
   測定条件は `defaultViewport: null` のみで、UA・ヘッダ・`Emulation.*` は変えない（`SEC-2`）。サーバー側の stderr には `WebMCP.enable` と `Runtime.addBinding` の「unimplemented method」だけが出た
+
+## 文書の Network イベント（#1364）
+
+`Network.enable` 済みの page session に、`Page.navigate` が取得した文書の `Network.requestWillBeSent`・`responseReceived`（`hasExtraInfo:false`）・`loadingFinished` を送る。ソース読解（B。puppeteer-core 25.12.0 の `NetworkManager`・`HTTPRequest`・`HTTPResponse`）: ナビゲーション要求は `requestId === loaderId && type === "Document"`、`response.url()` は request の URL（確定 URL）、`hasExtraInfo` が真だと応答が保留されるため偽にする、`timing`・`securityDetails` の欠落は許容。実 Puppeteer での `page.goto()` の `status()` の実測は未検証（試験ターゲットは未導入。Playwright 側は A で確認）。差異は `docs/design/playwright-compat.md` と同じ。
