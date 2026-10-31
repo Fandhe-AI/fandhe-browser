@@ -167,7 +167,9 @@ def build_argv(mode: str, *, host: Path, ports: dict[str, int], out_dir: Path, h
     if mode == "docker-none":
         if image is None:
             raise ValueError("docker-none needs --docker-image")
-        argv = ["docker", "run", "--rm", "--network", "none", "--user", f"{os.getuid()}:{os.getgid()}",
+        argv = ["docker", "run", "--rm", "--network", "none",
+                # Windows には getuid が無い（Linux コンテナの出力先はコンテナ既定のユーザーで書く）。
+                *(["--user", f"{os.getuid()}:{os.getgid()}"] if hasattr(os, "getuid") else []),
                 "--tmpfs", "/tmp", *(["--name", name] if name else [])]
         for name, ip in (("pages.test", judge.IP_ALLOWED), (judge.HOST_BLOCKED, judge.IP_BLOCKED),
                          (judge.HOST_INTERNAL_STANDIN, judge.IP_INTERNAL_STANDIN)):

@@ -206,7 +206,7 @@ class MeasureTest(unittest.TestCase):
             iso = measure.build_argv("bwrap-netns", host=Path("/h"), ports={"img": 2001}, out_dir=Path("/o"),
                                      hosts_file=Path("/hosts"), image=None, resolv_file=Path("/rc"), platform_name="linux")
         for argv in (base, iso):
-            i = argv.index("/rc")
+            i = argv.index(str(Path("/rc")))  # Windows ではパス区切りが変わる
             self.assertEqual(argv[i - 1], "--ro-bind")
             self.assertEqual(argv[i + 1], "/run/systemd/resolve/stub-resolv.conf")
             self.assertLess(argv.index("--tmpfs"), i)
@@ -314,10 +314,12 @@ class ProbeFailureTest(unittest.TestCase):
 
     def test_probe_connect_socket_creation_failure_is_unobservable(self) -> None:
         err = OSError(errno.EAFNOSUPPORT, "no ipv6")
+        # 名前は OS ごとに異なる（Windows は WSAEAFNOSUPPORT）ため、実装と同じ表から引く。
+        name = errno.errorcode[errno.EAFNOSUPPORT]
         with mock.patch.object(in_sandbox.socket, "socket", side_effect=err):
             self.assertEqual(in_sandbox.probe_connect(socket.AF_INET6, ("fd00::1", 80, 0, 0)),
-                             "unobservable:EAFNOSUPPORT")
-            self.assertEqual(in_sandbox.probe_udp("127.0.0.3", 9), "unobservable:EAFNOSUPPORT")
+                             f"unobservable:{name}")
+            self.assertEqual(in_sandbox.probe_udp("127.0.0.3", 9), f"unobservable:{name}")
             self.assertEqual(in_sandbox.reachable_resolver_sockets(), [])
 
     def test_ipv6_disabled_does_not_count_as_attempt(self) -> None:
@@ -341,7 +343,7 @@ class ProbeFailureTest(unittest.TestCase):
                                   "--ports", json.dumps(ports), "--out", str(args.out)])
         self.assertEqual(rc, 0)
         data = json.loads(args.out.read_text(encoding="utf-8"))
-        self.assertEqual(data["probes"]["internal_real"][judge.REAL_INTERNAL_V6], "unobservable:EAFNOSUPPORT")
+        self.assertEqual(data["probes"]["internal_real"][judge.REAL_INTERNAL_V6], f"unobservable:{errno.errorcode[errno.EAFNOSUPPORT]}")
         self.assertFalse(data["attempts"]["internal_real"])
         verdicts = judge.judge_all("bwrap-netns", data, {"internal_real": 0}, {"internal": 1})
         self.assertEqual(verdicts["internal_real"]["verdict"], judge.UNOBSERVABLE)
