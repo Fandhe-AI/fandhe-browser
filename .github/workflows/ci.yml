@@ -1195,6 +1195,18 @@ jobs:
           cmake --version | head -1
           python3 --version
           make --version | head -1
+          # bindgen（clang-sys）がランナー既存の別版 libclang（22 系）を拾うと、llvm-21 のリソースヘッダ
+          # （xmmintrin.h 等）と食い違い "__builtin_ia32_sqrtss" 未宣言で mozjs_sys が落ちる。
+          # clang と同じ major の libclang を導入し、LIBCLANG_PATH でその lib ディレクトリに固定する
+          major="$(clang --version | sed -n 's/.*clang version \([0-9]*\)\..*/\1/p' | head -1)"
+          sudo apt-get install -y --no-install-recommends "libclang-${major}-dev"
+          libdir="/usr/lib/llvm-${major}/lib"
+          if ! ls "$libdir"/libclang*.so* >/dev/null 2>&1; then
+            echo "error: libclang for LLVM ${major} not found under $libdir" >&2
+            exit 1
+          fi
+          echo "LIBCLANG_PATH=$libdir" >> "$GITHUB_ENV"
+          echo "LIBCLANG_PATH: $libdir"
       - name: "cargo cache の復元（servo-host）"
         id: cache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -1204,9 +1216,9 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             servo-host/target
-          key: "rust-${{ runner.os }}-servohost-v1-${{ steps.toolchain.outputs.cachekey }}-\
+          key: "rust-${{ runner.os }}-servohost-v2-${{ steps.toolchain.outputs.cachekey }}-\
             ${{ hashFiles('servo-host/Cargo.lock') }}"
-          restore-keys: rust-${{ runner.os }}-servohost-v1-${{ steps.toolchain.outputs.cachekey }}-
+          restore-keys: rust-${{ runner.os }}-servohost-v2-${{ steps.toolchain.outputs.cachekey }}-
       - name: "[servo-host] cargo fmt --check"
         if: ${{ !cancelled() }}
         run: cargo fmt --manifest-path servo-host/Cargo.toml --all --check
