@@ -1204,9 +1204,9 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             servo-host/target
-          key: "rust-${{ runner.os }}-servohost-v1-${{ steps.toolchain.outputs.cachekey }}-\
+          key: "rust-${{ runner.os }}-servohost-v2-${{ steps.toolchain.outputs.cachekey }}-\
             ${{ hashFiles('servo-host/Cargo.lock') }}"
-          restore-keys: rust-${{ runner.os }}-servohost-v1-${{ steps.toolchain.outputs.cachekey }}-
+          restore-keys: rust-${{ runner.os }}-servohost-v2-${{ steps.toolchain.outputs.cachekey }}-
       - name: "[servo-host] cargo fmt --check"
         if: ${{ !cancelled() }}
         run: cargo fmt --manifest-path servo-host/Cargo.toml --all --check
