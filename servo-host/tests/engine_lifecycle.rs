@@ -61,6 +61,18 @@ fn selftest_creates_and_drops_engine_within_limit() {
     let (code, out, err) = run(&["--selftest"]);
     assert_eq!(code, Some(0), "stderr: {err}");
     assert!(out.starts_with("selftest ok:"), "stdout: {out}");
+    // #1413: 異常終了時に死んだ段階を絞れるよう、進行段階が stderr に出る。
+    for stage in [
+        "engine created",
+        "page loaded",
+        "engine dropped",
+        "second engine rejected",
+    ] {
+        assert!(
+            err.contains(&format!("selftest: {stage}")),
+            "missing stage {stage}: {err}"
+        );
+    }
 }
 
 #[test]

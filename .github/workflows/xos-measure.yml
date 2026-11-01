@@ -890,6 +890,20 @@ jobs:
           $lines = & "$env:SystemRoot\System32\CheckNetIsolation.exe" LoopbackExempt -s
           $n = @($lines | Select-String -SimpleMatch 'S-1-15-2-').Count
           Write-Host "loopback-exempt SID lines: $n"
+      - name: "[egress-isolation] servo-host の異常終了イベント（WER。読み取りのみ。#1413）"
+        if: ${{ !cancelled() }}
+        run: |
+          # 0xC0000409 が panic（故障モジュールが exe 自身）か ANGLE / CRT かを切り分ける。固定フィルタで読むだけ。
+          $flt = @{ LogName = 'Application'; Id = 1000; StartTime = (Get-Date).AddHours(-3) }
+          $ev = @(Get-WinEvent -FilterHashtable $flt -ErrorAction SilentlyContinue |
+            Where-Object { $_.Message -like '*fandhe-browser-servo-host*' } |
+            Select-Object -First 5)
+          if ($ev.Count -eq 0) { Write-Host 'servo-host application errors: none' }
+          foreach ($e in $ev) {
+            $p = $e.Properties
+            Write-Host ("servo-host application error: module={0} exception={1} offset={2}" -f `
+              $p[3].Value, $p[6].Value, $p[7].Value)
+          }
       - name: "[egress-isolation] 結果表を Step Summary へ"
         if: ${{ !cancelled() }}
         run: |

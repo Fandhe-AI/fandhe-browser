@@ -98,6 +98,25 @@ class RunQuietTest(unittest.TestCase):
         self.assertEqual(first.kwargs["timeout"], 7)
         self.assertEqual(second.kwargs["stdout"], subprocess.PIPE)
 
+    def test_win32_capture_stderr_is_bounded(self) -> None:
+        fake = FakeProc(stderr=b"e" * 10000)
+        with mock.patch.object(quiet_io.subprocess, "Popen", return_value=fake):
+            cp = quiet_io.run_quiet(["x"], timeout=5, capture_stderr=True, stderr_keep_max=50, platform="win32")
+        self.assertEqual(cp.stderr, b"e" * 50)
+
+    def test_stderr_is_empty_unless_requested(self) -> None:
+        fake = FakeProc(stderr=b"noise")
+        with mock.patch.object(quiet_io.subprocess, "Popen", return_value=fake):
+            cp = quiet_io.run_quiet(["x"], timeout=5, platform="win32")
+        self.assertEqual(cp.stderr, b"")
+
+    def test_real_process_captures_bounded_stderr_on_this_os(self) -> None:
+        code = "import sys; sys.stderr.write('a' * 20000 + 'panicked at x:1'); sys.exit(3)"
+        cp = quiet_io.run_quiet([sys.executable, "-c", code], timeout=30, capture_stderr=True, stderr_keep_max=64)
+        self.assertEqual(cp.returncode, 3)
+        self.assertEqual(len(cp.stderr), 64)
+        self.assertTrue(cp.stderr.endswith(b"panicked at x:1"))
+
     def test_real_process_on_this_os(self) -> None:
         cp = quiet_io.run_quiet([sys.executable, "-c", "print('hi')"], timeout=30, capture_stdout=True)
         self.assertEqual((cp.returncode, cp.stdout.strip()), (0, b"hi"))
@@ -127,6 +146,58 @@ class PopenStdioHostTest(unittest.TestCase):
         self.assertEqual(kw["stdin"], subprocess.PIPE)
         self.assertEqual(kw["stdout"], subprocess.PIPE)
         self.assertEqual(kw["stderr"], subprocess.DEVNULL)
+
+
+class TailTextTest(unittest.TestCase):
+    def test_keeps_tail_and_strips_control_chars(self) -> None:
+        text = quiet_io.tail_text(b"head" + b"\x1b[31mred\x00" + b"\nlast\xff", limit=12)
+        self.assertEqual(text, "1mred\nlast\ufffd")
+
+    def test_win32_host_keeps_stderr_drain_and_linux_none(self) -> None:
+        fake = FakeProc(stderr=b"boom")
+        with mock.patch.object(quiet_io.subprocess, "Popen", return_value=fake):
+            proc = quiet_io.popen_stdio_host(["h"], platform="win32")
+        self.assertEqual(proc.stderr_drain.join(2.0), b"boom")
+        with mock.patch.object(quiet_io.subprocess, "Popen", return_value=FakeProc()):
+            self.assertIsNone(quiet_io.popen_stdio_host(["h"], platform="linux").stderr_drain)
+
+
+class RecordHostExitTest(unittest.TestCase):
+    """in_sandbox.record_host_exit（#1413）。shutdown 後の終了コードと stderr の記録。"""
+
+    def setUp(self) -> None:
+        import in_sandbox
+        self.mod = in_sandbox
+
+    def test_nonzero_exit_records_rc_and_stderr_tail(self) -> None:
+        proc = mock.Mock()
+        proc.wait.return_value = 3221226505
+        proc.stderr_drain.join.return_value = b"panicked at src/x.rs:1"
+        result: dict = {}
+        self.mod.record_host_exit(proc, result)
+        self.assertEqual(result, {"host_exit_rc": 3221226505, "host_stderr_tail": "panicked at src/x.rs:1"})
+
+    def test_zero_exit_records_no_tail(self) -> None:
+        proc = mock.Mock()
+        proc.wait.return_value = 0
+        result: dict = {}
+        self.mod.record_host_exit(proc, result)
+        self.assertEqual(result, {"host_exit_rc": 0})
+
+    def test_timeout_is_marked(self) -> None:
+        proc = mock.Mock()
+        proc.wait.side_effect = subprocess.TimeoutExpired("h", 1)
+        result: dict = {}
+        self.mod.record_host_exit(proc, result)
+        self.assertEqual(result, {"host_exit_rc": None, "host_exit_timed_out": True})
+
+    def test_fmt_rc_shows_hex_for_fail_fast(self) -> None:
+        import measure
+        self.assertEqual(measure.fmt_rc(3221226505),
+                         "3221226505 (0xC0000409; fail-fast, includes Rust panic=abort)")
+        self.assertEqual(measure.fmt_rc(0), "0")
+        self.assertEqual(measure.fmt_rc(-11), "-11")
+        self.assertEqual(measure.fmt_rc(None), "None")
 
 
 class InnerSourceTest(unittest.TestCase):

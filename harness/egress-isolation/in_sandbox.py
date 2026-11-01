@@ -123,6 +123,23 @@ def read_proc(name: str) -> str | None:
         return None
 
 
+def record_host_exit(proc: Any, result: dict[str, Any]) -> None:
+    """shutdown 応答後にホストの自然終了を待ち、終了コードを残す（#1413）。
+
+    ハーネスは後始末で kill するため、破棄段階の異常終了はここでしか観測できない。非 0 のときだけ stderr の末尾も残す。
+    """
+    try:
+        rc = proc.wait(timeout=sbd.SHUTDOWN_GRACE_S)
+    except subprocess.TimeoutExpired:
+        result["host_exit_rc"] = None
+        result["host_exit_timed_out"] = True
+        return
+    result["host_exit_rc"] = rc
+    drain = getattr(proc, "stderr_drain", None)
+    if rc != 0 and drain is not None:
+        result["host_stderr_tail"] = quiet_io.tail_text(drain.join(2.0))
+
+
 def host_argv(host: str) -> list[str]:
     """ホストの起動 argv。`.py` は Windows の CreateProcess が shebang を解釈しないため同じ interpreter 経由で起動する。
 
@@ -506,8 +523,12 @@ def run(args: argparse.Namespace, ports: dict[str, int]) -> dict[str, Any]:
 
         # AppContainer は `nul` を開けないため、内側の起動は quiet_io 経由（#1401）。失敗段階は error_stage に残す。
         stage = "selftest"
-        st = quiet_io.run_quiet([*host_argv(args.host), "--selftest"], env=env, timeout=90)
+        st = quiet_io.run_quiet([*host_argv(args.host), "--selftest"], env=env, timeout=90,
+                                capture_stderr=True)
         result["selftest_rc"] = st.returncode
+        if st.returncode != 0:
+            # 異常終了の理由（panic メッセージ・段階マーカー）を残す。0xC0000409 の切り分け用（#1413）。
+            result["selftest_stderr_tail"] = quiet_io.tail_text(st.stderr)
 
         stage = "spawn_host"
         proc = quiet_io.popen_stdio_host([*host_argv(args.host), "--stdio"], env=env)
@@ -541,6 +562,7 @@ def run(args: argparse.Namespace, ports: dict[str, int]) -> dict[str, Any]:
         try:
             sbd.call(chan, next_id, "shutdown", None, sbd.SHUTDOWN_GRACE_S + sbd.TIMEOUT_SLACK_S,
                      max_frame=info.response_max)
+            record_host_exit(proc, result)
         except (sbd.HostError, sbd.RpcError):
             pass
     except (sbd.HostError, OSError, subprocess.SubprocessError) as exc:
