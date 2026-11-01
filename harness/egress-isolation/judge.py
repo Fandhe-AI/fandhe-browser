@@ -215,6 +215,7 @@ def judge_all(
     binary_match: bool = True, mode_unavailable: str | None = None,
     loopback_confound: str | None = LOOPBACK_PREFLIGHT_MISSING_REASON,
     deny_log_reason: str | None = None, wildcard_routes: frozenset[str] = frozenset(),
+    route_notes: dict[str, str] | None = None,
 ) -> dict[str, dict[str, Any]]:
     """内側ランナーの結果 JSON と外側の件数から、隔離モードの全経路を判定する。
 
@@ -282,6 +283,10 @@ def judge_all(
             if deny_log_reason:
                 # 拒否ログが使えなかった理由を残す（Issue #1402）。
                 reason += f"; deny log unavailable: {deny_log_reason}"
+        note = (route_notes or {}).get(route)
+        if note and verdict == UNOBSERVABLE:
+            # 診断の事実（Issue #1415）。判定は変えず、unobservable の理由の末尾にだけ足す。
+            reason += f"; {note}"
         out[route] = {
             "verdict": verdict,
             "reason": reason,
