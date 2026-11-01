@@ -344,14 +344,14 @@ def run_mode(mode: str, *, host: Path, ports: dict[str, int], recs: dict[str, An
                 for r in ("redirect", "img", "fetch", "ws", "internal")}
         udp = f"{judge.IP_BLOCKED}:{ports['udp_direct']}"
         # 正解の分かっている拒否（内側ランナー自身の UDP プローブ）を拒否ログが取りこぼしているなら、
-        # 拒否ログは TCP の試行の根拠にしない（fail-closed。ビーコン由来の根拠は残す。Issue #1395）。
+        # 拒否ログは TCP の試行の根拠にしない（fail-closed。ビーコンは補助情報のみで根拠にしない。Issue #1395）。
         probe_ok, probe_why = seatbelt.self_check(denies, (inner.get("probes") or {}).get("udp_direct"), udp)
         if not probe_ok and status.get("available"):
             status = {**status, "available": False, "reason": probe_why}
         observed = dict(denies)  # 診断用に記録する生の件数（根拠に使うかは status で決まる）
         if not status.get("available"):
             denies = {}
-        # 拒否ログの結果は、ビーコン由来の試行を上書きせず OR で合成する。
+        # 拒否ログの結果を、内側ランナーの試行記録（UDP の errno 由来）へ OR で合成する。ビーコンは根拠にしない。
         inner["attempts"], inner["attempt_evidence"] = seatbelt.compose_attempts(
             inner.get("attempts") or {}, inner.get("attempt_evidence") or {}, denies, dest, udp)
         data["deny_log"] = {**status, "dest_counts": {d: observed.get(d, 0) for d in (*dest.values(), udp)}}
