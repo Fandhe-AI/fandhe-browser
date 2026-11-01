@@ -198,8 +198,8 @@ class ScanLineTest(unittest.TestCase):
         self.assertEqual(got, Counter({"127.0.0.2:2001": 1, "127.0.0.2:2002": 1}))
         self.assertEqual(diag, {"scanned_lines": 5, "json_lines": 3, "sandbox_lines": 4,
                                 "network_outbound_lines": 2, "deny_excluded_by_pid": 0, "deny_attributed": 2,
-                                "unmatched_deny_samples": ["Sandbox: host(101) deny(1) file-read-data /etc/hosts",
-                                                           "{broken json deny(1)"],
+                                "unmatched_deny_unattributed": 1,
+                                "unmatched_deny_samples": ["Sandbox: <proc>(<pid>) deny(1) file-read-data <path>"],
                                 "unmatched_deny_samples_dropped": 0, "pid_excluded_samples": [],
                                 "pid_excluded_samples_dropped": 0})
 
@@ -214,6 +214,7 @@ class ScanLineTest(unittest.TestCase):
         # 一致した帰属済みの行は本文を保持しない（サンプルは不一致・pid 除外の行だけ。Issue #1402）。
         self.assertEqual({k: v for k, v in diag.items() if not isinstance(v, int)},
                          {"unmatched_deny_samples": [], "pid_excluded_samples": []})
+        self.assertNotIn("secret-proc", str(diag))
 
 
 class SelfCheckTest(unittest.TestCase):

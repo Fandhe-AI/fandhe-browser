@@ -479,7 +479,7 @@ class StopOrderTest(unittest.TestCase):
 
 
 class DenySampleTest(unittest.TestCase):
-    """拒否メッセージ本文のサンプル保持（Issue #1402。正規表現は変えず形式を成果物から確認するための診断）。"""
+    """拒否メッセージのサンプル保持（Issue #1402。正規表現は変えず、形だけ・対象 pid だけを控える）。"""
 
     def _scan(self, lines: list[str], pids: frozenset[int] | None = None) -> seatbelt.DenyDiagnostics:
         diag = seatbelt.DenyDiagnostics()
@@ -488,20 +488,41 @@ class DenySampleTest(unittest.TestCase):
         return diag
 
     def test_unmatched_samples_capped_at_16_with_overflow_count(self) -> None:
-        diag = self._scan([f"Sandbox: x(1) deny(1) other-{i}" for i in range(20)])
+        diag = self._scan([f"Sandbox: x(1) deny(1) other-{i}" for i in range(20)], frozenset({1}))
         self.assertEqual(len(diag.unmatched_deny_samples), 16)
-        self.assertEqual(diag.unmatched_deny_samples[0], "Sandbox: x(1) deny(1) other-0")
-        self.assertEqual(diag.unmatched_deny_samples[15], "Sandbox: x(1) deny(1) other-15")
+        self.assertEqual(diag.unmatched_deny_samples[0], "Sandbox: <proc>(<pid>) deny(1) other-0")
         self.assertEqual(diag.unmatched_deny_samples_dropped, 4)
         self.assertEqual(diag.sandbox_lines, 20)
 
-    def test_pid_excluded_samples_capped_at_8(self) -> None:
-        diag = self._scan([f"Sandbox: x({100 + i}) deny(1) network-outbound 127.0.0.2:2001" for i in range(10)],
-                          frozenset({1}))
+    def test_unrelated_pid_unmatched_line_is_only_counted(self) -> None:
+        diag = self._scan(["Sandbox: other(999) deny(1) file-read-data /Users/someone/secret.txt",
+                           "deny(1) no pid here"], frozenset({101}))
+        self.assertEqual(diag.unmatched_deny_samples, [])
+        self.assertEqual(diag.unmatched_deny_unattributed, 2)
+        self.assertNotIn("secret", str(diag.as_dict()))
+        self.assertNotIn("someone", str(diag.as_dict()))
+
+    def test_target_pid_line_is_redacted_to_shape(self) -> None:
+        diag = self._scan([
+            "Sandbox: servo-host(101) deny(1) file-read-data /private/var/folders/x/y 10.1.2.3:443 "
+            "127.0.0.2:65251 ?token=abc localhost:80 ::ffff:127.0.0.1 fe80::1 abc123.x"], frozenset({101}))
+        self.assertEqual(diag.unmatched_deny_samples, [
+            "Sandbox: <proc>(<pid>) deny(1) file-read-data <path> <ipv4>:443 127.0.0.2:65251 "
+            "<redacted> localhost:80 ::ffff:127.0.0.1 <ipv6> aaa999.a"])
+        self.assertNotIn("servo-host", str(diag.as_dict()))
+
+    def test_odd_operation_token_becomes_op(self) -> None:
+        self.assertEqual(seatbelt.redact_shape("Sandbox: p(5) deny(1) /bad/op x"), "Sandbox: <proc>(<pid>) deny(1) <op> a")
+
+    def test_pid_excluded_samples_are_structured_and_capped_at_8(self) -> None:
+        diag = self._scan([f"Sandbox: x({100 + i}) deny(1) network-outbound 10.0.0.{i}:80" for i in range(9)]
+                          + ["Sandbox: x(200) deny(1) network-outbound 127.0.0.2:2001"], frozenset({1}))
+        self.assertEqual(diag.pid_excluded_samples[0], {"pid": 100, "dest": "<ipv4>:80"})
         self.assertEqual(len(diag.pid_excluded_samples), 8)
         self.assertEqual(diag.pid_excluded_samples_dropped, 2)
         self.assertEqual(diag.deny_excluded_by_pid, 10)
-        self.assertEqual(diag.unmatched_deny_samples, [])
+        loop = self._scan(["Sandbox: x(200) deny(1) network-outbound 127.0.0.2:2001"], frozenset({1}))
+        self.assertEqual(loop.pid_excluded_samples, [{"pid": 200, "dest": "127.0.0.2:2001"}])
 
     def test_matched_attributed_line_is_not_sampled(self) -> None:
         diag = seatbelt.DenyDiagnostics()
@@ -513,28 +534,27 @@ class DenySampleTest(unittest.TestCase):
 
     def test_line_without_deny_is_not_sampled(self) -> None:
         diag = self._scan(["Sandbox: allow network-outbound 127.0.0.2:2001"])
-        self.assertEqual(diag.unmatched_deny_samples, [])
-        self.assertEqual(diag.sandbox_lines, 0)
+        self.assertEqual((diag.unmatched_deny_samples, diag.unmatched_deny_unattributed, diag.sandbox_lines),
+                         ([], 0, 0))
 
-    def test_truncated_to_300_chars(self) -> None:
-        diag = self._scan(["deny(1) " + "a" * 500])
-        self.assertEqual(len(diag.unmatched_deny_samples[0]), 300)
-        self.assertEqual(diag.unmatched_deny_samples[0], ("deny(1) " + "a" * 500)[:300])
+    def test_shape_truncated_to_300_chars_and_24_per_token(self) -> None:
+        self.assertEqual(len(seatbelt.redact_shape("deny(1) op " + "a" * 100)), len("deny(1) op ") + 24)
+        long = seatbelt.redact_shape("deny(1) op " + " ".join(["bbbb"] * 200))
+        self.assertEqual(len(long), 300)
 
     def test_control_chars_become_spaces(self) -> None:
         self.assertEqual(seatbelt.sanitize_sample("a\nb\tc\x1bd\re\x7ff\u2028g"), "a b c d e f g")
-        diag = self._scan(["deny(1)\nfoo\x1b[0m"])
-        self.assertEqual(diag.unmatched_deny_samples, ["deny(1) foo [0m"])
+        self.assertEqual(seatbelt.redact_shape("deny(1) op a\nb\x1b[0m"), "deny(1) op a a?[9a")
 
     def test_samples_in_as_dict_and_summary_block(self) -> None:
-        diag = self._scan(["deny(1) weird `x`"])
+        diag = self._scan(["Sandbox: p(1) deny(1) op weird"], frozenset({1}))
         d = diag.as_dict()
-        self.assertEqual(d["unmatched_deny_samples"], ["deny(1) weird `x`"])
+        self.assertEqual(d["unmatched_deny_samples"], ["Sandbox: <proc>(<pid>) deny(1) op aaaaa"])
         dl = {"available": True, "diagnostics": d, "unprivileged": {"diagnostics": d}}
         block = measure._deny_sample_block(dl)
-        self.assertIn("deny(1) weird 'x'", block)
+        self.assertIn("Sandbox: <proc>(<pid>) deny(1) op aaaaa", block)
         self.assertEqual(block.count("```text"), 2)
-        self.assertNotIn("weird", str(measure._without_samples(dl)))
+        self.assertNotIn("aaaaa", str(measure._without_samples(dl)))
 
 
 if __name__ == "__main__":
