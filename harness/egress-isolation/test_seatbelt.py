@@ -228,19 +228,19 @@ class ComposeAttemptsTest(unittest.TestCase):
     DEST = {"redirect": "127.0.0.2:2001", "img": "127.0.0.2:2002"}
     UDP = "127.0.0.2:2006"
 
-    def test_deny_log_does_not_overwrite_beacon_evidence(self) -> None:
+    def test_deny_log_does_not_overwrite_errno_evidence(self) -> None:
         attempts, evidence = seatbelt.compose_attempts(
-            {"img": True}, {"img": "error_beacon"}, {}, self.DEST, self.UDP)
-        self.assertEqual(attempts["img"], True)
-        self.assertEqual(evidence, {"img": "error_beacon"})
-        self.assertEqual(attempts["redirect"], False)
+            {"udp_direct": True}, {"udp_direct": "errno"}, {}, self.DEST, self.UDP)
+        self.assertEqual(attempts["udp_direct"], True)
+        self.assertEqual(evidence, {"udp_direct": "errno"})
+        self.assertEqual((attempts["redirect"], attempts["img"]), (False, False))
 
     def test_deny_log_adds_evidence(self) -> None:
         attempts, evidence = seatbelt.compose_attempts(
-            {"img": True}, {"img": "error_beacon"}, {"127.0.0.2:2001": 1, "127.0.0.2:2002": 2, self.UDP: 1},
+            {}, {}, {"127.0.0.2:2001": 1, "127.0.0.2:2002": 2, self.UDP: 1},
             self.DEST, self.UDP)
         self.assertEqual((attempts["redirect"], attempts["udp_direct"]), (True, True))
-        self.assertEqual(evidence, {"img": "error_beacon+deny_log", "redirect": "deny_log", "udp_direct": "deny_log"})
+        self.assertEqual(evidence, {"img": "deny_log", "redirect": "deny_log", "udp_direct": "deny_log"})
 
 
 class BeaconTest(unittest.TestCase):
@@ -285,23 +285,25 @@ class BeaconTest(unittest.TestCase):
 class JudgeBeaconEvidenceTest(unittest.TestCase):
     INNER = {"positive_ok": True, "guard": {"unavailable": "n/a"}}
 
-    def test_beacon_attempt_passes_with_evidence(self) -> None:
-        inner = {**self.INNER, "attempts": {"img": True}, "attempt_evidence": {"img": "error_beacon"}}
+    def test_beacon_only_is_unobservable(self) -> None:
+        """ビーコンだけ（拒否ログなし）の経路は attempts が空なので pass にならない。"""
+        inner = {**self.INNER, "attempts": {}, "beacons": {"img": 1}}
         out = judge.judge_all("seatbelt", inner, {}, {"img": 1})
-        self.assertEqual((out["img"]["verdict"], out["img"]["evidence"]), (judge.PASS, "error_beacon"))
-        self.assertIn("failure-path beacon", out["img"]["method"])
+        self.assertEqual(out["img"]["verdict"], judge.UNOBSERVABLE)
+        self.assertEqual(out["img"]["reason"],
+                         "no attempt was observed inside the sandbox (TCP attempt evidence is the sandbox "
+                         "deny log only; failure beacons are not evidence)")
+        self.assertNotIn("evidence", out["img"])
 
-    def test_outer_receipt_wins_over_beacon(self) -> None:
-        inner = {**self.INNER, "attempts": {"img": True}, "attempt_evidence": {"img": "error_beacon"}}
+    def test_deny_log_attempt_passes_with_evidence(self) -> None:
+        inner = {**self.INNER, "attempts": {"img": True}, "attempt_evidence": {"img": "deny_log"}}
+        out = judge.judge_all("seatbelt", inner, {}, {"img": 1})
+        self.assertEqual((out["img"]["verdict"], out["img"]["evidence"]), (judge.PASS, "deny_log"))
+
+    def test_outer_receipt_wins_over_attempt(self) -> None:
+        inner = {**self.INNER, "attempts": {"img": True}, "attempt_evidence": {"img": "deny_log"}}
         out = judge.judge_all("seatbelt", inner, {"img": 1}, {"img": 1})
         self.assertEqual(out["img"]["verdict"], judge.FAIL)
-
-    def test_redirect_without_evidence_is_unobservable_with_reason(self) -> None:
-        out = judge.judge_all("seatbelt", {**self.INNER, "attempts": {}}, {}, {"redirect": 1, "img": 1})
-        self.assertEqual(out["redirect"]["verdict"], judge.UNOBSERVABLE)
-        self.assertIn("deny log only", out["redirect"]["reason"])
-        self.assertNotIn("evidence", out["redirect"])
-        self.assertNotIn("deny log only", out["img"]["reason"])
 
 
 if __name__ == "__main__":

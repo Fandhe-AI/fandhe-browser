@@ -172,10 +172,10 @@ def compose_attempts(
     attempts: dict[str, bool], evidence: dict[str, str], denies: dict[str, int] | Counter[str],
     dest_by_route: dict[str, str], udp_dest: str,
 ) -> tuple[dict[str, bool], dict[str, str]]:
-    """内側ランナーの試行（ビーコン・errno）と拒否ログの試行を OR で合成する。
+    """内側ランナーの試行（errno）と拒否ログの試行を OR で合成する。
 
     拒否ログは既存の根拠を上書きしない（`False` で消さない）。`denies` は根拠に使える場合だけ渡す
-    （自己検査が不成立なら空を渡す）。根拠の出どころは `evidence`（経路 -> "error_beacon" / "errno" / "deny_log" の `+` 連結）。
+    （自己検査が不成立なら空を渡す）。根拠の出どころは `evidence`（経路 -> "errno" / "deny_log" の `+` 連結）。
     """
     out_attempts = dict(attempts)
     out_evidence = dict(evidence)

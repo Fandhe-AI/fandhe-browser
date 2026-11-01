@@ -508,13 +508,10 @@ def run(args: argparse.Namespace, ports: dict[str, int]) -> dict[str, Any]:
         # 写し listener が無いモード: UDP はサンドボックスが sendto を拒否した errno を試行の根拠にする。
         # TCP の経路は measure.py が拒否ログ（macOS）から補う。errno は実測で観測した値（EPERM 等）を許可集合に入れる。
         result["attempts"]["udp_direct"] = probes.get("udp_direct") in SANDBOX_DENY_ERRNOS
-        # TCP は失敗経路のビーコン（許可オリジンへの GET）を根拠にする。redirect はページの JS が走らないので
-        # ビーコンを付けられず、拒否ログ（measure.py）だけが根拠になる（Issue #1395）。
+        # TCP の試行はここでは根拠にしない。失敗ビーコン（`beacons`）はブラウザ内部の要求拒否でも発火し、接続 syscall の
+        # 試行や遮断の証拠にならないため補助情報として記録するだけにする。TCP は measure.py が拒否ログ（macOS）から補い、
+        # 得られなければ unobservable のままにする（fail-closed。Issue #1395）。
         evidence = {"udp_direct": "errno"} if result["attempts"]["udp_direct"] else {}
-        for r in (x for x in TCP_ROUTES if x != "redirect"):
-            if beacons.get(r, 0) >= 1:
-                result["attempts"][r] = True
-                evidence[r] = "error_beacon"
         result["attempt_evidence"] = evidence
     for rec in inner.values():
         rec.stop()
