@@ -217,6 +217,123 @@ class ScanLineTest(unittest.TestCase):
         self.assertNotIn("secret-proc", str(diag))
 
 
+WILD = "Sandbox: Python(101) deny(1) network-outbound inet4x:*:{port}"
+
+
+class WildcardDenyTest(unittest.TestCase):
+    """macOS 26 のワイルドカード形式（`network-outbound <語>:*:<port>`。Issue #1402・実測 run 41305443526）。"""
+
+    DESTS = ("127.0.0.2:2001", "127.0.0.2:2002", "127.0.0.3:2005", "127.0.0.2:2006")
+    PIDS = frozenset({101})
+
+    def _scan(self, lines: list[str], dests: tuple[str, ...] | None = DESTS,
+              pids: frozenset[int] | None = PIDS) -> tuple[Counter[str], seatbelt.DenyDiagnostics]:
+        ports = seatbelt.PortMap.from_dests(dests) if dests is not None else None
+        diag = seatbelt.DenyDiagnostics()
+        got: Counter[str] = Counter()
+        for line in lines:
+            dest = seatbelt.scan_line(_record(line), pids, diag, ports)
+            if dest:
+                got[dest] += 1
+        return got, diag
+
+    def test_pid_and_known_port_attribute_to_dest(self) -> None:
+        got, diag = self._scan([WILD.format(port=2001), WILD.format(port=2001)])
+        self.assertEqual(got, Counter({"127.0.0.2:2001": 2}))
+        self.assertEqual((diag.wildcard_lines, diag.wildcard_attributed), (2, 2))
+        self.assertEqual(diag.match_kind, {"127.0.0.2:2001": {"*:port": 2}})
+        self.assertEqual(diag.unmatched_deny_samples, [])
+
+    def test_pid_mismatch_is_not_attributed(self) -> None:
+        got, diag = self._scan(["Sandbox: Python(999) deny(1) network-outbound inet4x:*:2001"])
+        self.assertEqual(got, Counter())
+        self.assertEqual((diag.wildcard_excluded_by_pid, diag.wildcard_attributed, diag.wildcard_unknown_port),
+                         (1, 0, 0))
+
+    def test_without_pid_filter_wildcard_is_not_attributed(self) -> None:
+        got, diag = self._scan([WILD.format(port=2001)], pids=None)
+        self.assertEqual((got, diag.wildcard_excluded_by_pid), (Counter(), 1))
+
+    def test_unknown_port_is_counted_separately(self) -> None:
+        got, diag = self._scan([WILD.format(port=4444)])
+        self.assertEqual(got, Counter())
+        self.assertEqual((diag.wildcard_unknown_port, diag.wildcard_attributed), (1, 0))
+
+    def test_no_known_ports_never_attributes(self) -> None:
+        got, diag = self._scan([WILD.format(port=2001)], dests=None)
+        self.assertEqual((got, diag.wildcard_unknown_port), (Counter(), 1))
+
+    def test_duplicate_port_is_not_attributed_and_recorded(self) -> None:
+        dests = ("127.0.0.2:2001", "127.0.0.3:2001", "127.0.0.2:2002")
+        got, diag = self._scan([WILD.format(port=2001), WILD.format(port=2002)], dests=dests)
+        self.assertEqual(got, Counter({"127.0.0.2:2002": 1}))
+        self.assertEqual((diag.wildcard_ambiguous_port, diag.wildcard_ambiguous_ports), (1, [2001]))
+
+    def test_ipv4_format_unchanged_and_records_match_kind(self) -> None:
+        got, diag = self._scan(["Sandbox: Python(101) deny(1) network-outbound 127.0.0.2:2001",
+                                "Sandbox: Python(101) deny(1) network-outbound 10.0.0.9:2001"])
+        self.assertEqual(got, Counter({"127.0.0.2:2001": 1, "10.0.0.9:2001": 1}))
+        self.assertEqual(diag.match_kind, {"127.0.0.2:2001": {"ip:port": 1}})
+        self.assertEqual(diag.wildcard_lines, 0)
+
+    def test_wildcard_fields_hidden_when_unused(self) -> None:
+        _, diag = self._scan(["Sandbox: Python(101) deny(1) network-outbound 10.0.0.9:80"])
+        self.assertNotIn("wildcard_lines", diag.as_dict())
+        _, diag = self._scan([WILD.format(port=2001)])
+        self.assertEqual(diag.as_dict()["wildcard_attributed"], 1)
+
+    def test_udp_self_probe_via_wildcard_passes_self_check(self) -> None:
+        got, _ = self._scan([WILD.format(port=2006)])
+        self.assertEqual(seatbelt.self_check(got, "EPERM", "127.0.0.2:2006"), (True, "ok"))
+
+    def test_udp_self_probe_with_other_port_fails_self_check(self) -> None:
+        got, _ = self._scan([WILD.format(port=2001), WILD.format(port=9999)])
+        self.assertEqual(seatbelt.self_check(got, "EPERM", "127.0.0.2:2006"),
+                         (False, "self-probe denial missing from deny log"))
+
+    def test_collect_denies_uses_known_dests_context_for_wildcard(self) -> None:
+        import io
+        import os
+        from unittest import mock
+
+        r, w = os.pipe()
+        os.write(w, (_record(WILD.format(port=2001)) + "\n").encode())
+        os.close(w)
+
+        class P:
+            returncode = 0
+            stdout = io.open(r, "rb", buffering=0)
+
+            def wait(self, timeout: float | None = None) -> int:
+                return 0
+
+        tok = measure._KNOWN_DESTS.set(("127.0.0.2:2001", "127.0.0.2:2006"))
+        try:
+            with mock.patch.object(measure.subprocess, "Popen", lambda *a, **k: P()):
+                counts, status = measure.collect_denies("2026-11-01 00:00:00", frozenset({101}))
+        finally:
+            measure._KNOWN_DESTS.reset(tok)
+        self.assertEqual(counts, {"127.0.0.2:2001": 1})
+        self.assertEqual(status["diagnostics"]["match_kind"], {"127.0.0.2:2001": {"*:port": 1}})
+
+    def test_redact_shape_keeps_port_digits(self) -> None:
+        self.assertEqual(seatbelt.redact_shape("Sandbox: Python(101) deny(1) network-outbound inet4x:*:49253"),
+                         "Sandbox: <proc>(<pid>) deny(1) network-outbound aaaa9a:*:49253")
+        self.assertEqual(seatbelt.redact_shape("Sandbox: p(1) deny(1) network-outbound 10.1.2.3:443"),
+                         "Sandbox: <proc>(<pid>) deny(1) network-outbound <ipv4>:443")
+        self.assertEqual(seatbelt.redact_shape("Sandbox: p(1) deny(1) file-read-data abc:123"),
+                         "Sandbox: <proc>(<pid>) deny(1) file-read-data aaa:999")
+
+
+class WildcardJudgeMethodTest(unittest.TestCase):
+    def test_method_mentions_port_attribution_only_for_wildcard_routes(self) -> None:
+        inner = {"positive_ok": True, "guard": {"unavailable": "n/a"}, "attempts": {"img": True, "fetch": True}}
+        v = judge.judge_all("seatbelt", inner, {}, {"img": 1, "fetch": 1}, wildcard_routes=frozenset({"img"}))
+        self.assertIn("attribution relies on the ephemeral listener port and the host pid", v["img"]["method"])
+        self.assertNotIn("ephemeral", v["fetch"]["method"])
+        self.assertEqual(v["img"]["verdict"], v["fetch"]["verdict"])
+
+
 class SelfCheckTest(unittest.TestCase):
     UDP = "127.0.0.2:2006"
 
