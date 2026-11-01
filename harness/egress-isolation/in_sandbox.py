@@ -47,6 +47,7 @@ import monitor  # noqa: E402
 import page_templates as fixtures  # noqa: E402
 import judge  # noqa: E402
 import listeners  # noqa: E402
+import quiet_io  # noqa: E402
 import seatbelt  # noqa: E402
 import servo_bbox_driver as sbd  # noqa: E402
 
@@ -163,8 +164,8 @@ def descendant_pids(root: int) -> set[int]:
     """`root` とその子孫の pid（`ps` の 1 回のスナップショット）。取得できなければ `root` のみ。"""
     pids = {root}
     try:
-        out = subprocess.run(["ps", "-axo", "pid=,ppid="], stdin=subprocess.DEVNULL,  # noqa: S603,S607
-                             capture_output=True, text=True, timeout=5, check=False).stdout
+        out = quiet_io.run_quiet(["ps", "-axo", "pid=,ppid="], timeout=5,
+                                 capture_stdout=True).stdout.decode("utf-8", "replace")
         pairs = [tuple(int(x) for x in line.split()[:2]) for line in out.splitlines() if len(line.split()) >= 2]
     except (OSError, subprocess.SubprocessError, ValueError):
         return pids
@@ -340,9 +341,8 @@ def host_identity(host: str) -> dict[str, Any]:
     ident: dict[str, Any] = {}
     try:
         ident["host_sha256"] = hashlib.sha256(Path(host).read_bytes()).hexdigest()
-        ident["host_version"] = subprocess.run(  # noqa: S603
-            [host, "--version"], capture_output=True, text=True, timeout=20, check=False,
-            stdin=subprocess.DEVNULL).stdout.strip()[:80]
+        ident["host_version"] = quiet_io.run_quiet(
+            [host, "--version"], timeout=20, capture_stdout=True).stdout.decode("utf-8", "replace").strip()[:80]
     except (OSError, subprocess.SubprocessError):
         pass
     return ident
@@ -428,6 +428,7 @@ def run(args: argparse.Namespace, ports: dict[str, int]) -> dict[str, Any]:
 
     workdir = make_private_workdir("egress-isolation-")
     proc: subprocess.Popen[bytes] | None = None
+    stage = "setup"
     guard: monitor.DestinationMonitor | None = None
     try:
         for sub in ("home", "tmp", "xdg-config", "xdg-cache", "xdg-data"):
@@ -436,16 +437,14 @@ def run(args: argparse.Namespace, ports: dict[str, int]) -> dict[str, Any]:
         env_notes = sorted(k for k in os.environ if k.lower().endswith("_proxy"))
         result["proxy_env_present"] = bool(env_notes)  # 値は記録しない（有無のみ）
 
-        st = subprocess.run(  # noqa: S603  (argv 固定・シェル不使用)
-            [*host_argv(args.host), "--selftest"], env=env, stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=90, check=False,
-        )
+        # AppContainer は `nul` を開けないため、内側の起動は quiet_io 経由（#1401）。失敗段階は error_stage に残す。
+        stage = "selftest"
+        st = quiet_io.run_quiet([*host_argv(args.host), "--selftest"], env=env, timeout=90)
         result["selftest_rc"] = st.returncode
 
-        proc = subprocess.Popen(  # noqa: S603
-            [*host_argv(args.host), "--stdio"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL, env=env,
-        )
+        stage = "spawn_host"
+        proc = quiet_io.popen_stdio_host([*host_argv(args.host), "--stdio"], env=env)
+        stage = "drive_host"
         # ハーネスが意図的に接続させるダミー宛先（127.0.0.2 / 127.0.0.3）は想定内の試行として除外し、監視を続ける。
         expected = {f"{judge.IP_INTERNAL_STANDIN if r == 'internal' else judge.IP_BLOCKED}:{ports[r]}"
                     for r in TCP_ROUTES} | {f"{judge.IP_BLOCKED}:{ports['udp_direct']}"}
@@ -479,6 +478,7 @@ def run(args: argparse.Namespace, ports: dict[str, int]) -> dict[str, Any]:
             pass
     except (sbd.HostError, OSError, subprocess.SubprocessError) as exc:
         result["error"] = describe_error(exc)
+        result["error_stage"] = stage
     finally:
         if guard is None:
             result["guard"] = {"unavailable": f"process-level monitor not supported on {sys.platform}"}
