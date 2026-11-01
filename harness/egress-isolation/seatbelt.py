@@ -27,8 +27,12 @@ LOG_BIN = "/usr/bin/log"
 # Issue #1402: xos-measure の macOS ジョブ（使い捨て runner）に限り、opt-in で `sudo log show` / `sudo log config` を使う。
 SUDO_BIN = "/usr/bin/sudo"
 LOG_CONFIG_SUBSYSTEMS = ("com.apple.sandbox", "com.apple.sandbox.reporting")
-LOG_CONFIG_ACTIONS = ("status", "raise", "reset")
-LOG_CONFIG_MODE = "level:debug,persist:debug"
+LOG_CONFIG_ACTIONS = ("status", "raise", "restore_default", "restore_info")
+# 上げる・戻す操作はレベルだけを変える（persist・signpost・oversize には触れない。Issue #1402）。値は定数に限る。
+LOG_CONFIG_MODE = "level:debug"
+LOG_CONFIG_RESTORE_DEFAULT_MODE = "level:default"
+LOG_CONFIG_RESTORE_INFO_MODE = "level:info"
+# `--reset` は persist・signpost・oversize などレベル以外のカスタム設定も消すため使わない（action に含めない）。
 # 隔離と無関係な失敗（GPU・WindowServer 等）を切り分ける陽性対照用の全許可プロファイル。
 BASELINE_PROFILE = "(version 1)(allow default)"
 # 隔離プロファイル。許可するのはページ配信用の loopback 1 ポートだけ（ホストが許可オリジンを読む経路）。
@@ -80,7 +84,10 @@ def log_config_argv(action: str, subsystem: str) -> list[str]:
         return [*base, "--status", "--subsystem", subsystem]
     if action == "raise":
         return [*base, "--subsystem", subsystem, "--mode", LOG_CONFIG_MODE]
-    return [*base, "--subsystem", subsystem, "--reset"]
+    if action == "restore_info":
+        return [*base, "--subsystem", subsystem, "--mode", LOG_CONFIG_RESTORE_INFO_MODE]
+    # 残りは restore_default（許可リストで検証済み）。
+    return [*base, "--subsystem", subsystem, "--mode", LOG_CONFIG_RESTORE_DEFAULT_MODE]
 
 
 def _default_runner(argv: list[str]) -> tuple[int, str]:
@@ -93,34 +100,58 @@ def _default_runner(argv: list[str]) -> tuple[int, str]:
     return cp.returncode, (cp.stdout + cp.stderr).decode("utf-8", errors="replace")[:400]
 
 
-def status_is_all_default(status: str) -> bool:
-    """`log config --status` の出力が「全設定項目が既定」と確実に読めるときだけ True（fail-closed。Issue #1402）。
+def _line_kind(ln: str) -> str | None:
+    """小文字化済みの 1 行を "default" / "info" / None（変更不可・解釈不能）に分類する。"""
+    pairs = re.findall(r"([a-z_-]+)\s*[=:]\s*([a-z_-]+)", ln)
+    if pairs:
+        return "default" if all(v == "default" for _, v in pairs) else None
+    rest = re.sub(r"^mode\s+for\s+('[^']*'|\S+)\s*:?\s*", "", ln).strip()
+    if rest == "default":
+        return "default"
+    tokens = rest.split()
+    if "persist_default" not in tokens or any(t.startswith("persist_") and t != "persist_default" for t in tokens):
+        return None
+    levels = {t for t in tokens if t in ("default", "info", "debug", "off")}
+    if levels == {"default"}:
+        return "default"
+    if levels == {"info"}:
+        return "info"
+    return None
 
-    `level=DEFAULT persist=INFO` のような key=value / key: value 形式は全値が default のときだけ True。
-    項目名のない形式は（`Mode for '<subsystem>'` の前置きを除いて）`default` 単独のときだけ True。
-    level だけ既定で persist 等がカスタムの状態・空・解釈不能な出力は False（`--reset` がカスタム設定を消すため）。
+
+def before_state_kind(status: str) -> str | None:
+    """`log config --status` の出力から、変更前の状態と戻し方を決める（fail-closed。Issue #1402）。
+
+    - "default": 全行が既定と読める。戻しは `--mode level:default`（`--reset` は使わない）。key=value 形式は全値 default、実機（macOS 26）の
+      空白区切りトークン形式 `Mode for '<s>'  DEFAULT PERSIST_DEFAULT ...` はレベルが DEFAULT のとき。
+    - "info": 全行がトークン形式でレベル INFO かつ `PERSIST_DEFAULT`。戻しは `--mode level:info` でレベルだけ
+      元へ戻す。いずれも `--reset` は使わない（persist・`SIGNPOST_*`・`OVERSIZE_*` などレベル以外のカスタム設定を
+      消してしまうため）。レベルだけを変えるので、それらは残る。判定にも使わない。
+    - None: DEBUG・OFF、`PERSIST_DEFAULT` 以外、行ごとに種別が異なる、空・解釈不能。変更しない。
+    残る差: 明示設定の INFO と plist 由来の INFO は status 上同じに見える。どちらもレベルだけを INFO へ戻すため
+    レベルは復元されるが、plist 由来のときの「設定なし」状態そのものとは区別できない。最終的な安全網は
+    復元後の `--status` 全体を変更前と比べる確認（不一致は all_restored=False で終了コード 3。#1405）。
     """
-    lines = [ln.strip().lower() for ln in status.splitlines() if ln.strip()]
-    if not lines:
-        return False
-    for ln in lines:
-        pairs = re.findall(r"([a-z_-]+)\s*[=:]\s*([a-z_-]+)", ln)
-        if pairs:
-            if any(v != "default" for _, v in pairs):
-                return False
-            continue
-        rest = re.sub(r"^mode\s+for\s+('[^']*'|\S+)\s*:?\s*", "", ln).strip()
-        if rest != "default":
-            return False
-    return True
+    kinds = {_line_kind(ln.strip().lower()) for ln in status.splitlines() if ln.strip()}
+    if len(kinds) != 1:
+        return None
+    return kinds.pop()
+
+
+def status_is_all_default(status: str) -> bool:
+    """全行が既定と読めるときだけ True（`before_state_kind` が "default"。INFO は含まない）。"""
+    return before_state_kind(status) == "default"
 
 
 class SandboxLogConfig:
     """sandbox 関連 subsystem のログレベルを上げ、終了時（例外時も）必ず元へ戻す context manager（Issue #1402）。
 
     `measure.py` の seatbelt 分岐が、内側の実行より前に enter し、`log show` の後に exit する。
-    変更前が既定と確認できないとき（既存のカスタム設定・status 取得失敗）は何も変更せず中止する（`aborted`）。
-    復元は `--reset` の後に `--status` を取り、変更前と一致したときだけ restored=True にする。
+    変更前が "default" か "info"（`before_state_kind`）と確認できないとき（カスタム設定・status 取得失敗）は
+    何も変更せず中止する（`aborted`）。上げる操作も戻す操作もレベルだけを変える（`level:debug` /
+    変更前が default なら `level:default`、info なら `level:info`）。`--reset` は使わない（レベル以外の
+    カスタム設定を消すため）。いずれも戻した後に `--status` を取り、
+    変更前と全体一致したときだけ restored=True にする。
     `runner` は自己テストで差し替える（argv -> (rc, 出力)）。
     """
 
@@ -138,11 +169,14 @@ class SandboxLogConfig:
                 rc, out = None, ""
                 self.state["subsystems"][sub]["status_before_error"] = type(err).__name__
             self.state["subsystems"][sub].update(status_before_rc=rc, status_before=out)
-        # 変更前の設定を確実に既定と確認できたときだけ変更する。既存のカスタム設定は `--reset` で消えてしまうため、
+        # 変更前の設定を確実に既定と確認できたときだけ変更する。レベルだけを変える前提のため、
         # 既定以外・status 取得失敗は何も変更せず中止する（復元不能な変更をしない。Issue #1402）。
         bad = [sub for sub in LOG_CONFIG_SUBSYSTEMS
                if self.state["subsystems"][sub].get("status_before_rc") != 0
-               or not status_is_all_default(str(self.state["subsystems"][sub].get("status_before", "")))]
+               or before_state_kind(str(self.state["subsystems"][sub].get("status_before", ""))) is None]
+        for sub in LOG_CONFIG_SUBSYSTEMS:
+            self.state["subsystems"][sub]["before_kind"] = before_state_kind(
+                str(self.state["subsystems"][sub].get("status_before", "")))
         if bad:
             self.state["aborted"] = "log config before-state is not default or unreadable; no change made"
             return self
@@ -162,8 +196,9 @@ class SandboxLogConfig:
             return
         for sub in LOG_CONFIG_SUBSYSTEMS:
             entry = self.state["subsystems"].setdefault(sub, {})
+            action = "restore_info" if entry.get("before_kind") == "info" else "restore_default"
             try:
-                entry["restore_rc"] = self._run(log_config_argv("reset", sub))[0]
+                entry["restore_rc"] = self._run(log_config_argv(action, sub))[0]
             except Exception as err:  # noqa: BLE001 - 残りの subsystem の復元を続けるため
                 entry["restore_rc"] = None
                 entry["restore_error"] = type(err).__name__

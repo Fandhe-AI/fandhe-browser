@@ -49,14 +49,19 @@ class ArgvTest(unittest.TestCase):
         for sub in SUBS:
             self.assertEqual(seatbelt.log_config_argv("status", sub), [*BASE, "config", "--status", "--subsystem", sub])
             self.assertEqual(seatbelt.log_config_argv("raise", sub),
-                             [*BASE, "config", "--subsystem", sub, "--mode", "level:debug,persist:debug"])
-            self.assertEqual(seatbelt.log_config_argv("reset", sub), [*BASE, "config", "--subsystem", sub, "--reset"])
+                             [*BASE, "config", "--subsystem", sub, "--mode", "level:debug"])
+            self.assertEqual(seatbelt.log_config_argv("restore_default", sub),
+                             [*BASE, "config", "--subsystem", sub, "--mode", "level:default"])
+            self.assertEqual(seatbelt.log_config_argv("restore_info", sub),
+                             [*BASE, "config", "--subsystem", sub, "--mode", "level:info"])
 
     def test_log_config_rejects_unknown_values(self) -> None:
         with self.assertRaises(ValueError):
             seatbelt.log_config_argv("erase", SUBS[0])
         with self.assertRaises(ValueError):
-            seatbelt.log_config_argv("reset", "com.apple.other")
+            seatbelt.log_config_argv("reset", SUBS[0])
+        with self.assertRaises(ValueError):
+            seatbelt.log_config_argv("restore_default", "com.apple.other")
 
 
 class ValidateTest(unittest.TestCase):
@@ -87,9 +92,11 @@ class FakeLog:
         self.order, self.reset_rc, self.after_status, self.resetted = order, reset_rc, after_status, False
 
     def __call__(self, argv: list[str]) -> tuple[int, str]:
-        action = "status" if "--status" in argv else "reset" if "--reset" in argv else "raise"
+        assert "--reset" not in argv
+        action = ("status" if "--status" in argv else "restore" if argv[-1] in ("level:default", "level:info")
+                  else "raise")
         self.order.append(f"{action}:{argv[argv.index('--subsystem') + 1]}")
-        if action == "reset":
+        if action == "restore":
             self.resetted = True
             return self.reset_rc, ""
         if action == "status":
@@ -158,7 +165,7 @@ class RunModeTest(unittest.TestCase):
         data = self._run(sudo_log="config", order=order, log=FakeLog(order), denies={UDP_DEST: 1})
         a, b = SUBS
         self.assertEqual(order, [f"status:{a}", f"status:{b}", f"raise:{a}", f"raise:{b}", "run_argv",
-                                 "log_show_sudo", "log_show", f"reset:{a}", f"reset:{b}", f"status:{a}", f"status:{b}"])
+                                 "log_show_sudo", "log_show", f"restore:{a}", f"restore:{b}", f"status:{a}", f"status:{b}"])
         state = data["deny_log"]["log_config"]
         self.assertIs(state["all_restored"], True)
         self.assertEqual(state["subsystems"][a]["restore_rc"], 0)
@@ -167,14 +174,14 @@ class RunModeTest(unittest.TestCase):
         order: list[str] = []
         self._run(sudo_log="config", order=order, log=FakeLog(order), run_exc=True)
         a, b = SUBS
-        self.assertEqual(order[-4:], [f"reset:{a}", f"reset:{b}", f"status:{a}", f"status:{b}"])
+        self.assertEqual(order[-4:], [f"restore:{a}", f"restore:{b}", f"status:{a}", f"status:{b}"])
         self.assertNotIn("log_show_sudo", order)
 
     def test_restore_runs_when_log_show_fails(self) -> None:
         order: list[str] = []
         data = self._run(sudo_log="config", order=order, log=FakeLog(order),
                          status={"available": False, "reason": "log show rc=1 (sudo)"})
-        self.assertIn(f"reset:{SUBS[0]}", order)
+        self.assertIn(f"restore:{SUBS[0]}", order)
         self.assertEqual(data["deny_log"]["reason"], "log show rc=1 (sudo)")
         self.assertIs(data["deny_log"]["log_config"]["all_restored"], True)
 
@@ -240,9 +247,10 @@ class SandboxLogConfigTest(unittest.TestCase):
         calls: list[str] = []
 
         def runner(argv: list[str]) -> tuple[int, str]:
-            if "--reset" in argv:
-                calls.append(argv[-2])
-                if argv[-2] == SUBS[0]:
+            if argv[-1] == "level:default":
+                sub = argv[argv.index("--subsystem") + 1]
+                calls.append(sub)
+                if sub == SUBS[0]:
                     raise OSError("x")
             return 0, "default"
 
@@ -259,7 +267,8 @@ class AbortOnNonDefaultTest(unittest.TestCase):
         calls: list[str] = []
 
         def runner(argv: list[str]) -> tuple[int, str]:
-            calls.append("status" if "--status" in argv else "reset" if "--reset" in argv else "raise")
+            assert "--reset" not in argv
+            calls.append("status" if "--status" in argv else "reset" if argv[-1] == "level:default" else "raise")
             return 0, "Mode DEBUG custom"
 
         with seatbelt.SandboxLogConfig(runner) as cfg:
@@ -288,7 +297,8 @@ class StatusAllDefaultTest(unittest.TestCase):
         calls: list[str] = []
 
         def runner(argv: list[str]) -> tuple[int, str]:
-            calls.append("status" if "--status" in argv else "reset" if "--reset" in argv else "raise")
+            assert "--reset" not in argv
+            calls.append("status" if "--status" in argv else "reset" if argv[-1] == "level:default" else "raise")
             return 0, status
 
         with seatbelt.SandboxLogConfig(runner) as cfg:
@@ -311,31 +321,129 @@ class StatusAllDefaultTest(unittest.TestCase):
         for status in ("DEFAULT", "Mode for 'com.apple.sandbox' DEFAULT", "level=DEFAULT persist=DEFAULT"):
             self.assertTrue(seatbelt.status_is_all_default(status), status)
 
+    def test_real_macos_token_format_is_info_kind_not_default(self) -> None:
+        real = (
+            "Mode for 'com.apple.sandbox'  INFO PERSIST_DEFAULT SIGNPOST_PERSISTED_OFF SIGNPOST_ENABLED_ON "
+            "SIGNPOST_BACKTRACE_ENABLED_OFF OVERSIZE_ENABLED_OFF\n"
+            "Mode for 'com.apple.sandbox.reporting'  INFO PERSIST_DEFAULT SIGNPOST_PERSISTED_OFF "
+            "SIGNPOST_ENABLED_ON SIGNPOST_BACKTRACE_ENABLED_OFF OVERSIZE_ENABLED_ON\n"
+        )
+        self.assertEqual(seatbelt.before_state_kind(real), "info")
+        self.assertFalse(seatbelt.status_is_all_default(real))
+        self.assertEqual(seatbelt.before_state_kind("Mode for 'x'  DEFAULT PERSIST_DEFAULT SIGNPOST_ENABLED_ON"),
+                         "default")
+        self.assertIsNone(seatbelt.before_state_kind("Mode for 'a'  INFO PERSIST_DEFAULT\nMode for 'b'  DEFAULT PERSIST_DEFAULT"))
+
+    def test_token_format_non_default_is_rejected(self) -> None:
+        for status in ("Mode for 'x'  DEBUG PERSIST_DEFAULT", "Mode for 'x'  INFO PERSIST_DEBUG",
+                       "Mode for 'x'  OFF PERSIST_DEFAULT", "", "garbage text here"):
+            self.assertFalse(seatbelt.status_is_all_default(status), status)
+
+
+class RestoreByBeforeKindTest(unittest.TestCase):
+    """変更前の種別で戻し方を分ける（INFO はレベルだけ戻し `--reset` を呼ばない。Issue #1402）。"""
+
+    INFO = "Mode for 'x'  INFO PERSIST_DEFAULT SIGNPOST_ENABLED_ON OVERSIZE_ENABLED_ON"
+    DEFAULT = "Mode for 'x'  DEFAULT PERSIST_DEFAULT SIGNPOST_ENABLED_ON"
+
+    def _run(self, before: str, after: str) -> tuple[list[list[str]], dict[str, Any]]:
+        argvs: list[list[str]] = []
+        changed = [False]
+
+        def runner(argv: list[str]) -> tuple[int, str]:
+            argvs.append(argv)
+            if "--status" in argv:
+                return 0, after if changed[0] else before
+            changed[0] = True
+            return 0, ""
+
+        with seatbelt.SandboxLogConfig(runner) as cfg:
+            pass
+        return argvs, cfg.state
+
+    def test_info_before_restores_level_only_without_reset(self) -> None:
+        argvs, state = self._run(self.INFO, self.INFO)
+        changes = [a for a in argvs if "--status" not in a]
+        self.assertEqual([a[-2:] for a in changes],
+                         [["--mode", "level:debug"]] * 2 + [["--mode", "level:info"]] * 2)
+        self.assertFalse(any("--reset" in a for a in argvs))
+        self.assertIs(state["all_restored"], True)
+
+    def test_default_before_restores_level_default_without_reset(self) -> None:
+        # SIGNPOST_*・OVERSIZE_* がカスタムでも --reset で消さない（Codex P1）。
+        argvs, state = self._run(self.DEFAULT + " OVERSIZE_ENABLED_ON", self.DEFAULT + " OVERSIZE_ENABLED_ON")
+        changes = [a for a in argvs if "--status" not in a]
+        self.assertEqual([a[-1] for a in changes], ["level:debug"] * 2 + ["level:default"] * 2)
+        self.assertFalse(any("--reset" in a for a in argvs))
+        self.assertIs(state["all_restored"], True)
+
+    def test_status_mismatch_after_restore_is_not_restored(self) -> None:
+        _, state = self._run(self.INFO, self.INFO.replace("OVERSIZE_ENABLED_ON", "OVERSIZE_ENABLED_OFF"))
+        self.assertIs(state["all_restored"], False)
+
+
+class _FakePipe:
+    """`_TimedLineReader` の `select.select` と `os.read` を差し替える偽のパイプ（OS 非依存）。
+
+    Windows の `select` はパイプの fd に使えない（WinError 10038）ため、実パイプではなくこの偽物で
+    期限・行分割の契約を全 OS で検証する。`clock` は `time.monotonic` の代わりで、`select` の待ちで進める。
+    """
+
+    def __init__(self, chunks: list[bytes], eof: bool = False) -> None:
+        self.chunks = list(chunks)
+        self.eof = eof
+        self.now = 1000.0
+        self.selects = 0
+
+    def clock(self) -> float:
+        return self.now
+
+    def select(self, rlist: list[int], _w: list[int], _x: list[int], timeout: float) -> tuple[list[int], list, list]:
+        self.selects += 1
+        if self.chunks or self.eof:
+            return rlist, [], []
+        self.now += timeout  # 読めるものが無ければ待ち時間ぶん時計を進める（実時間は待たない）
+        return [], [], []
+
+    def read(self, _fd: int, _n: int) -> bytes:
+        if self.chunks:
+            return self.chunks.pop(0)
+        return b""
+
 
 class TimedReaderTest(unittest.TestCase):
+    def _reader(self, fake: _FakePipe, budget: float) -> Any:
+        stack = mock.patch.multiple(measure, select=SimpleNamespace(select=fake.select))
+        stack.start()
+        self.addCleanup(stack.stop)
+        for target, repl in (("measure.os.read", fake.read), ("measure.time.monotonic", fake.clock)):
+            patcher = mock.patch(target, repl)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        return measure._TimedLineReader(SimpleNamespace(fileno=lambda: 7), fake.clock() + budget)
+
     def test_deadline_returns_eof_when_pipe_stays_open(self) -> None:
-        r, w = os.pipe()
-        try:
-            stream = SimpleNamespace(fileno=lambda: r)
-            reader = measure._TimedLineReader(stream, measure.time.monotonic() + 0.3)
-            os.write(w, b"a\nbb")
-            self.assertEqual(reader.readline(100), b"a\n")
-            self.assertEqual(reader.readline(100), b"")
-            self.assertIs(reader.timed_out, True)
-        finally:
-            os.close(r)
-            os.close(w)
+        fake = _FakePipe([b"a\nbb"])
+        reader = self._reader(fake, 0.3)
+        self.assertEqual(reader.readline(100), b"a\n")
+        self.assertEqual(reader.readline(100), b"")
+        self.assertIs(reader.timed_out, True)
+        self.assertEqual(reader.readline(100), b"")  # 期限後は残り（b"bb"）を返さず EOF 扱いのまま
 
     def test_long_line_is_split_at_limit(self) -> None:
-        r, w = os.pipe()
-        try:
-            reader = measure._TimedLineReader(SimpleNamespace(fileno=lambda: r), measure.time.monotonic() + 5)
-            os.write(w, b"abcdef\n")
-            self.assertEqual(reader.readline(4), b"abcd")
-            self.assertEqual(reader.readline(4), b"ef\n")
-        finally:
-            os.close(r)
-            os.close(w)
+        fake = _FakePipe([b"abcdef\n"])
+        reader = self._reader(fake, 5)
+        self.assertEqual(reader.readline(4), b"abcd")
+        self.assertEqual(reader.readline(4), b"ef\n")
+        self.assertIs(reader.timed_out, False)
+
+    def test_eof_returns_remaining_then_empty(self) -> None:
+        fake = _FakePipe([b"x\ny"], eof=True)
+        reader = self._reader(fake, 5)
+        self.assertEqual(reader.readline(100), b"x\n")
+        self.assertEqual(reader.readline(100), b"y")
+        self.assertEqual(reader.readline(100), b"")
+        self.assertIs(reader.timed_out, False)
 
 
 class StopOrderTest(unittest.TestCase):
