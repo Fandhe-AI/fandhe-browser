@@ -36,6 +36,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+from collections.abc import Mapping
 from typing import Any
 
 PROFILE_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{1,63}$")
@@ -209,11 +210,26 @@ def build_environment_block(env: dict[str, str]) -> str:
     return "".join(parts) + "\0"
 
 
-def container_env(staging_tmp: str, system_root: str | None) -> dict[str, str]:
-    """容器へ渡す環境変数（許可リスト）。`PATH`・`*_PROXY`・ユーザー由来の変数は渡さない（`SEC-2`）。"""
+# ホストから値を写す変数（仮説・未検証）。AppContainer で CreateProcessW を呼ぶと kernelbase が環境ブロックを
+# 容器向けに書き換える（LOCALAPPDATA・TEMP・TMP をコンテナフォルダへ向け直す）とみられ、LOCALAPPDATA 等が
+# ブロックに無いと ERROR_ENVVAR_NOT_FOUND(203) で失敗した（run 41284448458・#1396）。いずれもシステムの
+# パス・アカウント名で、秘密でも経路制御でもない。値が無い変数は渡さない。
+HOST_PATH_ENV_NAMES = ("LOCALAPPDATA", "USERPROFILE", "APPDATA", "HOMEDRIVE", "HOMEPATH", "USERNAME")
+
+
+def container_env(staging_tmp: str, system_root: str | None,
+                  host_env: Mapping[str, str] | None = None) -> dict[str, str]:
+    """容器へ渡す環境変数（許可リスト）。`PATH`・`*_PROXY` は渡さない（`SEC-2`）。
+
+    `host_env` から `HOST_PATH_ENV_NAMES` のうち値が空でないものだけを写す（理由は上記コメント）。
+    """
     env = {"TMP": staging_tmp, "TEMP": staging_tmp, "PYTHONIOENCODING": "utf-8"}
     if system_root:
         env["SystemRoot"] = system_root
+    for name in HOST_PATH_ENV_NAMES:
+        value = (host_env or {}).get(name)
+        if value and "\0" not in value:
+            env[name] = value
     return env
 
 
@@ -511,8 +527,10 @@ class AppContainerSession:
         staging = self._need_staging()
         argv = [self.python_path, "-I", "-B", self.script_path(script_rel), *script_args]
         cmd = ctypes.create_unicode_buffer(command_line(argv))
+        env_map = container_env(str(staging / "tmp"), os.environ.get("SystemRoot"), os.environ)
+        result["env_names"] = sorted(env_map)  # 診断用。名前だけを記録し値は記録しない
         env_block = ctypes.create_unicode_buffer(
-            build_environment_block(container_env(str(staging / "tmp"), os.environ.get("SystemRoot"))), )
+            build_environment_block(env_map), )
         stderr_path = staging / "stderr.txt"
         keep: list[Any] = []  # ctypes の参照を属性リストの生存期間中保持する
         files: list[Any] = []

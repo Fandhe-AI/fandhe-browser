@@ -69,6 +69,18 @@ class PureFunctionsTest(unittest.TestCase):
         self.assertNotIn("PATH", env)
         self.assertEqual(sorted(ac.container_env("C:\\s\\tmp", None)), ["PYTHONIOENCODING", "TEMP", "TMP"])
 
+    def test_container_env_copies_host_path_vars_only_when_set(self) -> None:
+        host = {"LOCALAPPDATA": "C:\\Users\\u\\AppData\\Local", "USERPROFILE": "C:\\Users\\u", "USERNAME": "u",
+                "APPDATA": "", "PATH": "C:\\bin", "HTTP_PROXY": "http://p:1", "HTTPS_PROXY": "http://p:1"}
+        env = ac.container_env("C:\\s\\tmp", "C:\\Windows", host)
+        self.assertEqual(sorted(env), ["LOCALAPPDATA", "PYTHONIOENCODING", "SystemRoot", "TEMP", "TMP",
+                                       "USERNAME", "USERPROFILE"])
+        self.assertEqual(env["LOCALAPPDATA"], "C:\\Users\\u\\AppData\\Local")
+        self.assertEqual(env["USERPROFILE"], "C:\\Users\\u")
+        self.assertEqual(env["TMP"], "C:\\s\\tmp")
+        for banned in ("PATH", "HTTP_PROXY", "HTTPS_PROXY", "APPDATA"):
+            self.assertNotIn(banned, env)
+
     def test_command_line_quotes_with_list2cmdline(self) -> None:
         self.assertEqual(ac.command_line(["C:\\a b\\python.exe", "-I", "x.py", "--p", "4000"]),
                          '"C:\\a b\\python.exe" -I x.py --p 4000')
