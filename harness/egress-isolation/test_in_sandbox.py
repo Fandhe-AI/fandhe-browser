@@ -502,6 +502,42 @@ class MakePrivateWorkdirTest(unittest.TestCase):
                 self.assertNotIn("Brien", out)
                 self.assertNotIn("O'", out)
 
+    def test_describe_error_masks_delimited_element_with_quotes_and_spaces(self) -> None:
+        # 環境の利用者名は無関係な値にし、パス規則だけで伏せられることを見る
+        env = {"USER": "unrelated-account"}
+        with mock.patch.dict(in_sandbox.os.environ, env, clear=True), \
+                mock.patch.object(in_sandbox.getpass, "getuser", return_value="unrelated-account"):
+            for raw, want in [("/home/O' Brien/cache", "/home/<user>/cache"),
+                              ("/home/O''Brien/cache", "/home/<user>/cache"),
+                              ("C:\\Users\\O' Brien\\x", "C:\\Users\\<user>\\x")]:
+                with self.subTest(raw=raw):
+                    out = in_sandbox.describe_error(OSError(raw))
+                    self.assertEqual(out, f"OSError: {want}")
+                    self.assertNotIn("Brien", out)
+
+    def test_known_user_name_is_replaced_even_without_trailing_separator(self) -> None:
+        env = {"USER": "O' Brien"}
+        with mock.patch.dict(in_sandbox.os.environ, env, clear=True), \
+                mock.patch.object(in_sandbox.getpass, "getuser", side_effect=OSError("no user")):
+            self.assertEqual(in_sandbox.describe_error(OSError("open /home/O' Brien")), "OSError: open /home/<user>")
+            # repr 形式（`'` が `\'` にエスケープされる）
+            out = in_sandbox.describe_error(PermissionError(13, "denied", "O' Brien"))
+            self.assertEqual(out, "PermissionError: [Errno 13] denied: \"<user>\"")
+            out = in_sandbox.describe_error(OSError("path 'x\\'O\\' Brien' end"))
+            self.assertNotIn("Brien", out)
+
+    def test_known_user_names_collects_env_sources_longest_first(self) -> None:
+        env = {"USERNAME": "al", "USER": "alice", "LOGNAME": "x", "USERPROFILE": "C:\\Users\\bobby\\",
+               "HOME": "/home/carol"}
+        with mock.patch.dict(in_sandbox.os.environ, env, clear=True), \
+                mock.patch.object(in_sandbox.getpass, "getuser", return_value="dave"):
+            self.assertEqual(in_sandbox.known_user_names(), ["alice", "bobby", "carol", "dave", "al"])
+
+    def test_known_user_names_ignores_getuser_failure(self) -> None:
+        with mock.patch.dict(in_sandbox.os.environ, {}, clear=True), \
+                mock.patch.object(in_sandbox.getpass, "getuser", side_effect=KeyError("x")):
+            self.assertEqual(in_sandbox.known_user_names(), [])
+
     def test_describe_error_masks_apostrophe_username_in_repr_form(self) -> None:
         exc = PermissionError(13, "Access is denied", "C:\\Users\\O'Brien\\AppData\\x")
         out = in_sandbox.describe_error(exc)

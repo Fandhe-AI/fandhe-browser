@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import errno
+import getpass
 import http.server
 import json
 import os
@@ -167,18 +168,49 @@ def describe_error(exc: BaseException) -> str:
     return f"{type(exc).__name__}: {mask_identity(str(exc))[:ERROR_DETAIL_MAX]}"
 
 
-# ユーザー名の要素は次のパス区切り・改行・行末までを全部伏せる（空白入りの名前も対象。長さ上限は ReDoS 対策）。
+# パス規則（補助・未知の名前用）。`Users` / `home` 直下の要素は、256 文字以内に後続のパス区切りがあれば
+# その区切りまでの全文字（空白・引用符を含む。改行は除く）を伏せる。区切りの無い末尾要素だけ、引用符を考慮する:
 # 引用符は直後が行末・空白・`),;:`・引用符・区切りのときだけ終端（メッセージを囲む引用符）で、
-# それ以外（`O'Brien` の `'B`）は名前の一部として含める。
-_USER_PATH_RE = re.compile(r"(?i)((?:[A-Za-z]:)?[\\/]+(?:Users|home)[\\/]+)(?:[^\\/\r\n'\"]|['\"](?=[^\s),;:'\"\\/])){1,256}")
+# それ以外（`O'Brien` の `'B`）は名前の一部として含める。長さ上限は ReDoS 対策。
+_USER_PATH_RE = re.compile(
+    r"(?i)((?:[A-Za-z]:)?[\\/]+(?:Users|home)[\\/]+)"
+    r"(?:[^\\/\r\n]{1,256}(?=[\\/])"
+    r"|(?:[^\\/\r\n'\"]|['\"](?=[^\s),;:'\"\\/])){1,256})")
 _SID_RE = re.compile(r"\bS-1-\d+(?:-\d+)+\b", re.IGNORECASE)
+KNOWN_NAME_MIN_LEN = 2  # 1 文字名は誤置換が多いためパス規則に任せる
+KNOWN_NAME_MAX_LEN = 256
+
+
+def known_user_names() -> list[str]:
+    """実行環境から得られる利用者名の候補（長い順）。取得に失敗した源は黙って飛ばす（Issue #1402・P3-a）。
+
+    `USERNAME`・`USER`・`LOGNAME`、`USERPROFILE`・`HOME` の basename、`getpass.getuser()` を使う。
+    `Public` / `runner` 等の汎用名も置換対象にする（漏えい防止を優先）。
+    """
+    cands: list[str] = []
+    for key in ("USERNAME", "USER", "LOGNAME"):
+        cands.append(os.environ.get(key, ""))
+    for key in ("USERPROFILE", "HOME"):
+        cands.append(re.split(r"[\\/]+", os.environ.get(key, "").rstrip("\\/"))[-1])
+    try:
+        cands.append(getpass.getuser())
+    except (OSError, KeyError, ImportError, ValueError):
+        pass
+    names = {c for c in cands if KNOWN_NAME_MIN_LEN <= len(c) <= KNOWN_NAME_MAX_LEN and "\0" not in c}
+    return sorted(names, key=lambda n: (-len(n), n))
 
 
 def mask_identity(text: str) -> str:
-    """`Users` / `home` 直下のユーザー名を `<user>`、SID（`S-1-...`）を `<sid>` に置換する（Issue #1402・P3-a）。
+    """利用者名を `<user>`、SID（`S-1-...`）を `<sid>` に置換する（Issue #1402・P3-a）。
+
+    1. 既知の利用者名（`known_user_names`）の完全一致を、そのままの形と repr の `'` → `\\'` 形の両方で長い順に置換
+    2. 上記で拾えない名前向けに、`Users` / `home` 直下の要素をパス規則（`_USER_PATH_RE`）で置換
 
     例外型名・errno・winerror・パスの残りの構造は変えない。マスク後に上限で切るため、切断で名前が復活しない。
     """
+    for name in known_user_names():
+        for form in sorted({name.replace("'", "\\'"), name}, key=lambda f: -len(f)):
+            text = text.replace(form, "<user>")
     return _SID_RE.sub("<sid>", _USER_PATH_RE.sub(r"\1<user>", text))
 
 
