@@ -478,8 +478,8 @@ class MakePrivateWorkdirTest(unittest.TestCase):
             ("/Users/Alice Smith/x", "/Users/<user>/x"),
             ("/home/a b/x", "/home/<user>/x"),
             ("C:\\Users\\Alice Smith", "C:\\Users\\<user>"),
-            ("'C:\\Users\\Alice Smith'", "'C:\\Users\\<user>'"),
-            ("\"/home/Alice Smith\" failed", "\"/home/<user>\" failed"),
+            ("'C:\\Users\\Alice Smith'", "'C:\\Users\\<user>"),
+            ("\"/home/Alice Smith\" failed", "\"/home/<user>"),
         ]
         for raw, want in cases:
             with self.subTest(raw=raw):
@@ -492,7 +492,7 @@ class MakePrivateWorkdirTest(unittest.TestCase):
         cases = [
             ("C:\\Users\\O'Brien\\AppData\\x", "C:\\Users\\<user>\\AppData\\x"),
             ("/home/O'Brien/x", "/home/<user>/x"),
-            ("'C:\\Users\\O'Brien'", "'C:\\Users\\<user>'"),
+            ("'C:\\Users\\O'Brien'", "'C:\\Users\\<user>"),
             ("C:\\Users\\'Brien\\x", "C:\\Users\\<user>\\x"),
         ]
         for raw, want in cases:
@@ -549,6 +549,30 @@ class MakePrivateWorkdirTest(unittest.TestCase):
         out = self.mask_with_user("Ali", "C:\\Users\\Alice\\x and Alice")
         self.assertEqual(out, "C:\\Users\\<user>\\x and Alice")
         self.assertNotIn("<user>ce", out)
+
+    def test_path_rule_masks_whole_element_even_for_known_name_prefix(self) -> None:
+        cases = [("/home/Alice Smith/cache", "/home/<user>/cache"),
+                 ("C:\\Users\\Alice.Smith\\AppData\\x", "C:\\Users\\<user>\\AppData\\x"),
+                 ("/home/Alice-Smith/x", "/home/<user>/x")]
+        for raw, want in cases:
+            with self.subTest(raw=raw):
+                out = self.mask_with_user("Alice", raw)
+                self.assertEqual(out, want)
+                self.assertNotIn("Smith", out)
+
+    def test_trailing_element_is_masked_to_end_of_line(self) -> None:
+        out = self.mask_with_user("unrelated", "'C:\\Users\\O' Brien'")
+        self.assertEqual(out, "'C:\\Users\\<user>")
+        self.assertNotIn("Brien", out)
+        self.assertEqual(self.mask_with_user("unrelated", "a /home/x y z\nnext line"), "a /home/<user>\nnext line")
+
+    def test_text_before_the_path_is_kept(self) -> None:
+        out = self.mask_with_user("unrelated", "[WinError 5] Access is denied: 'C:\\Users\\bob smith\\x'")
+        self.assertEqual(out, "[WinError 5] Access is denied: 'C:\\Users\\<user>\\x'")
+        exc = PermissionError(13, "Access is denied", "/home/a b")
+        with mock.patch.dict(in_sandbox.os.environ, {}, clear=True), \
+                mock.patch.object(in_sandbox.getpass, "getuser", side_effect=OSError("n")):
+            self.assertEqual(in_sandbox.describe_error(exc), "PermissionError: [Errno 13] Access is denied: '/home/<user>")
 
     def test_known_user_names_collects_env_sources_longest_first(self) -> None:
         env = {"USERNAME": "al", "USER": "alice", "LOGNAME": "x", "USERPROFILE": "C:\\Users\\bobby\\",
