@@ -49,8 +49,10 @@ class ArgvTest(unittest.TestCase):
         for sub in SUBS:
             self.assertEqual(seatbelt.log_config_argv("status", sub), [*BASE, "config", "--status", "--subsystem", sub])
             self.assertEqual(seatbelt.log_config_argv("raise", sub),
-                             [*BASE, "config", "--subsystem", sub, "--mode", "level:debug,persist:debug"])
+                             [*BASE, "config", "--subsystem", sub, "--mode", "level:debug"])
             self.assertEqual(seatbelt.log_config_argv("reset", sub), [*BASE, "config", "--subsystem", sub, "--reset"])
+            self.assertEqual(seatbelt.log_config_argv("restore_info", sub),
+                             [*BASE, "config", "--subsystem", sub, "--mode", "level:info"])
 
     def test_log_config_rejects_unknown_values(self) -> None:
         with self.assertRaises(ValueError):
@@ -311,19 +313,63 @@ class StatusAllDefaultTest(unittest.TestCase):
         for status in ("DEFAULT", "Mode for 'com.apple.sandbox' DEFAULT", "level=DEFAULT persist=DEFAULT"):
             self.assertTrue(seatbelt.status_is_all_default(status), status)
 
-    def test_real_macos_token_format_is_default(self) -> None:
+    def test_real_macos_token_format_is_info_kind_not_default(self) -> None:
         real = (
             "Mode for 'com.apple.sandbox'  INFO PERSIST_DEFAULT SIGNPOST_PERSISTED_OFF SIGNPOST_ENABLED_ON "
             "SIGNPOST_BACKTRACE_ENABLED_OFF OVERSIZE_ENABLED_OFF\n"
             "Mode for 'com.apple.sandbox.reporting'  INFO PERSIST_DEFAULT SIGNPOST_PERSISTED_OFF "
             "SIGNPOST_ENABLED_ON SIGNPOST_BACKTRACE_ENABLED_OFF OVERSIZE_ENABLED_ON\n"
         )
-        self.assertTrue(seatbelt.status_is_all_default(real))
+        self.assertEqual(seatbelt.before_state_kind(real), "info")
+        self.assertFalse(seatbelt.status_is_all_default(real))
+        self.assertEqual(seatbelt.before_state_kind("Mode for 'x'  DEFAULT PERSIST_DEFAULT SIGNPOST_ENABLED_ON"),
+                         "default")
+        self.assertIsNone(seatbelt.before_state_kind("Mode for 'a'  INFO PERSIST_DEFAULT\nMode for 'b'  DEFAULT PERSIST_DEFAULT"))
 
     def test_token_format_non_default_is_rejected(self) -> None:
         for status in ("Mode for 'x'  DEBUG PERSIST_DEFAULT", "Mode for 'x'  INFO PERSIST_DEBUG",
                        "Mode for 'x'  OFF PERSIST_DEFAULT", "", "garbage text here"):
             self.assertFalse(seatbelt.status_is_all_default(status), status)
+
+
+class RestoreByBeforeKindTest(unittest.TestCase):
+    """変更前の種別で戻し方を分ける（INFO はレベルだけ戻し `--reset` を呼ばない。Issue #1402）。"""
+
+    INFO = "Mode for 'x'  INFO PERSIST_DEFAULT SIGNPOST_ENABLED_ON OVERSIZE_ENABLED_ON"
+    DEFAULT = "Mode for 'x'  DEFAULT PERSIST_DEFAULT SIGNPOST_ENABLED_ON"
+
+    def _run(self, before: str, after: str) -> tuple[list[list[str]], dict[str, Any]]:
+        argvs: list[list[str]] = []
+        changed = [False]
+
+        def runner(argv: list[str]) -> tuple[int, str]:
+            argvs.append(argv)
+            if "--status" in argv:
+                return 0, after if changed[0] else before
+            changed[0] = True
+            return 0, ""
+
+        with seatbelt.SandboxLogConfig(runner) as cfg:
+            pass
+        return argvs, cfg.state
+
+    def test_info_before_restores_level_only_without_reset(self) -> None:
+        argvs, state = self._run(self.INFO, self.INFO)
+        changes = [a for a in argvs if "--status" not in a]
+        self.assertEqual([a[-2:] for a in changes],
+                         [["--mode", "level:debug"]] * 2 + [["--mode", "level:info"]] * 2)
+        self.assertFalse(any("--reset" in a for a in argvs))
+        self.assertIs(state["all_restored"], True)
+
+    def test_default_before_uses_reset(self) -> None:
+        argvs, state = self._run(self.DEFAULT, self.DEFAULT)
+        changes = [a for a in argvs if "--status" not in a]
+        self.assertEqual([a[-1] for a in changes], ["level:debug"] * 2 + ["--reset"] * 2)
+        self.assertIs(state["all_restored"], True)
+
+    def test_status_mismatch_after_restore_is_not_restored(self) -> None:
+        _, state = self._run(self.INFO, self.INFO.replace("OVERSIZE_ENABLED_ON", "OVERSIZE_ENABLED_OFF"))
+        self.assertIs(state["all_restored"], False)
 
 
 class TimedReaderTest(unittest.TestCase):
