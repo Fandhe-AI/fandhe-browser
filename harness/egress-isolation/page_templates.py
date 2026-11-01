@@ -45,10 +45,9 @@ _PAGES: dict[str, str] = {
 # 失敗経路のビーコン（macOS・Windows のページだけ。Issue #1395）。許可オリジンへの同一オリジン相対 GET で、
 # 許可外宛先への要求が失敗したコールバック（onerror / catch）の中でだけ送る。ブラウザが要求を発行して失敗した
 # 後にしか走らないため、プロセス監視の無い OS で「試行した」ことの根拠になる（推論であり直接の観測ではない）。
-# `redirect_fetch` は 302 を追従する fetch の補足用で、判定には使わない（トップレベルの redirect とは別の要求）。
-BEACON_ROUTES = ("img", "fetch", "ws", "internal", "redirect_fetch")
+# redirect にはビーコンを付けない（補足用の fetch は同じ宛先へ接続し拒否ログ・件数に混ざるため置かない）。
+BEACON_ROUTES = ("img", "fetch", "ws", "internal")
 BEACON_PREFIX = "/beacon/"
-REDIRECT_PROBE_PATH = "/redirect-probe"
 
 
 def _beacon(route: str) -> str:
@@ -73,11 +72,6 @@ _BEACON_PAGES: dict[str, str] = {
         "<!doctype html><html><body><script>"
         f"fetch('http://{judge.HOST_INTERNAL_STANDIN}:$p_internal/internal')"
         f".catch(function(){{{_beacon('internal')}}});"
-        "</script></body></html>"
-    ),
-    REDIRECT_PROBE_PATH: (
-        "<!doctype html><html><body><script>"
-        f"fetch('/redirect-out').catch(function(){{{_beacon('redirect_fetch')}}});"
         "</script></body></html>"
     ),
 }

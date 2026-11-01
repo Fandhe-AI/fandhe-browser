@@ -433,10 +433,6 @@ def run(args: argparse.Namespace, ports: dict[str, int]) -> dict[str, Any]:
             time.sleep(SETTLE_S)
             host_pids |= descendant_pids(proc.pid)  # 子プロセスを後から起こす場合も拾う（拒否ログの帰属用）
             result["host_pids"] = sorted(host_pids)
-            if literal and r == "redirect":
-                # 302 を追従する fetch の補足ビーコン（判定には使わない。Issue #1395）。
-                load_route(chan, next_id, info, base + fixtures.REDIRECT_PROBE_PATH)
-                time.sleep(SETTLE_S)
             guard_polls[r] = (guard.snapshot_polls() - polls_before) if guard is not None else 0  # 経路ごとに完了した走査の回数
         result["loads"] = loads
         result["guard_polls"] = guard_polls

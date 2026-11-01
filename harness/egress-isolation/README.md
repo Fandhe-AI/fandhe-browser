@@ -104,7 +104,7 @@ macOS・Windows の GitHub ホステッドランナー。結果は #1003 に記�
     宛先を取れた行・pid の帰属で除外した行・帰属した行。`deny_log.diagnostics`）を記録する。内側ランナー自身の UDP
     プローブが拒否されたのに拒否ログに無いときは自己検査が不成立（`deny_log.available=false`）となり、拒否ログを根拠にしない。
   - `redirect`（トップレベルの 302）はページの JS が走らずビーコンを付けられない。根拠は拒否ログだけで、得られなければ
-    `unobservable`（理由は結果の `reason`）。302 を追従する fetch の失敗ビーコン（`redirect_fetch`）は補足として記録するが判定には使わない。
+    `unobservable`（理由は結果の `reason`）。redirect にはビーコンを付けない（補足用 fetch が同じ宛先へ接続し拒否ログ・件数に混ざるため）。
   - `udp_direct` は `sendto` が拒否された errno。
   - Servo ホスト側の接続試行ログ（`egress_guard` 相当）は採らない。`egress_guard` は `/proc/net` を走査する Linux 専用で、
     macOS では connect が syscall で拒否されソケットが現れない。`servo-host/src` に接続試行のログも無く、追加には Servo の

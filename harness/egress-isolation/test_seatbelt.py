@@ -272,13 +272,13 @@ class BeaconTest(unittest.TestCase):
         for path, route in (("/fetch", "fetch"), ("/internal", "internal")):
             self.assertIn(f".catch(function(){{new Image().src='/beacon/{route}';}})", pages[path])
         self.assertIn("w.onerror=function(){new Image().src='/beacon/ws';}", pages["/ws"])
-        self.assertIn("/beacon/redirect_fetch", pages[page_templates.REDIRECT_PROBE_PATH])
+        self.assertNotIn("/redirect-probe", pages)
+        self.assertNotIn("redirect_fetch", "".join(pages.values()))
         for body in pages.values():
             self.assertNotIn("$", body)
 
     def test_default_pages_have_no_beacon(self) -> None:
         pages = page_templates.build_pages(PORTS)
-        self.assertNotIn(page_templates.REDIRECT_PROBE_PATH, pages)
         self.assertFalse(any("beacon" in body for body in pages.values()))
 
 
