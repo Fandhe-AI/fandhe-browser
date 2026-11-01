@@ -294,8 +294,12 @@ class WildcardDenyTest(unittest.TestCase):
     def test_collect_denies_uses_known_dests_context_for_wildcard(self) -> None:
         import io
         import os
+        from types import SimpleNamespace
         from unittest import mock
 
+        # Windows の select はパイプの fd に使えない（WinError 10038）ため、常に読み取り可能として返す偽物へ
+        # 差し替え、全 OS で同じ検証を走らせる（実パイプからの os.read は Windows でも動く）。
+        fake_select = SimpleNamespace(select=lambda rl, _w, _x, _t: (list(rl), [], []))
         r, w = os.pipe()
         os.write(w, (_record(WILD.format(port=2001)) + "\n").encode())
         os.close(w)
@@ -309,7 +313,8 @@ class WildcardDenyTest(unittest.TestCase):
 
         tok = measure._KNOWN_DESTS.set(("127.0.0.2:2001", "127.0.0.2:2006"))
         try:
-            with mock.patch.object(measure.subprocess, "Popen", lambda *a, **k: P()):
+            with mock.patch.object(measure.subprocess, "Popen", lambda *a, **k: P()), \
+                    mock.patch.object(measure, "select", fake_select):
                 counts, status = measure.collect_denies("2026-11-01 00:00:00", frozenset({101}))
         finally:
             measure._KNOWN_DESTS.reset(tok)
