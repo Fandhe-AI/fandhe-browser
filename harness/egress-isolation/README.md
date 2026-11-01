@@ -103,6 +103,12 @@ macOS・Windows の GitHub ホステッドランナー。結果は #1003 に記�
   - サンドボックス拒否ログ（TCP 経路の唯一の根拠。`log show`）: 取りこぼしの原因を切り分けるため、診断カウンタ（読んだ行・JSON 行・拒否行・
     宛先を取れた行・pid の帰属で除外した行・帰属した行。`deny_log.diagnostics`）を記録する。あわせて形式の確認用に、対象 pid に帰属する `deny(` 行で正規表現に一致しなかったものの「形」だけを最大 16 件（プロセス名・pid・パス・外部 IP・クエリは `<proc>`・`<pid>`・`<path>`・`<ipv4>`・`<redacted>` に置換。127.0.0.0/8 の宛先は実値）と、pid 帰属で除外した行の `{pid, dest}` を最大 8 件（本文は保存しない。127.0.0.0/8 以外の dest は `<ipv4>:port`）記録する。無関係なプロセスの不一致行は件数（`unmatched_deny_unattributed`）だけ。内側ランナー自身の UDP
     プローブが拒否されたのに拒否ログに無いときは自己検査が不成立（`deny_log.available=false`）となり、拒否ログを根拠にしない。
+    macOS 26 の拒否ログは宛先アドレスを `*` で出す形式（`deny(1) network-outbound <語>:*:<port>`。実測 xos-measure run 41305443526）もある。
+    既存の IPv4 形式は変えず、この形式は「pid が対象 pid に含まれ、かつポートがこの run の既知の宛先ポート集合で一意」のときだけその宛先へ帰属させる
+    （IPv4 形式より厳しい結合条件。判定ロジックは変えない）。既知集合に無いポートは `wildcard_unknown_port`、複数の宛先が共有するポートは帰属させず
+    （unobservable 側）`wildcard_ambiguous_port`・`wildcard_ambiguous_ports` に残す。宛先ごとの一致形式は `deny_log.diagnostics.match_kind`
+    （`ip:port` / `*:port` の件数）、この形式で観測した経路は `deny_log.wildcard_routes` と verdict の `method` に出る。
+    形のサンプルは `network-outbound` 直後の宛先トークン末尾のポート数字（1〜5 桁）と `*` を保持する（ポートは記録範囲の ip:port の内）。英字語は `a` 形のまま。
   - 拒否ログが使えない（自己検査の不成立・取りこぼし）TCP 経路は、ビーコンがあっても `unobservable`（理由は結果の `reason`）。
     したがって「Servo の事前ブロックではなく遮断された」ことは拒否ログの試行でのみ示す。
   - `udp_direct` は `sendto` が拒否された errno。

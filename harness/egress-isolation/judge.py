@@ -214,7 +214,7 @@ def judge_all(
     mode: str, inner: dict[str, Any], outer_counts: dict[str, int], control_counts: dict[str, int],
     binary_match: bool = True, mode_unavailable: str | None = None,
     loopback_confound: str | None = LOOPBACK_PREFLIGHT_MISSING_REASON,
-    deny_log_reason: str | None = None,
+    deny_log_reason: str | None = None, wildcard_routes: frozenset[str] = frozenset(),
 ) -> dict[str, dict[str, Any]]:
     """内側ランナーの結果 JSON と外側の件数から、隔離モードの全経路を判定する。
 
@@ -255,6 +255,10 @@ def judge_all(
         if not monitor_required:
             method = ("outer listener receipt + sandbox deny log / errno "
                       "(no process-level egress monitor on this OS)")
+            if route in wildcard_routes:
+                # macOS 26 の拒否ログは宛先アドレスを `*` で出す。判定ロジックは変えず、帰属の根拠だけを明示する（Issue #1402）。
+                method += ("; the OS log reports the address as '*', so attribution relies on the ephemeral "
+                           "listener port and the host pid")
         if mode == "appcontainer":
             method = ("outer listener receipt + in-container errno (no process-level monitor; "
                       "loopback confound checked by capability contrast)")

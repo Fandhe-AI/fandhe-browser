@@ -55,6 +55,15 @@ MAX_UNMATCHED_SAMPLES = 16
 MAX_PID_EXCLUDED_SAMPLES = 8
 MAX_SAMPLE_LEN = 300
 _DENY_RE = re.compile(r"(?:\((\d+)\)\s+)?deny\(\d+\) network-outbound (\d{1,3}(?:\.\d{1,3}){3}):(\d{1,5})\b")
+# macOS 26 の追加形式（Issue #1402・実測 xos-measure run 41305443526）。OS が宛先アドレスを `*` で出し、
+# 残る宛先情報はポートだけ（例 `deny(1) network-outbound inet4x:*:2001`。英字語は伏字化で不明のため依存しない）。
+# 上の `_DENY_RE`（IPv4 形式）は変えない。この形式は pid と既知ポート集合の両方を満たすときだけ帰属させる。
+_DENY_WILDCARD_RE = re.compile(
+    r"(?:\((\d+)\)\s+)?deny\(\d+\) network-outbound (?:[A-Za-z0-9]{1,16}:)?\*:(\d{1,5})\b")
+MATCH_KIND_IP_PORT = "ip:port"
+MATCH_KIND_WILDCARD = "*:port"
+MAX_MATCH_KIND_DESTS = 64
+MAX_AMBIGUOUS_PORTS_RECORDED = 16
 
 
 def isolated_profile(page_port: object) -> str:
@@ -267,6 +276,11 @@ class DenyDiagnostics:
     サンプル（Issue #1402。正規表現は変えず、実機の形式を成果物から確認するための控え。本文は生で残さない）:
     `unmatched_deny_samples` は対象 pid に帰属する `deny(` 行で正規表現に一致しなかったものの「形」（`redact_shape`。
     最大 16 件）。pid を取れない・対象外の不一致行は `unmatched_deny_unattributed` に数だけ残す。
+    ワイルドカード形式（`_DENY_WILDCARD_RE`）: `wildcard_lines` 一致した行、`wildcard_excluded_by_pid` pid が対象外、
+    `wildcard_unknown_port` pid は対象だがポートが既知の宛先ポート集合に無い、`wildcard_ambiguous_port` ポートを
+    複数の宛先が共有していて帰属不能（`wildcard_ambiguous_ports` にそのポート）、`wildcard_attributed` 帰属した行。
+    `match_kind` は宛先ごとの一致形式別の件数。
+
     `pid_excluded_samples` は pid 帰属で除外した行の `{"pid", "dest"}`（dest は 127.0.0.0/8 のときだけ実値、
     それ以外は `<ipv4>:port`。最大 8 件）で本文は保存しない。上限超過分は `*_dropped` に数だけ残す。
     """
@@ -282,6 +296,20 @@ class DenyDiagnostics:
     unmatched_deny_samples_dropped: int = 0
     pid_excluded_samples: list[dict[str, Any]] = field(default_factory=list)
     pid_excluded_samples_dropped: int = 0
+    wildcard_lines: int = 0
+    wildcard_attributed: int = 0
+    wildcard_excluded_by_pid: int = 0
+    wildcard_unknown_port: int = 0
+    wildcard_ambiguous_port: int = 0
+    wildcard_ambiguous_ports: list[int] = field(default_factory=list)
+    match_kind: dict[str, dict[str, int]] = field(default_factory=dict)
+
+    def count_match(self, dest: str, kind: str) -> None:
+        """宛先ごとに、どの形式（`ip:port` / `*:port`）で一致した行かを数える（宛先の種類数に上限）。"""
+        if dest not in self.match_kind and len(self.match_kind) >= MAX_MATCH_KIND_DESTS:
+            return
+        per = self.match_kind.setdefault(dest, {})
+        per[kind] = per.get(kind, 0) + 1
 
     def add_unmatched_sample(self, msg: str) -> None:
         """対象 pid に帰属する不一致 `deny(` 行の「形」を上限つきで控える（本文は残さない）。"""
@@ -299,7 +327,15 @@ class DenyDiagnostics:
             self.pid_excluded_samples_dropped += 1
 
     def as_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        """成果物用の dict。ワイルドカード形式の項目は、その形式の行を見たとき・一致形式を記録したときだけ含める。"""
+        d = asdict(self)
+        if not self.wildcard_lines:
+            for key in ("wildcard_lines", "wildcard_attributed", "wildcard_excluded_by_pid",
+                        "wildcard_unknown_port", "wildcard_ambiguous_port", "wildcard_ambiguous_ports"):
+                d.pop(key)
+        if not self.match_kind:
+            d.pop("match_kind")
+        return d
 
 
 _BODY_PID_RE = re.compile(r"\((\d+)\)\s+deny\(")
@@ -358,6 +394,17 @@ def _token_shape(tok: str) -> str:
     return "".join(out)[:MAX_TOKEN_SHAPE_LEN]
 
 
+def _dest_token_shape(tok: str) -> str:
+    """`network-outbound` 直後の宛先トークンの形。末尾の `:<1〜5桁>` のポートは数字を保持する（Issue #1402）。
+
+    ポートは記録範囲（ip:port と件数）の内。IPv4 は `_token_shape` が従来どおり扱う。
+    """
+    m = re.fullmatch(r"(.+):(\d{1,5})", tok)
+    if m and not _IPV4_PORT_RE.fullmatch(tok):
+        return f"{_token_shape(m.group(1))}:{m.group(2)}"
+    return _token_shape(tok)
+
+
 def redact_shape(msg: str) -> str:
     """拒否メッセージを「形」に変換する（プロセス名・pid・パス・外部 IP・クエリを残さない。Issue #1402）。
 
@@ -384,6 +431,9 @@ def redact_shape(msg: str) -> str:
             toks = toks[1:]
     else:
         toks = rest.split()
+    if dm and out[-1] == "network-outbound" and toks:
+        out.append(_dest_token_shape(toks[0]))
+        toks = toks[1:]
     out.extend(_token_shape(t) for t in toks)
     return sanitize_sample(" ".join(out))
 
@@ -408,10 +458,63 @@ def _record_message(line: str, diag: DenyDiagnostics) -> tuple[str, int]:
     return line, 0
 
 
-def scan_line(line: str, pids: frozenset[int] | None, diag: DenyDiagnostics) -> str | None:
+@dataclass(frozen=True)
+class PortMap:
+    """この run の既知の宛先 ("ip:port") から作る、ワイルドカード形式の拒否の帰属先（ポート -> 宛先）。
+
+    複数の宛先が同じポートを持つとき、そのポートは `ambiguous` に入れて帰属させない（unobservable 側に倒す）。
+    """
+
+    unique: dict[int, str]
+    ambiguous: frozenset[int]
+    dests: frozenset[str] = frozenset()
+
+    @staticmethod
+    def from_dests(dests: Any) -> "PortMap":
+        by_port: dict[int, set[str]] = {}
+        for d in dests:
+            _, _, port = str(d).rpartition(":")
+            if port.isdigit():
+                by_port.setdefault(int(port), set()).add(str(d))
+        return PortMap({p: next(iter(ds)) for p, ds in by_port.items() if len(ds) == 1},
+                       frozenset(p for p, ds in by_port.items() if len(ds) > 1),
+                       frozenset(d for ds in by_port.values() for d in ds))
+
+
+def _scan_wildcard(msg: str, record_pid: int, pids: frozenset[int] | None, ports: "PortMap | None",
+                   diag: DenyDiagnostics) -> str | None:
+    """ワイルドカード形式の行を、pid が対象かつポートが既知で一意のときだけ宛先へ帰属させる（そうでなければ None）。"""
+    m = _DENY_WILDCARD_RE.search(msg)
+    if not m or int(m.group(2)) > 65535:
+        return None
+    diag.wildcard_lines += 1
+    pid = int(m.group(1)) if m.group(1) is not None else record_pid or None
+    if pids is None or pid is None or pid not in pids:
+        diag.wildcard_excluded_by_pid += 1
+        return None
+    port = int(m.group(2))
+    if ports is not None and port in ports.ambiguous:
+        diag.wildcard_ambiguous_port += 1
+        if port not in diag.wildcard_ambiguous_ports and \
+                len(diag.wildcard_ambiguous_ports) < MAX_AMBIGUOUS_PORTS_RECORDED:
+            diag.wildcard_ambiguous_ports.append(port)
+        return None
+    dest = ports.unique.get(port) if ports is not None else None
+    if dest is None:
+        diag.wildcard_unknown_port += 1
+        return None
+    diag.wildcard_attributed += 1
+    diag.count_match(dest, MATCH_KIND_WILDCARD)
+    return dest
+
+
+def scan_line(line: str, pids: frozenset[int] | None, diag: DenyDiagnostics,
+              ports: "PortMap | None" = None) -> str | None:
     """1 行を解析して診断を更新し、対象 pid に帰属する拒否の "ip:port" を返す（該当しなければ None）。
 
-    `measure.collect_denies` が逐次読みの各行に対して呼ぶ。`pids` が None なら帰属を問わない（自己テスト）。
+    `measure.collect_denies` が逐次読みの各行に対して呼ぶ。`pids` が None なら IPv4 形式は帰属を問わない（自己テスト）。
+    IPv4 形式は従来どおり。ワイルドカード形式は `pids` に含まれる pid かつ `ports` の既知で一意なポートのときだけ
+    帰属させる（より厳しい結合条件。`pids`・`ports` が None なら帰属させない）。
     """
     diag.scanned_lines += 1
     if len(line) > MAX_LINE_LEN:
@@ -421,6 +524,11 @@ def scan_line(line: str, pids: frozenset[int] | None, diag: DenyDiagnostics) -> 
         diag.sandbox_lines += 1
     m = _DENY_RE.search(msg)
     if not m or int(m.group(3)) > 65535:
+        wild = _scan_wildcard(msg, record_pid, pids, ports, diag) if "deny(" in msg else None
+        if wild is not None:
+            return wild
+        if "deny(" in msg and _DENY_WILDCARD_RE.search(msg):
+            return None  # ワイルドカード形式として数え済み（不一致サンプルに重複して載せない）
         if "deny(" in msg:
             # 帰属を確認できた行だけ形を控える。無関係なプロセスの拒否は数だけ（情報記録の制限。Issue #1402）。
             bm = _BODY_PID_RE.search(msg)
@@ -437,7 +545,10 @@ def scan_line(line: str, pids: frozenset[int] | None, diag: DenyDiagnostics) -> 
         diag.add_pid_excluded_sample(pid, m.group(2), int(m.group(3)))
         return None
     diag.deny_attributed += 1
-    return f"{m.group(2)}:{int(m.group(3))}"
+    dest = f"{m.group(2)}:{int(m.group(3))}"
+    if ports is not None and dest in ports.dests:
+        diag.count_match(dest, MATCH_KIND_IP_PORT)
+    return dest
 
 
 def self_check(denies: dict[str, int] | Counter[str], udp_probe: object, udp_dest: str) -> tuple[bool, str]:

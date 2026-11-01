@@ -35,6 +35,7 @@ OS 別のモード（#1387）:
 from __future__ import annotations
 
 import argparse
+import contextvars
 from collections import Counter
 import json
 import os
@@ -317,8 +318,13 @@ class _TimedLineReader:
                 self._buf += chunk
 
 
+# run_mode が collect_denies の呼び出しの間だけ設定する、この run の既知の宛先 ("ip:port") 一覧。
+# collect_denies の呼び出し形（start, pids, sudo）を変えずに渡すための文脈（既存の差し替え・呼び出し側を壊さない）。
+_KNOWN_DESTS: contextvars.ContextVar[tuple[str, ...] | None] = contextvars.ContextVar("known_dests", default=None)
+
+
 def collect_denies(start: str, pids: frozenset[int] | None = None, *,
-                   sudo: bool = False) -> tuple[dict[str, int], dict[str, Any]]:
+                   sudo: bool = False, dests: Any = None) -> tuple[dict[str, int], dict[str, Any]]:
     """macOS のサンドボックス拒否ログを逐次読んで集計する。(宛先 -> 件数, 取得状況)。読めなければ空と理由。
 
     `pids` は対象ホストとその子孫の pid。拒否ログの `proc(<pid>)` が含まれる行だけを数える（無関係な
@@ -328,7 +334,14 @@ def collect_denies(start: str, pids: frozenset[int] | None = None, *,
     プロセスを止めて unobservable（available=False）にする（リソース枯渇の防止）。
 
     `sudo=True` は opt-in（Issue #1402。xos-measure の macOS ジョブのみ）。`sudo -n log show --info --debug` を使う。
+
+    `dests` はこの run の既知の宛先 ("ip:port") 一覧（dest_counts のキー）。macOS 26 のワイルドカード形式
+    （`network-outbound <語>:*:<port>`）は、pid が `pids` に含まれ、かつポートが `dests` で一意のときだけその宛先へ
+    帰属させる（ポート重複・未知ポートは帰属しない。`seatbelt.PortMap`）。None なら文脈 `_KNOWN_DESTS`（run_mode が設定）を使い、それも無ければ帰属させない。
     """
+    if dests is None:
+        dests = _KNOWN_DESTS.get()
+    port_map = seatbelt.PortMap.from_dests(dests) if dests is not None else None
     try:
         argv = seatbelt.log_show_argv(start, sudo=sudo)
         proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,  # noqa: S603
@@ -363,7 +376,7 @@ def collect_denies(start: str, pids: frozenset[int] | None = None, *,
                 lines += 1
             else:
                 lines += 1
-                dest = seatbelt.scan_line(raw.decode("utf-8", errors="replace").rstrip("\r\n"), pids, diag)
+                dest = seatbelt.scan_line(raw.decode("utf-8", errors="replace").rstrip("\r\n"), pids, diag, port_map)
                 if dest and sum(counts.values()) < seatbelt.MAX_LOG_LINES:
                     counts[dest] += 1
             if lines > seatbelt.MAX_SCAN_LINES or total > seatbelt.MAX_SCAN_BYTES:
@@ -526,11 +539,19 @@ def run_mode(mode: str, *, host: Path, ports: dict[str, int], recs: dict[str, An
             raw_pids = inner.get("host_pids")
             pids = frozenset(p for p in raw_pids if isinstance(p, int) and not isinstance(p, bool)) \
                 if isinstance(raw_pids, list) else frozenset()
+            all_dests = (*(f"{judge.IP_INTERNAL_STANDIN if r == 'internal' else judge.IP_BLOCKED}:{ports[r]}"
+                           for r in ("redirect", "img", "fetch", "ws", "internal")),
+                         f"{judge.IP_BLOCKED}:{ports['udp_direct']}")
             if pids:
-                denies, status = collect_denies(started, pids, sudo=use_sudo)
+                token = _KNOWN_DESTS.set(all_dests)
+                try:
+                    denies, status = collect_denies(started, pids, sudo=use_sudo)
+                    if use_sudo:
+                        # 権限の差かレベルの差かを切り分ける比較用（診断カウンタだけ。試行の根拠には使わない）。
+                        _, ustat = collect_denies(started, pids)
+                finally:
+                    _KNOWN_DESTS.reset(token)
                 if use_sudo:
-                    # 権限の差かレベルの差かを切り分ける比較用（診断カウンタだけ。試行の根拠には使わない）。
-                    _, ustat = collect_denies(started, pids)
                     unpriv = {k: ustat.get(k) for k in ("available", "reason", "deny_lines", "diagnostics")
                               if k in ustat}
             else:
@@ -560,6 +581,9 @@ def run_mode(mode: str, *, host: Path, ports: dict[str, int], recs: dict[str, An
             status = {**status, "available": False,
                       "reason": "log config not changed (non-default or unreadable)" if cfg.state.get("aborted")
                       else "log config not restored"}
+        mk = (status.get("diagnostics") or {}).get("match_kind") or {}
+        wildcard_routes = sorted(r for r, d in (*dest.items(), ("udp_direct", udp))
+                                 if status.get("available") and (mk.get(d) or {}).get(seatbelt.MATCH_KIND_WILDCARD))
         observed = dict(denies)  # 診断用に記録する生の件数（根拠に使うかは status で決まる）
         if not status.get("available"):
             denies = {}
@@ -568,6 +592,7 @@ def run_mode(mode: str, *, host: Path, ports: dict[str, int], recs: dict[str, An
             inner.get("attempts") or {}, inner.get("attempt_evidence") or {}, denies, dest, udp)
         data["deny_log"] = {**status, "dest_counts": {d: observed.get(d, 0) for d in (*dest.values(), udp)},
                             "sudo": use_sudo,
+                            "wildcard_routes": wildcard_routes,
                             "log_show_flags": "sudo -n, --info --debug" if use_sudo else "default",
                             "log_config": cfg.state if cfg is not None else None,
                             "unprivileged": unpriv}
@@ -795,7 +820,9 @@ def main(argv: list[str] | None = None) -> int:
                                                binary_match=data["binary_match"],
                                                mode_unavailable=data.get("unavailable"),
                                                loopback_confound=appcontainer_caveat(data),
-                                               deny_log_reason=_unavailable_deny_log_reason(data))
+                                               deny_log_reason=_unavailable_deny_log_reason(data),
+                                               wildcard_routes=frozenset(
+                                                   (data.get("deny_log") or {}).get("wildcard_routes") or ()))
     return finalize(results, out_dir)
 
 
