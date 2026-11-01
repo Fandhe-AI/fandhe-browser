@@ -11,9 +11,8 @@ name: XOS Measure
 #                          AppContainer〔ctypes のランチャー。#1396・loopback の切り分けつき〕。ubuntu は対象外）
 # Windows の egress-isolation は #1401 で opt-in のループバック免除（CheckNetIsolation LoopbackExempt。ハーネスが作った
 # AppContainer の SID だけ・計測後に解除）を付ける（オーナー承認 2026-11-01。使い捨て runner に限る）。
-# macOS の egress-isolation は #1402 で opt-in の sudo つき `log show` / `log config`（sandbox 関連 subsystem のログレベル）を
-# 付ける（オーナー承認 2026-11-01。この macOS ジョブ＝使い捨て runner に限る。`log config` は計測後に元へ戻して記録する。
-# ほかの管理者操作・依存の追加・Rust の unsafe は含まない。ローカル・既定の実行は sudo を使わない）。
+# macOS の egress-isolation は sudo なしの `log show` で拒否行を取る（#1402。実測で sudo・`log config` が不要と分かり、
+# オーナー判断 2026-11-01 で opt-in を削除した。ハーネス自身は sudo を使わない）。
 # 本 workflow は計測結果を出すだけで、合否・OS 間の差の判定はしない（判定は人間。.claude/rules/delegation-impl.md）。
 #
 # 設計上の位置づけ:
@@ -588,33 +587,18 @@ jobs:
         run: bash harness/egress-isolation/self-test.sh
       - name: "[egress-isolation] プラットフォームの記録（読み取りのみ）"
         run: python3 -I -B harness/egress-isolation/platform_probe.py
-      - name: "[egress-isolation] 実行（opt-in の sudo 拒否ログ 2 構成: show と config。#1402）"
+      - name: "[egress-isolation] 実行（baseline の対照と Seatbelt。sudo なしの拒否ログ。#1402）"
         run: |
-          mkdir -p "$OUT_DIR/sudo-show" "$OUT_DIR/sudo-config"
-          rc=0
-          for cfg in show config; do
-            python3 -I -B harness/egress-isolation/measure.py \
-              --host "$SERVO_HOST_TARGET_DIR/release/fandhe-browser-servo-host" \
-              --modes baseline,seatbelt --seatbelt-sudo-log "$cfg" --out "$OUT_DIR/sudo-$cfg" || rc=$?
-          done
-          exit "$rc"
-      - name: "[egress-isolation] log config の状態確認（読み取りのみ。承認範囲の sudo log config --status）"
-        if: ${{ always() }}
-        run: |
-          {
-            echo "### log config status after the run (#1402)"
-            for sub in com.apple.sandbox com.apple.sandbox.reporting; do
-              echo "- $sub: $(sudo -n /usr/bin/log config --status --subsystem "$sub" 2>&1 | head -c 400 | tr '\n' ' ')"
-            done
-          } >> "$GITHUB_STEP_SUMMARY"
+          mkdir -p "$OUT_DIR"
+          python3 -I -B harness/egress-isolation/measure.py \
+            --host "$SERVO_HOST_TARGET_DIR/release/fandhe-browser-servo-host" \
+            --modes baseline,seatbelt --out "$OUT_DIR"
       - name: "[egress-isolation] 結果表を Step Summary へ"
         if: ${{ !cancelled() }}
         run: |
-          for cfg in show config; do
-            if [ -f "$OUT_DIR/sudo-$cfg/summary.md" ]; then
-              { echo "## --seatbelt-sudo-log $cfg"; cat "$OUT_DIR/sudo-$cfg/summary.md"; } >> "$GITHUB_STEP_SUMMARY"
-            fi
-          done
+          if [ -f "$OUT_DIR/summary.md" ]; then
+            cat "$OUT_DIR/summary.md" >> "$GITHUB_STEP_SUMMARY"
+          fi
       - name: "[egress-isolation] 結果をアーティファクトへ"
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

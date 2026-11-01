@@ -1,6 +1,6 @@
 """管理者操作の復元・解除の失敗が終了コードに出ること、unobservable に降格した受信の注記の自己テスト。
 
-Issue #1401（Windows のループバック免除）・#1402（macOS の sudo `log config`）の事後監査（P2-1・P2-2・P3-1・P3-3）。
+Issue #1401（Windows のループバック免除）の事後監査（P2-1・P2-2・P3-1・P3-3）。
 Linux 上で mock だけで動く（実ホスト・管理者操作は行わない）。判定の結果では終了コードを変えない。
 """
 
@@ -25,18 +25,10 @@ META = {"date_utc": "2026-11-01T00:00:00Z", "kernel": "k", "host_sha256": "x", "
         "proxy_env_present": False}
 ROUTES = ("redirect", "img", "fetch", "ws", "internal", "udp_direct")
 
-SUBS = ("com.apple.sandbox", "com.apple.sandbox.reporting")
-CHANGED_RESTORED = {"all_restored": True, "subsystems": {s: {"raise_attempted": True, "restored": True} for s in SUBS}}
-CHANGED_NOT_RESTORED = {"all_restored": False,
-                        "subsystems": {s: {"raise_attempted": True, "restored": False} for s in SUBS}}
-ABORTED = {"all_restored": False, "aborted": "no change made", "subsystems": {s: {} for s in SUBS}}
 
-
-def _results(*, log_config: Any = None, exempt: Any = None, cleanup: Any = None, verdict: str = "pass") -> dict[str, Any]:
+def _results(*, exempt: Any = None, cleanup: Any = None, verdict: str = "pass") -> dict[str, Any]:
     iso: dict[str, Any] = {"outer_counts": {}, "verdicts": {"fetch": {
         "verdict": verdict, "reason": "r", "outer_count": 0, "control_count": 1, "method": "m"}}, "inner": {}}
-    if log_config is not None:
-        iso["log_config"] = log_config
     if exempt is not None:
         iso["appcontainer"] = {"loopback_exempt": exempt, "cleanup": cleanup or {}, "preflight": {}}
     return {"meta": META, "modes": {"baseline": {"outer_counts": {}}, "seatbelt": iso}}
@@ -48,18 +40,6 @@ class FinalizeExitCodeTest(unittest.TestCase):
         self.addCleanup(td.cleanup)
         with mock.patch("builtins.print"), mock.patch.object(sys, "stderr"):
             return measure.finalize(results, Path(td.name)), Path(td.name)
-
-    def test_macos_log_config_not_restored_is_3_after_files_are_written(self) -> None:
-        rc, out = self._run(_results(log_config=CHANGED_NOT_RESTORED))
-        self.assertEqual(rc, 3)
-        self.assertTrue((out / "summary.md").is_file())
-        self.assertIn("seatbelt", json.loads((out / "result.json").read_text(encoding="utf-8"))["modes"])
-
-    def test_macos_log_config_restored_is_0(self) -> None:
-        self.assertEqual(self._run(_results(log_config=CHANGED_RESTORED))[0], 0)
-
-    def test_aborted_without_change_is_0(self) -> None:
-        self.assertEqual(self._run(_results(log_config=ABORTED))[0], 0)
 
     def test_windows_exempt_removal_failures_are_3(self) -> None:
         req = {"requested": True}
@@ -98,32 +78,11 @@ class MainExitCodeTest(unittest.TestCase):
     def test_main_returns_3_on_restore_failure_and_0_on_success(self) -> None:
         if not sys.platform.startswith("linux"):
             self.skipTest("main() mode selection is exercised on Linux")
-        self.assertEqual(self._main({"log_config": CHANGED_NOT_RESTORED, "inner": {}}), 3)
-        self.assertEqual(self._main({"log_config": CHANGED_RESTORED, "inner": {}}), 0)
-
-
-class RunModeLogConfigTest(unittest.TestCase):
-    """内側の結果が空でも log_config が結果に残り、終了コードへ届く（Codex P1・Bugbot の指摘）。"""
-
-    def _run_mode(self, runner: Any) -> dict[str, Any]:
-        self._td = tempfile.mkdtemp()
-        self.addCleanup(__import__("shutil").rmtree, self._td, True)
-        with mock.patch.object(measure, "build_argv", return_value=["x"]), \
-                mock.patch.object(measure, "run_argv", return_value=(1, "boom")), \
-                mock.patch.object(measure, "collect_denies", side_effect=AssertionError("not reached")):
-            return measure.run_mode("seatbelt", host=Path("/h"), ports={}, recs={}, out_dir=Path(self._td),
-                                    hosts_file=Path("/h"), image=None, resolv_file=Path("/r"), page_port=1,
-                                    sudo_log="config", log_runner=runner)
-
-    def test_empty_inner_with_failed_restore_is_3(self) -> None:
-        def runner(argv: list[str]) -> tuple[int, str]:
-            # status は既定、level:default への復元は失敗。
-            return (1, "") if argv[-1] == "level:default" else (0, "level=DEFAULT persist=DEFAULT")
-        data = self._run_mode(runner)
-        self.assertEqual(data["inner"], {})
-        self.assertIs(data["log_config"]["all_restored"], False)
-        self.assertEqual(measure.admin_restore_failures({"modes": {"seatbelt": data}}),
-                         ["seatbelt: log config was not restored"])
+        req = {"requested": True}
+        bad = {"loopback_exempt_removed": False, "loopback_exempt_absent_after_remove": True}
+        ok = {"loopback_exempt_removed": True, "loopback_exempt_absent_after_remove": True}
+        self.assertEqual(self._main({"appcontainer": {"loopback_exempt": req, "cleanup": bad}, "inner": {}}), 3)
+        self.assertEqual(self._main({"appcontainer": {"loopback_exempt": req, "cleanup": ok}, "inner": {}}), 0)
 
 
 class DowngradedReceiptTest(unittest.TestCase):
