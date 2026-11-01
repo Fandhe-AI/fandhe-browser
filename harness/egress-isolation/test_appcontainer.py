@@ -143,6 +143,22 @@ class PureFunctionsTest(unittest.TestCase):
 
 
 @unittest.skipUnless(X64, "struct sizes are asserted for 64-bit pointers")
+class IcaclsTimeoutTest(unittest.TestCase):
+    def test_timeout_becomes_appcontainer_error(self) -> None:
+        import subprocess
+        from unittest import mock
+        with mock.patch.object(ac.subprocess, "run", side_effect=subprocess.TimeoutExpired("icacls", 60)):
+            with self.assertRaises(ac.AppContainerError) as cm:
+                ac._run_icacls(["icacls", "x"], "grant")
+        self.assertEqual(str(cm.exception), "icacls grant failed: TimeoutExpired")
+
+    def test_oserror_becomes_appcontainer_error(self) -> None:
+        from unittest import mock
+        with mock.patch.object(ac.subprocess, "run", side_effect=FileNotFoundError("icacls")):
+            with self.assertRaises(ac.AppContainerError):
+                ac._run_icacls(["icacls", "x"], "setintegritylevel")
+
+
 class StructSizeTest(unittest.TestCase):
     """Microsoft の定義（x64）: STARTUPINFOW 104・STARTUPINFOEXW 112・PROCESS_INFORMATION 24 等。"""
 

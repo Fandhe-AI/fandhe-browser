@@ -124,6 +124,15 @@ class JOBOBJECT_EXTENDED_LIMIT_INFORMATION(ctypes.Structure):  # noqa: N801
 
 
 # --- 純粋関数（全 OS で自己テストできる） -------------------------------------------------------------
+def _run_icacls(args: list[str], what: str) -> "subprocess.CompletedProcess[bytes]":
+    """icacls を実行する。タイムアウト・起動失敗は AppContainerError へ変換し、unobservable として記録させる。"""
+    try:
+        return subprocess.run(args, stdin=subprocess.DEVNULL, capture_output=True,  # noqa: S603
+                              timeout=60, check=False)
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise AppContainerError(f"icacls {what} failed: {type(exc).__name__}") from exc
+
+
 def validate_profile_name(name: object) -> str:
     """プロファイル名の検証（3〜64 文字の小文字英数字と `.` `_` `-`）。外部入力から作らず固定形式で組み立てる。"""
     if not isinstance(name, str) or not PROFILE_NAME_RE.match(name):
@@ -394,8 +403,7 @@ class AppContainerSession:
     def _icacls_grant(self, *, low_integrity: bool = True) -> None:
         sid = validate_sid_string(self.sid_string)
         assert self._root is not None
-        done = subprocess.run(icacls_grant_args(self._root, sid),  # noqa: S603,S607
-                              stdin=subprocess.DEVNULL, capture_output=True, timeout=60, check=False)
+        done = _run_icacls(icacls_grant_args(self._root, sid), "grant")
         if done.returncode != 0:
             raise AppContainerError("icacls grant failed")
         self._granted = True
@@ -403,8 +411,7 @@ class AppContainerSession:
             return
         # 通常の一時ディレクトリは medium integrity で、low integrity の AppContainer からは DACL の許可があっても
         # Mandatory Integrity Control に書き込みを拒否される。子へ継承する low ラベルを付ける。
-        done = subprocess.run(icacls_low_integrity_args(self._root),  # noqa: S603,S607
-                              stdin=subprocess.DEVNULL, capture_output=True, timeout=60, check=False)
+        done = _run_icacls(icacls_low_integrity_args(self._root), "setintegritylevel")
         if done.returncode != 0:
             raise AppContainerError("icacls setintegritylevel failed")
 
