@@ -351,6 +351,19 @@ _IPV4_PORT_RE = re.compile(r"(\d{1,3}(?:\.\d{1,3}){3})(?::(\d{1,5}))?")
 _MAPPED_LOOPBACK_RE = re.compile(r"::ffff:(127(?:\.\d{1,3}){3})(?::\d{1,5})?", re.IGNORECASE)
 _LOCALHOST_RE = re.compile(r"localhost(?::\d{1,5})?")
 _OP_RE = re.compile(r"[A-Za-z0-9*_-]{1,40}")
+# Apple の sandbox 操作名（完全一致または接頭辞）。外れたトークンは利用者由来の文字列が混ざりうるため
+# `<op>` に伏せる（Issue #1402・P3-b）。サンプル用の整形だけで、拒否ログの帰属パースには使わない。
+_KNOWN_OPS = frozenset({
+    "signal", "job-creation", "default", "authorization-right-obtain", "lsopen", "nvram-get", "nvram-set",
+    "nvram-delete", "pseudo-tty", "user-preference-read", "user-preference-write", "darwin-notification-post",
+    "distributed-notification-post", "forbidden-exec-sugid", "generic-issue-extension", "storage-class-map",
+    "dynamic-code-generation",
+})
+_KNOWN_OP_PREFIXES = ("network-", "file-", "mach-", "process-", "system-", "sysctl-", "iokit-", "ipc-")
+
+
+def _is_known_op(token: str) -> bool:
+    return token in _KNOWN_OPS or token.startswith(_KNOWN_OP_PREFIXES)
 _KEEP_SYMBOLS = frozenset("()[]{}:,.*-_\"'")
 MAX_TOKEN_SHAPE_LEN = 24
 
@@ -427,7 +440,7 @@ def redact_shape(msg: str) -> str:
         out.append(dm.group(0))
         toks = rest[dm.end():].split()
         if toks:
-            out.append(toks[0] if _OP_RE.fullmatch(toks[0]) else "<op>")
+            out.append(toks[0] if _OP_RE.fullmatch(toks[0]) and _is_known_op(toks[0]) else "<op>")
             toks = toks[1:]
     else:
         toks = rest.split()

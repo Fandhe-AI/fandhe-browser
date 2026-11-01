@@ -258,7 +258,7 @@ def judge_all(
             if route in wildcard_routes:
                 # macOS 26 の拒否ログは宛先アドレスを `*` で出す。判定ロジックは変えず、帰属の根拠だけを明示する（Issue #1402）。
                 method += ("; the OS log reports the address as '*', so attribution relies on the ephemeral "
-                           "listener port and the host pid")
+                           "listener port and the host pid (address and protocol are not verified)")
         if mode == "appcontainer":
             method = ("outer listener receipt + in-container errno (no process-level monitor; "
                       "loopback confound checked by capability contrast)")

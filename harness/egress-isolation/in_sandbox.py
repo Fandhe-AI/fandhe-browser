@@ -29,6 +29,7 @@ import errno
 import http.server
 import json
 import os
+import re
 import secrets
 import shutil
 import socket
@@ -129,23 +130,29 @@ def host_argv(host: str) -> list[str]:
     return [sys.executable, host] if host.endswith(".py") else [host]
 
 
+APPCONTAINER_FLAG_ENV = "FANDHE_EGRESS_APPCONTAINER"  # appcontainer.py が子へ渡すフラグ（同名・同値。Issue #1402・P2-1）
+APPCONTAINER_FLAG_VALUE = "1"
 ERROR_DETAIL_MAX = 1000  # 結果 JSON の error に残す例外メッセージの上限（パス全体が読める長さ。秘密情報は含まない）
 MKDIR_RETRIES = 100
 
 
 def make_private_workdir(prefix: str) -> Path:
-    """作業ディレクトリを作る。Windows では保護 DACL を付けず、親フォルダの権限を継承させる（Issue #1401）。
+    """作業ディレクトリを作る。AppContainer 経路の Windows だけ、保護 DACL を付けず親の権限を継承させる（Issue #1401・#1402）。
 
     Python 3.12.4 以降の `mkdtemp` / `os.mkdir(path, 0o700)` は Windows で「現在のユーザーと管理者だけ」の
     継承しない DACL を付けるため、AppContainer の SID が許可されず配下の mkdir・書き込みが拒否される。
     Windows の一時領域はコンテナ専用フォルダ（`...\\AC\\Temp`）に向け直されており、継承で十分に閉じている。
-    Linux・macOS は従来どおり 0o700 の非公開ディレクトリ。名前の衝突は `exist_ok` を使わず再試行する。
+    この前提が成り立つのは appcontainer.py が環境変数 `APPCONTAINER_FLAG_ENV` を渡す経路だけ。それ以外の
+    Windows は利用者の `%TEMP%` の ACL を継承しうるため、従来どおり 0o700（保護 DACL）にする。
+    Linux・macOS も 0o700 の非公開ディレクトリ。名前の衝突は `exist_ok` を使わず再試行する。
     """
+    inherit_dacl = (sys.platform == "win32"
+                    and os.environ.get(APPCONTAINER_FLAG_ENV) == APPCONTAINER_FLAG_VALUE)
     base = Path(tempfile.gettempdir())
     for _ in range(MKDIR_RETRIES):
         path = base / f"{prefix}{secrets.token_hex(8)}"
         try:
-            if sys.platform == "win32":
+            if inherit_dacl:
                 os.mkdir(path)
             else:
                 os.mkdir(path, 0o700)
@@ -156,8 +163,20 @@ def make_private_workdir(prefix: str) -> Path:
 
 
 def describe_error(exc: BaseException) -> str:
-    """例外型とメッセージ全体（上限 `ERROR_DETAIL_MAX`）。Windows のパス付きエラーが読める長さを確保する。"""
-    return f"{type(exc).__name__}: {str(exc)[:ERROR_DETAIL_MAX]}"
+    """例外型とマスク済みメッセージ（上限 `ERROR_DETAIL_MAX`）。パスの構造は残し、利用者名・SID だけ伏せる。"""
+    return f"{type(exc).__name__}: {mask_identity(str(exc))[:ERROR_DETAIL_MAX]}"
+
+
+_USER_PATH_RE = re.compile(r"(?i)((?:[A-Za-z]:)?[\\/]+(?:Users|home)[\\/]+)[^\\/\s'\"]+")
+_SID_RE = re.compile(r"\bS-1-\d+(?:-\d+)+\b", re.IGNORECASE)
+
+
+def mask_identity(text: str) -> str:
+    """`Users` / `home` 直下のユーザー名を `<user>`、SID（`S-1-...`）を `<sid>` に置換する（Issue #1402・P3-a）。
+
+    例外型名・errno・winerror・パスの残りの構造は変えない。マスク後に上限で切るため、切断で名前が復活しない。
+    """
+    return _SID_RE.sub("<sid>", _USER_PATH_RE.sub(r"\1<user>", text))
 
 
 def descendant_pids(root: int) -> set[int]:

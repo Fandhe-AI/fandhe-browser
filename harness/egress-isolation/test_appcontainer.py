@@ -65,16 +65,24 @@ class PureFunctionsTest(unittest.TestCase):
 
     def test_container_env_is_an_allowlist(self) -> None:
         env = ac.container_env("C:\\s\\tmp", "C:\\Windows")
-        self.assertEqual(sorted(env), ["PYTHONIOENCODING", "SystemRoot", "TEMP", "TMP"])
+        self.assertEqual(sorted(env), ["FANDHE_EGRESS_APPCONTAINER", "PYTHONIOENCODING", "SystemRoot", "TEMP", "TMP"])
         self.assertNotIn("PATH", env)
-        self.assertEqual(sorted(ac.container_env("C:\\s\\tmp", None)), ["PYTHONIOENCODING", "TEMP", "TMP"])
+        self.assertEqual(sorted(ac.container_env("C:\\s\\tmp", None)),
+                         ["FANDHE_EGRESS_APPCONTAINER", "PYTHONIOENCODING", "TEMP", "TMP"])
+
+    def test_container_env_carries_appcontainer_flag_matching_in_sandbox(self) -> None:
+        import in_sandbox
+        env = ac.container_env("C:\\s\\tmp", "C:\\Windows", {"FANDHE_EGRESS_APPCONTAINER": "spoof"})
+        self.assertEqual(env["FANDHE_EGRESS_APPCONTAINER"], "1")
+        self.assertEqual((ac.APPCONTAINER_FLAG_ENV, ac.APPCONTAINER_FLAG_VALUE),
+                         (in_sandbox.APPCONTAINER_FLAG_ENV, in_sandbox.APPCONTAINER_FLAG_VALUE))
 
     def test_container_env_copies_host_path_vars_only_when_set(self) -> None:
         host = {"LOCALAPPDATA": "C:\\Users\\u\\AppData\\Local", "USERPROFILE": "C:\\Users\\u", "USERNAME": "u",
                 "APPDATA": "", "PATH": "C:\\bin", "HTTP_PROXY": "http://p:1", "HTTPS_PROXY": "http://p:1"}
         env = ac.container_env("C:\\s\\tmp", "C:\\Windows", host)
-        self.assertEqual(sorted(env), ["LOCALAPPDATA", "PYTHONIOENCODING", "SystemRoot", "TEMP", "TMP",
-                                       "USERNAME", "USERPROFILE"])
+        self.assertEqual(sorted(env), ["FANDHE_EGRESS_APPCONTAINER", "LOCALAPPDATA", "PYTHONIOENCODING",
+                                       "SystemRoot", "TEMP", "TMP", "USERNAME", "USERPROFILE"])
         self.assertEqual(env["LOCALAPPDATA"], "C:\\Users\\u\\AppData\\Local")
         self.assertEqual(env["USERPROFILE"], "C:\\Users\\u")
         self.assertEqual(env["TMP"], "C:\\s\\tmp")

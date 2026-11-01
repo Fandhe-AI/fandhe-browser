@@ -488,9 +488,9 @@ class DenySampleTest(unittest.TestCase):
         return diag
 
     def test_unmatched_samples_capped_at_16_with_overflow_count(self) -> None:
-        diag = self._scan([f"Sandbox: x(1) deny(1) other-{i}" for i in range(20)], frozenset({1}))
+        diag = self._scan([f"Sandbox: x(1) deny(1) file-op-{i}" for i in range(20)], frozenset({1}))
         self.assertEqual(len(diag.unmatched_deny_samples), 16)
-        self.assertEqual(diag.unmatched_deny_samples[0], "Sandbox: <proc>(<pid>) deny(1) other-0")
+        self.assertEqual(diag.unmatched_deny_samples[0], "Sandbox: <proc>(<pid>) deny(1) file-op-0")
         self.assertEqual(diag.unmatched_deny_samples_dropped, 4)
         self.assertEqual(diag.sandbox_lines, 20)
 
@@ -513,6 +513,23 @@ class DenySampleTest(unittest.TestCase):
 
     def test_odd_operation_token_becomes_op(self) -> None:
         self.assertEqual(seatbelt.redact_shape("Sandbox: p(5) deny(1) /bad/op x"), "Sandbox: <proc>(<pid>) deny(1) <op> a")
+
+    def test_known_operations_kept_and_unknown_become_op(self) -> None:
+        for op in ("network-outbound", "network-bind", "file-write-create", "mach-lookup", "process-exec*",
+                   "system-fsctl", "sysctl-read", "iokit-open", "ipc-posix-shm-read-data", "signal", "job-creation"):
+            with self.subTest(op=op):
+                self.assertEqual(seatbelt.redact_shape(f"Sandbox: p(5) deny(1) {op} x"),
+                                 f"Sandbox: <proc>(<pid>) deny(1) {op} a")
+        for op in ("alice-secret", "op", "file", "networkx", "Signal2", "x" * 41):
+            with self.subTest(op=op):
+                self.assertEqual(seatbelt.redact_shape(f"Sandbox: p(5) deny(1) {op} x"),
+                                 "Sandbox: <proc>(<pid>) deny(1) <op> a")
+
+    def test_unknown_operation_does_not_affect_wildcard_attribution_parse(self) -> None:
+        diag = seatbelt.DenyDiagnostics()
+        dest = seatbelt.scan_line("Sandbox: x(7) deny(1) network-outbound *:2001", frozenset({7}), diag)
+        self.assertEqual(diag.unmatched_deny_samples, [])
+        self.assertEqual(diag.wildcard_lines, 1)
 
     def test_pid_excluded_samples_are_structured_and_capped_at_8(self) -> None:
         diag = self._scan([f"Sandbox: x({100 + i}) deny(1) network-outbound 10.0.0.{i}:80" for i in range(9)]
@@ -538,21 +555,21 @@ class DenySampleTest(unittest.TestCase):
                          ([], 0, 0))
 
     def test_shape_truncated_to_300_chars_and_24_per_token(self) -> None:
-        self.assertEqual(len(seatbelt.redact_shape("deny(1) op " + "a" * 100)), len("deny(1) op ") + 24)
-        long = seatbelt.redact_shape("deny(1) op " + " ".join(["bbbb"] * 200))
+        self.assertEqual(len(seatbelt.redact_shape("deny(1) file-read-data " + "a" * 100)), len("deny(1) file-read-data ") + 24)
+        long = seatbelt.redact_shape("deny(1) file-read-data " + " ".join(["bbbb"] * 200))
         self.assertEqual(len(long), 300)
 
     def test_control_chars_become_spaces(self) -> None:
         self.assertEqual(seatbelt.sanitize_sample("a\nb\tc\x1bd\re\x7ff\u2028g"), "a b c d e f g")
-        self.assertEqual(seatbelt.redact_shape("deny(1) op a\nb\x1b[0m"), "deny(1) op a a?[9a")
+        self.assertEqual(seatbelt.redact_shape("deny(1) file-read-data a\nb\x1b[0m"), "deny(1) file-read-data a a?[9a")
 
     def test_samples_in_as_dict_and_summary_block(self) -> None:
-        diag = self._scan(["Sandbox: p(1) deny(1) op weird"], frozenset({1}))
+        diag = self._scan(["Sandbox: p(1) deny(1) file-read-data weird"], frozenset({1}))
         d = diag.as_dict()
-        self.assertEqual(d["unmatched_deny_samples"], ["Sandbox: <proc>(<pid>) deny(1) op aaaaa"])
+        self.assertEqual(d["unmatched_deny_samples"], ["Sandbox: <proc>(<pid>) deny(1) file-read-data aaaaa"])
         dl = {"available": True, "diagnostics": d, "unprivileged": {"diagnostics": d}}
         block = measure._deny_sample_block(dl)
-        self.assertIn("Sandbox: <proc>(<pid>) deny(1) op aaaaa", block)
+        self.assertIn("Sandbox: <proc>(<pid>) deny(1) file-read-data aaaaa", block)
         self.assertEqual(block.count("```text"), 2)
         self.assertNotIn("aaaaa", str(measure._without_samples(dl)))
 

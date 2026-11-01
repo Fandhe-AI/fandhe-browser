@@ -396,13 +396,30 @@ class ProbeFailureTest(unittest.TestCase):
 class MakePrivateWorkdirTest(unittest.TestCase):
     """OS 非依存（`sys.platform` と `os.mkdir` をモック）。Issue #1401・`RENDER-3`。"""
 
-    def run_make(self, platform: str, side_effect=None):
+    FLAG = {in_sandbox.APPCONTAINER_FLAG_ENV: in_sandbox.APPCONTAINER_FLAG_VALUE}
+
+    def run_make(self, platform: str, side_effect=None, env: dict[str, str] | None = None):
+        # 環境変数も差し替える（既定は AppContainer フラグあり。無しの経路は env={} で指定する）
+        env = self.FLAG if env is None else env
         with mock.patch.object(in_sandbox.sys, "platform", platform), \
+                mock.patch.dict(in_sandbox.os.environ, env, clear=True), \
                 mock.patch.object(in_sandbox.os, "mkdir", side_effect=side_effect) as mk:
             path = in_sandbox.make_private_workdir("egress-isolation-")
         return path, mk
 
-    def test_win32_does_not_pass_mode_so_dacl_is_inherited(self) -> None:
+    def test_win32_without_flag_keeps_protected_dacl_0o700(self) -> None:
+        for env in ({}, {in_sandbox.APPCONTAINER_FLAG_ENV: "0"}, {in_sandbox.APPCONTAINER_FLAG_ENV: ""}):
+            with self.subTest(env=env):
+                path, mk = self.run_make("win32", env=env)
+                mk.assert_called_once_with(path, 0o700)
+
+    def test_flag_is_ignored_on_non_windows(self) -> None:
+        for platform in ("linux", "darwin"):
+            with self.subTest(platform=platform):
+                path, mk = self.run_make(platform, env=self.FLAG)
+                mk.assert_called_once_with(path, 0o700)
+
+    def test_win32_with_flag_does_not_pass_mode_so_dacl_is_inherited(self) -> None:
         path, mk = self.run_make("win32")
         mk.assert_called_once_with(path)
         self.assertEqual(mk.call_args.args, (path,))
@@ -438,6 +455,30 @@ class MakePrivateWorkdirTest(unittest.TestCase):
         msg = "x" * 900
         self.assertEqual(in_sandbox.describe_error(PermissionError(msg)), f"PermissionError: {msg}")
         self.assertEqual(len(in_sandbox.describe_error(OSError("y" * 5000))), len("OSError: ") + 1000)
+
+    def test_describe_error_masks_windows_user_path_and_keeps_type_and_errno(self) -> None:
+        exc = PermissionError(13, "Access is denied", "C:\\Users\\alice\\AppData\\Local\\Temp\\x")
+        self.assertEqual(in_sandbox.describe_error(exc),
+                         "PermissionError: [Errno 13] Access is denied: "
+                         "'C:\\\\Users\\\\<user>\\\\AppData\\\\Local\\\\Temp\\\\x'")
+        raw = "[WinError 5] denied: 'C:\\Users\\alice\\AppData\\x'"
+        self.assertEqual(in_sandbox.describe_error(OSError(raw)),
+                         "OSError: [WinError 5] denied: 'C:\\Users\\<user>\\AppData\\x'")
+
+    def test_describe_error_masks_unix_user_paths(self) -> None:
+        self.assertEqual(in_sandbox.describe_error(FileNotFoundError(2, "No such file", "/Users/bob/x/y")),
+                         "FileNotFoundError: [Errno 2] No such file: '/Users/<user>/x/y'")
+        self.assertEqual(in_sandbox.describe_error(OSError("open /home/carol/.cache/z failed")),
+                         "OSError: open /home/<user>/.cache/z failed")
+
+    def test_describe_error_masks_sid(self) -> None:
+        msg = "denied for S-1-15-2-3624051433-2125758914-1423191267 on C:\\Users\\dave\\t"
+        self.assertEqual(in_sandbox.describe_error(OSError(msg)), "OSError: denied for <sid> on C:\\Users\\<user>\\t")
+
+    def test_describe_error_masks_before_truncating(self) -> None:
+        out = in_sandbox.describe_error(OSError("x" * 990 + " /home/zed/f"))
+        self.assertNotIn("zed", out)
+        self.assertEqual(len(out), len("OSError: ") + 1000)
 
 
 if __name__ == "__main__":
