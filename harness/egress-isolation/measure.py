@@ -595,7 +595,9 @@ def run_mode(mode: str, *, host: Path, ports: dict[str, int], recs: dict[str, An
                             "wildcard_routes": wildcard_routes}
         if diag_dests:
             # 診断経路の宛先の件数は判定用の dest_counts と分けて出す（Issue #1415。根拠に使うのは availableのとき）。
-            data["deny_log"]["diagnostic_dest_counts"] = {r: observed.get(d, 0) for r, d in diag_dests.items()}
+            # redirect も経路名で並べる（dest_counts のキーは "ip:port" のため表示側で引けない。判定用の契約は変えない）。
+            data["deny_log"]["diagnostic_dest_counts"] = {
+                r: observed.get(d, 0) for r, d in (("redirect", dest["redirect"]), *diag_dests.items())}
             by_dest = {d: r for r, d in (*dest.items(), ("udp_direct", udp), *diag_dests.items())}
             un = (status.get("diagnostics") or {}).get("unattributed_network_dests") or {}
             data["deny_log"]["unattributed_routes"] = {by_dest.get(d, d): n for d, n in un.items()}
@@ -669,7 +671,7 @@ def redirect_diag_block(mode: str, data: dict[str, Any], outer: dict[str, int]) 
            "| route | outer | deny | load kind | elapsed_ms | host alive after failed load |",
            "| ----- | ----- | ---- | --------- | ---------- | ---------------------------- |"]
     for r in routes:
-        dv = deny.get(r, "-") if r != "redirect" else (dl.get("dest_counts") or {}).get("redirect", "-")
+        dv = deny.get(r, "-")
         out.append(f"| {r} | {outer.get(r, '-')} | {dv} | {(loads.get(r) or {}).get('kind', 'ok' if r in loads else '-')} "
                    f"| {ms.get(r, '-')} | {alive.get(r, '-')} |")
     if mode in judge.ISOLATED_MODES:

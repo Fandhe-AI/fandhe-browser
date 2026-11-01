@@ -309,7 +309,7 @@ class MeasureTest(unittest.TestCase):
                  "diag_loads": {"diag_nav_direct": {"ok": True, "final_host": "x"}},
                  "load_elapsed_ms": {"redirect": 120}, "host_alive_after_load": {"redirect": True}}
         mode = {"exit_code": 0, "inner": inner, "outer_counts": {"redirect": 0, "diag_nav_direct": 1},
-                "deny_log": {"dest_counts": {"redirect": 0}, "diagnostic_dest_counts": {"diag_nav_direct": 0,
+                "deny_log": {"dest_counts": {"127.0.0.2:2001": 3}, "diagnostic_dest_counts": {"redirect": 3, "diag_nav_direct": 0,
                                                                                          "diag_redirect_late": 0}},
                 "verdicts": {}}
         results = {"meta": {"date_utc": "d", "kernel": "k", "host_sha256": "s", "host_version": "v",
@@ -318,6 +318,8 @@ class MeasureTest(unittest.TestCase):
                              "seatbelt": mode}}
         text = measure.summarize(results)
         self.assertIn("redirect diagnostics (not verdicts)", text)
+        self.assertIn("| redirect | 0 | 3 | load_failed |", text)
+        self.assertIn("| diag_nav_direct | 1 | 0 |", text)
         self.assertIn("WARNING: diagnostic route diag_nav_direct has 1 outer receipt(s)", text)
         notes = measure.redirect_notes(mode)
         self.assertIn("redirect load kind=load_failed in 120 ms", notes["redirect"])
