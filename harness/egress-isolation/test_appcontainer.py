@@ -109,6 +109,29 @@ class PureFunctionsTest(unittest.TestCase):
         self.assertEqual(ac.icacls_low_integrity_args(root),
                          ["icacls", str(root), "/setintegritylevel", "(OI)(CI)L"])
 
+    def test_appcontainer_folder_staging_gets_explicit_grant_without_low_label(self) -> None:
+        # 3.13+ の mkdtemp は継承を切るため、AppContainer 専用フォルダ配下でも明示付与が要る。
+        from unittest import mock
+        calls: list[list[str]] = []
+
+        def fake_run(args: list[str], **_kw: Any) -> Any:
+            calls.append(list(args))
+            return mock.Mock(returncode=0)
+
+        with tempfile.TemporaryDirectory() as td:
+            sess = ac.AppContainerSession(host=Path(td) / "h.exe", harness_dir=Path(td))
+            sess.sid_string = SID
+            sess._root = Path(td)
+            with mock.patch.object(ac.subprocess, "run", fake_run):
+                sess._icacls_grant(low_integrity=False)
+            self.assertEqual(calls, [ac.icacls_grant_args(Path(td), SID)])
+            self.assertTrue(sess._granted)
+            calls.clear()
+            with mock.patch.object(ac.subprocess, "run", fake_run):
+                sess._icacls_grant()
+            self.assertEqual(calls, [ac.icacls_grant_args(Path(td), SID),
+                                     ac.icacls_low_integrity_args(Path(td))])
+
     def test_capability_sids_are_well_known_network_ones(self) -> None:
         self.assertEqual(ac.NETWORK_CAPABILITIES, ("S-1-15-3-1", "S-1-15-3-3"))
 

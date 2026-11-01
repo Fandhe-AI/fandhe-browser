@@ -376,6 +376,10 @@ class AppContainerSession:
         if base is not None and base.is_dir():
             self.staging_mode = "appcontainer-folder"
             self._root = Path(tempfile.mkdtemp(prefix="egress-", dir=base))
+            # Python 3.13 以降の mkdtemp は mode=0o700 で継承を切った DACL を付けるため、
+            # 親（AppContainer 専用フォルダ）の権限を継承せず容器が複製物を読めない。明示的に付与する。
+            # 親フォルダは容器の integrity で書けるので low ラベルは付けない。
+            self._icacls_grant(low_integrity=False)
         else:
             # フォールバック: ハーネスが作った一時ディレクトリへ当該 SID の権限だけを付与する。
             self.staging_mode = "icacls-grant"
@@ -387,7 +391,7 @@ class AppContainerSession:
         self._copy_files()
         self.cleanup["staging_mode"] = self.staging_mode
 
-    def _icacls_grant(self) -> None:
+    def _icacls_grant(self, *, low_integrity: bool = True) -> None:
         sid = validate_sid_string(self.sid_string)
         assert self._root is not None
         done = subprocess.run(icacls_grant_args(self._root, sid),  # noqa: S603,S607
@@ -395,6 +399,8 @@ class AppContainerSession:
         if done.returncode != 0:
             raise AppContainerError("icacls grant failed")
         self._granted = True
+        if not low_integrity:
+            return
         # 通常の一時ディレクトリは medium integrity で、low integrity の AppContainer からは DACL の許可があっても
         # Mandatory Integrity Control に書き込みを拒否される。子へ継承する low ラベルを付ける。
         done = subprocess.run(icacls_low_integrity_args(self._root),  # noqa: S603,S607
