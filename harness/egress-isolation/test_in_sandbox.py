@@ -393,5 +393,52 @@ class ProbeFailureTest(unittest.TestCase):
         self.assertEqual({v["verdict"] for v in verdicts.values()}, {judge.UNOBSERVABLE})
 
 
+class MakePrivateWorkdirTest(unittest.TestCase):
+    """OS 非依存（`sys.platform` と `os.mkdir` をモック）。Issue #1401・`RENDER-3`。"""
+
+    def run_make(self, platform: str, side_effect=None):
+        with mock.patch.object(in_sandbox.sys, "platform", platform), \
+                mock.patch.object(in_sandbox.os, "mkdir", side_effect=side_effect) as mk:
+            path = in_sandbox.make_private_workdir("egress-isolation-")
+        return path, mk
+
+    def test_win32_does_not_pass_mode_so_dacl_is_inherited(self) -> None:
+        path, mk = self.run_make("win32")
+        mk.assert_called_once_with(path)
+        self.assertEqual(mk.call_args.args, (path,))
+        self.assertEqual(mk.call_args.kwargs, {})
+        self.assertRegex(path.name, r"^egress-isolation-[0-9a-f]{16}$")
+
+    def test_non_windows_uses_0o700(self) -> None:
+        for platform in ("linux", "darwin"):
+            with self.subTest(platform=platform):
+                path, mk = self.run_make(platform)
+                mk.assert_called_once_with(path, 0o700)
+
+    def test_retries_on_collision_without_exist_ok(self) -> None:
+        for platform in ("win32", "linux"):
+            with self.subTest(platform=platform):
+                path, mk = self.run_make(platform, side_effect=[FileExistsError(), FileExistsError(), None])
+                self.assertEqual(mk.call_count, 3)
+                self.assertEqual(mk.call_args.args[0], path)
+                names = {c.args[0].name for c in mk.call_args_list}
+                self.assertEqual(len(names), 3)
+
+    def test_gives_up_after_retry_limit(self) -> None:
+        with self.assertRaises(FileExistsError):
+            self.run_make("win32", side_effect=FileExistsError())
+
+    def test_real_directory_is_created_and_writable(self) -> None:
+        path = in_sandbox.make_private_workdir("egress-test-")
+        self.addCleanup(shutil.rmtree, path, ignore_errors=True)
+        (path / "sub").mkdir()
+        self.assertTrue(path.is_dir())
+
+    def test_describe_error_keeps_long_message(self) -> None:
+        msg = "x" * 900
+        self.assertEqual(in_sandbox.describe_error(PermissionError(msg)), f"PermissionError: {msg}")
+        self.assertEqual(len(in_sandbox.describe_error(OSError("y" * 5000))), len("OSError: ") + 1000)
+
+
 if __name__ == "__main__":
     unittest.main()

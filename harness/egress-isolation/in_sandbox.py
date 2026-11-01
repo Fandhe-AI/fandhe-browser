@@ -29,6 +29,7 @@ import errno
 import http.server
 import json
 import os
+import secrets
 import shutil
 import socket
 import subprocess
@@ -125,6 +126,37 @@ def host_argv(host: str) -> list[str]:
     実ホストは実行可能バイナリ（`.py` ではない）。`.py` は自己テストの偽ホスト用。
     """
     return [sys.executable, host] if host.endswith(".py") else [host]
+
+
+ERROR_DETAIL_MAX = 1000  # 結果 JSON の error に残す例外メッセージの上限（パス全体が読める長さ。秘密情報は含まない）
+MKDIR_RETRIES = 100
+
+
+def make_private_workdir(prefix: str) -> Path:
+    """作業ディレクトリを作る。Windows では保護 DACL を付けず、親フォルダの権限を継承させる（Issue #1401）。
+
+    Python 3.12.4 以降の `mkdtemp` / `os.mkdir(path, 0o700)` は Windows で「現在のユーザーと管理者だけ」の
+    継承しない DACL を付けるため、AppContainer の SID が許可されず配下の mkdir・書き込みが拒否される。
+    Windows の一時領域はコンテナ専用フォルダ（`...\\AC\\Temp`）に向け直されており、継承で十分に閉じている。
+    Linux・macOS は従来どおり 0o700 の非公開ディレクトリ。名前の衝突は `exist_ok` を使わず再試行する。
+    """
+    base = Path(tempfile.gettempdir())
+    for _ in range(MKDIR_RETRIES):
+        path = base / f"{prefix}{secrets.token_hex(8)}"
+        try:
+            if sys.platform == "win32":
+                os.mkdir(path)
+            else:
+                os.mkdir(path, 0o700)
+        except FileExistsError:
+            continue
+        return path
+    raise FileExistsError(errno.EEXIST, "could not create a unique work directory", str(base))
+
+
+def describe_error(exc: BaseException) -> str:
+    """例外型とメッセージ全体（上限 `ERROR_DETAIL_MAX`）。Windows のパス付きエラーが読める長さを確保する。"""
+    return f"{type(exc).__name__}: {str(exc)[:ERROR_DETAIL_MAX]}"
 
 
 def descendant_pids(root: int) -> set[int]:
@@ -394,7 +426,7 @@ def run(args: argparse.Namespace, ports: dict[str, int]) -> dict[str, Any]:
             inner[r] = listeners.TcpRecorder(r, ip, ports[r]).start()
         inner["udp_direct"] = listeners.UdpRecorder("udp_direct", judge.IP_BLOCKED, ports["udp_direct"]).start()
 
-    workdir = Path(tempfile.mkdtemp(prefix="egress-isolation-"))
+    workdir = make_private_workdir("egress-isolation-")
     proc: subprocess.Popen[bytes] | None = None
     guard: monitor.DestinationMonitor | None = None
     try:
@@ -446,7 +478,7 @@ def run(args: argparse.Namespace, ports: dict[str, int]) -> dict[str, Any]:
         except (sbd.HostError, sbd.RpcError):
             pass
     except (sbd.HostError, OSError, subprocess.SubprocessError) as exc:
-        result["error"] = f"{type(exc).__name__}: {str(exc)[:120]}"
+        result["error"] = describe_error(exc)
     finally:
         if guard is None:
             result["guard"] = {"unavailable": f"process-level monitor not supported on {sys.platform}"}
@@ -541,7 +573,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         result = run(args, ports)
     except Exception as exc:  # noqa: BLE001  (最後の砦: 結果 JSON を必ず残し、モード全体を観測不能にする)
-        result = {"mode": args.mode, "fatal": f"{type(exc).__name__}: {str(exc)[:120]}",
+        result = {"mode": args.mode, "fatal": describe_error(exc),
                   "positive_ok": False, "attempts": {}}
     args.out.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return 2 if result.get("aborted") else 0
