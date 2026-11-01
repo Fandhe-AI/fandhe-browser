@@ -50,7 +50,8 @@ class ArgvTest(unittest.TestCase):
             self.assertEqual(seatbelt.log_config_argv("status", sub), [*BASE, "config", "--status", "--subsystem", sub])
             self.assertEqual(seatbelt.log_config_argv("raise", sub),
                              [*BASE, "config", "--subsystem", sub, "--mode", "level:debug"])
-            self.assertEqual(seatbelt.log_config_argv("reset", sub), [*BASE, "config", "--subsystem", sub, "--reset"])
+            self.assertEqual(seatbelt.log_config_argv("restore_default", sub),
+                             [*BASE, "config", "--subsystem", sub, "--mode", "level:default"])
             self.assertEqual(seatbelt.log_config_argv("restore_info", sub),
                              [*BASE, "config", "--subsystem", sub, "--mode", "level:info"])
 
@@ -58,7 +59,9 @@ class ArgvTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             seatbelt.log_config_argv("erase", SUBS[0])
         with self.assertRaises(ValueError):
-            seatbelt.log_config_argv("reset", "com.apple.other")
+            seatbelt.log_config_argv("reset", SUBS[0])
+        with self.assertRaises(ValueError):
+            seatbelt.log_config_argv("restore_default", "com.apple.other")
 
 
 class ValidateTest(unittest.TestCase):
@@ -89,9 +92,11 @@ class FakeLog:
         self.order, self.reset_rc, self.after_status, self.resetted = order, reset_rc, after_status, False
 
     def __call__(self, argv: list[str]) -> tuple[int, str]:
-        action = "status" if "--status" in argv else "reset" if "--reset" in argv else "raise"
+        assert "--reset" not in argv
+        action = ("status" if "--status" in argv else "restore" if argv[-1] in ("level:default", "level:info")
+                  else "raise")
         self.order.append(f"{action}:{argv[argv.index('--subsystem') + 1]}")
-        if action == "reset":
+        if action == "restore":
             self.resetted = True
             return self.reset_rc, ""
         if action == "status":
@@ -160,7 +165,7 @@ class RunModeTest(unittest.TestCase):
         data = self._run(sudo_log="config", order=order, log=FakeLog(order), denies={UDP_DEST: 1})
         a, b = SUBS
         self.assertEqual(order, [f"status:{a}", f"status:{b}", f"raise:{a}", f"raise:{b}", "run_argv",
-                                 "log_show_sudo", "log_show", f"reset:{a}", f"reset:{b}", f"status:{a}", f"status:{b}"])
+                                 "log_show_sudo", "log_show", f"restore:{a}", f"restore:{b}", f"status:{a}", f"status:{b}"])
         state = data["deny_log"]["log_config"]
         self.assertIs(state["all_restored"], True)
         self.assertEqual(state["subsystems"][a]["restore_rc"], 0)
@@ -169,14 +174,14 @@ class RunModeTest(unittest.TestCase):
         order: list[str] = []
         self._run(sudo_log="config", order=order, log=FakeLog(order), run_exc=True)
         a, b = SUBS
-        self.assertEqual(order[-4:], [f"reset:{a}", f"reset:{b}", f"status:{a}", f"status:{b}"])
+        self.assertEqual(order[-4:], [f"restore:{a}", f"restore:{b}", f"status:{a}", f"status:{b}"])
         self.assertNotIn("log_show_sudo", order)
 
     def test_restore_runs_when_log_show_fails(self) -> None:
         order: list[str] = []
         data = self._run(sudo_log="config", order=order, log=FakeLog(order),
                          status={"available": False, "reason": "log show rc=1 (sudo)"})
-        self.assertIn(f"reset:{SUBS[0]}", order)
+        self.assertIn(f"restore:{SUBS[0]}", order)
         self.assertEqual(data["deny_log"]["reason"], "log show rc=1 (sudo)")
         self.assertIs(data["deny_log"]["log_config"]["all_restored"], True)
 
@@ -242,9 +247,10 @@ class SandboxLogConfigTest(unittest.TestCase):
         calls: list[str] = []
 
         def runner(argv: list[str]) -> tuple[int, str]:
-            if "--reset" in argv:
-                calls.append(argv[-2])
-                if argv[-2] == SUBS[0]:
+            if argv[-1] == "level:default":
+                sub = argv[argv.index("--subsystem") + 1]
+                calls.append(sub)
+                if sub == SUBS[0]:
                     raise OSError("x")
             return 0, "default"
 
@@ -261,7 +267,8 @@ class AbortOnNonDefaultTest(unittest.TestCase):
         calls: list[str] = []
 
         def runner(argv: list[str]) -> tuple[int, str]:
-            calls.append("status" if "--status" in argv else "reset" if "--reset" in argv else "raise")
+            assert "--reset" not in argv
+            calls.append("status" if "--status" in argv else "reset" if argv[-1] == "level:default" else "raise")
             return 0, "Mode DEBUG custom"
 
         with seatbelt.SandboxLogConfig(runner) as cfg:
@@ -290,7 +297,8 @@ class StatusAllDefaultTest(unittest.TestCase):
         calls: list[str] = []
 
         def runner(argv: list[str]) -> tuple[int, str]:
-            calls.append("status" if "--status" in argv else "reset" if "--reset" in argv else "raise")
+            assert "--reset" not in argv
+            calls.append("status" if "--status" in argv else "reset" if argv[-1] == "level:default" else "raise")
             return 0, status
 
         with seatbelt.SandboxLogConfig(runner) as cfg:
@@ -361,10 +369,12 @@ class RestoreByBeforeKindTest(unittest.TestCase):
         self.assertFalse(any("--reset" in a for a in argvs))
         self.assertIs(state["all_restored"], True)
 
-    def test_default_before_uses_reset(self) -> None:
-        argvs, state = self._run(self.DEFAULT, self.DEFAULT)
+    def test_default_before_restores_level_default_without_reset(self) -> None:
+        # SIGNPOST_*・OVERSIZE_* がカスタムでも --reset で消さない（Codex P1）。
+        argvs, state = self._run(self.DEFAULT + " OVERSIZE_ENABLED_ON", self.DEFAULT + " OVERSIZE_ENABLED_ON")
         changes = [a for a in argvs if "--status" not in a]
-        self.assertEqual([a[-1] for a in changes], ["level:debug"] * 2 + ["--reset"] * 2)
+        self.assertEqual([a[-1] for a in changes], ["level:debug"] * 2 + ["level:default"] * 2)
+        self.assertFalse(any("--reset" in a for a in argvs))
         self.assertIs(state["all_restored"], True)
 
     def test_status_mismatch_after_restore_is_not_restored(self) -> None:

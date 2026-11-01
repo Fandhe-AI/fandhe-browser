@@ -27,10 +27,12 @@ LOG_BIN = "/usr/bin/log"
 # Issue #1402: xos-measure の macOS ジョブ（使い捨て runner）に限り、opt-in で `sudo log show` / `sudo log config` を使う。
 SUDO_BIN = "/usr/bin/sudo"
 LOG_CONFIG_SUBSYSTEMS = ("com.apple.sandbox", "com.apple.sandbox.reporting")
-LOG_CONFIG_ACTIONS = ("status", "raise", "reset", "restore_info")
+LOG_CONFIG_ACTIONS = ("status", "raise", "restore_default", "restore_info")
 # 上げる・戻す操作はレベルだけを変える（persist・signpost・oversize には触れない。Issue #1402）。値は定数に限る。
 LOG_CONFIG_MODE = "level:debug"
+LOG_CONFIG_RESTORE_DEFAULT_MODE = "level:default"
 LOG_CONFIG_RESTORE_INFO_MODE = "level:info"
+# `--reset` は persist・signpost・oversize などレベル以外のカスタム設定も消すため使わない（action に含めない）。
 # 隔離と無関係な失敗（GPU・WindowServer 等）を切り分ける陽性対照用の全許可プロファイル。
 BASELINE_PROFILE = "(version 1)(allow default)"
 # 隔離プロファイル。許可するのはページ配信用の loopback 1 ポートだけ（ホストが許可オリジンを読む経路）。
@@ -84,7 +86,8 @@ def log_config_argv(action: str, subsystem: str) -> list[str]:
         return [*base, "--subsystem", subsystem, "--mode", LOG_CONFIG_MODE]
     if action == "restore_info":
         return [*base, "--subsystem", subsystem, "--mode", LOG_CONFIG_RESTORE_INFO_MODE]
-    return [*base, "--subsystem", subsystem, "--reset"]
+    # 残りは restore_default（許可リストで検証済み）。
+    return [*base, "--subsystem", subsystem, "--mode", LOG_CONFIG_RESTORE_DEFAULT_MODE]
 
 
 def _default_runner(argv: list[str]) -> tuple[int, str]:
@@ -119,10 +122,11 @@ def _line_kind(ln: str) -> str | None:
 def before_state_kind(status: str) -> str | None:
     """`log config --status` の出力から、変更前の状態と戻し方を決める（fail-closed。Issue #1402）。
 
-    - "default": 全行が既定と読める。戻しは `--reset`。key=value 形式は全値 default、実機（macOS 26）の
+    - "default": 全行が既定と読める。戻しは `--mode level:default`（`--reset` は使わない）。key=value 形式は全値 default、実機（macOS 26）の
       空白区切りトークン形式 `Mode for '<s>'  DEFAULT PERSIST_DEFAULT ...` はレベルが DEFAULT のとき。
     - "info": 全行がトークン形式でレベル INFO かつ `PERSIST_DEFAULT`。戻しは `--mode level:info` でレベルだけ
-      元へ戻す（`--reset` は使わない）。persist・`SIGNPOST_*`・`OVERSIZE_*` には触れないので残る。判定にも使わない。
+      元へ戻す。いずれも `--reset` は使わない（persist・`SIGNPOST_*`・`OVERSIZE_*` などレベル以外のカスタム設定を
+      消してしまうため）。レベルだけを変えるので、それらは残る。判定にも使わない。
     - None: DEBUG・OFF、`PERSIST_DEFAULT` 以外、行ごとに種別が異なる、空・解釈不能。変更しない。
     残る差: 明示設定の INFO と plist 由来の INFO は status 上同じに見える。どちらもレベルだけを INFO へ戻すため
     レベルは復元されるが、plist 由来のときの「設定なし」状態そのものとは区別できない。最終的な安全網は
@@ -144,8 +148,9 @@ class SandboxLogConfig:
 
     `measure.py` の seatbelt 分岐が、内側の実行より前に enter し、`log show` の後に exit する。
     変更前が "default" か "info"（`before_state_kind`）と確認できないとき（カスタム設定・status 取得失敗）は
-    何も変更せず中止する（`aborted`）。上げる操作はレベルだけを変える。戻しは変更前が default なら `--reset`、
-    info なら `--mode level:info`（persist 等のカスタム設定を消さない）。いずれも戻した後に `--status` を取り、
+    何も変更せず中止する（`aborted`）。上げる操作も戻す操作もレベルだけを変える（`level:debug` /
+    変更前が default なら `level:default`、info なら `level:info`）。`--reset` は使わない（レベル以外の
+    カスタム設定を消すため）。いずれも戻した後に `--status` を取り、
     変更前と全体一致したときだけ restored=True にする。
     `runner` は自己テストで差し替える（argv -> (rc, 出力)）。
     """
@@ -164,7 +169,7 @@ class SandboxLogConfig:
                 rc, out = None, ""
                 self.state["subsystems"][sub]["status_before_error"] = type(err).__name__
             self.state["subsystems"][sub].update(status_before_rc=rc, status_before=out)
-        # 変更前の設定を確実に既定と確認できたときだけ変更する。既存のカスタム設定は `--reset` で消えてしまうため、
+        # 変更前の設定を確実に既定と確認できたときだけ変更する。レベルだけを変える前提のため、
         # 既定以外・status 取得失敗は何も変更せず中止する（復元不能な変更をしない。Issue #1402）。
         bad = [sub for sub in LOG_CONFIG_SUBSYSTEMS
                if self.state["subsystems"][sub].get("status_before_rc") != 0
@@ -191,7 +196,7 @@ class SandboxLogConfig:
             return
         for sub in LOG_CONFIG_SUBSYSTEMS:
             entry = self.state["subsystems"].setdefault(sub, {})
-            action = "restore_info" if entry.get("before_kind") == "info" else "reset"
+            action = "restore_info" if entry.get("before_kind") == "info" else "restore_default"
             try:
                 entry["restore_rc"] = self._run(log_config_argv(action, sub))[0]
             except Exception as err:  # noqa: BLE001 - 残りの subsystem の復元を続けるため

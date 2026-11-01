@@ -117,8 +117,8 @@ class RunModeLogConfigTest(unittest.TestCase):
 
     def test_empty_inner_with_failed_restore_is_3(self) -> None:
         def runner(argv: list[str]) -> tuple[int, str]:
-            # status は既定、reset は失敗。
-            return (1, "") if "--reset" in argv else (0, "level=DEFAULT persist=DEFAULT")
+            # status は既定、level:default への復元は失敗。
+            return (1, "") if argv[-1] == "level:default" else (0, "level=DEFAULT persist=DEFAULT")
         data = self._run_mode(runner)
         self.assertEqual(data["inner"], {})
         self.assertIs(data["log_config"]["all_restored"], False)
