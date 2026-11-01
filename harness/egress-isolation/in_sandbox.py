@@ -167,7 +167,8 @@ def describe_error(exc: BaseException) -> str:
     return f"{type(exc).__name__}: {mask_identity(str(exc))[:ERROR_DETAIL_MAX]}"
 
 
-_USER_PATH_RE = re.compile(r"(?i)((?:[A-Za-z]:)?[\\/]+(?:Users|home)[\\/]+)[^\\/\s'\"]+")
+# ユーザー名の要素は次のパス区切り・引用符・改行までを全部伏せる（空白入りの名前も対象。長さ上限は ReDoS 対策）。
+_USER_PATH_RE = re.compile(r"(?i)((?:[A-Za-z]:)?[\\/]+(?:Users|home)[\\/]+)[^\\/'\"\r\n]{1,256}")
 _SID_RE = re.compile(r"\bS-1-\d+(?:-\d+)+\b", re.IGNORECASE)
 
 

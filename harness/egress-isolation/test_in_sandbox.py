@@ -471,6 +471,33 @@ class MakePrivateWorkdirTest(unittest.TestCase):
         self.assertEqual(in_sandbox.describe_error(OSError("open /home/carol/.cache/z failed")),
                          "OSError: open /home/<user>/.cache/z failed")
 
+    def test_describe_error_masks_whole_username_element_with_spaces(self) -> None:
+        cases = [
+            ("C:\\Users\\Alice Smith\\AppData\\Local\\Temp\\x", "C:\\Users\\<user>\\AppData\\Local\\Temp\\x"),
+            ("C:\\\\Users\\\\Alice Smith\\\\AppData\\\\x", "C:\\\\Users\\\\<user>\\\\AppData\\\\x"),
+            ("/Users/Alice Smith/x", "/Users/<user>/x"),
+            ("/home/a b/x", "/home/<user>/x"),
+            ("C:\\Users\\Alice Smith", "C:\\Users\\<user>"),
+            ("'C:\\Users\\Alice Smith'", "'C:\\Users\\<user>'"),
+            ("\"/home/Alice Smith\" failed", "\"/home/<user>\" failed"),
+        ]
+        for raw, want in cases:
+            with self.subTest(raw=raw):
+                out = in_sandbox.describe_error(OSError(raw))
+                self.assertEqual(out, f"OSError: {want}")
+                self.assertNotIn("Alice", out)
+                self.assertNotIn("Smith", out)
+
+    def test_describe_error_masks_repr_form_of_spaced_username(self) -> None:
+        exc = PermissionError(13, "Access is denied", "C:\\Users\\Alice Smith\\AppData\\x")
+        out = in_sandbox.describe_error(exc)
+        self.assertEqual(out, "PermissionError: [Errno 13] Access is denied: 'C:\\\\Users\\\\<user>\\\\AppData\\\\x'")
+        self.assertNotIn("Alice", out)
+
+    def test_describe_error_username_element_is_length_bounded(self) -> None:
+        out = in_sandbox.describe_error(OSError("/home/" + "a" * 100000 + "/x"))
+        self.assertTrue(out.startswith("OSError: /home/<user>"))
+
     def test_describe_error_masks_sid(self) -> None:
         msg = "denied for S-1-15-2-3624051433-2125758914-1423191267 on C:\\Users\\dave\\t"
         self.assertEqual(in_sandbox.describe_error(OSError(msg)), "OSError: denied for <sid> on C:\\Users\\<user>\\t")
