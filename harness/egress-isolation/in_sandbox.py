@@ -167,8 +167,10 @@ def describe_error(exc: BaseException) -> str:
     return f"{type(exc).__name__}: {mask_identity(str(exc))[:ERROR_DETAIL_MAX]}"
 
 
-# ユーザー名の要素は次のパス区切り・引用符・改行までを全部伏せる（空白入りの名前も対象。長さ上限は ReDoS 対策）。
-_USER_PATH_RE = re.compile(r"(?i)((?:[A-Za-z]:)?[\\/]+(?:Users|home)[\\/]+)[^\\/'\"\r\n]{1,256}")
+# ユーザー名の要素は次のパス区切り・改行・行末までを全部伏せる（空白入りの名前も対象。長さ上限は ReDoS 対策）。
+# 引用符は直後が行末・空白・`),;:`・引用符・区切りのときだけ終端（メッセージを囲む引用符）で、
+# それ以外（`O'Brien` の `'B`）は名前の一部として含める。
+_USER_PATH_RE = re.compile(r"(?i)((?:[A-Za-z]:)?[\\/]+(?:Users|home)[\\/]+)(?:[^\\/\r\n'\"]|['\"](?=[^\s),;:'\"\\/])){1,256}")
 _SID_RE = re.compile(r"\bS-1-\d+(?:-\d+)+\b", re.IGNORECASE)
 
 

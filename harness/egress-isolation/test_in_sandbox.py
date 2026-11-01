@@ -488,6 +488,27 @@ class MakePrivateWorkdirTest(unittest.TestCase):
                 self.assertNotIn("Alice", out)
                 self.assertNotIn("Smith", out)
 
+    def test_describe_error_masks_username_with_apostrophe(self) -> None:
+        cases = [
+            ("C:\\Users\\O'Brien\\AppData\\x", "C:\\Users\\<user>\\AppData\\x"),
+            ("/home/O'Brien/x", "/home/<user>/x"),
+            ("'C:\\Users\\O'Brien'", "'C:\\Users\\<user>'"),
+            ("C:\\Users\\'Brien\\x", "C:\\Users\\<user>\\x"),
+        ]
+        for raw, want in cases:
+            with self.subTest(raw=raw):
+                out = in_sandbox.describe_error(OSError(raw))
+                self.assertEqual(out, f"OSError: {want}")
+                self.assertNotIn("Brien", out)
+                self.assertNotIn("O'", out)
+
+    def test_describe_error_masks_apostrophe_username_in_repr_form(self) -> None:
+        exc = PermissionError(13, "Access is denied", "C:\\Users\\O'Brien\\AppData\\x")
+        out = in_sandbox.describe_error(exc)
+        self.assertEqual(out, "PermissionError: [Errno 13] Access is denied: "
+                              "\"C:\\\\Users\\\\<user>\\\\AppData\\\\x\"")
+        self.assertNotIn("Brien", out)
+
     def test_describe_error_masks_repr_form_of_spaced_username(self) -> None:
         exc = PermissionError(13, "Access is denied", "C:\\Users\\Alice Smith\\AppData\\x")
         out = in_sandbox.describe_error(exc)
