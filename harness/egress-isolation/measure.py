@@ -40,6 +40,7 @@ import json
 import os
 import platform
 import re
+import select
 import signal
 import socket
 import subprocess
@@ -241,11 +242,35 @@ def _run_argv(argv: list[str]) -> tuple[int | None, str]:
         return None, "timed out"
 
 
-def _stop_log_proc(proc: Any) -> None:
-    """`log show` 系の子プロセスを止める。SIGTERM（sudo は子の log へ中継する）を先に送り、期限後に SIGKILL する。
+def _signal_log_group(proc: Any, sig: int) -> None:
+    """`start_new_session=True` で起動した `log show` 系のプロセスグループ全体へシグナルを送る。
 
-    sudo への SIGKILL は子の `log` に伝わらずパイプが開いたままになるため、この順にする（Issue #1402）。
+    sudo 配下の子 `log` は親と同じグループにいる（pgid == proc.pid）。グループ送信が拒否・失敗した場合は親だけへ送る。
     """
+    try:
+        os.killpg(proc.pid, sig)
+        return
+    except (OSError, AttributeError, TypeError):
+        pass
+    try:
+        proc.send_signal(sig)
+    except (OSError, AttributeError):
+        pass
+
+
+def _stop_log_proc(proc: Any) -> None:
+    """`log show` 系の子プロセスを止める。グループへ SIGTERM（sudo は子の log へ中継する）を先に送り、期限後に SIGKILL する。
+
+    sudo への SIGKILL だけでは子の `log` に伝わらずパイプが開いたままになるため、この順で
+    プロセスグループ全体へ送る（Issue #1402）。
+    """
+    if hasattr(os, "killpg") and hasattr(proc, "pid"):
+        try:
+            _signal_log_group(proc, signal.SIGTERM)
+            proc.wait(timeout=5)
+        except (subprocess.TimeoutExpired, OSError):
+            _signal_log_group(proc, signal.SIGKILL)
+        return
     try:
         proc.terminate()
         proc.wait(timeout=5)
@@ -254,6 +279,42 @@ def _stop_log_proc(proc: Any) -> None:
             proc.kill()
         except OSError:
             pass
+
+
+class _TimedLineReader:
+    """パイプの fd を `select` で期限つきに読む行リーダー。期限を過ぎたら EOF 扱い（b""）にして `timed_out` を立てる。
+
+    子の `log` が残ってパイプが閉じなくても `collect_denies` の読み取りループが戻れるようにする（Issue #1402）。
+    """
+
+    def __init__(self, stream: Any, deadline: float) -> None:
+        self._fd = stream.fileno()
+        self._deadline = deadline
+        self._buf = b""
+        self._eof = False
+        self.timed_out = False
+
+    def readline(self, limit: int = -1) -> bytes:
+        while True:
+            nl = self._buf.find(b"\n")
+            end = nl + 1 if nl >= 0 else (len(self._buf) if self._eof else -1)
+            if limit > 0 and (end < 0 or end > limit) and len(self._buf) >= limit:
+                end = limit
+            if end >= 0:
+                line, self._buf = self._buf[:end], self._buf[end:]
+                return line
+            remain = self._deadline - time.monotonic()
+            if remain <= 0:
+                self.timed_out = True
+                return b""
+            ready, _, _ = select.select([self._fd], [], [], min(remain, 1.0))
+            if not ready:
+                continue
+            chunk = os.read(self._fd, 65536)
+            if not chunk:
+                self._eof = True
+            else:
+                self._buf += chunk
 
 
 def collect_denies(start: str, pids: frozenset[int] | None = None, *,
@@ -275,6 +336,11 @@ def collect_denies(start: str, pids: frozenset[int] | None = None, *,
     except (OSError, subprocess.SubprocessError, ValueError) as exc:
         return {}, {"available": False, "reason": type(exc).__name__}
     timer = threading.Timer(180, _stop_log_proc, args=(proc,))
+    # タイマーで止めても子 log がパイプを握り続ける場合に備え、読み取り自体にも期限を付ける（無期限ブロックの防止）。
+    try:
+        reader: Any = _TimedLineReader(proc.stdout, time.monotonic() + 185)
+    except (AttributeError, OSError, ValueError, TypeError):
+        reader = proc.stdout
     timer.start()
     counts: Counter[str] = Counter()
     diag = seatbelt.DenyDiagnostics()
@@ -283,14 +349,14 @@ def collect_denies(start: str, pids: frozenset[int] | None = None, *,
     try:
         assert proc.stdout is not None
         while True:
-            raw = proc.stdout.readline(seatbelt.MAX_LINE_LEN + 1)
+            raw = reader.readline(seatbelt.MAX_LINE_LEN + 1)
             if not raw:
                 break
             total += len(raw)
             if not raw.endswith(b"\n") and len(raw) > seatbelt.MAX_LINE_LEN:
                 # 長すぎる行は残りを捨てる（メモリに溜めない）。
                 while True:
-                    rest = proc.stdout.readline(seatbelt.MAX_LINE_LEN)
+                    rest = reader.readline(seatbelt.MAX_LINE_LEN)
                     total += len(rest)
                     if not rest or rest.endswith(b"\n") or total > seatbelt.MAX_SCAN_BYTES:
                         break
@@ -319,6 +385,8 @@ def collect_denies(start: str, pids: frozenset[int] | None = None, *,
             proc.stdout.close()
     if over:
         return {}, {"available": False, "reason": "log show output exceeded scan limit"}
+    if getattr(reader, "timed_out", False):
+        return {}, {"available": False, "reason": "log show timed out"}
     if proc.returncode != 0:
         return {}, {"available": False, "reason": f"log show rc={proc.returncode}" + (" (sudo)" if sudo else "")}
     return dict(counts), {"available": True, "deny_lines": sum(counts.values()), "diagnostics": diag.as_dict()}
@@ -485,7 +553,9 @@ def run_mode(mode: str, *, host: Path, ports: dict[str, int], recs: dict[str, An
             status = {**status, "available": False, "reason": probe_why}
         if cfg is not None and not cfg.state.get("all_restored") and status.get("available"):
             # 片付けが不完全なら拒否ログを根拠にしない（pass にしない。udp の errno 根拠は残る）。
-            status = {**status, "available": False, "reason": "log config not restored"}
+            status = {**status, "available": False,
+                      "reason": "log config not changed (non-default or unreadable)" if cfg.state.get("aborted")
+                      else "log config not restored"}
         observed = dict(denies)  # 診断用に記録する生の件数（根拠に使うかは status で決まる）
         if not status.get("available"):
             denies = {}

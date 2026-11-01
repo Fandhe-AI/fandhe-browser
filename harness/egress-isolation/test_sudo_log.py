@@ -7,6 +7,7 @@ opt-in の検証・sudo の argv・log config の復元順序と成否・自己�
 from __future__ import annotations
 
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -251,6 +252,59 @@ class SandboxLogConfigTest(unittest.TestCase):
         self.assertIs(cfg.state["all_restored"], False)
         self.assertEqual(cfg.state["subsystems"][SUBS[0]]["restore_error"], "OSError")
         self.assertIs(cfg.state["subsystems"][SUBS[1]]["restored"], True)
+
+
+class AbortOnNonDefaultTest(unittest.TestCase):
+    def test_custom_before_state_makes_no_change(self) -> None:
+        calls: list[str] = []
+
+        def runner(argv: list[str]) -> tuple[int, str]:
+            calls.append("status" if "--status" in argv else "reset" if "--reset" in argv else "raise")
+            return 0, "Mode DEBUG custom"
+
+        with seatbelt.SandboxLogConfig(runner) as cfg:
+            pass
+        self.assertEqual(set(calls), {"status"})
+        self.assertIn("aborted", cfg.state)
+        self.assertIs(cfg.state["all_restored"], False)
+
+    def test_status_failure_makes_no_change(self) -> None:
+        calls: list[str] = []
+
+        def runner(argv: list[str]) -> tuple[int, str]:
+            calls.append("status" if "--status" in argv else "other")
+            return 1, ""
+
+        with seatbelt.SandboxLogConfig(runner) as cfg:
+            pass
+        self.assertEqual(set(calls), {"status"})
+        self.assertIn("aborted", cfg.state)
+
+
+class TimedReaderTest(unittest.TestCase):
+    def test_deadline_returns_eof_when_pipe_stays_open(self) -> None:
+        r, w = os.pipe()
+        try:
+            stream = SimpleNamespace(fileno=lambda: r)
+            reader = measure._TimedLineReader(stream, measure.time.monotonic() + 0.3)
+            os.write(w, b"a\nbb")
+            self.assertEqual(reader.readline(100), b"a\n")
+            self.assertEqual(reader.readline(100), b"")
+            self.assertIs(reader.timed_out, True)
+        finally:
+            os.close(r)
+            os.close(w)
+
+    def test_long_line_is_split_at_limit(self) -> None:
+        r, w = os.pipe()
+        try:
+            reader = measure._TimedLineReader(SimpleNamespace(fileno=lambda: r), measure.time.monotonic() + 5)
+            os.write(w, b"abcdef\n")
+            self.assertEqual(reader.readline(4), b"abcd")
+            self.assertEqual(reader.readline(4), b"ef\n")
+        finally:
+            os.close(r)
+            os.close(w)
 
 
 class StopOrderTest(unittest.TestCase):

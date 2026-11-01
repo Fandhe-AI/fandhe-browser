@@ -97,6 +97,7 @@ class SandboxLogConfig:
     """sandbox 関連 subsystem のログレベルを上げ、終了時（例外時も）必ず元へ戻す context manager（Issue #1402）。
 
     `measure.py` の seatbelt 分岐が、内側の実行より前に enter し、`log show` の後に exit する。
+    変更前が既定と確認できないとき（既存のカスタム設定・status 取得失敗）は何も変更せず中止する（`aborted`）。
     復元は `--reset` の後に `--status` を取り、変更前と一致したときだけ restored=True にする。
     `runner` は自己テストで差し替える（argv -> (rc, 出力)）。
     """
@@ -109,14 +110,34 @@ class SandboxLogConfig:
         for sub in LOG_CONFIG_SUBSYSTEMS:
             self.state["subsystems"][sub] = {}
         for sub in LOG_CONFIG_SUBSYSTEMS:
-            rc, out = self._run(log_config_argv("status", sub))
+            try:
+                rc, out = self._run(log_config_argv("status", sub))
+            except Exception as err:  # noqa: BLE001 - 取得不能は変更せず中止する
+                rc, out = None, ""
+                self.state["subsystems"][sub]["status_before_error"] = type(err).__name__
             self.state["subsystems"][sub].update(status_before_rc=rc, status_before=out)
+        # 変更前の設定を確実に既定と確認できたときだけ変更する。既存のカスタム設定は `--reset` で消えてしまうため、
+        # 既定以外・status 取得失敗は何も変更せず中止する（復元不能な変更をしない。Issue #1402）。
+        bad = [sub for sub in LOG_CONFIG_SUBSYSTEMS
+               if self.state["subsystems"][sub].get("status_before_rc") != 0
+               or "default" not in str(self.state["subsystems"][sub].get("status_before", "")).lower()]
+        if bad:
+            self.state["aborted"] = "log config before-state is not default or unreadable; no change made"
+            return self
         for sub in LOG_CONFIG_SUBSYSTEMS:
-            rc, _ = self._run(log_config_argv("raise", sub))
+            self.state["subsystems"][sub]["raise_attempted"] = True
+            try:
+                rc, _ = self._run(log_config_argv("raise", sub))
+            except Exception as err:  # noqa: BLE001 - 残りは変更せず exit で戻す
+                rc = None
+                self.state["subsystems"][sub]["raise_error"] = type(err).__name__
             self.state["subsystems"][sub]["raise_rc"] = rc
         return self
 
     def __exit__(self, *exc: object) -> None:
+        if self.state.get("aborted"):
+            # 何も変更していないので戻す対象もない。ただし拒否ログは昇格できていないため all_restored は False のまま。
+            return
         for sub in LOG_CONFIG_SUBSYSTEMS:
             entry = self.state["subsystems"].setdefault(sub, {})
             try:
