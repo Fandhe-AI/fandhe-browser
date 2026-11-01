@@ -101,6 +101,14 @@ class PureFunctionsTest(unittest.TestCase):
             self.assertEqual(ac.tail_text(big, 4), "xxxx")
             self.assertEqual(ac.tail_text(Path(td) / "none.txt"), "")
 
+    def test_fallback_dir_gets_dacl_grant_and_inherited_low_integrity_label(self) -> None:
+        root = Path("C:/t/egress-iso-x")
+        sid = "S-1-15-2-1-2-3-4-5-6-7"
+        self.assertEqual(ac.icacls_grant_args(root, sid),
+                         ["icacls", str(root), "/grant", f"*{sid}:(OI)(CI)(M)"])
+        self.assertEqual(ac.icacls_low_integrity_args(root),
+                         ["icacls", str(root), "/setintegritylevel", "(OI)(CI)L"])
+
     def test_capability_sids_are_well_known_network_ones(self) -> None:
         self.assertEqual(ac.NETWORK_CAPABILITIES, ("S-1-15-3-1", "S-1-15-3-3"))
 

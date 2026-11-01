@@ -12,7 +12,7 @@
     - AppContainer プロファイルを作り、`PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES` で `CreateProcessW` する。
       容器から読めるのは AppContainer 専用フォルダ（`GetAppContainerFolderPath`）だけなので、Python ランタイム・
       ハーネス・ホスト（exe と同階層の DLL）をそこへ複製して使う。toolcache・チェックアウト・`D:\\sr` の ACL は変えない。
-      専用フォルダのパスが取れない場合だけ、ハーネスが作った一時ディレクトリに `icacls` で当該 SID の権限を付与し、
+      専用フォルダのパスが取れない場合だけ、ハーネスが作った一時ディレクトリに `icacls` で当該 SID の権限と継承する low integrity ラベルを付与し、
       finally で除去する（フォールバック）。
     - プロセスは一時停止で作って Job（`KILL_ON_JOB_CLOSE`）に入れてから再開する。タイムアウト・失敗時もツリーごと止まる。
     - 環境変数は許可リストのみ（`SystemRoot`・`TMP`・`TEMP`・`PYTHONIOENCODING`。`PATH`・`*_PROXY` は渡さない。`SEC-2`）。
@@ -136,6 +136,16 @@ def profile_name(pid: int) -> str:
     if isinstance(pid, bool) or not isinstance(pid, int) or pid < 0:
         raise ValueError("pid must be a non-negative int")
     return validate_profile_name(f"fandhe.egressiso.{pid}")
+
+
+def icacls_grant_args(root: Path, sid: str) -> list[str]:
+    """フォールバックの専用ディレクトリへ AppContainer SID の Modify（継承）を付与する `icacls` 引数。"""
+    return ["icacls", str(root), "/grant", f"*{validate_sid_string(sid)}:(OI)(CI)(M)"]
+
+
+def icacls_low_integrity_args(root: Path) -> list[str]:
+    """専用ディレクトリへ子に継承する low integrity ラベル（S-1-16-4096）を付ける `icacls` 引数。"""
+    return ["icacls", str(root), "/setintegritylevel", "(OI)(CI)L"]
 
 
 def validate_sid_string(sid: object) -> str:
@@ -380,11 +390,17 @@ class AppContainerSession:
     def _icacls_grant(self) -> None:
         sid = validate_sid_string(self.sid_string)
         assert self._root is not None
-        done = subprocess.run(["icacls", str(self._root), "/grant", f"*{sid}:(OI)(CI)(M)"],  # noqa: S603,S607
+        done = subprocess.run(icacls_grant_args(self._root, sid),  # noqa: S603,S607
                               stdin=subprocess.DEVNULL, capture_output=True, timeout=60, check=False)
         if done.returncode != 0:
             raise AppContainerError("icacls grant failed")
         self._granted = True
+        # 通常の一時ディレクトリは medium integrity で、low integrity の AppContainer からは DACL の許可があっても
+        # Mandatory Integrity Control に書き込みを拒否される。子へ継承する low ラベルを付ける。
+        done = subprocess.run(icacls_low_integrity_args(self._root),  # noqa: S603,S607
+                              stdin=subprocess.DEVNULL, capture_output=True, timeout=60, check=False)
+        if done.returncode != 0:
+            raise AppContainerError("icacls setintegritylevel failed")
 
     def _icacls_remove(self) -> bool:
         sid = validate_sid_string(self.sid_string)
