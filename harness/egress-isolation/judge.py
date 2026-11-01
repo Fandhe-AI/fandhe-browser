@@ -60,6 +60,14 @@ STRUCTURAL_NA_REASON = "structural check requires a network namespace; not appli
 LOOPBACK_CONFOUND_REASON = (
     "loopback isolation blocks local destinations regardless of network capabilities; egress blocking cannot be "
     "distinguished from it (loopback exemption needs CheckNetIsolation, which was not run)")
+# ループバック免除を付けても netcap が外側に届かず、区別できないとき（Issue #1401）。
+LOOPBACK_CONFOUND_EXEMPTED_REASON = (
+    "loopback isolation still blocks local destinations after the loopback exemption was applied; egress blocking "
+    "cannot be distinguished from it")
+# capability なしでも外側の loopback listener に届いたとき（免除の有無を問わない。Issue #1401）。
+LOOPBACK_EXEMPT_UNMEASURABLE_REASON = (
+    "destinations in loopback are reachable from the container without network capabilities (loopback "
+    "exemption or otherwise); a loopback listener cannot measure egress blocking")
 LOOPBACK_PREFLIGHT_MISSING_REASON = (
     "loopback confound check did not complete (preflight missing or malformed); treated as confounded")
 
@@ -177,7 +185,7 @@ def _variant_receipts(entry: object) -> int | None:
     return total
 
 
-def appcontainer_confound(preflight: object) -> str | None:
+def appcontainer_confound(preflight: object, *, loopback_exempt: bool = False) -> str | None:
     """AppContainer の loopback 遮断と egress 遮断を区別できるか。区別できれば None、できなければ理由（Issue #1396）。
 
     `preflight` は `{"nocap": {...}, "netcap": {...}}`（各 variant は `probe`・`outer_tcp`・`outer_udp`）。
@@ -185,13 +193,21 @@ def appcontainer_confound(preflight: object) -> str | None:
     開くと言える。このとき capability なしの受信 0 件は capability の欠如（ネットワーク遮断）に帰属できる。
     届かないなら loopback 遮断が capability と無関係に局所宛先を止めており、ハーネスの宛先がすべて loopback のため
     egress 遮断と区別できない。preflight が無い・不正な場合も交絡ありとする（fail-closed）。
+    Issue #1401: `nocap`（capability なし）の受信が 1 件以上なら、免除の有無を問わず loopback 宛ての listener では
+    egress を測れない（`LOOPBACK_EXEMPT_UNMEASURABLE_REASON`）。`loopback_exempt` は免除を付けた実行かどうかで、
+    両方 0 件のときの理由だけを切り替える。
     """
     if not isinstance(preflight, dict):
         return LOOPBACK_PREFLIGHT_MISSING_REASON
     netcap = _variant_receipts(preflight.get("netcap"))
-    if netcap is None or _variant_receipts(preflight.get("nocap")) is None:
+    nocap = _variant_receipts(preflight.get("nocap"))
+    if netcap is None or nocap is None:
         return LOOPBACK_PREFLIGHT_MISSING_REASON
-    return None if netcap >= 1 else LOOPBACK_CONFOUND_REASON
+    if nocap >= 1:
+        return LOOPBACK_EXEMPT_UNMEASURABLE_REASON
+    if netcap >= 1:
+        return None
+    return LOOPBACK_CONFOUND_EXEMPTED_REASON if loopback_exempt else LOOPBACK_CONFOUND_REASON
 
 
 def judge_all(
@@ -241,7 +257,13 @@ def judge_all(
         if mode == "appcontainer":
             method = ("outer listener receipt + in-container errno (no process-level monitor; "
                       "loopback confound checked by capability contrast)")
-            if verdict == PASS and loopback_confound is not None:
+            if (verdict == FAIL and route in LISTENER_ROUTES
+                    and loopback_confound == LOOPBACK_EXEMPT_UNMEASURABLE_REASON):
+                # capability なしでも loopback 宛てが届く。外側の受信は egress 漏れと断定できない（件数は残す）。
+                verdict = UNOBSERVABLE
+                reason = (f"outer receipts ({outer_counts.get(route, 0)}) are attributable to loopback "
+                          f"reachability without capabilities; {loopback_confound}")
+            elif verdict == PASS and loopback_confound is not None:
                 verdict, reason = UNOBSERVABLE, loopback_confound
             elif (verdict == UNOBSERVABLE and reason.startswith("positive check failed")
                   and loopback_confound is not None):

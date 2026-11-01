@@ -121,6 +121,8 @@ loopback で配信するフィクスチャページ（`harness/render-screenshot
 | macOS | `sandbox-exec` の `(deny network*)` + プロキシのポートのみ許可で、WebSocket の直接接続が止まるか。ホストが隔離下で動くか。OS 版による差（runner のイメージ版を記録） | `xos-measure.yml` の macos runner（ローカルでも可） | `--selftest` が隔離と無関係に失敗する場合の切り分け手順を先に用意する（ヘッドレスの GPU・WindowServer 制限。`RENDER-4`） |
 | Windows | AppContainer の loopback 例外に管理者が要るか。プロキシ宛だけを通せるか。ANGLE の DLL・フォント・一時ディレクトリを含めホストが AppContainer 内で起動するか | **非管理者の実機またはローカル VM が必要**。`xos-measure.yml` の windows runner は管理者で動くため、鍵となる問いには答えられない | runner だけでは権限の問いに結論が出ない |
 
+Windows の補足（#1401）: `xos-measure.yml` の Windows ジョブに限り、opt-in のループバック免除（`CheckNetIsolation LoopbackExempt`。ハーネスが作った AppContainer の SID だけ・計測後に解除。オーナー承認 2026-11-01）をつけた preflight を追加した。結果は #1003 に記録する。
+
 ### 6.3 実施の扱い
 
 - `xos-measure.yml`（手動専用・required ではない）への suite 追加と測定ハーネスの実装は後続 issue（infra-builder・render-builder）とする。本 issue では計画を書くだけにする。Linux 版のハーネスは `harness/egress-isolation/`（#1377・#1380）で実装済み（結果は §6.4）。macOS・Windows 版は #1387 で同ハーネスを拡張し、`xos-measure.yml` の suite `egress-isolation` として実装した（macOS は Seatbelt の `seatbelt`、Windows は `baseline` と AppContainer。AppContainer のランチャーは #1396 でオーナー承認〔2026-11-01。`harness/egress-isolation/` の Python 計測ハーネスに限る ctypes の Win32 FFI。本体 crate の FFI・`unsafe` は対象外〕のうえ実装し、loopback 遮断と egress 遮断の切り分けは Servo を使わない preflight で行う。結果は #1003 に記録し、実測後に本書へ要約する）。macOS の TCP 経路の試行は、拒否ログだけでは観測できなかったため #1395 で失敗経路のビーコン（許可オリジンへの GET。補助情報のみで試行の根拠にしない。試行の根拠は UDP の errno）と拒否ログの診断・自己検査を加えた（手段の詳細は `harness/egress-isolation/README.md`）

@@ -9,6 +9,8 @@ name: XOS Measure
 #   suite=egress-isolation Servo ホストの egress 隔離を macOS・Windows で実測する（#1387・TASK-38・RENDER-3。
 #                          harness/egress-isolation/measure.py。macOS は Seatbelt、Windows は baseline と
 #                          AppContainer〔ctypes のランチャー。#1396・loopback の切り分けつき〕。ubuntu は対象外）
+# Windows の egress-isolation は #1401 で opt-in のループバック免除（CheckNetIsolation LoopbackExempt。ハーネスが作った
+# AppContainer の SID だけ・計測後に解除）を付ける（オーナー承認 2026-11-01。使い捨て runner に限る）。
 # 本 workflow は計測結果を出すだけで、合否・OS 間の差の判定はしない（判定は人間。.claude/rules/delegation-impl.md）。
 #
 # 設計上の位置づけ:
@@ -866,12 +868,13 @@ jobs:
         run: bash harness/egress-isolation/self-test.sh
       - name: "[egress-isolation] プラットフォームの記録（読み取りのみ）"
         run: python -I -B harness/egress-isolation/platform_probe.py
-      - name: "[egress-isolation] 実行（baseline の対照と AppContainer。preflight つき）"
+      - name: "[egress-isolation] 実行（baseline の対照と AppContainer。ループバック免除つき preflight。#1401）"
         run: |
           $out = Join-Path $env:RUNNER_TEMP 'egress-isolation'
           New-Item -ItemType Directory -Force -Path $out | Out-Null
           $bin = Join-Path $env:SERVO_HOST_TARGET_DIR 'release\fandhe-browser-servo-host.exe'
-          python -I -B harness/egress-isolation/measure.py --host $bin --modes baseline,appcontainer --out $out
+          python -I -B harness/egress-isolation/measure.py --host $bin --modes baseline,appcontainer `
+            --appcontainer-loopback-exempt --out $out
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: "[egress-isolation] AppContainer プロファイルの残骸の確認（読み取りのみ）"
         if: ${{ !cancelled() }}
@@ -879,6 +882,12 @@ jobs:
           $pk = Join-Path $env:LOCALAPPDATA 'Packages'
           $left = Get-ChildItem $pk -Filter 'fandhe.egressiso.*' -ErrorAction SilentlyContinue
           Write-Host "leftover AppContainer profile folders: $(@($left).Count)"
+      - name: "[egress-isolation] ループバック免除の残骸の確認（読み取りのみ。#1401）"
+        if: ${{ !cancelled() }}
+        run: |
+          $lines = & "$env:SystemRoot\System32\CheckNetIsolation.exe" LoopbackExempt -s
+          $n = @($lines | Select-String -SimpleMatch 'S-1-15-2-').Count
+          Write-Host "loopback-exempt SID lines: $n"
       - name: "[egress-isolation] 結果表を Step Summary へ"
         if: ${{ !cancelled() }}
         run: |

@@ -6,7 +6,10 @@
     `measure.py` の Windows `appcontainer` モードが、capability を持たない AppContainer の中で
     `in_sandbox.py`（ひいては Servo ホスト）を起動するための Win32 FFI を閉じ込める。
     オーナー承認（2026-11-01）の範囲は「`harness/egress-isolation/` の Python 計測ハーネスに限る ctypes の Win32 FFI」。
-    本体 crate（Rust）への FFI・`unsafe` の追加、依存の追加、管理者権限が要る操作（`CheckNetIsolation` 等）は範囲外で、行わない。
+    本体 crate（Rust）への FFI・`unsafe` の追加、依存の追加は範囲外で、行わない。
+    管理者権限が要る操作は、Issue #1401 のオーナー承認（2026-11-01）の範囲だけ行う。範囲は `xos-measure.yml` の Windows ジョブ
+    （使い捨て runner）で opt-in（`loopback_exempt=True`）のときに、ハーネスが作ったプロファイルの SID へ
+    `CheckNetIsolation LoopbackExempt` を付け、計測後に必ず解除すること。既定では呼ばない。
 
 方式:
     - AppContainer プロファイルを作り、`PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES` で `CreateProcessW` する。
@@ -160,6 +163,35 @@ def drain_job(api: Any, job: Any, *, limit_s: float = JOB_DRAIN_LIMIT_S, poll_s:
 
 
 # --- 純粋関数（全 OS で自己テストできる） -------------------------------------------------------------
+CHECKNETISOLATION_ACTIONS = {"add": "-a", "delete": "-d", "show": "-s"}
+CHECKNETISOLATION_TIMEOUT_S = 60
+
+
+def checknetisolation_args(action: str, sid: str | None, system_root: str) -> list[str]:
+    """`CheckNetIsolation LoopbackExempt` の argv（Issue #1401）。実行ファイルは SystemRoot 配下の絶対パス（PATH 検索なし）。
+
+    add / delete はハーネスが作ったプロファイルの SID だけを `-p=` で渡す（検証済みの文字列のみ）。show は全体の一覧。
+    """
+    flag = CHECKNETISOLATION_ACTIONS.get(action)
+    if flag is None:
+        raise ValueError("invalid CheckNetIsolation action")
+    if not isinstance(system_root, str) or not (re.match(r"^[A-Za-z]:[\\/]", system_root) or system_root.startswith("\\\\")):
+        raise AppContainerError("SystemRoot is not an absolute path")
+    exe = system_root.rstrip("\\/") + "\\System32\\CheckNetIsolation.exe"
+    args = [exe, "LoopbackExempt", flag]
+    if action != "show":
+        args.append(f"-p={validate_sid_string(sid)}")
+    return args
+
+
+def _run_checknetisolation(args: list[str]) -> tuple[int, str]:
+    """CheckNetIsolation を実行し (rc, 出力の先頭) を返す。起動失敗・タイムアウトは例外のまま呼び出し側へ。"""
+    done = subprocess.run(args, stdin=subprocess.DEVNULL, capture_output=True,  # noqa: S603
+                          timeout=CHECKNETISOLATION_TIMEOUT_S, check=False, shell=False)
+    out = (done.stdout or b"").decode("utf-8", errors="replace")
+    return done.returncode, out
+
+
 def _run_icacls(args: list[str], what: str) -> "subprocess.CompletedProcess[bytes]":
     """icacls を実行する。タイムアウト・起動失敗は AppContainerError へ変換し、unobservable として記録させる。"""
     try:
@@ -340,7 +372,8 @@ class AppContainerSession:
     `__exit__` が必ず片付け、結果は `cleanup` に残る。
     """
 
-    def __init__(self, *, host: Path, harness_dir: Path, timeout_s: int = DEFAULT_TIMEOUT_S) -> None:
+    def __init__(self, *, host: Path, harness_dir: Path, timeout_s: int = DEFAULT_TIMEOUT_S,
+                 loopback_exempt: bool = False) -> None:
         self.host = host
         self.harness_dir = harness_dir
         self.timeout_s = timeout_s
@@ -354,6 +387,10 @@ class AppContainerSession:
         self._created = False
         self._granted = False
         self._root: Path | None = None  # 片付けで丸ごと削除する複製先の根
+        # Issue #1401: opt-in のループバック免除。部分適用を除外できないため、付与を試みたら解除も必ず試す。
+        self.loopback_exempt = loopback_exempt
+        self.loopback_exempt_state: dict[str, Any] = {"requested": loopback_exempt}
+        self._exempt_attempted = False
 
     # 複製先の中のパス（容器内で使う）。
     @property
@@ -381,6 +418,8 @@ class AppContainerSession:
         self._api = _api()
         try:
             self._create_profile()
+            if self.loopback_exempt:
+                self._add_loopback_exempt()
             self._prepare_staging()
         except BaseException:
             self.__exit__(None, None, None)
@@ -389,6 +428,9 @@ class AppContainerSession:
 
     def __exit__(self, *exc: object) -> None:
         c = self.cleanup
+        # 免除の解除はプロファイル削除より前（SID が有効なうちに）。失敗しても後続の片付けは続ける。
+        if self._exempt_attempted and self.sid_string:
+            self._remove_loopback_exempt()
         if self._root is not None:
             shutil.rmtree(self._root, ignore_errors=True)
             c["staging_removed"] = not self._root.exists()
@@ -401,6 +443,48 @@ class AppContainerSession:
             self._api.FreeSid(self._sid)
             self._sid = ctypes.c_void_p(None)
             c["sid_freed"] = True
+
+    def _exempt_listed(self) -> bool | None:
+        """`LoopbackExempt -s` の出力に当該 SID があるか。実行できなければ None（未確認）。"""
+        sid = validate_sid_string(self.sid_string)
+        try:
+            rc, out = _run_checknetisolation(
+                checknetisolation_args("show", None, os.environ.get("SystemRoot", "")))
+        except (OSError, subprocess.SubprocessError, AppContainerError):
+            return None
+        if rc != 0:
+            return None
+        return sid.lower() in out.lower()
+
+    def _add_loopback_exempt(self) -> None:
+        """Issue #1401: ハーネスが作ったプロファイルの SID にだけループバック免除を付ける（opt-in・要管理者）。"""
+        st = self.loopback_exempt_state
+        args = checknetisolation_args("add", self.sid_string, os.environ.get("SystemRoot", ""))
+        self._exempt_attempted = True
+        try:
+            rc, _ = _run_checknetisolation(args)
+        except (OSError, subprocess.SubprocessError) as exc:
+            st["added"] = False
+            raise AppContainerError(f"CheckNetIsolation LoopbackExempt -a failed: {type(exc).__name__}") from exc
+        st["add_rc"] = rc
+        if rc != 0:
+            st["added"] = False
+            raise AppContainerError(f"CheckNetIsolation LoopbackExempt -a failed rc={rc}")
+        listed = self._exempt_listed()
+        st["listed_after_add"] = listed
+        # 一覧の表示形式に依存するため、未確認でも失敗にはしない（免除が効かなければ preflight の対照が
+        # 交絡ありと判定し、判定は fail-closed のまま）。解除は付与を試みた時点で必ず行う。
+        st["added"] = True
+
+    def _remove_loopback_exempt(self) -> None:
+        c = self.cleanup
+        try:
+            rc, _ = _run_checknetisolation(
+                checknetisolation_args("delete", self.sid_string, os.environ.get("SystemRoot", "")))
+            c["loopback_exempt_removed"] = rc == 0
+        except (OSError, subprocess.SubprocessError, AppContainerError):
+            c["loopback_exempt_removed"] = False
+        c["loopback_exempt_absent_after_remove"] = self._exempt_listed() is False
 
     def _create_profile(self) -> None:
         a = self._api

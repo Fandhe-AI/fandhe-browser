@@ -118,7 +118,7 @@ macOS・Windows の GitHub ホステッドランナー。結果は #1003 に記�
 - Windows の `appcontainer`（#1396。オーナー承認 2026-11-01: `harness/egress-isolation/` の Python 計測ハーネスに限る ctypes の Win32 FFI）:
   - `appcontainer.py` が `CreateAppContainerProfile`・`PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES`・`CreateProcessW`・Job
     （`KILL_ON_JOB_CLOSE`）で内側ランナー（`in_sandbox.py`。Servo ホストは子プロセス）を起動する。標準ライブラリの ctypes のみで、
-    本体 crate（Rust）への FFI・`unsafe`・依存の追加、管理者権限が要る操作（`CheckNetIsolation` 等）は行わない。
+    本体 crate（Rust）への FFI・`unsafe`・依存の追加は行わない。管理者権限が要る操作は、次項の #1401 の承認範囲（`xos-measure.yml` の Windows ジョブでの opt-in）を除き行わない。
   - 容器から読めるのは AppContainer 専用フォルダだけなので、Python ランタイム・ハーネス・ホスト（exe と同階層の DLL）をそこへ複製する
     （toolcache・チェックアウト・`D:\sr` の ACL は変えない）。専用フォルダが取れないときだけ一時ディレクトリに `icacls` で SID を付与し、
     終了時に除去する。複製したホストの SHA256 を記録し、baseline と同一性を比べる。
@@ -133,10 +133,26 @@ macOS・Windows の GitHub ホステッドランナー。結果は #1003 に記�
   - 宛先は 127.0.0.0/8 のダミーだけ。TCP 5 経路は試行の根拠（写し listener・拒否ログ）が無いため `unobservable` のまま。`udp_direct` の
     errno は生の値を `probes.udp_direct` に記録するだけで、Windows の拒否 errno は実測前に判定へ入れない
     （`in_sandbox.APPCONTAINER_DENY_ERRNOS` は空。観測した値を根拠に追加する）。
+  - ループバック免除（#1401。オーナー承認 2026-11-01: `xos-measure.yml` の Windows ジョブ〔使い捨て runner〕に限り、ハーネスが作った
+    AppContainer の SID だけに `CheckNetIsolation LoopbackExempt` を付ける。opt-in で、計測後に必ず解除）: `measure.py --appcontainer-loopback-exempt`
+    （Windows の `appcontainer` モードのときだけ受け付ける。既定・ローカル・`ci.yml` では呼ばない）。プロファイル作成の直後・最初の起動の前に
+    付与し、片付けではプロファイル削除より前に解除する（付与に失敗しても解除を試みる）。解除の成否と、解除後に一覧へ SID が無いことを
+    `appcontainer.cleanup` の `loopback_exempt_removed`・`loopback_exempt_absent_after_remove` に記録し、解除に失敗すれば pass にしない。
+    交絡の判定は 3 通り: (1) `nocap` が外側に届いた場合は loopback 宛ての listener では egress を測れないとして listener 経路を理由つきの
+    `unobservable`（外側の受信由来の fail も `unobservable` に変え、件数は `outer_count` に残す）、(2) `nocap` 0 件・`netcap` 1 件以上なら交絡なし、
+    (3) 両方 0 件なら免除ありでも区別できず `unobservable`。
+  - 免除で測れない場合の代替案（未検証。採否はオーナー判断）:
+
+    | 案 | 内容 | 懸念 |
+    | -- | ---- | ---- |
+    | (a) runner 自身の NIC アドレス | loopback 以外の自機アドレスの listener | 宛先を 127.0.0.0/8 以外に向けない安全規則に反する。隔離が自機の全アドレスに及ぶ可能性も未確認 |
+    | (b) 別ホスト・別 VM の listener | ジョブ間のネットワーク設計が要る | 実在アドレスへのプローブになる |
+    | (c) WFP の監査（`auditpol` の Filtering Platform Connection 等） | 試行そのものを観測する | 本承認の範囲外の管理者操作 |
+
 - Windows の runner は管理者で動くため、「非管理者で loopback 例外を作れるか」には答えられない（設計 §6.2）。
 
 ## 承認事項（この issue では実装しない）
 
 Landlock ルールの適用（`landlock` クレートまたは `unsafe`）・seccomp-bpf・許可リスト付きプロキシと netns 内への中継・
-Servo 自身の DNS/UDP の外部観測・`CheckNetIsolation LoopbackExempt` の設定変更・Windows の TCP 経路の試行の観測手段（WFP の監査等）・古いカーネルでの再測定。
-（Windows の AppContainer ランチャー〔ctypes〕は #1396 でオーナー承認のうえ実装済み。範囲はこのディレクトリの Python ハーネスに限る。）
+Servo 自身の DNS/UDP の外部観測・Windows の TCP 経路の試行の観測手段（WFP の監査等）・古いカーネルでの再測定。
+（`CheckNetIsolation LoopbackExempt` は #1401 で承認済みの opt-in〔xos-measure の Windows のみ〕として実装済み。Windows の AppContainer ランチャー〔ctypes〕は #1396 でオーナー承認のうえ実装済み。範囲はこのディレクトリの Python ハーネスに限る。）

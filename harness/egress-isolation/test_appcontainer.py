@@ -403,7 +403,7 @@ class JudgeAppContainerTest(unittest.TestCase):
 class FakeSession:
     """`appcontainer.AppContainerSession` と同じ規約の偽物。finally での片付けの呼び出しを記録する。"""
 
-    def __init__(self, *, main: dict[str, Any], cleanup_ok: bool = True) -> None:
+    def __init__(self, *, main: dict[str, Any], cleanup_ok: bool = True, **_kw: Any) -> None:
         self.main, self.cleanup_ok = main, cleanup_ok
         self.name, self.sid_string, self.staging_mode = "fandhe.egressiso.1", SID, "appcontainer-folder"
         self.host_path = "C:\\stage\\host\\h.exe"
@@ -500,6 +500,168 @@ class RunAppContainerModeTest(unittest.TestCase):
         self.assertIn("| nocap |", text)
         self.assertIn("loopback confound:", text)
         json.dumps(results)  # JSON 化できる
+
+SYS_ROOT = "C:\\Windows"
+CNI = "C:\\Windows\\System32\\CheckNetIsolation.exe"
+
+
+class CheckNetIsolationArgsTest(unittest.TestCase):
+    """Issue #1401: CheckNetIsolation の argv は固定形式で、SID は検証済みの値だけ。"""
+
+    def test_exact_argv(self) -> None:
+        self.assertEqual(ac.checknetisolation_args("add", SID, SYS_ROOT), [CNI, "LoopbackExempt", "-a", f"-p={SID}"])
+        self.assertEqual(ac.checknetisolation_args("delete", SID, SYS_ROOT),
+                         [CNI, "LoopbackExempt", "-d", f"-p={SID}"])
+        self.assertEqual(ac.checknetisolation_args("show", None, SYS_ROOT), [CNI, "LoopbackExempt", "-s"])
+
+    def test_rejects_bad_inputs(self) -> None:
+        with self.assertRaises(ValueError):
+            ac.checknetisolation_args("reset", SID, SYS_ROOT)
+        with self.assertRaises(ValueError):
+            ac.checknetisolation_args("add", "S-1-5-32-544", SYS_ROOT)
+        with self.assertRaises(ac.AppContainerError):
+            ac.checknetisolation_args("add", SID, "Windows")
+        with self.assertRaises(ac.AppContainerError):
+            ac.checknetisolation_args("show", None, "")
+
+
+class LoopbackExemptSessionTest(unittest.TestCase):
+    """付与・解除の順序と、解除失敗・付与失敗の記録（Issue #1401。Linux 上で subprocess を偽物にして確かめる）。"""
+
+    def _session(self, order: list[str], *, exempt: bool, rc: dict[str, Any] | None = None) -> Any:
+        from unittest import mock
+        rc = rc or {}
+        sess = ac.AppContainerSession(host=Path("h.exe"), harness_dir=Path("."), loopback_exempt=exempt)
+
+        class Api:
+            def __getattr__(self, name: str) -> Any:
+                def call(*_a: Any) -> int:
+                    order.append(name)
+                    return 0
+                return call
+
+        def create_profile() -> None:
+            order.append("create_profile")
+            sess.sid_string = SID
+            sess._created = True
+
+        def run(args: list[str], **_kw: Any) -> Any:
+            flag = args[2]
+            order.append(f"cni {flag}")
+            behavior = rc.get(flag, 0)
+            if isinstance(behavior, Exception):
+                raise behavior
+            out = SID if flag == "-s" and rc.get("listed", True) else ""
+
+            class Done:
+                returncode = behavior if flag != "-s" else 0
+                stdout = out.encode()
+            return Done()
+
+        sess._api_patch = (mock.patch.object(ac, "_api", return_value=Api()),
+                           mock.patch.object(sess, "_create_profile", create_profile),
+                           mock.patch.object(sess, "_prepare_staging", lambda: order.append("prepare_staging")),
+                           mock.patch.object(ac.subprocess, "run", run),
+                           mock.patch.dict(ac.os.environ, {"SystemRoot": SYS_ROOT}))
+        return sess
+
+    def _enter_exit(self, sess: Any) -> None:
+        for p in sess._api_patch:
+            p.start()
+        try:
+            sess._sid = ctypes.c_void_p(1)
+            with sess:
+                pass
+        finally:
+            for p in sess._api_patch:
+                p.stop()
+
+    def test_order_add_before_staging_and_remove_before_delete(self) -> None:
+        order: list[str] = []
+        sess = self._session(order, exempt=True)
+        self._enter_exit(sess)
+        self.assertEqual(order, ["create_profile", "cni -a", "cni -s", "prepare_staging",
+                                 "cni -d", "cni -s", "DeleteAppContainerProfile", "FreeSid"])
+        self.assertEqual(sess.loopback_exempt_state,
+                         {"requested": True, "add_rc": 0, "listed_after_add": True, "added": True})
+        self.assertIs(sess.cleanup["loopback_exempt_removed"], True)
+        # 解除後の確認で SID が一覧に残っていれば absent は False（偽物は常に SID を返す）。
+        self.assertIs(sess.cleanup["loopback_exempt_absent_after_remove"], False)
+
+    def test_remove_failure_is_recorded_and_profile_still_deleted(self) -> None:
+        for bad in (1, __import__("subprocess").TimeoutExpired("x", 60)):
+            order: list[str] = []
+            sess = self._session(order, exempt=True, rc={"-d": bad})
+            self._enter_exit(sess)
+            self.assertIs(sess.cleanup["loopback_exempt_removed"], False)
+            self.assertIn("DeleteAppContainerProfile", order)
+            data = {"appcontainer": {"cleanup": sess.cleanup, "loopback_exempt": sess.loopback_exempt_state,
+                                     "preflight": _preflight((0, 0), (1, 0))}}
+            self.assertIn("cleanup was incomplete", measure.appcontainer_caveat(data) or "")
+
+    def test_add_failure_raises_and_still_tries_remove_and_profile_delete(self) -> None:
+        order: list[str] = []
+        sess = self._session(order, exempt=True, rc={"-a": 5})
+        with self.assertRaises(ac.AppContainerError):
+            self._enter_exit(sess)
+        self.assertEqual(order, ["create_profile", "cni -a", "cni -d", "cni -s", "DeleteAppContainerProfile", "FreeSid"])
+        self.assertIs(sess.loopback_exempt_state["added"], False)
+        self.assertEqual(sess.loopback_exempt_state["add_rc"], 5)
+
+    def test_default_off_never_calls_checknetisolation(self) -> None:
+        order: list[str] = []
+        sess = self._session(order, exempt=False)
+        self._enter_exit(sess)
+        self.assertFalse([o for o in order if o.startswith("cni")])
+        self.assertEqual(sess.loopback_exempt_state, {"requested": False})
+        self.assertFalse([k for k in sess.cleanup if k.startswith("loopback_exempt")])
+
+
+class LoopbackExemptJudgeTest(unittest.TestCase):
+    def test_confound_three_ways(self) -> None:
+        self.assertEqual(judge.appcontainer_confound(_preflight((1, 0), (1, 0))),
+                         judge.LOOPBACK_EXEMPT_UNMEASURABLE_REASON)
+        self.assertIsNone(judge.appcontainer_confound(_preflight((0, 0), (1, 0)), loopback_exempt=True))
+        self.assertEqual(judge.appcontainer_confound(_preflight((0, 0), (0, 0)), loopback_exempt=True),
+                         judge.LOOPBACK_CONFOUND_EXEMPTED_REASON)
+        self.assertEqual(judge.appcontainer_confound(_preflight((0, 0), (0, 0)), loopback_exempt=False),
+                         judge.LOOPBACK_CONFOUND_REASON)
+
+    def test_nocap_reach_downgrades_listener_fail_and_keeps_counts(self) -> None:
+        v = judge.judge_all("appcontainer", _inner(), {**ZERO, "udp_direct": 1, "fetch": 2}, CONTROL,
+                            loopback_confound=judge.LOOPBACK_EXEMPT_UNMEASURABLE_REASON)
+        for route, n in (("udp_direct", 1), ("fetch", 2)):
+            self.assertEqual(v[route]["verdict"], judge.UNOBSERVABLE)
+            self.assertIn(f"outer receipts ({n})", v[route]["reason"])
+            self.assertEqual(v[route]["outer_count"], n)
+
+    def test_other_confound_keeps_fail(self) -> None:
+        v = judge.judge_all("appcontainer", _inner(), {**ZERO, "fetch": 2}, CONTROL,
+                            loopback_confound=judge.LOOPBACK_CONFOUND_EXEMPTED_REASON)
+        self.assertEqual(v["fetch"]["verdict"], judge.FAIL)
+
+
+class LoopbackExemptMeasureTest(unittest.TestCase):
+    def test_flag_reaches_launcher_and_is_recorded(self) -> None:
+        seen: dict[str, Any] = {}
+
+        def make(**kw: Any) -> FakeSession:
+            seen.update(kw)
+            return FakeSession(main=_main(_inner()))
+        recs = {k: _Rec() for k in PORTS}
+        with tempfile.TemporaryDirectory() as td:
+            data = measure.run_appcontainer_mode(host=Path("C:/h.exe"), ports=PORTS, recs=recs, out_dir=Path(td),
+                                                 page_port=4000, launcher=make, loopback_exempt=True)
+        self.assertIs(seen["loopback_exempt"], True)
+        self.assertEqual(data["appcontainer"]["loopback_exempt"], {"requested": True})
+
+    def test_validate_flag(self) -> None:
+        measure.validate_loopback_exempt(False, "linux", ["baseline"])
+        measure.validate_loopback_exempt(True, "win32", ["baseline", "appcontainer"])
+        with self.assertRaises(ValueError):
+            measure.validate_loopback_exempt(True, "linux", ["baseline", "appcontainer"])
+        with self.assertRaises(ValueError):
+            measure.validate_loopback_exempt(True, "win32", ["baseline"])
 
 
 if __name__ == "__main__":
