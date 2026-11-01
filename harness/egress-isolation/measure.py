@@ -246,7 +246,7 @@ def _run_argv(argv: list[str]) -> tuple[int | None, str]:
 def _signal_log_group(proc: Any, sig: int) -> None:
     """`start_new_session=True` で起動した `log show` 系のプロセスグループ全体へシグナルを送る。
 
-    sudo 配下の子 `log` は親と同じグループにいる（pgid == proc.pid）。グループ送信が拒否・失敗した場合は親だけへ送る。
+    子は `start_new_session=True` で自前のグループを持つ（pgid == proc.pid）。グループ送信が拒否・失敗した場合は親だけへ送る。
     """
     try:
         os.killpg(proc.pid, sig)
@@ -260,11 +260,7 @@ def _signal_log_group(proc: Any, sig: int) -> None:
 
 
 def _stop_log_proc(proc: Any) -> None:
-    """`log show` 系の子プロセスを止める。グループへ SIGTERM（sudo は子の log へ中継する）を先に送り、期限後に SIGKILL する。
-
-    sudo への SIGKILL だけでは子の `log` に伝わらずパイプが開いたままになるため、この順で
-    プロセスグループ全体へ送る（Issue #1402）。
-    """
+    """`log show` の子プロセスを止める。グループへ SIGTERM を先に送り、期限後に SIGKILL する（Issue #1402）。"""
     if hasattr(os, "killpg") and hasattr(proc, "pid"):
         try:
             _signal_log_group(proc, signal.SIGTERM)
@@ -319,12 +315,12 @@ class _TimedLineReader:
 
 
 # run_mode が collect_denies の呼び出しの間だけ設定する、この run の既知の宛先 ("ip:port") 一覧。
-# collect_denies の呼び出し形（start, pids, sudo）を変えずに渡すための文脈（既存の差し替え・呼び出し側を壊さない）。
+# collect_denies の呼び出し形（start, pids）を変えずに渡すための文脈（既存の差し替え・呼び出し側を壊さない）。
 _KNOWN_DESTS: contextvars.ContextVar[tuple[str, ...] | None] = contextvars.ContextVar("known_dests", default=None)
 
 
 def collect_denies(start: str, pids: frozenset[int] | None = None, *,
-                   sudo: bool = False, dests: Any = None) -> tuple[dict[str, int], dict[str, Any]]:
+                   dests: Any = None) -> tuple[dict[str, int], dict[str, Any]]:
     """macOS のサンドボックス拒否ログを逐次読んで集計する。(宛先 -> 件数, 取得状況)。読めなければ空と理由。
 
     `pids` は対象ホストとその子孫の pid。拒否ログの `proc(<pid>)` が含まれる行だけを数える（無関係な
@@ -332,8 +328,6 @@ def collect_denies(start: str, pids: frozenset[int] | None = None, *,
 
     出力を全量メモリに載せず、1 行ずつ上限つきで読む。行数・総バイト数が上限に達したら
     プロセスを止めて unobservable（available=False）にする（リソース枯渇の防止）。
-
-    `sudo=True` は opt-in（Issue #1402。xos-measure の macOS ジョブのみ）。`sudo -n log show --info --debug` を使う。
 
     `dests` はこの run の既知の宛先 ("ip:port") 一覧（dest_counts のキー）。macOS 26 のワイルドカード形式
     （`network-outbound <語>:*:<port>`）は、pid が `pids` に含まれ、かつポートが `dests` で一意のときだけその宛先へ
@@ -343,7 +337,7 @@ def collect_denies(start: str, pids: frozenset[int] | None = None, *,
         dests = _KNOWN_DESTS.get()
     port_map = seatbelt.PortMap.from_dests(dests) if dests is not None else None
     try:
-        argv = seatbelt.log_show_argv(start, sudo=sudo)
+        argv = seatbelt.log_show_argv(start)
         proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,  # noqa: S603
                                 stderr=subprocess.DEVNULL, start_new_session=True)
     except (OSError, subprocess.SubprocessError, ValueError) as exc:
@@ -401,7 +395,7 @@ def collect_denies(start: str, pids: frozenset[int] | None = None, *,
     if getattr(reader, "timed_out", False):
         return {}, {"available": False, "reason": "log show timed out"}
     if proc.returncode != 0:
-        return {}, {"available": False, "reason": f"log show rc={proc.returncode}" + (" (sudo)" if sudo else "")}
+        return {}, {"available": False, "reason": f"log show rc={proc.returncode}"}
     return dict(counts), {"available": True, "deny_lines": sum(counts.values()), "diagnostics": diag.as_dict()}
 
 
@@ -501,9 +495,7 @@ def appcontainer_caveat(data: dict[str, Any]) -> str | None:
 
 def run_mode(mode: str, *, host: Path, ports: dict[str, int], recs: dict[str, Any], out_dir: Path,
              hosts_file: Path, image: str | None, resolv_file: Path | None = None, page_port: int = 0,
-             launcher: Any = None, loopback_exempt: bool = False, sudo_log: str | None = None,
-             log_runner: Any = None) -> dict[str, Any]:
-    """`sudo_log` は seatbelt だけで効く opt-in（None / "show" / "config"。Issue #1402）。"""
+             launcher: Any = None, loopback_exempt: bool = False) -> dict[str, Any]:
     if mode == "appcontainer":
         return run_appcontainer_mode(host=host, ports=ports, recs=recs, out_dir=out_dir, page_port=page_port,
                                      launcher=launcher, loopback_exempt=loopback_exempt)
@@ -512,61 +504,41 @@ def run_mode(mode: str, *, host: Path, ports: dict[str, int], recs: dict[str, An
     name = f"egress-iso-{os.getpid()}" if mode == "docker-none" else None
     argv = build_argv(mode, host=host, ports=ports, out_dir=out_dir, hosts_file=hosts_file, image=image,
                       resolv_file=resolv_file, name=name, page_port=page_port)
-    use_sudo = mode == "seatbelt" and sudo_log in ("show", "config")
-    cfg = seatbelt.SandboxLogConfig(runner=log_runner) if mode == "seatbelt" and sudo_log == "config" else None
     denies: dict[str, int] = {}
     status: dict[str, Any] = {}
-    unpriv: dict[str, Any] | None = None
     pids: frozenset[int] = frozenset()
     inner: dict[str, Any] = {}
-    # log config を上げた場合は、内側の実行・log show のどこで失敗しても finally で必ず戻す（Issue #1402）。
-    try:
-        if cfg is not None:
-            cfg.__enter__()
-        started = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time() - 2))
-        rc, err = run_argv(argv, container=name)
-        outer = {k: r.count - before[k] for k, r in recs.items()}
-        result_path = out_dir / f"{mode}.json"
-        # 内側ランナーが正常終了（0）または隔離 abort（2。理由つきの JSON を書く）した場合の今回の結果だけを使う。
-        # それ以外の失敗は空 = 判定不能（合格にしない）。--out は空ディレクトリ検査済みで古い結果は混ざらない。
-        if rc in (0, 2) and result_path.is_file():
+    started = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time() - 2))
+    rc, err = run_argv(argv, container=name)
+    outer = {k: r.count - before[k] for k, r in recs.items()}
+    result_path = out_dir / f"{mode}.json"
+    # 内側ランナーが正常終了（0）または隔離 abort（2。理由つきの JSON を書く）した場合の今回の結果だけを使う。
+    # それ以外の失敗は空 = 判定不能（合格にしない）。--out は空ディレクトリ検査済みで古い結果は混ざらない。
+    if rc in (0, 2) and result_path.is_file():
+        try:
+            inner = json.loads(result_path.read_text(encoding="utf-8"))
+        except ValueError:
+            inner = {}
+    if mode == "seatbelt" and inner:
+        # 共有 loopback のため内側の写し listener が無い。TCP の試行は拒否ログ（宛先 ip:port）で観測する。
+        raw_pids = inner.get("host_pids")
+        pids = frozenset(p for p in raw_pids if isinstance(p, int) and not isinstance(p, bool)) \
+            if isinstance(raw_pids, list) else frozenset()
+        all_dests = (*(f"{judge.IP_INTERNAL_STANDIN if r == 'internal' else judge.IP_BLOCKED}:{ports[r]}"
+                       for r in ("redirect", "img", "fetch", "ws", "internal")),
+                     f"{judge.IP_BLOCKED}:{ports['udp_direct']}")
+        if pids:
+            token = _KNOWN_DESTS.set(all_dests)
             try:
-                inner = json.loads(result_path.read_text(encoding="utf-8"))
-            except ValueError:
-                inner = {}
-        if mode == "seatbelt" and inner:
-            # 共有 loopback のため内側の写し listener が無い。TCP の試行は拒否ログ（宛先 ip:port）で観測する。
-            raw_pids = inner.get("host_pids")
-            pids = frozenset(p for p in raw_pids if isinstance(p, int) and not isinstance(p, bool)) \
-                if isinstance(raw_pids, list) else frozenset()
-            all_dests = (*(f"{judge.IP_INTERNAL_STANDIN if r == 'internal' else judge.IP_BLOCKED}:{ports[r]}"
-                           for r in ("redirect", "img", "fetch", "ws", "internal")),
-                         f"{judge.IP_BLOCKED}:{ports['udp_direct']}")
-            if pids:
-                token = _KNOWN_DESTS.set(all_dests)
-                try:
-                    denies, status = collect_denies(started, pids, sudo=use_sudo)
-                    if use_sudo:
-                        # 権限の差かレベルの差かを切り分ける比較用（診断カウンタだけ。試行の根拠には使わない）。
-                        _, ustat = collect_denies(started, pids)
-                finally:
-                    _KNOWN_DESTS.reset(token)
-                if use_sudo:
-                    unpriv = {k: ustat.get(k) for k in ("available", "reason", "deny_lines", "diagnostics")
-                              if k in ustat}
-            else:
-                # 対象 PID を特定できないときは帰属を確認できないため、拒否ログを試行の根拠にしない（unobservable）。
-                denies, status = {}, {"available": False, "reason": "host pid not recorded"}
-    finally:
-        if cfg is not None:
-            cfg.__exit__(None, None, None)
+                denies, status = collect_denies(started, pids)
+            finally:
+                _KNOWN_DESTS.reset(token)
+        else:
+            # 対象 PID を特定できないときは帰属を確認できないため、拒否ログを試行の根拠にしない（unobservable）。
+            denies, status = {}, {"available": False, "reason": "host pid not recorded"}
     data = {"mode": mode, "exit_code": rc, "binary_sha256": inner.get("host_sha256"),
             "binary_version": inner.get("host_version"), "stderr_tail": err if rc != 0 else "", "inner": inner,
             "outer_counts": outer}
-    if cfg is not None:
-        # 内側の結果の有無（タイムアウト・異常終了で inner が空でも）にかかわらず、復元の状態を残す。
-        # 終了コード（admin_restore_failures）はここを読む。
-        data["log_config"] = cfg.state
     if mode == "seatbelt" and inner:
         dest = {r: f"{judge.IP_INTERNAL_STANDIN if r == 'internal' else judge.IP_BLOCKED}:{ports[r]}"
                 for r in ("redirect", "img", "fetch", "ws", "internal")}
@@ -576,11 +548,6 @@ def run_mode(mode: str, *, host: Path, ports: dict[str, int], recs: dict[str, An
         probe_ok, probe_why = seatbelt.self_check(denies, (inner.get("probes") or {}).get("udp_direct"), udp)
         if not probe_ok and status.get("available"):
             status = {**status, "available": False, "reason": probe_why}
-        if cfg is not None and not cfg.state.get("all_restored") and status.get("available"):
-            # 片付けが不完全なら拒否ログを根拠にしない（pass にしない。udp の errno 根拠は残る）。
-            status = {**status, "available": False,
-                      "reason": "log config not changed (non-default or unreadable)" if cfg.state.get("aborted")
-                      else "log config not restored"}
         mk = (status.get("diagnostics") or {}).get("match_kind") or {}
         wildcard_routes = sorted(r for r, d in (*dest.items(), ("udp_direct", udp))
                                  if status.get("available") and (mk.get(d) or {}).get(seatbelt.MATCH_KIND_WILDCARD))
@@ -591,11 +558,7 @@ def run_mode(mode: str, *, host: Path, ports: dict[str, int], recs: dict[str, An
         inner["attempts"], inner["attempt_evidence"] = seatbelt.compose_attempts(
             inner.get("attempts") or {}, inner.get("attempt_evidence") or {}, denies, dest, udp)
         data["deny_log"] = {**status, "dest_counts": {d: observed.get(d, 0) for d in (*dest.values(), udp)},
-                            "sudo": use_sudo,
-                            "wildcard_routes": wildcard_routes,
-                            "log_show_flags": "sudo -n, --info --debug" if use_sudo else "default",
-                            "log_config": cfg.state if cfg is not None else None,
-                            "unprivileged": unpriv}
+                            "wildcard_routes": wildcard_routes}
     return data
 
 
@@ -603,33 +566,30 @@ _SAMPLE_KEYS = ("unmatched_deny_samples", "pid_excluded_samples")
 
 
 def _without_samples(dl: Any) -> Any:
-    """deny_log（入れ子の unprivileged を含む）から診断サンプル本文を除いた写し。サマリーの 1 行表示用。"""
+    """deny_log から診断サンプル本文を除いた写し。サマリーの 1 行表示用。"""
     if not isinstance(dl, dict):
         return dl
     out = dict(dl)
     for key in ("diagnostics",):
         if isinstance(out.get(key), dict):
             out[key] = {k: v for k, v in out[key].items() if k not in _SAMPLE_KEYS}
-    if isinstance(out.get("unprivileged"), dict):
-        out["unprivileged"] = _without_samples(out["unprivileged"])
     return out
 
 
 def _deny_sample_block(dl: dict[str, Any]) -> list[str]:
     """診断サンプルを text のコードブロックで出す（表・箇条書きを壊さない。バッククォートは置換する）。"""
     out: list[str] = []
-    for label, d in (("privileged", dl), ("unprivileged", dl.get("unprivileged"))):
-        diag = d.get("diagnostics") if isinstance(d, dict) else None
-        if not isinstance(diag, dict):
+    diag = dl.get("diagnostics")
+    if not isinstance(diag, dict):
+        return out
+    for key in _SAMPLE_KEYS:
+        samples = diag.get(key) or []
+        dropped = diag.get(f"{key}_dropped", 0)
+        if not samples and not dropped:
             continue
-        for key in _SAMPLE_KEYS:
-            samples = diag.get(key) or []
-            dropped = diag.get(f"{key}_dropped", 0)
-            if not samples and not dropped:
-                continue
-            out += ["", f"deny log samples ({label} {key}; {len(samples)} shown, {dropped} dropped)", "", "```text"]
-            out += [str(x).replace("`", "'") for x in samples]
-            out.append("```")
+        out += ["", f"deny log samples ({key}; {len(samples)} shown, {dropped} dropped)", "", "```text"]
+        out += [str(x).replace("`", "'") for x in samples]
+        out.append("```")
     return out
 
 
@@ -680,10 +640,6 @@ def summarize(results: dict[str, Any]) -> str:
         if data.get("deny_log"):
             dl = data["deny_log"]
             lines.append(f"- sandbox deny log: {_without_samples(dl)}")
-            if dl.get("sudo") or dl.get("log_config"):
-                lc = dl.get("log_config") or {}
-                lines.append(f"- deny log opt-in (Issue #1402): sudo={dl.get('sudo')}, flags={dl.get('log_show_flags')}, "
-                             f"log config all_restored={lc.get('all_restored')}, unprivileged diagnostics={_without_samples(dl.get('unprivileged'))}")
             lines += _deny_sample_block(dl)
         if inner.get("beacons") is not None:
             lines.append(f"- failure-path beacons (route -> count): {inner['beacons']}")
@@ -717,16 +673,6 @@ def _unavailable_deny_log_reason(data: dict[str, Any]) -> str | None:
     return dl.get("reason") if dl and not dl.get("available") else None
 
 
-def validate_seatbelt_sudo_log(value: str | None, plat: str, modes: list[str]) -> None:
-    """`--seatbelt-sudo-log` は macOS の seatbelt モードがあるときだけ受け付ける（Issue #1402）。"""
-    if value is None:
-        return
-    if value not in ("show", "config"):
-        raise ValueError("--seatbelt-sudo-log must be show or config")
-    if plat != "darwin" or "seatbelt" not in modes:
-        raise ValueError("--seatbelt-sudo-log needs darwin and the seatbelt mode")
-
-
 DEFAULT_MODES = {"linux": ("baseline", "bwrap-netns"), "darwin": ("baseline", "seatbelt"),
                  "win32": ("baseline", "appcontainer")}
 
@@ -742,10 +688,6 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--appcontainer-loopback-exempt", action="store_true",
                         help="Opt-in (needs administrator; used only by the xos-measure Windows job): add "
                         "CheckNetIsolation LoopbackExempt for the harness-created AppContainer SID and remove it afterwards.")
-    parser.add_argument("--seatbelt-sudo-log", choices=("show", "config"), default=None,
-                        help="Opt-in (macOS seatbelt only; used only by the xos-measure macOS job on a throwaway runner): "
-                        "show = read the deny log with `sudo -n log show --info --debug`; config = show plus raise the "
-                        "sandbox subsystems' log level with `sudo log config` and reset it afterwards (Issue #1402).")
     args = parser.parse_args(argv)
     try:
         plat = "linux" if sys.platform.startswith("linux") else sys.platform
@@ -757,7 +699,6 @@ def main(argv: list[str] | None = None) -> int:
         if not modes or modes[0] != "baseline" or any(m not in allowed for m in modes):
             raise ValueError("--modes must start with baseline and use known modes")
         validate_loopback_exempt(args.appcontainer_loopback_exempt, plat, modes)
-        validate_seatbelt_sudo_log(args.seatbelt_sudo_log, plat, modes)
         image = validate_image(args.docker_image) if args.docker_image else None
         if "docker-none" in modes and image is None:
             raise ValueError("docker-none needs --docker-image")
@@ -795,7 +736,6 @@ def main(argv: list[str] | None = None) -> int:
                 "kernel": platform.release(), "platform_name": platform.platform(),
                 "sw_vers": mac_version() if sys.platform == "darwin" else None, "host_sha256": sha, "host_version": version,
                 "proxy_env_present": any(k.lower().endswith("_proxy") for k in os.environ),
-                "seatbelt_sudo_log": args.seatbelt_sudo_log,
             }
             for mode in modes:
                 # モードごとにポートを取り直す（close 直後の再 bind が EADDRINUSE になるのを避ける）。
@@ -803,8 +743,7 @@ def main(argv: list[str] | None = None) -> int:
                 results["modes"][mode] = run_mode(mode, host=host, ports=ports, recs=recs, out_dir=out_dir,
                                                   hosts_file=hosts_file, image=image,
                                                   resolv_file=resolv_file, page_port=page_port,
-                                                  loopback_exempt=args.appcontainer_loopback_exempt,
-                                                  sudo_log=args.seatbelt_sudo_log)
+                                                  loopback_exempt=args.appcontainer_loopback_exempt)
                 if mode == "docker-none" and image is not None:
                     results["modes"][mode]["image_id"] = docker_image_id(image)
         finally:
@@ -826,24 +765,18 @@ def main(argv: list[str] | None = None) -> int:
     return finalize(results, out_dir)
 
 
-# 管理者操作（macOS の `log config`・Windows のループバック免除）の復元・解除が不成立だったときの終了コード。
-# 判定（pass / fail / unobservable）では変えない。2 は引数エラーで使用済み（Issue #1401・#1402 の監査）。
+# 管理者操作（Windows のループバック免除）の解除が不成立だったときの終了コード。
+# 判定（pass / fail / unobservable）では変えない。2 は引数エラーで使用済み（Issue #1401 の監査）。
 EXIT_ADMIN_RESTORE_FAILED = 3
 
 
 def admin_restore_failures(results: dict[str, Any]) -> list[str]:
-    """管理者操作の復元・解除が不成立のモードと内容を返す（空なら成立。要求されなかった操作は対象外）。
+    """管理者操作の解除が不成立のモードと内容を返す（空なら成立。要求されなかった操作は対象外）。
 
-    macOS: `log config` の変更を試みた（`raise_attempted`）のに `all_restored` が真でない。中止（aborted）は対象外。
     Windows: ループバック免除を要求した実行で、解除の rc 失敗・解除後も一覧に残る/確認不能。
     """
     failures: list[str] = []
     for mode, data in (results.get("modes") or {}).items():
-        lc = data.get("log_config")
-        if lc and not lc.get("aborted") and lc.get("all_restored") is not True and any(
-                e.get("raise_attempted") for e in (lc.get("subsystems") or {}).values()):
-            # 実際に変更を試みた操作の復元が不成立。変更せず中止（aborted）したケースは対象外。
-            failures.append(f"{mode}: log config was not restored")
         ac = data.get("appcontainer") or {}
         if (ac.get("loopback_exempt") or {}).get("requested") is True:
             cleanup = ac.get("cleanup") or {}
@@ -854,7 +787,7 @@ def admin_restore_failures(results: dict[str, Any]) -> list[str]:
 
 
 def finalize(results: dict[str, Any], out_dir: Path) -> int:
-    """結果 JSON と summary を書き終えてから、復元・解除の不成立だけを終了コードに反映する。"""
+    """結果 JSON と summary を書き終えてから、解除の不成立だけを終了コードに反映する。"""
     (out_dir / "result.json").write_text(json.dumps(results, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     summary = summarize(results)
     (out_dir / "summary.md").write_text(summary, encoding="utf-8")

@@ -17,22 +17,12 @@ from __future__ import annotations
 
 import json
 import re
-import subprocess
 from collections import Counter
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
 SANDBOX_EXEC = "/usr/bin/sandbox-exec"
 LOG_BIN = "/usr/bin/log"
-# Issue #1402: xos-measure の macOS ジョブ（使い捨て runner）に限り、opt-in で `sudo log show` / `sudo log config` を使う。
-SUDO_BIN = "/usr/bin/sudo"
-LOG_CONFIG_SUBSYSTEMS = ("com.apple.sandbox", "com.apple.sandbox.reporting")
-LOG_CONFIG_ACTIONS = ("status", "raise", "restore_default", "restore_info")
-# 上げる・戻す操作はレベルだけを変える（persist・signpost・oversize には触れない。Issue #1402）。値は定数に限る。
-LOG_CONFIG_MODE = "level:debug"
-LOG_CONFIG_RESTORE_DEFAULT_MODE = "level:default"
-LOG_CONFIG_RESTORE_INFO_MODE = "level:info"
-# `--reset` は persist・signpost・oversize などレベル以外のカスタム設定も消すため使わない（action に含めない）。
 # 隔離と無関係な失敗（GPU・WindowServer 等）を切り分ける陽性対照用の全許可プロファイル。
 BASELINE_PROFILE = "(version 1)(allow default)"
 # 隔離プロファイル。許可するのはページ配信用の loopback 1 ポートだけ（ホストが許可オリジンを読む経路）。
@@ -73,159 +63,11 @@ def isolated_profile(page_port: object) -> str:
     return _ISOLATED_TEMPLATE.format(port=page_port)
 
 
-def log_show_argv(start: str, *, sudo: bool = False) -> list[str]:
-    """`log show` の固定 argv。`start` は `YYYY-MM-DD HH:MM:SS` 形式のみ受け付ける。
-
-    `sudo=True`（opt-in。Issue #1402）は `sudo -n` つきで `--info --debug` も付ける。パスワード要求では止まらず失敗させる。
-    """
+def log_show_argv(start: str) -> list[str]:
+    """`log show` の固定 argv（非特権）。`start` は `YYYY-MM-DD HH:MM:SS` 形式のみ受け付ける。"""
     if not re.fullmatch(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}", start):
         raise ValueError("start must be 'YYYY-MM-DD HH:MM:SS'")
-    if sudo:
-        return [SUDO_BIN, "-n", LOG_BIN, "show", "--style", "ndjson", "--info", "--debug",
-                "--start", start, "--predicate", LOG_PREDICATE]
     return [LOG_BIN, "show", "--style", "ndjson", "--start", start, "--predicate", LOG_PREDICATE]
-
-
-def log_config_argv(action: str, subsystem: str) -> list[str]:
-    """`sudo log config` の固定 argv（Issue #1402 の承認範囲。許可リストの action・subsystem だけ）。"""
-    if action not in LOG_CONFIG_ACTIONS:
-        raise ValueError("unknown log config action")
-    if subsystem not in LOG_CONFIG_SUBSYSTEMS:
-        raise ValueError("unknown log config subsystem")
-    base = [SUDO_BIN, "-n", LOG_BIN, "config"]
-    if action == "status":
-        return [*base, "--status", "--subsystem", subsystem]
-    if action == "raise":
-        return [*base, "--subsystem", subsystem, "--mode", LOG_CONFIG_MODE]
-    if action == "restore_info":
-        return [*base, "--subsystem", subsystem, "--mode", LOG_CONFIG_RESTORE_INFO_MODE]
-    # 残りは restore_default（許可リストで検証済み）。
-    return [*base, "--subsystem", subsystem, "--mode", LOG_CONFIG_RESTORE_DEFAULT_MODE]
-
-
-def _default_runner(argv: list[str]) -> tuple[int, str]:
-    """固定 argv を `shell=False`・stdin なし・timeout つきで実行する（出力は先頭の上限つき）。"""
-    try:
-        cp = subprocess.run(argv, stdin=subprocess.DEVNULL, capture_output=True, timeout=60,  # noqa: S603
-                            check=False)
-    except (OSError, subprocess.SubprocessError):
-        return 127, ""
-    return cp.returncode, (cp.stdout + cp.stderr).decode("utf-8", errors="replace")[:400]
-
-
-def _line_kind(ln: str) -> str | None:
-    """小文字化済みの 1 行を "default" / "info" / None（変更不可・解釈不能）に分類する。"""
-    pairs = re.findall(r"([a-z_-]+)\s*[=:]\s*([a-z_-]+)", ln)
-    if pairs:
-        return "default" if all(v == "default" for _, v in pairs) else None
-    rest = re.sub(r"^mode\s+for\s+('[^']*'|\S+)\s*:?\s*", "", ln).strip()
-    if rest == "default":
-        return "default"
-    tokens = rest.split()
-    if "persist_default" not in tokens or any(t.startswith("persist_") and t != "persist_default" for t in tokens):
-        return None
-    levels = {t for t in tokens if t in ("default", "info", "debug", "off")}
-    if levels == {"default"}:
-        return "default"
-    if levels == {"info"}:
-        return "info"
-    return None
-
-
-def before_state_kind(status: str) -> str | None:
-    """`log config --status` の出力から、変更前の状態と戻し方を決める（fail-closed。Issue #1402）。
-
-    - "default": 全行が既定と読める。戻しは `--mode level:default`（`--reset` は使わない）。key=value 形式は全値 default、実機（macOS 26）の
-      空白区切りトークン形式 `Mode for '<s>'  DEFAULT PERSIST_DEFAULT ...` はレベルが DEFAULT のとき。
-    - "info": 全行がトークン形式でレベル INFO かつ `PERSIST_DEFAULT`。戻しは `--mode level:info` でレベルだけ
-      元へ戻す。いずれも `--reset` は使わない（persist・`SIGNPOST_*`・`OVERSIZE_*` などレベル以外のカスタム設定を
-      消してしまうため）。レベルだけを変えるので、それらは残る。判定にも使わない。
-    - None: DEBUG・OFF、`PERSIST_DEFAULT` 以外、行ごとに種別が異なる、空・解釈不能。変更しない。
-    残る差: 明示設定の INFO と plist 由来の INFO は status 上同じに見える。どちらもレベルだけを INFO へ戻すため
-    レベルは復元されるが、plist 由来のときの「設定なし」状態そのものとは区別できない。最終的な安全網は
-    復元後の `--status` 全体を変更前と比べる確認（不一致は all_restored=False で終了コード 3。#1405）。
-    """
-    kinds = {_line_kind(ln.strip().lower()) for ln in status.splitlines() if ln.strip()}
-    if len(kinds) != 1:
-        return None
-    return kinds.pop()
-
-
-def status_is_all_default(status: str) -> bool:
-    """全行が既定と読めるときだけ True（`before_state_kind` が "default"。INFO は含まない）。"""
-    return before_state_kind(status) == "default"
-
-
-class SandboxLogConfig:
-    """sandbox 関連 subsystem のログレベルを上げ、終了時（例外時も）必ず元へ戻す context manager（Issue #1402）。
-
-    `measure.py` の seatbelt 分岐が、内側の実行より前に enter し、`log show` の後に exit する。
-    変更前が "default" か "info"（`before_state_kind`）と確認できないとき（カスタム設定・status 取得失敗）は
-    何も変更せず中止する（`aborted`）。上げる操作も戻す操作もレベルだけを変える（`level:debug` /
-    変更前が default なら `level:default`、info なら `level:info`）。`--reset` は使わない（レベル以外の
-    カスタム設定を消すため）。いずれも戻した後に `--status` を取り、
-    変更前と全体一致したときだけ restored=True にする。
-    `runner` は自己テストで差し替える（argv -> (rc, 出力)）。
-    """
-
-    def __init__(self, runner: Any = None) -> None:
-        self._run = runner or _default_runner
-        self.state: dict[str, Any] = {"subsystems": {}, "all_restored": False}
-
-    def __enter__(self) -> "SandboxLogConfig":
-        for sub in LOG_CONFIG_SUBSYSTEMS:
-            self.state["subsystems"][sub] = {}
-        for sub in LOG_CONFIG_SUBSYSTEMS:
-            try:
-                rc, out = self._run(log_config_argv("status", sub))
-            except Exception as err:  # noqa: BLE001 - 取得不能は変更せず中止する
-                rc, out = None, ""
-                self.state["subsystems"][sub]["status_before_error"] = type(err).__name__
-            self.state["subsystems"][sub].update(status_before_rc=rc, status_before=out)
-        # 変更前の設定を確実に既定と確認できたときだけ変更する。レベルだけを変える前提のため、
-        # 既定以外・status 取得失敗は何も変更せず中止する（復元不能な変更をしない。Issue #1402）。
-        bad = [sub for sub in LOG_CONFIG_SUBSYSTEMS
-               if self.state["subsystems"][sub].get("status_before_rc") != 0
-               or before_state_kind(str(self.state["subsystems"][sub].get("status_before", ""))) is None]
-        for sub in LOG_CONFIG_SUBSYSTEMS:
-            self.state["subsystems"][sub]["before_kind"] = before_state_kind(
-                str(self.state["subsystems"][sub].get("status_before", "")))
-        if bad:
-            self.state["aborted"] = "log config before-state is not default or unreadable; no change made"
-            return self
-        for sub in LOG_CONFIG_SUBSYSTEMS:
-            self.state["subsystems"][sub]["raise_attempted"] = True
-            try:
-                rc, _ = self._run(log_config_argv("raise", sub))
-            except Exception as err:  # noqa: BLE001 - 残りは変更せず exit で戻す
-                rc = None
-                self.state["subsystems"][sub]["raise_error"] = type(err).__name__
-            self.state["subsystems"][sub]["raise_rc"] = rc
-        return self
-
-    def __exit__(self, *exc: object) -> None:
-        if self.state.get("aborted"):
-            # 何も変更していないので戻す対象もない。ただし拒否ログは昇格できていないため all_restored は False のまま。
-            return
-        for sub in LOG_CONFIG_SUBSYSTEMS:
-            entry = self.state["subsystems"].setdefault(sub, {})
-            action = "restore_info" if entry.get("before_kind") == "info" else "restore_default"
-            try:
-                entry["restore_rc"] = self._run(log_config_argv(action, sub))[0]
-            except Exception as err:  # noqa: BLE001 - 残りの subsystem の復元を続けるため
-                entry["restore_rc"] = None
-                entry["restore_error"] = type(err).__name__
-        for sub in LOG_CONFIG_SUBSYSTEMS:
-            entry = self.state["subsystems"][sub]
-            try:
-                rc, out = self._run(log_config_argv("status", sub))
-            except Exception as err:  # noqa: BLE001
-                rc, out = None, ""
-                entry["status_after_error"] = type(err).__name__
-            entry.update(status_after_rc=rc, status_after=out)
-            entry["restored"] = (entry.get("restore_rc") == 0 and rc == 0 and out == entry.get("status_before")
-                                 and entry.get("status_before_rc") == 0)
-        self.state["all_restored"] = all(e.get("restored") is True for e in self.state["subsystems"].values())
 
 
 def parse_deny_line(line: str, pids: frozenset[int] | None = None) -> str | None:
