@@ -7,8 +7,8 @@ name: XOS Measure
 #   suite=compat-practical TASK-59（#294）。PoC-1 の代表タスクを 3 OS で実行し動作率の差を見る
 #                          （harness/compat-practical/repeat_core.sh。22 件と 28 件の両方の成功数を出す。MEAS-4・COMPAT-4）
 #   suite=egress-isolation Servo ホストの egress 隔離を macOS・Windows で実測する（#1387・TASK-38・RENDER-3。
-#                          harness/egress-isolation/measure.py。macOS は Seatbelt、Windows は baseline のみ
-#                          〔AppContainer ランチャーは FFI が要る承認事項のため unobservable で記録〕。ubuntu は対象外）
+#                          harness/egress-isolation/measure.py。macOS は Seatbelt、Windows は baseline と
+#                          AppContainer〔ctypes のランチャー。#1396・loopback の切り分けつき〕。ubuntu は対象外）
 # 本 workflow は計測結果を出すだけで、合否・OS 間の差の判定はしない（判定は人間。.claude/rules/delegation-impl.md）。
 #
 # 設計上の位置づけ:
@@ -604,7 +604,7 @@ jobs:
           retention-days: 30
           if-no-files-found: error
 
-  # Windows 版。前提検証は cli-conformance-windows と同一内容（更新時は両方を揃える）。AppContainer は未実装（unobservable）
+  # Windows 版。前提検証は cli-conformance-windows と同一内容（更新時は両方を揃える）。AppContainer は ctypes のランチャー（#1396）で実測する
   egress-isolation-windows:
     if: ${{ inputs.suite == 'egress-isolation' }}
     runs-on: windows-latest
@@ -866,13 +866,19 @@ jobs:
         run: bash harness/egress-isolation/self-test.sh
       - name: "[egress-isolation] プラットフォームの記録（読み取りのみ）"
         run: python -I -B harness/egress-isolation/platform_probe.py
-      - name: "[egress-isolation] 実行（baseline の正の対照。appcontainer は unobservable）"
+      - name: "[egress-isolation] 実行（baseline の対照と AppContainer。preflight つき）"
         run: |
           $out = Join-Path $env:RUNNER_TEMP 'egress-isolation'
           New-Item -ItemType Directory -Force -Path $out | Out-Null
           $bin = Join-Path $env:SERVO_HOST_TARGET_DIR 'release\fandhe-browser-servo-host.exe'
           python -I -B harness/egress-isolation/measure.py --host $bin --modes baseline,appcontainer --out $out
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: "[egress-isolation] AppContainer プロファイルの残骸の確認（読み取りのみ）"
+        if: ${{ !cancelled() }}
+        run: |
+          $pk = Join-Path $env:LOCALAPPDATA 'Packages'
+          $left = Get-ChildItem $pk -Filter 'fandhe.egressiso.*' -ErrorAction SilentlyContinue
+          Write-Host "leftover AppContainer profile folders: $(@($left).Count)"
       - name: "[egress-isolation] 結果表を Step Summary へ"
         if: ${{ !cancelled() }}
         run: |

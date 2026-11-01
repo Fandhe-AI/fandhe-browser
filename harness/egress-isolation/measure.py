@@ -14,8 +14,10 @@
 
 OS 別のモード（#1387）:
     Linux は bwrap / docker。macOS は `sandbox-exec`（Seatbelt。`seatbelt.py`）で、試行の観測はサンドボックスの
-    拒否ログ。Windows は baseline のみ実測し、`appcontainer` は起動に FFI（ctypes）が要るため承認事項として
-    保留し、全経路を理由つきの `unobservable` で出す（設計 §7）。macOS・Windows にはプロセス単位の監視が無い。
+    拒否ログ。Windows は baseline と、capability なしの AppContainer（`appcontainer.py`。ctypes。Issue #1396 で
+    オーナー承認済み）で内側ランナーを起動する `appcontainer`。AppContainer は loopback に出られないため、
+    Servo を使わない preflight（`appcontainer_probe.py`）で loopback 遮断と egress 遮断を切り分け、
+    切り分けられない経路は理由つきの `unobservable` にする。macOS・Windows にはプロセス単位の監視が無い。
 
 安全上の規則:
     - 宛先は 127.0.0.0/8 のダミーだけ。実在のアドレスへ向けたプローブは、隔離下の内側で
@@ -47,13 +49,9 @@ from typing import Any
 _HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(_HERE))
 import judge  # noqa: E402
+import appcontainer  # noqa: E402
 import listeners  # noqa: E402
 import seatbelt  # noqa: E402
-
-APPCONTAINER_UNAVAILABLE = (
-    "AppContainer launcher needs FFI (CreateProcessW with SECURITY_CAPABILITIES via ctypes); "
-    "approval item (design section 7); not implemented"
-)
 
 RUN_TIMEOUT_S = 240
 DOCKER_IMAGE_RE = re.compile(r"^[a-z0-9][a-z0-9._/:@-]{0,127}$")
@@ -304,12 +302,101 @@ def collect_denies(start: str, pids: frozenset[int] | None = None) -> tuple[dict
     return dict(counts), {"available": True, "deny_lines": sum(counts.values()), "diagnostics": diag.as_dict()}
 
 
+def run_appcontainer_mode(*, host: Path, ports: dict[str, int], recs: dict[str, Any], out_dir: Path,
+                          page_port: int, launcher: Any = None) -> dict[str, Any]:
+    """AppContainer モード（Windows。Issue #1396）。preflight（capability の対照）→ 本体の順に同じ容器で実行する。
+
+    `launcher` は `appcontainer.run_in_appcontainer_session` と同じ呼び出し規約のファクトリ（自己テストで偽物を渡す）。
+    起動・複製・片付けの失敗は `unavailable` に理由を入れて全経路を `unobservable` にする。成功・失敗・タイムアウトの
+    いずれでも `with` が容器・ハンドル・複製先を片付け、その結果を `appcontainer.cleanup` に残す。
+    """
+    make = launcher or appcontainer.run_in_appcontainer_session
+    data: dict[str, Any] = {
+        "mode": "appcontainer", "exit_code": None, "binary_sha256": None, "binary_version": None,
+        "stderr_tail": "", "inner": {}, "outer_counts": {k: 0 for k in recs},
+        "appcontainer": {"preflight": None, "profile": None, "staging": None, "cleanup": {}, "launcher_error": None},
+    }
+    info = data["appcontainer"]
+    # 経路用の listener とは分ける（経路の受信件数を汚さない）。
+    pre_tcp = listeners.TcpRecorder("preflight_tcp", judge.IP_BLOCKED).start()
+    pre_udp = listeners.UdpRecorder("preflight_udp", judge.IP_BLOCKED).start()
+    session = None
+    try:
+        session = make(host=host, harness_dir=_HERE.parent)
+        with session:
+            info["profile"] = {"name": getattr(session, "name", None), "sid": getattr(session, "sid_string", None)}
+            info["staging"] = getattr(session, "staging_mode", None)
+            preflight: dict[str, Any] = {}
+            for variant, caps in (("nocap", ()), ("netcap", appcontainer.NETWORK_CAPABILITIES)):
+                t0, u0 = pre_tcp.count, pre_udp.count
+                res = session.run("egress-isolation/appcontainer_probe.py",
+                                  ["--tcp-port", str(pre_tcp.port), "--udp-port", str(pre_udp.port),
+                                   "--out", session.out_path(f"preflight-{variant}.json")],
+                                  capabilities=caps, result_name=f"preflight-{variant}.json")
+                preflight[variant] = {
+                    "probe": res.get("result_json"), "exit_code": res.get("exit_code"),
+                    "timed_out": res.get("timed_out"), "error": res.get("error"),
+                    "outer_tcp": pre_tcp.count - t0, "outer_udp": pre_udp.count - u0}
+            info["preflight"] = preflight
+            before = {k: r.count for k, r in recs.items()}
+            res = session.run("egress-isolation/in_sandbox.py",
+                              ["--mode", "appcontainer", "--host", session.host_path,
+                               "--ports", json.dumps(ports, sort_keys=True),
+                               "--out", session.out_path("appcontainer.json"), "--page-port", str(page_port)],
+                              capabilities=(), result_name="appcontainer.json")
+            data["outer_counts"] = {k: r.count - before[k] for k, r in recs.items()}
+            data["exit_code"] = res.get("exit_code")
+            data["stderr_tail"] = res.get("stderr_tail") or ""
+            inner = res.get("result_json")
+            if res.get("exit_code") in (0, 2) and isinstance(inner, dict):
+                data["inner"] = inner
+            if res.get("error"):
+                info["launcher_error"] = res["error"]
+            if res.get("timed_out"):
+                info["launcher_error"] = "in-container runner timed out"
+    except (appcontainer.AppContainerError, OSError, ValueError) as exc:
+        info["launcher_error"] = f"{type(exc).__name__}: {str(exc)[:200]}"
+    finally:
+        pre_tcp.stop()
+        pre_udp.stop()
+        info["cleanup"] = dict(getattr(session, "cleanup", {}) or {})
+    inner = data["inner"]
+    data["binary_sha256"] = inner.get("host_sha256")
+    data["binary_version"] = inner.get("host_version")
+    reason = None
+    if info["launcher_error"]:
+        reason = f"AppContainer launcher failed: {info['launcher_error']}"
+    elif not inner:
+        reason = f"in-container runner produced no result (exit code {data['exit_code']})"
+    if reason is not None:
+        if sum(data["outer_counts"].values()) == 0:
+            data["unavailable"] = reason
+        else:
+            # 外側で受信があったときは、理由つきの unobservable で fail を隠さない（judge が受信を先に fail にする）。
+            inner = data["inner"] = {**inner, "fatal": reason, "positive_ok": False}
+    if inner:
+        (out_dir / "appcontainer.json").write_text(json.dumps(inner, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return data
+
+
+def appcontainer_caveat(data: dict[str, Any]) -> str | None:
+    """appcontainer の pass を妨げる理由（loopback の交絡、または片付けの不完全）。なければ None。"""
+    info = data.get("appcontainer") or {}
+    confound = judge.appcontainer_confound(info.get("preflight"))
+    if confound is not None:
+        return confound
+    cleanup = info.get("cleanup") or {}
+    if not cleanup or any(v is False for v in cleanup.values()):
+        return "AppContainer cleanup was incomplete or not recorded; result is not trusted"
+    return None
+
+
 def run_mode(mode: str, *, host: Path, ports: dict[str, int], recs: dict[str, Any], out_dir: Path,
-             hosts_file: Path, image: str | None, resolv_file: Path | None = None, page_port: int = 0) -> dict[str, Any]:
+             hosts_file: Path, image: str | None, resolv_file: Path | None = None, page_port: int = 0,
+             launcher: Any = None) -> dict[str, Any]:
     if mode == "appcontainer":
-        return {"mode": mode, "exit_code": None, "binary_sha256": None, "binary_version": None,
-                "stderr_tail": "", "inner": {}, "outer_counts": {k: 0 for k in recs},
-                "unavailable": APPCONTAINER_UNAVAILABLE}
+        return run_appcontainer_mode(host=host, ports=ports, recs=recs, out_dir=out_dir, page_port=page_port,
+                                     launcher=launcher)
     before = {k: r.count for k, r in recs.items()}
     # docker はコンテナ名を付けて、タイムアウト・例外時にも確実に後始末する（名前は pid 由来の固定形式）。
     name = f"egress-iso-{os.getpid()}" if mode == "docker-none" else None
@@ -383,6 +470,24 @@ def summarize(results: dict[str, Any]) -> str:
         lines.append(f"- guard: {inner.get('guard')}")
         if data.get("unavailable"):
             lines.append(f"- mode unavailable: {data['unavailable']}")
+        ac = data.get("appcontainer")
+        if ac:
+            lines.append(f"- appcontainer: profile={ac.get('profile')}; staging={ac.get('staging')}; "
+                         f"launcher_error={ac.get('launcher_error')}")
+            lines.append(f"- appcontainer cleanup: {ac.get('cleanup')}")
+            pre = ac.get("preflight") or {}
+            lines += ["", "preflight (loopback confound check; outer = receipts at the preflight listeners)", "",
+                      "| variant | loopback_self | tcp_outer | udp_outer | outer tcp | outer udp |",
+                      "| ------- | ------------- | --------- | --------- | --------- | --------- |"]
+            for variant in ("nocap", "netcap"):
+                e = pre.get(variant) or {}
+                p = e.get("probe") or {}
+                lines.append(f"| {variant} | {p.get('loopback_self')} | {p.get('tcp_outer')} | {p.get('udp_outer')} | "
+                             f"{e.get('outer_tcp')} | {e.get('outer_udp')} |")
+            lines.append("")
+            lines.append(f"- loopback confound: {judge.appcontainer_confound(pre) or 'none'}")
+        if inner.get("fatal"):
+            lines.append(f"- in-sandbox fatal: {inner['fatal']}")
         if data.get("deny_log"):
             lines.append(f"- sandbox deny log: {data['deny_log']}")
         if inner.get("beacons") is not None:
@@ -479,7 +584,8 @@ def main(argv: list[str] | None = None) -> int:
             data["binary_match"] = bool(base_sha) and data.get("binary_sha256") == base_sha
             data["verdicts"] = judge.judge_all(mode, data["inner"], data["outer_counts"], control,
                                                binary_match=data["binary_match"],
-                                               mode_unavailable=data.get("unavailable"))
+                                               mode_unavailable=data.get("unavailable"),
+                                               loopback_confound=appcontainer_caveat(data))
     (out_dir / "result.json").write_text(json.dumps(results, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     summary = summarize(results)
     (out_dir / "summary.md").write_text(summary, encoding="utf-8")

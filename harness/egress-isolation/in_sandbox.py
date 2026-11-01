@@ -3,7 +3,8 @@
 
 役割・責務境界:
     Issue #1377（TASK-38・`RENDER-3`・`SEC-2`・`XOS-1`）。`measure.py` が bwrap（`--unshare-net` の有無）または
-    `docker run --network none` の中で起動する。許可オリジン（pages.test -> 127.0.0.1）を自前で配信し、
+    `docker run --network none`（Windows の `appcontainer` は `appcontainer.py` の AppContainer、macOS の `seatbelt` は
+    Seatbelt）の中で起動する。許可オリジン（pages.test -> 127.0.0.1）を自前で配信し、
     ホスト（`fandhe-browser-servo-host --stdio`）へ経路ごとの `load` を送り、(iv)(v) のプローブを行い、
     結果を `--out` の JSON に書く。外側の listener の受信件数は `measure.py` が数える（ここでは数えない）。
 
@@ -277,6 +278,9 @@ def probe_nameservers() -> dict[str, Any]:
 
 # サンドボックス（Seatbelt 等）が送信を拒否したときの errno 名。実測で観測した値に合わせて見直す（#1387）。
 SANDBOX_DENY_ERRNOS = seatbelt.SANDBOX_DENY_ERRNOS
+# AppContainer（Windows）が送信を拒否したときの errno 名。実測前は空で、UDP の試行は根拠なし（unobservable）になる。
+# 生の errno は `probes["udp_direct"]` に記録される。実測で観測した値を根拠に別コミットで追加する（Issue #1396）。
+APPCONTAINER_DENY_ERRNOS: frozenset[str] = frozenset()
 NS_UNREACHABLE = frozenset({"ENETUNREACH", "EHOSTUNREACH", "ENETDOWN", "EADDRNOTAVAIL", "EAFNOSUPPORT"})
 
 
@@ -507,7 +511,8 @@ def run(args: argparse.Namespace, ports: dict[str, int]) -> dict[str, Any]:
     if isolated and not netns:
         # 写し listener が無いモード: UDP はサンドボックスが sendto を拒否した errno を試行の根拠にする。
         # TCP の経路は measure.py が拒否ログ（macOS）から補う。errno は実測で観測した値（EPERM 等）を許可集合に入れる。
-        result["attempts"]["udp_direct"] = probes.get("udp_direct") in SANDBOX_DENY_ERRNOS
+        deny_errnos = APPCONTAINER_DENY_ERRNOS if args.mode == "appcontainer" else SANDBOX_DENY_ERRNOS
+        result["attempts"]["udp_direct"] = probes.get("udp_direct") in deny_errnos
         # TCP の試行はここでは根拠にしない。失敗ビーコン（`beacons`）はブラウザ内部の要求拒否でも発火し、接続 syscall の
         # 試行や遮断の証拠にならないため補助情報として記録するだけにする。TCP は measure.py が拒否ログ（macOS）から補い、
         # 得られなければ unobservable のままにする（fail-closed。Issue #1395）。

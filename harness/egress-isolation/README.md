@@ -89,7 +89,7 @@ macOS・Windows の GitHub ホステッドランナー。結果は #1003 に記�
 | OS | モード | 内容 |
 | -- | ------ | ---- |
 | macOS | `baseline` / `seatbelt` | baseline は `sandbox-exec -p "(version 1)(allow default)"`（隔離と無関係な失敗の切り分け）。`seatbelt` は `(deny network-outbound (remote ip))` ＋ページ配信用 loopback 1 ポートの許可（`seatbelt.py`） |
-| Windows | `baseline` / `appcontainer` | baseline は直接起動。`appcontainer` は**未実装**（起動に `CreateProcessW` の `SECURITY_CAPABILITIES` を ctypes で呼ぶ FFI が要り、設計 §7 の承認事項。全経路を理由つきの `unobservable` で出す） |
+| Windows | `baseline` / `appcontainer` | baseline は直接起動。`appcontainer` は capability なしの AppContainer で内側ランナーごと起動する（`appcontainer.py`。#1396。下記） |
 
 観測手段が Linux と異なる点（`method` 列にも出る）:
 
@@ -115,9 +115,28 @@ macOS・Windows の GitHub ホステッドランナー。結果は #1003 に記�
   （実在の内部アドレスにも向けない）。
 - macOS は lo0 に 127.0.0.2 / 127.0.0.3 の alias が要る（`sudo ifconfig lo0 alias 127.0.0.2 up`）。ハーネスは sudo を
   使わず、bind できなければ exit 2 で案内する。workflow は使い捨て runner で固定 argv の alias 追加を行う。
+- Windows の `appcontainer`（#1396。オーナー承認 2026-11-01: `harness/egress-isolation/` の Python 計測ハーネスに限る ctypes の Win32 FFI）:
+  - `appcontainer.py` が `CreateAppContainerProfile`・`PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES`・`CreateProcessW`・Job
+    （`KILL_ON_JOB_CLOSE`）で内側ランナー（`in_sandbox.py`。Servo ホストは子プロセス）を起動する。標準ライブラリの ctypes のみで、
+    本体 crate（Rust）への FFI・`unsafe`・依存の追加、管理者権限が要る操作（`CheckNetIsolation` 等）は行わない。
+  - 容器から読めるのは AppContainer 専用フォルダだけなので、Python ランタイム・ハーネス・ホスト（exe と同階層の DLL）をそこへ複製する
+    （toolcache・チェックアウト・`D:\sr` の ACL は変えない）。専用フォルダが取れないときだけ一時ディレクトリに `icacls` で SID を付与し、
+    終了時に除去する。複製したホストの SHA256 を記録し、baseline と同一性を比べる。
+  - プロファイル・ハンドル・属性リスト・SID・複製先は成功・失敗・タイムアウトのいずれでも `try/finally` で片付け、各段の成否を
+    結果の `appcontainer.cleanup` に記録する。片付けが不完全なら pass にしない。環境変数は許可リスト（`SystemRoot`・`TMP`・`TEMP`・
+    `PYTHONIOENCODING`）のみ。
+  - loopback の切り分け: AppContainer は既定で loopback に出られない。外側 listener の受信 0 件が egress 遮断か loopback 遮断かを区別するため、
+    Servo を使わない preflight（`appcontainer_probe.py`）を capability なし（`nocap`）とネットワーク capability あり（`netcap`:
+    `internetClient`＋`privateNetworkClientServer`）で実行し、容器内の loopback 自己接続と、preflight 専用の外側 listener（127.0.0.2）への
+    到達を記録する。`netcap` でも外側に届かなければ loopback 遮断と egress 遮断を区別できず、listener 経路は理由つきの `unobservable`
+    （`judge.appcontainer_confound`）。preflight が無い・不正な場合も同じ（fail-closed）。
+  - 宛先は 127.0.0.0/8 のダミーだけ。TCP 5 経路は試行の根拠（写し listener・拒否ログ）が無いため `unobservable` のまま。`udp_direct` の
+    errno は生の値を `probes.udp_direct` に記録するだけで、Windows の拒否 errno は実測前に判定へ入れない
+    （`in_sandbox.APPCONTAINER_DENY_ERRNOS` は空。観測した値を根拠に追加する）。
 - Windows の runner は管理者で動くため、「非管理者で loopback 例外を作れるか」には答えられない（設計 §6.2）。
 
 ## 承認事項（この issue では実装しない）
 
 Landlock ルールの適用（`landlock` クレートまたは `unsafe`）・seccomp-bpf・許可リスト付きプロキシと netns 内への中継・
-Servo 自身の DNS/UDP の外部観測・Windows の AppContainer ランチャー（ctypes による FFI）・`CheckNetIsolation LoopbackExempt` の設定変更・古いカーネルでの再測定。
+Servo 自身の DNS/UDP の外部観測・`CheckNetIsolation LoopbackExempt` の設定変更・Windows の TCP 経路の試行の観測手段（WFP の監査等）・古いカーネルでの再測定。
+（Windows の AppContainer ランチャー〔ctypes〕は #1396 でオーナー承認のうえ実装済み。範囲はこのディレクトリの Python ハーネスに限る。）
