@@ -18,6 +18,10 @@ OS 別のモード（#1387）:
     オーナー承認済み）で内側ランナーを起動する `appcontainer`。AppContainer は loopback に出られないため、
     Servo を使わない preflight（`appcontainer_probe.py`）で loopback 遮断と egress 遮断を切り分け、
     切り分けられない経路は理由つきの `unobservable` にする。macOS・Windows にはプロセス単位の監視が無い。
+    Issue #1401: `--appcontainer-loopback-exempt`（opt-in。`xos-measure.yml` の Windows ジョブだけが付ける。要管理者）で
+    ハーネスが作ったプロファイルの SID に `CheckNetIsolation LoopbackExempt` を付けて preflight を取り直し、解除する
+    （オーナー承認 2026-11-01）。capability なしでも外側に届いたら、loopback 宛ての listener では測れないとして
+    理由つきの `unobservable` にする。
 
 安全上の規則:
     - 宛先は 127.0.0.0/8 のダミーだけ。実在のアドレスへ向けたプローブは、隔離下の内側で
@@ -303,7 +307,7 @@ def collect_denies(start: str, pids: frozenset[int] | None = None) -> tuple[dict
 
 
 def run_appcontainer_mode(*, host: Path, ports: dict[str, int], recs: dict[str, Any], out_dir: Path,
-                          page_port: int, launcher: Any = None) -> dict[str, Any]:
+                          page_port: int, launcher: Any = None, loopback_exempt: bool = False) -> dict[str, Any]:
     """AppContainer モード（Windows。Issue #1396）。preflight（capability の対照）→ 本体の順に同じ容器で実行する。
 
     `launcher` は `appcontainer.run_in_appcontainer_session` と同じ呼び出し規約のファクトリ（自己テストで偽物を渡す）。
@@ -314,7 +318,8 @@ def run_appcontainer_mode(*, host: Path, ports: dict[str, int], recs: dict[str, 
     data: dict[str, Any] = {
         "mode": "appcontainer", "exit_code": None, "binary_sha256": None, "binary_version": None,
         "stderr_tail": "", "inner": {}, "outer_counts": {k: 0 for k in recs},
-        "appcontainer": {"preflight": None, "profile": None, "staging": None, "cleanup": {}, "launcher_error": None},
+        "appcontainer": {"preflight": None, "profile": None, "staging": None, "cleanup": {}, "launcher_error": None,
+                         "loopback_exempt": {"requested": loopback_exempt}},
     }
     info = data["appcontainer"]
     # 経路用の listener とは分ける（経路の受信件数を汚さない）。
@@ -322,7 +327,7 @@ def run_appcontainer_mode(*, host: Path, ports: dict[str, int], recs: dict[str, 
     pre_udp = listeners.UdpRecorder("preflight_udp", judge.IP_BLOCKED).start()
     session = None
     try:
-        session = make(host=host, harness_dir=_HERE.parent)
+        session = make(host=host, harness_dir=_HERE.parent, loopback_exempt=loopback_exempt)
         with session:
             info["profile"] = {"name": getattr(session, "name", None), "sid": getattr(session, "sid_string", None)}
             info["staging"] = getattr(session, "staging_mode", None)
@@ -360,6 +365,8 @@ def run_appcontainer_mode(*, host: Path, ports: dict[str, int], recs: dict[str, 
         pre_tcp.stop()
         pre_udp.stop()
         info["cleanup"] = dict(getattr(session, "cleanup", {}) or {})
+        info["loopback_exempt"] = dict(getattr(session, "loopback_exempt_state", None)
+                                       or {"requested": loopback_exempt})
     inner = data["inner"]
     data["binary_sha256"] = inner.get("host_sha256")
     data["binary_version"] = inner.get("host_version")
@@ -382,7 +389,9 @@ def run_appcontainer_mode(*, host: Path, ports: dict[str, int], recs: dict[str, 
 def appcontainer_caveat(data: dict[str, Any]) -> str | None:
     """appcontainer の pass を妨げる理由（loopback の交絡、または片付けの不完全）。なければ None。"""
     info = data.get("appcontainer") or {}
-    confound = judge.appcontainer_confound(info.get("preflight"))
+    exempt = info.get("loopback_exempt")
+    requested = isinstance(exempt, dict) and exempt.get("requested") is True
+    confound = judge.appcontainer_confound(info.get("preflight"), loopback_exempt=requested)
     if confound is not None:
         return confound
     cleanup = info.get("cleanup") or {}
@@ -393,10 +402,10 @@ def appcontainer_caveat(data: dict[str, Any]) -> str | None:
 
 def run_mode(mode: str, *, host: Path, ports: dict[str, int], recs: dict[str, Any], out_dir: Path,
              hosts_file: Path, image: str | None, resolv_file: Path | None = None, page_port: int = 0,
-             launcher: Any = None) -> dict[str, Any]:
+             launcher: Any = None, loopback_exempt: bool = False) -> dict[str, Any]:
     if mode == "appcontainer":
         return run_appcontainer_mode(host=host, ports=ports, recs=recs, out_dir=out_dir, page_port=page_port,
-                                     launcher=launcher)
+                                     launcher=launcher, loopback_exempt=loopback_exempt)
     before = {k: r.count for k, r in recs.items()}
     # docker はコンテナ名を付けて、タイムアウト・例外時にも確実に後始末する（名前は pid 由来の固定形式）。
     name = f"egress-iso-{os.getpid()}" if mode == "docker-none" else None
@@ -475,6 +484,7 @@ def summarize(results: dict[str, Any]) -> str:
             lines.append(f"- appcontainer: profile={ac.get('profile')}; staging={ac.get('staging')}; "
                          f"launcher_error={ac.get('launcher_error')}")
             lines.append(f"- appcontainer cleanup: {ac.get('cleanup')}")
+            lines.append(f"- loopback exemption: {ac.get('loopback_exempt')}")
             pre = ac.get("preflight") or {}
             lines += ["", "preflight (loopback confound check; outer = receipts at the preflight listeners)", "",
                       "| variant | loopback_self | tcp_outer | udp_outer | outer tcp | outer udp |",
@@ -485,7 +495,7 @@ def summarize(results: dict[str, Any]) -> str:
                 lines.append(f"| {variant} | {p.get('loopback_self')} | {p.get('tcp_outer')} | {p.get('udp_outer')} | "
                              f"{e.get('outer_tcp')} | {e.get('outer_udp')} |")
             lines.append("")
-            lines.append(f"- loopback confound: {judge.appcontainer_confound(pre) or 'none'}")
+            lines.append(f"- loopback confound: {judge.appcontainer_confound(pre, loopback_exempt=bool((ac.get('loopback_exempt') or {}).get('requested'))) or 'none'}")
         if inner.get("fatal"):
             lines.append(f"- in-sandbox fatal: {inner['fatal']}")
         if data.get("deny_log"):
@@ -505,6 +515,12 @@ def summarize(results: dict[str, Any]) -> str:
     return "\n".join(lines) + "\n"
 
 
+def validate_loopback_exempt(requested: bool, plat: str, modes: list[str]) -> None:
+    """`--appcontainer-loopback-exempt` は Windows の appcontainer モードがあるときだけ受け付ける（Issue #1401）。"""
+    if requested and (plat != "win32" or "appcontainer" not in modes):
+        raise ValueError("--appcontainer-loopback-exempt needs win32 and the appcontainer mode")
+
+
 DEFAULT_MODES = {"linux": ("baseline", "bwrap-netns"), "darwin": ("baseline", "seatbelt"),
                  "win32": ("baseline", "appcontainer")}
 
@@ -517,6 +533,9 @@ def main(argv: list[str] | None = None) -> int:
                         "darwin baseline,seatbelt; win32 baseline,appcontainer.")
     parser.add_argument("--docker-image", help="Image containing the host at " + DOCKER_HOST_PATH)
     parser.add_argument("--out", required=True, type=Path, help="Existing empty directory for results.")
+    parser.add_argument("--appcontainer-loopback-exempt", action="store_true",
+                        help="Opt-in (needs administrator; used only by the xos-measure Windows job): add "
+                        "CheckNetIsolation LoopbackExempt for the harness-created AppContainer SID and remove it afterwards.")
     args = parser.parse_args(argv)
     try:
         plat = "linux" if sys.platform.startswith("linux") else sys.platform
@@ -527,6 +546,7 @@ def main(argv: list[str] | None = None) -> int:
         modes = args.modes.split(",") if args.modes else list(DEFAULT_MODES[plat])
         if not modes or modes[0] != "baseline" or any(m not in allowed for m in modes):
             raise ValueError("--modes must start with baseline and use known modes")
+        validate_loopback_exempt(args.appcontainer_loopback_exempt, plat, modes)
         image = validate_image(args.docker_image) if args.docker_image else None
         if "docker-none" in modes and image is None:
             raise ValueError("docker-none needs --docker-image")
@@ -570,7 +590,8 @@ def main(argv: list[str] | None = None) -> int:
                 page_port = 0 if sys.platform.startswith("linux") else free_port()
                 results["modes"][mode] = run_mode(mode, host=host, ports=ports, recs=recs, out_dir=out_dir,
                                                   hosts_file=hosts_file, image=image,
-                                                  resolv_file=resolv_file, page_port=page_port)
+                                                  resolv_file=resolv_file, page_port=page_port,
+                                                  loopback_exempt=args.appcontainer_loopback_exempt)
                 if mode == "docker-none" and image is not None:
                     results["modes"][mode]["image_id"] = docker_image_id(image)
         finally:
