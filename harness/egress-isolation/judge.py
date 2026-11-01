@@ -214,6 +214,7 @@ def judge_all(
     mode: str, inner: dict[str, Any], outer_counts: dict[str, int], control_counts: dict[str, int],
     binary_match: bool = True, mode_unavailable: str | None = None,
     loopback_confound: str | None = LOOPBACK_PREFLIGHT_MISSING_REASON,
+    deny_log_reason: str | None = None,
 ) -> dict[str, dict[str, Any]]:
     """内側ランナーの結果 JSON と外側の件数から、隔離モードの全経路を判定する。
 
@@ -274,6 +275,9 @@ def judge_all(
                 and reason == "no attempt was observed inside the sandbox"):
             # TCP 経路の試行の根拠は拒否ログだけ。失敗ビーコンは補助情報で根拠にしない（Issue #1395）。
             reason += " (TCP attempt evidence is the sandbox deny log only; failure beacons are not evidence)"
+            if deny_log_reason:
+                # 拒否ログが使えなかった理由を残す（Issue #1402）。
+                reason += f"; deny log unavailable: {deny_log_reason}"
         out[route] = {
             "verdict": verdict,
             "reason": reason,

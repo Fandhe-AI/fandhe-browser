@@ -1,0 +1,289 @@
+"""macOS Seatbelt の opt-in sudo 拒否ログ（`--seatbelt-sudo-log`）の自己テスト（Issue #1402・TASK-38・`RENDER-3`・`SEC-2`）。
+
+実 macOS・sudo は使わない。`measure.run_argv`・`measure.collect_denies` と log config の runner を偽物にして、
+opt-in の検証・sudo の argv・log config の復元順序と成否・自己照合の分岐を具体値で確かめる。
+"""
+
+from __future__ import annotations
+
+import json
+import sys
+import tempfile
+import unittest
+from collections import Counter
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
+from unittest import mock
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import judge  # noqa: E402
+import measure  # noqa: E402
+import seatbelt  # noqa: E402
+
+PORTS = {"redirect": 2001, "img": 2002, "fetch": 2003, "ws": 2004, "internal": 2005, "udp_direct": 2006}
+TCP_DEST = {"redirect": "127.0.0.2:2001", "img": "127.0.0.2:2002", "fetch": "127.0.0.2:2003",
+            "ws": "127.0.0.2:2004", "internal": "127.0.0.3:2005"}
+UDP_DEST = "127.0.0.2:2006"
+SUBS = seatbelt.LOG_CONFIG_SUBSYSTEMS
+BASE = ["/usr/bin/sudo", "-n", "/usr/bin/log"]
+
+
+class ArgvTest(unittest.TestCase):
+    def test_log_show_default_is_unchanged(self) -> None:
+        self.assertEqual(
+            seatbelt.log_show_argv("2026-11-01 00:00:00"),
+            ["/usr/bin/log", "show", "--style", "ndjson", "--start", "2026-11-01 00:00:00",
+             "--predicate", seatbelt.LOG_PREDICATE])
+
+    def test_log_show_sudo(self) -> None:
+        self.assertEqual(
+            seatbelt.log_show_argv("2026-11-01 00:00:00", sudo=True),
+            [*BASE, "show", "--style", "ndjson", "--info", "--debug", "--start", "2026-11-01 00:00:00",
+             "--predicate", seatbelt.LOG_PREDICATE])
+        with self.assertRaises(ValueError):
+            seatbelt.log_show_argv("1; rm -rf /", sudo=True)
+
+    def test_log_config_argv_exact(self) -> None:
+        for sub in SUBS:
+            self.assertEqual(seatbelt.log_config_argv("status", sub), [*BASE, "config", "--status", "--subsystem", sub])
+            self.assertEqual(seatbelt.log_config_argv("raise", sub),
+                             [*BASE, "config", "--subsystem", sub, "--mode", "level:debug,persist:debug"])
+            self.assertEqual(seatbelt.log_config_argv("reset", sub), [*BASE, "config", "--subsystem", sub, "--reset"])
+
+    def test_log_config_rejects_unknown_values(self) -> None:
+        with self.assertRaises(ValueError):
+            seatbelt.log_config_argv("erase", SUBS[0])
+        with self.assertRaises(ValueError):
+            seatbelt.log_config_argv("reset", "com.apple.other")
+
+
+class ValidateTest(unittest.TestCase):
+    def test_accepts_only_darwin_with_seatbelt(self) -> None:
+        measure.validate_seatbelt_sudo_log("show", "darwin", ["baseline", "seatbelt"])
+        measure.validate_seatbelt_sudo_log("config", "darwin", ["baseline", "seatbelt"])
+        measure.validate_seatbelt_sudo_log(None, "linux", ["baseline"])
+        for args in (("show", "linux", ["baseline", "seatbelt"]), ("show", "win32", ["baseline", "appcontainer"]),
+                     ("show", "darwin", ["baseline"]), ("all", "darwin", ["baseline", "seatbelt"])):
+            with self.assertRaises(ValueError):
+                measure.validate_seatbelt_sudo_log(*args)
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "Linux 上の引数検証（非 darwin で exit 2）")
+    def test_main_rejects_on_non_darwin(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            host = Path(td) / "host"
+            host.write_text("x", encoding="utf-8")
+            host.chmod(0o755)
+            out = Path(td) / "out"
+            out.mkdir()
+            self.assertEqual(measure.main(["--host", str(host), "--out", str(out), "--seatbelt-sudo-log", "show"]), 2)
+
+
+class FakeLog:
+    """log config の runner。呼び出し順を共有リストへ記録し、status の出力と各 rc を差し替えられる。"""
+
+    def __init__(self, order: list[str], *, reset_rc: int = 0, after_status: str = "default") -> None:
+        self.order, self.reset_rc, self.after_status, self.resetted = order, reset_rc, after_status, False
+
+    def __call__(self, argv: list[str]) -> tuple[int, str]:
+        action = "status" if "--status" in argv else "reset" if "--reset" in argv else "raise"
+        self.order.append(f"{action}:{argv[argv.index('--subsystem') + 1]}")
+        if action == "reset":
+            self.resetted = True
+            return self.reset_rc, ""
+        if action == "status":
+            return 0, self.after_status if self.resetted else "default"
+        return 0, ""
+
+
+class RunModeTest(unittest.TestCase):
+    def _run(self, *, sudo_log: str | None, order: list[str], log: FakeLog | None = None, run_exc: bool = False,
+             denies: dict[str, int] | None = None, status: dict[str, Any] | None = None,
+             udp_errno: str = "EPERM", mode: str = "seatbelt") -> dict[str, Any]:
+        recs = {k: SimpleNamespace(count=0) for k in PORTS}
+        with tempfile.TemporaryDirectory() as td:
+            out_dir = Path(td)
+            (out_dir / f"{mode}.json").write_text(json.dumps({
+                "host_pids": [101], "probes": {"udp_direct": udp_errno}, "positive_ok": True,
+                "guard": {"unavailable": "n/a"}, "attempts": {"udp_direct": True},
+                "attempt_evidence": {"udp_direct": "errno"}}), encoding="utf-8")
+
+            def fake_run(argv: list[str], container: str | None = None) -> tuple[int | None, str]:
+                order.append("run_argv")
+                if run_exc:
+                    raise RuntimeError("boom")
+                return 0, ""
+
+            def fake_collect(start: str, pids: Any = None, *, sudo: bool = False) -> tuple[dict[str, int], dict[str, Any]]:
+                order.append("log_show_sudo" if sudo else "log_show")
+                if sudo:
+                    return dict(denies or {}), dict(status or {"available": True, "deny_lines": 1})
+                return {}, {"available": True, "deny_lines": 0, "diagnostics": {"lines": 3}}
+
+            with mock.patch.object(measure, "run_argv", fake_run), \
+                    mock.patch.object(measure, "collect_denies", fake_collect), \
+                    mock.patch.object(measure, "build_argv", lambda *a, **k: ["true"]):
+                if run_exc:
+                    with self.assertRaises(RuntimeError):
+                        measure.run_mode(mode, host=Path("h"), ports=PORTS, recs=recs, out_dir=out_dir,
+                                         hosts_file=Path("hosts"), image=None, sudo_log=sudo_log, log_runner=log)
+                    return {}
+                return measure.run_mode(mode, host=Path("h"), ports=PORTS, recs=recs, out_dir=out_dir,
+                                        hosts_file=Path("hosts"), image=None, sudo_log=sudo_log, log_runner=log)
+
+    def test_without_opt_in_no_sudo_is_used(self) -> None:
+        order: list[str] = []
+        log = FakeLog(order)
+        data = self._run(sudo_log=None, order=order, log=log)
+        self.assertEqual(order, ["run_argv", "log_show"])
+        self.assertIs(data["deny_log"]["sudo"], False)
+        self.assertIsNone(data["deny_log"]["log_config"])
+
+    def test_show_uses_sudo_and_no_log_config(self) -> None:
+        order: list[str] = []
+        data = self._run(sudo_log="show", order=order, log=FakeLog(order), denies={UDP_DEST: 1})
+        self.assertEqual(order, ["run_argv", "log_show_sudo", "log_show"])
+        self.assertIs(data["deny_log"]["sudo"], True)
+        self.assertEqual(data["deny_log"]["unprivileged"]["deny_lines"], 0)
+        self.assertIsNone(data["deny_log"]["log_config"])
+
+    def test_baseline_never_touches_log_config(self) -> None:
+        order: list[str] = []
+        self._run(sudo_log="config", order=order, log=FakeLog(order), mode="baseline")
+        self.assertEqual(order, ["run_argv"])
+
+    def test_config_restore_order(self) -> None:
+        order: list[str] = []
+        data = self._run(sudo_log="config", order=order, log=FakeLog(order), denies={UDP_DEST: 1})
+        a, b = SUBS
+        self.assertEqual(order, [f"status:{a}", f"status:{b}", f"raise:{a}", f"raise:{b}", "run_argv",
+                                 "log_show_sudo", "log_show", f"reset:{a}", f"reset:{b}", f"status:{a}", f"status:{b}"])
+        state = data["deny_log"]["log_config"]
+        self.assertIs(state["all_restored"], True)
+        self.assertEqual(state["subsystems"][a]["restore_rc"], 0)
+
+    def test_restore_runs_when_run_argv_raises(self) -> None:
+        order: list[str] = []
+        self._run(sudo_log="config", order=order, log=FakeLog(order), run_exc=True)
+        a, b = SUBS
+        self.assertEqual(order[-4:], [f"reset:{a}", f"reset:{b}", f"status:{a}", f"status:{b}"])
+        self.assertNotIn("log_show_sudo", order)
+
+    def test_restore_runs_when_log_show_fails(self) -> None:
+        order: list[str] = []
+        data = self._run(sudo_log="config", order=order, log=FakeLog(order),
+                         status={"available": False, "reason": "log show rc=1 (sudo)"})
+        self.assertIn(f"reset:{SUBS[0]}", order)
+        self.assertEqual(data["deny_log"]["reason"], "log show rc=1 (sudo)")
+        self.assertIs(data["deny_log"]["log_config"]["all_restored"], True)
+
+    def test_failed_reset_is_recorded_and_not_pass(self) -> None:
+        order: list[str] = []
+        data = self._run(sudo_log="config", order=order, log=FakeLog(order, reset_rc=1),
+                         denies={UDP_DEST: 1, **{d: 1 for d in TCP_DEST.values()}})
+        dl = data["deny_log"]
+        self.assertIs(dl["log_config"]["all_restored"], False)
+        self.assertEqual(dl["log_config"]["subsystems"][SUBS[0]]["restore_rc"], 1)
+        self.assertEqual((dl["available"], dl["reason"]), (False, "log config not restored"))
+        v = judge.judge_all("seatbelt", data["inner"], {}, {r: 1 for r in PORTS}, deny_log_reason=dl["reason"])
+        for route in TCP_DEST:
+            self.assertEqual(v[route]["verdict"], judge.UNOBSERVABLE)
+            self.assertIn("deny log unavailable: log config not restored", v[route]["reason"])
+
+    def test_status_mismatch_after_reset_is_not_restored(self) -> None:
+        order: list[str] = []
+        data = self._run(sudo_log="config", order=order, log=FakeLog(order, after_status="debug"),
+                         denies={UDP_DEST: 1})
+        self.assertIs(data["deny_log"]["log_config"]["all_restored"], False)
+        self.assertEqual(data["deny_log"]["reason"], "log config not restored")
+
+    def test_self_check_holds_tcp_routes_pass(self) -> None:
+        order: list[str] = []
+        denies = {UDP_DEST: 1, **{d: 1 for d in TCP_DEST.values()}}
+        data = self._run(sudo_log="config", order=order, log=FakeLog(order), denies=denies)
+        self.assertIs(data["deny_log"]["available"], True)
+        v = judge.judge_all("seatbelt", data["inner"], {}, {r: 1 for r in PORTS})
+        for route in TCP_DEST:
+            self.assertEqual(v[route]["verdict"], judge.PASS)
+            self.assertEqual(v[route]["evidence"], "deny_log")
+
+    def test_self_check_failure_is_unobservable_with_reason(self) -> None:
+        order: list[str] = []
+        data = self._run(sudo_log="config", order=order, log=FakeLog(order), denies={d: 1 for d in TCP_DEST.values()})
+        dl = data["deny_log"]
+        self.assertEqual((dl["available"], dl["reason"]), (False, "self-probe denial missing from deny log"))
+        v = judge.judge_all("seatbelt", data["inner"], {}, {r: 1 for r in PORTS}, deny_log_reason=dl["reason"])
+        for route in TCP_DEST:
+            self.assertEqual(v[route]["verdict"], judge.UNOBSERVABLE)
+            self.assertIn("deny log unavailable: self-probe denial missing from deny log", v[route]["reason"])
+
+    def test_self_check_ok_but_no_tcp_denies_is_unobservable_or_fail(self) -> None:
+        order: list[str] = []
+        data = self._run(sudo_log="show", order=order, log=FakeLog(order), denies={UDP_DEST: 1})
+        v = judge.judge_all("seatbelt", data["inner"], {}, {r: 1 for r in PORTS})
+        self.assertEqual(v["img"]["verdict"], judge.UNOBSERVABLE)
+        self.assertNotIn("deny log unavailable", v["img"]["reason"])
+        v = judge.judge_all("seatbelt", data["inner"], {"img": 1}, {r: 1 for r in PORTS})
+        self.assertEqual(v["img"]["verdict"], judge.FAIL)
+
+    def test_beacons_alone_are_not_evidence(self) -> None:
+        order: list[str] = []
+        data = self._run(sudo_log="show", order=order, log=FakeLog(order), denies={UDP_DEST: 1})
+        data["inner"]["beacons"] = {"img": 3}
+        v = judge.judge_all("seatbelt", data["inner"], {}, {r: 1 for r in PORTS})
+        self.assertEqual(v["img"]["verdict"], judge.UNOBSERVABLE)
+
+
+class SandboxLogConfigTest(unittest.TestCase):
+    def test_reset_exception_does_not_stop_remaining_subsystems(self) -> None:
+        calls: list[str] = []
+
+        def runner(argv: list[str]) -> tuple[int, str]:
+            if "--reset" in argv:
+                calls.append(argv[-2])
+                if argv[-2] == SUBS[0]:
+                    raise OSError("x")
+            return 0, "default"
+
+        with seatbelt.SandboxLogConfig(runner) as cfg:
+            pass
+        self.assertEqual(calls, list(SUBS))
+        self.assertIs(cfg.state["all_restored"], False)
+        self.assertEqual(cfg.state["subsystems"][SUBS[0]]["restore_error"], "OSError")
+        self.assertIs(cfg.state["subsystems"][SUBS[1]]["restored"], True)
+
+
+class StopOrderTest(unittest.TestCase):
+    def test_terminate_precedes_kill(self) -> None:
+        events: list[str] = []
+
+        class P:
+            def terminate(self) -> None:
+                events.append("terminate")
+
+            def wait(self, timeout: float | None = None) -> None:
+                events.append("wait")
+                raise measure.subprocess.TimeoutExpired("x", 1)
+
+            def kill(self) -> None:
+                events.append("kill")
+
+        measure._stop_log_proc(P())
+        self.assertEqual(events, ["terminate", "wait", "kill"])
+
+    def test_sudo_nonzero_rc_reports_reason(self) -> None:
+        class P:
+            returncode = 1
+            stdout = SimpleNamespace(readline=lambda n=-1: b"", close=lambda: None)
+
+            def wait(self, timeout: float | None = None) -> int:
+                return 1
+
+        with mock.patch.object(measure.subprocess, "Popen", lambda *a, **k: P()) as _:
+            counts, status = measure.collect_denies("2026-11-01 00:00:00", frozenset({1}), sudo=True)
+        self.assertEqual(counts, {})
+        self.assertEqual(status, {"available": False, "reason": "log show rc=1 (sudo)"})
+
+
+if __name__ == "__main__":
+    unittest.main()

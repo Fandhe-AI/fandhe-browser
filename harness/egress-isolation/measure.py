@@ -241,7 +241,23 @@ def _run_argv(argv: list[str]) -> tuple[int | None, str]:
         return None, "timed out"
 
 
-def collect_denies(start: str, pids: frozenset[int] | None = None) -> tuple[dict[str, int], dict[str, Any]]:
+def _stop_log_proc(proc: Any) -> None:
+    """`log show` 系の子プロセスを止める。SIGTERM（sudo は子の log へ中継する）を先に送り、期限後に SIGKILL する。
+
+    sudo への SIGKILL は子の `log` に伝わらずパイプが開いたままになるため、この順にする（Issue #1402）。
+    """
+    try:
+        proc.terminate()
+        proc.wait(timeout=5)
+    except (subprocess.TimeoutExpired, OSError):
+        try:
+            proc.kill()
+        except OSError:
+            pass
+
+
+def collect_denies(start: str, pids: frozenset[int] | None = None, *,
+                   sudo: bool = False) -> tuple[dict[str, int], dict[str, Any]]:
     """macOS のサンドボックス拒否ログを逐次読んで集計する。(宛先 -> 件数, 取得状況)。読めなければ空と理由。
 
     `pids` は対象ホストとその子孫の pid。拒否ログの `proc(<pid>)` が含まれる行だけを数える（無関係な
@@ -249,14 +265,16 @@ def collect_denies(start: str, pids: frozenset[int] | None = None) -> tuple[dict
 
     出力を全量メモリに載せず、1 行ずつ上限つきで読む。行数・総バイト数が上限に達したら
     プロセスを止めて unobservable（available=False）にする（リソース枯渇の防止）。
+
+    `sudo=True` は opt-in（Issue #1402。xos-measure の macOS ジョブのみ）。`sudo -n log show --info --debug` を使う。
     """
     try:
-        argv = seatbelt.log_show_argv(start)
+        argv = seatbelt.log_show_argv(start, sudo=sudo)
         proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,  # noqa: S603
-                                stderr=subprocess.DEVNULL)
+                                stderr=subprocess.DEVNULL, start_new_session=True)
     except (OSError, subprocess.SubprocessError, ValueError) as exc:
         return {}, {"available": False, "reason": type(exc).__name__}
-    timer = threading.Timer(180, proc.kill)
+    timer = threading.Timer(180, _stop_log_proc, args=(proc,))
     timer.start()
     counts: Counter[str] = Counter()
     diag = seatbelt.DenyDiagnostics()
@@ -288,21 +306,21 @@ def collect_denies(start: str, pids: frozenset[int] | None = None) -> tuple[dict
     finally:
         timer.cancel()
         if over:
-            proc.kill()
+            _stop_log_proc(proc)
         else:
             # 通常の EOF では子プロセスの終了処理が済むまで期限付きで待つ（直後の poll() が None でも
             # 正常終了した log show を kill して集計済みの拒否記録を捨てない）。超過時だけ kill する。
             try:
                 proc.wait(timeout=30)
             except subprocess.TimeoutExpired:
-                proc.kill()
+                _stop_log_proc(proc)
         proc.wait()
         if proc.stdout:
             proc.stdout.close()
     if over:
         return {}, {"available": False, "reason": "log show output exceeded scan limit"}
     if proc.returncode != 0:
-        return {}, {"available": False, "reason": f"log show rc={proc.returncode}"}
+        return {}, {"available": False, "reason": f"log show rc={proc.returncode}" + (" (sudo)" if sudo else "")}
     return dict(counts), {"available": True, "deny_lines": sum(counts.values()), "diagnostics": diag.as_dict()}
 
 
@@ -402,7 +420,9 @@ def appcontainer_caveat(data: dict[str, Any]) -> str | None:
 
 def run_mode(mode: str, *, host: Path, ports: dict[str, int], recs: dict[str, Any], out_dir: Path,
              hosts_file: Path, image: str | None, resolv_file: Path | None = None, page_port: int = 0,
-             launcher: Any = None, loopback_exempt: bool = False) -> dict[str, Any]:
+             launcher: Any = None, loopback_exempt: bool = False, sudo_log: str | None = None,
+             log_runner: Any = None) -> dict[str, Any]:
+    """`sudo_log` は seatbelt だけで効く opt-in（None / "show" / "config"。Issue #1402）。"""
     if mode == "appcontainer":
         return run_appcontainer_mode(host=host, ports=ports, recs=recs, out_dir=out_dir, page_port=page_port,
                                      launcher=launcher, loopback_exempt=loopback_exempt)
@@ -411,31 +431,50 @@ def run_mode(mode: str, *, host: Path, ports: dict[str, int], recs: dict[str, An
     name = f"egress-iso-{os.getpid()}" if mode == "docker-none" else None
     argv = build_argv(mode, host=host, ports=ports, out_dir=out_dir, hosts_file=hosts_file, image=image,
                       resolv_file=resolv_file, name=name, page_port=page_port)
-    started = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time() - 2))
-    rc, err = run_argv(argv, container=name)
-    outer = {k: r.count - before[k] for k, r in recs.items()}
-    result_path = out_dir / f"{mode}.json"
+    use_sudo = mode == "seatbelt" and sudo_log in ("show", "config")
+    cfg = seatbelt.SandboxLogConfig(runner=log_runner) if mode == "seatbelt" and sudo_log == "config" else None
+    denies: dict[str, int] = {}
+    status: dict[str, Any] = {}
+    unpriv: dict[str, Any] | None = None
+    pids: frozenset[int] = frozenset()
     inner: dict[str, Any] = {}
-    # 内側ランナーが正常終了（0）または隔離 abort（2。理由つきの JSON を書く）した場合の今回の結果だけを使う。
-    # それ以外の失敗は空 = 判定不能（合格にしない）。--out は空ディレクトリ検査済みで古い結果は混ざらない。
-    if rc in (0, 2) and result_path.is_file():
-        try:
-            inner = json.loads(result_path.read_text(encoding="utf-8"))
-        except ValueError:
-            inner = {}
+    # log config を上げた場合は、内側の実行・log show のどこで失敗しても finally で必ず戻す（Issue #1402）。
+    try:
+        if cfg is not None:
+            cfg.__enter__()
+        started = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time() - 2))
+        rc, err = run_argv(argv, container=name)
+        outer = {k: r.count - before[k] for k, r in recs.items()}
+        result_path = out_dir / f"{mode}.json"
+        # 内側ランナーが正常終了（0）または隔離 abort（2。理由つきの JSON を書く）した場合の今回の結果だけを使う。
+        # それ以外の失敗は空 = 判定不能（合格にしない）。--out は空ディレクトリ検査済みで古い結果は混ざらない。
+        if rc in (0, 2) and result_path.is_file():
+            try:
+                inner = json.loads(result_path.read_text(encoding="utf-8"))
+            except ValueError:
+                inner = {}
+        if mode == "seatbelt" and inner:
+            # 共有 loopback のため内側の写し listener が無い。TCP の試行は拒否ログ（宛先 ip:port）で観測する。
+            raw_pids = inner.get("host_pids")
+            pids = frozenset(p for p in raw_pids if isinstance(p, int) and not isinstance(p, bool)) \
+                if isinstance(raw_pids, list) else frozenset()
+            if pids:
+                denies, status = collect_denies(started, pids, sudo=use_sudo)
+                if use_sudo:
+                    # 権限の差かレベルの差かを切り分ける比較用（診断カウンタだけ。試行の根拠には使わない）。
+                    _, ustat = collect_denies(started, pids)
+                    unpriv = {k: ustat.get(k) for k in ("available", "reason", "deny_lines", "diagnostics")
+                              if k in ustat}
+            else:
+                # 対象 PID を特定できないときは帰属を確認できないため、拒否ログを試行の根拠にしない（unobservable）。
+                denies, status = {}, {"available": False, "reason": "host pid not recorded"}
+    finally:
+        if cfg is not None:
+            cfg.__exit__(None, None, None)
     data = {"mode": mode, "exit_code": rc, "binary_sha256": inner.get("host_sha256"),
             "binary_version": inner.get("host_version"), "stderr_tail": err if rc != 0 else "", "inner": inner,
             "outer_counts": outer}
     if mode == "seatbelt" and inner:
-        # 共有 loopback のため内側の写し listener が無い。TCP の試行は拒否ログ（宛先 ip:port）で観測する。
-        raw_pids = inner.get("host_pids")
-        pids = frozenset(p for p in raw_pids if isinstance(p, int) and not isinstance(p, bool)) \
-            if isinstance(raw_pids, list) else frozenset()
-        if pids:
-            denies, status = collect_denies(started, pids)
-        else:
-            # 対象 PID を特定できないときは帰属を確認できないため、拒否ログを試行の根拠にしない（unobservable）。
-            denies, status = {}, {"available": False, "reason": "host pid not recorded"}
         dest = {r: f"{judge.IP_INTERNAL_STANDIN if r == 'internal' else judge.IP_BLOCKED}:{ports[r]}"
                 for r in ("redirect", "img", "fetch", "ws", "internal")}
         udp = f"{judge.IP_BLOCKED}:{ports['udp_direct']}"
@@ -444,13 +483,20 @@ def run_mode(mode: str, *, host: Path, ports: dict[str, int], recs: dict[str, An
         probe_ok, probe_why = seatbelt.self_check(denies, (inner.get("probes") or {}).get("udp_direct"), udp)
         if not probe_ok and status.get("available"):
             status = {**status, "available": False, "reason": probe_why}
+        if cfg is not None and not cfg.state.get("all_restored") and status.get("available"):
+            # 片付けが不完全なら拒否ログを根拠にしない（pass にしない。udp の errno 根拠は残る）。
+            status = {**status, "available": False, "reason": "log config not restored"}
         observed = dict(denies)  # 診断用に記録する生の件数（根拠に使うかは status で決まる）
         if not status.get("available"):
             denies = {}
         # 拒否ログの結果を、内側ランナーの試行記録（UDP の errno 由来）へ OR で合成する。ビーコンは根拠にしない。
         inner["attempts"], inner["attempt_evidence"] = seatbelt.compose_attempts(
             inner.get("attempts") or {}, inner.get("attempt_evidence") or {}, denies, dest, udp)
-        data["deny_log"] = {**status, "dest_counts": {d: observed.get(d, 0) for d in (*dest.values(), udp)}}
+        data["deny_log"] = {**status, "dest_counts": {d: observed.get(d, 0) for d in (*dest.values(), udp)},
+                            "sudo": use_sudo,
+                            "log_show_flags": "sudo -n, --info --debug" if use_sudo else "default",
+                            "log_config": cfg.state if cfg is not None else None,
+                            "unprivileged": unpriv}
     return data
 
 
@@ -499,7 +545,12 @@ def summarize(results: dict[str, Any]) -> str:
         if inner.get("fatal"):
             lines.append(f"- in-sandbox fatal: {inner['fatal']}")
         if data.get("deny_log"):
-            lines.append(f"- sandbox deny log: {data['deny_log']}")
+            dl = data["deny_log"]
+            lines.append(f"- sandbox deny log: {dl}")
+            if dl.get("sudo") or dl.get("log_config"):
+                lc = dl.get("log_config") or {}
+                lines.append(f"- deny log opt-in (Issue #1402): sudo={dl.get('sudo')}, flags={dl.get('log_show_flags')}, "
+                             f"log config all_restored={lc.get('all_restored')}, unprivileged diagnostics={dl.get('unprivileged')}")
         if inner.get("beacons") is not None:
             lines.append(f"- failure-path beacons (route -> count): {inner['beacons']}")
         if inner.get("attempt_evidence"):
@@ -521,6 +572,22 @@ def validate_loopback_exempt(requested: bool, plat: str, modes: list[str]) -> No
         raise ValueError("--appcontainer-loopback-exempt needs win32 and the appcontainer mode")
 
 
+def _unavailable_deny_log_reason(data: dict[str, Any]) -> str | None:
+    """拒否ログが使えなかったときの理由（judge の reason へ足す。使えた・無いときは None）。"""
+    dl = data.get("deny_log") or {}
+    return dl.get("reason") if dl and not dl.get("available") else None
+
+
+def validate_seatbelt_sudo_log(value: str | None, plat: str, modes: list[str]) -> None:
+    """`--seatbelt-sudo-log` は macOS の seatbelt モードがあるときだけ受け付ける（Issue #1402）。"""
+    if value is None:
+        return
+    if value not in ("show", "config"):
+        raise ValueError("--seatbelt-sudo-log must be show or config")
+    if plat != "darwin" or "seatbelt" not in modes:
+        raise ValueError("--seatbelt-sudo-log needs darwin and the seatbelt mode")
+
+
 DEFAULT_MODES = {"linux": ("baseline", "bwrap-netns"), "darwin": ("baseline", "seatbelt"),
                  "win32": ("baseline", "appcontainer")}
 
@@ -536,6 +603,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--appcontainer-loopback-exempt", action="store_true",
                         help="Opt-in (needs administrator; used only by the xos-measure Windows job): add "
                         "CheckNetIsolation LoopbackExempt for the harness-created AppContainer SID and remove it afterwards.")
+    parser.add_argument("--seatbelt-sudo-log", choices=("show", "config"), default=None,
+                        help="Opt-in (macOS seatbelt only; used only by the xos-measure macOS job on a throwaway runner): "
+                        "show = read the deny log with `sudo -n log show --info --debug`; config = show plus raise the "
+                        "sandbox subsystems' log level with `sudo log config` and reset it afterwards (Issue #1402).")
     args = parser.parse_args(argv)
     try:
         plat = "linux" if sys.platform.startswith("linux") else sys.platform
@@ -547,6 +618,7 @@ def main(argv: list[str] | None = None) -> int:
         if not modes or modes[0] != "baseline" or any(m not in allowed for m in modes):
             raise ValueError("--modes must start with baseline and use known modes")
         validate_loopback_exempt(args.appcontainer_loopback_exempt, plat, modes)
+        validate_seatbelt_sudo_log(args.seatbelt_sudo_log, plat, modes)
         image = validate_image(args.docker_image) if args.docker_image else None
         if "docker-none" in modes and image is None:
             raise ValueError("docker-none needs --docker-image")
@@ -584,6 +656,7 @@ def main(argv: list[str] | None = None) -> int:
                 "kernel": platform.release(), "platform_name": platform.platform(),
                 "sw_vers": mac_version() if sys.platform == "darwin" else None, "host_sha256": sha, "host_version": version,
                 "proxy_env_present": any(k.lower().endswith("_proxy") for k in os.environ),
+                "seatbelt_sudo_log": args.seatbelt_sudo_log,
             }
             for mode in modes:
                 # モードごとにポートを取り直す（close 直後の再 bind が EADDRINUSE になるのを避ける）。
@@ -591,7 +664,8 @@ def main(argv: list[str] | None = None) -> int:
                 results["modes"][mode] = run_mode(mode, host=host, ports=ports, recs=recs, out_dir=out_dir,
                                                   hosts_file=hosts_file, image=image,
                                                   resolv_file=resolv_file, page_port=page_port,
-                                                  loopback_exempt=args.appcontainer_loopback_exempt)
+                                                  loopback_exempt=args.appcontainer_loopback_exempt,
+                                                  sudo_log=args.seatbelt_sudo_log)
                 if mode == "docker-none" and image is not None:
                     results["modes"][mode]["image_id"] = docker_image_id(image)
         finally:
@@ -606,7 +680,8 @@ def main(argv: list[str] | None = None) -> int:
             data["verdicts"] = judge.judge_all(mode, data["inner"], data["outer_counts"], control,
                                                binary_match=data["binary_match"],
                                                mode_unavailable=data.get("unavailable"),
-                                               loopback_confound=appcontainer_caveat(data))
+                                               loopback_confound=appcontainer_caveat(data),
+                                               deny_log_reason=_unavailable_deny_log_reason(data))
     (out_dir / "result.json").write_text(json.dumps(results, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     summary = summarize(results)
     (out_dir / "summary.md").write_text(summary, encoding="utf-8")
