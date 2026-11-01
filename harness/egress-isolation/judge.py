@@ -192,9 +192,14 @@ def judge_all(
             else "outer listener receipt + inner listener attempt + egress_guard"
         )
         if not monitor_required:
-            method = "outer listener receipt + sandbox deny log / errno (no process-level egress monitor on this OS)"
+            method = ("outer listener receipt + failure-path beacon / sandbox deny log / errno "
+                      "(no process-level egress monitor on this OS)")
         if not binary_match and verdict == PASS:
             verdict, reason = UNOBSERVABLE, "binary inside the sandbox differs from the baseline control binary"
+        if (not monitor_required and route == "redirect" and verdict == UNOBSERVABLE
+                and reason == "no attempt was observed inside the sandbox"):
+            # トップレベルの 302 はページの JS が走らずビーコンを付けられない。根拠は拒否ログだけ（Issue #1395）。
+            reason += " (top-level redirect has no page-level beacon; deny log only)"
         out[route] = {
             "verdict": verdict,
             "reason": reason,
@@ -202,4 +207,7 @@ def judge_all(
             "control_count": control_counts.get(control_route, 0),
             "method": method,
         }
+        evidence = (inner.get("attempt_evidence") or {}).get(route)
+        if isinstance(evidence, str):
+            out[route]["evidence"] = evidence
     return out

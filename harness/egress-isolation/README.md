@@ -95,8 +95,21 @@ macOS・Windows の GitHub ホステッドランナー。結果は #1003 に記�
 
 - プロセス単位の監視（`egress_guard`）が無い。pass の条件から外す代わりに、外側 listener の受信 0 件・baseline の到達・
   試行の観測・`--selftest` と loopback の `load` の成功をすべて要する。
-- 試行の観測は、macOS の TCP 経路はサンドボックス拒否ログ（`log show`。ip:port と件数だけ記録）、`udp_direct` は
-  `sendto` が拒否された errno。ログが読めない・0 件なら試行は未観測（unobservable）。
+- 試行の観測（#1395）。macOS・Windows の TCP 経路の試行は次の順で根拠にする。いずれも ip:port と件数だけを記録する。
+  - 失敗経路のビーコン（主。img・fetch・ws・internal）: 同じページが、許可外宛先への要求が失敗したとき
+    （`onerror` / `catch`）だけ許可オリジンへ `/beacon/<route>` を送る。ブラウザが要求を発行して失敗した後にしか走らず、
+    外側 0 件・baseline の到達と合わせて「Servo の事前ブロックではなく遮断された」ことを推論する（直接の観測ではない。
+    結果の `beacons`・`attempt_evidence`）。Linux のページは変えない。
+  - サンドボックス拒否ログ（副。`log show`）: 取りこぼしの原因を切り分けるため、診断カウンタ（読んだ行・JSON 行・拒否行・
+    宛先を取れた行・pid の帰属で除外した行・帰属した行。`deny_log.diagnostics`）を記録する。内側ランナー自身の UDP
+    プローブが拒否されたのに拒否ログに無いときは自己検査が不成立（`deny_log.available=false`）となり、拒否ログを根拠にしない。
+  - `redirect`（トップレベルの 302）はページの JS が走らずビーコンを付けられない。根拠は拒否ログだけで、得られなければ
+    `unobservable`（理由は結果の `reason`）。302 を追従する fetch の失敗ビーコン（`redirect_fetch`）は補足として記録するが判定には使わない。
+  - `udp_direct` は `sendto` が拒否された errno。
+  - Servo ホスト側の接続試行ログ（`egress_guard` 相当）は採らない。`egress_guard` は `/proc/net` を走査する Linux 専用で、
+    macOS では connect が syscall で拒否されソケットが現れない。`servo-host/src` に接続試行のログも無く、追加には Servo の
+    net スタックの改変か servo-host の改修が要る。
+  - 後続の候補（今回は入れない）: SBPL の `(with message ...)` 等の修飾子、`log stream` の並行収集、workflow の sudo による `log show`。
 - 共有 loopback で内側の写し listener を立てられない。hosts も変えないため、ページは IP リテラル（127.0.0.x）で配る。
 - `internal_real` / `dns` は netns 前提の構造検査で、Seatbelt・AppContainer では成り立たないため `unobservable`
   （実在の内部アドレスにも向けない）。

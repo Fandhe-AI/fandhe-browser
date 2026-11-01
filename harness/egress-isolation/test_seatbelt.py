@@ -3,11 +3,16 @@
 from __future__ import annotations
 
 import sys
+import threading
 import unittest
+import urllib.error
+import urllib.request
+import http.server
 from collections import Counter
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import in_sandbox  # noqa: E402
 import judge  # noqa: E402
 import measure  # noqa: E402
 import page_templates  # noqa: E402
@@ -32,7 +37,7 @@ class SeatbeltProfileTest(unittest.TestCase):
     def test_log_argv_is_fixed_and_start_is_validated(self) -> None:
         argv = seatbelt.log_show_argv("2026-10-31 12:00:00")
         self.assertEqual(argv[:3], ["/usr/bin/log", "show", "--style"])
-        self.assertEqual(argv[-1], 'sender == "Sandbox"')
+        self.assertEqual(argv[-1], 'sender == "Sandbox" OR subsystem == "com.apple.sandbox.reporting"')
         with self.assertRaises(ValueError):
             seatbelt.log_show_argv("now; rm -rf /")
 
@@ -149,6 +154,154 @@ class BuildArgvOsTest(unittest.TestCase):
     def test_unrunnable_mode_is_rejected(self) -> None:
         with self.assertRaises(ValueError):
             self._argv("appcontainer", "win32")
+
+
+def _record(msg: str, pid: int = 0) -> str:
+    import json
+
+    return json.dumps({"eventMessage": msg, "processID": pid})
+
+
+class ScanLineTest(unittest.TestCase):
+    """ndjson の解析・pid の帰属・診断カウンタ（Issue #1395）。"""
+
+    def _scan(self, lines: list[str], pids: frozenset[int] | None) -> tuple[Counter[str], dict[str, int]]:
+        diag = seatbelt.DenyDiagnostics()
+        got: Counter[str] = Counter()
+        for line in lines:
+            dest = seatbelt.scan_line(line, pids, diag)
+            if dest:
+                got[dest] += 1
+        return got, diag.as_dict()
+
+    def test_pid_from_message_and_from_record(self) -> None:
+        lines = [
+            _record("Sandbox: host(101) deny(1) network-outbound 127.0.0.2:2001", 0),
+            _record("deny(1) network-outbound 127.0.0.2:2002", 101),  # メッセージに pid が無い -> processID
+            _record("Sandbox: other(999) deny(1) network-outbound 127.0.0.2:2003", 101),  # メッセージの pid を優先
+            _record("deny(1) network-outbound 127.0.0.2:2004", 0),  # 帰属不能
+        ]
+        got, diag = self._scan(lines, frozenset({101}))
+        self.assertEqual(got, Counter({"127.0.0.2:2001": 1, "127.0.0.2:2002": 1}))
+        self.assertEqual(diag["deny_excluded_by_pid"], 2)
+        self.assertEqual(diag["deny_attributed"], 2)
+
+    def test_diagnostics_separate_stages(self) -> None:
+        lines = [
+            _record("Sandbox: host(101) deny(1) network-outbound 127.0.0.2:2001"),
+            _record("Sandbox: host(101) deny(1) file-read-data /etc/hosts"),
+            "Sandbox: host(101) deny(1) network-outbound 127.0.0.2:2002",  # JSON でない行は正規表現にフォールバック
+            "{broken json deny(1)",
+            _record("unrelated"),
+        ]
+        got, diag = self._scan(lines, frozenset({101}))
+        self.assertEqual(got, Counter({"127.0.0.2:2001": 1, "127.0.0.2:2002": 1}))
+        self.assertEqual(diag, {"scanned_lines": 5, "json_lines": 3, "sandbox_lines": 4,
+                                "network_outbound_lines": 2, "deny_excluded_by_pid": 0, "deny_attributed": 2})
+
+    def test_long_line_is_counted_but_not_parsed(self) -> None:
+        long_line = _record("deny(1) network-outbound 127.0.0.2:2001 " + "x" * seatbelt.MAX_LINE_LEN, 101)
+        got, diag = self._scan([long_line], frozenset({101}))
+        self.assertEqual((got, diag["scanned_lines"], diag["network_outbound_lines"]), (Counter(), 1, 0))
+
+    def test_diagnostics_hold_counts_only(self) -> None:
+        _, diag = self._scan([_record("Sandbox: secret-proc(101) deny(1) network-outbound 127.0.0.2:2001")],
+                             frozenset({101}))
+        self.assertTrue(all(isinstance(v, int) for v in diag.values()))
+
+
+class SelfCheckTest(unittest.TestCase):
+    UDP = "127.0.0.2:2006"
+
+    def test_denied_probe_without_log_line_fails(self) -> None:
+        self.assertEqual(seatbelt.self_check({}, "EPERM", self.UDP),
+                         (False, "self-probe denial missing from deny log"))
+
+    def test_denied_probe_with_log_line_passes(self) -> None:
+        self.assertEqual(seatbelt.self_check({self.UDP: 1}, "EPERM", self.UDP), (True, "ok"))
+
+    def test_probe_not_denied_cannot_be_checked(self) -> None:
+        self.assertEqual(seatbelt.self_check({}, "sent", self.UDP), (True, "ok"))
+
+
+class ComposeAttemptsTest(unittest.TestCase):
+    DEST = {"redirect": "127.0.0.2:2001", "img": "127.0.0.2:2002"}
+    UDP = "127.0.0.2:2006"
+
+    def test_deny_log_does_not_overwrite_beacon_evidence(self) -> None:
+        attempts, evidence = seatbelt.compose_attempts(
+            {"img": True}, {"img": "error_beacon"}, {}, self.DEST, self.UDP)
+        self.assertEqual(attempts["img"], True)
+        self.assertEqual(evidence, {"img": "error_beacon"})
+        self.assertEqual(attempts["redirect"], False)
+
+    def test_deny_log_adds_evidence(self) -> None:
+        attempts, evidence = seatbelt.compose_attempts(
+            {"img": True}, {"img": "error_beacon"}, {"127.0.0.2:2001": 1, "127.0.0.2:2002": 2, self.UDP: 1},
+            self.DEST, self.UDP)
+        self.assertEqual((attempts["redirect"], attempts["udp_direct"]), (True, True))
+        self.assertEqual(evidence, {"img": "error_beacon+deny_log", "redirect": "deny_log", "udp_direct": "deny_log"})
+
+
+class BeaconTest(unittest.TestCase):
+    """失敗経路のビーコン（Issue #1395）。"""
+
+    def _serve(self) -> tuple[http.server.ThreadingHTTPServer, str]:
+        in_sandbox._PageHandler.beacons = {}
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), in_sandbox._PageHandler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        return server, f"http://127.0.0.1:{server.server_address[1]}"
+
+    def test_known_beacon_counts_and_unknown_is_404(self) -> None:
+        _, base = self._serve()
+        for name in ("img", "img", "fetch"):
+            with urllib.request.urlopen(f"{base}/beacon/{name}") as resp:
+                self.assertEqual(resp.status, 204)
+        for bad in ("../etc/passwd", "unknown", "img/x", ""):
+            with self.assertRaises(urllib.error.HTTPError) as ctx:
+                urllib.request.urlopen(f"{base}/beacon/{bad}")
+            self.assertEqual(ctx.exception.code, 404)
+            ctx.exception.close()
+        self.assertEqual(in_sandbox._PageHandler.beacons, {"img": 2, "fetch": 1})
+
+    def test_literal_pages_send_beacon_only_in_failure_callbacks(self) -> None:
+        pages = page_templates.build_pages(PORTS, literal=True)
+        self.assertIn("onerror=\"new Image().src='/beacon/img';\"", pages["/img"])
+        for path, route in (("/fetch", "fetch"), ("/internal", "internal")):
+            self.assertIn(f".catch(function(){{new Image().src='/beacon/{route}';}})", pages[path])
+        self.assertIn("w.onerror=function(){new Image().src='/beacon/ws';}", pages["/ws"])
+        self.assertIn("/beacon/redirect_fetch", pages[page_templates.REDIRECT_PROBE_PATH])
+        for body in pages.values():
+            self.assertNotIn("$", body)
+
+    def test_default_pages_have_no_beacon(self) -> None:
+        pages = page_templates.build_pages(PORTS)
+        self.assertNotIn(page_templates.REDIRECT_PROBE_PATH, pages)
+        self.assertFalse(any("beacon" in body for body in pages.values()))
+
+
+class JudgeBeaconEvidenceTest(unittest.TestCase):
+    INNER = {"positive_ok": True, "guard": {"unavailable": "n/a"}}
+
+    def test_beacon_attempt_passes_with_evidence(self) -> None:
+        inner = {**self.INNER, "attempts": {"img": True}, "attempt_evidence": {"img": "error_beacon"}}
+        out = judge.judge_all("seatbelt", inner, {}, {"img": 1})
+        self.assertEqual((out["img"]["verdict"], out["img"]["evidence"]), (judge.PASS, "error_beacon"))
+        self.assertIn("failure-path beacon", out["img"]["method"])
+
+    def test_outer_receipt_wins_over_beacon(self) -> None:
+        inner = {**self.INNER, "attempts": {"img": True}, "attempt_evidence": {"img": "error_beacon"}}
+        out = judge.judge_all("seatbelt", inner, {"img": 1}, {"img": 1})
+        self.assertEqual(out["img"]["verdict"], judge.FAIL)
+
+    def test_redirect_without_evidence_is_unobservable_with_reason(self) -> None:
+        out = judge.judge_all("seatbelt", {**self.INNER, "attempts": {}}, {}, {"redirect": 1, "img": 1})
+        self.assertEqual(out["redirect"]["verdict"], judge.UNOBSERVABLE)
+        self.assertIn("deny log only", out["redirect"]["reason"])
+        self.assertNotIn("evidence", out["redirect"])
+        self.assertNotIn("deny log only", out["img"]["reason"])
 
 
 if __name__ == "__main__":

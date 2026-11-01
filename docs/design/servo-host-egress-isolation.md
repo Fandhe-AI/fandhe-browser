@@ -123,7 +123,7 @@ loopback で配信するフィクスチャページ（`harness/render-screenshot
 
 ### 6.3 実施の扱い
 
-- `xos-measure.yml`（手動専用・required ではない）への suite 追加と測定ハーネスの実装は後続 issue（infra-builder・render-builder）とする。本 issue では計画を書くだけにする。Linux 版のハーネスは `harness/egress-isolation/`（#1377・#1380）で実装済み（結果は §6.4）。macOS・Windows 版は #1387 で同ハーネスを拡張し、`xos-measure.yml` の suite `egress-isolation` として実装した（macOS は Seatbelt の `seatbelt`、Windows は `baseline` のみ実測し AppContainer のランチャーは FFI が要る承認事項のため `unobservable`。結果は #1003 に記録し、実測後に本書へ要約する）
+- `xos-measure.yml`（手動専用・required ではない）への suite 追加と測定ハーネスの実装は後続 issue（infra-builder・render-builder）とする。本 issue では計画を書くだけにする。Linux 版のハーネスは `harness/egress-isolation/`（#1377・#1380）で実装済み（結果は §6.4）。macOS・Windows 版は #1387 で同ハーネスを拡張し、`xos-measure.yml` の suite `egress-isolation` として実装した（macOS は Seatbelt の `seatbelt`、Windows は `baseline` のみ実測し AppContainer のランチャーは FFI が要る承認事項のため `unobservable`。結果は #1003 に記録し、実測後に本書へ要約する）。macOS の TCP 経路の試行は、拒否ログだけでは観測できなかったため #1395 で失敗経路のビーコン（許可オリジンへの GET。推論による根拠）と拒否ログの診断・自己検査を加えた（手段の詳細は `harness/egress-isolation/README.md`）
 - 依存・`unsafe` を要する測定用コードは承認の後にする
 
 ### 6.4 Linux の実測結果（c56f11c2・2026-10-31）

@@ -42,6 +42,46 @@ _PAGES: dict[str, str] = {
     ),
     "/dns": f'<!doctype html><html><body><img src="http://{judge.HOST_NXDOMAIN}/x"></body></html>',
 }
+# 失敗経路のビーコン（macOS・Windows のページだけ。Issue #1395）。許可オリジンへの同一オリジン相対 GET で、
+# 許可外宛先への要求が失敗したコールバック（onerror / catch）の中でだけ送る。ブラウザが要求を発行して失敗した
+# 後にしか走らないため、プロセス監視の無い OS で「試行した」ことの根拠になる（推論であり直接の観測ではない）。
+# `redirect_fetch` は 302 を追従する fetch の補足用で、判定には使わない（トップレベルの redirect とは別の要求）。
+BEACON_ROUTES = ("img", "fetch", "ws", "internal", "redirect_fetch")
+BEACON_PREFIX = "/beacon/"
+REDIRECT_PROBE_PATH = "/redirect-probe"
+
+
+def _beacon(route: str) -> str:
+    return f"new Image().src='{BEACON_PREFIX}{route}';"
+
+
+_BEACON_PAGES: dict[str, str] = {
+    "/img": (f'<!doctype html><html><body><img src="http://{judge.HOST_BLOCKED}:$p_img/img" '
+             f'onerror="{_beacon("img")}"></body></html>'),
+    "/fetch": (
+        "<!doctype html><html><body><script>"
+        f"fetch('http://{judge.HOST_BLOCKED}:$p_fetch/fetch').catch(function(){{{_beacon('fetch')}}});"
+        "</script></body></html>"
+    ),
+    "/ws": (
+        "<!doctype html><html><body><script>"
+        f"try{{var w=new WebSocket('ws://{judge.HOST_BLOCKED}:$p_ws/ws');"
+        f"w.onerror=function(){{{_beacon('ws')}}};}}catch(e){{}}"
+        "</script></body></html>"
+    ),
+    "/internal": (
+        "<!doctype html><html><body><script>"
+        f"fetch('http://{judge.HOST_INTERNAL_STANDIN}:$p_internal/internal')"
+        f".catch(function(){{{_beacon('internal')}}});"
+        "</script></body></html>"
+    ),
+    REDIRECT_PROBE_PATH: (
+        "<!doctype html><html><body><script>"
+        f"fetch('/redirect-out').catch(function(){{{_beacon('redirect_fetch')}}});"
+        "</script></body></html>"
+    ),
+}
+
 # リダイレクト（許可外ホストへの 302）。Location はポートだけを埋めた固定形。
 REDIRECT_PATH = "/redirect-out"
 _REDIRECT_LOCATION = f"http://{judge.HOST_BLOCKED}:$p_redirect/redirected"
@@ -82,9 +122,11 @@ def _literal(text: str) -> str:
 def build_pages(ports: dict[str, Any], *, literal: bool = False) -> dict[str, str]:
     """パス -> HTML。`ports` に不足があれば KeyError、int 以外は ValueError。
 
-    `literal=True` はダミー宛先を IP リテラルにする（DNS 経路の `/dns` は NXDOMAIN 名のまま）。
+    `literal=True` はダミー宛先を IP リテラルにし、失敗経路のビーコン付きページへ差し替える（DNS 経路の `/dns` は
+    NXDOMAIN 名のまま。Issue #1395）。`literal=False`（Linux）の出力は従来から変えない。
     """
-    return {path: _subst(_literal(body) if literal else body, ports) for path, body in _PAGES.items()}
+    pages = {**_PAGES, **_BEACON_PAGES} if literal else _PAGES
+    return {path: _subst(_literal(body) if literal else body, ports) for path, body in pages.items()}
 
 
 def redirect_location(ports: dict[str, Any], *, literal: bool = False) -> str:

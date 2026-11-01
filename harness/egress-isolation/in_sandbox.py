@@ -45,6 +45,7 @@ import monitor  # noqa: E402
 import page_templates as fixtures  # noqa: E402
 import judge  # noqa: E402
 import listeners  # noqa: E402
+import seatbelt  # noqa: E402
 import servo_bbox_driver as sbd  # noqa: E402
 
 LOAD_TIMEOUT_MS = 8000
@@ -52,6 +53,7 @@ SETTLE_S = 2.5
 PROBE_TIMEOUT_S = 2.0
 DNS_TIMEOUT_S = 5.0
 TCP_ROUTES = ("redirect", "img", "fetch", "ws", "internal")
+MAX_BEACON_COUNT = 1000
 PAGE_ROUTES = ("redirect", "img", "fetch", "ws", "internal", "internal_real", "dns")
 
 
@@ -61,6 +63,9 @@ class _PageHandler(http.server.BaseHTTPRequestHandler):
     pages: dict[str, str] = {}
     redirect_to = ""
     timeout = 10.0
+    # 失敗経路のビーコンの件数（固定キーのみ・上限つき。Issue #1395）。
+    beacons: dict[str, int] = {}
+    beacon_lock = threading.Lock()
 
     def _path(self) -> str:
         return self.path.split("?", 1)[0].split("#", 1)[0]
@@ -71,6 +76,16 @@ class _PageHandler(http.server.BaseHTTPRequestHandler):
             self.send_response(302)
             self.send_header("Location", self.redirect_to)
             self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        if path.startswith(fixtures.BEACON_PREFIX):
+            name = path[len(fixtures.BEACON_PREFIX):]
+            if name not in fixtures.BEACON_ROUTES:  # 固定集合との完全一致のみ（未知・パス走査風は 404）
+                self.send_error(404)
+                return
+            with self.beacon_lock:
+                self.beacons[name] = min(self.beacons.get(name, 0) + 1, MAX_BEACON_COUNT)
+            self.send_response(204)
             self.end_headers()
             return
         body = self.pages.get(path)
@@ -261,7 +276,7 @@ def probe_nameservers() -> dict[str, Any]:
 
 
 # サンドボックス（Seatbelt 等）が送信を拒否したときの errno 名。実測で観測した値に合わせて見直す（#1387）。
-SANDBOX_DENY_ERRNOS = frozenset({"EPERM", "EACCES"})
+SANDBOX_DENY_ERRNOS = seatbelt.SANDBOX_DENY_ERRNOS
 NS_UNREACHABLE = frozenset({"ENETUNREACH", "EHOSTUNREACH", "ENETDOWN", "EADDRNOTAVAIL", "EAFNOSUPPORT"})
 
 
@@ -364,6 +379,8 @@ def run(args: argparse.Namespace, ports: dict[str, int]) -> dict[str, Any]:
     page_port = server.server_address[1]
     _PageHandler.pages = fixtures.build_pages(ports, literal=literal)
     _PageHandler.redirect_to = fixtures.redirect_location(ports, literal=literal)
+    with _PageHandler.beacon_lock:
+        _PageHandler.beacons = {}
     threading.Thread(target=server.serve_forever, daemon=True).start()
 
     inner: dict[str, Any] = {}
@@ -416,6 +433,10 @@ def run(args: argparse.Namespace, ports: dict[str, int]) -> dict[str, Any]:
             time.sleep(SETTLE_S)
             host_pids |= descendant_pids(proc.pid)  # 子プロセスを後から起こす場合も拾う（拒否ログの帰属用）
             result["host_pids"] = sorted(host_pids)
+            if literal and r == "redirect":
+                # 302 を追従する fetch の補足ビーコン（判定には使わない。Issue #1395）。
+                load_route(chan, next_id, info, base + fixtures.REDIRECT_PROBE_PATH)
+                time.sleep(SETTLE_S)
             guard_polls[r] = (guard.snapshot_polls() - polls_before) if guard is not None else 0  # 経路ごとに完了した走査の回数
         result["loads"] = loads
         result["guard_polls"] = guard_polls
@@ -470,6 +491,9 @@ def run(args: argparse.Namespace, ports: dict[str, int]) -> dict[str, Any]:
     result["probes"] = probes
     time.sleep(0.5)
 
+    with _PageHandler.beacon_lock:
+        beacons = dict(_PageHandler.beacons)
+    result["beacons"] = beacons
     counts = {k: rec.count for k, rec in inner.items()}
     result["inner_counts"] = counts
     result["positive_ok"] = (
@@ -488,6 +512,14 @@ def run(args: argparse.Namespace, ports: dict[str, int]) -> dict[str, Any]:
         # 写し listener が無いモード: UDP はサンドボックスが sendto を拒否した errno を試行の根拠にする。
         # TCP の経路は measure.py が拒否ログ（macOS）から補う。errno は実測で観測した値（EPERM 等）を許可集合に入れる。
         result["attempts"]["udp_direct"] = probes.get("udp_direct") in SANDBOX_DENY_ERRNOS
+        # TCP は失敗経路のビーコン（許可オリジンへの GET）を根拠にする。redirect はページの JS が走らないので
+        # ビーコンを付けられず、拒否ログ（measure.py）だけが根拠になる（Issue #1395）。
+        evidence = {"udp_direct": "errno"} if result["attempts"]["udp_direct"] else {}
+        for r in (x for x in TCP_ROUTES if x != "redirect"):
+            if beacons.get(r, 0) >= 1:
+                result["attempts"][r] = True
+                evidence[r] = "error_beacon"
+        result["attempt_evidence"] = evidence
     for rec in inner.values():
         rec.stop()
     server.shutdown()
