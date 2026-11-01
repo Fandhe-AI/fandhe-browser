@@ -633,6 +633,11 @@ def summarize(results: dict[str, Any]) -> str:
         lines += ["", "| route | verdict | outer | control | method | reason |", "| --- | --- | --- | --- | --- | --- |"]
         for r, v in data.get("verdicts", {}).items():
             lines.append(f"| {r} | {v['verdict']} | {v['outer_count']} | {v['control_count']} | {v['method']} | {v['reason']} |")
+        # unobservable に降格しても外側の受信は本物の漏えいかもしれない（Issue #1401 監査）。目立たせる。
+        for r, v in data.get("verdicts", {}).items():
+            if v["verdict"] == judge.UNOBSERVABLE and v["outer_count"] >= 1:
+                lines.append(f"- WARNING: route {r} is unobservable but has {v['outer_count']} outer receipt(s); "
+                             "review for a possible real leak")
     return "\n".join(lines) + "\n"
 
 
@@ -752,11 +757,44 @@ def main(argv: list[str] | None = None) -> int:
                                                mode_unavailable=data.get("unavailable"),
                                                loopback_confound=appcontainer_caveat(data),
                                                deny_log_reason=_unavailable_deny_log_reason(data))
+    return finalize(results, out_dir)
+
+
+# 管理者操作（macOS の `log config`・Windows のループバック免除）の復元・解除が不成立だったときの終了コード。
+# 判定（pass / fail / unobservable）では変えない。2 は引数エラーで使用済み（Issue #1401・#1402 の監査）。
+EXIT_ADMIN_RESTORE_FAILED = 3
+
+
+def admin_restore_failures(results: dict[str, Any]) -> list[str]:
+    """管理者操作の復元・解除が不成立のモードと内容を返す（空なら成立。要求されなかった操作は対象外）。
+
+    macOS: `log config` を上げた構成（`deny_log.log_config` あり）で `all_restored` が真でない。
+    Windows: ループバック免除を要求した実行で、解除の rc 失敗・解除後も一覧に残る/確認不能。
+    """
+    failures: list[str] = []
+    for mode, data in (results.get("modes") or {}).items():
+        lc = (data.get("deny_log") or {}).get("log_config")
+        if lc and lc.get("all_restored") is not True:
+            failures.append(f"{mode}: log config was not restored")
+        ac = data.get("appcontainer") or {}
+        if (ac.get("loopback_exempt") or {}).get("requested") is True:
+            cleanup = ac.get("cleanup") or {}
+            for key in ("loopback_exempt_removed", "loopback_exempt_absent_after_remove"):
+                if key in cleanup and cleanup[key] is not True:
+                    failures.append(f"{mode}: {key} is not true")
+    return failures
+
+
+def finalize(results: dict[str, Any], out_dir: Path) -> int:
+    """結果 JSON と summary を書き終えてから、復元・解除の不成立だけを終了コードに反映する。"""
     (out_dir / "result.json").write_text(json.dumps(results, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     summary = summarize(results)
     (out_dir / "summary.md").write_text(summary, encoding="utf-8")
     print(summary)
-    return 0
+    failures = admin_restore_failures(results)
+    for f in failures:
+        print(f"error: administrator operation not undone ({f})", file=sys.stderr)
+    return EXIT_ADMIN_RESTORE_FAILED if failures else 0
 
 
 if __name__ == "__main__":

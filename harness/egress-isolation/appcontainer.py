@@ -184,6 +184,21 @@ def checknetisolation_args(action: str, sid: str | None, system_root: str) -> li
     return args
 
 
+def trusted_system_root() -> str:
+    """管理者で実行する exe の基準になる Windows ディレクトリ（例 `C:\\Windows`）。
+
+    環境変数 `SystemRoot` は差し替えられうるため、Windows では `GetSystemDirectoryW`（`...\\System32`）の親を使う
+    （Issue #1401 の監査 P3-3。既存の ctypes 承認の範囲）。Windows 以外は自己テスト用に環境変数へ退避する。
+    """
+    if sys.platform == "win32":
+        buf = ctypes.create_unicode_buffer(520)
+        n = ctypes.windll.kernel32.GetSystemDirectoryW(buf, 520)  # type: ignore[attr-defined]
+        if not 0 < n < 520:
+            raise AppContainerError("GetSystemDirectoryW failed")
+        return buf.value.rstrip("\\/").rsplit("\\", 1)[0]
+    return os.environ.get("SystemRoot", "")
+
+
 def _run_checknetisolation(args: list[str]) -> tuple[int, str]:
     """CheckNetIsolation を実行し (rc, 出力の先頭) を返す。起動失敗・タイムアウトは例外のまま呼び出し側へ。"""
     done = subprocess.run(args, stdin=subprocess.DEVNULL, capture_output=True,  # noqa: S603
@@ -446,11 +461,11 @@ class AppContainerSession:
 
     def _exempt_listed(self) -> bool | None:
         """`LoopbackExempt -s` の出力に当該 SID があるか。実行できなければ None（未確認）。"""
-        sid = validate_sid_string(self.sid_string)
         try:
+            sid = validate_sid_string(self.sid_string)
             rc, out = _run_checknetisolation(
-                checknetisolation_args("show", None, os.environ.get("SystemRoot", "")))
-        except (OSError, subprocess.SubprocessError, AppContainerError):
+                checknetisolation_args("show", None, trusted_system_root()))
+        except (OSError, subprocess.SubprocessError, AppContainerError, ValueError):
             return None
         if rc != 0:
             return None
@@ -459,7 +474,7 @@ class AppContainerSession:
     def _add_loopback_exempt(self) -> None:
         """Issue #1401: ハーネスが作ったプロファイルの SID にだけループバック免除を付ける（opt-in・要管理者）。"""
         st = self.loopback_exempt_state
-        args = checknetisolation_args("add", self.sid_string, os.environ.get("SystemRoot", ""))
+        args = checknetisolation_args("add", self.sid_string, trusted_system_root())
         self._exempt_attempted = True
         try:
             rc, _ = _run_checknetisolation(args)
@@ -480,9 +495,10 @@ class AppContainerSession:
         c = self.cleanup
         try:
             rc, _ = _run_checknetisolation(
-                checknetisolation_args("delete", self.sid_string, os.environ.get("SystemRoot", "")))
+                checknetisolation_args("delete", self.sid_string, trusted_system_root()))
             c["loopback_exempt_removed"] = rc == 0
-        except (OSError, subprocess.SubprocessError, AppContainerError):
+        except (OSError, subprocess.SubprocessError, AppContainerError, ValueError):
+            # validate_sid_string の ValueError も含める。後続の staging・プロファイル削除を止めない。
             c["loopback_exempt_removed"] = False
         c["loopback_exempt_absent_after_remove"] = self._exempt_listed() is False
 
