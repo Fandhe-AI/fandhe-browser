@@ -66,7 +66,7 @@ DOCKER_HOST_PATH = "/opt/fandhe/bin/fandhe-browser-servo-host"
 
 def fmt_rc(rc: Any) -> str:
     """終了コードを 10 進と 16 進で示す。0xC0000409 は Rust の panic=abort も含む fail-fast（#1413）。"""
-    if not isinstance(rc, int) or isinstance(rc, bool) or 0 <= rc < 256:
+    if not isinstance(rc, int) or isinstance(rc, bool) or rc < 256:
         return str(rc)
     note = "; fail-fast, includes Rust panic=abort" if rc & 0xFFFFFFFF == 0xC0000409 else ""
     return f"{rc} (0x{rc & 0xFFFFFFFF:08X}{note})"

@@ -111,11 +111,11 @@ class RunQuietTest(unittest.TestCase):
         self.assertEqual(cp.stderr, b"")
 
     def test_real_process_captures_bounded_stderr_on_this_os(self) -> None:
-        code = "import sys; sys.stderr.write('panicked at x:1' + 'z' * 20000); sys.exit(3)"
+        code = "import sys; sys.stderr.write('a' * 20000 + 'panicked at x:1'); sys.exit(3)"
         cp = quiet_io.run_quiet([sys.executable, "-c", code], timeout=30, capture_stderr=True, stderr_keep_max=64)
         self.assertEqual(cp.returncode, 3)
         self.assertEqual(len(cp.stderr), 64)
-        self.assertTrue(cp.stderr.startswith(b"panicked at x:1"))
+        self.assertTrue(cp.stderr.endswith(b"panicked at x:1"))
 
     def test_real_process_on_this_os(self) -> None:
         cp = quiet_io.run_quiet([sys.executable, "-c", "print('hi')"], timeout=30, capture_stdout=True)
@@ -196,6 +196,7 @@ class RecordHostExitTest(unittest.TestCase):
         self.assertEqual(measure.fmt_rc(3221226505),
                          "3221226505 (0xC0000409; fail-fast, includes Rust panic=abort)")
         self.assertEqual(measure.fmt_rc(0), "0")
+        self.assertEqual(measure.fmt_rc(-11), "-11")
         self.assertEqual(measure.fmt_rc(None), "None")
 
 

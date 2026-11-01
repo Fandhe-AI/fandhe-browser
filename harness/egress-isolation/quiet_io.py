@@ -21,7 +21,7 @@ from typing import Any
 DRAIN_CHUNK = 4096
 # 読み捨てる際に保持する先頭の最大バイト数（呼び出し側が結果を使う場合の上限。メモリ肥大を防ぐ）。
 KEEP_MAX = 64 * 1024
-# 異常終了の診断用に保持する stderr の先頭の最大バイト数（#1413。panic メッセージ等を残すための小さな上限）。
+# 異常終了の診断用に保持する stderr の末尾の最大バイト数（#1413。panic メッセージ等を残すための小さな上限）。
 STDERR_KEEP_MAX = 8 * 1024
 
 
@@ -31,11 +31,16 @@ def use_devnull(platform: str | None = None) -> bool:
 
 
 class BoundedDrain:
-    """パイプを最後まで読み、先頭 `keep_max` バイトだけ保持して残りを捨てるスレッド。"""
+    """パイプを最後まで読み、`keep_max` バイトだけ保持して残りを捨てるスレッド。
 
-    def __init__(self, stream: Any, keep_max: int = KEEP_MAX) -> None:
+    既定は先頭保持。`keep_tail=True` は末尾保持（直近 `keep_max` バイトを残す。#1413 の stderr 診断用で、
+    最後の段階マーカーと panic メッセージを確実に残すため）。
+    """
+
+    def __init__(self, stream: Any, keep_max: int = KEEP_MAX, keep_tail: bool = False) -> None:
         self._stream = stream
         self._keep_max = keep_max
+        self._keep_tail = keep_tail
         self.data = bytearray()
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
@@ -46,6 +51,12 @@ class BoundedDrain:
                 chunk = self._stream.read(DRAIN_CHUNK)
                 if not chunk:
                     return
+                if self._keep_tail:
+                    if self._keep_max > 0:
+                        self.data += chunk
+                        if len(self.data) > self._keep_max:
+                            del self.data[:len(self.data) - self._keep_max]
+                    continue
                 room = self._keep_max - len(self.data)
                 if room > 0:
                     self.data += chunk[:room]
@@ -64,7 +75,7 @@ def run_quiet(argv: list[str], *, timeout: float, env: dict[str, str] | None = N
               platform: str | None = None) -> subprocess.CompletedProcess[bytes]:
     """`subprocess.run` の代わり。stdin 無し・stdout / stderr は `capture_*` のときだけ（上限つき）返す。
 
-    `capture_stderr` は #1413 の診断用（selftest が異常終了した理由を残す）。先頭 `stderr_keep_max` バイトだけ保持する。
+    `capture_stderr` は #1413 の診断用（selftest が異常終了した理由を残す）。末尾 `stderr_keep_max` バイトだけ保持する。
 
     タイムアウトは `subprocess.TimeoutExpired`（`subprocess.run` と同じ）。
     """
@@ -84,7 +95,7 @@ def run_quiet(argv: list[str], *, timeout: float, env: dict[str, str] | None = N
     except OSError:
         pass
     out = BoundedDrain(proc.stdout, keep_max if capture_stdout else 0)
-    err = BoundedDrain(proc.stderr, stderr_keep_max if capture_stderr else 0)
+    err = BoundedDrain(proc.stderr, stderr_keep_max if capture_stderr else 0, keep_tail=True)
     try:
         rc = proc.wait(timeout=timeout)
     except subprocess.TimeoutExpired:
@@ -108,7 +119,7 @@ def popen_stdio_host(argv: list[str], *, env: dict[str, str] | None = None,
     """stdin / stdout を PIPE（フレーム通信用）、stderr を捨てる形でホストを起動する。
 
     win32 では stderr を PIPE にして上限つきで読み捨てるスレッドを起こす（読まないとパイプが満杯で
-    ホストが止まるため）。診断用に先頭 `STDERR_KEEP_MAX` バイトを保持し、戻り値の属性 `stderr_drain`
+    ホストが止まるため）。診断用に末尾 `STDERR_KEEP_MAX` バイトを保持し、戻り値の属性 `stderr_drain`
     （`BoundedDrain`）から後で読める（#1413）。非 win32 は従来どおり捨てる（`stderr_drain` は None）。
     """
     if use_devnull(platform):
@@ -118,5 +129,5 @@ def popen_stdio_host(argv: list[str], *, env: dict[str, str] | None = None,
         return proc
     proc = subprocess.Popen(  # noqa: S603
         argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
-    proc.stderr_drain = BoundedDrain(proc.stderr, STDERR_KEEP_MAX)  # type: ignore[attr-defined]
+    proc.stderr_drain = BoundedDrain(proc.stderr, STDERR_KEEP_MAX, keep_tail=True)  # type: ignore[attr-defined]
     return proc
