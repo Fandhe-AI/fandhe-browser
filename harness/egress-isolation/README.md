@@ -95,8 +95,21 @@ macOS・Windows の GitHub ホステッドランナー。結果は #1003 に記�
 
 - プロセス単位の監視（`egress_guard`）が無い。pass の条件から外す代わりに、外側 listener の受信 0 件・baseline の到達・
   試行の観測・`--selftest` と loopback の `load` の成功をすべて要する。
-- 試行の観測は、macOS の TCP 経路はサンドボックス拒否ログ（`log show`。ip:port と件数だけ記録）、`udp_direct` は
-  `sendto` が拒否された errno。ログが読めない・0 件なら試行は未観測（unobservable）。
+- 試行の観測（#1395）。macOS・Windows の TCP 経路の試行は次の順で根拠にする。いずれも ip:port と件数だけを記録する。
+  - 失敗経路のビーコン（補助情報のみ。img・fetch・ws・internal）: 同じページが、許可外宛先への要求が失敗したとき
+    （`onerror` / `catch`）だけ許可オリジンへ `/beacon/<route>` を送り、結果の `beacons` に件数を記録する。
+    ブラウザ内部が要求を拒否した場合も発火するため、接続 syscall の試行や Seatbelt による遮断の証拠にならず、
+    `attempts` の根拠にも判定にも使わない（ビーコンだけでは `unobservable`）。Linux のページは変えない。
+  - サンドボックス拒否ログ（TCP 経路の唯一の根拠。`log show`）: 取りこぼしの原因を切り分けるため、診断カウンタ（読んだ行・JSON 行・拒否行・
+    宛先を取れた行・pid の帰属で除外した行・帰属した行。`deny_log.diagnostics`）を記録する。内側ランナー自身の UDP
+    プローブが拒否されたのに拒否ログに無いときは自己検査が不成立（`deny_log.available=false`）となり、拒否ログを根拠にしない。
+  - 拒否ログが使えない（自己検査の不成立・取りこぼし）TCP 経路は、ビーコンがあっても `unobservable`（理由は結果の `reason`）。
+    したがって「Servo の事前ブロックではなく遮断された」ことは拒否ログの試行でのみ示す。
+  - `udp_direct` は `sendto` が拒否された errno。
+  - Servo ホスト側の接続試行ログ（`egress_guard` 相当）は採らない。`egress_guard` は `/proc/net` を走査する Linux 専用で、
+    macOS では connect が syscall で拒否されソケットが現れない。`servo-host/src` に接続試行のログも無く、追加には Servo の
+    net スタックの改変か servo-host の改修が要る。
+  - 後続の候補（今回は入れない）: SBPL の `(with message ...)` 等の修飾子、`log stream` の並行収集、workflow の sudo による `log show`。
 - 共有 loopback で内側の写し listener を立てられない。hosts も変えないため、ページは IP リテラル（127.0.0.x）で配る。
 - `internal_real` / `dns` は netns 前提の構造検査で、Seatbelt・AppContainer では成り立たないため `unobservable`
   （実在の内部アドレスにも向けない）。

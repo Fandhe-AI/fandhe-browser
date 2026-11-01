@@ -257,6 +257,7 @@ def collect_denies(start: str, pids: frozenset[int] | None = None) -> tuple[dict
     timer = threading.Timer(180, proc.kill)
     timer.start()
     counts: Counter[str] = Counter()
+    diag = seatbelt.DenyDiagnostics()
     lines = total = 0
     over = False
     try:
@@ -276,7 +277,7 @@ def collect_denies(start: str, pids: frozenset[int] | None = None) -> tuple[dict
                 lines += 1
             else:
                 lines += 1
-                dest = seatbelt.parse_deny_line(raw.decode("utf-8", errors="replace"), pids)
+                dest = seatbelt.scan_line(raw.decode("utf-8", errors="replace").rstrip("\r\n"), pids, diag)
                 if dest and sum(counts.values()) < seatbelt.MAX_LOG_LINES:
                     counts[dest] += 1
             if lines > seatbelt.MAX_SCAN_LINES or total > seatbelt.MAX_SCAN_BYTES:
@@ -300,7 +301,7 @@ def collect_denies(start: str, pids: frozenset[int] | None = None) -> tuple[dict
         return {}, {"available": False, "reason": "log show output exceeded scan limit"}
     if proc.returncode != 0:
         return {}, {"available": False, "reason": f"log show rc={proc.returncode}"}
-    return dict(counts), {"available": True, "deny_lines": sum(counts.values())}
+    return dict(counts), {"available": True, "deny_lines": sum(counts.values()), "diagnostics": diag.as_dict()}
 
 
 def run_mode(mode: str, *, host: Path, ports: dict[str, int], recs: dict[str, Any], out_dir: Path,
@@ -341,14 +342,19 @@ def run_mode(mode: str, *, host: Path, ports: dict[str, int], recs: dict[str, An
             denies, status = {}, {"available": False, "reason": "host pid not recorded"}
         dest = {r: f"{judge.IP_INTERNAL_STANDIN if r == 'internal' else judge.IP_BLOCKED}:{ports[r]}"
                 for r in ("redirect", "img", "fetch", "ws", "internal")}
-        attempts = dict(inner.get("attempts") or {})
-        for route, seen in seatbelt.attempts_from_denies(
-                Counter(denies), dest).items():
-            attempts[route] = seen
         udp = f"{judge.IP_BLOCKED}:{ports['udp_direct']}"
-        attempts["udp_direct"] = bool(attempts.get("udp_direct")) or denies.get(udp, 0) >= 1
-        inner["attempts"] = attempts
-        data["deny_log"] = {**status, "dest_counts": {d: denies.get(d, 0) for d in (*dest.values(), udp)}}
+        # 正解の分かっている拒否（内側ランナー自身の UDP プローブ）を拒否ログが取りこぼしているなら、
+        # 拒否ログは TCP の試行の根拠にしない（fail-closed。ビーコンは補助情報のみで根拠にしない。Issue #1395）。
+        probe_ok, probe_why = seatbelt.self_check(denies, (inner.get("probes") or {}).get("udp_direct"), udp)
+        if not probe_ok and status.get("available"):
+            status = {**status, "available": False, "reason": probe_why}
+        observed = dict(denies)  # 診断用に記録する生の件数（根拠に使うかは status で決まる）
+        if not status.get("available"):
+            denies = {}
+        # 拒否ログの結果を、内側ランナーの試行記録（UDP の errno 由来）へ OR で合成する。ビーコンは根拠にしない。
+        inner["attempts"], inner["attempt_evidence"] = seatbelt.compose_attempts(
+            inner.get("attempts") or {}, inner.get("attempt_evidence") or {}, denies, dest, udp)
+        data["deny_log"] = {**status, "dest_counts": {d: observed.get(d, 0) for d in (*dest.values(), udp)}}
     return data
 
 
@@ -379,6 +385,10 @@ def summarize(results: dict[str, Any]) -> str:
             lines.append(f"- mode unavailable: {data['unavailable']}")
         if data.get("deny_log"):
             lines.append(f"- sandbox deny log: {data['deny_log']}")
+        if inner.get("beacons") is not None:
+            lines.append(f"- failure-path beacons (route -> count): {inner['beacons']}")
+        if inner.get("attempt_evidence"):
+            lines.append(f"- attempt evidence (route -> source): {inner['attempt_evidence']}")
         lines.append(f"- isolation precheck: {inner.get('isolation_precheck')}")
         lines.append(f"- binary sha256 (inside sandbox): {data.get('binary_sha256')}; "
                      f"matches baseline: {data.get('binary_match')}")

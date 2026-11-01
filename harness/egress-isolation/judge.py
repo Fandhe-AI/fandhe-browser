@@ -59,6 +59,8 @@ STRUCTURAL_NA_REASON = "structural check requires a network namespace; not appli
 # 宛先 listener があるもの（TCP/UDP）と、構造的に観測する経路（実在アドレス・DNS）。
 LISTENER_ROUTES = ("redirect", "img", "fetch", "ws", "internal", "udp_direct")
 STRUCTURAL_ROUTES = ("internal_real", "dns")
+# 拒否ログだけを試行の根拠にする TCP 経路（macOS・Windows。Issue #1395）。
+TCP_DENY_LOG_ROUTES = ("redirect", "img", "fetch", "ws", "internal")
 # ホストにページを読み込ませる経路。egress guard の走査が完了していなければ観測できていない。
 LOADED_ROUTES = ("redirect", "img", "fetch", "ws", "internal")
 # 構造的な経路の陽性対照（隔離なしで届くことを確かめた経路）。
@@ -192,9 +194,14 @@ def judge_all(
             else "outer listener receipt + inner listener attempt + egress_guard"
         )
         if not monitor_required:
-            method = "outer listener receipt + sandbox deny log / errno (no process-level egress monitor on this OS)"
+            method = ("outer listener receipt + sandbox deny log / errno "
+                      "(no process-level egress monitor on this OS)")
         if not binary_match and verdict == PASS:
             verdict, reason = UNOBSERVABLE, "binary inside the sandbox differs from the baseline control binary"
+        if (not monitor_required and route in TCP_DENY_LOG_ROUTES and verdict == UNOBSERVABLE
+                and reason == "no attempt was observed inside the sandbox"):
+            # TCP 経路の試行の根拠は拒否ログだけ。失敗ビーコンは補助情報で根拠にしない（Issue #1395）。
+            reason += " (TCP attempt evidence is the sandbox deny log only; failure beacons are not evidence)"
         out[route] = {
             "verdict": verdict,
             "reason": reason,
@@ -202,4 +209,7 @@ def judge_all(
             "control_count": control_counts.get(control_route, 0),
             "method": method,
         }
+        evidence = (inner.get("attempt_evidence") or {}).get(route)
+        if isinstance(evidence, str):
+            out[route]["evidence"] = evidence
     return out

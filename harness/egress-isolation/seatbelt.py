@@ -15,8 +15,11 @@ URL・本文は扱わない（ip:port と件数のみ）。方式の採否は決
 
 from __future__ import annotations
 
+import json
 import re
 from collections import Counter
+from dataclasses import asdict, dataclass
+from typing import Any
 
 SANDBOX_EXEC = "/usr/bin/sandbox-exec"
 LOG_BIN = "/usr/bin/log"
@@ -27,7 +30,11 @@ _ISOLATED_TEMPLATE = (
     '(version 1)(allow default)(deny network-outbound (remote ip))'
     '(allow network-outbound (remote ip "localhost:{port}"))'
 )
-LOG_PREDICATE = 'sender == "Sandbox"'
+# macOS 26 で拒否が `sender == "Sandbox"` に出ない可能性があるため reporting subsystem も拾う（Issue #1395）。
+# 最終的な絞り込みは正規表現と pid の帰属で行う。固定文字列で外部入力を連結しない。
+LOG_PREDICATE = 'sender == "Sandbox" OR subsystem == "com.apple.sandbox.reporting"'
+# サンドボックスが送信を拒否したときの errno 名（`in_sandbox.py` の UDP プローブと拒否ログの自己検査が共有する）。
+SANDBOX_DENY_ERRNOS = frozenset({"EPERM", "EACCES"})
 MAX_LOG_LINES = 20000
 MAX_LINE_LEN = 4096
 # `log show` を逐次読む際の打ち切り上限（読み取った行数・総バイト数）。超えたら収集を諦める（unobservable）。
@@ -85,3 +92,103 @@ def parse_denies(text: str, pids: frozenset[int] | None = None) -> Counter[str]:
 def attempts_from_denies(denies: Counter[str], dest_by_route: dict[str, str]) -> dict[str, bool]:
     """経路ごとの宛先 ("ip:port") が拒否ログに 1 件以上あれば試行ありとする。"""
     return {route: denies.get(dest, 0) >= 1 for route, dest in dest_by_route.items()}
+
+
+@dataclass
+class DenyDiagnostics:
+    """拒否ログの取りこぼしの原因を段ごとに切り分ける診断カウンタ（件数だけ。Issue #1395）。
+
+    `scanned_lines` 読んだ行、`json_lines` JSON として解析できた行、`sandbox_lines` 拒否（`deny(`）を含む行、
+    `network_outbound_lines` うち宛先まで取り出せた行、`deny_excluded_by_pid` pid の帰属で除外した行、
+    `deny_attributed` 対象 pid に帰属して数えた行。プロセス名・パス・URL は保持しない。
+    """
+
+    scanned_lines: int = 0
+    json_lines: int = 0
+    sandbox_lines: int = 0
+    network_outbound_lines: int = 0
+    deny_excluded_by_pid: int = 0
+    deny_attributed: int = 0
+
+    def as_dict(self) -> dict[str, int]:
+        return asdict(self)
+
+
+def _record_message(line: str, diag: DenyDiagnostics) -> tuple[str, int]:
+    """ndjson 1 行から (拒否メッセージ本文, レコードの processID)。JSON でなければ行そのものと 0。
+
+    kernel 経由のサンドボックスメッセージではレコードの `processID` が 0 になりうるため、pid は本文の
+    `name(pid)` を優先し、レコード側は 0 以外のときだけ補助に使う。
+    """
+    if line.startswith("{"):
+        try:
+            obj: Any = json.loads(line)
+        except ValueError:
+            obj = None
+        if isinstance(obj, dict):
+            diag.json_lines += 1
+            msg = obj.get("eventMessage")
+            pid = obj.get("processID")
+            return (msg if isinstance(msg, str) else "",
+                    pid if isinstance(pid, int) and not isinstance(pid, bool) and pid > 0 else 0)
+    return line, 0
+
+
+def scan_line(line: str, pids: frozenset[int] | None, diag: DenyDiagnostics) -> str | None:
+    """1 行を解析して診断を更新し、対象 pid に帰属する拒否の "ip:port" を返す（該当しなければ None）。
+
+    `measure.collect_denies` が逐次読みの各行に対して呼ぶ。`pids` が None なら帰属を問わない（自己テスト）。
+    """
+    diag.scanned_lines += 1
+    if len(line) > MAX_LINE_LEN:
+        return None
+    msg, record_pid = _record_message(line, diag)
+    if "deny(" in msg:
+        diag.sandbox_lines += 1
+    m = _DENY_RE.search(msg)
+    if not m or int(m.group(3)) > 65535:
+        return None
+    diag.network_outbound_lines += 1
+    pid = int(m.group(1)) if m.group(1) is not None else record_pid or None
+    if pids is not None and (pid is None or pid not in pids):
+        diag.deny_excluded_by_pid += 1
+        return None
+    diag.deny_attributed += 1
+    return f"{m.group(2)}:{int(m.group(3))}"
+
+
+def self_check(denies: dict[str, int] | Counter[str], udp_probe: object, udp_dest: str) -> tuple[bool, str]:
+    """内側ランナー自身の UDP プローブが拒否された（確実に拒否が起きた）のに、その宛先の拒否が 0 件なら不成立。
+
+    拒否ログの収集・解析が、正解の分かっている拒否も取りこぼしていることを示す。不成立のときは拒否ログを
+    TCP 経路の試行の根拠にしない（fail-closed）。UDP が拒否されていなければ検査できないので成立扱い。
+    """
+    if udp_probe in SANDBOX_DENY_ERRNOS and denies.get(udp_dest, 0) < 1:
+        return False, "self-probe denial missing from deny log"
+    return True, "ok"
+
+
+def compose_attempts(
+    attempts: dict[str, bool], evidence: dict[str, str], denies: dict[str, int] | Counter[str],
+    dest_by_route: dict[str, str], udp_dest: str,
+) -> tuple[dict[str, bool], dict[str, str]]:
+    """内側ランナーの試行（errno）と拒否ログの試行を OR で合成する。
+
+    拒否ログは既存の根拠を上書きしない（`False` で消さない）。`denies` は根拠に使える場合だけ渡す
+    （自己検査が不成立なら空を渡す）。根拠の出どころは `evidence`（経路 -> "errno" / "deny_log" の `+` 連結）。
+    """
+    out_attempts = dict(attempts)
+    out_evidence = dict(evidence)
+
+    def mark(route: str) -> None:
+        out_attempts[route] = True
+        out_evidence[route] = "+".join(filter(None, [out_evidence.get(route), "deny_log"]))
+
+    for route, seen in attempts_from_denies(Counter(denies), dest_by_route).items():
+        out_attempts[route] = bool(out_attempts.get(route))
+        if seen:
+            mark(route)
+    if denies.get(udp_dest, 0) >= 1:
+        mark("udp_direct")
+    out_attempts["udp_direct"] = bool(out_attempts.get("udp_direct"))
+    return out_attempts, out_evidence
