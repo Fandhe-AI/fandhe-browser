@@ -64,6 +64,14 @@ DOCKER_IMAGE_RE = re.compile(r"^[a-z0-9][a-z0-9._/:@-]{0,127}$")
 DOCKER_HOST_PATH = "/opt/fandhe/bin/fandhe-browser-servo-host"
 
 
+def fmt_rc(rc: Any) -> str:
+    """終了コードを 10 進と 16 進で示す。0xC0000409 は Rust の panic=abort も含む fail-fast（#1413）。"""
+    if not isinstance(rc, int) or isinstance(rc, bool) or 0 <= rc < 256:
+        return str(rc)
+    note = "; fail-fast, includes Rust panic=abort" if rc & 0xFFFFFFFF == 0xC0000409 else ""
+    return f"{rc} (0x{rc & 0xFFFFFFFF:08X}{note})"
+
+
 def validate_host(path: str) -> Path:
     p = Path(path)
     if not p.is_absolute() or not p.is_file() or not os.access(p, os.X_OK):
@@ -614,7 +622,15 @@ def summarize(results: dict[str, Any]) -> str:
         inner = data.get("inner", {})
         lines += ["", f"## {mode}", ""]
         lines.append(f"- exit code: {data.get('exit_code')}; positive_ok: {inner.get('positive_ok')}; "
-                     f"selftest_rc: {inner.get('selftest_rc')}; aborted: {inner.get('aborted', False)}")
+                     f"selftest_rc: {fmt_rc(inner.get('selftest_rc'))}; aborted: {inner.get('aborted', False)}")
+        if "host_exit_rc" in inner:
+            lines.append(f"- host exit after shutdown: {fmt_rc(inner.get('host_exit_rc'))}; "
+                         f"timed out: {inner.get('host_exit_timed_out', False)}")
+        for key in ("selftest_stderr_tail", "host_stderr_tail"):
+            tail = inner.get(key)
+            if tail:
+                safe = tail.replace("```", "'" * 3).replace("::", ": :")
+                lines += ["", f"{key} (last 2 KiB at most):", "", "```text", safe, "```"]
         lines.append(f"- guard: {inner.get('guard')}")
         if data.get("unavailable"):
             lines.append(f"- mode unavailable: {data['unavailable']}")

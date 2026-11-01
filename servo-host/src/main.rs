@@ -93,22 +93,35 @@ fn run_stdio() -> ExitCode {
     }
 }
 
+/// `--selftest` の進行段階を stderr に 1 行出す（#1413）。
+///
+/// AppContainer 内の異常終了（0xC0000409）で panic メッセージが残らない場合でも、最後に出た段階から
+/// 死んだ位置を絞れるようにする。egress 隔離ハーネス（`harness/egress-isolation/`）が末尾を回収する。
+/// stdout の `selftest ok:` と終了コードの契約には影響しない。
+fn selftest_stage(stage: &str) {
+    eprintln!("selftest: {stage}");
+}
+
 /// Servo を生成して `data:` ページの読み込み完了を待ち、破棄と解放を確かめて所要時間を返す。
 ///
 /// 失敗（生成・URL 解析・タイムアウト・解放漏れ・二重生成の許容）は `Err` に倒す。
 /// WebView の生成と読み込み待ちは `page::navigate` を使う。
 fn selftest() -> Result<Duration, String> {
     let engine = Engine::new().map_err(|e| e.to_string())?;
+    selftest_stage("engine created");
     let weak_context = engine.context_weak();
     let url = ServoUrl::parse(SELFTEST_URL).map_err(|e| format!("invalid selftest url: {e}"))?;
     let start = Instant::now();
     let webview = page::navigate(&engine, url, start + SELFTEST_TIMEOUT)
         .map_err(|e| format!("page load did not complete within {SELFTEST_TIMEOUT:?}: {e:?}"))?;
     let elapsed = start.elapsed();
+    selftest_stage("page loaded");
 
     // WebView を先に解放してから Engine を破棄する（Servo の Drop が終了を待つ）。
     drop(webview);
+    selftest_stage("webview dropped");
     drop(engine);
+    selftest_stage("engine dropped");
     if weak_context.upgrade().is_some() {
         return Err("rendering context leaked after engine drop".to_string());
     }
@@ -118,5 +131,6 @@ fn selftest() -> Result<Duration, String> {
         Err(e) => return Err(format!("unexpected error on second engine: {e}")),
         Ok(_) => return Err("second engine creation was not rejected".to_string()),
     }
+    selftest_stage("second engine rejected");
     Ok(elapsed)
 }

@@ -95,6 +95,11 @@ macOS・Windows の GitHub ホステッドランナー。結果は #1003 に記�
 
 - プロセス単位の監視（`egress_guard`）が無い。pass の条件から外す代わりに、外側 listener の受信 0 件・baseline の到達・
   試行の観測・`--selftest` と loopback の `load` の成功をすべて要する。
+- 異常終了の診断（#1413）。内側の結果 JSON に次を残す。`selftest_rc` が 0 以外のときだけ `selftest_stderr_tail`
+  （`--selftest` の stderr の末尾。段階マーカー `selftest: <stage>` と panic メッセージ）、`shutdown` 後にホストを待って
+  `host_exit_rc`（待ちが時間切れなら `host_exit_timed_out: true`）、0 以外のときだけ `host_stderr_tail`。どれも上限つきで、
+  URL・環境変数の値は載せない。Windows の `0xC0000409`（3221226505）は fail-fast の終了コードで、スタック溢れだけでなく
+  Rust の `panic = "abort"` の panic も同じコードになる。判定（`positive_ok`）には使わない。
 - 試行の観測（#1395）。macOS・Windows の TCP 経路の試行は次の順で根拠にする。いずれも ip:port と件数だけを記録する。
   - 失敗経路のビーコン（補助情報のみ。img・fetch・ws・internal）: 同じページが、許可外宛先への要求が失敗したとき
     （`onerror` / `catch`）だけ許可オリジンへ `/beacon/<route>` を送り、結果の `beacons` に件数を記録する。
