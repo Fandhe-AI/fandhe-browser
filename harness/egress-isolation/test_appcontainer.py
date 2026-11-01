@@ -142,7 +142,6 @@ class PureFunctionsTest(unittest.TestCase):
             ac._api()
 
 
-@unittest.skipUnless(X64, "struct sizes are asserted for 64-bit pointers")
 class IcaclsTimeoutTest(unittest.TestCase):
     def test_timeout_becomes_appcontainer_error(self) -> None:
         import subprocess
@@ -159,6 +158,7 @@ class IcaclsTimeoutTest(unittest.TestCase):
                 ac._run_icacls(["icacls", "x"], "setintegritylevel")
 
 
+@unittest.skipUnless(X64, "struct sizes are asserted for 64-bit pointers")
 class StructSizeTest(unittest.TestCase):
     """Microsoft の定義（x64）: STARTUPINFOW 104・STARTUPINFOEXW 112・PROCESS_INFORMATION 24 等。"""
 
