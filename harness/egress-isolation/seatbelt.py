@@ -19,7 +19,7 @@ import json
 import re
 import subprocess
 from collections import Counter
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from typing import Any
 
 SANDBOX_EXEC = "/usr/bin/sandbox-exec"
@@ -50,6 +50,10 @@ MAX_LINE_LEN = 4096
 # `log show` を逐次読む際の打ち切り上限（読み取った行数・総バイト数）。超えたら収集を諦める（unobservable）。
 MAX_SCAN_LINES = 500000
 MAX_SCAN_BYTES = 64 * 1024 * 1024
+# 診断サンプルの上限（Issue #1402）。形式が未確定の拒否メッセージを成果物から確認するための本文の控え。
+MAX_UNMATCHED_SAMPLES = 16
+MAX_PID_EXCLUDED_SAMPLES = 8
+MAX_SAMPLE_LEN = 300
 _DENY_RE = re.compile(r"(?:\((\d+)\)\s+)?deny\(\d+\) network-outbound (\d{1,3}(?:\.\d{1,3}){3}):(\d{1,5})\b")
 
 
@@ -258,7 +262,13 @@ class DenyDiagnostics:
 
     `scanned_lines` 読んだ行、`json_lines` JSON として解析できた行、`sandbox_lines` 拒否（`deny(`）を含む行、
     `network_outbound_lines` うち宛先まで取り出せた行、`deny_excluded_by_pid` pid の帰属で除外した行、
-    `deny_attributed` 対象 pid に帰属して数えた行。プロセス名・パス・URL は保持しない。
+    `deny_attributed` 対象 pid に帰属して数えた行。
+
+    サンプル（Issue #1402。正規表現は変えず、実機の形式を成果物から確認するための控え。本文は生で残さない）:
+    `unmatched_deny_samples` は対象 pid に帰属する `deny(` 行で正規表現に一致しなかったものの「形」（`redact_shape`。
+    最大 16 件）。pid を取れない・対象外の不一致行は `unmatched_deny_unattributed` に数だけ残す。
+    `pid_excluded_samples` は pid 帰属で除外した行の `{"pid", "dest"}`（dest は 127.0.0.0/8 のときだけ実値、
+    それ以外は `<ipv4>:port`。最大 8 件）で本文は保存しない。上限超過分は `*_dropped` に数だけ残す。
     """
 
     scanned_lines: int = 0
@@ -267,9 +277,115 @@ class DenyDiagnostics:
     network_outbound_lines: int = 0
     deny_excluded_by_pid: int = 0
     deny_attributed: int = 0
+    unmatched_deny_unattributed: int = 0
+    unmatched_deny_samples: list[str] = field(default_factory=list)
+    unmatched_deny_samples_dropped: int = 0
+    pid_excluded_samples: list[dict[str, Any]] = field(default_factory=list)
+    pid_excluded_samples_dropped: int = 0
 
-    def as_dict(self) -> dict[str, int]:
+    def add_unmatched_sample(self, msg: str) -> None:
+        """対象 pid に帰属する不一致 `deny(` 行の「形」を上限つきで控える（本文は残さない）。"""
+        if len(self.unmatched_deny_samples) < MAX_UNMATCHED_SAMPLES:
+            self.unmatched_deny_samples.append(redact_shape(msg))
+        else:
+            self.unmatched_deny_samples_dropped += 1
+
+    def add_pid_excluded_sample(self, pid: int | None, ip: str, port: int) -> None:
+        """pid 帰属で除外した行を `{"pid", "dest"}` だけ上限つきで控える。"""
+        if len(self.pid_excluded_samples) < MAX_PID_EXCLUDED_SAMPLES:
+            dest = f"{ip}:{port}" if _is_loopback_ipv4(ip) else f"<ipv4>:{port}"
+            self.pid_excluded_samples.append({"pid": pid, "dest": dest})
+        else:
+            self.pid_excluded_samples_dropped += 1
+
+    def as_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+
+_BODY_PID_RE = re.compile(r"\((\d+)\)\s+deny\(")
+
+
+def sanitize_sample(msg: str) -> str:
+    """サンプルを 300 文字に切り詰め、制御文字（改行・タブ・ESC・C1・行区切り）を空白に置換する。"""
+    return "".join(" " if (ord(c) < 32 or 0x7F <= ord(c) <= 0x9F or c in "\u2028\u2029") else c
+                   for c in msg[:MAX_SAMPLE_LEN])
+
+
+_IPV4_PORT_RE = re.compile(r"(\d{1,3}(?:\.\d{1,3}){3})(?::(\d{1,5}))?")
+_MAPPED_LOOPBACK_RE = re.compile(r"::ffff:(127(?:\.\d{1,3}){3})(?::\d{1,5})?", re.IGNORECASE)
+_LOCALHOST_RE = re.compile(r"localhost(?::\d{1,5})?")
+_OP_RE = re.compile(r"[A-Za-z0-9*_-]{1,40}")
+_KEEP_SYMBOLS = frozenset("()[]{}:,.*-_\"'")
+MAX_TOKEN_SHAPE_LEN = 24
+
+
+def _valid_ipv4(ip: str) -> bool:
+    parts = ip.split(".")
+    return len(parts) == 4 and all(p.isdigit() and int(p) <= 255 for p in parts)
+
+
+def _is_loopback_ipv4(ip: str) -> bool:
+    return _valid_ipv4(ip) and ip.split(".")[0] == "127"
+
+
+def _token_shape(tok: str) -> str:
+    """1 トークンを「形」に変える。ループバックの宛先以外の値（IP・パス・クエリ）は残さない。"""
+    m = _IPV4_PORT_RE.fullmatch(tok)
+    if m and _valid_ipv4(m.group(1)):
+        if _is_loopback_ipv4(m.group(1)):
+            return tok
+        return "<ipv4>" + (f":{m.group(2)}" if m.group(2) else "")
+    mm = _MAPPED_LOOPBACK_RE.fullmatch(tok)
+    if mm and _valid_ipv4(mm.group(1)):
+        return tok
+    bare = tok.replace("[", "").replace("]", "")
+    if bare.count(":") >= 2 and re.fullmatch(r"[0-9A-Fa-f:.]+", bare):
+        return "<ipv6>"
+    if _LOCALHOST_RE.fullmatch(tok):
+        return tok
+    if "/" in tok:
+        return "<path>"
+    if "?" in tok or "=" in tok:
+        return "<redacted>"
+    out = []
+    for c in tok:
+        if c.isascii() and c.isalpha():
+            out.append("a")
+        elif c.isascii() and c.isdigit():
+            out.append("9")
+        else:
+            out.append(c if c in _KEEP_SYMBOLS else "?")
+    return "".join(out)[:MAX_TOKEN_SHAPE_LEN]
+
+
+def redact_shape(msg: str) -> str:
+    """拒否メッセージを「形」に変換する（プロセス名・pid・パス・外部 IP・クエリを残さない。Issue #1402）。
+
+    `deny(` より前は `Sandbox: <proc>(<pid>) ` のような形だけ、`deny(N)` と操作名（英数字記号 40 文字以内）は
+    そのまま、以降のトークンは `_token_shape`。結果は 300 文字・制御文字置換で `sanitize_sample` を通す。
+    """
+    idx = msg.find("deny(")
+    prefix, rest = (msg[:idx], msg[idx:]) if idx >= 0 else (msg, "")
+    out: list[str] = []
+    pm = re.match(r"\s*([A-Za-z]{1,16}:)\s", prefix)
+    if pm:
+        out.append(pm.group(1))
+        prefix = prefix[pm.end():]
+    if re.search(r"\(\d+\)\s*$", prefix):
+        out.append("<proc>(<pid>)")
+    elif prefix.strip():
+        out.append("<proc>")
+    dm = re.match(r"deny\(\d+\)", rest)
+    if dm:
+        out.append(dm.group(0))
+        toks = rest[dm.end():].split()
+        if toks:
+            out.append(toks[0] if _OP_RE.fullmatch(toks[0]) else "<op>")
+            toks = toks[1:]
+    else:
+        toks = rest.split()
+    out.extend(_token_shape(t) for t in toks)
+    return sanitize_sample(" ".join(out))
 
 
 def _record_message(line: str, diag: DenyDiagnostics) -> tuple[str, int]:
@@ -305,11 +421,20 @@ def scan_line(line: str, pids: frozenset[int] | None, diag: DenyDiagnostics) -> 
         diag.sandbox_lines += 1
     m = _DENY_RE.search(msg)
     if not m or int(m.group(3)) > 65535:
+        if "deny(" in msg:
+            # 帰属を確認できた行だけ形を控える。無関係なプロセスの拒否は数だけ（情報記録の制限。Issue #1402）。
+            bm = _BODY_PID_RE.search(msg)
+            upid = int(bm.group(1)) if bm else record_pid or None
+            if pids is None or (upid is not None and upid in pids):
+                diag.add_unmatched_sample(msg)
+            else:
+                diag.unmatched_deny_unattributed += 1
         return None
     diag.network_outbound_lines += 1
     pid = int(m.group(1)) if m.group(1) is not None else record_pid or None
     if pids is not None and (pid is None or pid not in pids):
         diag.deny_excluded_by_pid += 1
+        diag.add_pid_excluded_sample(pid, m.group(2), int(m.group(3)))
         return None
     diag.deny_attributed += 1
     return f"{m.group(2)}:{int(m.group(3))}"
