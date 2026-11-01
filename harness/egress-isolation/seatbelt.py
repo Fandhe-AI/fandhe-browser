@@ -93,6 +93,28 @@ def _default_runner(argv: list[str]) -> tuple[int, str]:
     return cp.returncode, (cp.stdout + cp.stderr).decode("utf-8", errors="replace")[:400]
 
 
+def status_is_all_default(status: str) -> bool:
+    """`log config --status` の出力が「全設定項目が既定」と確実に読めるときだけ True（fail-closed。Issue #1402）。
+
+    `level=DEFAULT persist=INFO` のような key=value / key: value 形式は全値が default のときだけ True。
+    項目名のない形式は（`Mode for '<subsystem>'` の前置きを除いて）`default` 単独のときだけ True。
+    level だけ既定で persist 等がカスタムの状態・空・解釈不能な出力は False（`--reset` がカスタム設定を消すため）。
+    """
+    lines = [ln.strip().lower() for ln in status.splitlines() if ln.strip()]
+    if not lines:
+        return False
+    for ln in lines:
+        pairs = re.findall(r"([a-z_-]+)\s*[=:]\s*([a-z_-]+)", ln)
+        if pairs:
+            if any(v != "default" for _, v in pairs):
+                return False
+            continue
+        rest = re.sub(r"^mode\s+for\s+('[^']*'|\S+)\s*:?\s*", "", ln).strip()
+        if rest != "default":
+            return False
+    return True
+
+
 class SandboxLogConfig:
     """sandbox 関連 subsystem のログレベルを上げ、終了時（例外時も）必ず元へ戻す context manager（Issue #1402）。
 
@@ -120,7 +142,7 @@ class SandboxLogConfig:
         # 既定以外・status 取得失敗は何も変更せず中止する（復元不能な変更をしない。Issue #1402）。
         bad = [sub for sub in LOG_CONFIG_SUBSYSTEMS
                if self.state["subsystems"][sub].get("status_before_rc") != 0
-               or "default" not in str(self.state["subsystems"][sub].get("status_before", "")).lower()]
+               or not status_is_all_default(str(self.state["subsystems"][sub].get("status_before", "")))]
         if bad:
             self.state["aborted"] = "log config before-state is not default or unreadable; no change made"
             return self

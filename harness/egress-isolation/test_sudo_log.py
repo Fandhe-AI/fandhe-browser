@@ -281,6 +281,37 @@ class AbortOnNonDefaultTest(unittest.TestCase):
         self.assertIn("aborted", cfg.state)
 
 
+class StatusAllDefaultTest(unittest.TestCase):
+    """log config の変更前判定は全項目が既定のときだけ許可する（fail-closed。Issue #1402）。"""
+
+    def _calls(self, status: str) -> tuple[set[str], dict[str, Any]]:
+        calls: list[str] = []
+
+        def runner(argv: list[str]) -> tuple[int, str]:
+            calls.append("status" if "--status" in argv else "reset" if "--reset" in argv else "raise")
+            return 0, status
+
+        with seatbelt.SandboxLogConfig(runner) as cfg:
+            pass
+        return set(calls), cfg.state
+
+    def test_level_default_but_persist_custom_makes_no_change(self) -> None:
+        for status in ("level=DEFAULT persist=DEBUG", "Mode for 'x': level: DEFAULT, persist: INFO"):
+            calls, state = self._calls(status)
+            self.assertEqual(calls, {"status"}, status)
+            self.assertIn("aborted", state)
+
+    def test_uninterpretable_status_makes_no_change(self) -> None:
+        for status in ("", "something unexpected", "default but not really"):
+            calls, state = self._calls(status)
+            self.assertEqual(calls, {"status"}, status)
+            self.assertIn("aborted", state)
+
+    def test_all_default_forms_are_accepted(self) -> None:
+        for status in ("DEFAULT", "Mode for 'com.apple.sandbox' DEFAULT", "level=DEFAULT persist=DEFAULT"):
+            self.assertTrue(seatbelt.status_is_all_default(status), status)
+
+
 class TimedReaderTest(unittest.TestCase):
     def test_deadline_returns_eof_when_pipe_stays_open(self) -> None:
         r, w = os.pipe()
