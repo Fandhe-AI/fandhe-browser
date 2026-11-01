@@ -94,11 +94,18 @@ def _default_runner(argv: list[str]) -> tuple[int, str]:
 
 
 def status_is_all_default(status: str) -> bool:
-    """`log config --status` の出力が「全設定項目が既定」と確実に読めるときだけ True（fail-closed。Issue #1402）。
+    """`log config --status` の出力が「変更してよい（既定とみなせる）状態」と確実に読めるときだけ True（fail-closed。Issue #1402）。
 
-    `level=DEFAULT persist=INFO` のような key=value / key: value 形式は全値が default のときだけ True。
-    項目名のない形式は（`Mode for '<subsystem>'` の前置きを除いて）`default` 単独のときだけ True。
-    level だけ既定で persist 等がカスタムの状態・空・解釈不能な出力は False（`--reset` がカスタム設定を消すため）。
+    対応する形式は 2 つ。
+    - key=value / key: value 形式: 全値が default のときだけ True。
+    - 実機（macOS 26）の空白区切りトークン形式
+      `Mode for 'com.apple.sandbox'  INFO PERSIST_DEFAULT SIGNPOST_...`:
+      `PERSIST_DEFAULT` を含み、レベルが DEFAULT または INFO のときだけ True。`SIGNPOST_*`・`OVERSIZE_*` は判定に使わない。
+      INFO は未変更のランナーで観測された初期値で、subsystem の plist の既定と考えられる。
+    DEBUG・OFF のレベル、`PERSIST_DEFAULT` 以外の persist、空・解釈不能な出力は False。
+
+    INFO が実はカスタム設定だった場合の安全性は本関数ではなく復元確認が担保する。`SandboxLogConfig` は
+    `--reset` の後に `--status` を取り、変更前と一致しなければ all_restored=False にする（終了コード 3。#1405）。
     """
     lines = [ln.strip().lower() for ln in status.splitlines() if ln.strip()]
     if not lines:
@@ -110,7 +117,13 @@ def status_is_all_default(status: str) -> bool:
                 return False
             continue
         rest = re.sub(r"^mode\s+for\s+('[^']*'|\S+)\s*:?\s*", "", ln).strip()
-        if rest != "default":
+        if rest == "default":
+            continue
+        tokens = rest.split()
+        levels = {t for t in tokens if t in ("default", "info", "debug", "off")}
+        if "persist_default" not in tokens or not levels or not levels <= {"default", "info"}:
+            return False
+        if any(t.startswith("persist_") and t != "persist_default" for t in tokens):
             return False
     return True
 

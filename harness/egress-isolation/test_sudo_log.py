@@ -311,6 +311,20 @@ class StatusAllDefaultTest(unittest.TestCase):
         for status in ("DEFAULT", "Mode for 'com.apple.sandbox' DEFAULT", "level=DEFAULT persist=DEFAULT"):
             self.assertTrue(seatbelt.status_is_all_default(status), status)
 
+    def test_real_macos_token_format_is_default(self) -> None:
+        real = (
+            "Mode for 'com.apple.sandbox'  INFO PERSIST_DEFAULT SIGNPOST_PERSISTED_OFF SIGNPOST_ENABLED_ON "
+            "SIGNPOST_BACKTRACE_ENABLED_OFF OVERSIZE_ENABLED_OFF\n"
+            "Mode for 'com.apple.sandbox.reporting'  INFO PERSIST_DEFAULT SIGNPOST_PERSISTED_OFF "
+            "SIGNPOST_ENABLED_ON SIGNPOST_BACKTRACE_ENABLED_OFF OVERSIZE_ENABLED_ON\n"
+        )
+        self.assertTrue(seatbelt.status_is_all_default(real))
+
+    def test_token_format_non_default_is_rejected(self) -> None:
+        for status in ("Mode for 'x'  DEBUG PERSIST_DEFAULT", "Mode for 'x'  INFO PERSIST_DEBUG",
+                       "Mode for 'x'  OFF PERSIST_DEFAULT", "", "garbage text here"):
+            self.assertFalse(seatbelt.status_is_all_default(status), status)
+
 
 class TimedReaderTest(unittest.TestCase):
     def test_deadline_returns_eof_when_pipe_stays_open(self) -> None:
