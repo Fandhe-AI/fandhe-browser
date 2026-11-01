@@ -396,13 +396,30 @@ class ProbeFailureTest(unittest.TestCase):
 class MakePrivateWorkdirTest(unittest.TestCase):
     """OS 非依存（`sys.platform` と `os.mkdir` をモック）。Issue #1401・`RENDER-3`。"""
 
-    def run_make(self, platform: str, side_effect=None):
+    FLAG = {in_sandbox.APPCONTAINER_FLAG_ENV: in_sandbox.APPCONTAINER_FLAG_VALUE}
+
+    def run_make(self, platform: str, side_effect=None, env: dict[str, str] | None = None):
+        # 環境変数も差し替える（既定は AppContainer フラグあり。無しの経路は env={} で指定する）
+        env = self.FLAG if env is None else env
         with mock.patch.object(in_sandbox.sys, "platform", platform), \
+                mock.patch.dict(in_sandbox.os.environ, env, clear=True), \
                 mock.patch.object(in_sandbox.os, "mkdir", side_effect=side_effect) as mk:
             path = in_sandbox.make_private_workdir("egress-isolation-")
         return path, mk
 
-    def test_win32_does_not_pass_mode_so_dacl_is_inherited(self) -> None:
+    def test_win32_without_flag_keeps_protected_dacl_0o700(self) -> None:
+        for env in ({}, {in_sandbox.APPCONTAINER_FLAG_ENV: "0"}, {in_sandbox.APPCONTAINER_FLAG_ENV: ""}):
+            with self.subTest(env=env):
+                path, mk = self.run_make("win32", env=env)
+                mk.assert_called_once_with(path, 0o700)
+
+    def test_flag_is_ignored_on_non_windows(self) -> None:
+        for platform in ("linux", "darwin"):
+            with self.subTest(platform=platform):
+                path, mk = self.run_make(platform, env=self.FLAG)
+                mk.assert_called_once_with(path, 0o700)
+
+    def test_win32_with_flag_does_not_pass_mode_so_dacl_is_inherited(self) -> None:
         path, mk = self.run_make("win32")
         mk.assert_called_once_with(path)
         self.assertEqual(mk.call_args.args, (path,))
@@ -438,6 +455,162 @@ class MakePrivateWorkdirTest(unittest.TestCase):
         msg = "x" * 900
         self.assertEqual(in_sandbox.describe_error(PermissionError(msg)), f"PermissionError: {msg}")
         self.assertEqual(len(in_sandbox.describe_error(OSError("y" * 5000))), len("OSError: ") + 1000)
+
+    def test_describe_error_masks_windows_user_path_and_keeps_type_and_errno(self) -> None:
+        exc = PermissionError(13, "Access is denied", "C:\\Users\\alice\\AppData\\Local\\Temp\\x")
+        self.assertEqual(in_sandbox.describe_error(exc),
+                         "PermissionError: [Errno 13] Access is denied: "
+                         "'C:\\\\Users\\\\<user>\\\\AppData\\\\Local\\\\Temp\\\\x'")
+        raw = "[WinError 5] denied: 'C:\\Users\\alice\\AppData\\x'"
+        self.assertEqual(in_sandbox.describe_error(OSError(raw)),
+                         "OSError: [WinError 5] denied: 'C:\\Users\\<user>\\AppData\\x'")
+
+    def test_describe_error_masks_unix_user_paths(self) -> None:
+        self.assertEqual(in_sandbox.describe_error(FileNotFoundError(2, "No such file", "/Users/bob/x/y")),
+                         "FileNotFoundError: [Errno 2] No such file: '/Users/<user>/x/y'")
+        self.assertEqual(in_sandbox.describe_error(OSError("open /home/carol/.cache/z failed")),
+                         "OSError: open /home/<user>/.cache/z failed")
+
+    def test_describe_error_masks_whole_username_element_with_spaces(self) -> None:
+        cases = [
+            ("C:\\Users\\Alice Smith\\AppData\\Local\\Temp\\x", "C:\\Users\\<user>\\AppData\\Local\\Temp\\x"),
+            ("C:\\\\Users\\\\Alice Smith\\\\AppData\\\\x", "C:\\\\Users\\\\<user>\\\\AppData\\\\x"),
+            ("/Users/Alice Smith/x", "/Users/<user>/x"),
+            ("/home/a b/x", "/home/<user>/x"),
+            ("C:\\Users\\Alice Smith", "C:\\Users\\<user>"),
+            ("'C:\\Users\\Alice Smith'", "'C:\\Users\\<user>"),
+            ("\"/home/Alice Smith\" failed", "\"/home/<user>"),
+        ]
+        for raw, want in cases:
+            with self.subTest(raw=raw):
+                out = in_sandbox.describe_error(OSError(raw))
+                self.assertEqual(out, f"OSError: {want}")
+                self.assertNotIn("Alice", out)
+                self.assertNotIn("Smith", out)
+
+    def test_describe_error_masks_username_with_apostrophe(self) -> None:
+        cases = [
+            ("C:\\Users\\O'Brien\\AppData\\x", "C:\\Users\\<user>\\AppData\\x"),
+            ("/home/O'Brien/x", "/home/<user>/x"),
+            ("'C:\\Users\\O'Brien'", "'C:\\Users\\<user>"),
+            ("C:\\Users\\'Brien\\x", "C:\\Users\\<user>\\x"),
+        ]
+        for raw, want in cases:
+            with self.subTest(raw=raw):
+                out = in_sandbox.describe_error(OSError(raw))
+                self.assertEqual(out, f"OSError: {want}")
+                self.assertNotIn("Brien", out)
+                self.assertNotIn("O'", out)
+
+    def test_describe_error_masks_delimited_element_with_quotes_and_spaces(self) -> None:
+        # 環境の利用者名は無関係な値にし、パス規則だけで伏せられることを見る
+        env = {"USER": "unrelated-account"}
+        with mock.patch.dict(in_sandbox.os.environ, env, clear=True), \
+                mock.patch.object(in_sandbox.getpass, "getuser", return_value="unrelated-account"):
+            for raw, want in [("/home/O' Brien/cache", "/home/<user>/cache"),
+                              ("/home/O''Brien/cache", "/home/<user>/cache"),
+                              ("C:\\Users\\O' Brien\\x", "C:\\Users\\<user>\\x")]:
+                with self.subTest(raw=raw):
+                    out = in_sandbox.describe_error(OSError(raw))
+                    self.assertEqual(out, f"OSError: {want}")
+                    self.assertNotIn("Brien", out)
+
+    def test_known_user_name_is_replaced_even_without_trailing_separator(self) -> None:
+        env = {"USER": "O' Brien"}
+        with mock.patch.dict(in_sandbox.os.environ, env, clear=True), \
+                mock.patch.object(in_sandbox.getpass, "getuser", side_effect=OSError("no user")):
+            self.assertEqual(in_sandbox.describe_error(OSError("open /home/O' Brien")), "OSError: open /home/<user>")
+            # repr 形式（`'` が `\'` にエスケープされる）
+            out = in_sandbox.describe_error(PermissionError(13, "denied", "O' Brien"))
+            self.assertEqual(out, "PermissionError: [Errno 13] denied: \"<user>\"")
+            out = in_sandbox.describe_error(OSError("path 'x\\'O\\' Brien' end"))
+            self.assertNotIn("Brien", out)
+
+    def mask_with_user(self, name: str, text: str) -> str:
+        with mock.patch.dict(in_sandbox.os.environ, {"USER": name}, clear=True), \
+                mock.patch.object(in_sandbox.getpass, "getuser", side_effect=OSError("no user")):
+            return in_sandbox.mask_identity(text)
+
+    def test_known_name_equal_to_path_marker_does_not_break_path_rule(self) -> None:
+        for marker in ("Users", "home"):
+            with self.subTest(marker=marker):
+                self.assertEqual(self.mask_with_user(marker, "C:\\Users\\Alice\\x"), "C:\\Users\\<user>\\x")
+                self.assertEqual(self.mask_with_user(marker, "/home/Alice/x"), "/home/<user>/x")
+
+    def test_known_name_user_does_not_inflate_placeholder(self) -> None:
+        out = self.mask_with_user("user", "C:\\Users\\Alice\\x for user")
+        self.assertEqual(out, "C:\\Users\\<user>\\x for <user>")
+        self.assertNotIn("<<", out)
+
+    def test_known_name_is_not_replaced_inside_other_words(self) -> None:
+        self.assertEqual(self.mask_with_user("rr", "[Errno 13] Error rr"), "[Errno 13] Error <user>")
+
+    def test_short_known_name_does_not_leave_partial_replacement(self) -> None:
+        out = self.mask_with_user("Ali", "C:\\Users\\Alice\\x and Alice")
+        self.assertEqual(out, "C:\\Users\\<user>\\x and Alice")
+        self.assertNotIn("<user>ce", out)
+
+    def test_path_rule_masks_whole_element_even_for_known_name_prefix(self) -> None:
+        cases = [("/home/Alice Smith/cache", "/home/<user>/cache"),
+                 ("C:\\Users\\Alice.Smith\\AppData\\x", "C:\\Users\\<user>\\AppData\\x"),
+                 ("/home/Alice-Smith/x", "/home/<user>/x")]
+        for raw, want in cases:
+            with self.subTest(raw=raw):
+                out = self.mask_with_user("Alice", raw)
+                self.assertEqual(out, want)
+                self.assertNotIn("Smith", out)
+
+    def test_trailing_element_is_masked_to_end_of_line(self) -> None:
+        out = self.mask_with_user("unrelated", "'C:\\Users\\O' Brien'")
+        self.assertEqual(out, "'C:\\Users\\<user>")
+        self.assertNotIn("Brien", out)
+        self.assertEqual(self.mask_with_user("unrelated", "a /home/x y z\nnext line"), "a /home/<user>\nnext line")
+
+    def test_text_before_the_path_is_kept(self) -> None:
+        out = self.mask_with_user("unrelated", "[WinError 5] Access is denied: 'C:\\Users\\bob smith\\x'")
+        self.assertEqual(out, "[WinError 5] Access is denied: 'C:\\Users\\<user>\\x'")
+        exc = PermissionError(13, "Access is denied", "/home/a b")
+        with mock.patch.dict(in_sandbox.os.environ, {}, clear=True), \
+                mock.patch.object(in_sandbox.getpass, "getuser", side_effect=OSError("n")):
+            self.assertEqual(in_sandbox.describe_error(exc), "PermissionError: [Errno 13] Access is denied: '/home/<user>")
+
+    def test_known_user_names_collects_env_sources_longest_first(self) -> None:
+        env = {"USERNAME": "al", "USER": "alice", "LOGNAME": "x", "USERPROFILE": "C:\\Users\\bobby\\",
+               "HOME": "/home/carol"}
+        with mock.patch.dict(in_sandbox.os.environ, env, clear=True), \
+                mock.patch.object(in_sandbox.getpass, "getuser", return_value="dave"):
+            self.assertEqual(in_sandbox.known_user_names(), ["alice", "bobby", "carol", "dave", "al"])
+
+    def test_known_user_names_ignores_getuser_failure(self) -> None:
+        with mock.patch.dict(in_sandbox.os.environ, {}, clear=True), \
+                mock.patch.object(in_sandbox.getpass, "getuser", side_effect=KeyError("x")):
+            self.assertEqual(in_sandbox.known_user_names(), [])
+
+    def test_describe_error_masks_apostrophe_username_in_repr_form(self) -> None:
+        exc = PermissionError(13, "Access is denied", "C:\\Users\\O'Brien\\AppData\\x")
+        out = in_sandbox.describe_error(exc)
+        self.assertEqual(out, "PermissionError: [Errno 13] Access is denied: "
+                              "\"C:\\\\Users\\\\<user>\\\\AppData\\\\x\"")
+        self.assertNotIn("Brien", out)
+
+    def test_describe_error_masks_repr_form_of_spaced_username(self) -> None:
+        exc = PermissionError(13, "Access is denied", "C:\\Users\\Alice Smith\\AppData\\x")
+        out = in_sandbox.describe_error(exc)
+        self.assertEqual(out, "PermissionError: [Errno 13] Access is denied: 'C:\\\\Users\\\\<user>\\\\AppData\\\\x'")
+        self.assertNotIn("Alice", out)
+
+    def test_describe_error_username_element_is_length_bounded(self) -> None:
+        out = in_sandbox.describe_error(OSError("/home/" + "a" * 100000 + "/x"))
+        self.assertTrue(out.startswith("OSError: /home/<user>"))
+
+    def test_describe_error_masks_sid(self) -> None:
+        msg = "denied for S-1-15-2-3624051433-2125758914-1423191267 on C:\\Users\\dave\\t"
+        self.assertEqual(in_sandbox.describe_error(OSError(msg)), "OSError: denied for <sid> on C:\\Users\\<user>\\t")
+
+    def test_describe_error_masks_before_truncating(self) -> None:
+        out = in_sandbox.describe_error(OSError("x" * 990 + " /home/zed/f"))
+        self.assertNotIn("zed", out)
+        self.assertEqual(len(out), len("OSError: ") + 1000)
 
 
 if __name__ == "__main__":

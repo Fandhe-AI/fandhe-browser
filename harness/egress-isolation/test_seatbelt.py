@@ -336,6 +336,8 @@ class WildcardJudgeMethodTest(unittest.TestCase):
         v = judge.judge_all("seatbelt", inner, {}, {"img": 1, "fetch": 1}, wildcard_routes=frozenset({"img"}))
         self.assertIn("attribution relies on the ephemeral listener port and the host pid", v["img"]["method"])
         self.assertNotIn("ephemeral", v["fetch"]["method"])
+        self.assertIn("(address and protocol are not verified)", v["img"]["method"])
+        self.assertNotIn("not verified", v["fetch"]["method"])
         self.assertEqual(v["img"]["verdict"], v["fetch"]["verdict"])
 
 

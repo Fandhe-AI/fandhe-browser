@@ -264,13 +264,21 @@ def build_environment_block(env: dict[str, str]) -> str:
 HOST_PATH_ENV_NAMES = ("LOCALAPPDATA", "USERPROFILE", "APPDATA", "HOMEDRIVE", "HOMEPATH", "USERNAME")
 
 
+# 容器内側の `in_sandbox.py` へ「AppContainer 経路である」ことを伝えるフラグ（Issue #1402・P2-1）。
+# 値は固定の定数で、経路制御・識別面には使わない。`in_sandbox.APPCONTAINER_FLAG_ENV` / `_VALUE` と同一にする
+# （両者は別プロセスで import し合わないため、一致は test_appcontainer が検査する）。
+APPCONTAINER_FLAG_ENV = "FANDHE_EGRESS_APPCONTAINER"
+APPCONTAINER_FLAG_VALUE = "1"
+
+
 def container_env(staging_tmp: str, system_root: str | None,
                   host_env: Mapping[str, str] | None = None) -> dict[str, str]:
     """容器へ渡す環境変数（許可リスト）。`PATH`・`*_PROXY` は渡さない（`SEC-2`）。
 
     `host_env` から `HOST_PATH_ENV_NAMES` のうち値が空でないものだけを写す（理由は上記コメント）。
     """
-    env = {"TMP": staging_tmp, "TEMP": staging_tmp, "PYTHONIOENCODING": "utf-8"}
+    env = {"TMP": staging_tmp, "TEMP": staging_tmp, "PYTHONIOENCODING": "utf-8",
+           APPCONTAINER_FLAG_ENV: APPCONTAINER_FLAG_VALUE}
     if system_root:
         env["SystemRoot"] = system_root
     for name in HOST_PATH_ENV_NAMES:
