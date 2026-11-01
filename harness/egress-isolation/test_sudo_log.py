@@ -382,33 +382,68 @@ class RestoreByBeforeKindTest(unittest.TestCase):
         self.assertIs(state["all_restored"], False)
 
 
-# `_TimedLineReader` は macOS の `log show` のパイプを読むためのもの（Issue #1402）。Windows の `select` は
-# ソケットにしか使えず、パイプの fd では WinError 10038 になるため、POSIX でだけ実行する（実測で使うのは darwin のみ）。
-@unittest.skipIf(sys.platform == "win32", "select() はパイプに使えない（WinError 10038）。対象は macOS の log show 読み取り")
+class _FakePipe:
+    """`_TimedLineReader` の `select.select` と `os.read` を差し替える偽のパイプ（OS 非依存）。
+
+    Windows の `select` はパイプの fd に使えない（WinError 10038）ため、実パイプではなくこの偽物で
+    期限・行分割の契約を全 OS で検証する。`clock` は `time.monotonic` の代わりで、`select` の待ちで進める。
+    """
+
+    def __init__(self, chunks: list[bytes], eof: bool = False) -> None:
+        self.chunks = list(chunks)
+        self.eof = eof
+        self.now = 1000.0
+        self.selects = 0
+
+    def clock(self) -> float:
+        return self.now
+
+    def select(self, rlist: list[int], _w: list[int], _x: list[int], timeout: float) -> tuple[list[int], list, list]:
+        self.selects += 1
+        if self.chunks or self.eof:
+            return rlist, [], []
+        self.now += timeout  # 読めるものが無ければ待ち時間ぶん時計を進める（実時間は待たない）
+        return [], [], []
+
+    def read(self, _fd: int, _n: int) -> bytes:
+        if self.chunks:
+            return self.chunks.pop(0)
+        return b""
+
+
 class TimedReaderTest(unittest.TestCase):
+    def _reader(self, fake: _FakePipe, budget: float) -> Any:
+        stack = mock.patch.multiple(measure, select=SimpleNamespace(select=fake.select))
+        stack.start()
+        self.addCleanup(stack.stop)
+        for target, repl in (("measure.os.read", fake.read), ("measure.time.monotonic", fake.clock)):
+            patcher = mock.patch(target, repl)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        return measure._TimedLineReader(SimpleNamespace(fileno=lambda: 7), fake.clock() + budget)
+
     def test_deadline_returns_eof_when_pipe_stays_open(self) -> None:
-        r, w = os.pipe()
-        try:
-            stream = SimpleNamespace(fileno=lambda: r)
-            reader = measure._TimedLineReader(stream, measure.time.monotonic() + 0.3)
-            os.write(w, b"a\nbb")
-            self.assertEqual(reader.readline(100), b"a\n")
-            self.assertEqual(reader.readline(100), b"")
-            self.assertIs(reader.timed_out, True)
-        finally:
-            os.close(r)
-            os.close(w)
+        fake = _FakePipe([b"a\nbb"])
+        reader = self._reader(fake, 0.3)
+        self.assertEqual(reader.readline(100), b"a\n")
+        self.assertEqual(reader.readline(100), b"")
+        self.assertIs(reader.timed_out, True)
+        self.assertEqual(reader.readline(100), b"")  # 期限後は残り（b"bb"）を返さず EOF 扱いのまま
 
     def test_long_line_is_split_at_limit(self) -> None:
-        r, w = os.pipe()
-        try:
-            reader = measure._TimedLineReader(SimpleNamespace(fileno=lambda: r), measure.time.monotonic() + 5)
-            os.write(w, b"abcdef\n")
-            self.assertEqual(reader.readline(4), b"abcd")
-            self.assertEqual(reader.readline(4), b"ef\n")
-        finally:
-            os.close(r)
-            os.close(w)
+        fake = _FakePipe([b"abcdef\n"])
+        reader = self._reader(fake, 5)
+        self.assertEqual(reader.readline(4), b"abcd")
+        self.assertEqual(reader.readline(4), b"ef\n")
+        self.assertIs(reader.timed_out, False)
+
+    def test_eof_returns_remaining_then_empty(self) -> None:
+        fake = _FakePipe([b"x\ny"], eof=True)
+        reader = self._reader(fake, 5)
+        self.assertEqual(reader.readline(100), b"x\n")
+        self.assertEqual(reader.readline(100), b"y")
+        self.assertEqual(reader.readline(100), b"")
+        self.assertIs(reader.timed_out, False)
 
 
 class StopOrderTest(unittest.TestCase):
