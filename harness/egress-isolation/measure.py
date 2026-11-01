@@ -542,6 +542,10 @@ def run_mode(mode: str, *, host: Path, ports: dict[str, int], recs: dict[str, An
     data = {"mode": mode, "exit_code": rc, "binary_sha256": inner.get("host_sha256"),
             "binary_version": inner.get("host_version"), "stderr_tail": err if rc != 0 else "", "inner": inner,
             "outer_counts": outer}
+    if cfg is not None:
+        # 内側の結果の有無（タイムアウト・異常終了で inner が空でも）にかかわらず、復元の状態を残す。
+        # 終了コード（admin_restore_failures）はここを読む。
+        data["log_config"] = cfg.state
     if mode == "seatbelt" and inner:
         dest = {r: f"{judge.IP_INTERNAL_STANDIN if r == 'internal' else judge.IP_BLOCKED}:{ports[r]}"
                 for r in ("redirect", "img", "fetch", "ws", "internal")}
@@ -768,13 +772,15 @@ EXIT_ADMIN_RESTORE_FAILED = 3
 def admin_restore_failures(results: dict[str, Any]) -> list[str]:
     """管理者操作の復元・解除が不成立のモードと内容を返す（空なら成立。要求されなかった操作は対象外）。
 
-    macOS: `log config` を上げた構成（`deny_log.log_config` あり）で `all_restored` が真でない。
+    macOS: `log config` の変更を試みた（`raise_attempted`）のに `all_restored` が真でない。中止（aborted）は対象外。
     Windows: ループバック免除を要求した実行で、解除の rc 失敗・解除後も一覧に残る/確認不能。
     """
     failures: list[str] = []
     for mode, data in (results.get("modes") or {}).items():
-        lc = (data.get("deny_log") or {}).get("log_config")
-        if lc and lc.get("all_restored") is not True:
+        lc = data.get("log_config")
+        if lc and not lc.get("aborted") and lc.get("all_restored") is not True and any(
+                e.get("raise_attempted") for e in (lc.get("subsystems") or {}).values()):
+            # 実際に変更を試みた操作の復元が不成立。変更せず中止（aborted）したケースは対象外。
             failures.append(f"{mode}: log config was not restored")
         ac = data.get("appcontainer") or {}
         if (ac.get("loopback_exempt") or {}).get("requested") is True:
