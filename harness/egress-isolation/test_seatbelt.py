@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sys
 import threading
 import unittest
@@ -201,7 +202,10 @@ class ScanLineTest(unittest.TestCase):
                                 "unmatched_deny_unattributed": 1,
                                 "unmatched_deny_samples": ["Sandbox: <proc>(<pid>) deny(1) file-read-data <path>"],
                                 "unmatched_deny_samples_dropped": 0, "pid_excluded_samples": [],
-                                "pid_excluded_samples_dropped": 0})
+                                "pid_excluded_samples_dropped": 0,
+                                "unattributed_no_pid": 1, "unattributed_other_pid": 0,
+                                "unattributed_ops": {"<op>": 1}, "unattributed_network_dests": {},
+                                "unattributed_network_unknown_port": 0})
 
     def test_long_line_is_counted_but_not_parsed(self) -> None:
         long_line = _record("deny(1) network-outbound 127.0.0.2:2001 " + "x" * seatbelt.MAX_LINE_LEN, 101)
@@ -439,3 +443,52 @@ class JudgeBeaconEvidenceTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class UnattributedBreakdownTest(unittest.TestCase):
+    """Issue #1415 D4: 帰属できない拒否行は操作名・既知ポートの宛先・pid の有無だけに畳む。"""
+
+    def _scan(self, lines: list[str], pids: frozenset[int], dests: tuple[str, ...]) -> dict:
+        diag = seatbelt.DenyDiagnostics()
+        pm = seatbelt.PortMap.from_dests(dests)
+        for ln in lines:
+            seatbelt.scan_line(ln, pids, diag, pm)
+        return diag.as_dict()
+
+    def test_other_pid_known_port_goes_to_dest_and_unknown_port_only_counts(self) -> None:
+        d = self._scan([
+            "Sandbox: other(999) deny(1) network-outbound 127.0.0.2:49232",
+            "Sandbox: other(999) deny(1) network-outbound inet4x:*:49232",
+            "Sandbox: other(999) deny(1) network-outbound 127.0.0.2:55555",
+            "Sandbox: other(999) deny(1) network-outbound inet4x:*:55556",
+        ], frozenset({101}), ("127.0.0.2:49232",))
+        self.assertEqual(d["unattributed_network_dests"], {"127.0.0.2:49232": 2})
+        self.assertEqual(d["unattributed_network_unknown_port"], 2)
+        self.assertEqual(d["unattributed_other_pid"], 4)
+        self.assertEqual(d["unattributed_no_pid"], 0)
+        self.assertEqual(d["unattributed_ops"], {"network-outbound": 4})
+        self.assertNotIn("55555", json.dumps({k: v for k, v in d.items() if k.startswith("unattributed_")}))
+
+    def test_no_pid_and_unknown_op_are_masked(self) -> None:
+        d = self._scan(["deny(1) secret-user-op /Users/x/y", "Sandbox: o(5) deny(1) file-read-data /p"],
+                       frozenset({101}), ())
+        self.assertEqual(d["unattributed_no_pid"], 1)
+        self.assertEqual(d["unattributed_ops"], {"<op>": 1, "file-read-data": 1})
+        self.assertNotIn("secret-user-op", json.dumps(d))
+
+    def test_op_kinds_are_capped(self) -> None:
+        lines = [f"Sandbox: o(5) deny(1) mach-lookup{i}" for i in range(40)]
+        d = self._scan(lines, frozenset({101}), ())
+        self.assertLessEqual(len(d["unattributed_ops"]), seatbelt.MAX_UNATTRIBUTED_OPS)
+
+    def test_attributed_lines_are_not_counted(self) -> None:
+        d = self._scan(["Sandbox: host(101) deny(1) network-outbound 127.0.0.2:49232"],
+                       frozenset({101}), ("127.0.0.2:49232",))
+        self.assertNotIn("unattributed_ops", d)
+
+    def test_diagnostic_log_show_argv_is_fixed(self) -> None:
+        base = seatbelt.log_show_argv("2026-11-01 00:00:00")
+        diag = seatbelt.log_show_argv("2026-11-01 00:00:00", diagnostic=True)
+        self.assertNotIn("--info", base)
+        self.assertEqual(diag, [*base[:6], "--info", "--debug", *base[6:]])
+        self.assertEqual(diag[-1], seatbelt.LOG_PREDICATE)

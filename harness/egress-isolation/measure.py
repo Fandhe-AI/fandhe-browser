@@ -85,14 +85,28 @@ def validate_image(image: str) -> str:
     return image
 
 
-def start_outer_listeners() -> tuple[dict[str, Any], dict[str, int]]:
-    """外側の許可外宛先（127.0.0.2/127.0.0.3）の listener を立て、(listener 辞書, ポート辞書) を返す。"""
+def start_outer_listeners(diag: bool = False) -> tuple[dict[str, Any], dict[str, int]]:
+    """外側の許可外宛先（127.0.0.2/127.0.0.3）の listener を立て、(listener 辞書, ポート辞書) を返す。
+
+    `diag=True`（macOS のときだけ呼び出し側が渡す。Issue #1415）は redirect の診断経路の listener を足す。
+    診断経路は判定に使わない（`judge.routes_for_mode` に入れない）。
+    """
     recs: dict[str, Any] = {}
+    if diag:
+        for r in fixtures_diag_routes():
+            recs[r] = listeners.TcpRecorder(r, judge.IP_BLOCKED).start()
     for r in ("redirect", "img", "fetch", "ws"):
         recs[r] = listeners.TcpRecorder(r, judge.IP_BLOCKED).start()
     recs["internal"] = listeners.TcpRecorder("internal", judge.IP_INTERNAL_STANDIN).start()
     recs["udp_direct"] = listeners.UdpRecorder("udp_direct", judge.IP_BLOCKED).start()
     return recs, {k: v.port for k, v in recs.items()}
+
+
+def fixtures_diag_routes() -> tuple[str, ...]:
+    """診断経路名（`page_templates.DIAG_ROUTES`）。循環 import を避けて遅延 import する。"""
+    import page_templates
+
+    return page_templates.DIAG_ROUTES
 
 
 def resolv_bind_args(resolv_file: Path) -> list[str]:
@@ -152,6 +166,8 @@ def build_argv(mode: str, *, host: Path, ports: dict[str, int], out_dir: Path, h
     """内側ランナーを起動する固定 argv。ポートは int を文字列化したものだけが入る。"""
     inner_args = ["--mode", mode, "--ports", json.dumps(ports, sort_keys=True)]
     plat = platform_name or sys.platform
+    if plat == "darwin" and all(r in ports for r in fixtures_diag_routes()):
+        inner_args.append("--diag-routes")  # redirect の診断（Issue #1415。判定には使わない）
     if not plat.startswith("linux"):
         # macOS・Windows: 内側ランナーを（Seatbelt があれば包んで）直接起動する。
         inner_args += ["--page-port", str(page_port)]
@@ -328,7 +344,7 @@ _KNOWN_DESTS: contextvars.ContextVar[tuple[str, ...] | None] = contextvars.Conte
 
 
 def collect_denies(start: str, pids: frozenset[int] | None = None, *,
-                   dests: Any = None) -> tuple[dict[str, int], dict[str, Any]]:
+                   dests: Any = None, diagnostic: bool = False) -> tuple[dict[str, int], dict[str, Any]]:
     """macOS のサンドボックス拒否ログを逐次読んで集計する。(宛先 -> 件数, 取得状況)。読めなければ空と理由。
 
     `pids` は対象ホストとその子孫の pid。拒否ログの `proc(<pid>)` が含まれる行だけを数える（無関係な
@@ -345,7 +361,7 @@ def collect_denies(start: str, pids: frozenset[int] | None = None, *,
         dests = _KNOWN_DESTS.get()
     port_map = seatbelt.PortMap.from_dests(dests) if dests is not None else None
     try:
-        argv = seatbelt.log_show_argv(start)
+        argv = seatbelt.log_show_argv(start, diagnostic=diagnostic)
         proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,  # noqa: S603
                                 stderr=subprocess.DEVNULL, start_new_session=True)
     except (OSError, subprocess.SubprocessError, ValueError) as exc:
@@ -516,6 +532,8 @@ def run_mode(mode: str, *, host: Path, ports: dict[str, int], recs: dict[str, An
     status: dict[str, Any] = {}
     pids: frozenset[int] = frozenset()
     inner: dict[str, Any] = {}
+    diag_dests: dict[str, str] = {}
+    info_debug: dict[str, Any] | None = None
     started = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time() - 2))
     rc, err = run_argv(argv, container=name)
     outer = {k: r.count - before[k] for k, r in recs.items()}
@@ -532,13 +550,21 @@ def run_mode(mode: str, *, host: Path, ports: dict[str, int], recs: dict[str, An
         raw_pids = inner.get("host_pids")
         pids = frozenset(p for p in raw_pids if isinstance(p, int) and not isinstance(p, bool)) \
             if isinstance(raw_pids, list) else frozenset()
+        # 診断経路（Issue #1415）の宛先も既知の宛先に入れる（入れないとワイルドカード形式が未知ポート扱いになる）。
+        diag_dests = {r: f"{judge.IP_BLOCKED}:{ports[r]}" for r in fixtures_diag_routes() if r in ports}
         all_dests = (*(f"{judge.IP_INTERNAL_STANDIN if r == 'internal' else judge.IP_BLOCKED}:{ports[r]}"
                        for r in ("redirect", "img", "fetch", "ws", "internal")),
-                     f"{judge.IP_BLOCKED}:{ports['udp_direct']}")
+                     f"{judge.IP_BLOCKED}:{ports['udp_direct']}", *diag_dests.values())
         if pids:
             token = _KNOWN_DESTS.set(all_dests)
             try:
                 denies, status = collect_denies(started, pids)
+                if (status.get("available") and diag_dests
+                        and denies.get(f"{judge.IP_BLOCKED}:{ports['redirect']}", 0) == 0):
+                    # D5: redirect の拒否行が 0 件のときだけ、取得レベルを広げて読み直す（件数は補助情報。根拠にしない）。
+                    info_denies, info_status = collect_denies(started, pids, diagnostic=True)
+                    info_debug = ({d: info_denies.get(d, 0) for d in all_dests}
+                                  if info_status.get("available") else {"unavailable": info_status.get("reason")})
             finally:
                 _KNOWN_DESTS.reset(token)
         else:
@@ -567,6 +593,14 @@ def run_mode(mode: str, *, host: Path, ports: dict[str, int], recs: dict[str, An
             inner.get("attempts") or {}, inner.get("attempt_evidence") or {}, denies, dest, udp)
         data["deny_log"] = {**status, "dest_counts": {d: observed.get(d, 0) for d in (*dest.values(), udp)},
                             "wildcard_routes": wildcard_routes}
+        if diag_dests:
+            # 診断経路の宛先の件数は判定用の dest_counts と分けて出す（Issue #1415。根拠に使うのは availableのとき）。
+            data["deny_log"]["diagnostic_dest_counts"] = {r: observed.get(d, 0) for r, d in diag_dests.items()}
+            by_dest = {d: r for r, d in (*dest.items(), ("udp_direct", udp), *diag_dests.items())}
+            un = (status.get("diagnostics") or {}).get("unattributed_network_dests") or {}
+            data["deny_log"]["unattributed_routes"] = {by_dest.get(d, d): n for d, n in un.items()}
+            if info_debug is not None:
+                data["deny_log"]["diagnostic_info_debug_dest_counts"] = info_debug
     return data
 
 
@@ -601,6 +635,54 @@ def _deny_sample_block(dl: dict[str, Any]) -> list[str]:
     return out
 
 
+def redirect_notes(data: dict[str, Any]) -> dict[str, str]:
+    """redirect が unobservable のときに理由へ足す診断の事実（Issue #1415）。診断が無ければ空。判定は変えない。"""
+    inner = data.get("inner") or {}
+    dl = data.get("deny_log") or {}
+    dc = dl.get("diagnostic_dest_counts")
+    if not isinstance(dc, dict):
+        return {}
+    kind = lambda r: ((inner.get("loads") or {}).get(r) or (inner.get("diag_loads") or {}).get(r) or {}).get("kind")  # noqa: E731
+    ms = inner.get("load_elapsed_ms") or {}
+    parts = [f"diagnostics (not verdicts): deny rows late-redirect={dc.get('diag_redirect_late', 0)}, "
+             f"direct-nav={dc.get('diag_nav_direct', 0)}",
+             f"redirect load kind={kind('redirect')} in {ms.get('redirect')} ms"]
+    if dl.get("unattributed_routes"):
+        parts.append(f"unattributed deny rows by route={dl['unattributed_routes']}")
+    if "diagnostic_info_debug_dest_counts" in dl:
+        parts.append(f"info/debug re-read={dl['diagnostic_info_debug_dest_counts']}")
+    return {"redirect": "; ".join(parts)}
+
+
+def redirect_diag_block(mode: str, data: dict[str, Any], outer: dict[str, int]) -> list[str]:
+    """redirect 診断の表（Issue #1415。判定ではない）。診断経路が無いモードは空。WARNING は隔離モードの外側受信。"""
+    inner = data.get("inner") or {}
+    routes = ("redirect", *fixtures_diag_routes())
+    if not any(r in outer for r in fixtures_diag_routes()):
+        return []
+    dl = data.get("deny_log") or {}
+    deny = dict(dl.get("diagnostic_dest_counts") or {})
+    ms = inner.get("load_elapsed_ms") or {}
+    alive = inner.get("host_alive_after_load") or {}
+    loads = {**(inner.get("loads") or {}), **(inner.get("diag_loads") or {})}
+    out = ["", "redirect diagnostics (not verdicts)", "",
+           "| route | outer | deny | load kind | elapsed_ms | host alive after failed load |",
+           "| ----- | ----- | ---- | --------- | ---------- | ---------------------------- |"]
+    for r in routes:
+        dv = deny.get(r, "-") if r != "redirect" else (dl.get("dest_counts") or {}).get("redirect", "-")
+        out.append(f"| {r} | {outer.get(r, '-')} | {dv} | {(loads.get(r) or {}).get('kind', 'ok' if r in loads else '-')} "
+                   f"| {ms.get(r, '-')} | {alive.get(r, '-')} |")
+    if mode in judge.ISOLATED_MODES:
+        for r in fixtures_diag_routes():
+            if outer.get(r, 0) >= 1:
+                out.append(f"- WARNING: diagnostic route {r} has {outer[r]} outer receipt(s) in an isolated mode; "
+                           "review for a possible real leak")
+    for key in ("unattributed_routes", "diagnostic_info_debug_dest_counts"):
+        if key in dl:
+            out.append(f"- {key}: {dl[key]}")
+    return out
+
+
 def summarize(results: dict[str, Any]) -> str:
     meta = results["meta"]
     lines = [f"# egress isolation measurement ({meta.get('platform_name', 'Linux')})", ""]
@@ -616,6 +698,7 @@ def summarize(results: dict[str, Any]) -> str:
     lines.append("| ----- | -------------- |")
     for r, c in sorted(base.get("outer_counts", {}).items()):
         lines.append(f"| {r} | {c} |")
+    lines += redirect_diag_block("baseline", base, base.get("outer_counts", {}))
     for mode, data in results["modes"].items():
         if mode == "baseline":
             continue
@@ -674,6 +757,7 @@ def summarize(results: dict[str, Any]) -> str:
             if v["verdict"] == judge.UNOBSERVABLE and v["outer_count"] >= 1:
                 lines.append(f"- WARNING: route {r} is unobservable but has {v['outer_count']} outer receipt(s); "
                              "review for a possible real leak")
+        lines += redirect_diag_block(mode, data, data.get("outer_counts", {}))
     return "\n".join(lines) + "\n"
 
 
@@ -737,7 +821,7 @@ def main(argv: list[str] | None = None) -> int:
         hosts_file.write_text(judge.HOSTS_FILE, encoding="utf-8")
         resolv_file = Path(td) / "resolv.conf"
         resolv_file.write_text(judge.RESOLV_CONF, encoding="utf-8")
-        recs, ports = start_outer_listeners()
+        recs, ports = start_outer_listeners(diag=sys.platform == "darwin")
         results: dict[str, Any] = {"modes": {}}
         try:
             version = subprocess.run([str(host), "--version"], capture_output=True, text=True,  # noqa: S603
@@ -777,7 +861,8 @@ def main(argv: list[str] | None = None) -> int:
                                                loopback_confound=appcontainer_caveat(data),
                                                deny_log_reason=_unavailable_deny_log_reason(data),
                                                wildcard_routes=frozenset(
-                                                   (data.get("deny_log") or {}).get("wildcard_routes") or ()))
+                                                   (data.get("deny_log") or {}).get("wildcard_routes") or ()),
+                                               route_notes=redirect_notes(data))
     return finalize(results, out_dir)
 
 

@@ -104,6 +104,31 @@ class JudgeAllTest(unittest.TestCase):
         self.assertTrue(all(v["verdict"] == judge.FAIL for v in out.values()))
 
 
+class RouteNotesTest(unittest.TestCase):
+    """Issue #1415: route_notes は unobservable の理由の末尾にだけ付き、判定を変えない。"""
+
+    INNER = {"positive_ok": True, "guard": {}, "attempts": {"img": True}}
+
+    def test_note_only_on_unobservable_routes(self) -> None:
+        plain = judge.judge_all("seatbelt", self.INNER, {}, {"redirect": 1, "img": 1})
+        noted = judge.judge_all("seatbelt", self.INNER, {}, {"redirect": 1, "img": 1},
+                                route_notes={"redirect": "diagnostics: x", "img": "diagnostics: y"})
+        self.assertEqual(plain["redirect"]["verdict"], noted["redirect"]["verdict"])
+        self.assertEqual(noted["redirect"]["verdict"], judge.UNOBSERVABLE)
+        self.assertTrue(noted["redirect"]["reason"].endswith("; diagnostics: x"))
+        self.assertEqual(plain["img"], noted["img"])  # img は pass のまま・理由も不変
+        self.assertEqual(noted["img"]["verdict"], judge.PASS)
+
+    def test_routes_for_mode_unchanged_by_diag_routes(self) -> None:
+        for r in fixtures.DIAG_ROUTES:
+            self.assertNotIn(r, judge.routes_for_mode("seatbelt"))
+            self.assertNotIn(r, judge.routes_for_mode("baseline"))
+
+    def test_build_pages_literal_false_is_unchanged_by_diag(self) -> None:
+        pages = fixtures.build_pages(FixturesTest.PORTS)
+        self.assertNotIn(fixtures.REDIRECT_LATE_PATH, pages)
+
+
 class ModeAllowlistTest(unittest.TestCase):
     def test_baseline_has_no_real_internal_or_dns_routes(self) -> None:
         self.assertEqual(judge.routes_for_mode("baseline"), judge.LISTENER_ROUTES)

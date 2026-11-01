@@ -81,6 +81,15 @@ _BEACON_PAGES: dict[str, str] = {
 REDIRECT_PATH = "/redirect-out"
 _REDIRECT_LOCATION = f"http://{judge.HOST_BLOCKED}:$p_redirect/redirected"
 
+# 診断用の経路（macOS だけ。Issue #1415）。redirect の拒否行が取れない原因（順序・トップレベルナビゲーション・
+# 302 の追従）を切り分けるための補助で、判定（`judge.routes_for_mode` 等）には使わない。
+#   diag_redirect_late: 判定経路の末尾でもう一度 302 を試す（先頭であることによる間引きの確認）。
+#   diag_nav_direct: 302 を経ずに許可外宛先をトップレベルで直接 load する（302 の追従の確認）。
+DIAG_ROUTES = ("diag_redirect_late", "diag_nav_direct")
+REDIRECT_LATE_PATH = "/redirect-late"
+DIAG_NAV_DIRECT_PATH = "/direct"
+_DIAG_REDIRECT_LOCATION = f"http://{judge.HOST_BLOCKED}:$p_diag_redirect_late/redirected"
+
 # 経路 -> ページのパス
 ROUTE_PATH = {
     "redirect": REDIRECT_PATH,
@@ -126,3 +135,8 @@ def build_pages(ports: dict[str, Any], *, literal: bool = False) -> dict[str, st
 
 def redirect_location(ports: dict[str, Any], *, literal: bool = False) -> str:
     return _subst(_literal(_REDIRECT_LOCATION) if literal else _REDIRECT_LOCATION, ports)
+
+
+def diag_redirect_location(ports: dict[str, Any], *, literal: bool = False) -> str:
+    """診断用 302（`/redirect-late`）の Location。`redirect_location` と同じく int のポートだけを置換する。"""
+    return _subst(_literal(_DIAG_REDIRECT_LOCATION) if literal else _DIAG_REDIRECT_LOCATION, ports)

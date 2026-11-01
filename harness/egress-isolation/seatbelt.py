@@ -54,6 +54,7 @@ MATCH_KIND_IP_PORT = "ip:port"
 MATCH_KIND_WILDCARD = "*:port"
 MAX_MATCH_KIND_DESTS = 64
 MAX_AMBIGUOUS_PORTS_RECORDED = 16
+MAX_UNATTRIBUTED_OPS = 16
 
 
 def isolated_profile(page_port: object) -> str:
@@ -63,11 +64,16 @@ def isolated_profile(page_port: object) -> str:
     return _ISOLATED_TEMPLATE.format(port=page_port)
 
 
-def log_show_argv(start: str) -> list[str]:
-    """`log show` の固定 argv（非特権）。`start` は `YYYY-MM-DD HH:MM:SS` 形式のみ受け付ける。"""
+def log_show_argv(start: str, *, diagnostic: bool = False) -> list[str]:
+    """`log show` の固定 argv（非特権）。`start` は `YYYY-MM-DD HH:MM:SS` 形式のみ受け付ける。
+
+    `diagnostic=True` は取得レベルを広げる診断用（`--info --debug`。Issue #1415 の D5。判定の根拠には使わない）。
+    述語は常に固定の `LOG_PREDICATE`。
+    """
     if not re.fullmatch(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}", start):
         raise ValueError("start must be 'YYYY-MM-DD HH:MM:SS'")
-    return [LOG_BIN, "show", "--style", "ndjson", "--start", start, "--predicate", LOG_PREDICATE]
+    return [LOG_BIN, "show", "--style", "ndjson", "--start", start,
+            *(["--info", "--debug"] if diagnostic else []), "--predicate", LOG_PREDICATE]
 
 
 def parse_deny_line(line: str, pids: frozenset[int] | None = None) -> str | None:
@@ -145,6 +151,35 @@ class DenyDiagnostics:
     wildcard_ambiguous_port: int = 0
     wildcard_ambiguous_ports: list[int] = field(default_factory=list)
     match_kind: dict[str, dict[str, int]] = field(default_factory=dict)
+    # 帰属できなかった `deny(` 行の内訳（Issue #1415 の D4。件数だけ。本文・pid・プロセス名・パスは保存しない）。
+    # `unattributed_no_pid` pid を取れなかった行、`unattributed_other_pid` 対象外の pid の行、
+    # `unattributed_ops` 操作名（既知の操作名以外は `<op>`。種類は MAX_UNATTRIBUTED_OPS まで）→件数、
+    # `unattributed_network_dests` network-outbound で既知で一意なポートと一致した宛先 "ip:port" →件数、
+    # `unattributed_network_unknown_port` 既知ポートに一致しなかった network-outbound の件数（ポートの数字は残さない）。
+    unattributed_no_pid: int = 0
+    unattributed_other_pid: int = 0
+    unattributed_ops: dict[str, int] = field(default_factory=dict)
+    unattributed_network_dests: dict[str, int] = field(default_factory=dict)
+    unattributed_network_unknown_port: int = 0
+
+    def note_unattributed(self, msg: str, pid: int | None, ports: "PortMap | None") -> None:
+        """帰属できなかった `deny(` 行を、操作名・既知ポートの宛先・pid の有無だけに畳んで数える（Issue #1415 D4）。"""
+        if pid is None:
+            self.unattributed_no_pid += 1
+        else:
+            self.unattributed_other_pid += 1
+        idx = msg.find("deny(")
+        toks = msg[idx:].split()[1:] if idx >= 0 else []
+        op = toks[0] if toks and _OP_RE.fullmatch(toks[0]) and _is_known_op(toks[0]) else "<op>"
+        if op in self.unattributed_ops or len(self.unattributed_ops) < MAX_UNATTRIBUTED_OPS:
+            self.unattributed_ops[op] = self.unattributed_ops.get(op, 0) + 1
+        if op == "network-outbound":
+            pm = re.search(r":(\d{1,5})$", toks[1]) if len(toks) > 1 else None
+            dest = ports.unique.get(int(pm.group(1))) if pm and ports is not None else None
+            if dest is not None:
+                self.unattributed_network_dests[dest] = self.unattributed_network_dests.get(dest, 0) + 1
+            else:
+                self.unattributed_network_unknown_port += 1
 
     def count_match(self, dest: str, kind: str) -> None:
         """宛先ごとに、どの形式（`ip:port` / `*:port`）で一致した行かを数える（宛先の種類数に上限）。"""
@@ -177,6 +212,10 @@ class DenyDiagnostics:
                 d.pop(key)
         if not self.match_kind:
             d.pop("match_kind")
+        if not (self.unattributed_ops or self.unattributed_no_pid or self.unattributed_other_pid):
+            for key in ("unattributed_no_pid", "unattributed_other_pid", "unattributed_ops",
+                        "unattributed_network_dests", "unattributed_network_unknown_port"):
+                d.pop(key)
         return d
 
 
@@ -346,6 +385,7 @@ def _scan_wildcard(msg: str, record_pid: int, pids: frozenset[int] | None, ports
     pid = int(m.group(1)) if m.group(1) is not None else record_pid or None
     if pids is None or pid is None or pid not in pids:
         diag.wildcard_excluded_by_pid += 1
+        diag.note_unattributed(msg, pid, ports)
         return None
     port = int(m.group(2))
     if ports is not None and port in ports.ambiguous:
@@ -392,12 +432,14 @@ def scan_line(line: str, pids: frozenset[int] | None, diag: DenyDiagnostics,
                 diag.add_unmatched_sample(msg)
             else:
                 diag.unmatched_deny_unattributed += 1
+                diag.note_unattributed(msg, upid, ports)
         return None
     diag.network_outbound_lines += 1
     pid = int(m.group(1)) if m.group(1) is not None else record_pid or None
     if pids is not None and (pid is None or pid not in pids):
         diag.deny_excluded_by_pid += 1
         diag.add_pid_excluded_sample(pid, m.group(2), int(m.group(3)))
+        diag.note_unattributed(msg, pid, ports)
         return None
     diag.deny_attributed += 1
     dest = f"{m.group(2)}:{int(m.group(3))}"

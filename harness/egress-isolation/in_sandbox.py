@@ -66,7 +66,8 @@ class _PageHandler(http.server.BaseHTTPRequestHandler):
     """固定の辞書から HTML を返す（ディスクを読まない）。クエリは無視し、GET/HEAD 以外は 405。"""
 
     pages: dict[str, str] = {}
-    redirect_to = ""
+    # パス -> Location の 302 辞書。既存の REDIRECT_PATH に加え、診断が有効なときだけ /redirect-late を登録する。
+    redirects: dict[str, str] = {}
     timeout = 10.0
     # 失敗経路のビーコンの件数（固定キーのみ・上限つき。Issue #1395）。
     beacons: dict[str, int] = {}
@@ -77,9 +78,10 @@ class _PageHandler(http.server.BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:  # noqa: N802
         path = self._path()
-        if path == fixtures.REDIRECT_PATH:
+        location = self.redirects.get(path)
+        if location is not None:
             self.send_response(302)
-            self.send_header("Location", self.redirect_to)
+            self.send_header("Location", location)
             self.send_header("Content-Length", "0")
             self.end_headers()
             return
@@ -451,6 +453,13 @@ def validate_args(args: argparse.Namespace) -> dict[str, int]:
         value = ports[key]
         if isinstance(value, bool) or not isinstance(value, int) or not (1024 <= value <= 65535):
             raise ValueError(f"port for {key} must be an int in [1024, 65535]")
+    if getattr(args, "diag_routes", False):
+        # 診断経路（Issue #1415。macOS だけ）。指定したときだけ必須で、判定経路のポートとは別に検証する。
+        for key in fixtures.DIAG_ROUTES:
+            value = ports.get(key)
+            if isinstance(value, bool) or not isinstance(value, int) or not (1024 <= value <= 65535):
+                raise ValueError(f"port for {key} must be an int in [1024, 65535]")
+        needed = (*needed, *fixtures.DIAG_ROUTES)
     return {k: ports[k] for k in needed}
 
 
@@ -498,7 +507,10 @@ def run(args: argparse.Namespace, ports: dict[str, int]) -> dict[str, Any]:
     server.daemon_threads = True
     page_port = server.server_address[1]
     _PageHandler.pages = fixtures.build_pages(ports, literal=literal)
-    _PageHandler.redirect_to = fixtures.redirect_location(ports, literal=literal)
+    _PageHandler.redirects = {fixtures.REDIRECT_PATH: fixtures.redirect_location(ports, literal=literal)}
+    diag = bool(getattr(args, "diag_routes", False)) and all(r in ports for r in fixtures.DIAG_ROUTES)
+    if diag:
+        _PageHandler.redirects[fixtures.REDIRECT_LATE_PATH] = fixtures.diag_redirect_location(ports, literal=literal)
     with _PageHandler.beacon_lock:
         _PageHandler.beacons = {}
     threading.Thread(target=server.serve_forever, daemon=True).start()
@@ -550,15 +562,41 @@ def run(args: argparse.Namespace, ports: dict[str, int]) -> dict[str, Any]:
         loads: dict[str, Any] = {}
         host_pids = {os.getpid()} | descendant_pids(proc.pid)
         guard_polls: dict[str, int] = {}
+        load_ms: dict[str, int] = {}
+        alive_after: dict[str, bool] = {}
+
+        def timed_load(route: str, url: str) -> dict[str, Any]:
+            """`load_route` に所要時間（ms）と、失敗直後のホスト生存の記録を足す（Issue #1415 D3。判定には使わない）。"""
+            t0 = time.monotonic()
+            res = load_route(chan, next_id, info, url)
+            load_ms[route] = int((time.monotonic() - t0) * 1000)
+            if not res.get("ok"):
+                alive_after[route] = proc.poll() is None
+            return res
+
         for r in (x for x in PAGE_ROUTES if x in result["routes"] and (netns or x in TCP_ROUTES)):
             polls_before = guard.snapshot_polls() if guard is not None else 0
-            loads[r] = load_route(chan, next_id, info, base + fixtures.ROUTE_PATH[r])
+            loads[r] = timed_load(r, base + fixtures.ROUTE_PATH[r])
             time.sleep(SETTLE_S)
             host_pids |= descendant_pids(proc.pid)  # 子プロセスを後から起こす場合も拾う（拒否ログの帰属用）
             result["host_pids"] = sorted(host_pids)
             guard_polls[r] = (guard.snapshot_polls() - polls_before) if guard is not None else 0  # 経路ごとに完了した走査の回数
         result["loads"] = loads
         result["guard_polls"] = guard_polls
+        if diag:
+            # 判定経路の後に診断経路を試す（Issue #1415。判定・attempts には混ぜない）。
+            diag_loads: dict[str, Any] = {}
+            diag_urls = {"diag_redirect_late": base + fixtures.REDIRECT_LATE_PATH,
+                         "diag_nav_direct": f"http://{judge.IP_BLOCKED}:{ports['diag_nav_direct']}"
+                                            f"{fixtures.DIAG_NAV_DIRECT_PATH}"}
+            for r in fixtures.DIAG_ROUTES:
+                diag_loads[r] = timed_load(r, diag_urls[r])
+                time.sleep(SETTLE_S)
+                host_pids |= descendant_pids(proc.pid)
+                result["host_pids"] = sorted(host_pids)
+            result["diag_loads"] = diag_loads
+        result["load_elapsed_ms"] = load_ms
+        result["host_alive_after_load"] = alive_after
         try:
             sbd.call(chan, next_id, "shutdown", None, sbd.SHUTDOWN_GRACE_S + sbd.TIMEOUT_SLACK_S,
                      max_frame=info.response_max)
@@ -653,6 +691,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--out", required=True, type=Path)
     parser.add_argument("--page-port", type=int, default=0,
                         help="Fixed port for the allowed page server (Seatbelt profile needs it before launch).")
+    parser.add_argument("--diag-routes", action="store_true",
+                        help="macOS only: also run redirect diagnostics (Issue #1415). Not part of verdicts.")
     args = parser.parse_args(argv)
     try:
         ports = validate_args(args)

@@ -125,6 +125,21 @@ macOS・Windows の GitHub ホステッドランナー。結果は #1003 に記�
     sudo つき拒否ログの opt-in と `log config` の操作を削除した）。UDP の自己照合が成り立てば TCP 5 経路の deny 行が試行の根拠になり、
     成り立たなければ理由（`deny log unavailable: ...`）つきの `unobservable`。`log stream`・`log erase` など管理者操作は実装しない。
   - 後続の候補（今回は入れない）: SBPL の `(with message ...)` 等の修飾子、`log stream` の並行収集。
+  - redirect の診断（#1415。macOS だけ・判定には使わない）。macOS 26 の実測（run 41326087766）で redirect だけ拒否行が 0 件の
+    `unobservable` になる。redirect は唯一のトップレベルナビゲーションで、servo-host の `load_failed` は複数の原因（エラーページ・
+    final_url 欠落・許可規則外・Crashed）を 1 種別にまとめるため、「connect を試みていない」のか「拒否されたが行が出ていない」のかを
+    今の結果では区別できない。切り分けのため、判定経路の後に診断を足す。verdict・`attempts`・`positive_ok`・
+    `judge.routes_for_mode` は変えず、redirect が `unobservable` のときだけ理由の末尾に事実を足す。
+    - D1 `diag_redirect_late`: 末尾でもう一度 302（専用ポート・`/redirect-late`）を試す。先頭であることによる間引きの確認。
+    - D2 `diag_nav_direct`: 302 を経ず `127.0.0.2:<専用ポート>/direct` をトップレベルで直接 load する。302 の追従の確認。
+    - D3: 全 `load` の所要時間（ms）と、失敗直後のホスト生存（`proc.poll()`）。すぐ失敗なら connect 拒否かエラーページ、約 8 秒なら時間切れ。
+    - D4: 帰属できなかった `deny(` 行の内訳（`diagnostics.unattributed_*`）。記録するのは pid の有無・既知の操作名（それ以外は `<op>`・
+      種類は 16 まで）・既知で一意なポートと一致した宛先の件数だけ。未知ポートは数字を残さず件数のみ。本文・pid・プロセス名・パスは残さない。
+    - D5: 本来の収集で redirect の宛先が 0 件のときだけ、`log show --info --debug`（述語は同じ固定文字列）で読み直し、既知の宛先の件数だけを
+      `deny_log.diagnostic_info_debug_dest_counts` に残す。根拠にはしない。
+    - 結果の読み方: D2 に拒否行があり redirect に無ければ 302 の追従が connect に達していない。どちらも無ければトップレベルナビゲーションの
+      接続がこの形式では報告されない。D1 だけにあれば順序の影響（後続で経路順の変更を検討する）。隔離モードで診断経路の外側に受信があれば
+      WARNING を出す（判定は変えない）。診断経路は Linux・Windows では有効にしない。
 - 共有 loopback で内側の写し listener を立てられない。hosts も変えないため、ページは IP リテラル（127.0.0.x）で配る。
 - `internal_real` / `dns` は netns 前提の構造検査で、Seatbelt・AppContainer では成り立たないため `unobservable`
   （実在の内部アドレスにも向けない）。

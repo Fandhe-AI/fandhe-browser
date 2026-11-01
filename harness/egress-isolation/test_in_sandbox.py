@@ -68,6 +68,39 @@ class InnerRunnerTest(unittest.TestCase):
         self.assertTrue(all(n >= 1 for n in result["guard_polls"].values()), result["guard_polls"])
         self.assertEqual(set(result["guard_polls"]), {"redirect", "img", "fetch", "ws", "internal"})
 
+    def test_diag_routes_run_after_judged_routes_in_order(self) -> None:
+        """Issue #1415: --diag-routes は判定経路の後に D1・D2 の順で load し、loads / attempts には混ぜない。"""
+        host = make_fake_host(self.tmp, [])
+        ports = {**self.ports(), "diag_redirect_late": 20010, "diag_nav_direct": 20011}
+        args = self.args("baseline", host)
+        args.diag_routes = True
+        args.ports = json.dumps(ports)
+        self.assertEqual(in_sandbox.validate_args(args)["diag_nav_direct"], 20011)
+        result = in_sandbox.run(args, in_sandbox.validate_args(args))
+        self.assertEqual(list(result["diag_loads"]), ["diag_redirect_late", "diag_nav_direct"])
+        self.assertEqual(set(result["loads"]), {"redirect", "img", "fetch", "ws", "internal"})
+        self.assertEqual(set(result["load_elapsed_ms"]),
+                         {"redirect", "img", "fetch", "ws", "internal", "diag_redirect_late", "diag_nav_direct"})
+        self.assertTrue(all(isinstance(v, int) for v in result["load_elapsed_ms"].values()))
+        self.assertNotIn("diag_nav_direct", result["attempts"])
+
+    def test_without_diag_flag_result_has_no_diag_loads(self) -> None:
+        host = make_fake_host(self.tmp, [])
+        result = in_sandbox.run(self.args("baseline", host), self.ports())
+        self.assertNotIn("diag_loads", result)
+        args = self.args("baseline", host)
+        args.diag_routes = True  # ポートが無ければ検証で拒否される
+        with self.assertRaises(ValueError):
+            in_sandbox.validate_args(args)
+
+    def test_late_redirect_handler_returns_302_to_late_port(self) -> None:
+        import page_templates
+
+        loc = page_templates.diag_redirect_location({"diag_redirect_late": 20010}, literal=True)
+        self.assertEqual(loc, f"http://{judge.IP_BLOCKED}:20010/redirected")
+        loc_name = page_templates.diag_redirect_location({"diag_redirect_late": 20010})
+        self.assertEqual(loc_name, f"http://{judge.HOST_BLOCKED}:20010/redirected")
+
     def test_host_that_never_connects_leaves_outer_empty(self) -> None:
         outer = listeners.TcpRecorder("o", "127.0.0.2").start()
         self.addCleanup(outer.stop)
@@ -240,6 +273,54 @@ class MeasureTest(unittest.TestCase):
         finally:
             for r in recs.values():
                 r.stop()
+
+    def test_outer_listeners_without_diag_keep_original_keys(self) -> None:
+        recs, ports = measure.start_outer_listeners(diag=False)
+        try:
+            self.assertEqual(set(ports), {"redirect", "img", "fetch", "ws", "internal", "udp_direct"})
+        finally:
+            for r in recs.values():
+                r.stop()
+
+    def test_outer_listeners_with_diag_add_two_routes(self) -> None:
+        recs, ports = measure.start_outer_listeners(diag=True)
+        try:
+            self.assertTrue({"diag_redirect_late", "diag_nav_direct"} <= set(ports))
+            self.assertTrue(all(recs[r].ip == judge.IP_BLOCKED for r in ("diag_redirect_late", "diag_nav_direct")))
+        finally:
+            for r in recs.values():
+                r.stop()
+
+    def test_diag_flag_only_for_darwin_argv(self) -> None:
+        host = Path(sys.executable)
+        ports = {"redirect": 2001, "img": 2002, "fetch": 2003, "ws": 2004, "internal": 2005, "udp_direct": 2006}
+        kw = dict(host=host, out_dir=Path("/tmp"), hosts_file=Path("/tmp/h"), image=None, page_port=3000)
+        plain = measure.build_argv("baseline", ports=ports, platform_name="darwin", **kw)
+        self.assertNotIn("--diag-routes", plain)
+        with_diag = measure.build_argv("baseline", ports={**ports, "diag_redirect_late": 2007, "diag_nav_direct": 2008},
+                                       platform_name="darwin", **kw)
+        self.assertIn("--diag-routes", with_diag)
+        win = measure.build_argv("baseline", ports={**ports, "diag_redirect_late": 2007, "diag_nav_direct": 2008},
+                                 platform_name="win32", **kw)
+        self.assertNotIn("--diag-routes", win)
+
+    def test_summary_shows_redirect_diagnostics_and_warning(self) -> None:
+        inner = {"loads": {"redirect": {"ok": False, "kind": "load_failed"}},
+                 "diag_loads": {"diag_nav_direct": {"ok": True, "final_host": "x"}},
+                 "load_elapsed_ms": {"redirect": 120}, "host_alive_after_load": {"redirect": True}}
+        mode = {"exit_code": 0, "inner": inner, "outer_counts": {"redirect": 0, "diag_nav_direct": 1},
+                "deny_log": {"dest_counts": {"redirect": 0}, "diagnostic_dest_counts": {"diag_nav_direct": 0,
+                                                                                         "diag_redirect_late": 0}},
+                "verdicts": {}}
+        results = {"meta": {"date_utc": "d", "kernel": "k", "host_sha256": "s", "host_version": "v",
+                            "proxy_env_present": False},
+                   "modes": {"baseline": {"outer_counts": {"img": 1, "diag_nav_direct": 1, "diag_redirect_late": 1}},
+                             "seatbelt": mode}}
+        text = measure.summarize(results)
+        self.assertIn("redirect diagnostics (not verdicts)", text)
+        self.assertIn("WARNING: diagnostic route diag_nav_direct has 1 outer receipt(s)", text)
+        notes = measure.redirect_notes(mode)
+        self.assertIn("redirect load kind=load_failed in 120 ms", notes["redirect"])
 
     def test_summary_lists_verdicts_without_urls(self) -> None:
         verdicts = judge.judge_all("bwrap-netns", {"positive_ok": True, "guard": {}, "attempts": {}}, {}, {})
