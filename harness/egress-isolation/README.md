@@ -109,12 +109,19 @@ macOS・Windows の GitHub ホステッドランナー。結果は #1003 に記�
   - Servo ホスト側の接続試行ログ（`egress_guard` 相当）は採らない。`egress_guard` は `/proc/net` を走査する Linux 専用で、
     macOS では connect が syscall で拒否されソケットが現れない。`servo-host/src` に接続試行のログも無く、追加には Servo の
     net スタックの改変か servo-host の改修が要る。
-  - 後続の候補（今回は入れない）: SBPL の `(with message ...)` 等の修飾子、`log stream` の並行収集、workflow の sudo による `log show`。
+  - opt-in の sudo つき拒否ログ（#1402。オーナー承認 2026-11-01。xos-measure の macOS ジョブ＝使い捨て runner に限る）:
+    `measure.py --seatbelt-sudo-log show|config`（darwin の seatbelt モードのみ。それ以外は exit 2。既定・ローカルは未指定で sudo を使わない）。
+    `show` は `sudo -n log show --info --debug` で拒否ログを読む（比較用に sudo なしの診断カウンタも `deny_log.unprivileged` へ記録。根拠には使わない）。
+    `config` は加えて `sudo log config` で sandbox 関連 subsystem（`com.apple.sandbox`・`com.apple.sandbox.reporting`）のレベルを上げ、
+    try/finally で `--reset` して `--status` を変更前と比べる（`deny_log.log_config`。戻せなければ `all_restored=false` で拒否ログを根拠にしない）。
+    UDP の自己照合が成り立てば TCP 5 経路の deny 行が試行の根拠になり、成り立たなければ理由（`deny log unavailable: ...`）つきの `unobservable`。
+    workflow は 2 構成（`sudo-show`・`sudo-config`）を別々に実行する。`log stream`・`log erase` など承認範囲外の管理者操作は実装しない。
+  - 後続の候補（今回は入れない）: SBPL の `(with message ...)` 等の修飾子、`log stream` の並行収集。
 - 共有 loopback で内側の写し listener を立てられない。hosts も変えないため、ページは IP リテラル（127.0.0.x）で配る。
 - `internal_real` / `dns` は netns 前提の構造検査で、Seatbelt・AppContainer では成り立たないため `unobservable`
   （実在の内部アドレスにも向けない）。
-- macOS は lo0 に 127.0.0.2 / 127.0.0.3 の alias が要る（`sudo ifconfig lo0 alias 127.0.0.2 up`）。ハーネスは sudo を
-  使わず、bind できなければ exit 2 で案内する。workflow は使い捨て runner で固定 argv の alias 追加を行う。
+- macOS は lo0 に 127.0.0.2 / 127.0.0.3 の alias が要る（`sudo ifconfig lo0 alias 127.0.0.2 up`）。ハーネスは lo0 alias では sudo を
+  使わず（#1402 の opt-in の `log show` / `log config` を除く）、bind できなければ exit 2 で案内する。workflow は使い捨て runner で固定 argv の alias 追加を行う。
 - Windows の `appcontainer`（#1396。オーナー承認 2026-11-01: `harness/egress-isolation/` の Python 計測ハーネスに限る ctypes の Win32 FFI）:
   - `appcontainer.py` が `CreateAppContainerProfile`・`PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES`・`CreateProcessW`・Job
     （`KILL_ON_JOB_CLOSE`）で内側ランナー（`in_sandbox.py`。Servo ホストは子プロセス）を起動する。標準ライブラリの ctypes のみで、
