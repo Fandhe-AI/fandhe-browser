@@ -372,6 +372,9 @@ class RestoreByBeforeKindTest(unittest.TestCase):
         self.assertIs(state["all_restored"], False)
 
 
+# `_TimedLineReader` は macOS の `log show` のパイプを読むためのもの（Issue #1402）。Windows の `select` は
+# ソケットにしか使えず、パイプの fd では WinError 10038 になるため、POSIX でだけ実行する（実測で使うのは darwin のみ）。
+@unittest.skipIf(sys.platform == "win32", "select() はパイプに使えない（WinError 10038）。対象は macOS の log show 読み取り")
 class TimedReaderTest(unittest.TestCase):
     def test_deadline_returns_eof_when_pipe_stays_open(self) -> None:
         r, w = os.pipe()
