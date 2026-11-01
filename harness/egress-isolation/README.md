@@ -116,7 +116,7 @@ macOS・Windows の GitHub ホステッドランナー。結果は #1003 に記�
     macOS では connect が syscall で拒否されソケットが現れない。`servo-host/src` に接続試行のログも無く、追加には Servo の
     net スタックの改変か servo-host の改修が要る。
   - macOS は sudo なしの `log show --style ndjson`（非特権）で拒否行を取る（#1402。xos-measure の実測 run 41309744793・41310673642・41313641135 で、
-    sudo・`log config` なしでも上記 macOS 26 のワイルドカード形式の拒否行が取れ、TCP 5 経路が pass・自己検査成立。オーナー判断 2026-11-01 で
+    sudo・`log config` なしでも上記 macOS 26 のワイルドカード形式の拒否行が取れ、TCP 4 経路（img・fetch・ws・internal）が pass〔redirect は unobservable〕・自己検査成立。オーナー判断 2026-11-01 で
     sudo つき拒否ログの opt-in と `log config` の操作を削除した）。UDP の自己照合が成り立てば TCP 5 経路の deny 行が試行の根拠になり、
     成り立たなければ理由（`deny log unavailable: ...`）つきの `unobservable`。`log stream`・`log erase` など管理者操作は実装しない。
   - 後続の候補（今回は入れない）: SBPL の `(with message ...)` 等の修飾子、`log stream` の並行収集。
