@@ -159,6 +159,100 @@ class IcaclsTimeoutTest(unittest.TestCase):
 
 
 @unittest.skipUnless(X64, "struct sizes are asserted for 64-bit pointers")
+class DrainJobTest(unittest.TestCase):
+    """TerminateJobObject 後の終了待ち（#1396）。Windows 以外でも偽の api で実行できる。"""
+
+    class FakeApi:
+        def __init__(self, active: list[int], query_ok: bool = True) -> None:
+            self.active, self.query_ok, self.calls = list(active), query_ok, []
+
+        def QueryInformationJobObject(self, job: Any, cls: int, ref: Any, size: int, ret: Any) -> int:
+            self.calls.append(("query", cls))
+            if not self.query_ok:
+                return 0
+            ref._obj.ActiveProcesses = self.active.pop(0) if len(self.active) > 1 else self.active[0]
+            return 1
+
+    def test_returns_true_once_active_processes_reach_zero(self) -> None:
+        api = self.FakeApi([2, 1, 0])
+        sleeps: list[float] = []
+        ok = ac.drain_job(api, "J", poll_s=0.05, sleep=sleeps.append, clock=lambda: 0.0)
+        self.assertTrue(ok)
+        self.assertEqual(len(api.calls), 3)
+        self.assertEqual(api.calls[0], ("query", 1))
+        self.assertEqual(sleeps, [0.05, 0.05])
+
+    def test_timeout_returns_false(self) -> None:
+        api = self.FakeApi([1])
+        ticks = iter([0.0, 1.0, 2.0, 3.0, 4.0])
+        ok = ac.drain_job(api, "J", limit_s=2.5, sleep=lambda _s: None, clock=lambda: next(ticks))
+        self.assertFalse(ok)
+        self.assertEqual(len(api.calls), 3)
+
+    def test_query_failure_is_fail_closed(self) -> None:
+        self.assertFalse(ac.drain_job(self.FakeApi([0], query_ok=False), "J"))
+
+    def test_struct_size_matches_win32(self) -> None:
+        self.assertEqual(ctypes.sizeof(ac.JOBOBJECT_BASIC_ACCOUNTING_INFORMATION), 48)
+
+
+class LaunchTeardownOrderTest(unittest.TestCase):
+    """_launch の finally が TerminateJobObject -> 終了待ち -> CloseHandle の順で動くこと（#1396）。"""
+
+    def _run(self, active: list[int]) -> tuple[list[str], dict[str, Any], dict[str, Any]]:
+        from unittest import mock
+        order: list[str] = []
+
+        class Api:
+            def __getattr__(self, name: str) -> Any:
+                def call(*args: Any) -> int:
+                    order.append(name)
+                    if name == "QueryInformationJobObject":
+                        args[2]._obj.ActiveProcesses = active.pop(0) if len(active) > 1 else active[0]
+                        return 1
+                    if name == "WaitForSingleObject":
+                        return 0
+                    if name == "InitializeProcThreadAttributeList" and args[0] is None:
+                        args[3]._obj.value = 64
+                        return 0
+                    if name == "ResumeThread":
+                        return 1
+                    return 1
+                return call
+
+        class FakeMsvcrt:
+            @staticmethod
+            def get_osfhandle(fd: int) -> int:
+                return fd
+
+        tmp = Path(tempfile.mkdtemp())
+        sess = ac.AppContainerSession(host=Path("h.exe"), harness_dir=tmp)
+        sess._api = Api()
+        sess.staging = tmp
+        result: dict[str, Any] = {"exit_code": None, "timed_out": False}
+        with mock.patch.dict(sys.modules, {"msvcrt": FakeMsvcrt}), \
+                mock.patch.object(ac.os, "set_handle_inheritable", create=True), \
+                mock.patch.object(ac.time, "sleep"), \
+                mock.patch.object(ac.time, "monotonic", side_effect=iter(range(0, 1000, 5))):
+            sess._launch("x.py", [], (), 5, result)
+        return order, sess.cleanup, result
+
+    def test_drain_runs_after_terminate_and_before_close(self) -> None:
+        order, cleanup, _ = self._run([1, 0])
+        i_term = len(order) - 1 - order[::-1].index("TerminateJobObject")
+        i_query = order.index("QueryInformationJobObject", i_term)
+        i_close = order.index("CloseHandle", i_term)
+        self.assertLess(i_term, i_query)
+        self.assertLess(i_query, i_close)
+        self.assertTrue(cleanup["job_drained"])
+
+    def test_drain_timeout_is_recorded_as_incomplete_and_cleanup_continues(self) -> None:
+        order, cleanup, _ = self._run([1])
+        self.assertIs(cleanup["job_drained"], False)
+        self.assertEqual(order.count("CloseHandle"), 1)  # Linux では proc/thread が NULL のため job のみ
+        self.assertTrue(cleanup["handles_closed"])
+
+
 class StructSizeTest(unittest.TestCase):
     """Microsoft の定義（x64）: STARTUPINFOW 104・STARTUPINFOEXW 112・PROCESS_INFORMATION 24 等。"""
 

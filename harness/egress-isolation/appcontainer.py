@@ -34,6 +34,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 from typing import Any
 
@@ -59,7 +60,11 @@ CREATE_NO_WINDOW = 0x08000000
 STARTF_USESTDHANDLES = 0x00000100
 SE_GROUP_ENABLED = 0x00000004
 JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
+JobObjectBasicAccountingInformation = 1
 JobObjectExtendedLimitInformation = 9
+# TerminateJobObject 後に Job 内の全プロセスの終了を待つ上限（秒）と、ポーリング間隔（秒）。
+JOB_DRAIN_LIMIT_S = 10.0
+JOB_DRAIN_POLL_S = 0.05
 WAIT_OBJECT_0 = 0
 WAIT_TIMEOUT = 0x102
 ERROR_INSUFFICIENT_BUFFER = 122
@@ -121,6 +126,36 @@ class JOBOBJECT_EXTENDED_LIMIT_INFORMATION(ctypes.Structure):  # noqa: N801
     _fields_ = [("BasicLimitInformation", JOBOBJECT_BASIC_LIMIT_INFORMATION), ("IoInfo", IO_COUNTERS),
                 ("ProcessMemoryLimit", ctypes.c_size_t), ("JobMemoryLimit", ctypes.c_size_t),
                 ("PeakProcessMemoryUsed", ctypes.c_size_t), ("PeakJobMemoryUsed", ctypes.c_size_t)]
+
+
+class JOBOBJECT_BASIC_ACCOUNTING_INFORMATION(ctypes.Structure):  # noqa: N801
+    _fields_ = [("TotalUserTime", ctypes.c_int64), ("TotalKernelTime", ctypes.c_int64),
+                ("ThisPeriodTotalUserTime", ctypes.c_int64), ("ThisPeriodTotalKernelTime", ctypes.c_int64),
+                ("TotalPageFaultCount", ctypes.c_uint32), ("TotalProcesses", ctypes.c_uint32),
+                ("ActiveProcesses", ctypes.c_uint32), ("TotalTerminatedProcesses", ctypes.c_uint32)]
+
+
+def drain_job(api: Any, job: Any, *, limit_s: float = JOB_DRAIN_LIMIT_S, poll_s: float = JOB_DRAIN_POLL_S,
+              sleep: Any = None, clock: Any = None) -> bool:
+    """Job の ActiveProcesses が 0 になるまで上限時間つきで待つ。0 になれば True、超過・照会失敗は False。
+
+    TerminateJobObject は終了を要求するだけで完了を待たない。実行中のプロセスが複製先やプロファイルを
+    掴んだまま rmtree・DeleteAppContainerProfile が走ると残骸が出るため、片付けの前に呼ぶ（#1396）。
+    False のときは呼び出し側が cleanup に未完了として記録する（fail-closed）。
+    """
+    sleep = sleep or time.sleep
+    clock = clock or time.monotonic
+    deadline = clock() + limit_s
+    while True:
+        info = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION()
+        if not api.QueryInformationJobObject(job, JobObjectBasicAccountingInformation, ctypes.byref(info),
+                                             ctypes.sizeof(info), None):
+            return False
+        if info.ActiveProcesses == 0:
+            return True
+        if clock() >= deadline:
+            return False
+        sleep(poll_s)
 
 
 # --- 純粋関数（全 OS で自己テストできる） -------------------------------------------------------------
@@ -267,6 +302,7 @@ def _api() -> Any:
         CreateProcessW=sig(k32.CreateProcessW, [wp, vp, vp, vp, i32, u32, vp, wp, vp, vp], i32),
         CreateJobObjectW=sig(k32.CreateJobObjectW, [vp, vp], vp),
         SetInformationJobObject=sig(k32.SetInformationJobObject, [vp, i32, vp, u32], i32),
+        QueryInformationJobObject=sig(k32.QueryInformationJobObject, [vp, i32, vp, u32, vp], i32),
         AssignProcessToJobObject=sig(k32.AssignProcessToJobObject, [vp, vp], i32),
         ResumeThread=sig(k32.ResumeThread, [vp], u32),
         WaitForSingleObject=sig(k32.WaitForSingleObject, [vp, u32], u32),
@@ -560,8 +596,11 @@ class AppContainerSession:
                 result["exit_code"] = None if result["timed_out"] else int(code.value)
         finally:
             c = self.cleanup
+            drained = True
             if h["job"]:
                 a.TerminateJobObject(h["job"], 1)
+                # 終了を待ってからハンドル・複製先を解放する。超過は未完了として記録し、片付けは続ける。
+                drained = drain_job(a, h["job"])
             closed = True
             for key in ("proc", "thread", "job"):
                 if h[key] and not a.CloseHandle(h[key]):
@@ -576,6 +615,7 @@ class AppContainerSession:
                 except OSError:
                     closed = False
             c["handles_closed"] = bool(c.get("handles_closed", True)) and closed
+            c["job_drained"] = bool(c.get("job_drained", True)) and drained
             result["stderr_tail"] = tail_text(stderr_path) if result.get("exit_code") != 0 else ""
             del keep
 
