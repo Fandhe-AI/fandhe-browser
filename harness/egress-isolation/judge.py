@@ -56,6 +56,13 @@ PLATFORM_MODES = {
 NETNS_MODES = ("bwrap-netns", "docker-none")
 STRUCTURAL_NA_REASON = "structural check requires a network namespace; not applicable on this OS"
 
+# AppContainer の loopback 遮断と egress 遮断を区別できないときの理由（Issue #1396）。
+LOOPBACK_CONFOUND_REASON = (
+    "loopback isolation blocks local destinations regardless of network capabilities; egress blocking cannot be "
+    "distinguished from it (loopback exemption needs CheckNetIsolation, which was not run)")
+LOOPBACK_PREFLIGHT_MISSING_REASON = (
+    "loopback confound check did not complete (preflight missing or malformed); treated as confounded")
+
 # 宛先 listener があるもの（TCP/UDP）と、構造的に観測する経路（実在アドレス・DNS）。
 LISTENER_ROUTES = ("redirect", "img", "fetch", "ws", "internal", "udp_direct")
 STRUCTURAL_ROUTES = ("internal_real", "dns")
@@ -157,11 +164,46 @@ def check_isolation(net_dev: str | None, route: str | None, ipv6_route: str | No
     return True, "only loopback is present"
 
 
+def _variant_receipts(entry: object) -> int | None:
+    """preflight の 1 variant の外側受信件数（TCP + UDP）。形式不正は None。"""
+    if not isinstance(entry, dict) or not isinstance(entry.get("probe"), dict):
+        return None
+    total = 0
+    for key in ("outer_tcp", "outer_udp"):
+        v = entry.get(key)
+        if isinstance(v, bool) or not isinstance(v, int) or v < 0:
+            return None
+        total += v
+    return total
+
+
+def appcontainer_confound(preflight: object) -> str | None:
+    """AppContainer の loopback 遮断と egress 遮断を区別できるか。区別できれば None、できなければ理由（Issue #1396）。
+
+    `preflight` は `{"nocap": {...}, "netcap": {...}}`（各 variant は `probe`・`outer_tcp`・`outer_udp`）。
+    ネットワーク capability を付けた `netcap` で外側の listener に 1 件以上届けば、loopback への到達は capability で
+    開くと言える。このとき capability なしの受信 0 件は capability の欠如（ネットワーク遮断）に帰属できる。
+    届かないなら loopback 遮断が capability と無関係に局所宛先を止めており、ハーネスの宛先がすべて loopback のため
+    egress 遮断と区別できない。preflight が無い・不正な場合も交絡ありとする（fail-closed）。
+    """
+    if not isinstance(preflight, dict):
+        return LOOPBACK_PREFLIGHT_MISSING_REASON
+    netcap = _variant_receipts(preflight.get("netcap"))
+    if netcap is None or _variant_receipts(preflight.get("nocap")) is None:
+        return LOOPBACK_PREFLIGHT_MISSING_REASON
+    return None if netcap >= 1 else LOOPBACK_CONFOUND_REASON
+
+
 def judge_all(
     mode: str, inner: dict[str, Any], outer_counts: dict[str, int], control_counts: dict[str, int],
     binary_match: bool = True, mode_unavailable: str | None = None,
+    loopback_confound: str | None = LOOPBACK_PREFLIGHT_MISSING_REASON,
 ) -> dict[str, dict[str, Any]]:
-    """内側ランナーの結果 JSON と外側の件数から、隔離モードの全経路を判定する。"""
+    """内側ランナーの結果 JSON と外側の件数から、隔離モードの全経路を判定する。
+
+    `loopback_confound` は appcontainer だけが使う（`appcontainer_confound` の戻り値。None は交絡なし）。
+    既定値は「未確認」で、省略したとき appcontainer の pass は出ない（fail-closed）。
+    """
     positive_ok = bool(inner.get("positive_ok"))
     guard = inner.get("guard") or {}
     guard_unavailable = guard.get("unavailable") is not None
@@ -196,6 +238,14 @@ def judge_all(
         if not monitor_required:
             method = ("outer listener receipt + sandbox deny log / errno "
                       "(no process-level egress monitor on this OS)")
+        if mode == "appcontainer":
+            method = ("outer listener receipt + in-container errno (no process-level monitor; "
+                      "loopback confound checked by capability contrast)")
+            if verdict == PASS and loopback_confound is not None:
+                verdict, reason = UNOBSERVABLE, loopback_confound
+            elif (verdict == UNOBSERVABLE and reason.startswith("positive check failed")
+                  and loopback_confound is not None):
+                reason += f"; {loopback_confound}"
         if not binary_match and verdict == PASS:
             verdict, reason = UNOBSERVABLE, "binary inside the sandbox differs from the baseline control binary"
         if (not monitor_required and route in TCP_DENY_LOG_ROUTES and verdict == UNOBSERVABLE
