@@ -172,10 +172,9 @@ def describe_error(exc: BaseException) -> str:
 # その区切りまでの全文字（空白・引用符を含む。改行は除く）を伏せる。区切りの無い末尾要素だけ、引用符を考慮する:
 # 引用符は直後が行末・空白・`),;:`・引用符・区切りのときだけ終端（メッセージを囲む引用符）で、
 # それ以外（`O'Brien` の `'B`）は名前の一部として含める。長さ上限は ReDoS 対策。
-_USER_PATH_RE = re.compile(
-    r"(?i)((?:[A-Za-z]:)?[\\/]+(?:Users|home)[\\/]+)"
-    r"(?:[^\\/\r\n]{1,256}(?=[\\/])"
-    r"|(?:[^\\/\r\n'\"]|['\"](?=[^\s),;:'\"\\/])){1,256})")
+_USER_PATH_BODY = (
+    r"[^\\/\r\n]{1,256}(?=[\\/])"
+    r"|(?:[^\\/\r\n'\"]|['\"](?=[^\s),;:'\"\\/])){1,256}")
 _SID_RE = re.compile(r"\bS-1-\d+(?:-\d+)+\b", re.IGNORECASE)
 KNOWN_NAME_MIN_LEN = 2  # 1 文字名は誤置換が多いためパス規則に任せる
 KNOWN_NAME_MAX_LEN = 256
@@ -200,18 +199,38 @@ def known_user_names() -> list[str]:
     return sorted(names, key=lambda n: (-len(n), n))
 
 
+_PATH_PREFIX = r"(?i)((?:[A-Za-z]:)?[\\/]+(?:Users|home)[\\/]+)"
+_WORD_CLASS = "A-Za-z0-9_"
+PATH_MARKERS = frozenset({"users", "home"})
+
+
+def _name_forms(names: list[str]) -> list[str]:
+    """候補名のそのまま形と repr の `'` → `\\'` 形（長い順・`re.escape` 済み）。"""
+    forms = {f for n in names for f in (n, n.replace("'", "\\'"))}
+    return [re.escape(f) for f in sorted(forms, key=lambda f: (-len(f), f))]
+
+
 def mask_identity(text: str) -> str:
     """利用者名を `<user>`、SID（`S-1-...`）を `<sid>` に置換する（Issue #1402・P3-a）。
 
-    1. 既知の利用者名（`known_user_names`）の完全一致を、そのままの形と repr の `'` → `\\'` 形の両方で長い順に置換
-    2. 上記で拾えない名前向けに、`Users` / `home` 直下の要素をパス規則（`_USER_PATH_RE`）で置換
+    1. パス規則: `Users` / `home` 直下の要素を置換する。要素の先頭が既知の利用者名（単語境界つき）なら
+       それを優先して取り（区切りの無い末尾要素の空白・引用符入りの名前を漏らさない）、そうでなければ
+       `_USER_PATH_BODY` の規則で伏せる。目印（`Users` / `home`）を先に処理するため、既知名が目印と同じでも壊れない
+    2. 既知名の完全一致（そのまま形と `\\'` 形）を、単語境界つき・`<...>` トークンの内側を除いて 1 回の `re.sub` で置換する
+       （置換結果は再走査されず `<<user>>` にならない。`Error` のような別語の部分一致も書き換えない）
 
     例外型名・errno・winerror・パスの残りの構造は変えない。マスク後に上限で切るため、切断で名前が復活しない。
     """
-    for name in known_user_names():
-        for form in sorted({name.replace("'", "\\'"), name}, key=lambda f: -len(f)):
-            text = text.replace(form, "<user>")
-    return _SID_RE.sub("<sid>", _USER_PATH_RE.sub(r"\1<user>", text))
+    forms = _name_forms(known_user_names())
+    known = (rf"(?:{'|'.join(forms)})(?![{_WORD_CLASS}])|") if forms else ""
+    path_re = re.compile(_PATH_PREFIX + "(?:" + known + _USER_PATH_BODY + ")")
+    text = path_re.sub(r"\1<user>", text)
+    # 目印そのもの（`Users` / `home`）と同名の利用者は 2 段目から外す。残った目印まで書き換えると構造が壊れるため
+    # （その名前のパス内の出現は 1 段目で伏せ済み）
+    loose = _name_forms([n for n in known_user_names() if n.lower() not in PATH_MARKERS])
+    if loose:
+        text = re.sub(rf"(?<![{_WORD_CLASS}<])(?:{'|'.join(loose)})(?![{_WORD_CLASS}>])", "<user>", text)
+    return _SID_RE.sub("<sid>", text)
 
 
 def descendant_pids(root: int) -> set[int]:

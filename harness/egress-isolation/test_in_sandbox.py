@@ -526,6 +526,30 @@ class MakePrivateWorkdirTest(unittest.TestCase):
             out = in_sandbox.describe_error(OSError("path 'x\\'O\\' Brien' end"))
             self.assertNotIn("Brien", out)
 
+    def mask_with_user(self, name: str, text: str) -> str:
+        with mock.patch.dict(in_sandbox.os.environ, {"USER": name}, clear=True), \
+                mock.patch.object(in_sandbox.getpass, "getuser", side_effect=OSError("no user")):
+            return in_sandbox.mask_identity(text)
+
+    def test_known_name_equal_to_path_marker_does_not_break_path_rule(self) -> None:
+        for marker in ("Users", "home"):
+            with self.subTest(marker=marker):
+                self.assertEqual(self.mask_with_user(marker, "C:\\Users\\Alice\\x"), "C:\\Users\\<user>\\x")
+                self.assertEqual(self.mask_with_user(marker, "/home/Alice/x"), "/home/<user>/x")
+
+    def test_known_name_user_does_not_inflate_placeholder(self) -> None:
+        out = self.mask_with_user("user", "C:\\Users\\Alice\\x for user")
+        self.assertEqual(out, "C:\\Users\\<user>\\x for <user>")
+        self.assertNotIn("<<", out)
+
+    def test_known_name_is_not_replaced_inside_other_words(self) -> None:
+        self.assertEqual(self.mask_with_user("rr", "[Errno 13] Error rr"), "[Errno 13] Error <user>")
+
+    def test_short_known_name_does_not_leave_partial_replacement(self) -> None:
+        out = self.mask_with_user("Ali", "C:\\Users\\Alice\\x and Alice")
+        self.assertEqual(out, "C:\\Users\\<user>\\x and Alice")
+        self.assertNotIn("<user>ce", out)
+
     def test_known_user_names_collects_env_sources_longest_first(self) -> None:
         env = {"USERNAME": "al", "USER": "alice", "LOGNAME": "x", "USERPROFILE": "C:\\Users\\bobby\\",
                "HOME": "/home/carol"}
