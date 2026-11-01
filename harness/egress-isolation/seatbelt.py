@@ -19,7 +19,7 @@ import json
 import re
 import subprocess
 from collections import Counter
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from typing import Any
 
 SANDBOX_EXEC = "/usr/bin/sandbox-exec"
@@ -50,6 +50,10 @@ MAX_LINE_LEN = 4096
 # `log show` を逐次読む際の打ち切り上限（読み取った行数・総バイト数）。超えたら収集を諦める（unobservable）。
 MAX_SCAN_LINES = 500000
 MAX_SCAN_BYTES = 64 * 1024 * 1024
+# 診断サンプルの上限（Issue #1402）。形式が未確定の拒否メッセージを成果物から確認するための本文の控え。
+MAX_UNMATCHED_SAMPLES = 16
+MAX_PID_EXCLUDED_SAMPLES = 8
+MAX_SAMPLE_LEN = 300
 _DENY_RE = re.compile(r"(?:\((\d+)\)\s+)?deny\(\d+\) network-outbound (\d{1,3}(?:\.\d{1,3}){3}):(\d{1,5})\b")
 
 
@@ -258,7 +262,12 @@ class DenyDiagnostics:
 
     `scanned_lines` 読んだ行、`json_lines` JSON として解析できた行、`sandbox_lines` 拒否（`deny(`）を含む行、
     `network_outbound_lines` うち宛先まで取り出せた行、`deny_excluded_by_pid` pid の帰属で除外した行、
-    `deny_attributed` 対象 pid に帰属して数えた行。プロセス名・パス・URL は保持しない。
+    `deny_attributed` 対象 pid に帰属して数えた行。
+
+    サンプル（Issue #1402。正規表現は変えず、実機の形式を成果物から確認するための本文の控え）:
+    `unmatched_deny_samples` は `deny(` を含むが正規表現に一致しなかった本文（最大 16 件）、
+    `pid_excluded_samples` は一致したが pid の帰属で除外した本文（最大 8 件）。各件は 300 文字に切り詰め、
+    制御文字は空白に置換する。上限超過分は `*_dropped` に数だけ残す。環境変数の値は扱わない。
     """
 
     scanned_lines: int = 0
@@ -267,9 +276,33 @@ class DenyDiagnostics:
     network_outbound_lines: int = 0
     deny_excluded_by_pid: int = 0
     deny_attributed: int = 0
+    unmatched_deny_samples: list[str] = field(default_factory=list)
+    unmatched_deny_samples_dropped: int = 0
+    pid_excluded_samples: list[str] = field(default_factory=list)
+    pid_excluded_samples_dropped: int = 0
+
+    def add_unmatched_sample(self, msg: str) -> None:
+        """正規表現に一致しなかった `deny(` 行の本文を上限つきで控える。"""
+        if len(self.unmatched_deny_samples) < MAX_UNMATCHED_SAMPLES:
+            self.unmatched_deny_samples.append(sanitize_sample(msg))
+        else:
+            self.unmatched_deny_samples_dropped += 1
+
+    def add_pid_excluded_sample(self, msg: str) -> None:
+        """pid の帰属で除外した行の本文を上限つきで控える。"""
+        if len(self.pid_excluded_samples) < MAX_PID_EXCLUDED_SAMPLES:
+            self.pid_excluded_samples.append(sanitize_sample(msg))
+        else:
+            self.pid_excluded_samples_dropped += 1
 
     def as_dict(self) -> dict[str, int]:
         return asdict(self)
+
+
+def sanitize_sample(msg: str) -> str:
+    """サンプル本文を 300 文字に切り詰め、制御文字（改行・タブ・ESC・C1・行区切り）を空白に置換する。"""
+    return "".join(" " if (ord(c) < 32 or 0x7F <= ord(c) <= 0x9F or c in "\u2028\u2029") else c
+                   for c in msg[:MAX_SAMPLE_LEN])
 
 
 def _record_message(line: str, diag: DenyDiagnostics) -> tuple[str, int]:
@@ -305,11 +338,14 @@ def scan_line(line: str, pids: frozenset[int] | None, diag: DenyDiagnostics) -> 
         diag.sandbox_lines += 1
     m = _DENY_RE.search(msg)
     if not m or int(m.group(3)) > 65535:
+        if "deny(" in msg:
+            diag.add_unmatched_sample(msg)
         return None
     diag.network_outbound_lines += 1
     pid = int(m.group(1)) if m.group(1) is not None else record_pid or None
     if pids is not None and (pid is None or pid not in pids):
         diag.deny_excluded_by_pid += 1
+        diag.add_pid_excluded_sample(msg)
         return None
     diag.deny_attributed += 1
     return f"{m.group(2)}:{int(m.group(3))}"

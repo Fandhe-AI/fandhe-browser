@@ -574,6 +574,40 @@ def run_mode(mode: str, *, host: Path, ports: dict[str, int], recs: dict[str, An
     return data
 
 
+_SAMPLE_KEYS = ("unmatched_deny_samples", "pid_excluded_samples")
+
+
+def _without_samples(dl: Any) -> Any:
+    """deny_log（入れ子の unprivileged を含む）から診断サンプル本文を除いた写し。サマリーの 1 行表示用。"""
+    if not isinstance(dl, dict):
+        return dl
+    out = dict(dl)
+    for key in ("diagnostics",):
+        if isinstance(out.get(key), dict):
+            out[key] = {k: v for k, v in out[key].items() if k not in _SAMPLE_KEYS}
+    if isinstance(out.get("unprivileged"), dict):
+        out["unprivileged"] = _without_samples(out["unprivileged"])
+    return out
+
+
+def _deny_sample_block(dl: dict[str, Any]) -> list[str]:
+    """診断サンプルを text のコードブロックで出す（表・箇条書きを壊さない。バッククォートは置換する）。"""
+    out: list[str] = []
+    for label, d in (("privileged", dl), ("unprivileged", dl.get("unprivileged"))):
+        diag = d.get("diagnostics") if isinstance(d, dict) else None
+        if not isinstance(diag, dict):
+            continue
+        for key in _SAMPLE_KEYS:
+            samples = diag.get(key) or []
+            dropped = diag.get(f"{key}_dropped", 0)
+            if not samples and not dropped:
+                continue
+            out += ["", f"deny log samples ({label} {key}; {len(samples)} shown, {dropped} dropped)", "", "```text"]
+            out += [str(x).replace("`", "'") for x in samples]
+            out.append("```")
+    return out
+
+
 def summarize(results: dict[str, Any]) -> str:
     meta = results["meta"]
     lines = [f"# egress isolation measurement ({meta.get('platform_name', 'Linux')})", ""]
@@ -620,11 +654,12 @@ def summarize(results: dict[str, Any]) -> str:
             lines.append(f"- in-sandbox fatal: {inner['fatal']}")
         if data.get("deny_log"):
             dl = data["deny_log"]
-            lines.append(f"- sandbox deny log: {dl}")
+            lines.append(f"- sandbox deny log: {_without_samples(dl)}")
             if dl.get("sudo") or dl.get("log_config"):
                 lc = dl.get("log_config") or {}
                 lines.append(f"- deny log opt-in (Issue #1402): sudo={dl.get('sudo')}, flags={dl.get('log_show_flags')}, "
-                             f"log config all_restored={lc.get('all_restored')}, unprivileged diagnostics={dl.get('unprivileged')}")
+                             f"log config all_restored={lc.get('all_restored')}, unprivileged diagnostics={_without_samples(dl.get('unprivileged'))}")
+            lines += _deny_sample_block(dl)
         if inner.get("beacons") is not None:
             lines.append(f"- failure-path beacons (route -> count): {inner['beacons']}")
         if inner.get("attempt_evidence"):

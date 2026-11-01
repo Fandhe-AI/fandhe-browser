@@ -197,7 +197,11 @@ class ScanLineTest(unittest.TestCase):
         got, diag = self._scan(lines, frozenset({101}))
         self.assertEqual(got, Counter({"127.0.0.2:2001": 1, "127.0.0.2:2002": 1}))
         self.assertEqual(diag, {"scanned_lines": 5, "json_lines": 3, "sandbox_lines": 4,
-                                "network_outbound_lines": 2, "deny_excluded_by_pid": 0, "deny_attributed": 2})
+                                "network_outbound_lines": 2, "deny_excluded_by_pid": 0, "deny_attributed": 2,
+                                "unmatched_deny_samples": ["Sandbox: host(101) deny(1) file-read-data /etc/hosts",
+                                                           "{broken json deny(1)"],
+                                "unmatched_deny_samples_dropped": 0, "pid_excluded_samples": [],
+                                "pid_excluded_samples_dropped": 0})
 
     def test_long_line_is_counted_but_not_parsed(self) -> None:
         long_line = _record("deny(1) network-outbound 127.0.0.2:2001 " + "x" * seatbelt.MAX_LINE_LEN, 101)
@@ -207,7 +211,9 @@ class ScanLineTest(unittest.TestCase):
     def test_diagnostics_hold_counts_only(self) -> None:
         _, diag = self._scan([_record("Sandbox: secret-proc(101) deny(1) network-outbound 127.0.0.2:2001")],
                              frozenset({101}))
-        self.assertTrue(all(isinstance(v, int) for v in diag.values()))
+        # 一致した帰属済みの行は本文を保持しない（サンプルは不一致・pid 除外の行だけ。Issue #1402）。
+        self.assertEqual({k: v for k, v in diag.items() if not isinstance(v, int)},
+                         {"unmatched_deny_samples": [], "pid_excluded_samples": []})
 
 
 class SelfCheckTest(unittest.TestCase):

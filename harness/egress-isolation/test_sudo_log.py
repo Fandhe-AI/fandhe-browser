@@ -478,5 +478,64 @@ class StopOrderTest(unittest.TestCase):
         self.assertEqual(status, {"available": False, "reason": "log show rc=1 (sudo)"})
 
 
+class DenySampleTest(unittest.TestCase):
+    """拒否メッセージ本文のサンプル保持（Issue #1402。正規表現は変えず形式を成果物から確認するための診断）。"""
+
+    def _scan(self, lines: list[str], pids: frozenset[int] | None = None) -> seatbelt.DenyDiagnostics:
+        diag = seatbelt.DenyDiagnostics()
+        for ln in lines:
+            seatbelt.scan_line(json.dumps({"eventMessage": ln, "processID": 0}), pids, diag)
+        return diag
+
+    def test_unmatched_samples_capped_at_16_with_overflow_count(self) -> None:
+        diag = self._scan([f"Sandbox: x(1) deny(1) other-{i}" for i in range(20)])
+        self.assertEqual(len(diag.unmatched_deny_samples), 16)
+        self.assertEqual(diag.unmatched_deny_samples[0], "Sandbox: x(1) deny(1) other-0")
+        self.assertEqual(diag.unmatched_deny_samples[15], "Sandbox: x(1) deny(1) other-15")
+        self.assertEqual(diag.unmatched_deny_samples_dropped, 4)
+        self.assertEqual(diag.sandbox_lines, 20)
+
+    def test_pid_excluded_samples_capped_at_8(self) -> None:
+        diag = self._scan([f"Sandbox: x({100 + i}) deny(1) network-outbound 127.0.0.2:2001" for i in range(10)],
+                          frozenset({1}))
+        self.assertEqual(len(diag.pid_excluded_samples), 8)
+        self.assertEqual(diag.pid_excluded_samples_dropped, 2)
+        self.assertEqual(diag.deny_excluded_by_pid, 10)
+        self.assertEqual(diag.unmatched_deny_samples, [])
+
+    def test_matched_attributed_line_is_not_sampled(self) -> None:
+        diag = seatbelt.DenyDiagnostics()
+        dest = seatbelt.scan_line(
+            json.dumps({"eventMessage": "Sandbox: x(7) deny(1) network-outbound 127.0.0.2:2001"}),
+            frozenset({7}), diag)
+        self.assertEqual(dest, "127.0.0.2:2001")
+        self.assertEqual((diag.unmatched_deny_samples, diag.pid_excluded_samples), ([], []))
+
+    def test_line_without_deny_is_not_sampled(self) -> None:
+        diag = self._scan(["Sandbox: allow network-outbound 127.0.0.2:2001"])
+        self.assertEqual(diag.unmatched_deny_samples, [])
+        self.assertEqual(diag.sandbox_lines, 0)
+
+    def test_truncated_to_300_chars(self) -> None:
+        diag = self._scan(["deny(1) " + "a" * 500])
+        self.assertEqual(len(diag.unmatched_deny_samples[0]), 300)
+        self.assertEqual(diag.unmatched_deny_samples[0], ("deny(1) " + "a" * 500)[:300])
+
+    def test_control_chars_become_spaces(self) -> None:
+        self.assertEqual(seatbelt.sanitize_sample("a\nb\tc\x1bd\re\x7ff\u2028g"), "a b c d e f g")
+        diag = self._scan(["deny(1)\nfoo\x1b[0m"])
+        self.assertEqual(diag.unmatched_deny_samples, ["deny(1) foo [0m"])
+
+    def test_samples_in_as_dict_and_summary_block(self) -> None:
+        diag = self._scan(["deny(1) weird `x`"])
+        d = diag.as_dict()
+        self.assertEqual(d["unmatched_deny_samples"], ["deny(1) weird `x`"])
+        dl = {"available": True, "diagnostics": d, "unprivileged": {"diagnostics": d}}
+        block = measure._deny_sample_block(dl)
+        self.assertIn("deny(1) weird 'x'", block)
+        self.assertEqual(block.count("```text"), 2)
+        self.assertNotIn("weird", str(measure._without_samples(dl)))
+
+
 if __name__ == "__main__":
     unittest.main()
