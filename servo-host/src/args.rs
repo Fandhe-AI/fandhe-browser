@@ -8,6 +8,7 @@
 //! 呼び出し元は `main`。`--egress-proxy-port`（macOS 向け）・`--egress-relay-uds`（Linux 向け）は
 //! 本体の egress 隔離（#1436 が付与）が渡す。proxy の場所は `engine::LoopbackProxy` として
 //! Servo の proxy pref にだけ流れる。
+//! `--egress-relay-uds` は `bwrap --unshare-net` で包むときだけ渡す前提（`relay` のモジュール doc。#1444）。
 
 use std::fmt;
 use std::num::NonZeroU16;
@@ -38,6 +39,9 @@ pub(crate) enum Egress {
     /// `127.0.0.1:<port>` の CONNECT プロキシへ向ける（macOS 向け）。
     ProxyPort(NonZeroU16),
     /// netns 内の中継を起動し、各接続を `<path>` の UDS へ転送する（Linux 向け）。
+    ///
+    /// 前提（#1444）: #1436 が `bwrap --unshare-net` で包むときだけ渡す。隔離なしで渡すと
+    /// ホストの `127.0.0.1` に中継が開き、同一ホストの他プロセスから届き得る。
     #[cfg(unix)]
     RelayUds(PathBuf),
 }
