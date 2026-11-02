@@ -448,29 +448,45 @@ fn connect_upstream(
         write_status(conn, 403, "Forbidden");
         return None;
     }
+    // 接続は 1 本の専用スレッドが同一ソケットで待ち続け（tick ごとに作り直さない）、
+    // 呼び出し側は tick ごとに停止フラグを見る（RENDER-3）。スレッドの寿命は
+    // `connect_timeout` の総期限で有界（停止時は結果を捨てて切り離す）。
+    let total = shared.limits.connect_timeout;
     let started = Instant::now();
     let tick = shared.limits.tick();
-    'addrs: for addr in addrs.iter().take(MAX_CONNECT_ATTEMPTS) {
-        // 接続待機も停止対象にする（RENDER-3）。tick 単位に刻み、各周期で停止を確認する。
-        loop {
-            if shared.stop.load(Ordering::Relaxed) {
-                write_status(conn, 503, "Service Unavailable");
-                return None;
+    let (tx, rx) = mpsc::channel();
+    let targets: Vec<SocketAddr> = addrs.iter().take(MAX_CONNECT_ATTEMPTS).copied().collect();
+    let spawned = thread::Builder::new()
+        .name("egress-proxy-connect".to_owned())
+        .spawn(move || {
+            for addr in targets {
+                let remaining = total.saturating_sub(started.elapsed());
+                if remaining.is_zero() {
+                    break;
+                }
+                // 検査済みの SocketAddr へそのまま接続する（名前を引き直さない）。
+                if let Ok(s) = TcpStream::connect_timeout(&addr, remaining) {
+                    // 受信側が去っていれば s は破棄される。
+                    let _ = tx.send(s);
+                    return;
+                }
             }
-            let remaining = shared
-                .limits
-                .connect_timeout
-                .saturating_sub(started.elapsed());
-            if remaining.is_zero() {
-                break 'addrs;
-            }
-            // 検査済みの SocketAddr へそのまま接続する（名前を引き直さない）。
-            match TcpStream::connect_timeout(addr, tick.min(remaining)) {
-                Ok(s) => return Some(s),
-                // 周期の期限切れは同じアドレスで待機を続ける。それ以外は次のアドレスへ。
-                Err(e) if e.kind() == io::ErrorKind::TimedOut => {}
-                Err(_) => continue 'addrs,
-            }
+        });
+    if spawned.is_err() {
+        shared.counters.bump(Event::SpawnFailed);
+        write_status(conn, 502, "Bad Gateway");
+        return None;
+    }
+    loop {
+        if shared.stop.load(Ordering::Relaxed) {
+            write_status(conn, 503, "Service Unavailable");
+            return None;
+        }
+        match rx.recv_timeout(tick) {
+            Ok(s) => return Some(s),
+            Err(RecvTimeoutError::Timeout) => {}
+            // 全アドレス失敗または期限切れでスレッドが終了した。
+            Err(RecvTimeoutError::Disconnected) => break,
         }
     }
     shared.counters.bump(Event::UpstreamFailed);
