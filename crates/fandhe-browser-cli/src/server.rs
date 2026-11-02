@@ -44,7 +44,7 @@ use fandhe_browser_cdp::{CdpState, WsConfigError, endpoints};
 use fandhe_browser_core::render::Renderer;
 use fandhe_browser_core::{AppState, PageScriptHandle, ScriptContextHandle};
 use fandhe_browser_profile::{ProfileError, ProfileStore};
-use fandhe_browser_render::host_process::HostProcessError;
+use fandhe_browser_render::host_process::{EgressIsolationUnavailable, HostProcessError};
 
 /// 既定の待ち受けアドレス。9333 は spec `api-cdp.md` のレスポンス例（`CDP-1`）に合わせた値。
 pub(crate) const DEFAULT_ADDR: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9333);
@@ -128,6 +128,9 @@ pub(crate) enum StartupError {
     Bind(io::Error),
     /// 描画ホストの解決の失敗（未設定の `Disabled` は無効レンダラーになり、ここへは来ない）。
     RenderHost(HostProcessError),
+    /// `[rendering] egress_isolation = "required"` だが、この環境では隔離できない
+    /// （`RENDER-3`・TASK-38・#1436）。理由は固定文言で、パスを含まない。
+    RenderIsolation(EgressIsolationUnavailable),
     /// 非同期ランタイムの構築失敗。
     Runtime(io::Error),
     /// 待ち受けループの異常終了。
@@ -160,6 +163,10 @@ impl fmt::Display for StartupError {
             Self::RouteConflict(_) => f.write_str("router merge conflict"),
             Self::NonLoopbackAddr => f.write_str("refusing to bind a non-loopback address"),
             Self::RenderHost(_) => f.write_str(RENDER_HOST_INVALID_MESSAGE),
+            Self::RenderIsolation(reason) => write!(
+                f,
+                "render host egress isolation is required but unavailable: {reason}"
+            ),
             Self::Bind(_) => f.write_str("failed to bind listener"),
             Self::Runtime(_) => f.write_str("failed to build async runtime"),
             Self::Serve(_) => f.write_str("server terminated abnormally"),
@@ -175,7 +182,7 @@ impl std::error::Error for StartupError {
             Self::Profile(e) => Some(e),
             Self::WebSocketConfig(e) => Some(e),
             Self::RouteConflict(e) => Some(e),
-            Self::NonLoopbackAddr => None,
+            Self::NonLoopbackAddr | Self::RenderIsolation(_) => None,
             Self::RenderHost(e) => Some(e),
             Self::Bind(e) | Self::Runtime(e) | Self::Serve(e) => Some(e),
         }

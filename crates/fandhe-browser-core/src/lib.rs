@@ -121,8 +121,8 @@ pub mod selector;
 pub mod state;
 
 pub use config::{
-    Config, ConfigError, EngineKind, IsolationStrength, JsConfig, ProfileConfig, RenderingConfig,
-    bundled_engines,
+    Config, ConfigError, EgressIsolationMode, EngineKind, IsolationStrength, JsConfig,
+    ProfileConfig, RenderingConfig, bundled_engines,
 };
 pub use cssom::{
     ComputedDeclaration, ComputedStyle, Declaration, DeclarationOrigin, Importance, Specificity,

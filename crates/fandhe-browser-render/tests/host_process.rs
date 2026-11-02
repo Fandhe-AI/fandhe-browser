@@ -12,13 +12,19 @@ mod support;
 use std::collections::BTreeSet;
 use std::time::{Duration, Instant};
 
+use fandhe_browser_core::EgressIsolationMode;
+#[cfg(unix)]
+use fandhe_browser_render::host_process::EgressIsolationStatus;
 #[cfg(unix)]
 use fandhe_browser_render::host_process::HOST_ARGS;
 #[cfg(unix)]
-use fandhe_browser_render::host_process::{FORCED_ENV_NAMES, PASSTHROUGH_ENV_NAMES};
+use fandhe_browser_render::host_process::HostProcessConfig;
 use fandhe_browser_render::host_process::{
-    HostProcess, HostProcessError, HostTimeouts, TimeoutPhase,
+    EgressIsolationUnavailable, HostProcess, HostProcessError, HostTimeouts, IsolationProbe,
+    TimeoutPhase,
 };
+#[cfg(unix)]
+use fandhe_browser_render::host_process::{FORCED_ENV_NAMES, PASSTHROUGH_ENV_NAMES};
 use fandhe_browser_render::protocol::{
     BoundingBoxParams, LoadParams, MethodResult, ProtocolError, Request, ScreenshotParams,
     VisibilityParams,
@@ -342,6 +348,296 @@ fn t_rss_limit() {
     assert_gone(child_pid(&root, 1));
 }
 
+// ---------------------------------------------------------------------------
+// egress 隔離（RENDER-3・#1436）
+// ---------------------------------------------------------------------------
+
+/// 隔離できない環境で `required` なら起動せず、理由つきのエラーを返す。ブレーカーには数えない。
+fn t_required_unavailable_does_not_spawn() {
+    let root = Root::new("iso-required", "ok");
+    let cfg = root
+        .config(base_timeouts())
+        .with_egress_isolation(EgressIsolationMode::Required)
+        .with_isolation_probe(IsolationProbe::Unavailable(
+            EgressIsolationUnavailable::SandboxToolNotFound,
+        ));
+    let mut h = HostProcess::new(cfg);
+    for _ in 0..5 {
+        let e = h.load(&page(), 1).expect_err("required must refuse");
+        assert!(
+            matches!(
+                e,
+                HostProcessError::EgressIsolationUnavailable(
+                    EgressIsolationUnavailable::SandboxToolNotFound
+                )
+            ),
+            "{e:?}"
+        );
+    }
+    assert_eq!(count(&root.0, "spawns"), 0, "host must never be started");
+    assert_eq!(
+        HostProcessError::EgressIsolationUnavailable(
+            EgressIsolationUnavailable::SandboxToolNotFound
+        )
+        .to_string(),
+        "render host egress isolation is required but unavailable"
+    );
+    assert!(h.pid().is_none());
+}
+
+// 使うテストが unix 限定のため、Windows では dead_code にならないよう cfg を揃える。
+#[cfg(unix)]
+type Warnings = std::sync::Arc<std::sync::Mutex<Vec<EgressIsolationUnavailable>>>;
+
+#[cfg(unix)]
+fn with_warning_sink(cfg: HostProcessConfig) -> (HostProcessConfig, Warnings) {
+    let sink: Warnings = Warnings::default();
+    let s2 = std::sync::Arc::clone(&sink);
+    let cfg = cfg.with_isolation_warning(std::sync::Arc::new(move |r| {
+        s2.lock().unwrap().push(r);
+    }));
+    (cfg, sink)
+}
+
+/// 隔離できない環境で `best-effort` なら、警告を 1 回だけ出して従来どおり起動する。
+#[cfg(unix)]
+fn t_best_effort_warns_once_and_starts_unwrapped() {
+    let root = Root::new("iso-besteffort", "dump");
+    let reason = EgressIsolationUnavailable::UnsupportedPlatform;
+    let (cfg, sink) = with_warning_sink(
+        root.config(base_timeouts())
+            .with_egress_isolation(EgressIsolationMode::BestEffort)
+            .with_isolation_probe(IsolationProbe::Unavailable(reason)),
+    );
+    let mut h = HostProcess::new(cfg);
+    h.load(&page(), 1).expect("starts without isolation");
+    assert_eq!(
+        h.egress_isolation(),
+        Some(EgressIsolationStatus::Unisolated(reason))
+    );
+    let obs: Value =
+        serde_json::from_str(&std::fs::read_to_string(root.0.join("obs-dump.json")).unwrap())
+            .unwrap();
+    assert_eq!(obs["args"], serde_json::json!(["--stdio"]));
+    assert_eq!(*sink.lock().unwrap(), vec![reason]);
+    // 再起動しても警告は HostProcess ごとに 1 回。
+    h.shutdown();
+    h.load(&page(), 1).expect("restart");
+    assert_eq!(count(&root.0, "spawns"), 2);
+    assert_eq!(*sink.lock().unwrap(), vec![reason]);
+}
+
+#[cfg(target_os = "linux")]
+fn wait_gone(pid: u32) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if !std::path::Path::new(&format!("/proc/{pid}")).exists() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    panic!("process {pid} is still alive");
+}
+
+/// 実環境（Linux）の判定に従う。bwrap が使える環境では argv・RSS の pid・終了処理を確かめ、
+/// 使えない環境では `required` が起動しないことを確かめる（どちらの分岐も具体値で assert）。
+#[cfg(target_os = "linux")]
+fn t_system_probe_branch() {
+    use fandhe_browser_render::host_process::{IsolationBackend, probe_system};
+    match probe_system() {
+        Ok(()) => {
+            let root = Root::new("iso-system-ok", "dump");
+            let cfg = root
+                .config_system(base_timeouts())
+                .with_egress_isolation(EgressIsolationMode::Required)
+                .with_rss_poll_interval(Duration::from_millis(50));
+            let mut h = HostProcess::new(cfg);
+            h.load(&page(), 1).expect("wrapped host starts");
+            assert_eq!(
+                h.egress_isolation(),
+                Some(EgressIsolationStatus::Isolated(IsolationBackend::Bwrap))
+            );
+            let workdir = std::fs::canonicalize(h.workdir_path().unwrap()).unwrap();
+            let obs: Value = serde_json::from_str(
+                &std::fs::read_to_string(root.0.join("obs-dump.json")).unwrap(),
+            )
+            .unwrap();
+            let args: Vec<&str> = obs["args"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_str().unwrap())
+                .collect();
+            let sock = workdir.join("egress-proxy.sock");
+            assert_eq!(
+                args,
+                ["--stdio", "--egress-relay-uds", sock.to_str().unwrap()]
+            );
+            // pid 名前空間（RENDER-3）: ホストから本体と起動した子（外側の pid）が見えない。
+            // ns 内ではホストの親は init 役の bwrap（pid 1）で、自身の pid（pid-1 ファイル）は 2。
+            let wrapper_pid = h.pid().expect("wrapper pid");
+            let seen: Vec<u64> = obs["proc_pids"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_u64().unwrap())
+                .collect();
+            assert!(seen.contains(&1), "ns init visible: {seen:?}");
+            assert!(
+                !seen.contains(&u64::from(std::process::id())),
+                "parent pid must be hidden: {seen:?}"
+            );
+            assert!(
+                !seen.contains(&u64::from(wrapper_pid)),
+                "wrapper pid must be hidden: {seen:?}"
+            );
+            assert_eq!(obs["ppid"], 1);
+            assert_eq!(child_pid(&root, 1), 2);
+            // RSS 監視は bwrap ではなく 2 段下（外側の pid でのホスト）を辿る。
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while h.monitored_pid().is_none() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            let host_pid = h.monitored_pid().expect("monitored host pid");
+            assert_ne!(host_pid, wrapper_pid, "wrapper pid differs from host pid");
+            let tree = outer_tree(wrapper_pid);
+            assert_eq!(tree.len(), 2, "wrapper -> init -> host: {tree:?}");
+            assert_eq!(tree[1], host_pid);
+            assert_eq!(nspid(host_pid), vec![host_pid, 2], "NSpid of the host");
+            // 終了処理: ラッパーを kill すると、init 役もホストも残らない。
+            h.shutdown();
+            assert!(!workdir.exists());
+            wait_gone(host_pid);
+            wait_gone(tree[0]);
+            wait_gone(wrapper_pid);
+        }
+        Err(reason) => {
+            let root = Root::new("iso-system-ng", "ok");
+            let cfg = root
+                .config_system(base_timeouts())
+                .with_egress_isolation(EgressIsolationMode::Required);
+            let mut h = HostProcess::new(cfg);
+            let e = h.load(&page(), 1).expect_err("required must refuse");
+            assert!(
+                matches!(&e, HostProcessError::EgressIsolationUnavailable(r) if *r == reason),
+                "{e:?}"
+            );
+            assert_eq!(count(&root.0, "spawns"), 0);
+        }
+    }
+}
+
+/// 外側の pid 名前空間で、`wrapper` の子孫を 1 本道で辿った pid 列（子が 1 件の間だけ）。
+#[cfg(target_os = "linux")]
+fn outer_tree(wrapper: u32) -> Vec<u32> {
+    let mut out = Vec::new();
+    let mut cur = wrapper;
+    while let Ok(t) = std::fs::read_to_string(format!("/proc/{cur}/task/{cur}/children")) {
+        let kids: Vec<u32> = t.split_whitespace().map(|p| p.parse().unwrap()).collect();
+        match kids.as_slice() {
+            [only] => {
+                out.push(*only);
+                cur = *only;
+            }
+            _ => break,
+        }
+    }
+    out
+}
+
+/// `/proc/<pid>/status` の `NSpid`（外側から内側へ並ぶ pid）。
+#[cfg(target_os = "linux")]
+fn nspid(pid: u32) -> Vec<u32> {
+    std::fs::read_to_string(format!("/proc/{pid}/status"))
+        .unwrap()
+        .lines()
+        .find_map(|l| l.strip_prefix("NSpid:"))
+        .unwrap()
+        .split_whitespace()
+        .map(|p| p.parse().unwrap())
+        .collect()
+}
+
+/// `root` 配下を cmdline に含むプロセス（bwrap・init 役・ホスト）の外側 pid を、`stop` が立つまで
+/// 集め続ける。ns 内の pid（pid-N ファイル）は外側の `/proc` では引けないため、失敗する load の
+/// 後始末（ホストの消滅）を外側の pid で確かめるために使う。
+#[cfg(target_os = "linux")]
+fn spawn_pid_collector(
+    root: &std::path::Path,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> std::thread::JoinHandle<BTreeSet<u32>> {
+    let needle = root.to_string_lossy().into_owned();
+    std::thread::spawn(move || {
+        let mut found = BTreeSet::new();
+        while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+            if let Ok(d) = std::fs::read_dir("/proc") {
+                for e in d.flatten() {
+                    let Some(pid) = e.file_name().to_str().and_then(|n| n.parse::<u32>().ok())
+                    else {
+                        continue;
+                    };
+                    if pid == std::process::id() {
+                        continue;
+                    }
+                    if let Ok(c) = std::fs::read(e.path().join("cmdline"))
+                        && String::from_utf8_lossy(&c).contains(&needle)
+                    {
+                        found.insert(pid);
+                    }
+                }
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        found
+    })
+}
+
+/// bwrap 越しでも、タイムアウトで kill した後にホストが残らない。
+#[cfg(target_os = "linux")]
+fn t_system_probe_timeout_kills_wrapped_host() {
+    if fandhe_browser_render::host_process::probe_system().is_err() {
+        return; // 隔離できない環境では上のテストが required の拒否を確かめる。
+    }
+    let root = Root::new("iso-timeout", "hang-load");
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let collector = spawn_pid_collector(&root.0, stop.clone());
+    let mut h = HostProcess::new(root.config_system(short_timeouts()));
+    let e = h.load(&page(), 1).expect_err("timeout");
+    assert!(
+        matches!(e, HostProcessError::Timeout(TimeoutPhase::Load)),
+        "{e:?}"
+    );
+    stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    let pids = collector.join().unwrap();
+    assert!(pids.len() >= 3, "bwrap, init and host seen: {pids:?}");
+    pids.into_iter().for_each(wait_gone);
+}
+
+/// bwrap 越しでも RSS 上限超過でホスト本体（bwrap の子）が落ちる。bwrap 自身の RSS では判定しない。
+#[cfg(target_os = "linux")]
+fn t_system_probe_rss_limit_kills_wrapped_host() {
+    if fandhe_browser_render::host_process::probe_system().is_err() {
+        return;
+    }
+    let root = Root::new("iso-rss", "rss");
+    let cfg = root
+        .config_system(base_timeouts())
+        .with_rss_limit_bytes(48 * 1024 * 1024)
+        .with_rss_poll_interval(Duration::from_millis(50));
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let collector = spawn_pid_collector(&root.0, stop.clone());
+    let mut h = HostProcess::new(cfg);
+    let e = h.load(&page(), 1).expect_err("rss");
+    assert!(
+        matches!(e, HostProcessError::ResourceLimitExceeded),
+        "{e:?}"
+    );
+    stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    let pids = collector.join().unwrap();
+    assert!(pids.len() >= 3, "bwrap, init and host seen: {pids:?}");
+    pids.into_iter().for_each(wait_gone);
+}
+
 fn main() {
     maybe_run_fake_host();
     #[allow(unused_mut)]
@@ -361,6 +657,27 @@ fn main() {
         ("profile_isolation", t_profile_isolation),
         ("stderr_tail", t_stderr_tail),
     ];
+    tests.push((
+        "egress_required_unavailable",
+        t_required_unavailable_does_not_spawn,
+    ));
+    #[cfg(unix)]
+    tests.push((
+        "egress_best_effort_warns_once",
+        t_best_effort_warns_once_and_starts_unwrapped,
+    ));
+    #[cfg(target_os = "linux")]
+    {
+        tests.push(("egress_system_probe_branch", t_system_probe_branch));
+        tests.push((
+            "egress_system_rss_limit_kills_wrapped_host",
+            t_system_probe_rss_limit_kills_wrapped_host,
+        ));
+        tests.push((
+            "egress_system_timeout_kills_wrapped_host",
+            t_system_probe_timeout_kills_wrapped_host,
+        ));
+    }
     #[cfg(unix)]
     tests.push(("dump_env_args_cwd", t_dump_env_args_cwd));
     #[cfg(any(target_os = "linux", target_os = "macos"))]

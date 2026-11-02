@@ -14,7 +14,8 @@ use fandhe_browser_render::codec::{
     write_frame,
 };
 use fandhe_browser_render::host_process::{
-    HOST_ARGS, HostProcessConfig, HostTimeouts, resolve_host_binary,
+    EgressIsolationUnavailable, HOST_ARGS, HostProcessConfig, HostTimeouts, IsolationProbe,
+    resolve_host_binary,
 };
 use serde_json::{Value, json};
 
@@ -72,7 +73,24 @@ pub fn fake_host() -> ! {
             .map(|(k, _)| k.to_string_lossy().into_owned())
             .collect();
         names.sort();
+        // pid 名前空間の観測（RENDER-3）: 見える pid と自分の PPid。
+        let mut proc_pids: Vec<u32> = std::fs::read_dir("/proc")
+            .map(|d| {
+                d.flatten()
+                    .filter_map(|e| e.file_name().to_str()?.parse().ok())
+                    .collect()
+            })
+            .unwrap_or_default();
+        proc_pids.sort_unstable();
+        let ppid: Option<u32> = std::fs::read_to_string("/proc/self/status")
+            .ok()
+            .and_then(|t| {
+                t.lines()
+                    .find_map(|l| l.strip_prefix("PPid:")?.trim().parse().ok())
+            });
         let obs = json!({
+            "proc_pids": proc_pids,
+            "ppid": ppid,
             "args": std::env::args().skip(1).collect::<Vec<_>>(),
             "env": names,
             "cwd": cwd.to_string_lossy(),
@@ -267,7 +285,16 @@ impl Root {
         std::fs::write(p.join("scenario"), scenario).expect("scenario");
         Self(p)
     }
+    /// 隔離なし（`IsolationProbe::Unavailable`）に固定した設定。実行環境の bwrap の有無で
+    /// 既存の結合テストの挙動が変わらないようにする（RENDER-3・#1436）。
     pub fn config(&self, timeouts: HostTimeouts) -> HostProcessConfig {
+        self.config_system(timeouts)
+            .with_isolation_probe(IsolationProbe::Unavailable(
+                EgressIsolationUnavailable::SandboxToolNotFound,
+            ))
+    }
+    /// 隔離可否を実環境で判定する設定（`IsolationProbe::System`）。
+    pub fn config_system(&self, timeouts: HostTimeouts) -> HostProcessConfig {
         let exe = std::env::current_exe().expect("exe");
         let copy = exe;
         let bin = resolve_host_binary(Some(&copy), None, None).expect("binary");
@@ -314,9 +341,19 @@ pub fn assert_gone(pid: u32) {
     }
 }
 /// 偽ホストとして再実行された場合は `fake_host` で終了しない。通常実行なら何もしない。
+///
+/// 隔離のラッパー越しに起動された場合は、`HOST_ARGS` に egress オプションが 1 組続く
+/// （`--egress-relay-uds <path>`・`--egress-proxy-port <port>`。#1436）。
 pub fn maybe_run_fake_host() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    if args == HOST_ARGS {
+    let base = HOST_ARGS.len();
+    let is_host = args.get(..base).is_some_and(|a| a == HOST_ARGS)
+        && match args.get(base..) {
+            Some([]) => true,
+            Some([opt, _]) => opt == "--egress-relay-uds" || opt == "--egress-proxy-port",
+            _ => false,
+        };
+    if is_host {
         fake_host();
     }
 }

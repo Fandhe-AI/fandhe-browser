@@ -407,11 +407,18 @@ fn run(args: CommandArgs) -> Result<CommandOutcome, CommandError> {
     // プロファイル指定の検証（終了コード 2）も副作用・ホスト起動の前に確定させる。
     profile::build_store(&options.profile)?;
     precheck_url(&options.url)?;
+    // `[rendering] egress_isolation` を読む。読まないと `required` が黙って無視される抜け穴になる
+    // （RENDER-3・#1436）。`launch` と同じ設定ファイル（`FANDHE_BROWSER_CONFIG`）を使うため、
+    // 不正な設定はここでも起動エラーになる（ホストを起動する前）。
+    let config = crate::startup_config::load_startup_config()?;
     // 指定時のみ開き、コマンド終了までロックを保持する（出力ファイルの書き込みより前）。
     let _profile = profile::open_explicit(&options.profile)?;
     // `--timeout` は `load` の上限だけを変える（スクリーンショット段階の 20 秒は変えない）。
-    let renderer =
-        render_host::renderer_from_process_with_load_timeout(None, options.load_timeout_ms)?;
+    let renderer = render_host::renderer_from_process_with_load_timeout(
+        None,
+        options.load_timeout_ms,
+        config.rendering().egress_isolation(),
+    )?;
     let (shot, final_url) = capture_with(&*renderer, &options)?;
     let bytes = write_png(&options.output, &shot)?;
     ScreenshotOutput {
