@@ -14,7 +14,8 @@
 //!
 //! 読めるのは `[profile]`（保存先 `root`・分離強度 `isolation`。TASK-91（91.1）・
 //! Issue #214）、`[js]`（`engine`。TASK-91（91.2）・Issue #215）、`[rendering]`
-//! （`enabled`。TASK-91（91.3）・Issue #216）。リポジトリ直下の
+//! （`enabled`。TASK-91（91.3）・Issue #216。`egress_isolation` は Servo ホストの egress 隔離の
+//! 要求水準 `best-effort`（既定）/ `required`。`RENDER-3`・TASK-38・#1436）。リポジトリ直下の
 //! `fandhe-browser.toml` は全セクションを説明した設定サンプルである。
 //!
 //! トップレベル・各セクションとも未知キーを `deny_unknown_fields` で拒否する
@@ -369,12 +370,58 @@ impl Config {
 #[non_exhaustive]
 pub struct RenderingConfig {
     enabled: bool,
+    egress_isolation: EgressIsolationMode,
 }
 
 impl RenderingConfig {
     /// レンダリング層の有効化が要求され、受理されたか。既定は `false`。
     pub fn enabled(&self) -> bool {
         self.enabled
+    }
+
+    /// Servo ホストの egress 隔離の要求水準（`[rendering] egress_isolation`。既定は
+    /// [`EgressIsolationMode::BestEffort`]。`RENDER-3`・TASK-38・#1436）。
+    pub fn egress_isolation(&self) -> EgressIsolationMode {
+        self.egress_isolation
+    }
+}
+
+/// Servo ホストの egress 隔離（bwrap・sandbox-exec で包みプロキシ経由に限る）の要求水準
+/// （`[rendering] egress_isolation`。`RENDER-3`・TASK-38・#1436）。
+///
+/// 値の意味づけと隔離の実装は render crate の `HostProcess` が担い、core は設定値の型と
+/// 解析だけを持つ（render・cli が共有するため下位の core に置く）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum EgressIsolationMode {
+    /// 隔離できなければ警告して隔離なしで起動する（既定）。
+    #[default]
+    BestEffort,
+    /// 隔離できなければ起動しない（fail-closed）。
+    Required,
+}
+
+impl EgressIsolationMode {
+    /// TOML の文字列表現に対応する `&'static str` を返す。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            EgressIsolationMode::BestEffort => "best-effort",
+            EgressIsolationMode::Required => "required",
+        }
+    }
+
+    fn parse(value: &str) -> Result<EgressIsolationMode> {
+        match value {
+            "best-effort" => Ok(EgressIsolationMode::BestEffort),
+            "required" => Ok(EgressIsolationMode::Required),
+            other => Err(Error::from(ConfigError::InvalidValue {
+                key: "rendering.egress_isolation",
+                message: format!(
+                    "unknown rendering.egress_isolation {:?} (supported: best-effort, required)",
+                    truncate_for_message(other)
+                ),
+            })),
+        }
     }
 }
 
@@ -390,11 +437,21 @@ const RENDERING_COMPILED: bool = false;
 /// （モジュール doc「`[rendering] enabled` の解決規則」）。
 /// `compiled` を引数にして、同梱時の分岐も単体テストできるようにしている。
 fn resolve_rendering(raw: Option<RawRendering>, compiled: bool) -> Result<RenderingConfig> {
-    let enabled = raw.and_then(|r| r.enabled).unwrap_or(false);
+    let (enabled, egress) = match raw {
+        Some(r) => (r.enabled.unwrap_or(false), r.egress_isolation),
+        None => (false, None),
+    };
     if enabled && !compiled {
         return Err(Error::from(ConfigError::RenderingNotCompiled));
     }
-    Ok(RenderingConfig { enabled })
+    let egress_isolation = match egress {
+        Some(v) => EgressIsolationMode::parse(&v)?,
+        None => EgressIsolationMode::default(),
+    };
+    Ok(RenderingConfig {
+        enabled,
+        egress_isolation,
+    })
 }
 
 /// `[js]` セクションの設定（JS エンジン選択。TASK-91（91.2）・Issue #215・
@@ -861,6 +918,7 @@ struct RawConfig {
 #[serde(deny_unknown_fields)]
 struct RawRendering {
     enabled: Option<bool>,
+    egress_isolation: Option<String>,
 }
 
 /// `[js]` セクションの生 TOML 構造（非公開）。
@@ -1463,9 +1521,66 @@ mod tests {
     fn task_91_3_enabled_with_layer_is_accepted() {
         let raw = Some(RawRendering {
             enabled: Some(true),
+            egress_isolation: None,
         });
         let config = resolve_rendering(raw, true).expect("同梱なら受理");
         assert!(config.enabled());
+    }
+
+    /// RENDER-3（TASK-38・#1436）: `egress_isolation` の省略は `best-effort`、明示値は受理される。
+    #[test]
+    fn render_3_egress_isolation_defaults_and_accepts_known_values() {
+        for input in ["", "[rendering]\n", "[rendering]\nenabled = false\n"] {
+            let config = Config::from_toml_str(input).expect("読める");
+            assert_eq!(
+                config.rendering().egress_isolation(),
+                EgressIsolationMode::BestEffort,
+                "{input:?}"
+            );
+        }
+        let config = Config::from_toml_str("[rendering]\negress_isolation = \"best-effort\"\n")
+            .expect("best-effort");
+        assert_eq!(
+            config.rendering().egress_isolation(),
+            EgressIsolationMode::BestEffort
+        );
+        let config = Config::from_toml_str("[rendering]\negress_isolation = \"required\"\n")
+            .expect("required");
+        assert_eq!(
+            config.rendering().egress_isolation(),
+            EgressIsolationMode::Required
+        );
+        assert_eq!(EgressIsolationMode::Required.as_str(), "required");
+        assert_eq!(EgressIsolationMode::BestEffort.as_str(), "best-effort");
+    }
+
+    /// RENDER-3（TASK-38・#1436）: 未知の値は設定エラー、型違いは構文エラー。
+    #[test]
+    fn render_3_egress_isolation_rejects_unknown_values() {
+        for bad in ["Required", "", "off", "true", "required "] {
+            let input = format!("[rendering]\negress_isolation = {bad:?}\n");
+            let err = Config::from_toml_str(&input).expect_err("未知値は拒否");
+            assert!(
+                matches!(
+                    err,
+                    Error::Config(ConfigError::InvalidValue {
+                        key: "rendering.egress_isolation",
+                        ..
+                    })
+                ),
+                "{bad:?}: {err:?}"
+            );
+        }
+        for bad in [
+            "[rendering]\negress_isolation = 1\n",
+            "[rendering]\negress = 'required'\n",
+        ] {
+            let err = Config::from_toml_str(bad).expect_err("構文エラー");
+            assert!(
+                matches!(err, Error::Config(ConfigError::Syntax { .. })),
+                "{bad}"
+            );
+        }
     }
 
     /// TASK-112（`JS-1`・`JS-4`）: `execute_page_scripts` の省略・`false` は `false`。

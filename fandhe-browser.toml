@@ -34,3 +34,7 @@ execute_modules = false
 # 存在しないため、true を指定すると設定エラーになる（暫定挙動。最終仕様は
 # rendering-layer.md と合わせて決定する）。
 enabled = false
+# Servo ホストの egress 隔離（Linux: bwrap、macOS: sandbox-exec で包み、通信を許可リスト付き
+# プロキシに限る。Windows は未対応）。"best-effort"（既定）は隔離できなければ警告して隔離なしで
+# 起動し、"required" は隔離できなければ起動しない。
+# egress_isolation = "best-effort"
