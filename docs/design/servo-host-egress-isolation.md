@@ -1,6 +1,6 @@
 # Servo ホストの egress 隔離方式: 3 OS の比較設計と実測計画
 
-- **状態**: 設計（比較と実測計画）。**方式の最終決定は実測の後にオーナーが行う**（#1003）。2026-10-31 の暫定判断（Linux を先行・macOS と Windows は実測まで D の扱い）を §8 に、Linux の実測結果を §6.4 に記録した
+- **状態**: 設計（比較と実測計画）。**方式の最終決定は実測の後にオーナーが行う**（#1003）。2026-11-02 の見直し（GA の成立範囲は Linux と macOS の B・Windows は D）を §8.1 に、2026-10-31 の暫定判断（履歴）を §8.2 に、Linux の実測結果を §6.4 に記録した
 - **対応**: TASK-38・MS-4・`RENDER-3`・`SEC-2`・`PLUG-1`・`XOS-1`・Issue #1368（親判断 #1003）。関連は `RENDER-1`。docker 経路は #1386 で再実測した（§6.4）。後続は #1387（macOS・Windows の実測ハーネス）
 - **入力資料**: [servo-host-egress-options.md](./servo-host-egress-options.md)（#1317。手段ごとの詳細表・Servo 0.7 の net 層の事実・承認事項の洗い出し。以下「options §n」と書く）。設計の親は [servo-host-design.md](./servo-host-design.md) §2.5・§13 項目 6
 - **確度の表記**: 「確認済み」は原文またはコードを確認した事項、「推測」は読んだ範囲からの推論、「未確認」は調べていない事項。一次情報は options の出典（参照日 2026-10-29、Servo は `v0.7.0` タグ）に従い、判断の前に原文で再確認する。本書では新たな外部ページの再取得はしていない
@@ -87,7 +87,7 @@ B の具体形は次の 2 つ。外部 http/https に出る要件があるため
 | macOS | 条件付き。`(deny network*)` + loopback のプロキシのポートだけ許可 | `remote ip "localhost:<port>"` の実動作。非推奨 API が将来の OS で消える可能性。ヘッドレスでの GPU・フォントの動作（`RENDER-4` の前歴） |
 | Windows | 不成立の公算が高い | AppContainer の loopback 例外に管理者権限が要るか。ホストが AppContainer 内で動くか |
 
-B が成立しない OS の既知の制約として明記する文言（D）の置き場所の候補は、設計 §2.5 と README。文言の方針は §8 の 2（2026-10-31 の暫定判断）で決まった。置き場所は未定。
+B が成立しない OS の既知の制約として明記する文言（D）の方針は §8.2 の 2（2026-10-31）で決まり、置き場所は §8.1 の 2（2026-11-02）で README「実装方針（要点）」と設計 §2.5 に決まった。
 
 ## 5. 補助 A の位置づけ
 
@@ -181,27 +181,46 @@ Windows の補足（#1401）: `xos-measure.yml` の Windows ジョブに限り�
 | 変更 | `servo-host/src/engine.rs` の `fixed_preferences`（proxy pref の注入。クライアントから任意引数を渡さない方針〔設計 §2.6〕と整合させる） |
 | CI | `xos-measure.yml` への suite 追加（required ではないため ruleset への影響なし。`egress-isolation` は #1387 の指定で追加済み） |
 
-## 8. オーナー判断（2026-10-31・暫定）
+## 8. オーナー判断
+
+### 8.1 見直し（2026-11-02・#1003）
+
+- **判断日**: 2026-11-02。根拠は macOS・Windows の実測（xos-measure の suite `egress-isolation`）。§8.2 の暫定判断（2026-10-31）を、この実測を受けて見直した
+- 対応: TASK-38・`RENDER-3`・`SEC-2`・`XOS-1`
+
+| 論点 | 2026-10-31 の暫定（§8.2） | 2026-11-02 の見直し | 後続 |
+| ---- | ------------------------- | ------------------- | ---- |
+| 1. GA の成立範囲 | Linux を先行（B: bwrap `--unshare-net`） | Linux（B: bwrap `--unshare-net`）と macOS（B: Seatbelt）を含める。根拠: macOS 26 の run 41401095620・41402439545 で、TCP 5 経路（redirect・img・fetch・ws・internal）と udp_direct が pass し、拒否ログの自己検査も成立した（予熱 5 回入り。#1415・#1424・#1425）。`dns`・`internal_real` は netns が前提の構造検査のため、macOS では対象外（unobservable） | 本番への組み込みは論点 4 |
+| 2. 既知の制約の文言（D）の置き場所 | 設計 §2.5 か README のどちらか（未定） | README「実装方針（要点）」と設計 §2.5 に置く | 文言は両者で同じ内容 |
+| 3. Windows の扱い | macOS・Windows の実測まで GA の成立範囲から外し、D の扱い | 引き続き D（既知の制約）とし、GA の成立範囲から外す。根拠: AppContainer 内で Servo ホストの陽性対照は成立した（`positive_ok: true`。run 41386861681・41402439545。#1413・#1420）。一方、Servo を使わない preflight で、capability なしでも loopback の外側 listener に届いた（loopback 免除を付けているため）。そのため全経路が「loopback listener では egress の遮断を測れない」理由で unobservable。測り直すには loopback 以外の宛先が要る | 測り方の検討は #1427。AppContainer 内の ipc-channel の制約は #1421 |
+| 4. 本番への組み込み | （新規の論点） | 本番の起動（`crates/fandhe-browser-render` の HostProcess）には、まだ OS 隔離が入っていない。§7 の承認事項（依存・`unsafe`）をオーナーに諮ってから、実装 issue を起票する | 実装 issue は未起票 |
+
+- 「8 経路すべて pass」（§6.4）のうち `internal_real`・`dns` は構造検査で、Servo 自身の DNS・UDP 送信は外部から観測していない
+- AppContainer 内の ipc-channel の制約（ボディ付きリクエストで panic し得る）は推定で、未実測（#1421）
+
+### 8.2 暫定判断（2026-10-31・履歴。§8.1 で見直し済み）
 
 - **判断日**: 2026-10-31。根拠は #1003 のコメント「オーナー判断（2026-10-31）: §8 の 3 点」で、Linux の実測（§6.4）を受けたもの
-- **macOS・Windows の実測前の暫定判断**で、実測の後に見直す。方式の最終決定（§1）は引き続き実測の後に行う
+- **macOS・Windows の実測前の暫定判断**だった。実測の後に見直す、とされていた（§8.1 で見直した）
 - 対応: TASK-38・`RENDER-1`・`SEC-2`・`XOS-1`
 
 | 論点（判断前の問い） | 判断 | 後続 |
 | -------------------- | ---- | ---- |
 | 1. GA で必須とする成立範囲（3 OS 揃えるか、Linux を先行するか） | Linux を先行する。Linux は B（OS 隔離）として bwrap `--unshare-net` を主方式にする（§6.4 で 8 経路すべて pass）。docker `--network none` は、配布コンテナとホストの glibc をそろえてから測り直す | #1386（測定済み。§6.4・§9.1） |
-| 2. B が成立しない OS・環境での既知の制約の文言（D） | OS 隔離が使えない環境では A（アプリ側の検知）だけで動作し、「egress を完全には遮断できない」と明記する。既定ではそのことを警告する | 文言の置き場所は §4 の候補（設計 §2.5・README）から選ぶ（未定） |
-| 3. Windows の扱い（弱い保証にとどめるか、対象外とするか） | macOS・Windows の実測が済むまで GA の成立範囲から外し、D の扱いとする | #1387 |
+| 2. B が成立しない OS・環境での既知の制約の文言（D） | OS 隔離が使えない環境では A（アプリ側の検知）だけで動作し、「egress を完全には遮断できない」と明記する。既定ではそのことを警告する | 文言の置き場所は §4 の候補（設計 §2.5・README）から選ぶ（未定。§8.1 の論点 2 で決定） |
+| 3. Windows の扱い（弱い保証にとどめるか、対象外とするか） | macOS・Windows の実測が済むまで GA の成立範囲から外し、D の扱いとする | #1387（§8.1 の論点 1・3 で更新） |
 
 - 「8 経路すべて pass」のうち `internal_real`・`dns` は構造検査で、Servo 自身の DNS・UDP 送信は外部から観測していない（§6.4）
 
 ## 9. 未確認事項
 
-options §7 を引き継ぐ。本書で新たに加わる未確認事項はない。§6.2 で確かめるとしていた Docker 既定 seccomp 下での `unshare` の挙動と Landlock の実機の対応は、Linux（カーネル 7.0.0-34）について §6.4 で確かめた。
+options §7 を引き継ぐ。本書で新たに加わる未確認事項は §9.2 の 2 行（2026-11-02 の見直しで追加）。§6.2 で確かめるとしていた Docker 既定 seccomp 下での `unshare` の挙動と Landlock の実機の対応は、Linux（カーネル 7.0.0-34）について §6.4 で確かめた。
 
 ### 9.1 2026-10-31 の Linux 実測で解消した事項
 
 詳細は §6.4（TASK-38・`RENDER-1`）。
+
+- macOS の成立性（B: Seatbelt の TCP 5 経路と udp_direct の pass）: 2026-11-02 の見直しで GA の成立範囲に含めた（§8.1。`dns`・`internal_real` は構造検査のため対象外）
 
 - Docker 既定 seccomp 下の `unshare -n`: EPERM
 - Ubuntu の AppArmor 制限（`kernel.apparmor_restrict_unprivileged_userns=1`）下での netns の作り方: 特権なしの `unshare -n`・`unshare -rn` は EPERM、`bwrap --unshare-net` は成功。ns 内に `CAP_NET_ADMIN` は無い
@@ -213,7 +232,9 @@ options §7 を引き継ぐ。本書で新たに加わる未確認事項はな�
 
 | 未確認事項 | 追跡先 |
 | ---------- | ------ |
-| macOS・Windows での成立性（§3.2・§3.3・§6.2） | #1387 |
+| Windows の成立性（§3.3・§6.2）。§8.1 で D（既知の制約）とした。測り直しは次行の #1427 で追跡する | #1387 |
+| Windows の測り直し（loopback 以外の宛先を使う測り方。loopback 免除の下では外側 listener に届くため、現行の測り方では egress を測れない） | #1427 |
+| AppContainer 内の ipc-channel の制約（ボディ付きリクエストで panic し得る。推定・未実測） | #1421 |
 | Docker 内での bwrap の可否（イメージに bwrap が無い） | 未起票 |
 | Servo 自身の DNS・UDP 送信の外部観測（root か `CAP_NET_ADMIN` が要る） | 未起票 |
 | Landlock ルール適用下の動作・seccomp・許可リスト付きプロキシとの併用 | §7 の承認事項 |
