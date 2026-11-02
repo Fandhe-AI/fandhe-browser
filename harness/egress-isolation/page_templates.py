@@ -90,6 +90,13 @@ REDIRECT_LATE_PATH = "/redirect-late"
 DIAG_NAV_DIRECT_PATH = "/direct"
 _DIAG_REDIRECT_LOCATION = f"http://{judge.HOST_BLOCKED}:$p_diag_redirect_late/redirected"
 
+# 予熱用の経路（macOS だけ。Issue #1415）。判定経路の前に 1 回だけ「遮断ダミー宛先への 302」を読み込む。
+# 最初に遮断されるトップレベルナビゲーションでだけ拒否行が出ない事象を、判定しない経路に吸わせるための
+# もので、判定（`judge.routes_for_mode` 等）・attempts・外側受信の集計には入れない。
+WARMUP_ROUTE = "warmup_redirect"
+REDIRECT_WARMUP_PATH = "/redirect-warmup"
+_WARMUP_REDIRECT_LOCATION = f"http://{judge.HOST_BLOCKED}:$p_warmup_redirect/redirected"
+
 # 経路 -> ページのパス
 ROUTE_PATH = {
     "redirect": REDIRECT_PATH,
@@ -140,3 +147,8 @@ def redirect_location(ports: dict[str, Any], *, literal: bool = False) -> str:
 def diag_redirect_location(ports: dict[str, Any], *, literal: bool = False) -> str:
     """診断用 302（`/redirect-late`）の Location。`redirect_location` と同じく int のポートだけを置換する。"""
     return _subst(_literal(_DIAG_REDIRECT_LOCATION) if literal else _DIAG_REDIRECT_LOCATION, ports)
+
+
+def warmup_redirect_location(ports: dict[str, Any], *, literal: bool = False) -> str:
+    """予熱用 302（`/redirect-warmup`）の Location。int のポートだけを置換する（Issue #1415）。"""
+    return _subst(_literal(_WARMUP_REDIRECT_LOCATION) if literal else _WARMUP_REDIRECT_LOCATION, ports)

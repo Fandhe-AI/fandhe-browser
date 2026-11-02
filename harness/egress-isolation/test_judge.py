@@ -124,6 +124,14 @@ class RouteNotesTest(unittest.TestCase):
             self.assertNotIn(r, judge.routes_for_mode("seatbelt"))
             self.assertNotIn(r, judge.routes_for_mode("baseline"))
 
+    def test_routes_for_mode_unchanged_by_warmup_route(self) -> None:
+        for mode in ("seatbelt", "baseline"):
+            self.assertNotIn(fixtures.WARMUP_ROUTE, judge.routes_for_mode(mode))
+
+    def test_build_pages_has_no_warmup_page(self) -> None:
+        for literal in (False, True):
+            self.assertNotIn(fixtures.REDIRECT_WARMUP_PATH, fixtures.build_pages(FixturesTest.PORTS, literal=literal))
+
     def test_build_pages_literal_false_is_unchanged_by_diag(self) -> None:
         pages = fixtures.build_pages(FixturesTest.PORTS)
         self.assertNotIn(fixtures.REDIRECT_LATE_PATH, pages)

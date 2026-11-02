@@ -101,6 +101,74 @@ class InnerRunnerTest(unittest.TestCase):
         loc_name = page_templates.diag_redirect_location({"diag_redirect_late": 20010})
         self.assertEqual(loc_name, f"http://{judge.HOST_BLOCKED}:20010/redirected")
 
+    def _warmup_args(self, host: Path, *, diag: bool = False) -> argparse.Namespace:
+        ports = {**self.ports(), "warmup_redirect": 20020}
+        if diag:
+            ports.update({"diag_redirect_late": 20010, "diag_nav_direct": 20011})
+        args = self.args("baseline", host)
+        args.warmup = True
+        args.diag_routes = diag
+        args.ports = json.dumps(ports)
+        return args
+
+    def _recorded_paths(self, args: argparse.Namespace) -> tuple[dict, list[str]]:
+        urls: list[str] = []
+        real = in_sandbox.load_route
+
+        def spy(chan, next_id, info, url):  # noqa: ANN001
+            urls.append(url.split("/", 3)[3] if url.count("/") >= 3 else url)
+            return real(chan, next_id, info, url)
+
+        with mock.patch.object(in_sandbox, "load_route", spy):
+            result = in_sandbox.run(args, in_sandbox.validate_args(args))
+        return result, urls
+
+    def test_warmup_runs_between_ok_and_judged_routes_without_entering_verdict_data(self) -> None:
+        """Issue #1415: 予熱は /ok の後・判定経路の前に 1 回だけ。loads / attempts / guard_polls には混ぜない。"""
+        host = make_fake_host(self.tmp, [])
+        result, urls = self._recorded_paths(self._warmup_args(host))
+        self.assertEqual(urls[:3], ["ok", "redirect-warmup", "redirect-out"])
+        self.assertEqual(urls.count("redirect-warmup"), 1)
+        self.assertIn("warmup_load", result)
+        for key in ("loads", "guard_polls", "attempts"):
+            self.assertNotIn("warmup_redirect", result[key])
+        self.assertIn("warmup_redirect", result["load_elapsed_ms"])
+
+    def test_warmup_with_diag_keeps_order_ok_warmup_judged_then_diag(self) -> None:
+        host = make_fake_host(self.tmp, [])
+        result, urls = self._recorded_paths(self._warmup_args(host, diag=True))
+        self.assertEqual(urls[0:2], ["ok", "redirect-warmup"])
+        self.assertEqual(urls[-2].split("/")[0], "redirect-late")
+        self.assertEqual(list(result["diag_loads"]), ["diag_redirect_late", "diag_nav_direct"])
+
+    def test_without_warmup_flag_result_has_no_warmup_load(self) -> None:
+        host = make_fake_host(self.tmp, [])
+        result, urls = self._recorded_paths(self.args("baseline", host))
+        self.assertNotIn("warmup_load", result)
+        self.assertNotIn("redirect-warmup", urls)
+        self.assertNotIn("warmup_redirect", result["load_elapsed_ms"])
+
+    def test_warmup_requires_valid_port(self) -> None:
+        host = make_fake_host(self.tmp, [])
+        for bad in (None, True, 80, "20020", 70000):
+            args = self._warmup_args(host)
+            ports = json.loads(args.ports)
+            if bad is None:
+                del ports["warmup_redirect"]
+            else:
+                ports["warmup_redirect"] = bad
+            args.ports = json.dumps(ports)
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                in_sandbox.validate_args(args)
+
+    def test_warmup_redirect_location_targets_blocked_dummy(self) -> None:
+        import page_templates
+
+        self.assertEqual(page_templates.warmup_redirect_location({"warmup_redirect": 20020}, literal=True),
+                         f"http://{judge.IP_BLOCKED}:20020/redirected")
+        self.assertEqual(page_templates.warmup_redirect_location({"warmup_redirect": 20020}),
+                         f"http://{judge.HOST_BLOCKED}:20020/redirected")
+
     def test_host_that_never_connects_leaves_outer_empty(self) -> None:
         outer = listeners.TcpRecorder("o", "127.0.0.2").start()
         self.addCleanup(outer.stop)
@@ -303,6 +371,46 @@ class MeasureTest(unittest.TestCase):
         win = measure.build_argv("baseline", ports={**ports, "diag_redirect_late": 2007, "diag_nav_direct": 2008},
                                  platform_name="win32", **kw)
         self.assertNotIn("--diag-routes", win)
+
+    def test_warmup_listener_only_with_diag_and_argv_flag_only_for_darwin(self) -> None:
+        recs, ports = measure.start_outer_listeners(diag=False)
+        try:
+            self.assertNotIn("warmup_redirect", ports)
+        finally:
+            for r in recs.values():
+                r.stop()
+        recs, ports = measure.start_outer_listeners(diag=True)
+        try:
+            self.assertEqual(recs["warmup_redirect"].ip, judge.IP_BLOCKED)
+        finally:
+            for r in recs.values():
+                r.stop()
+        host = Path(sys.executable)
+        base = {"redirect": 2001, "img": 2002, "fetch": 2003, "ws": 2004, "internal": 2005, "udp_direct": 2006}
+        kw = dict(host=host, out_dir=Path("/tmp"), hosts_file=Path("/tmp/h"), image=None, page_port=3000)
+        ports = {**base, "warmup_redirect": 2009}
+        for mode in ("baseline", "seatbelt"):  # 読み込み順を揃えるため両方に付く
+            self.assertIn("--warmup", measure.build_argv(mode, ports=ports, platform_name="darwin", **kw))
+        for plat in ("linux", "win32"):
+            self.assertNotIn("--warmup", measure.build_argv("baseline", ports=ports, platform_name=plat, **kw))
+        self.assertNotIn("--warmup", measure.build_argv("baseline", ports=base, platform_name="darwin", **kw))
+
+    def test_summary_shows_warmup_row_warning_and_note_without_changing_verdicts(self) -> None:
+        inner = {"loads": {"redirect": {"ok": False, "kind": "load_failed"}},
+                 "warmup_load": {"ok": False, "kind": "load_failed"},
+                 "diag_loads": {}, "load_elapsed_ms": {"redirect": 120, "warmup_redirect": 90},
+                 "host_alive_after_load": {}}
+        mode = {"exit_code": 0, "inner": inner, "outer_counts": {"redirect": 0, "diag_nav_direct": 0},
+                "warmup": {"outer": 1, "deny": 2},
+                "deny_log": {"dest_counts": {}, "diagnostic_dest_counts": {"redirect": 0}}, "verdicts": {}}
+        results = {"meta": {"date_utc": "d", "kernel": "k", "host_sha256": "s", "host_version": "v",
+                            "proxy_env_present": False},
+                   "modes": {"baseline": {"outer_counts": {"img": 1, "diag_nav_direct": 1}}, "seatbelt": mode}}
+        text = measure.summarize(results)
+        self.assertIn("| warmup_redirect (warm-up) | 1 | 2 | load_failed | 90 |", text)
+        self.assertIn("WARNING: warm-up route has 1 outer receipt(s)", text)
+        self.assertIn("warm-up deny rows=2, warm-up outer=1", measure.redirect_notes(mode)["redirect"])
+        self.assertNotIn("warmup_redirect", mode["outer_counts"])
 
     def test_summary_shows_redirect_diagnostics_and_warning(self) -> None:
         inner = {"loads": {"redirect": {"ok": False, "kind": "load_failed"}},
