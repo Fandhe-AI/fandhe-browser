@@ -134,6 +134,8 @@ pub enum IsolationProbe {
 /// 利用できると確認したサンドボックス。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum Sandbox {
+    // 構築は Linux の probe のみ（macOS・Windows では未使用で、-D warnings の dead_code になるため許可する）。
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     Bwrap(PathBuf),
     // 構築は macOS の probe のみ（他 OS では未使用）。
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
