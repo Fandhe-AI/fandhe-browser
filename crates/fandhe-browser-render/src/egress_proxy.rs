@@ -42,13 +42,36 @@ pub const MAX_HEADER_BYTES: usize = 8 * 1024;
 /// accept からヘッダ終端までの総時間（slowloris 対策）。loopback / UDS の相手なので通常は
 /// ミリ秒で届く。
 pub const HEADER_DEADLINE: Duration = Duration::from_secs(10);
-/// 同時接続数（トンネル確立後も含む）。ブラウザの同時ソケット数の目安から決めた。1 接続あたり
-/// 最大 2 スレッドなので、スレッド数は高々この 2 倍に有界。
+/// 同時接続数（トンネル確立後も含む）。ブラウザの同時ソケット数の目安から決めた。
+///
+/// ハンドシェイク中とトンネル確立後で枠を分けない。servo-host 側の中継
+/// （`servo-host/src/relay.rs`）は CONNECT の内容を解釈せず両者を区別できないため、別枠にすると
+/// 中継の上限を本体と揃えられなくなる。アイドルのトンネルが枠を握り続ける時間は
+/// [`IDLE_TIMEOUT`] で有界（#1444）。値は変えない。
+///
+/// 1 接続あたり最大 2 スレッド（ハンドラと逆方向の pump）に加え、上流への接続試行と名前解決
+/// （後者は [`MAX_RESOLVER_THREADS`] 本まで）のスレッドが要る。枠を超えた接続は accept スレッド
+/// 上で 503 を返し、待たせない。
+///
+/// 同値を `servo-host/src/relay.rs` の `MAX_CONNECTIONS` に複製している（別 workspace のため
+/// import できない）。変えるときは両方を同時に変える。
 pub const MAX_CONCURRENT_CONNECTIONS: usize = 128;
+/// 名前解決スレッドの同時数の上限（期限切れで切り離されたものを含む）。
+///
+/// getaddrinfo は中断できず、`connect_timeout` で待ちを打ち切った後もスレッドは戻るまで残る。
+/// 残存数がこの値に達している間は新しい名前の解決を始めず、502 を返す（`resolve_failed` に
+/// 数える。期限切れと区別するには呼び出し回数と応答時間を見る）。IP リテラルの宛先は
+/// この枠を使わない。servo-host の中継の `MAX_DIAL_THREADS` が同じ考え方（#1444）。
+pub const MAX_RESOLVER_THREADS: usize = 32;
 /// 名前解決の待ち時間と、上流への TCP 接続全体の時間（それぞれこの値まで。複数アドレスを
 /// 試す場合も接続は合計でこの値まで）。
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// トンネル確立後の無通信（双方向とも）の上限。片方向だけ流れ続ける長いダウンロードは切らない。
+///
+/// 根拠（#1444）: Servo 0.7.0 の HTTP クライアント（servo-net の `create_http_client`）は
+/// hyper-util の既定のプール設定を使い、アイドルの接続を約 90 秒で自分から閉じる。この値は
+/// プールを経由しない長い接続（WebSocket 等）向けの安全網で、Servo 側より長い。
+/// `servo-host/src/relay.rs` の `IDLE_TIMEOUT` に同値を複製している。変えるときは両方を同時に変える。
 pub const IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 /// 停止フラグとアイドル判定を見る周期の上限。
 pub const TUNNEL_TICK: Duration = Duration::from_millis(250);
@@ -142,7 +165,8 @@ pub trait EgressResolver: Send + Sync {
 ///
 /// 注意: getaddrinfo は同期でブロックし中断できない。プロキシ側が別スレッドで呼び、
 /// `connect_timeout` を期限に待ちを打ち切る（停止フラグも見る）。期限後も解決スレッドは
-/// 戻るまで残るが、残存数は上限（32）で有界で、超えた分は解決せず 502 を返す。
+/// 戻るまで残るが、残存数は上限（[`MAX_RESOLVER_THREADS`]）で有界で、超えた分は解決せず
+/// 502 を返す。
 #[derive(Clone, Copy, Debug, Default)]
 pub struct SystemResolver;
 
@@ -156,6 +180,10 @@ impl EgressResolver for SystemResolver {
 #[derive(Clone, Default)]
 pub struct EgressProxyConfig {
     /// 内部アドレス宛てを許すか（既定 false。core の `FetchOptions` と同じ意味）。
+    ///
+    /// 注意: true にすると宛先の IP 検査が全 IP で通る。[`EgressEndpoint::LoopbackTcp`]
+    /// （認証なし・同一ホストの他プロセスからも届く）と組み合わせると、ローカルの内部ネットワーク
+    /// 向けの開放プロキシになり得る。本番の既定は false のまま使うこと（#1444）。
     pub allow_private_network_access: bool,
     /// 上限値。
     pub limits: EgressProxyLimits,
@@ -164,7 +192,8 @@ pub struct EgressProxyConfig {
 }
 
 impl EgressProxyConfig {
-    /// 内部アドレス宛てを許すかを設定する。
+    /// 内部アドレス宛てを許すかを設定する。true の危険性は
+    /// [`EgressProxyConfig::allow_private_network_access`] を参照（既定は false）。
     #[must_use]
     pub fn with_allow_private_network_access(mut self, allow: bool) -> Self {
         self.allow_private_network_access = allow;
@@ -197,9 +226,19 @@ impl EgressProxyConfig {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum EgressEndpoint {
     /// 指定ディレクトリ配下の UDS（Linux 向け）。ディレクトリは絶対パス・非 symlink・0700 で、
-    /// ソケット名は固定の `egress-proxy.sock`（外部文字列をパスに入れない）。ソケットは 0600。
+    /// 所有者がこのプロセスの uid であること。ソケット名は固定の `egress-proxy.sock`
+    /// （外部文字列をパスに入れない）。ソケットは 0600。
+    ///
+    /// 呼び出し側の契約（#1444）: 自プロセスが作った 0700 のディレクトリ（祖先も他ユーザーから
+    /// 書けない）を渡す。検査から bind までの間にディレクトリを差し替えて元に戻す競合は
+    /// `openat` 系なしでは閉じきれないため、この契約を前提に受け入れている。bind の前後で
+    /// (dev, ino, uid, mode) を照合して窓を縮めている。
     UnixSocketIn(PathBuf),
     /// `127.0.0.1:0` の TCP（macOS 向け。loopback 以外へは bind しない）。
+    ///
+    /// 認証が無く、同一ホストの他プロセスからも届く。[`EgressProxyConfig::allow_private_network_access`]
+    /// を true にするとローカル向けの開放プロキシになり得る（既定は false）。macOS では
+    /// Seatbelt 側で届く先を絞る前提（#1444）。
     LoopbackTcp,
 }
 
@@ -258,7 +297,8 @@ pub struct EgressProxyStats {
 pub enum EgressProxyError {
     /// この OS では未対応（Windows）。
     UnsupportedPlatform,
-    /// ソケット用ディレクトリが絶対パス・非 symlink・0700 を満たさない。
+    /// ソケット用ディレクトリが絶対パス・非 symlink・0700・自プロセスの uid 所有を満たさない
+    /// （bind の前後で差し替わった場合を含む）。
     InvalidSocketDir,
     /// ソケットパスが `sun_path` の上限を超える。
     SocketPathTooLong,
@@ -278,7 +318,7 @@ impl fmt::Display for EgressProxyError {
             Self::UnsupportedPlatform => write!(f, "egress proxy is not supported on this OS"),
             Self::InvalidSocketDir => write!(
                 f,
-                "socket directory must be an absolute, non-symlink directory with mode 0700"
+                "socket directory must be an absolute, non-symlink directory with mode 0700 owned by this process"
             ),
             Self::SocketPathTooLong => write!(f, "socket path is too long for sun_path"),
             Self::AlreadyExists => write!(f, "socket path already exists"),

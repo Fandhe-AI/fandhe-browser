@@ -5,10 +5,15 @@
 //! accept スレッド上で 503 を返して閉じる（無制限にスレッドが増える経路を作らない）。
 //! ハンドラは要求解析（[`super::request`]）→ 解決・全 IP 検査 → 検査済み `SocketAddr` への接続
 //! → 200 応答 → 双方向転送の順に進む。
+//!
+//! 枠の考え方（#1444）: 同時接続数の枠はトンネル確立後も握り続け、アイドルは
+//! [`super::IDLE_TIMEOUT`] で有界にする。ハンドシェイク中との別枠にはしない（servo-host の
+//! 中継が両者を区別できず、上限を揃えられないため）。名前解決スレッドは別に
+//! [`super::MAX_RESOLVER_THREADS`] で有界。
 
 use std::io::{self, Read, Write};
 use std::net::{Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream};
-use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -22,7 +27,7 @@ use super::request::{ConnectTarget, Host, Reject, parse_connect, read_request_he
 use super::{
     BoundEndpoint, CoreAddressPolicy, EgressAddressPolicy, EgressEndpoint, EgressProxyConfig,
     EgressProxyError, EgressProxyLimits, EgressProxyStats, EgressResolver, MAX_CONNECT_ATTEMPTS,
-    SystemResolver,
+    MAX_RESOLVER_THREADS, SystemResolver,
 };
 
 /// UDS のソケットファイル名（固定。外部文字列をパスに入れない）。
@@ -33,9 +38,6 @@ const ACCEPT_POLL: Duration = Duration::from_millis(25);
 const REJECT_WRITE_TIMEOUT: Duration = Duration::from_millis(100);
 /// エラー応答の書き込み timeout。
 const RESPONSE_WRITE_TIMEOUT: Duration = Duration::from_secs(1);
-/// 名前解決用スレッドの同時数の上限。解決は同期 API（getaddrinfo）で中断できないため、
-/// 期限後に切り離したスレッドが残る。残存数をこの値で有界にする（超えたら解決せず 502）。
-const MAX_RESOLVER_THREADS: usize = 32;
 /// 転送バッファ長。
 const PUMP_BUF: usize = 16 * 1024;
 
@@ -265,12 +267,62 @@ fn max_socket_path_len() -> usize {
     }
 }
 
+/// ソケット用ディレクトリの検査対象の属性（bind 前後の照合用。純関数で検査するため値で持つ）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DirFacts {
+    is_dir: bool,
+    mode: u32,
+    uid: u32,
+    dev: u64,
+    ino: u64,
+}
+
+impl DirFacts {
+    fn of(meta: &std::fs::Metadata) -> Self {
+        Self {
+            is_dir: meta.file_type().is_dir(),
+            mode: meta.mode(),
+            uid: meta.uid(),
+            dev: meta.dev(),
+            ino: meta.ino(),
+        }
+    }
+}
+
+/// bind 前後のディレクトリ属性と、bind したソケットの所有者 uid を照合する（SEC-2・#1444）。
+///
+/// std に `geteuid` が無い（libc 等は追加しない）ため、bind 直後のソケットはこのプロセスが作った
+/// ものという前提で、その uid をプロセスの uid の代わりに使う。ディレクトリの所有者がソケットの
+/// uid と違う、bind の間に dev・ino・uid が変わった、ディレクトリでない、group/other に権限がある
+/// のいずれかなら拒否する。
+fn verify_socket_dir(
+    before: DirFacts,
+    after: DirFacts,
+    socket_uid: u32,
+) -> Result<(), EgressProxyError> {
+    let ok = before.is_dir
+        && after.is_dir
+        && before.mode & 0o077 == 0
+        && after.mode & 0o077 == 0
+        && after.uid == socket_uid
+        && (before.dev, before.ino, before.uid) == (after.dev, after.ino, after.uid);
+    if ok {
+        Ok(())
+    } else {
+        Err(EgressProxyError::InvalidSocketDir)
+    }
+}
+
+/// `dir` 配下に UDS を bind する。`dir` は呼び出し側が自プロセスで作った 0700 のディレクトリ
+/// （[`EgressEndpoint::UnixSocketIn`] の契約）。stat から bind までの競合は bind の前後の
+/// 照合（[`verify_socket_dir`]）で縮めるが、`openat` 系なしでは閉じきれず契約を前提にする。
 fn bind_unix(dir: &Path) -> Result<(Listener, BoundEndpoint, PathBuf), EgressProxyError> {
     if !dir.is_absolute() {
         return Err(EgressProxyError::InvalidSocketDir);
     }
     let meta = std::fs::symlink_metadata(dir).map_err(|_| EgressProxyError::InvalidSocketDir)?;
-    if !meta.file_type().is_dir() || meta.permissions().mode() & 0o077 != 0 {
+    let before = DirFacts::of(&meta);
+    if !before.is_dir || before.mode & 0o077 != 0 {
         return Err(EgressProxyError::InvalidSocketDir);
     }
     let path = dir.join(SOCKET_NAME);
@@ -283,6 +335,19 @@ fn bind_unix(dir: &Path) -> Result<(Listener, BoundEndpoint, PathBuf), EgressPro
     // bind 直後は umask 由来の権限だが、親ディレクトリが 0700 のためこの間に他ユーザーは
     // 到達できない。直後に 0600 へ絞る。
     let listener = UnixListener::bind(&path).map_err(EgressProxyError::Bind)?;
+    let verified = (|| {
+        let sock =
+            std::fs::symlink_metadata(&path).map_err(|_| EgressProxyError::InvalidSocketDir)?;
+        let after = std::fs::symlink_metadata(dir)
+            .map_err(|_| EgressProxyError::InvalidSocketDir)
+            .map(|m| DirFacts::of(&m))?;
+        verify_socket_dir(before, after, sock.uid())
+    })();
+    if let Err(e) = verified {
+        drop(listener);
+        remove_socket_file(&path);
+        return Err(e);
+    }
     if let Err(e) = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)) {
         drop(listener);
         remove_socket_file(&path);
@@ -681,4 +746,56 @@ fn write_all_checked(
 fn abort(a: &Conn, b: &Conn) {
     a.shutdown(Shutdown::Both);
     b.shutdown(Shutdown::Both);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn facts() -> DirFacts {
+        DirFacts {
+            is_dir: true,
+            mode: 0o040_700,
+            uid: 1000,
+            dev: 7,
+            ino: 42,
+        }
+    }
+
+    /// SEC-2（#1444）: すべて一致すれば通る。
+    #[test]
+    fn sec_2_socket_dir_matching_facts_is_accepted() {
+        assert!(verify_socket_dir(facts(), facts(), 1000).is_ok());
+    }
+
+    /// SEC-2（#1444）: ディレクトリの所有者がソケットの uid（自プロセス）と違えば拒否する。
+    #[test]
+    fn sec_2_socket_dir_owner_mismatch_is_rejected() {
+        let other = DirFacts { uid: 0, ..facts() };
+        let r = verify_socket_dir(other, other, 1000);
+        assert!(matches!(r, Err(EgressProxyError::InvalidSocketDir)));
+    }
+
+    /// SEC-2（#1444）: bind の間に dev・ino が変わった、または権限が緩んだら拒否する。
+    #[test]
+    fn sec_2_socket_dir_swapped_during_bind_is_rejected() {
+        for after in [
+            DirFacts { ino: 43, ..facts() },
+            DirFacts { dev: 8, ..facts() },
+            DirFacts {
+                mode: 0o040_755,
+                ..facts()
+            },
+            DirFacts {
+                is_dir: false,
+                ..facts()
+            },
+        ] {
+            let r = verify_socket_dir(facts(), after, 1000);
+            assert!(
+                matches!(r, Err(EgressProxyError::InvalidSocketDir)),
+                "{after:?}"
+            );
+        }
+    }
 }

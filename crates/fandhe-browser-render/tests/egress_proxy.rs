@@ -20,14 +20,14 @@ mod unix_tests {
     use std::os::unix::fs::{DirBuilderExt, FileTypeExt, PermissionsExt};
     use std::os::unix::net::UnixStream;
     use std::path::PathBuf;
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Condvar, Mutex};
     use std::thread;
     use std::time::{Duration, Instant};
 
     use fandhe_browser_render::egress_proxy::{
         BoundEndpoint, EgressAddressPolicy, EgressEndpoint, EgressProxy, EgressProxyConfig,
-        EgressProxyError, EgressProxyLimits, EgressResolver,
+        EgressProxyError, EgressProxyLimits, EgressResolver, MAX_RESOLVER_THREADS,
     };
 
     static DIR_SEQ: AtomicUsize = AtomicUsize::new(0);
@@ -536,5 +536,124 @@ mod unix_tests {
         });
         let r = EgressProxy::start(EgressEndpoint::LoopbackTcp, cfg);
         assert!(matches!(r, Err(EgressProxyError::InvalidConfig)));
+    }
+
+    /// RENDER-3（#1444）: アイドルのトンネルも接続枠を握り、アイドル timeout で閉じるまで返らない。
+    #[test]
+    fn render_3_idle_tunnels_hold_cap_until_idle_timeout() {
+        let e = echo();
+        let cfg = EgressProxyConfig::default()
+            .with_allow_private_network_access(true)
+            .with_limits(EgressProxyLimits {
+                max_connections: 1,
+                idle_timeout: Duration::from_millis(300),
+                ..Default::default()
+            });
+        let p = EgressProxy::start(EgressEndpoint::LoopbackTcp, cfg).unwrap();
+        let mut first = open(p.endpoint());
+        first
+            .write_all(connect_req("127.0.0.1", e.addr.port()).as_bytes())
+            .unwrap();
+        assert!(read_head(&mut *first).starts_with("HTTP/1.1 200 "));
+        // 通信しないトンネルが枠を握っている間、次の接続は 503。
+        let mut second = open(p.endpoint());
+        assert!(read_head(&mut *second).starts_with("HTTP/1.1 503 "));
+        assert_eq!(p.stats().over_capacity, 1);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while p.stats().idle_timeout < 1 {
+            assert!(Instant::now() < deadline, "idle timeout did not fire");
+            thread::sleep(Duration::from_millis(20));
+        }
+        // 枠の返却はハンドラの終了後。空くまで待ってから 3 本目が通ることを確かめる。
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let mut third = open(p.endpoint());
+            third
+                .write_all(connect_req("127.0.0.1", e.addr.port()).as_bytes())
+                .unwrap();
+            if read_head(&mut *third).starts_with("HTTP/1.1 200 ") {
+                break;
+            }
+            assert!(Instant::now() < deadline, "slot was not released");
+            thread::sleep(Duration::from_millis(20));
+        }
+        drop(first);
+    }
+
+    /// 解除されるまでブロックし、呼び出し回数を数えるリゾルバ。
+    struct GateResolver {
+        calls: Arc<AtomicUsize>,
+        open: Arc<(Mutex<bool>, Condvar)>,
+    }
+    impl EgressResolver for GateResolver {
+        fn resolve(&self, _host: &str, _port: u16) -> std::io::Result<Vec<SocketAddr>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let (lock, cv) = &*self.open;
+            let mut released = lock.lock().unwrap();
+            while !*released {
+                released = cv.wait(released).unwrap();
+            }
+            Ok(Vec::new())
+        }
+    }
+
+    /// RENDER-3（#1444）: 解決スレッドの残存数が上限に達したら、解決せずに 502 を即返す。
+    /// 解除されて枠が戻れば、再び解決が呼ばれる。
+    #[test]
+    fn render_3_resolver_thread_cap_returns_502_without_resolving() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let cfg = EgressProxyConfig::default()
+            .with_resolver(Arc::new(GateResolver {
+                calls: Arc::clone(&calls),
+                open: Arc::clone(&gate),
+            }))
+            .with_limits(EgressProxyLimits {
+                connect_timeout: Duration::from_secs(1),
+                ..Default::default()
+            });
+        let p = EgressProxy::start(EgressEndpoint::LoopbackTcp, cfg).unwrap();
+        let ep = p.endpoint().clone();
+        let clients: Vec<_> = (0..MAX_RESOLVER_THREADS)
+            .map(|_| {
+                let ep = ep.clone();
+                thread::spawn(move || {
+                    let mut c = open(&ep);
+                    c.write_all(connect_req("gate.example", 443).as_bytes())
+                        .unwrap();
+                    read_head(&mut *c)
+                })
+            })
+            .collect();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while calls.load(Ordering::SeqCst) < MAX_RESOLVER_THREADS {
+            assert!(Instant::now() < deadline, "resolvers did not start");
+            thread::sleep(Duration::from_millis(5));
+        }
+        // 上限到達後の 1 本: 解決は呼ばれず、connect_timeout を待たずに 502。
+        let started = Instant::now();
+        let mut over = open(&ep);
+        over.write_all(connect_req("gate.example", 443).as_bytes())
+            .unwrap();
+        assert!(read_head(&mut *over).starts_with("HTTP/1.1 502 "));
+        assert!(started.elapsed() < Duration::from_millis(800));
+        assert_eq!(calls.load(Ordering::SeqCst), MAX_RESOLVER_THREADS);
+        for c in clients {
+            assert!(c.join().unwrap().starts_with("HTTP/1.1 502 "));
+        }
+        // 解除すると、切り離されていたスレッドが戻って枠が返り、解決が再び呼ばれる。
+        {
+            let (lock, cv) = &*gate;
+            *lock.lock().unwrap() = true;
+            cv.notify_all();
+        }
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while calls.load(Ordering::SeqCst) == MAX_RESOLVER_THREADS {
+            assert!(Instant::now() < deadline, "resolver slot was not released");
+            let mut c = open(&ep);
+            c.write_all(connect_req("gate.example", 443).as_bytes())
+                .unwrap();
+            assert!(read_head(&mut *c).starts_with("HTTP/1.1 502 "));
+        }
     }
 }
