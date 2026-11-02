@@ -397,6 +397,26 @@ mod unix_tests {
         assert!(started.elapsed() < Duration::from_secs(3));
     }
 
+    /// RENDER-3: 到達しない上流への接続待機中でも停止（Drop 相当）で短時間に中断される。
+    /// 環境によっては即座に接続失敗（502）になるため、503 か 502 のいずれかで、
+    /// connect_timeout（10 s）を待たず 3 s 未満で終わることを確認する。
+    #[test]
+    fn render_3_shutdown_interrupts_pending_upstream_connect() {
+        let p = EgressProxy::start(EgressEndpoint::LoopbackTcp, allow_private()).unwrap();
+        let mut c = open(p.endpoint());
+        c.write_all(connect_req("10.255.255.1", 443).as_bytes())
+            .unwrap();
+        thread::sleep(Duration::from_millis(300));
+        let started = Instant::now();
+        p.shutdown();
+        let head = read_head(&mut *c);
+        assert!(
+            head.starts_with("HTTP/1.1 503 ") || head.starts_with("HTTP/1.1 502 "),
+            "unexpected head: {head}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(3));
+    }
+
     /// RENDER-3: 相手が読まず反対方向が EOF 済みでも、停止でトンネルが短時間で閉じる。
     #[test]
     fn render_3_shutdown_closes_tunnel_blocked_on_write() {

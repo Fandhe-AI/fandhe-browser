@@ -449,17 +449,28 @@ fn connect_upstream(
         return None;
     }
     let started = Instant::now();
-    for addr in addrs.iter().take(MAX_CONNECT_ATTEMPTS) {
-        let remaining = shared
-            .limits
-            .connect_timeout
-            .saturating_sub(started.elapsed());
-        if remaining.is_zero() {
-            break;
-        }
-        // 検査済みの SocketAddr へそのまま接続する（名前を引き直さない）。
-        if let Ok(s) = TcpStream::connect_timeout(addr, remaining) {
-            return Some(s);
+    let tick = shared.limits.tick();
+    'addrs: for addr in addrs.iter().take(MAX_CONNECT_ATTEMPTS) {
+        // 接続待機も停止対象にする（RENDER-3）。tick 単位に刻み、各周期で停止を確認する。
+        loop {
+            if shared.stop.load(Ordering::Relaxed) {
+                write_status(conn, 503, "Service Unavailable");
+                return None;
+            }
+            let remaining = shared
+                .limits
+                .connect_timeout
+                .saturating_sub(started.elapsed());
+            if remaining.is_zero() {
+                break 'addrs;
+            }
+            // 検査済みの SocketAddr へそのまま接続する（名前を引き直さない）。
+            match TcpStream::connect_timeout(addr, tick.min(remaining)) {
+                Ok(s) => return Some(s),
+                // 周期の期限切れは同じアドレスで待機を続ける。それ以外は次のアドレスへ。
+                Err(e) if e.kind() == io::ErrorKind::TimedOut => {}
+                Err(_) => continue 'addrs,
+            }
         }
     }
     shared.counters.bump(Event::UpstreamFailed);
