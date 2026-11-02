@@ -118,6 +118,11 @@ def fixtures_warmup_route() -> str:
     return page_templates.WARMUP_ROUTE
 
 
+# 警告末尾の注記。拒否ログの自己検査があるのは seatbelt だけなので、他モードでは「不成立」と書かない（Issue #1422）。
+SELF_CHECK_NOTE = {"seatbelt": "deny log self-check failed (fail-closed)"}
+SELF_CHECK_NOTE_NONE = "no deny log self-check in this mode; possible isolation hole"
+
+
 def auxiliary_outer_receipts(mode: str, outer: dict[str, int], warmup_outer: Any) -> dict[str, int]:
     """隔離モードで外側に届いた予熱・診断経路の受信を `{経路名: 件数}` で返す（Issue #1422・TASK-38・RENDER-3）。
 
@@ -749,10 +754,10 @@ def redirect_diag_block(mode: str, data: dict[str, Any], outer: dict[str, int]) 
         for r in fixtures_diag_routes():
             if outer.get(r, 0) >= 1:
                 out.append(f"- WARNING: diagnostic route {r} has {outer[r]} outer receipt(s) in an isolated mode; "
-                           "deny log self-check failed (fail-closed)")
+                           + SELF_CHECK_NOTE.get(mode, SELF_CHECK_NOTE_NONE))
     if wu is not None and mode in judge.ISOLATED_MODES and (wu.get("outer") or 0) >= 1:
         out.append(f"- WARNING: warm-up route has {wu['outer']} outer receipt(s) in an isolated mode; "
-                   "deny log self-check failed (fail-closed)")
+                   + SELF_CHECK_NOTE.get(mode, SELF_CHECK_NOTE_NONE))
     for key in ("unattributed_routes", "diagnostic_info_debug_dest_counts"):
         if key in dl:
             out.append(f"- {key}: {dl[key]}")
@@ -792,7 +797,8 @@ def summarize(results: dict[str, Any]) -> str:
                 lines += ["", f"{key} (last 2 KiB at most):", "", "```text", safe, "```"]
         lines.append(f"- guard: {inner.get('guard')}")
         if data.get("auxiliary_outer_receipts"):
-            lines.append(f"- auxiliary outer receipts (self-check failed): {data['auxiliary_outer_receipts']}")
+            label = "self-check failed" if mode == "seatbelt" else "no deny log self-check in this mode"
+            lines.append(f"- auxiliary outer receipts ({label}): {data['auxiliary_outer_receipts']}")
         if data.get("unavailable"):
             lines.append(f"- mode unavailable: {data['unavailable']}")
         ac = data.get("appcontainer")
