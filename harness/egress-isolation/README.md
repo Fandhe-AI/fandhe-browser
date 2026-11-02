@@ -123,7 +123,7 @@ macOS・Windows の GitHub ホステッドランナー。結果は #1003 に記�
     macOS では connect が syscall で拒否されソケットが現れない。`servo-host/src` に接続試行のログも無く、追加には Servo の
     net スタックの改変か servo-host の改修が要る。
   - macOS は sudo なしの `log show --style ndjson`（非特権）で拒否行を取る（#1402。xos-measure の実測 run 41309744793・41310673642・41313641135 で、
-    sudo・`log config` なしでも上記 macOS 26 のワイルドカード形式の拒否行が取れ、TCP 4 経路（img・fetch・ws・internal）が pass〔redirect は unobservable。#1415 で拒否行の取りこぼしを件数・時間の別に調査中で、pass とは断定しない〕・自己検査成立。オーナー判断 2026-11-01 で
+    sudo・`log config` なしでも上記 macOS 26 のワイルドカード形式の拒否行が取れ、TCP 4 経路（img・fetch・ws・internal）が pass・自己検査成立。redirect は予熱つきの実測（#1415。run 41401095620・41402439545）で pass になった（下の予熱の節の結果）。オーナー判断 2026-11-01 で
     sudo つき拒否ログの opt-in と `log config` の操作を削除した）。UDP の自己照合が成り立てば TCP 5 経路の deny 行が試行の根拠になり、
     成り立たなければ理由（`deny log unavailable: ...`）つきの `unobservable`。`log stream`・`log erase` など管理者操作は実装しない。
   - 後続の候補（今回は入れない）: SBPL の `(with message ...)` 等の修飾子、`log stream` の並行収集。
@@ -160,8 +160,13 @@ macOS・Windows の GitHub ホステッドランナー。結果は #1003 に記�
       `deny_log.first_deny`（`index`: 遮断読み込みの何件目か、`route`、`start_ms`、`missed_before`: それ以前に拒否行が 0 件だった遮断読み込みの数）で、
       拒否行が出始める位置を 1 か所で比べる。int と固定語彙だけで、URL・拒否行の本文は載せない。
     - 読み方: `first_deny.index`（件数）がランをまたいでそろえば件数によるため、K を増やして確定させる。`start_ms`（時間）がそろえば時間によるため、
-      `--warmup-wait-ms` で待ちを足す。どちらもそろわず redirect と img が直らなければ、既知の制約（案 C）として記録するかをオーナーが判断する。
-      切り分けの例: `K=5・W=0`（既定）、`K=1・W=5000`、`K=0・W=10000`。
+      `--warmup-wait-ms` で待ちを足す。切り分けの例: `K=5・W=0`（既定）、`K=1・W=5000`、`K=0・W=10000`。
+    - 結果（#1415・xos-measure の suite `egress-isolation`・macOS 26。予熱は判定・集計に入れない）: 既定の予熱 5 回で 2 回実測し、既定は 5 回で確定する。
+      run 41401095620（main 653c5ebb）と run 41402439545（main 02dba6fc）の両方で、予熱 1〜3 回目の拒否行は 0 件、4・5 回目が各 1 件だった。
+      拒否行が出始めたのは 4 回目で、開始からそれぞれ 8601 ms と 8548 ms。両方とも redirect・img・fetch・ws・internal・udp_direct が pass で、
+      自己検査も成立した（予熱・診断経路の外側受信は 0 件）。
+    - 未確定: 各読み込みは約 2.8 秒おきに始まるため、取りこぼしが件数（先頭 3 件）によるのか時間（約 8.5 秒まで）によるのかは、この 2 回では区別できていない。
+      どちらにしても、既定の予熱 5 回で判定経路はその取りこぼしの範囲の外に出る。切り分けの例（`K=1・W=5000` 等）は未実施。
     - 起動: xos-measure の入力 `egress_warmup_count`・`egress_warmup_wait_ms`（macOS の suite のみ。文字列で受け、シェルで正規表現と範囲を検証してから渡す）。
       `measure.py` は macOS 以外で指定すると exit 2。上限は資源の枯渇とジョブの超過を防ぐためのもの。
     - macOS だけ有効（`--diag-routes` と同じゲート）。Linux・Windows には導入しない。判定基準（`judge.py`）・管理者操作の不使用は変えない。
