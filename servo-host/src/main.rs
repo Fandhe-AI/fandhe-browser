@@ -60,7 +60,9 @@ fn finish(code: u8) -> ExitCode {
     if EXIT_BEFORE_SERVO_TEARDOWN {
         use std::io::Write;
         let _ = std::io::stdout().flush();
-        eprintln!("host exiting before servo teardown");
+        // stderr が閉じていても panic しない（release は `panic = "abort"` で、`eprintln!` の panic は
+        // `process::exit` に届く前に abort になるため）。書き込み・flush の失敗は無視する。
+        let _ = writeln!(std::io::stderr(), "host exiting before servo teardown");
         let _ = std::io::stderr().flush();
         std::process::exit(i32::from(code));
     }
