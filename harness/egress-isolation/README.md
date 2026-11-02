@@ -80,6 +80,51 @@ measure.py は全モードで同一バイナリ（sha256 一致。`binary_match`
   プロファイル）経由でのみ netns を作れる。ns 内に CAP_NET_ADMIN は無く、veth は作れない。
 - 内側の `/etc/hosts` は bind マウント（docker は `--add-host`）。Servo が参照することはベースラインの受信で確認する。
 
+## proxy-relay（netns 内の中継 → UDS → CONNECT プロキシ。#1431）
+
+設計 §8.1 は Linux の方式を B（bwrap `--unshare-net`）とし、外への通信は本体の許可リスト付き CONNECT プロキシだけを通す想定にした。
+`--unshare-net` の中からは親の loopback に届かないため、「netns 内のクライアント → netns 内 `127.0.0.1:R`（中継）→ bind マウントした
+UDS → 親の CONNECT プロキシ → 宛先」の構成が成り立つかを、**Servo を使わず**に `relay_probe.py`（単独のプローブ。`measure.py` とは独立。
+結果 JSON の `mode` は `proxy-relay`）で測る。
+
+```bash
+python3 -I -B harness/egress-isolation/relay_probe.py --out "$(mktemp -d)"   # 要 bwrap・Linux のみ
+```
+
+5 項目（判定は `judge_relay`。pass / fail / unobservable の fail-closed）:
+
+| 項目 | 内容 |
+| ---- | ---- |
+| `lo` | `--unshare-net` の中で `lo` に bind・listen し、同じ netns から往復できるか |
+| `uds` | 親で listen する UDS を `--bind`（rw）と `--ro-bind`（ro）で `--tmpfs /run` の上に見せ、中から両方 connect できるか |
+| `relay` | 中継を通して `CONNECT` → `200` → nonce の往復まで届くか（陽性対照。外側 listener の受信とプロキシの `allowed` も要る） |
+| `direct` | 中継を通さない直接 connect が netns で失敗するか（陰性対照。ベースライン〔`--unshare-net` なし〕で届くことが前提。プロキシ経由でない外側の受信が 0 件） |
+| `ip_recheck` | 許可リストに載った 127.0.0.2 への CONNECT を、IP の再検査（`ip_denied`）で 403 にできるか（拒否理由が `ip_denied` でなければ unobservable） |
+
+- テスト用プロキシのポリシーは**測定用のフィクスチャ**で、本番のプロキシではない。本番のポリシーは loopback を含む内部アドレスをすべて拒否するはずで、
+  ここでは 127.0.0.4 を許可先の代役にしているにすぎない。評価順は 127/8 外の拒否（安全柵）→ IP の再検査 → 許可リスト。authority は IPv4 リテラルのみ（名前解決しない）。
+- 本番のプロキシの実装・`servo-host` への注入・HostProcess への bwrap の組み込みは設計 §7 の承認事項のまま。ここで確かめたのは構成の成立性だけ。
+- 範囲外: 名前解決後の再検査（DNS rebinding）、CONNECT 上の TLS、Servo 0.7.0 の `Tunnel` との実接続。
+- 安全上の規則: 宛先は 127.0.0.0/8 のダミーのみ（プロキシは 127/8 外へ connect しない）。UDS は 0700 のディレクトリ内。ヘッダ長・同時接続・転送量・アイドル時間に上限。結果に nonce・要求本文は残さない。自己テストは bwrap を使わない（`make check-egress-isolation`）。
+
+### 実測結果（2026-11-02。コミット 06d4ba30）
+
+| 項目 | 値 |
+| ---- | -- |
+| カーネル | 7.0.0-34-generic（x86_64） |
+| bwrap | bubblewrap 0.11.1 |
+| AppArmor | `kernel.apparmor_restrict_unprivileged_userns=1`（制限あり）。bwrap 経由で netns を作れた |
+
+| 項目 | 結果 | 観測 |
+| ---- | ---- | ---- |
+| `lo` | pass | netns 内の 127.0.0.1 で bind・listen・往復に成功 |
+| `uds` | pass | rw・ro の両マウントに connect でき、プロキシが 2 接続を数えた |
+| `relay` | pass | 200・nonce 16 バイトが一致・外側 listener の受信 1 件 |
+| `direct` | pass | netns の直接 connect は `ECONNREFUSED`（ベースラインでは届いた）。プロキシ経由でない受信 0 件 |
+| `ip_recheck` | pass | 127.0.0.2 は 403（`ip_denied` 1 件）。内部 listener の受信 0 件（ベースラインでは 1 件） |
+
+結論: この環境では構成が成り立つ。他の環境（AppArmor の制限が無い環境・6.7 未満のカーネル）は未測定。
+
 ## macOS・Windows（#1387）
 
 `xos-measure.yml` の suite `egress-isolation`（`gh workflow run xos-measure.yml -f suite=egress-isolation`。
@@ -214,6 +259,6 @@ macOS・Windows の GitHub ホステッドランナー。結果は #1003 に記�
 
 ## 承認事項（この issue では実装しない）
 
-Landlock ルールの適用（`landlock` クレートまたは `unsafe`）・seccomp-bpf・許可リスト付きプロキシと netns 内への中継・
+Landlock ルールの適用（`landlock` クレートまたは `unsafe`）・seccomp-bpf・許可リスト付きプロキシ（本番の実装。netns 内の中継の成立性だけは #1431 の proxy-relay で確認済み）・
 Servo 自身の DNS/UDP の外部観測・Windows の TCP 経路の試行の観測手段（WFP の監査等）・古いカーネルでの再測定。
 （`CheckNetIsolation LoopbackExempt` は #1401 で承認済みの opt-in〔xos-measure の Windows のみ〕として実装済み。Windows の AppContainer ランチャー〔ctypes〕は #1396 でオーナー承認のうえ実装済み。範囲はこのディレクトリの Python ハーネスに限る。）

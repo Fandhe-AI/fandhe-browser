@@ -125,7 +125,7 @@ Windows の補足（#1401）: `xos-measure.yml` の Windows ジョブに限り�
 
 ### 6.3 実施の扱い
 
-- `xos-measure.yml`（手動専用・required ではない）への suite 追加と測定ハーネスの実装は後続 issue（infra-builder・render-builder）とする。本 issue では計画を書くだけにする。Linux 版のハーネスは `harness/egress-isolation/`（#1377・#1380）で実装済み（結果は §6.4）。macOS・Windows 版は #1387 で同ハーネスを拡張し、`xos-measure.yml` の suite `egress-isolation` として実装した（macOS は Seatbelt の `seatbelt`、Windows は `baseline` と AppContainer。AppContainer のランチャーは #1396 でオーナー承認〔2026-11-01。`harness/egress-isolation/` の Python 計測ハーネスに限る ctypes の Win32 FFI。本体 crate の FFI・`unsafe` は対象外〕のうえ実装し、loopback 遮断と egress 遮断の切り分けは Servo を使わない preflight で行う。結果は #1003 に記録し、実測後に本書へ要約する）。macOS の TCP 経路の試行は、拒否ログだけでは観測できなかったため #1395 で失敗経路のビーコン（許可オリジンへの GET。補助情報のみで試行の根拠にしない。試行の根拠は UDP の errno）と拒否ログの診断・自己検査を加えた（手段の詳細は `harness/egress-isolation/README.md`）。TCP が観測不能だった原因は、macOS 26 の拒否行の形式（`deny(1) network-outbound <word>:*:<port>`。宛先アドレスが `*`）が想定の IPv4 形式と異なっていたことだけだった。#1409 でこれを追加形式として受理し、帰属は「ホストの pid」と「その run の一時 listener ポート」の両方一致に限る（アドレス・プロトコルは検証せず、ポートが重複する場合は帰属しない）。拒否ログの収集は sudo なし（非特権）の `log show` で足りる。sudo つき `log show --info --debug`・`log config` によるログレベル変更・`--seatbelt-sudo-log` の opt-in は #1402 で一時導入したが、実測（xos-measure run 41309744793・41310673642・41313641135）で非特権の `log show` でも拒否行が同じだけ取れ、TCP 4 経路（img・fetch・ws・internal）と UDP の udp_direct が pass・自己検査が成立したため、オーナー判断（2026-11-01）により #1414 で削除した。redirect は、#1415 の予熱（既定 5 回。判定・集計には使わない）を入れた macOS 26 の実測で pass になった（run 41401095620・41402439545。判定基準は変えていない。詳細は `harness/egress-isolation/README.md` の予熱の節）。ランナー設定の `sudo ifconfig lo0 alias 127.0.0.2/127.0.0.3` は残る（結果は #1003）
+- `xos-measure.yml`（手動専用・required ではない）への suite 追加と測定ハーネスの実装は後続 issue（infra-builder・render-builder）とする。本 issue では計画を書くだけにする。Linux 版のハーネスは `harness/egress-isolation/`（#1377・#1380）で実装済み（結果は §6.4）。Linux の netns 内の中継から UDS 経由でプロキシへ届くかは #1431 で実測した（§6.5）。macOS・Windows 版は #1387 で同ハーネスを拡張し、`xos-measure.yml` の suite `egress-isolation` として実装した（macOS は Seatbelt の `seatbelt`、Windows は `baseline` と AppContainer。AppContainer のランチャーは #1396 でオーナー承認〔2026-11-01。`harness/egress-isolation/` の Python 計測ハーネスに限る ctypes の Win32 FFI。本体 crate の FFI・`unsafe` は対象外〕のうえ実装し、loopback 遮断と egress 遮断の切り分けは Servo を使わない preflight で行う。結果は #1003 に記録し、実測後に本書へ要約する）。macOS の TCP 経路の試行は、拒否ログだけでは観測できなかったため #1395 で失敗経路のビーコン（許可オリジンへの GET。補助情報のみで試行の根拠にしない。試行の根拠は UDP の errno）と拒否ログの診断・自己検査を加えた（手段の詳細は `harness/egress-isolation/README.md`）。TCP が観測不能だった原因は、macOS 26 の拒否行の形式（`deny(1) network-outbound <word>:*:<port>`。宛先アドレスが `*`）が想定の IPv4 形式と異なっていたことだけだった。#1409 でこれを追加形式として受理し、帰属は「ホストの pid」と「その run の一時 listener ポート」の両方一致に限る（アドレス・プロトコルは検証せず、ポートが重複する場合は帰属しない）。拒否ログの収集は sudo なし（非特権）の `log show` で足りる。sudo つき `log show --info --debug`・`log config` によるログレベル変更・`--seatbelt-sudo-log` の opt-in は #1402 で一時導入したが、実測（xos-measure run 41309744793・41310673642・41313641135）で非特権の `log show` でも拒否行が同じだけ取れ、TCP 4 経路（img・fetch・ws・internal）と UDP の udp_direct が pass・自己検査が成立したため、オーナー判断（2026-11-01）により #1414 で削除した。redirect は、#1415 の予熱（既定 5 回。判定・集計には使わない）を入れた macOS 26 の実測で pass になった（run 41401095620・41402439545。判定基準は変えていない。詳細は `harness/egress-isolation/README.md` の予熱の節）。ランナー設定の `sudo ifconfig lo0 alias 127.0.0.2/127.0.0.3` は残る（結果は #1003）
 - 依存・`unsafe` を要する測定用コードは承認の後にする
 
 ### 6.4 Linux の実測結果（c56f11c2・2026-10-31）
@@ -168,6 +168,28 @@ Windows の補足（#1401）: `xos-measure.yml` の Windows ジョブに限り�
 - Servo 自身の DNS・UDP 送信の外部観測（root か `CAP_NET_ADMIN` が要る）
 - Landlock ルールの適用・seccomp・許可リスト付きプロキシとの併用（§7 の承認事項）
 - macOS・Windows（#1387）、AppArmor の制限が無い環境・古いカーネル
+
+### 6.5 Linux の proxy-relay 実測結果（#1431・2026-11-02）
+
+§8.1 の方式 B（bwrap `--unshare-net` ＋ 許可リスト付き CONNECT プロキシ）で必要になる「netns 内の中継 → UDS → 親のプロキシ」の構成が成り立つかを、Servo を使わずに `harness/egress-isolation/relay_probe.py` で 1 回測った結果（TASK-38・`RENDER-3`・`SEC-2`・`XOS-1`）。依存・`unsafe` は使わない。手順・判定は `harness/egress-isolation/README.md` の proxy-relay の節を正とする。
+
+| 項目 | 値 |
+| ---- | -- |
+| コミット | `06d4ba30`（origin/main） |
+| カーネル・bwrap | 7.0.0-34-generic（x86_64）・bubblewrap 0.11.1 |
+| AppArmor | `kernel.apparmor_restrict_unprivileged_userns=1`（制限あり。bwrap 経由では netns を作れた） |
+
+| 項目 | 結果 | 観測 |
+| ---- | ---- | ---- |
+| `lo`（netns 内の loopback） | pass | 127.0.0.1 の bind・listen・往復に成功 |
+| `uds`（`--bind` / `--ro-bind` した UDS への connect） | pass | rw・ro の両方に connect でき、プロキシが 2 接続を数えた |
+| `relay`（中継経由で外側 listener へ。陽性対照） | pass | 200 応答・nonce の往復が一致・外側の受信 1 件 |
+| `direct`（中継なしの直接 connect。陰性対照） | pass | `ECONNREFUSED`。ベースラインでは届き、プロキシ経由でない受信は 0 件 |
+| `ip_recheck`（許可リストに載った内部 IP への CONNECT） | pass | 403（`ip_denied`）。内部 listener の受信 0 件（ベースラインでは 1 件） |
+
+- プロキシのポリシーは測定用のフィクスチャで、本番のものではない。本番は loopback を含む内部アドレスをすべて拒否するはずで、ここでは 127.0.0.4 を許可先の代役にしている。
+- 結論: この環境では構成が成り立つ。本番のプロキシの実装・`servo-host` への注入・HostProcess への bwrap の組み込みは §7 の承認事項のまま。
+- 未測定: 名前解決後の再検査（DNS rebinding）、CONNECT 上の TLS、Servo 0.7.0 の `Tunnel` との実接続、AppArmor の制限が無い環境・6.7 未満のカーネル。
 
 ## 7. 承認事項（実装しない）
 
@@ -237,6 +259,6 @@ options §7 を引き継ぐ。本書で新たに加わる未確認事項は §9.
 | AppContainer 内の ipc-channel の制約（ボディ付きリクエストで panic し得る。推定・未実測） | #1421 |
 | Docker 内での bwrap の可否（イメージに bwrap が無い） | 未起票 |
 | Servo 自身の DNS・UDP 送信の外部観測（root か `CAP_NET_ADMIN` が要る） | 未起票 |
-| Landlock ルール適用下の動作・seccomp・許可リスト付きプロキシとの併用 | §7 の承認事項 |
+| Landlock ルール適用下の動作・seccomp・許可リスト付きプロキシとの併用（netns 内の中継 → UDS → プロキシの成立性は §6.5 で確認済み。本番のプロキシは §7 の承認事項のまま） | §7 の承認事項 |
 | AppArmor の制限が無い環境・6.7 未満のカーネル | 未起票 |
 | net 層の直接接続の網羅 | options §7 の 1 |
