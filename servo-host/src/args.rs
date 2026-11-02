@@ -53,6 +53,8 @@ pub(crate) enum ArgError {
     /// ポートが 1〜65535 の 10 進整数ではない。
     InvalidPort,
     /// UDS パスが絶対・正規化済み・長さ上限内ではない。
+    // 構築は unix 版 `parse_relay` のみ。非 unix では dead_code 警告になるため許可する。
+    #[cfg_attr(not(unix), allow(dead_code))]
     InvalidRelayPath(&'static str),
     /// `--egress-proxy-port` と `--egress-relay-uds` の同時指定。
     ConflictingEgress,
