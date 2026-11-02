@@ -138,6 +138,11 @@ pub trait EgressResolver: Send + Sync {
 }
 
 /// `ToSocketAddrs`（getaddrinfo）による既定のリゾルバ。
+///
+/// 注意: getaddrinfo は同期でブロックし、解決そのものには timeout がない
+/// （`connect_timeout` は TCP 接続にしか効かない）。応答しない DNS 宛先を多数同時に
+/// 指定されると、その分だけ同時接続の枠とスレッドが長時間塞がる。枠の上限で有界であり、
+/// 入力元が信頼できる Servo ホストである前提のため既知の制約として受容する。
 #[derive(Clone, Copy, Debug, Default)]
 pub struct SystemResolver;
 
