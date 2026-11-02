@@ -188,6 +188,8 @@ Windows の補足（#1401）: `xos-measure.yml` の Windows ジョブに限り�
 | `ip_recheck`（許可リストに載った内部 IP への CONNECT） | pass | 403（`ip_denied`）。内部 listener の受信 0 件（ベースラインでは 1 件） |
 
 - プロキシのポリシーは測定用のフィクスチャで、本番のものではない。本番は loopback を含む内部アドレスをすべて拒否するはずで、ここでは 127.0.0.4 を許可先の代役にしている。
+- `direct` は「netns 内の `127.x` は netns 自身の `lo` に向かう」性質に頼る陰性対照で、外へ出る経路の遮断そのものは §6.4 の実測が担う。
+- #1433 で bwrap の FS を `--ro-bind / /` に絞り（書き込めるのは `/run` の tmpfs・UDS ディレクトリ・出力ディレクトリだけ）、同じ構成で 5 項目がすべて pass することを再確認した。
 - 結論: この環境では構成が成り立つ。本番のプロキシの実装・`servo-host` への注入・HostProcess への bwrap の組み込みは §7 の承認事項のまま。
 - 未測定: 名前解決後の再検査（DNS rebinding）、CONNECT 上の TLS、Servo 0.7.0 の `Tunnel` との実接続、AppArmor の制限が無い環境・6.7 未満のカーネル。
 

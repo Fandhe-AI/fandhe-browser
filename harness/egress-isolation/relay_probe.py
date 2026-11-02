@@ -14,6 +14,7 @@
     - `uds`: 親で listen するファイルシステム上の UDS を `--bind`（rw）/ `--ro-bind`（ro）で見せたとき、中から connect できるか。
     - `relay`: 中継を通して親のプロキシ経由で外側の listener に届くか（陽性対照。200 応答と nonce の往復まで）。
     - `direct`: 中継を通さない直接 connect が netns で失敗するか（陰性対照。ベースラインでは届くことが前提）。
+      netns 内の `127.x` は netns 自身の `lo` に向かう性質に頼る測定で、外へ出る経路の遮断そのものは設計 §6.4 の実測が担う。
     - `ip_recheck`: プロキシが接続先 IP を再検査し、内部アドレス（127.0.0.2）への CONNECT を拒否できるか。
 
 テスト用プロキシのポリシーは測定用のフィクスチャで、本番のプロキシではない。本番のポリシーは loopback を含む内部アドレスを
@@ -25,6 +26,7 @@
     - プロキシは UDS（0700 のディレクトリ内）でだけ待ち受ける。TCP の listen は loopback の echo listener と netns 内の中継のみ。
     - authority は IPv4 リテラルだけを受け付け、名前解決はしない。ヘッダ長・同時接続数・転送量・アイドル時間に上限を置く。
     - 結果に残すのは件数・バイト数・errno 名・ステータスコード・判定コードだけ（nonce の値・要求の本文は残さない）。
+    - bwrap の FS は `--ro-bind / /`＋`--dev /dev`。書き込めるのは tmpfs の `/run`・UDS ディレクトリ・出力ディレクトリだけ（#1433）。
     - bwrap の argv は定数のリスト（シェル不使用）。依存・`unsafe`・ctypes は使わない。
 
 終了コード: 0（完走。合否は result.json の verdicts を見る）／ 1（計測の失敗）／ 2（引数の不正・Linux 以外・bwrap 無しなど前提の不成立。
@@ -44,7 +46,7 @@ import os
 import platform
 import re
 import secrets
-import select
+import selectors
 import shutil
 import socket
 import sys
@@ -77,10 +79,11 @@ MAX_ECHO_BYTES = 4096
 MAX_RELAY_BYTES = 65536
 IDLE_S = 2.0
 CONN_TIMEOUT_S = 2.0
+CONN_DEADLINE_S = 10.0  # 接続 1 本あたりの総時間の上限（少しずつ送り続ける接続が同時接続の枠を占有し続けるのを防ぐ。#1433）
 SETTLE_S = 0.4  # 内側の終了後、外側スレッドの受信集計が追いつくのを待つ。
 RESPONSE_REASONS = {200: "Connection established", 400: "Bad Request", 403: "Forbidden",
                     405: "Method Not Allowed", 502: "Bad Gateway"}
-AUTHORITY_RE = re.compile(r"^(\d{1,3}(?:\.\d{1,3}){3}):(\d{1,5})$")
+AUTHORITY_RE = re.compile(r"(\d{1,3}(?:\.\d{1,3}){3}):(\d{1,5})")  # fullmatch で使う（`$` は末尾の改行を許すため。#1433）
 
 
 # ---------------------------------------------------------------------------
@@ -103,7 +106,7 @@ def parse_connect_request(data: bytes) -> tuple[int, str | None, int | None]:
         return 400, None, None
     if parts[0] != "CONNECT":
         return 405, None, None
-    m = AUTHORITY_RE.match(parts[1])
+    m = AUTHORITY_RE.fullmatch(parts[1])
     if m is None:
         return 400, None, None
     try:
@@ -131,13 +134,19 @@ def evaluate_policy(ip: str, port: int, allow: frozenset[tuple[str, int]]) -> st
     return "allowed"
 
 
-def build_relay_argv(*, netns: bool, sockdir: str, inner_out: str, ports: dict[str, int], phase: str) -> list[str]:
-    """bwrap の固定 argv。`--tmpfs /run` の後に UDS のディレクトリを rw と ro で明示的に見せる。"""
+def build_relay_argv(*, netns: bool, sockdir: str, out_dir: str, inner_out: str, ports: dict[str, int],
+                     phase: str) -> list[str]:
+    """bwrap の固定 argv。`--tmpfs /run` の後に UDS のディレクトリを rw と ro で明示的に見せる。
+
+    root FS は `--ro-bind / /` で読み取り専用にし、sandbox の中で書き込めるのは tmpfs の `/run`・UDS ディレクトリ（rw マウント）・
+    出力ディレクトリ `out_dir` だけにする（#1433。以前は `--dev-bind / /` でホストの FS 全体に書けた）。
+    出力ディレクトリの bind は `/run` 配下でも隠れないよう tmpfs と UDS の bind より後に置く。
+    """
     argv = ["bwrap", "--die-with-parent"]
     if netns:
         argv.append("--unshare-net")
-    argv += ["--dev-bind", "/", "/", "--tmpfs", "/run",
-             "--bind", sockdir, MOUNT_RW, "--ro-bind", sockdir, MOUNT_RO, "--",
+    argv += ["--ro-bind", "/", "/", "--dev", "/dev", "--tmpfs", "/run",
+             "--bind", sockdir, MOUNT_RW, "--ro-bind", sockdir, MOUNT_RO, "--bind", out_dir, out_dir, "--",
              sys.executable, "-I", "-B", str(Path(__file__).resolve()),
              "--inner", "--phase", phase, "--ports", json.dumps(ports, sort_keys=True), "--out", inner_out]
     return argv
@@ -267,24 +276,40 @@ def _errname(d: Any) -> str:
 # 外側: echo listener・CONNECT プロキシ
 # ---------------------------------------------------------------------------
 
-def pump(a: socket.socket, b: socket.socket, limit: int = MAX_RELAY_BYTES, idle: float = IDLE_S) -> None:
-    """a と b の間でバイトを双方向にコピーする（総量・アイドル時間に上限。どちらかが閉じたら終了）。"""
+def pump(a: socket.socket, b: socket.socket, limit: int = MAX_RELAY_BYTES, idle: float = IDLE_S,
+         deadline: float | None = None) -> None:
+    """a と b の間でバイトを双方向にコピーする（総量・アイドル時間・総時間に上限。どちらかが閉じたら終了）。
+
+    `deadline` は `time.monotonic()` 基準の絶対時刻（省略時は呼び出し時刻＋`CONN_DEADLINE_S`）。fd 番号の上限を避けるため
+    `selectors`（Linux では epoll）で待つ。
+    """
+    if deadline is None:
+        deadline = time.monotonic() + CONN_DEADLINE_S
     total = 0
+    sel = selectors.DefaultSelector()
     try:
+        sel.register(a, selectors.EVENT_READ)
+        sel.register(b, selectors.EVENT_READ)
         while True:
-            ready, _, _ = select.select([a, b], [], [], idle)
-            if not ready:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
                 return
-            for s in ready:
-                data = s.recv(4096)
+            events = sel.select(min(idle, remaining))
+            if not events:
+                return
+            for key, _ in events:
+                s = key.fileobj
+                data = s.recv(4096)  # type: ignore[union-attr]
                 if not data:
                     return
                 total += len(data)
                 if total > limit:
                     return
-                (b if s is a else a).sendall(data)
-    except OSError:
+                (b if s is a else a).sendall(data)  # type: ignore[union-attr]
+    except (OSError, ValueError):
         return
+    finally:
+        sel.close()
 
 
 class EchoListener:
@@ -331,8 +356,9 @@ class EchoListener:
     def _serve(self, conn: socket.socket) -> None:
         try:
             conn.settimeout(CONN_TIMEOUT_S)
+            deadline = time.monotonic() + CONN_DEADLINE_S
             seen = 0
-            while seen < MAX_ECHO_BYTES:
+            while seen < MAX_ECHO_BYTES and time.monotonic() < deadline:
                 data = conn.recv(1024)
                 if not data:
                     break
@@ -400,10 +426,21 @@ class ConnectProxy:
 
     def _handle(self, conn: socket.socket) -> None:
         try:
-            conn.settimeout(CONN_TIMEOUT_S)
+            deadline = time.monotonic() + CONN_DEADLINE_S
             buf = b""
             while b"\r\n\r\n" not in buf and len(buf) < MAX_HEADER:
-                chunk = conn.recv(1024)
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    self._count("deadline")
+                    return
+                limited = remaining < CONN_TIMEOUT_S  # この待ちが期限で切られるか（タイマーの丸め誤差に左右されないよう先に決める）
+                conn.settimeout(min(CONN_TIMEOUT_S, remaining))
+                try:
+                    chunk = conn.recv(1024)
+                except socket.timeout:
+                    if limited:
+                        self._count("deadline")
+                    return
                 if not chunk:
                     break
                 buf += chunk
@@ -430,7 +467,7 @@ class ConnectProxy:
                 with self._lock:
                     self.upstream_ok += 1
                 self._reply(conn, 200)
-                pump(conn, up)
+                pump(conn, up, deadline=deadline)
         except OSError:
             pass
         finally:
@@ -534,9 +571,10 @@ class Relay:
     def _serve(self, conn: socket.socket) -> None:
         up = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
+            conn.settimeout(CONN_TIMEOUT_S)
             up.settimeout(CONN_TIMEOUT_S)
             up.connect(self.uds_path)
-            pump(conn, up)
+            pump(conn, up, deadline=time.monotonic() + CONN_DEADLINE_S)
         except OSError:
             pass
         finally:
@@ -674,7 +712,7 @@ def run_outer(out: Path) -> int:
         for phase, netns in (("baseline", False), ("netns", True)):
             before = (echo_t.connections, echo_i.connections, proxy.snapshot())
             inner_out = out / f"{phase}.json"
-            rc, err = measure.run_argv(build_relay_argv(netns=netns, sockdir=sockdir, inner_out=str(inner_out),
+            rc, err = measure.run_argv(build_relay_argv(netns=netns, sockdir=sockdir, out_dir=str(out), inner_out=str(inner_out),
                                                        ports=ports, phase=phase))
             time.sleep(SETTLE_S)
             counts[phase] = {"target": echo_t.connections - before[0], "internal": echo_i.connections - before[1]}
