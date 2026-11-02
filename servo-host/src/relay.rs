@@ -331,7 +331,7 @@ mod tests {
     use super::*;
     use std::os::unix::fs::DirBuilderExt;
     use std::os::unix::net::UnixListener;
-    use std::sync::atomic::AtomicU32;
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
     static SEQ: AtomicU32 = AtomicU32::new(0);
 
@@ -556,9 +556,21 @@ mod tests {
         let held: Arc<Mutex<Vec<UnixStream>>> = Arc::new(Mutex::new(Vec::new()));
         let filler_held = Arc::clone(&held);
         let filler_path = sock.clone();
-        std::thread::spawn(move || {
-            while let Ok(s) = UnixStream::connect(&filler_path) {
-                filler_held.lock().unwrap().push(s);
+        // 停止フラグと上限で filler の暴走（CPU・fd の占有）を防ぐ。
+        let stop = Arc::new(AtomicBool::new(false));
+        let filler_stop = Arc::clone(&stop);
+        let _filler = std::thread::spawn(move || {
+            while !filler_stop.load(Ordering::Relaxed) {
+                match UnixStream::connect(&filler_path) {
+                    Ok(s) => {
+                        let mut h = filler_held.lock().unwrap();
+                        if h.len() >= 4096 {
+                            break;
+                        }
+                        h.push(s);
+                    }
+                    Err(_) => break,
+                }
             }
         });
         let mut last = 0;
@@ -603,9 +615,21 @@ mod tests {
         let held: Arc<Mutex<Vec<UnixStream>>> = Arc::new(Mutex::new(Vec::new()));
         let filler_held = Arc::clone(&held);
         let filler_path = sock.clone();
-        std::thread::spawn(move || {
-            while let Ok(s) = UnixStream::connect(&filler_path) {
-                filler_held.lock().unwrap().push(s);
+        // 停止フラグと上限で filler の暴走（CPU・fd の占有）を防ぐ。
+        let stop = Arc::new(AtomicBool::new(false));
+        let filler_stop = Arc::clone(&stop);
+        let filler = std::thread::spawn(move || {
+            while !filler_stop.load(Ordering::Relaxed) {
+                match UnixStream::connect(&filler_path) {
+                    Ok(s) => {
+                        let mut h = filler_held.lock().unwrap();
+                        if h.len() >= 4096 {
+                            break;
+                        }
+                        h.push(s);
+                    }
+                    Err(_) => break,
+                }
             }
         });
         let mut last = 0;
@@ -617,7 +641,7 @@ mod tests {
             last = n;
         }
         let limits = RelayLimits {
-            connect_timeout: Duration::from_millis(300),
+            connect_timeout: Duration::from_secs(2),
             max_dial_threads: 2,
             ..RelayLimits::default()
         };
@@ -633,13 +657,28 @@ mod tests {
         let started = Instant::now();
         let mut c = connect(&relay);
         assert!(matches!(c.read(&mut buf), Ok(0) | Err(_)));
-        assert!(started.elapsed() < Duration::from_millis(250));
+        assert!(started.elapsed() < Duration::from_secs(1));
         assert!(wait_until(|| relay.active() == 0));
         // 詰まりを解く: 溜めた接続を捨て、listener が accept を始める。dial スレッドが戻っても
         // `active` は 0 のまま（二重返却なら usize が巻き戻る）。
+        // filler は止めてから接続を捨て、accept 側も停止フラグで終わらせる。
+        // accept を始めてから filler を止める（connect で塞がった filler を解放するため）。
+        stop.store(true, Ordering::Relaxed);
         held.lock().unwrap().clear();
-        std::thread::spawn(move || for _ in listener.incoming().flatten() {});
+        listener.set_nonblocking(true).unwrap();
+        let accept_stop = Arc::new(AtomicBool::new(false));
+        let acceptor_flag = Arc::clone(&accept_stop);
+        let acceptor = std::thread::spawn(move || {
+            while !acceptor_flag.load(Ordering::Relaxed) {
+                if listener.accept().is_err() {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
+        });
         std::thread::sleep(Duration::from_millis(500));
         assert_eq!(relay.active(), 0);
+        filler.join().unwrap();
+        accept_stop.store(true, Ordering::Relaxed);
+        acceptor.join().unwrap();
     }
 }
