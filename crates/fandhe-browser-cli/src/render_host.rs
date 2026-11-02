@@ -7,6 +7,7 @@
 //!
 //! # スタブについて
 //!
+//! `[rendering] egress_isolation`（`best-effort` 既定・`required`。`RENDER-3`・#1436）は設定から `HostProcessConfig` へ渡す。
 //! 設定ファイルからのホストパス指定は未配線（REPAIR-3）。設定キーが core の `Config` に未定義のため、
 //! 呼び出し側（`main`）は `configured` に `None` を渡し、ホストパスは環境変数
 //! `FANDHE_BROWSER_RENDER_HOST`・本体の隣の `fandhe-browser-servo-host` の順で解決される。
@@ -19,9 +20,11 @@
 use std::path::Path;
 use std::sync::Arc;
 
+use fandhe_browser_core::EgressIsolationMode;
 use fandhe_browser_core::render::{DisabledRenderer, Renderer};
 use fandhe_browser_render::host_process::{
-    HostBinary, HostProcessConfig, HostProcessError, resolve_host_binary_from_process,
+    EgressIsolationUnavailable, HostBinary, HostProcessConfig, HostProcessError,
+    isolation_warning_message, probe_system, resolve_host_binary_from_process,
 };
 use fandhe_browser_render::host_renderer::{HostRenderer, HostRendererConfig};
 
@@ -30,12 +33,18 @@ use crate::server::StartupError;
 /// プロセス環境（環境変数・実行ファイルの隣）からホストを解決して描画実装を選ぶ。
 ///
 /// `configured` は設定ファイル由来のホストパス（絶対パスのみ許可。PATH 探索はしない）。
+///
+/// `egress` は `[rendering] egress_isolation`（`RENDER-3`・#1436）。`required` で隔離できない環境
+/// なら、ホストを起動する前に（サーバーの bind より前に）起動エラーにする。
 pub(crate) fn renderer_from_process(
     configured: Option<&Path>,
+    egress: EgressIsolationMode,
 ) -> Result<Arc<dyn Renderer>, StartupError> {
-    select_renderer(
+    select_renderer_checked(
         resolve_host_binary_from_process(configured),
-        HostProcessConfig::new,
+        egress,
+        probe_system,
+        None,
     )
 }
 
@@ -46,10 +55,43 @@ pub(crate) fn renderer_from_process(
 pub(crate) fn renderer_from_process_with_load_timeout(
     configured: Option<&Path>,
     load_timeout_ms: Option<u32>,
+    egress: EgressIsolationMode,
 ) -> Result<Arc<dyn Renderer>, StartupError> {
-    select_renderer_with(
+    select_renderer_checked(
         resolve_host_binary_from_process(configured),
-        HostProcessConfig::new,
+        egress,
+        probe_system,
+        load_timeout_ms,
+    )
+}
+
+/// 本番の `HostProcessConfig`。各種既定値のまま、egress 隔離の水準と警告の出力先だけを足す。
+/// 警告（`best-effort` で隔離できず隔離なしで起動するとき）は stderr へ英語 1 行で出す。
+fn production_config(binary: HostBinary, egress: EgressIsolationMode) -> HostProcessConfig {
+    HostProcessConfig::new(binary)
+        .with_egress_isolation(egress)
+        .with_isolation_warning(Arc::new(|reason| {
+            eprintln!("warning: {}", isolation_warning_message(reason));
+        }))
+}
+
+/// [`select_renderer_with`] に egress 隔離の前倒し判定を足した本番の入口。
+///
+/// ホストが解決でき、かつ `required` のときだけ `probe`（本番は `probe_system`。結果はキャッシュ
+/// 済み）を呼び、隔離できなければ [`StartupError::RenderIsolation`]。`HostProcess` の起動時にも
+/// 同じ判定が走る（二重の防御）。`probe` はテストが実コマンドを呼ばないための注入点。
+pub(crate) fn select_renderer_checked(
+    resolved: Result<HostBinary, HostProcessError>,
+    egress: EgressIsolationMode,
+    probe: impl FnOnce() -> Result<(), EgressIsolationUnavailable>,
+    load_timeout_ms: Option<u32>,
+) -> Result<Arc<dyn Renderer>, StartupError> {
+    if resolved.is_ok() && egress == EgressIsolationMode::Required {
+        probe().map_err(StartupError::RenderIsolation)?;
+    }
+    select_renderer_with(
+        resolved,
+        |binary| production_config(binary, egress),
         load_timeout_ms,
     )
 }
@@ -62,6 +104,7 @@ pub(crate) fn renderer_from_process_with_load_timeout(
 ///
 /// `make_config` はテストが一時ディレクトリや短いタイムアウトを差し込むための注入点で、
 /// 本番は `HostProcessConfig::new`（各種既定値のまま。cli では緩めない）。
+#[cfg(test)]
 pub(crate) fn select_renderer(
     resolved: Result<HostBinary, HostProcessError>,
     make_config: impl FnOnce(HostBinary) -> HostProcessConfig,
@@ -197,6 +240,85 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, RenderError::HostUnavailable), "{err:?}");
         assert!(reached.exists(), "host must have been spawned");
+    }
+
+    /// `RENDER-3`・#1436: `required` で隔離できなければ、ホストを起動せず起動エラー（英語・パスなし）。
+    #[test]
+    fn render3_required_without_isolation_is_startup_error() {
+        let binary = resolve_host_binary(Some(&std::env::current_exe().unwrap()), None, None)
+            .expect("absolute existing path resolves");
+        let err = select_renderer_checked(
+            Ok(binary),
+            EgressIsolationMode::Required,
+            || Err(EgressIsolationUnavailable::SandboxToolNotFound),
+            None,
+        )
+        .err()
+        .expect("required must refuse");
+        assert!(matches!(
+            err,
+            StartupError::RenderIsolation(EgressIsolationUnavailable::SandboxToolNotFound)
+        ));
+        assert_eq!(
+            err.to_string(),
+            "render host egress isolation is required but unavailable: \
+             sandbox tool (bwrap or sandbox-exec) was not found"
+        );
+    }
+
+    /// `RENDER-3`・#1436: `best-effort` は判定を呼ばず（隔離できなくても）`HostRenderer` を返す。
+    /// `required` でも未設定ホスト（`Disabled`）なら判定を呼ばず無効レンダラー。
+    #[test]
+    fn render3_best_effort_and_disabled_skip_the_probe() {
+        let binary = resolve_host_binary(Some(&std::env::current_exe().unwrap()), None, None)
+            .expect("absolute existing path resolves");
+        let never = || -> Result<(), EgressIsolationUnavailable> { panic!("probe must not run") };
+        select_renderer_checked(Ok(binary), EgressIsolationMode::BestEffort, never, None)
+            .expect("best-effort starts regardless");
+        let page = fandhe_browser_core::render::PageRef::new("https://a.example/");
+        let disabled = select_renderer_checked(
+            Err(HostProcessError::Disabled),
+            EgressIsolationMode::Required,
+            never,
+            None,
+        )
+        .expect("disabled is not an error");
+        assert!(matches!(
+            disabled.load(&page),
+            Err(RenderError::RenderingDisabled)
+        ));
+    }
+
+    /// `RENDER-3`・#1436: `required` で隔離できる環境（probe が Ok）なら通常どおり `HostRenderer`。
+    #[test]
+    fn render3_required_with_isolation_available_builds_renderer() {
+        let binary = resolve_host_binary(Some(&std::env::current_exe().unwrap()), None, None)
+            .expect("absolute existing path resolves");
+        select_renderer_checked(Ok(binary), EgressIsolationMode::Required, || Ok(()), None)
+            .expect("required with isolation available");
+    }
+
+    /// `RENDER-3`・#1436: 設定ファイルの `[rendering] egress_isolation` が cli の起動設定から読める。
+    #[test]
+    fn render3_egress_isolation_is_read_from_startup_config() {
+        use crate::startup_config::load_startup_config_from;
+        let dir = TempDir::new();
+        let path = dir.owned.join("c.toml");
+        std::fs::write(&path, "[rendering]\negress_isolation = \"required\"\n").unwrap();
+        let config = load_startup_config_from(Some(path.clone().into_os_string())).expect("ok");
+        assert_eq!(
+            config.rendering().egress_isolation(),
+            EgressIsolationMode::Required
+        );
+        std::fs::write(&path, "[rendering]\negress_isolation = \"strict\"\n").unwrap();
+        assert!(load_startup_config_from(Some(path.into_os_string())).is_err());
+        assert_eq!(
+            load_startup_config_from(None)
+                .expect("unset")
+                .rendering()
+                .egress_isolation(),
+            EgressIsolationMode::BestEffort
+        );
     }
 
     /// `CLI-1`・`RENDER-4`: `load` の上限は `HostRendererConfig` まで届く。未指定は `None`（ホスト既定）。

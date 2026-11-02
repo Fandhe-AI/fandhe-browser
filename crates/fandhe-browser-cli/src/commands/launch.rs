@@ -152,7 +152,7 @@ pub(crate) fn start_server(
     // 描画ホストの解決も bind より前に行う。不正なパスはサーバーを起動せず非 0 終了させる（fail-closed）。
     // 設定キーは core の `Config` に未定義のため `None` 固定（REPAIR-3。後続課題で config から渡す）。
     // 解決できてもホストはここでは起動しない（`HostRenderer` は初回の描画要求で遅延起動する）。
-    let renderer = render_host::renderer_from_process(None)?;
+    let renderer = render_host::renderer_from_process(None, config.rendering().egress_isolation())?;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
