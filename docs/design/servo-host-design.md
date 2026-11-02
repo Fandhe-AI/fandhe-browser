@@ -123,7 +123,7 @@ servo-host/
 ### 2.5 URL・セレクタの検証
 
 - URL はクライアントで送信前に検証し、ホストでも再検証する（二重化）。scheme は `http` / `https` のみ。`file:`・`data:`・`javascript:`・`about:` と userinfo は拒否。ループバック・プライベート IP・`localhost` は core の fetch と同じポリシー（`allow_private_network_access`、既定 false）に従う。
-- **残存リスク**: Servo 内部のリダイレクト・サブリソース・DNS リバインディングはクライアント検証だけでは防げない。対策候補は egress ガード（`harness/render-screenshot/egress_guard.py` の方式）、OS ネットワーク隔離、core が取得済みの HTML を渡す方式。いずれも**未検証**で、GA 前のオーナー判断事項（§13）とする。2026-10-31 のオーナー判断（#1003）で OS 隔離を本命・事後検知を補助とする枠組みが決まり、3 OS の比較設計と実測計画は [servo-host-egress-isolation.md](./servo-host-egress-isolation.md) にある（方式の採否は実測後）。
+- **既知の制約（残存リスク）**: 現時点では、Servo ホストの egress は OS で遮断されていない（本番の起動経路に OS 隔離は未実装）。Servo 内部のリダイレクト・サブリソース・DNS リバインディングは、URL の検証では防げない。GA では Linux・macOS で OS 隔離（B）を予定し、Windows は既知の制約（D）とする（オーナー判断 2026-11-02・#1003・TASK-38・`RENDER-3`）。方式の比較・実測・判断は [servo-host-egress-isolation.md](./servo-host-egress-isolation.md)（§8.1）を参照。
 - 可視性・境界ボックスの取得に JS 評価を使う場合、セレクタは JSON エスケープした文字列リテラルとしてのみ埋め込み、連結しない。長さと文字種も検証する。取得手段（埋込 API のレイアウト取得か JS 評価か）は**未検証**で、実装 Issue の先頭ステップで確認する。
 
 ### 2.6 起動

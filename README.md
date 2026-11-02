@@ -41,6 +41,7 @@ workspace と crate 骨格（`crates/fandhe-browser-*`）の実装段階です�
 ## 実装方針（要点）
 
 - **二層アーキテクチャ**: 非レンダリング基盤層（HTML パース・DOM・要素操作）を既定とし、レンダリング層は `Servo` を別 workspace・別 `Cargo.lock` の子プロセス（Servo ホスト、`servo-host/`）に隔離し、設定でホストのパスを与えたときだけ起動するオプトインとします。本体バイナリに Servo は含まれません
+- **Servo ホストの egress（既知の制約）**: 現時点では Servo ホストのネットワーク送信は OS で遮断されていません。ページ内のリダイレクト・サブリソース・DNS リバインディングは URL の検証では防げません。GA では Linux・macOS で OS 隔離を予定し、Windows は既知の制約です（`RENDER-3`・TASK-38）。詳細は [servo-host-egress-isolation.md](./docs/design/servo-host-egress-isolation.md) を参照してください
 - **JS エンジン**: V8（`rusty_v8`）を既定とし、トレイト抽象化で `boa` へ切り替え可能にします
 - **AI 最適化 API**: アクセシビリティツリー・簡約 DOM を第一級 API として提供し、AI へ渡すトークン量を削減します
 - **自動化プロトコル**: CDP 互換レイヤー（既存 Playwright / Puppeteer 資産の流用）と独自 AI 最適化 API を併設します
