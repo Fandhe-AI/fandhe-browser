@@ -124,13 +124,32 @@ class RouteNotesTest(unittest.TestCase):
             self.assertNotIn(r, judge.routes_for_mode("seatbelt"))
             self.assertNotIn(r, judge.routes_for_mode("baseline"))
 
-    def test_routes_for_mode_unchanged_by_warmup_route(self) -> None:
+    def test_routes_for_mode_unchanged_by_warmup_routes(self) -> None:
+        names = fixtures.warmup_routes(fixtures.MAX_WARMUP_COUNT)
+        self.assertEqual(len(names), 10)
+        self.assertEqual(names[0], "warmup_redirect_1")
+        self.assertEqual(names[-1], "warmup_redirect_10")
         for mode in ("seatbelt", "baseline"):
-            self.assertNotIn(fixtures.WARMUP_ROUTE, judge.routes_for_mode(mode))
+            for name in names:
+                self.assertNotIn(name, judge.routes_for_mode(mode))
 
     def test_build_pages_has_no_warmup_page(self) -> None:
         for literal in (False, True):
-            self.assertNotIn(fixtures.REDIRECT_WARMUP_PATH, fixtures.build_pages(FixturesTest.PORTS, literal=literal))
+            pages = fixtures.build_pages(FixturesTest.PORTS, literal=literal)
+            for i in range(1, fixtures.MAX_WARMUP_COUNT + 1):
+                self.assertNotIn(fixtures.warmup_redirect_path(i), pages)
+
+    def test_warmup_routes_and_index_reject_out_of_range(self) -> None:
+        for bad in (-1, 11, True, "3", None):
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                fixtures.warmup_routes(bad)
+        for bad in (0, 11, True, "1"):
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                fixtures.warmup_redirect_path(bad)
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                fixtures.warmup_redirect_location({"warmup_redirect_1": 20020}, bad)
+        self.assertEqual(fixtures.warmup_routes(0), ())
+        self.assertEqual(fixtures.warmup_redirect_path(3), "/redirect-warmup-3")
 
     def test_build_pages_literal_false_is_unchanged_by_diag(self) -> None:
         pages = fixtures.build_pages(FixturesTest.PORTS)

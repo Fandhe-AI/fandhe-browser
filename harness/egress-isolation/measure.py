@@ -85,16 +85,17 @@ def validate_image(image: str) -> str:
     return image
 
 
-def start_outer_listeners(diag: bool = False) -> tuple[dict[str, Any], dict[str, int]]:
+def start_outer_listeners(diag: bool = False, warmup_count: int = 0) -> tuple[dict[str, Any], dict[str, int]]:
     """外側の許可外宛先（127.0.0.2/127.0.0.3）の listener を立て、(listener 辞書, ポート辞書) を返す。
 
     `diag=True`（macOS のときだけ呼び出し側が渡す。Issue #1415）は redirect の診断経路の listener を足す。
-    診断経路は判定に使わない（`judge.routes_for_mode` に入れない）。予熱経路（`warmup_redirect`）の listener も
-    同じ `diag` で足す（判定せず、受信件数は `outer_counts` から外して別に記録する）。
+    診断経路は判定に使わない（`judge.routes_for_mode` に入れない）。予熱経路（`warmup_redirect_<i>`）の listener は
+    `diag` のときだけ `warmup_count` 個（回ごとに別ポート）を足す（判定せず、受信件数は `outer_counts` から外して別に記録する）。
     """
     recs: dict[str, Any] = {}
     if diag:
-        recs[fixtures_warmup_route()] = listeners.TcpRecorder(fixtures_warmup_route(), judge.IP_BLOCKED).start()
+        for name in fixtures_warmup_routes(warmup_count):
+            recs[name] = listeners.TcpRecorder(name, judge.IP_BLOCKED).start()
         for r in fixtures_diag_routes():
             recs[r] = listeners.TcpRecorder(r, judge.IP_BLOCKED).start()
     for r in ("redirect", "img", "fetch", "ws"):
@@ -111,11 +112,40 @@ def fixtures_diag_routes() -> tuple[str, ...]:
     return page_templates.DIAG_ROUTES
 
 
-def fixtures_warmup_route() -> str:
-    """予熱経路名（`page_templates.WARMUP_ROUTE`。Issue #1415）。遅延 import。"""
+def fixtures_warmup_routes(count: int) -> tuple[str, ...]:
+    """予熱経路名 `warmup_redirect_1..count`（`page_templates.warmup_routes`。Issue #1415）。遅延 import。"""
     import page_templates
 
-    return page_templates.WARMUP_ROUTE
+    return page_templates.warmup_routes(count)
+
+
+def fixtures_max_warmup() -> int:
+    """予熱回数の上限（`page_templates.MAX_WARMUP_COUNT`）。遅延 import。"""
+    import page_templates
+
+    return page_templates.MAX_WARMUP_COUNT
+
+
+MAX_WARMUP_WAIT_MS = 30000  # 予熱後の待ち時間の上限（in_sandbox.MAX_WARMUP_WAIT_MS と同じ値）
+DEFAULT_WARMUP_COUNT = 5  # macOS の既定の予熱回数（Issue #1415。オーナー判断 2026-11-02・案 A'）
+
+
+def resolve_warmup(plat: str, count: int | None, wait_ms: int | None) -> tuple[int, int]:
+    """予熱の回数と待ち時間（ms）を解決する。macOS 以外で明示したら ValueError（Linux・Windows の判定を変えない）。
+
+    macOS で未指定なら (5, 0)。範囲外・bool は ValueError。main の引数検査（exit 2）から呼ぶ。
+    """
+    if plat != "darwin":
+        if count is not None or wait_ms is not None:
+            raise ValueError("--warmup-count / --warmup-wait-ms are supported on macOS only")
+        return 0, 0
+    k = DEFAULT_WARMUP_COUNT if count is None else count
+    w = 0 if wait_ms is None else wait_ms
+    if isinstance(k, bool) or not isinstance(k, int) or not (0 <= k <= fixtures_max_warmup()):
+        raise ValueError(f"--warmup-count must be an int in [0, {fixtures_max_warmup()}]")
+    if isinstance(w, bool) or not isinstance(w, int) or not (0 <= w <= MAX_WARMUP_WAIT_MS):
+        raise ValueError(f"--warmup-wait-ms must be an int in [0, {MAX_WARMUP_WAIT_MS}]")
+    return k, w
 
 
 def resolv_bind_args(resolv_file: Path) -> list[str]:
@@ -171,15 +201,16 @@ def free_port() -> int:
 
 def build_argv(mode: str, *, host: Path, ports: dict[str, int], out_dir: Path, hosts_file: Path,
                image: str | None, resolv_file: Path | None = None, name: str | None = None,
-               page_port: int = 0, platform_name: str | None = None) -> list[str]:
+               page_port: int = 0, platform_name: str | None = None, warmup_wait_ms: int = 0) -> list[str]:
     """内側ランナーを起動する固定 argv。ポートは int を文字列化したものだけが入る。"""
     inner_args = ["--mode", mode, "--ports", json.dumps(ports, sort_keys=True)]
     plat = platform_name or sys.platform
     if plat == "darwin" and all(r in ports for r in fixtures_diag_routes()):
         inner_args.append("--diag-routes")  # redirect の診断（Issue #1415。判定には使わない）
-    if plat == "darwin" and fixtures_warmup_route() in ports:
+    warmup_count = sum(1 for r in fixtures_warmup_routes(fixtures_max_warmup()) if r in ports)
+    if plat == "darwin" and (warmup_count > 0 or warmup_wait_ms > 0):
         # 予熱（Issue #1415）。baseline・seatbelt の両方に付けて読み込み順を揃える。Linux・Windows には付けない。
-        inner_args.append("--warmup")
+        inner_args += ["--warmup-count", str(warmup_count), "--warmup-wait-ms", str(int(warmup_wait_ms))]
     if not plat.startswith("linux"):
         # macOS・Windows: 内側ランナーを（Seatbelt があれば包んで）直接起動する。
         inner_args += ["--page-port", str(page_port)]
@@ -531,7 +562,7 @@ def appcontainer_caveat(data: dict[str, Any]) -> str | None:
 
 def run_mode(mode: str, *, host: Path, ports: dict[str, int], recs: dict[str, Any], out_dir: Path,
              hosts_file: Path, image: str | None, resolv_file: Path | None = None, page_port: int = 0,
-             launcher: Any = None, loopback_exempt: bool = False) -> dict[str, Any]:
+             launcher: Any = None, loopback_exempt: bool = False, warmup_wait_ms: int = 0) -> dict[str, Any]:
     if mode == "appcontainer":
         return run_appcontainer_mode(host=host, ports=ports, recs=recs, out_dir=out_dir, page_port=page_port,
                                      launcher=launcher, loopback_exempt=loopback_exempt)
@@ -539,20 +570,20 @@ def run_mode(mode: str, *, host: Path, ports: dict[str, int], recs: dict[str, An
     # docker はコンテナ名を付けて、タイムアウト・例外時にも確実に後始末する（名前は pid 由来の固定形式）。
     name = f"egress-iso-{os.getpid()}" if mode == "docker-none" else None
     argv = build_argv(mode, host=host, ports=ports, out_dir=out_dir, hosts_file=hosts_file, image=image,
-                      resolv_file=resolv_file, name=name, page_port=page_port)
+                      resolv_file=resolv_file, name=name, page_port=page_port, warmup_wait_ms=warmup_wait_ms)
     denies: dict[str, int] = {}
     status: dict[str, Any] = {}
     pids: frozenset[int] = frozenset()
     inner: dict[str, Any] = {}
     diag_dests: dict[str, str] = {}
-    warmup_dest: str | None = None
+    warmup_dests: dict[str, str] = {}
     info_debug: dict[str, Any] | None = None
     started = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time() - 2))
     rc, err = run_argv(argv, container=name)
     outer = {k: r.count - before[k] for k, r in recs.items()}
-    # 予熱の受信は判定用の outer_counts に入れず別に残す（Issue #1415）。
-    warmup_key = fixtures_warmup_route()
-    warmup_outer = outer.pop(warmup_key, None)
+    outer_all = dict(outer)
+    # 予熱の受信は判定用の outer_counts に入れず回ごとに別に残す（Issue #1415）。
+    warmup_outer = {k: outer.pop(k) for k in fixtures_warmup_routes(fixtures_max_warmup()) if k in outer}
     result_path = out_dir / f"{mode}.json"
     # 内側ランナーが正常終了（0）または隔離 abort（2。理由つきの JSON を書く）した場合の今回の結果だけを使う。
     # それ以外の失敗は空 = 判定不能（合格にしない）。--out は空ディレクトリ検査済みで古い結果は混ざらない。
@@ -568,11 +599,11 @@ def run_mode(mode: str, *, host: Path, ports: dict[str, int], recs: dict[str, An
             if isinstance(raw_pids, list) else frozenset()
         # 診断経路（Issue #1415）の宛先も既知の宛先に入れる（入れないとワイルドカード形式が未知ポート扱いになる）。
         diag_dests = {r: f"{judge.IP_BLOCKED}:{ports[r]}" for r in fixtures_diag_routes() if r in ports}
-        warmup_dest = f"{judge.IP_BLOCKED}:{ports[warmup_key]}" if warmup_key in ports else None
+        warmup_dests = {k: f"{judge.IP_BLOCKED}:{ports[k]}" for k in warmup_outer if k in ports}
         all_dests = (*(f"{judge.IP_INTERNAL_STANDIN if r == 'internal' else judge.IP_BLOCKED}:{ports[r]}"
                        for r in ("redirect", "img", "fetch", "ws", "internal")),
                      f"{judge.IP_BLOCKED}:{ports['udp_direct']}", *diag_dests.values(),
-                     *((warmup_dest,) if warmup_dest else ()))
+                     *warmup_dests.values())
         if pids:
             token = _KNOWN_DESTS.set(all_dests)
             try:
@@ -591,8 +622,9 @@ def run_mode(mode: str, *, host: Path, ports: dict[str, int], recs: dict[str, An
     data = {"mode": mode, "exit_code": rc, "binary_sha256": inner.get("host_sha256"),
             "binary_version": inner.get("host_version"), "stderr_tail": err if rc != 0 else "", "inner": inner,
             "outer_counts": outer}
-    if warmup_outer is not None:
-        data["warmup"] = {"outer": warmup_outer}
+    if warmup_outer:
+        data["warmup"] = {"count": len(warmup_outer), "outer": sum(warmup_outer.values()),
+                          "per_route": {k: {"outer": n} for k, n in warmup_outer.items()}}
     if mode == "seatbelt" and inner:
         dest = {r: f"{judge.IP_INTERNAL_STANDIN if r == 'internal' else judge.IP_BLOCKED}:{ports[r]}"
                 for r in ("redirect", "img", "fetch", "ws", "internal")}
@@ -618,16 +650,60 @@ def run_mode(mode: str, *, host: Path, ports: dict[str, int], recs: dict[str, An
             # redirect も経路名で並べる（dest_counts のキーは "ip:port" のため表示側で引けない。判定用の契約は変えない）。
             data["deny_log"]["diagnostic_dest_counts"] = {
                 r: observed.get(d, 0) for r, d in (("redirect", dest["redirect"]), *diag_dests.items())}
-            if warmup_dest and "warmup" in data:
+            if warmup_dests and "warmup" in data:
                 # 予熱の拒否行（観測値。根拠にしない）。判定用の dest_counts には入れない。
-                data["warmup"]["deny"] = observed.get(warmup_dest, 0)
+                for k, d in warmup_dests.items():
+                    data["warmup"]["per_route"][k]["deny"] = observed.get(d, 0)
+                data["warmup"]["deny"] = sum(observed.get(d, 0) for d in warmup_dests.values())
             by_dest = {d: r for r, d in (*dest.items(), ("udp_direct", udp), *diag_dests.items(),
-                                         *(((warmup_key, warmup_dest),) if warmup_dest else ()))}
+                                         *warmup_dests.items())}
             un = (status.get("diagnostics") or {}).get("unattributed_network_dests") or {}
             data["deny_log"]["unattributed_routes"] = {by_dest.get(d, d): n for d, n in un.items()}
             if info_debug is not None:
                 data["deny_log"]["diagnostic_info_debug_dest_counts"] = info_debug
+        route_dest = {**dest, **diag_dests, **warmup_dests}
+        timeline, first = merge_timeline(inner.get("load_timeline"), outer_all, route_dest, observed,
+                                         deny_known=bool(status.get("available")))
+        data["deny_log"]["first_deny"] = first
+    else:
+        timeline, _ = merge_timeline(inner.get("load_timeline"), outer_all, {}, {}, deny_known=False)
+    if timeline:
+        data["load_timeline"] = timeline
     return data
+
+
+def merge_timeline(raw: Any, outer: dict[str, int], route_dest: dict[str, str], observed: dict[str, int], *,
+                   deny_known: bool) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
+    """内側の読み込み時系列に外側の受信件数・拒否行の件数を結合し、最初に拒否行が出た読み込みを返す（Issue #1415）。
+
+    診断のみで判定には使わない。`first_deny` は遮断される読み込み（loopback 以外）のうち最初に拒否行が 1 件以上あったもので、
+    `missed_before` はそれより前に拒否行が 0 件だった遮断読み込みの数（件数によるか時間によるかをランをまたいで比べる）。
+    拒否ログが使えない（`deny_known=False`）ときの deny は None。該当がなければ first は None。
+    """
+    if not isinstance(raw, list):
+        return [], None
+    out: list[dict[str, Any]] = []
+    first: dict[str, Any] | None = None
+    missed = 0
+    blocked_seen = 0
+    for e in raw:
+        if not isinstance(e, dict) or not isinstance(e.get("route"), str):
+            continue
+        route = e["route"]
+        dest = route_dest.get(route)
+        deny = observed.get(dest, 0) if (deny_known and dest) else None
+        row = {**{k: e.get(k) for k in ("route", "role", "start_ms", "elapsed_ms", "kind")},
+               "outer": outer.get(route), "deny": deny}
+        out.append(row)
+        if e.get("role") == "loopback" or deny is None:
+            continue
+        blocked_seen += 1
+        if first is None:
+            if deny >= 1:
+                first = {"index": blocked_seen, "route": route, "start_ms": e.get("start_ms"), "missed_before": missed}
+            else:
+                missed += 1
+    return out, first
 
 
 _SAMPLE_KEYS = ("unmatched_deny_samples", "pid_excluded_samples")
@@ -679,7 +755,14 @@ def redirect_notes(data: dict[str, Any]) -> dict[str, str]:
         parts.append(f"info/debug re-read={dl['diagnostic_info_debug_dest_counts']}")
     wu = data.get("warmup")
     if isinstance(wu, dict):
-        parts.append(f"warm-up deny rows={wu.get('deny')}, warm-up outer={wu.get('outer')}")
+        per = {k: v.get("deny") for k, v in (wu.get("per_route") or {}).items() if isinstance(v, dict)}
+        parts.append(f"warm-up deny rows={wu.get('deny')} (per route {per}), warm-up outer={wu.get('outer')}")
+    first = dl.get("first_deny")
+    if isinstance(first, dict):
+        parts.append(f"first deny at blocked load #{first.get('index')} ({first.get('route')}, "
+                     f"t={first.get('start_ms')} ms; {first.get('missed_before')} earlier blocked load(s) had 0 rows)")
+    elif "first_deny" in dl:
+        parts.append("no blocked load had a deny row")
     return {"redirect": "; ".join(parts)}
 
 
@@ -699,10 +782,12 @@ def redirect_diag_block(mode: str, data: dict[str, Any], outer: dict[str, int]) 
            "| route | outer | deny | load kind | elapsed_ms | host alive after failed load |",
            "| ----- | ----- | ---- | --------- | ---------- | ---------------------------- |"]
     if wu is not None:
-        wk = fixtures_warmup_route()
-        out.append(f"| {wk} (warm-up) | {wu.get('outer', '-')} | {wu.get('deny', '-')} "
-                   f"| {(inner.get('warmup_load') or {}).get('kind', 'ok' if inner.get('warmup_load') else '-')} "
-                   f"| {ms.get(wk, '-')} | {alive.get(wk, '-')} |")
+        wloads = inner.get("warmup_loads") or {}
+        for wk, per in (wu.get("per_route") or {}).items():
+            wl = wloads.get(wk)
+            out.append(f"| {wk} (warm-up) | {per.get('outer', '-')} | {per.get('deny', '-')} "
+                       f"| {(wl or {}).get('kind', 'ok' if wl else '-')} "
+                       f"| {ms.get(wk, '-')} | {alive.get(wk, '-')} |")
     for r in routes:
         dv = deny.get(r, "-")
         out.append(f"| {r} | {outer.get(r, '-')} | {dv} | {(loads.get(r) or {}).get('kind', 'ok' if r in loads else '-')} "
@@ -718,6 +803,30 @@ def redirect_diag_block(mode: str, data: dict[str, Any], outer: dict[str, int]) 
     for key in ("unattributed_routes", "diagnostic_info_debug_dest_counts"):
         if key in dl:
             out.append(f"- {key}: {dl[key]}")
+    out += _timeline_block(data, dl)
+    return out
+
+
+def _timeline_block(data: dict[str, Any], dl: dict[str, Any]) -> list[str]:
+    """読み込み時系列の表と first_deny の 1 行（Issue #1415。拒否行が出始めるのが何件目か・何 ms 後かを比べる。判定ではない）。"""
+    timeline = data.get("load_timeline")
+    if not isinstance(timeline, list) or not timeline:
+        return []
+    inner = data.get("inner") or {}
+    out = ["", "load timeline (not verdicts; start_ms is since host spawn)", "",
+           f"warm-up count={inner.get('warmup_count', '-')}, wait after warm-up={inner.get('warmup_wait_ms', '-')} ms", "",
+           "| # | route | role | start_ms | elapsed_ms | load kind | outer | deny |",
+           "| - | ----- | ---- | -------- | ---------- | --------- | ----- | ---- |"]
+    for i, e in enumerate(timeline, start=1):
+        cells = [e.get(k) if e.get(k) is not None else "-"
+                 for k in ("route", "role", "start_ms", "elapsed_ms", "kind", "outer", "deny")]
+        out.append(f"| {i} | " + " | ".join(str(c) for c in cells) + " |")
+    first = dl.get("first_deny")
+    if isinstance(first, dict):
+        out.append(f"- first deny: blocked load #{first.get('index')} ({first.get('route')}) at {first.get('start_ms')} ms; "
+                   f"{first.get('missed_before')} earlier blocked load(s) had 0 deny rows")
+    elif "first_deny" in dl:
+        out.append("- first deny: none (no blocked load had a deny row)")
     return out
 
 
@@ -729,6 +838,8 @@ def summarize(results: dict[str, Any]) -> str:
     lines.append(f"- host binary sha256: {meta['host_sha256']}")
     lines.append(f"- host version: {meta['host_version']}")
     lines.append(f"- proxy env present: {meta['proxy_env_present']} (values are never recorded)")
+    if meta.get("warmup_count") is not None:
+        lines.append(f"- warm-up loads: {meta['warmup_count']}; wait after warm-up: {meta.get('warmup_wait_ms')} ms (Issue #1415)")
     lines.append("")
     base = results["modes"].get("baseline", {})
     lines += ["## baseline control (outer receipts per route)", ""]
@@ -826,6 +937,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--appcontainer-loopback-exempt", action="store_true",
                         help="Opt-in (needs administrator; used only by the xos-measure Windows job): add "
                         "CheckNetIsolation LoopbackExempt for the harness-created AppContainer SID and remove it afterwards.")
+    parser.add_argument("--warmup-count", type=int, default=None,
+                        help="macOS only: number of blocked-302 warm-up loads before the verdict routes "
+                        "(0-10; default 5; Issue #1415). Diagnostic only, not part of verdicts.")
+    parser.add_argument("--warmup-wait-ms", type=int, default=None,
+                        help="macOS only: wait (0-30000 ms; default 0) after the last warm-up, before the verdict "
+                        "routes (Issue #1415).")
     args = parser.parse_args(argv)
     try:
         plat = "linux" if sys.platform.startswith("linux") else sys.platform
@@ -837,6 +954,7 @@ def main(argv: list[str] | None = None) -> int:
         if not modes or modes[0] != "baseline" or any(m not in allowed for m in modes):
             raise ValueError("--modes must start with baseline and use known modes")
         validate_loopback_exempt(args.appcontainer_loopback_exempt, plat, modes)
+        warmup_count, warmup_wait_ms = resolve_warmup(plat, args.warmup_count, args.warmup_wait_ms)
         image = validate_image(args.docker_image) if args.docker_image else None
         if "docker-none" in modes and image is None:
             raise ValueError("docker-none needs --docker-image")
@@ -859,7 +977,7 @@ def main(argv: list[str] | None = None) -> int:
         hosts_file.write_text(judge.HOSTS_FILE, encoding="utf-8")
         resolv_file = Path(td) / "resolv.conf"
         resolv_file.write_text(judge.RESOLV_CONF, encoding="utf-8")
-        recs, ports = start_outer_listeners(diag=sys.platform == "darwin")
+        recs, ports = start_outer_listeners(diag=sys.platform == "darwin", warmup_count=warmup_count)
         results: dict[str, Any] = {"modes": {}}
         try:
             version = subprocess.run([str(host), "--version"], capture_output=True, text=True,  # noqa: S603
@@ -874,6 +992,8 @@ def main(argv: list[str] | None = None) -> int:
                 "kernel": platform.release(), "platform_name": platform.platform(),
                 "sw_vers": mac_version() if sys.platform == "darwin" else None, "host_sha256": sha, "host_version": version,
                 "proxy_env_present": any(k.lower().endswith("_proxy") for k in os.environ),
+                "warmup_count": warmup_count if sys.platform == "darwin" else None,
+                "warmup_wait_ms": warmup_wait_ms if sys.platform == "darwin" else None,
             }
             for mode in modes:
                 # モードごとにポートを取り直す（close 直後の再 bind が EADDRINUSE になるのを避ける）。
@@ -881,7 +1001,8 @@ def main(argv: list[str] | None = None) -> int:
                 results["modes"][mode] = run_mode(mode, host=host, ports=ports, recs=recs, out_dir=out_dir,
                                                   hosts_file=hosts_file, image=image,
                                                   resolv_file=resolv_file, page_port=page_port,
-                                                  loopback_exempt=args.appcontainer_loopback_exempt)
+                                                  loopback_exempt=args.appcontainer_loopback_exempt,
+                                                  warmup_wait_ms=warmup_wait_ms)
                 if mode == "docker-none" and image is not None:
                     results["modes"][mode]["image_id"] = docker_image_id(image)
         finally:

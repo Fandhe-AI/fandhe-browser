@@ -55,6 +55,7 @@ import servo_bbox_driver as sbd  # noqa: E402
 
 LOAD_TIMEOUT_MS = 8000
 SETTLE_S = 2.5
+MAX_WARMUP_WAIT_MS = 30000  # 予熱後の待ち時間の上限（ジョブの超過を防ぐ。Issue #1415）
 PROBE_TIMEOUT_S = 2.0
 DNS_TIMEOUT_S = 5.0
 TCP_ROUTES = ("redirect", "img", "fetch", "ws", "internal")
@@ -460,12 +461,18 @@ def validate_args(args: argparse.Namespace) -> dict[str, int]:
             if isinstance(value, bool) or not isinstance(value, int) or not (1024 <= value <= 65535):
                 raise ValueError(f"port for {key} must be an int in [1024, 65535]")
         needed = (*needed, *fixtures.DIAG_ROUTES)
-    if getattr(args, "warmup", False):
-        # 予熱経路（Issue #1415。macOS だけ）。指定したときだけ必須。判定経路のポートとは別に検証する。
-        value = ports.get(fixtures.WARMUP_ROUTE)
+    count = getattr(args, "warmup_count", 0)
+    wait_ms = getattr(args, "warmup_wait_ms", 0)
+    if isinstance(count, bool) or not isinstance(count, int) or not (0 <= count <= fixtures.MAX_WARMUP_COUNT):
+        raise ValueError(f"--warmup-count must be an int in [0, {fixtures.MAX_WARMUP_COUNT}]")
+    if isinstance(wait_ms, bool) or not isinstance(wait_ms, int) or not (0 <= wait_ms <= MAX_WARMUP_WAIT_MS):
+        raise ValueError(f"--warmup-wait-ms must be an int in [0, {MAX_WARMUP_WAIT_MS}]")
+    # 予熱経路（Issue #1415。macOS だけ）。K 個すべての専用ポートを必須にし、判定経路のポートとは別に検証する。
+    for key in fixtures.warmup_routes(count):
+        value = ports.get(key)
         if isinstance(value, bool) or not isinstance(value, int) or not (1024 <= value <= 65535):
-            raise ValueError(f"port for {fixtures.WARMUP_ROUTE} must be an int in [1024, 65535]")
-        needed = (*needed, fixtures.WARMUP_ROUTE)
+            raise ValueError(f"port for {key} must be an int in [1024, 65535]")
+        needed = (*needed, key)
     return {k: ports[k] for k in needed}
 
 
@@ -492,13 +499,30 @@ def load_route(chan: sbd.HostChannel, next_id: list[int], info: sbd.HostInfo, ur
     return {"ok": True, "final_host": host}
 
 
+def _warmup_wait(wait_ms: int) -> None:
+    """予熱の終了から判定経路の開始までの待ち（Issue #1415。件数ではなく時間で拒否行が出始めるかの切り分け用）。
+
+    テストで差し替えられるよう関数にしている。`run()` から最後の予熱の後に 1 回だけ呼ばれる。
+    """
+    if wait_ms > 0:
+        time.sleep(wait_ms / 1000)
+
+
 def run(args: argparse.Namespace, ports: dict[str, int]) -> dict[str, Any]:
     isolated = args.mode in judge.ISOLATED_MODES
     # netns を前提にする検査・写し listener・構造的な経路は bwrap / docker のモードだけ（#1387）。
     netns = args.mode in judge.NETNS_MODES
     linux = sys.platform.startswith("linux")
     literal = not linux  # macOS・Windows は hosts を変えられないので IP リテラルのページを配る
-    result: dict[str, Any] = {"mode": args.mode, "routes": list(judge.routes_for_mode(args.mode))}
+    warmup_count = getattr(args, "warmup_count", 0)
+    warmup_wait_ms = getattr(args, "warmup_wait_ms", 0)
+    warmup_names = fixtures.warmup_routes(warmup_count)
+    result: dict[str, Any] = {"mode": args.mode, "routes": list(judge.routes_for_mode(args.mode)),
+                              "warmup_count": warmup_count, "warmup_wait_ms": warmup_wait_ms}
+    # 読み込みごとの開始時刻（ホスト起動からの経過 ms）・所要 ms の時系列（Issue #1415。診断のみで判定に使わない）。
+    # 例外時にも途中まで残るよう try の前に result へ結ぶ。
+    load_timeline: list[dict[str, Any]] = []
+    result["load_timeline"] = load_timeline
     result.update(host_identity(args.host))
 
     dev, route4, route6 = read_proc("dev"), read_proc("route"), read_proc("ipv6_route")
@@ -517,10 +541,10 @@ def run(args: argparse.Namespace, ports: dict[str, int]) -> dict[str, Any]:
     diag = bool(getattr(args, "diag_routes", False)) and all(r in ports for r in fixtures.DIAG_ROUTES)
     if diag:
         _PageHandler.redirects[fixtures.REDIRECT_LATE_PATH] = fixtures.diag_redirect_location(ports, literal=literal)
-    warmup = bool(getattr(args, "warmup", False)) and fixtures.WARMUP_ROUTE in ports
-    if warmup:
-        _PageHandler.redirects[fixtures.REDIRECT_WARMUP_PATH] = fixtures.warmup_redirect_location(
-            ports, literal=literal)
+    for i, name in enumerate(warmup_names, start=1):
+        if name in ports:
+            _PageHandler.redirects[fixtures.warmup_redirect_path(i)] = fixtures.warmup_redirect_location(
+                ports, i, literal=literal)
     with _PageHandler.beacon_lock:
         _PageHandler.beacons = {}
     threading.Thread(target=server.serve_forever, daemon=True).start()
@@ -554,6 +578,7 @@ def run(args: argparse.Namespace, ports: dict[str, int]) -> dict[str, Any]:
 
         stage = "spawn_host"
         proc = quiet_io.popen_stdio_host([*host_argv(args.host), "--stdio"], env=env)
+        host_t0 = time.monotonic()  # 時系列の基準（ホスト起動）
         stage = "drive_host"
         # ハーネスが意図的に接続させるダミー宛先（127.0.0.2 / 127.0.0.3）は想定内の試行として除外し、監視を続ける。
         expected = {f"{judge.IP_INTERNAL_STANDIN if r == 'internal' else judge.IP_BLOCKED}:{ports[r]}"
@@ -567,7 +592,14 @@ def run(args: argparse.Namespace, ports: dict[str, int]) -> dict[str, Any]:
         next_id = [1]
         base = f"http://{judge.IP_ALLOWED if literal else judge.HOST_ALLOWED}:{page_port}"
 
+        def record(route: str, role: str, t0: float, elapsed_ms: int, res: dict[str, Any]) -> None:
+            """時系列へ 1 件足す。int と固定語彙だけを入れ、URL は入れない。"""
+            load_timeline.append({"route": route, "role": role, "start_ms": int((t0 - host_t0) * 1000),
+                                  "elapsed_ms": elapsed_ms, "kind": res.get("kind", "ok" if res.get("ok") else "error")})
+
+        t_ok = time.monotonic()
         loopback = load_route(chan, next_id, info, f"{base}/ok")
+        record("ok", "loopback", t_ok, int((time.monotonic() - t_ok) * 1000), loopback)
         result["loopback_load"] = loopback
         loads: dict[str, Any] = {}
         host_pids = {os.getpid()} | descendant_pids(proc.pid)
@@ -575,27 +607,32 @@ def run(args: argparse.Namespace, ports: dict[str, int]) -> dict[str, Any]:
         load_ms: dict[str, int] = {}
         alive_after: dict[str, bool] = {}
 
-        def timed_load(route: str, url: str) -> dict[str, Any]:
+        def timed_load(route: str, url: str, role: str) -> dict[str, Any]:
             """`load_route` に所要時間（ms）と、失敗直後のホスト生存の記録を足す（Issue #1415 D3。判定には使わない）。"""
             t0 = time.monotonic()
             res = load_route(chan, next_id, info, url)
             load_ms[route] = int((time.monotonic() - t0) * 1000)
+            record(route, role, t0, load_ms[route], res)
             if not res.get("ok"):
                 alive_after[route] = proc.poll() is None
             return res
 
-        if warmup:
-            # 予熱（Issue #1415。macOS だけ）: 最初の遮断されたトップレベルナビゲーションでは redirect の拒否行が
-            # 取れない事象（run 41338564798）を、判定しない経路に吸わせる。許可宛先の /ok は上で読み込み済みで
-            # それでも直らなかったため、遮断ダミー宛先への 302 にしている。loads・guard_polls・attempts には入れない。
-            result["warmup_load"] = timed_load(fixtures.WARMUP_ROUTE, base + fixtures.REDIRECT_WARMUP_PATH)
-            time.sleep(SETTLE_S)
-            host_pids |= descendant_pids(proc.pid)
-            result["host_pids"] = sorted(host_pids)
+        if warmup_names:
+            # 予熱（Issue #1415。macOS だけ）: 遮断されるトップレベルナビゲーションの先頭で redirect の拒否行が取れない事象
+            # （run 41338564798）を、判定しない経路に吸わせる。回ごとに専用ポートの遮断ダミー宛先への 302 を読み込み、
+            # 拒否行をどの回のものか帰属できるようにする。loads・guard_polls・attempts には入れない。
+            warmup_loads: dict[str, Any] = {}
+            for i, name in enumerate(warmup_names, start=1):
+                warmup_loads[name] = timed_load(name, base + fixtures.warmup_redirect_path(i), "warmup")
+                time.sleep(SETTLE_S)
+                host_pids |= descendant_pids(proc.pid)
+                result["host_pids"] = sorted(host_pids)
+            result["warmup_loads"] = warmup_loads
+        _warmup_wait(warmup_wait_ms)
 
         for r in (x for x in PAGE_ROUTES if x in result["routes"] and (netns or x in TCP_ROUTES)):
             polls_before = guard.snapshot_polls() if guard is not None else 0
-            loads[r] = timed_load(r, base + fixtures.ROUTE_PATH[r])
+            loads[r] = timed_load(r, base + fixtures.ROUTE_PATH[r], "judged")
             time.sleep(SETTLE_S)
             host_pids |= descendant_pids(proc.pid)  # 子プロセスを後から起こす場合も拾う（拒否ログの帰属用）
             result["host_pids"] = sorted(host_pids)
@@ -609,7 +646,7 @@ def run(args: argparse.Namespace, ports: dict[str, int]) -> dict[str, Any]:
                          "diag_nav_direct": f"http://{judge.IP_BLOCKED}:{ports['diag_nav_direct']}"
                                             f"{fixtures.DIAG_NAV_DIRECT_PATH}"}
             for r in fixtures.DIAG_ROUTES:
-                diag_loads[r] = timed_load(r, diag_urls[r])
+                diag_loads[r] = timed_load(r, diag_urls[r], "diag")
                 time.sleep(SETTLE_S)
                 host_pids |= descendant_pids(proc.pid)
                 result["host_pids"] = sorted(host_pids)
@@ -710,8 +747,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--out", required=True, type=Path)
     parser.add_argument("--page-port", type=int, default=0,
                         help="Fixed port for the allowed page server (Seatbelt profile needs it before launch).")
-    parser.add_argument("--warmup", action="store_true",
-                        help="macOS only: load a blocked-302 warm-up route before the verdict routes "
+    parser.add_argument("--warmup-count", type=int, default=0,
+                        help="macOS only: number of blocked-302 warm-up loads (0-10, one dedicated port each) "
+                             "before the verdict routes (Issue #1415). Not part of verdicts.")
+    parser.add_argument("--warmup-wait-ms", type=int, default=0,
+                        help="macOS only: wait (0-30000 ms) after the last warm-up, before the verdict routes "
                              "(Issue #1415). Not part of verdicts.")
     parser.add_argument("--diag-routes", action="store_true",
                         help="macOS only: also run redirect diagnostics (Issue #1415). Not part of verdicts.")

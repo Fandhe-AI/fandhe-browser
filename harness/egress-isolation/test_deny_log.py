@@ -95,30 +95,89 @@ class RunModeTest(unittest.TestCase):
         v = judge.judge_all("seatbelt", data["inner"], {}, {r: 1 for r in PORTS})
         self.assertEqual(v["img"]["verdict"], judge.UNOBSERVABLE)
 
-    def test_warmup_unattributed_dest_is_reported_by_route_name(self) -> None:
-        """予熱宛先の PID 帰属できない拒否行が、ip:port ではなく経路名 warmup_redirect で出る（Issue #1415）。"""
+    def _run_with_warmups(self, k: int, denies: dict[str, int], *, unattributed: dict[str, int] | None = None,
+                          timeline: list[dict[str, Any]] | None = None,
+                          known: list[Any] | None = None) -> tuple[dict[str, Any], dict[str, int]]:
+        """K 回の予熱つきで seatbelt の run_mode を回す。denies は経路名 -> 拒否行の件数（宛先へ写して渡す）。"""
         import page_templates
 
-        warmup = page_templates.WARMUP_ROUTE
         diag = list(page_templates.DIAG_ROUTES)
-        ports = {**PORTS, **{r: 3000 + i for i, r in enumerate([*diag, warmup])}}
-        warmup_dest = f"{judge.IP_BLOCKED}:{ports[warmup]}"
-        recs = {k: SimpleNamespace(count=0) for k in ports}
+        warmups = list(page_templates.warmup_routes(k))
+        ports = {**PORTS, **{r: 3000 + i for i, r in enumerate([*diag, *warmups])}}
+        dest_of = {**{r: f"{judge.IP_BLOCKED}:{ports[r]}" for r in ("redirect", "img", "fetch", "ws", *diag, *warmups)},
+                   "internal": f"{judge.IP_INTERNAL_STANDIN}:{ports['internal']}"}
+        raw = {dest_of[r]: n for r, n in denies.items()}
+        raw[f"{judge.IP_BLOCKED}:{ports['udp_direct']}"] = 1
+        recs = {k2: SimpleNamespace(count=0) for k2 in ports}
         with tempfile.TemporaryDirectory() as td:
             out_dir = Path(td)
-            (out_dir / "seatbelt.json").write_text(json.dumps({
-                "host_pids": [101], "probes": {"udp_direct": "EPERM"}, "positive_ok": True,
-                "guard": {"unavailable": "n/a"}, "attempts": {"udp_direct": True},
-                "attempt_evidence": {"udp_direct": "errno"}}), encoding="utf-8")
-            status = {"available": True, "deny_lines": 1,
-                      "diagnostics": {"unattributed_network_dests": {warmup_dest: 2}}}
-            with mock.patch.object(measure, "run_argv", lambda *a, **k: (0, "")), \
-                    mock.patch.object(measure, "collect_denies",
-                                      lambda *a, **k: ({UDP_DEST: 1}, dict(status))), \
-                    mock.patch.object(measure, "build_argv", lambda *a, **k: ["true"]):
+            inner = {"host_pids": [101], "probes": {"udp_direct": "EPERM"}, "positive_ok": True,
+                     "guard": {"unavailable": "n/a"}, "attempts": {"udp_direct": True},
+                     "attempt_evidence": {"udp_direct": "errno"}, "loads": {}, "diag_loads": {}}
+            if timeline is not None:
+                inner["load_timeline"] = timeline
+            (out_dir / "seatbelt.json").write_text(json.dumps(inner), encoding="utf-8")
+            status = {"available": True, "deny_lines": 1}
+            if unattributed:
+                status["diagnostics"] = {"unattributed_network_dests": {dest_of[r]: n for r, n in unattributed.items()}}
+
+            def fake_collect(*a: Any, **k2: Any) -> tuple[dict[str, int], dict[str, Any]]:
+                if known is not None:
+                    known.append(measure._KNOWN_DESTS.get())
+                return dict(raw), dict(status)
+
+            with mock.patch.object(measure, "run_argv", lambda *a, **k2: (0, "")), \
+                    mock.patch.object(measure, "collect_denies", fake_collect), \
+                    mock.patch.object(measure, "build_argv", lambda *a, **k2: ["true"]):
                 data = measure.run_mode("seatbelt", host=Path("h"), ports=ports, recs=recs, out_dir=out_dir,
                                         hosts_file=Path("hosts"), image=None)
-        self.assertEqual(data["deny_log"]["unattributed_routes"], {"warmup_redirect": 2})
+        return data, {r: ports[r] for r in ports}
+
+    def test_known_dests_include_every_warmup_destination(self) -> None:
+        known: list[Any] = []
+        _, ports = self._run_with_warmups(5, {}, known=known)
+        for i in range(1, 6):
+            self.assertIn(f"{judge.IP_BLOCKED}:{ports[f'warmup_redirect_{i}']}", known[0])
+
+    def test_per_round_deny_counts_and_first_deny_are_exact(self) -> None:
+        """予熱 1・2 が 0 件、予熱 3 から 1 件ずつ・redirect も 1 件のとき、回ごとの件数と first_deny が具体値で一致する。"""
+        tl = [{"route": "ok", "role": "loopback", "start_ms": 100, "elapsed_ms": 10, "kind": "ok"},
+              {"route": "warmup_redirect_1", "role": "warmup", "start_ms": 900, "elapsed_ms": 50, "kind": "load_failed"},
+              {"route": "warmup_redirect_2", "role": "warmup", "start_ms": 3500, "elapsed_ms": 40, "kind": "load_failed"},
+              {"route": "warmup_redirect_3", "role": "warmup", "start_ms": 6100, "elapsed_ms": 45, "kind": "load_failed"},
+              {"route": "redirect", "role": "judged", "start_ms": 8700, "elapsed_ms": 60, "kind": "load_failed"}]
+        data, _ = self._run_with_warmups(3, {"warmup_redirect_3": 2, "redirect": 1}, timeline=tl)
+        wu = data["warmup"]
+        self.assertEqual(wu["count"], 3)
+        self.assertEqual(wu["deny"], 2)
+        self.assertEqual({k: v["deny"] for k, v in wu["per_route"].items()},
+                         {"warmup_redirect_1": 0, "warmup_redirect_2": 0, "warmup_redirect_3": 2})
+        self.assertEqual(data["deny_log"]["first_deny"],
+                         {"index": 3, "route": "warmup_redirect_3", "start_ms": 6100, "missed_before": 2})
+        self.assertEqual([(e["route"], e["deny"]) for e in data["load_timeline"]],
+                         [("ok", None), ("warmup_redirect_1", 0), ("warmup_redirect_2", 0),
+                          ("warmup_redirect_3", 2), ("redirect", 1)])
+        # 予熱は判定用の集計に入らない
+        self.assertFalse([k for k in data["outer_counts"] if k.startswith("warmup_redirect")])
+        self.assertFalse([k for k in data["deny_log"]["dest_counts"] if k.endswith(":3003") or k.endswith(":3004")])
+
+    def test_first_deny_is_none_when_no_blocked_load_has_rows(self) -> None:
+        tl = [{"route": "warmup_redirect_1", "role": "warmup", "start_ms": 900, "elapsed_ms": 50, "kind": "load_failed"}]
+        data, _ = self._run_with_warmups(1, {}, timeline=tl)
+        self.assertIsNone(data["deny_log"]["first_deny"])
+
+    def test_warmups_do_not_change_verdicts(self) -> None:
+        denies = {"redirect": 1, "img": 1, "fetch": 1, "ws": 1, "internal": 1}
+        results = []
+        for k in (0, 5):
+            data, _ = self._run_with_warmups(k, {**denies, **{f"warmup_redirect_{i}": 3 for i in range(1, k + 1)}})
+            results.append(judge.judge_all("seatbelt", data["inner"], data["outer_counts"], {r: 1 for r in PORTS}))
+        self.assertEqual(results[0], results[1])
+
+    def test_warmup_unattributed_dest_is_reported_by_route_name(self) -> None:
+        """予熱宛先の PID 帰属できない拒否行が、ip:port ではなく経路名 warmup_redirect_<i> で出る（Issue #1415）。"""
+        data, _ = self._run_with_warmups(3, {}, unattributed={"warmup_redirect_2": 2})
+        self.assertEqual(data["deny_log"]["unattributed_routes"], {"warmup_redirect_2": 2})
 
 
 class _FakePipe:
