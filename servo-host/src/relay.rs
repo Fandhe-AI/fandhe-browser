@@ -150,6 +150,18 @@ impl Drop for Guard {
     }
 }
 
+/// 接続待ち枠を原子的に取得する。上限未満のときだけ加算し（判定と加算を `try_update`（旧 fetch_update）で
+/// 不可分にして並行取得でも上限を超えない）、上限到達時は枠を取らず `None` を返す。
+/// 枠の返却は戻り値 `Guard` の drop で全経路（成功・失敗・早期 return）一律に行う。
+fn try_acquire(counter: &Arc<AtomicUsize>, max: usize) -> Option<Guard> {
+    counter
+        .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+            (n < max).then_some(n + 1)
+        })
+        .ok()?;
+    Some(Guard(Arc::clone(counter)))
+}
+
 /// UDS へ期限つきで接続する。std の `UnixStream::connect` はブロッキングで、相手の accept
 /// キューが満杯だと戻らないため、接続は別スレッドで行い `connect_timeout` で待ちを切る。
 /// 期限超過時は呼び出し側が枠（`active`）を返却する。接続スレッドは接続が成否いずれかで戻るまで
@@ -159,11 +171,7 @@ fn connect_uds(
     limits: RelayLimits,
     connecting: &Arc<AtomicUsize>,
 ) -> Option<UnixStream> {
-    if connecting.load(Ordering::SeqCst) >= limits.max_connections {
-        return None;
-    }
-    connecting.fetch_add(1, Ordering::SeqCst);
-    let guard = Guard(Arc::clone(connecting));
+    let guard = try_acquire(connecting, limits.max_connections)?;
     let (tx, rx) = std::sync::mpsc::channel();
     let path = uds.to_path_buf();
     std::thread::Builder::new()
@@ -301,6 +309,36 @@ mod tests {
     use std::sync::atomic::AtomicU32;
 
     static SEQ: AtomicU32 = AtomicU32::new(0);
+
+    /// 接続待ち枠は上限ちょうど（127 -> 128）まで取れ、上限到達後は取れず、返却で再取得できる。
+    #[test]
+    fn try_acquire_stops_at_limit_and_releases_on_drop() {
+        let c = Arc::new(AtomicUsize::new(127));
+        let g = try_acquire(&c, 128).expect("127 -> 128 は取得できる");
+        assert_eq!(c.load(Ordering::SeqCst), 128);
+        assert!(try_acquire(&c, 128).is_none());
+        assert_eq!(c.load(Ordering::SeqCst), 128);
+        drop(g);
+        assert_eq!(c.load(Ordering::SeqCst), 127);
+        assert!(try_acquire(&c, 128).is_some());
+    }
+
+    /// 並行取得でも成功数が上限を超えない。
+    #[test]
+    fn try_acquire_concurrent_never_exceeds_limit() {
+        let c = Arc::new(AtomicUsize::new(0));
+        let guards: Vec<_> = (0..16)
+            .map(|_| {
+                let c = Arc::clone(&c);
+                std::thread::spawn(move || try_acquire(&c, 4))
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .filter_map(|h| h.join().unwrap())
+            .collect();
+        assert_eq!(guards.len(), 4);
+        assert_eq!(c.load(Ordering::SeqCst), 4);
+    }
 
     /// 一意な 0700 ディレクトリ（Drop で削除）。UDS パス長が上限内であることを確かめる。
     struct TmpDir(PathBuf);
