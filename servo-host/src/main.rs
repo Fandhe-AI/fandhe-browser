@@ -12,6 +12,9 @@
 //! - `--stdio`: 本体 render crate から起動される stdio サーバー（#993。`server`）。`load`（#231）と
 //!   `screenshot`（PNG の base64 inline。#232）・`visibility`（JS 評価。#233。`layout`）は
 //!   `page::ServoHandler` で実装済み。`bounding_box`（JS 評価。#234）も同じ `layout` 経由で実装済み。
+//!   `--egress-proxy-port <port>`（macOS 向け）・`--egress-relay-uds <path>`（Linux 向け。netns 内の
+//!   `relay` が `127.0.0.1` で待ち受けて UDS へ転送）のどちらか 1 つを足すと、Servo の proxy pref を
+//!   `http://127.0.0.1:<port>` に向ける（`args` が検証。RENDER-3・SEC-2・#1435。設計 §2.6）。
 //! - それ以外: 標準エラーに示し、非ゼロで終了する（固定の許可リスト。SEC-2）。
 //!
 //! Servo と描画コンテキストの生成・破棄は `engine` が担う（RENDER-3・#230）。
@@ -22,16 +25,20 @@
 //!
 //! 可視性判定・境界ボックス取得のスクリプト生成と結果解釈は Servo 非依存の `layout` が担う（RENDER-3・#233・#234）。
 
+mod args;
 mod engine;
 mod layout;
 mod page;
+#[cfg(unix)]
+mod relay;
 mod screenshot;
 mod server;
 
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
-use engine::{Engine, EngineError};
+use args::{Command, Egress};
+use engine::{Engine, EngineError, LoopbackProxy};
 use server::ServeOutcome;
 use servo::ServoUrl;
 
@@ -71,21 +78,23 @@ fn finish(code: u8) -> ExitCode {
 
 /// 引数に応じて `--version`・`--selftest`・`--stdio` を処理し、他は失敗終了する。
 fn main() -> ExitCode {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    // `--stdio` は単独でのみ受け付ける（後続の引数は拒否。固定の許可リスト）。
-    if args.first().map(String::as_str) == Some("--stdio") && args.len() == 1 {
-        return run_stdio();
-    }
-    match args.first().map(String::as_str).filter(|_| args.len() == 1) {
-        Some("--version") => {
+    // 非 UTF-8 の引数で panic しないよう `args_os` で受け、変換できなければ Usage と同じ失敗にする。
+    let args: Result<Vec<String>, _> = std::env::args_os()
+        .skip(1)
+        .map(std::ffi::OsString::into_string)
+        .collect();
+    let parsed = args
+        .map_err(|_| args::ArgError::Usage)
+        .and_then(|a| args::parse(&a));
+    match parsed {
+        Ok(Command::Version) => {
             println!("fandhe-browser-servo-host {}", env!("CARGO_PKG_VERSION"));
             ExitCode::SUCCESS
         }
-        Some("--selftest") => run_selftest(),
-        _ => {
-            eprintln!(
-                "error: fandhe-browser-servo-host supports only --version, --selftest and --stdio"
-            );
+        Ok(Command::Selftest) => run_selftest(),
+        Ok(Command::Stdio(egress)) => run_stdio(egress),
+        Err(e) => {
+            eprintln!("error: {e}");
             ExitCode::FAILURE
         }
     }
@@ -96,9 +105,28 @@ fn main() -> ExitCode {
 /// stdout はフレーム専用（`println!` 等を stdio 経路に置かない）。ログは stderr のみ。
 /// `Engine`（Servo）は hello の送信後、最初の `load` で作る（ハンドシェイクの 10 秒以内に
 /// hello を出すため）。Servo 自身が stdout へ書き出すリスクは設計 §2.1 を参照。
-fn run_stdio() -> ExitCode {
+fn run_stdio(egress: Egress) -> ExitCode {
+    // 中継は hello の前に起動する（Servo 未生成のため失敗時は `finish` 不要）。プロセス終了まで保持する。
+    #[cfg(unix)]
+    let mut _relay = None;
+    let proxy = match egress {
+        Egress::None => None,
+        Egress::ProxyPort(port) => Some(LoopbackProxy::new(port)),
+        #[cfg(unix)]
+        Egress::RelayUds(path) => match relay::start(path) {
+            Ok(r) => {
+                let proxy = LoopbackProxy::new(r.port());
+                _relay = Some(r);
+                Some(proxy)
+            }
+            Err(e) => {
+                eprintln!("error: cannot start egress relay: {e}");
+                return ExitCode::FAILURE;
+            }
+        },
+    };
     // `handler` が `Engine` を持つ。Windows では drop の前に `finish` で終了する（#1413）。
-    let mut handler = page::ServoHandler::new();
+    let mut handler = page::ServoHandler::new(proxy);
     let outcome = server::serve(
         std::io::stdin().lock(),
         std::io::stdout().lock(),
@@ -125,7 +153,7 @@ fn selftest_stage(stage: &str) {
 /// `--selftest` を実行して終了コードへ写す。`Engine` はこの関数が所有し、Windows では drop の前に
 /// `finish` で終了する（#1413。成功・失敗とも。失敗が 0xC0000409 に化けないようにする）。
 fn run_selftest() -> ExitCode {
-    let engine = match Engine::new() {
+    let engine = match Engine::new(None) {
         Ok(e) => e,
         Err(e) => {
             eprintln!("error: selftest failed: {e}");
@@ -184,7 +212,7 @@ fn selftest_run(engine: &Engine) -> Result<Duration, String> {
 
 /// 1 プロセス 1 回の制約: 2 回目の生成は panic せず `AlreadyCreated` で拒否される。
 fn selftest_second_engine() -> Result<(), String> {
-    match Engine::new() {
+    match Engine::new(None) {
         Err(EngineError::AlreadyCreated) => {}
         Err(e) => return Err(format!("unexpected error on second engine: {e}")),
         Ok(_) => return Err("second engine creation was not rejected".to_string()),

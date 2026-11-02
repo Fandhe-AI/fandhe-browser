@@ -782,3 +782,55 @@ fn closed_port_is_outside_ephemeral_range_and_not_reassigned() {
         "port {port} was reassigned to a :0 bind"
     );
 }
+
+/// hello を受けて shutdown し、終了コード 0 と stdout がフレームのみであることを確かめる。
+fn assert_starts_and_shuts_down(args: &[&str]) {
+    let mut h = spawn(args);
+    let hello: serde_json::Value = serde_json::from_str(&h.recv()).unwrap();
+    assert_eq!(hello["event"], "hello", "args: {args:?}");
+    h.send(r#"{"v":1,"id":1,"method":"shutdown"}"#);
+    assert_eq!(h.recv(), r#"{"v":1,"id":1,"result":{}}"#);
+    let (code, rest, stderr) = h.finish();
+    assert_eq!(code, Some(0), "args: {args:?} stderr: {stderr}");
+    assert_eq!(rest, 0, "stdout must contain frames only");
+}
+
+/// RENDER-3・SEC-2（#1435）: egress 引数つきでも hello を出し、shutdown で 0 終了する。
+#[test]
+fn egress_arguments_are_accepted() {
+    let port = closed_port().to_string();
+    assert_starts_and_shuts_down(&["--stdio", "--egress-proxy-port", &port]);
+}
+
+#[cfg(unix)]
+#[test]
+fn egress_relay_uds_argument_is_accepted() {
+    // 中継は bind するだけで UDS へは接続しない（接続は Servo の通信時）ため、不在のパスでよい。
+    assert_starts_and_shuts_down(&["--stdio", "--egress-relay-uds", "/nonexistent/proxy.sock"]);
+}
+
+/// RENDER-3・SEC-2（#1435）: 不正な egress 引数は失敗終了（コード 1）し、フレームを出さない。
+#[test]
+fn invalid_egress_arguments_are_rejected_without_frames() {
+    for args in [
+        &["--stdio", "--egress-proxy-port"][..],
+        &["--stdio", "--egress-proxy-port", "0"],
+        &["--stdio", "--egress-proxy-port", "65536"],
+        &[
+            "--stdio",
+            "--egress-proxy-port",
+            "80",
+            "--egress-relay-uds",
+            "/a",
+        ],
+        &["--stdio", "--egress-relay-uds", "rel.sock"],
+        &["--stdio", "--egress-relay-uds", "/a/../b.sock"],
+        &["--stdio", "--bogus", "1"],
+    ] {
+        let h = spawn(args);
+        let (code, rest, stderr) = h.finish();
+        assert_eq!(code, Some(1), "args: {args:?} stderr: {stderr}");
+        assert_eq!(rest, 0, "args: {args:?}: no frames expected");
+        assert!(stderr.starts_with("error: "), "stderr: {stderr}");
+    }
+}
