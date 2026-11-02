@@ -90,12 +90,31 @@ REDIRECT_LATE_PATH = "/redirect-late"
 DIAG_NAV_DIRECT_PATH = "/direct"
 _DIAG_REDIRECT_LOCATION = f"http://{judge.HOST_BLOCKED}:$p_diag_redirect_late/redirected"
 
-# 予熱用の経路（macOS だけ。Issue #1415）。判定経路の前に 1 回だけ「遮断ダミー宛先への 302」を読み込む。
-# 最初に遮断されるトップレベルナビゲーションでだけ拒否行が出ない事象を、判定しない経路に吸わせるための
-# もので、判定（`judge.routes_for_mode` 等）・attempts・外側受信の集計には入れない。
-WARMUP_ROUTE = "warmup_redirect"
-REDIRECT_WARMUP_PATH = "/redirect-warmup"
-_WARMUP_REDIRECT_LOCATION = f"http://{judge.HOST_BLOCKED}:$p_warmup_redirect/redirected"
+# 予熱用の経路（macOS だけ。Issue #1415）。判定経路の前に K 回（既定 5）「遮断ダミー宛先への 302」を読み込む。
+# 遮断されるトップレベルナビゲーションの先頭 1〜3 件で拒否行が 0 件になる事象を、判定しない経路に吸わせるとともに、
+# 拒否行が出始めるのが何件目・何 ms 後かを回ごとに比べるためのもの。回ごとに専用ポート（`p_warmup_redirect_<i>`）を使い、
+# 拒否行をどの回のものか帰属できるようにする。判定（`judge.routes_for_mode` 等）・attempts・外側受信の集計には入れない。
+MAX_WARMUP_COUNT = 10
+WARMUP_ROUTE_PREFIX = "warmup_redirect"
+
+
+def _warmup_index(index: Any) -> int:
+    if isinstance(index, bool) or not isinstance(index, int) or not (1 <= index <= MAX_WARMUP_COUNT):
+        raise ValueError(f"warm-up index must be an int in [1, {MAX_WARMUP_COUNT}]")
+    return index
+
+
+def warmup_routes(count: Any) -> tuple[str, ...]:
+    """予熱経路名 `warmup_redirect_1`..`warmup_redirect_<count>`。count は 0..MAX_WARMUP_COUNT の int だけ。"""
+    if isinstance(count, bool) or not isinstance(count, int) or not (0 <= count <= MAX_WARMUP_COUNT):
+        raise ValueError(f"warm-up count must be an int in [0, {MAX_WARMUP_COUNT}]")
+    return tuple(f"{WARMUP_ROUTE_PREFIX}_{i}" for i in range(1, count + 1))
+
+
+def warmup_redirect_path(index: int) -> str:
+    """予熱用 302 のパス `/redirect-warmup-<index>`。"""
+    return f"/redirect-warmup-{_warmup_index(index)}"
+
 
 # 経路 -> ページのパス
 ROUTE_PATH = {
@@ -149,6 +168,7 @@ def diag_redirect_location(ports: dict[str, Any], *, literal: bool = False) -> s
     return _subst(_literal(_DIAG_REDIRECT_LOCATION) if literal else _DIAG_REDIRECT_LOCATION, ports)
 
 
-def warmup_redirect_location(ports: dict[str, Any], *, literal: bool = False) -> str:
-    """予熱用 302（`/redirect-warmup`）の Location。int のポートだけを置換する（Issue #1415）。"""
-    return _subst(_literal(_WARMUP_REDIRECT_LOCATION) if literal else _WARMUP_REDIRECT_LOCATION, ports)
+def warmup_redirect_location(ports: dict[str, Any], index: int, *, literal: bool = False) -> str:
+    """予熱用 302 の Location。index 回目の専用ポート（int）だけを置換する（Issue #1415）。"""
+    template = f"http://{judge.HOST_BLOCKED}:$p_{WARMUP_ROUTE_PREFIX}_{_warmup_index(index)}/redirected"
+    return _subst(_literal(template) if literal else template, ports)

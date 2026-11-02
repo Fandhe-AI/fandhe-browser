@@ -123,7 +123,7 @@ macOS・Windows の GitHub ホステッドランナー。結果は #1003 に記�
     macOS では connect が syscall で拒否されソケットが現れない。`servo-host/src` に接続試行のログも無く、追加には Servo の
     net スタックの改変か servo-host の改修が要る。
   - macOS は sudo なしの `log show --style ndjson`（非特権）で拒否行を取る（#1402。xos-measure の実測 run 41309744793・41310673642・41313641135 で、
-    sudo・`log config` なしでも上記 macOS 26 のワイルドカード形式の拒否行が取れ、TCP 4 経路（img・fetch・ws・internal）が pass〔redirect は unobservable。#1415 の予熱で対処中で、pass とは断定しない〕・自己検査成立。オーナー判断 2026-11-01 で
+    sudo・`log config` なしでも上記 macOS 26 のワイルドカード形式の拒否行が取れ、TCP 4 経路（img・fetch・ws・internal）が pass〔redirect は unobservable。#1415 で拒否行の取りこぼしを件数・時間の別に調査中で、pass とは断定しない〕・自己検査成立。オーナー判断 2026-11-01 で
     sudo つき拒否ログの opt-in と `log config` の操作を削除した）。UDP の自己照合が成り立てば TCP 5 経路の deny 行が試行の根拠になり、
     成り立たなければ理由（`deny log unavailable: ...`）つきの `unobservable`。`log stream`・`log erase` など管理者操作は実装しない。
   - 後続の候補（今回は入れない）: SBPL の `(with message ...)` 等の修飾子、`log stream` の並行収集。
@@ -144,17 +144,28 @@ macOS・Windows の GitHub ホステッドランナー。結果は #1003 に記�
       WARNING を出し、拒否ログの自己検査を不成立にする（fail-closed。#1422。理由に経路名と件数。baseline は対象外。
       `judge.py` の判定基準は変えない。`udp_direct` は errno と外側の UDP listener で判定するため影響しない）。診断経路は Linux・Windows では有効にしない。
   - redirect の予熱（#1415。macOS だけ・判定には使わない）。診断（run 41338564798）で、拒否行が取れないのは「最初に読み込む判定経路」
-    だけで、同じ形の 302 を後ろで試す D1 には 1 件出ることが分かった（順序への依存）。オーナー判断 2026-11-02（案 A）で、判定経路の前に
-    予熱を 1 回入れる。
-    - 順序: `/ok`（許可宛先。陽性対照）→ 予熱 → 判定経路 → D1・D2。許可宛先の `/ok` はすでに先頭にあり、それでも redirect は
-      0 件だったため、予熱は同じ形の「遮断ダミー宛先 `127.0.0.2:<専用ポート>` へのトップレベル 302（`/redirect-warmup`）」にして、
-      最初の遮断されたナビゲーションで起きる事象を判定しない経路に吸わせる。
+    だけで、同じ形の 302 を後ろで試す D1 には 1 件出ることが分かった（順序への依存）。オーナー判断 2026-11-02 の案 A で予熱を 1 回入れたが、
+    それでも redirect と img が `unobservable` のまま残り（run 41382057223・41386861681。予熱なしの比較は run 41382060305）、
+    取りこぼしは先頭の 1 件ではなく先頭の 1〜3 件で、何件かはランごとに違った。`log show` の取得開始は測定開始の 2 秒前で、取得範囲は原因ではない。
+    そこでオーナー判断 2026-11-02（案 A'）で、判定基準を変えずに「件数によるか時間によるか」を測れるようにした。
+    - 順序: `/ok`（許可宛先。陽性対照）→ 予熱 K 回（既定 5。`--warmup-count`、0〜10）→ 待ち（`--warmup-wait-ms`、0〜30000。既定 0）→
+      判定経路 → D1・D2。各回は「遮断ダミー宛先 `127.0.0.2:<回ごとの専用ポート>` へのトップレベル 302（`/redirect-warmup-<i>`）」で、
+      拒否行をどの回のものか帰属できる（経路名 `warmup_redirect_<i>`）。待ちは最後の予熱の後に 1 回だけ入れる（K=0 でも W>0 なら入る）。
     - 集計から外す: 予熱は verdict・`attempts`・`loads`・`guard_polls`・`outer_counts`・`deny_log.dest_counts` に入れない。
-      結果の `inner.warmup_load`・`warmup`（外側受信 `outer`・拒否行 `deny`。観測値で根拠にしない）に別に残す。
-      baseline と seatbelt で同じ順序にする（`--warmup` を両方に付ける）。隔離モードで予熱の外側受信が 1 以上なら WARNING を出し、診断経路と同じく自己検査を不成立にする（#1422）。
+      結果の `inner.warmup_loads`（経路名 -> 結果）・`warmup`（`count`・合計の外側受信 `outer`・拒否行 `deny`・回ごとの `per_route`。
+      拒否行は観測値で根拠にしない）に別に残す。baseline と seatbelt で同じ順序にする（両方に付ける）。
+      隔離モードで予熱のどれかの回で外側受信が 1 以上なら WARNING を出し、診断経路と同じく拒否ログの自己検査を不成立にする（fail-closed。#1422。理由に受信のあった経路名と件数。受信 0・`per_route` が空は不成立にしない。baseline は対象外）。
+    - 時系列: 各読み込み（`/ok`・予熱・判定経路・D1/D2）の `route`・`role`（loopback / warmup / judged / diag）・ホスト起動からの開始 ms
+      （`start_ms`）・所要 ms・読み込み種別・外側受信 `outer`・拒否行 `deny` を `load_timeline`（結果 JSON と Step Summary の表）に残す。
+      `deny_log.first_deny`（`index`: 遮断読み込みの何件目か、`route`、`start_ms`、`missed_before`: それ以前に拒否行が 0 件だった遮断読み込みの数）で、
+      拒否行が出始める位置を 1 か所で比べる。int と固定語彙だけで、URL・拒否行の本文は載せない。
+    - 読み方: `first_deny.index`（件数）がランをまたいでそろえば件数によるため、K を増やして確定させる。`start_ms`（時間）がそろえば時間によるため、
+      `--warmup-wait-ms` で待ちを足す。どちらもそろわず redirect と img が直らなければ、既知の制約（案 C）として記録するかをオーナーが判断する。
+      切り分けの例: `K=5・W=0`（既定）、`K=1・W=5000`、`K=0・W=10000`。
+    - 起動: xos-measure の入力 `egress_warmup_count`・`egress_warmup_wait_ms`（macOS の suite のみ。文字列で受け、シェルで正規表現と範囲を検証してから渡す）。
+      `measure.py` は macOS 以外で指定すると exit 2。上限は資源の枯渇とジョブの超過を防ぐためのもの。
     - macOS だけ有効（`--diag-routes` と同じゲート）。Linux・Windows には導入しない。判定基準（`judge.py`）・管理者操作の不使用は変えない。
-    - 直らない場合: redirect の理由に予熱の拒否行・外側受信の件数が付く。予熱 0 件・redirect 0 件なら順序ではなく 302 の追従そのものの
-      事象と読める。次の手（redirect を末尾へ入れ替える案・servo-host から `load_failed` の詳細を返す案）はオーナー判断で、ここでは実装しない。
+    - 次の手（servo-host から `load_failed` の詳細を返す案 B・既知の制約として記録する案 C）はオーナー判断で、ここでは実装しない。
 - 共有 loopback で内側の写し listener を立てられない。hosts も変えないため、ページは IP リテラル（127.0.0.x）で配る。
 - `internal_real` / `dns` は netns 前提の構造検査で、Seatbelt・AppContainer では成り立たないため `unobservable`
   （実在の内部アドレスにも向けない）。

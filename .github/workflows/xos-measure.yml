@@ -30,6 +30,11 @@ name: XOS Measure
 # - サードパーティ action は ci.yml・bench-competitor.yml と同じ SHA 固定のもの（checkout・dtolnay/rust-toolchain・
 #   upload-artifact）だけ。node 22 未満の runner には nodejs.org の公式アーカイブを sha256 照合して導入する。
 #
+# egress-isolation の macOS 実測（#1415）: 拒否ログの取りこぼしが件数によるか時間によるかを測るため、遮断される予熱の回数と
+# 予熱後の待ち時間を入力で変えられる（egress_warmup_count: 0〜10、egress_warmup_wait_ms: 0〜30000。macOS のみ）。入力は env 経由で
+# 渡し、シェルで形式と範囲を検証してから measure.py へ渡す（run: に直接展開しない）。
+#   gh workflow run xos-measure.yml -f suite=egress-isolation -f egress_warmup_count=1 -f egress_warmup_wait_ms=5000
+#
 # 起動例（main へマージ後）:
 #   gh workflow run xos-measure.yml -f suite=cli-conformance
 #   gh workflow run xos-measure.yml -f suite=compat-practical -f repeat=3
@@ -51,6 +56,16 @@ on:
         type: string
         required: false
         default: "3"
+      egress_warmup_count:
+        description: "egress-isolation（macOS）の遮断される予熱の回数（0〜10。#1415。他の suite では使わない）"
+        type: string
+        required: false
+        default: "5"
+      egress_warmup_wait_ms:
+        description: "egress-isolation（macOS）の予熱後の待ち時間 ms（0〜30000。#1415。他の suite では使わない）"
+        type: string
+        required: false
+        default: "0"
 
 permissions:
   contents: read
@@ -587,12 +602,27 @@ jobs:
         run: bash harness/egress-isolation/self-test.sh
       - name: "[egress-isolation] プラットフォームの記録（読み取りのみ）"
         run: python3 -I -B harness/egress-isolation/platform_probe.py
-      - name: "[egress-isolation] 実行（baseline の対照と Seatbelt。sudo なしの拒否ログ。#1402）"
+      - name: "[egress-isolation] 実行（baseline の対照と Seatbelt。sudo なしの拒否ログ。#1402。予熱の回数・待ちは #1415）"
+        env:
+          EGRESS_WARMUP_COUNT: ${{ inputs.egress_warmup_count }}
+          EGRESS_WARMUP_WAIT_MS: ${{ inputs.egress_warmup_wait_ms }}
         run: |
+          # 入力は形式（先頭 0 のない 10 進 5 桁以内）と範囲を検証してから渡す（measure.py の検査が二段目）
+          re='^(0|[1-9][0-9]{0,4})$'
+          if ! [[ "$EGRESS_WARMUP_COUNT" =~ $re ]] || [ "$EGRESS_WARMUP_COUNT" -gt 10 ]; then
+            echo "egress_warmup_count must be an integer in [0, 10]" >&2
+            exit 1
+          fi
+          if ! [[ "$EGRESS_WARMUP_WAIT_MS" =~ $re ]] || [ "$EGRESS_WARMUP_WAIT_MS" -gt 30000 ]; then
+            echo "egress_warmup_wait_ms must be an integer in [0, 30000]" >&2
+            exit 1
+          fi
+          echo "egress warm-up: count=$EGRESS_WARMUP_COUNT wait_ms=$EGRESS_WARMUP_WAIT_MS" >> "$GITHUB_STEP_SUMMARY"
           mkdir -p "$OUT_DIR"
           python3 -I -B harness/egress-isolation/measure.py \
             --host "$SERVO_HOST_TARGET_DIR/release/fandhe-browser-servo-host" \
-            --modes baseline,seatbelt --out "$OUT_DIR"
+            --modes baseline,seatbelt --out "$OUT_DIR" \
+            --warmup-count "$EGRESS_WARMUP_COUNT" --warmup-wait-ms "$EGRESS_WARMUP_WAIT_MS"
       - name: "[egress-isolation] 結果表を Step Summary へ"
         if: ${{ !cancelled() }}
         run: |
