@@ -106,7 +106,7 @@ python3 -I -B harness/egress-isolation/relay_probe.py --out "$(mktemp -d)"   # �
 - 本番のプロキシの実装・`servo-host` への注入・HostProcess への bwrap の組み込みは設計 §7 の承認事項のまま。ここで確かめたのは構成の成立性だけ。
 - 範囲外: 名前解決後の再検査（DNS rebinding）、CONNECT 上の TLS、Servo 0.7.0 の `Tunnel` との実接続。
 - 安全上の規則: 宛先は 127.0.0.0/8 のダミーのみ（プロキシは 127/8 外へ connect しない）。UDS は 0700 のディレクトリ内。ヘッダ長・同時接続・転送量・アイドル時間に上限。結果に nonce・要求本文は残さない。自己テストは bwrap を使わない（`make check-egress-isolation`）。
-- bwrap の FS は `--ro-bind / /`＋`--dev /dev`。sandbox の中で書き込めるのは tmpfs の `/run`・UDS ディレクトリ・出力ディレクトリだけ（#1433。以前は `--dev-bind / /` でホストの FS 全体に書けた）。接続ごとに総時間 10 秒の期限を持ち、少しずつ送り続ける接続が同時接続の枠を占有し続けないようにしている。
+- bwrap はホストの FS を `--ro-bind / /`＋`--dev /dev` で読み取り専用に見せる（読み取りは制限せず、制限するのは書き込みだけ）。このプローブが測るのはネットワーク（netns・中継・プロキシ）で、FS の隔離は測定の対象外。sandbox の中で書き込めるのは tmpfs の `/run`・UDS ディレクトリ・`out/inner/` だけ（#1433・#1442。以前は `--dev-bind / /` でホストの FS 全体に、その後は `out/` 全体に書けた）。出力は `result.json`・`summary.md` が `out/` 直下、inner の `baseline.json`・`netns.json` が `out/inner/`。接続ごとに総時間 10 秒の期限を持ち、少しずつ送り続ける接続が同時接続の枠を占有し続けないようにしている。
 - `direct`（陰性対照）は「netns 内の `127.x` は netns 自身の `lo` に向かう」性質に頼る測定で、外へ出る経路の遮断そのものは設計 §6.4 の実測が担う。
 
 ### 実測結果（2026-11-02。コミット 06d4ba30）
