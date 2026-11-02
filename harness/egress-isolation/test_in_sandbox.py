@@ -532,6 +532,22 @@ class MeasureTest(unittest.TestCase):
         self.assertIn("first deny at blocked load #2 (warmup_redirect_2, t=3500 ms; 1 earlier", note)
         self.assertNotIn("warmup_redirect", mode["outer_counts"])
 
+    def test_first_deny_none_distinguishes_unavailable_log_from_zero_rows(self) -> None:
+        timeline = [{"route": "redirect", "role": "blocked", "start_ms": 10, "elapsed_ms": 5,
+                     "kind": "load_failed", "outer": 0, "deny": 0}]
+        for available, want_block, want_note in (
+                (True, "- first deny: none (no blocked load had a deny row)", "no blocked load had a deny row"),
+                (False, "- first deny: unavailable (deny log unavailable: log show rc=1)",
+                 "first deny unavailable (deny log unavailable: log show rc=1)")):
+            dl = {"available": available, "dest_counts": {}, "diagnostic_dest_counts": {"redirect": 0},
+                  "first_deny": None}
+            if not available:
+                dl["reason"] = "log show rc=1"
+            mode = {"exit_code": 0, "inner": {"loads": {}, "diag_loads": {}}, "outer_counts": {},
+                    "load_timeline": timeline, "deny_log": dl, "verdicts": {}}
+            self.assertIn(want_block, measure._timeline_block(mode, dl))
+            self.assertIn(want_note, measure.redirect_notes(mode)["redirect"])
+
     def test_summary_shows_redirect_diagnostics_and_warning(self) -> None:
         inner = {"loads": {"redirect": {"ok": False, "kind": "load_failed"}},
                  "diag_loads": {"diag_nav_direct": {"ok": True, "final_host": "x"}},

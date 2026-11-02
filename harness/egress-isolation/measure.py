@@ -762,7 +762,10 @@ def redirect_notes(data: dict[str, Any]) -> dict[str, str]:
         parts.append(f"first deny at blocked load #{first.get('index')} ({first.get('route')}, "
                      f"t={first.get('start_ms')} ms; {first.get('missed_before')} earlier blocked load(s) had 0 rows)")
     elif "first_deny" in dl:
-        parts.append("no blocked load had a deny row")
+        if dl.get("available"):
+            parts.append("no blocked load had a deny row")
+        else:
+            parts.append(f"first deny unavailable (deny log unavailable: {dl.get('reason')})")
     return {"redirect": "; ".join(parts)}
 
 
@@ -826,7 +829,10 @@ def _timeline_block(data: dict[str, Any], dl: dict[str, Any]) -> list[str]:
         out.append(f"- first deny: blocked load #{first.get('index')} ({first.get('route')}) at {first.get('start_ms')} ms; "
                    f"{first.get('missed_before')} earlier blocked load(s) had 0 deny rows")
     elif "first_deny" in dl:
-        out.append("- first deny: none (no blocked load had a deny row)")
+        if dl.get("available"):
+            out.append("- first deny: none (no blocked load had a deny row)")
+        else:
+            out.append(f"- first deny: unavailable (deny log unavailable: {dl.get('reason')})")
     return out
 
 
