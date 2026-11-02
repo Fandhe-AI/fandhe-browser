@@ -41,6 +41,7 @@ import errno
 import ipaddress
 import json
 import os
+import platform
 import re
 import secrets
 import select
@@ -226,8 +227,10 @@ def judge_relay(*, bwrap_found: bool, base_rc: int | None, net_rc: int | None, b
     elif _ok(direct.get("target")) or leaked > 0:
         res["direct"] = _v(FAIL, f"direct connect reached outside (connect_ok={_ok(direct.get('target'))}, "
                            f"unproxied receipts={leaked})", "direct connect inside netns vs baseline")
-    elif "target" not in direct:
-        res["direct"] = _unobs("direct connect was not attempted", "direct connect inside netns vs baseline")
+    elif not isinstance(direct.get("target"), dict) or direct["target"].get("ok") is not False or leaked != 0:
+        # 試行結果が欠落・不整合（ok が明示的な False でない、受信差が負など）のときは pass を導かない
+        res["direct"] = _unobs("direct connect result missing or inconsistent (need ok=false and unproxied receipts=0)",
+                               "direct connect inside netns vs baseline")
     else:
         res["direct"] = _v(PASS, f"direct connect failed ({_errname(direct.get('target'))}); unproxied receipts=0",
                            "direct connect inside netns vs baseline")
@@ -594,10 +597,8 @@ def run_inner(phase: str, ports: dict[str, int], out_path: Path) -> int:
     if phase == "netns":
         relay = Relay(f"{MOUNT_RW}/{SOCK_NAME}")
         try:
-            if relay.port in (ports["target"], ports["internal"]):
-                result["relay"] = {"status": None, "echo_ok": False, "bytes": 0, "errno": "PORT_CLASH"}
-            else:
-                result["relay"] = via_relay(relay.port, f"{IP_TARGET}:{ports['target']}", secrets.token_hex(8).encode())
+            # 中継（netns 内）と外側リスナーは別 netns のため、ポート番号の一致は衝突ではない。
+            result["relay"] = via_relay(relay.port, f"{IP_TARGET}:{ports['target']}", secrets.token_hex(8).encode())
             r = via_relay(relay.port, f"{IP_INTERNAL}:{ports['internal']}")
             result["ip_recheck"] = {"status": r["status"], "errno": r["errno"]}
         finally:
@@ -623,7 +624,7 @@ def _diff(after: dict[str, Any], before: dict[str, Any]) -> dict[str, Any]:
 
 
 def environment() -> dict[str, Any]:
-    return {"kernel": os.uname().release, "machine": os.uname().machine,
+    return {"kernel": platform.release(), "machine": platform.machine(),
             "bwrap": platform_probe.tool_versions().get("bwrap", ""), "sysctl": platform_probe.read_sysctls()}
 
 

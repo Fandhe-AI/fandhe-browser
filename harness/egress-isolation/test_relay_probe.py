@@ -99,6 +99,15 @@ class JudgeTest(unittest.TestCase):
     def test_direct_leak_fails(self) -> None:
         self.assertEqual(verdicts(outer_net={"target": 2, "internal": 0})["direct"], "fail")
 
+    def test_direct_requires_explicit_failure_and_exact_zero(self) -> None:
+        for tgt in (None, {}, {"errno": "X"}, {"ok": None}):
+            net = copy.deepcopy(good_inputs()["net"])
+            net["direct"]["target"] = tgt
+            self.assertEqual(verdicts(net=net)["direct"], "unobservable", tgt)
+        # 受信差が負（out_t < upstream_ok）は不整合
+        p = {"codes": {"closed_early": 2, "allowed": 1, "ip_denied": 1}, "upstream_ok": 2}
+        self.assertEqual(verdicts(proxy=p)["direct"], "unobservable")
+
     def test_internal_received_fails(self) -> None:
         self.assertEqual(verdicts(outer_net={"target": 1, "internal": 1})["ip_recheck"], "fail")
 
@@ -177,6 +186,13 @@ class OuterTest(unittest.TestCase):
                 rp.valid_out_dir(d)
         with self.assertRaises(ValueError):
             rp.valid_out_dir("rel")
+
+    def test_non_linux_exits_2_without_uname(self) -> None:
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(rp.sys, "platform", "win32"), \
+                mock.patch.object(rp.os, "uname", side_effect=AttributeError, create=True):
+            self.assertEqual(rp.run_outer(Path(d)), 2)
+            self.assertTrue(Path(d, "result.json").exists())
 
     def test_valid_ports(self) -> None:
         self.assertEqual(rp.valid_ports('{"target": 5000, "internal": 5001}'), {"target": 5000, "internal": 5001})
