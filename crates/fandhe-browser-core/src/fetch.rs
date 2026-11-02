@@ -417,7 +417,12 @@ fn is_ipv6_site_local(v6: Ipv6Addr) -> bool {
 /// IP リテラル指定経路（[`url_ip_literal`]）・DNS 解決経路
 /// （[`SafeResolver::resolve`]）の双方がこの関数を経由するため、ここで
 /// 拒否対象を追加すれば両経路に反映される。
-fn is_disallowed_address(ip: IpAddr) -> bool {
+///
+/// 公開 API（CORE-1・RENDER-3・TASK-38・#1434）: render crate の egress 用 CONNECT
+/// プロキシ（Servo ホストの宛先 IP 判定。SSRF・DNS リバインディング対策。security.md
+/// 「SSRF」）が、fetch と同一の判定を共有するために使う。戻り値 `true` は「拒否対象」。
+/// 判定ロジックは fetch 経路と同一で、公開によって変わらない（REPAIR-4）。
+pub fn is_disallowed_address(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => is_disallowed_ipv4(v4),
         IpAddr::V6(v6) => {

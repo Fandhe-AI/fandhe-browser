@@ -149,7 +149,7 @@ pub use event_loop::{
 };
 pub use fetch::{
     FetchOptions, FetchResponse, Fetcher, USER_AGENT, UrlOrigin, check_network_target_url,
-    url_origin,
+    is_disallowed_address, url_origin,
 };
 // js crate のワーカー入口をそのまま再エクスポートする（ラッパーを挟まない）。ラッパーで
 // マーカー設定時にも `None` を返すと fail-closed が崩れるため（security.md・`JS-2`・#513）。

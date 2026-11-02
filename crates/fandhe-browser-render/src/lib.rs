@@ -14,7 +14,8 @@
 //! クライアント側のプロトコル型は [`protocol`]、フレームコーデックは [`codec`]
 //! （済み。RENDER-3・TASK-38・#989）。子プロセス管理は [`host_process`]
 //! （済み。RENDER-3・RENDER-4・PLUG-1・TASK-38・#994）。core の `Renderer` の実装は
-//! [`host_renderer`]（済み。RENDER-3・TASK-38・#235）。
+//! [`host_renderer`]（済み。RENDER-3・TASK-38・#235）。Servo ホストの egress 用 CONNECT
+//! プロキシ単体は [`egress_proxy`]（済み。RENDER-3・TASK-38・#1434。HostProcess への組み込みは未実装）。
 //!
 //! # スタブについて
 //!
@@ -29,6 +30,7 @@
 //!   プライベート IP / loopback ポリシーとの統合（HostRenderer #235。RENDER-3）
 
 pub mod codec;
+pub mod egress_proxy;
 pub mod host_process;
 pub mod host_renderer;
 pub mod protocol;
