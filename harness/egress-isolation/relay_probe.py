@@ -26,7 +26,10 @@
     - プロキシは UDS（0700 のディレクトリ内）でだけ待ち受ける。TCP の listen は loopback の echo listener と netns 内の中継のみ。
     - authority は IPv4 リテラルだけを受け付け、名前解決はしない。ヘッダ長・同時接続数・転送量・アイドル時間に上限を置く。
     - 結果に残すのは件数・バイト数・errno 名・ステータスコード・判定コードだけ（nonce の値・要求の本文は残さない）。
-    - bwrap の FS は `--ro-bind / /`＋`--dev /dev`。書き込めるのは tmpfs の `/run`・UDS ディレクトリ・出力ディレクトリだけ（#1433）。
+    - bwrap はホストの FS を `--ro-bind / /`＋`--dev /dev` で読み取り専用に「見せる」（読み取りは制限せず、書き込みだけを制限する）。
+      書き込めるのは tmpfs の `/run`・UDS ディレクトリ・inner の出力用サブディレクトリ（`out/inner`）だけで、外側が書く
+      `result.json`・`summary.md` のある `out/` 直下は書き込めない（#1433・#1442）。このプローブが測るのはネットワーク
+      （netns・中継・プロキシ）で、FS の隔離は測定の対象外。
     - bwrap の argv は定数のリスト（シェル不使用）。依存・`unsafe`・ctypes は使わない。
 
 終了コード: 0（完走。合否は result.json の verdicts を見る）／ 1（計測の失敗）／ 2（引数の不正・Linux 以外・bwrap 無しなど前提の不成立。
@@ -72,6 +75,7 @@ IP_INTERNAL = judge.IP_BLOCKED  # 127.0.0.2。内部アドレスの代役
 INTERNAL_IPS = frozenset({"127.0.0.2", "127.0.0.3"})  # プロキシが「内部アドレス」とみなす集合（フィクスチャ）
 MOUNT_RW = "/run/fandhe-relay-rw"
 MOUNT_RO = "/run/fandhe-relay-ro"
+INNER_DIR_NAME = "inner"  # inner の出力（baseline.json・netns.json）専用のサブディレクトリ名（#1442）
 SOCK_NAME = "p.sock"
 SUN_PATH_MAX = 100  # sun_path は 108 バイト。余裕を見る。
 MAX_HEADER = 8192
@@ -134,19 +138,23 @@ def evaluate_policy(ip: str, port: int, allow: frozenset[tuple[str, int]]) -> st
     return "allowed"
 
 
-def build_relay_argv(*, netns: bool, sockdir: str, out_dir: str, inner_out: str, ports: dict[str, int],
+def build_relay_argv(*, netns: bool, sockdir: str, inner_dir: str, inner_out: str, ports: dict[str, int],
                      phase: str) -> list[str]:
     """bwrap の固定 argv。`--tmpfs /run` の後に UDS のディレクトリを rw と ro で明示的に見せる。
 
-    root FS は `--ro-bind / /` で読み取り専用にし、sandbox の中で書き込めるのは tmpfs の `/run`・UDS ディレクトリ（rw マウント）・
-    出力ディレクトリ `out_dir` だけにする（#1433。以前は `--dev-bind / /` でホストの FS 全体に書けた）。
-    出力ディレクトリの bind は `/run` 配下でも隠れないよう tmpfs と UDS の bind より後に置く。
+    root FS は `--ro-bind / /` で読み取り専用に見せ、sandbox の中で書き込めるのは tmpfs の `/run`・UDS ディレクトリ（rw マウント）・
+    inner の出力用サブディレクトリ `inner_dir`（`out/inner`。外側が書く `result.json` とは分ける）だけにする
+    （#1433・#1442。以前は `--dev-bind / /` でホストの FS 全体に、その後は `out` 全体に書けた）。
+    `inner_dir` の bind は `/run` 配下でも隠れないよう tmpfs と UDS の bind より後に置く。
+    `inner_out` が `inner_dir` の直下でなければ ValueError（書き込み先を bind した範囲に閉じるため）。
     """
+    if Path(inner_out).parent != Path(inner_dir):
+        raise ValueError("inner_out must be directly under inner_dir")
     argv = ["bwrap", "--die-with-parent"]
     if netns:
         argv.append("--unshare-net")
     argv += ["--ro-bind", "/", "/", "--dev", "/dev", "--tmpfs", "/run",
-             "--bind", sockdir, MOUNT_RW, "--ro-bind", sockdir, MOUNT_RO, "--bind", out_dir, out_dir, "--",
+             "--bind", sockdir, MOUNT_RW, "--ro-bind", sockdir, MOUNT_RO, "--bind", inner_dir, inner_dir, "--",
              sys.executable, "-I", "-B", str(Path(__file__).resolve()),
              "--inner", "--phase", phase, "--ports", json.dumps(ports, sort_keys=True), "--out", inner_out]
     return argv
@@ -241,7 +249,8 @@ def judge_relay(*, bwrap_found: bool, base_rc: int | None, net_rc: int | None, b
         res["direct"] = _unobs("direct connect result missing or inconsistent (need ok=false and unproxied receipts=0)",
                                "direct connect inside netns vs baseline")
     else:
-        res["direct"] = _v(PASS, f"direct connect failed ({_errname(direct.get('target'))}); unproxied receipts=0",
+        res["direct"] = _v(PASS, f"direct connect failed (target errno={_errlabel(direct.get('target'))}, "
+                           f"internal errno={_errlabel(direct.get('internal'))}); unproxied receipts=0",
                            "direct connect inside netns vs baseline")
     # 5. ip_recheck
     rc_ = net.get("ip_recheck") if isinstance(net.get("ip_recheck"), dict) else {}
@@ -266,6 +275,11 @@ def _get(d: Any, *keys: str) -> Any:
             return None
         d = d.get(k)
     return d
+
+
+def _errlabel(d: Any) -> str:
+    """direct の根拠欄用。errno を取れなかった（欠落）ことを `unknown` と出す（判定には使わない。#1442）。"""
+    return str(d.get("errno")) if isinstance(d, dict) and d.get("errno") else "unknown"
 
 
 def _errname(d: Any) -> str:
@@ -447,6 +461,10 @@ class ConnectProxy:
             if not buf:
                 self._count("closed_early")
                 return
+            # ヘッダ読みで期限に合わせて縮めた timeout が後続の sendall（_reply・pump）に残ると、期限間際に届いた
+            # 正当な転送が数 ms で切れる。通常値へ戻す（#1442）。総時間は deadline で引き続き抑えており、
+            # 超過しうるのは _reply 1 回分（最大 CONN_TIMEOUT_S）だけで有限。
+            conn.settimeout(CONN_TIMEOUT_S)
             status, ip, port = parse_connect_request(buf)
             if status != 200 or ip is None or port is None:
                 self._count("bad_request" if status == 400 else "method_not_allowed")
@@ -709,10 +727,13 @@ def run_outer(out: Path) -> int:
         counts: dict[str, Any] = {}
         inner: dict[str, Any] = {}
         proxy_net: dict[str, Any] = {}
+        inner_dir = out / INNER_DIR_NAME  # sandbox に書かせる唯一の出力先（result.json のある out 直下とは分ける。#1442）
+        inner_dir.mkdir(mode=0o700)
         for phase, netns in (("baseline", False), ("netns", True)):
             before = (echo_t.connections, echo_i.connections, proxy.snapshot())
-            inner_out = out / f"{phase}.json"
-            rc, err = measure.run_argv(build_relay_argv(netns=netns, sockdir=sockdir, out_dir=str(out), inner_out=str(inner_out),
+            inner_out = inner_dir / f"{phase}.json"
+            rc, err = measure.run_argv(build_relay_argv(netns=netns, sockdir=sockdir, inner_dir=str(inner_dir),
+                                                       inner_out=str(inner_out),
                                                        ports=ports, phase=phase))
             time.sleep(SETTLE_S)
             counts[phase] = {"target": echo_t.connections - before[0], "internal": echo_i.connections - before[1]}

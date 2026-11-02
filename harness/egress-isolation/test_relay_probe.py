@@ -73,7 +73,8 @@ class PolicyTest(unittest.TestCase):
 
 class ArgvTest(unittest.TestCase):
     def args(self, netns: bool) -> list[str]:
-        return rp.build_relay_argv(netns=netns, sockdir="/tmp/fer-x", out_dir="/tmp/out", inner_out="/tmp/out/o.json",
+        return rp.build_relay_argv(netns=netns, sockdir="/tmp/fer-x", inner_dir="/tmp/out/inner",
+                                   inner_out="/tmp/out/inner/o.json",
                                    ports={"target": 5000, "internal": 5001}, phase="netns")
 
     def test_netns_flag(self) -> None:
@@ -93,11 +94,20 @@ class ArgvTest(unittest.TestCase):
         self.assertEqual(a[ro], "--ro-bind")
         self.assertLess(a.index("--tmpfs"), rw)
         self.assertLess(a.index("--tmpfs"), ro)
-        out = [k for k in range(len(a) - 2) if a[k] == "--bind" and a[k + 1] == "/tmp/out"]
+        out = [k for k in range(len(a) - 2) if a[k] == "--bind" and a[k + 1] == "/tmp/out/inner"]
         self.assertEqual(len(out), 1)
-        self.assertEqual(a[out[0] + 2], "/tmp/out")
+        self.assertEqual(a[out[0] + 2], "/tmp/out/inner")
         self.assertGreater(out[0], rw)
         self.assertGreater(out[0], ro)
+        self.assertGreater(out[0], a.index("--tmpfs"))
+        # 親の out（result.json の置き場）は bind しない（#1442）
+        self.assertNotIn("/tmp/out", a)
+
+    def test_inner_out_must_be_under_inner_dir(self) -> None:
+        for bad in ("/tmp/out/o.json", "/tmp/out/inner/sub/o.json", "/etc/o.json"):
+            with self.assertRaises(ValueError, msg=bad):
+                rp.build_relay_argv(netns=True, sockdir="/tmp/fer-x", inner_dir="/tmp/out/inner", inner_out=bad,
+                                    ports={"target": 5000, "internal": 5001}, phase="netns")
 
 
 class JudgeTest(unittest.TestCase):
@@ -120,6 +130,22 @@ class JudgeTest(unittest.TestCase):
         # 受信差が負（out_t < upstream_ok）は不整合
         p = {"codes": {"closed_early": 2, "allowed": 1, "ip_denied": 1}, "upstream_ok": 2}
         self.assertEqual(verdicts(proxy=p)["direct"], "unobservable")
+
+    def test_direct_reason_keeps_errno_names(self) -> None:
+        """direct の根拠欄に errno 名を残す。判定は変えない（#1442）。"""
+        r = rp.judge_relay(**good_inputs())["direct"]
+        self.assertEqual(r["verdict"], "pass")
+        self.assertIn("target errno=ECONNREFUSED", r["reason"])
+        self.assertIn("internal errno=ECONNREFUSED", r["reason"])
+        net = copy.deepcopy(good_inputs()["net"])
+        net["direct"]["target"] = {"ok": False, "errno": "ETIMEDOUT"}
+        r = rp.judge_relay(**{**good_inputs(), "net": net})["direct"]
+        self.assertEqual(r["verdict"], "pass")
+        self.assertIn("target errno=ETIMEDOUT", r["reason"])
+        net["direct"]["target"] = {"ok": False}
+        r = rp.judge_relay(**{**good_inputs(), "net": net})["direct"]
+        self.assertEqual(r["verdict"], "pass")
+        self.assertIn("target errno=unknown", r["reason"])
 
     def test_internal_received_fails(self) -> None:
         self.assertEqual(verdicts(outer_net={"target": 1, "internal": 1})["ip_recheck"], "fail")
@@ -301,6 +327,38 @@ class DeadlineTest(unittest.TestCase):
                 finally:
                     proxy.stop()
         finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    @unittest.skipUnless(hasattr(socket, "AF_UNIX"), "AF_UNIX required")
+    def test_handle_restores_conn_timeout_before_pump(self) -> None:
+        """ヘッダ読みで縮めた timeout が pump・_reply に残らない（#1442）。総時間の deadline は維持する。"""
+        try:
+            d = tempfile.mkdtemp(prefix="fer-t-", dir="/tmp")
+            echo = rp.EchoListener("127.0.0.4")
+        except OSError:
+            self.skipTest("cannot set up temp dir or loopback alias")
+        seen: dict = {}
+
+        def record(a: socket.socket, b: socket.socket, **kw: object) -> None:
+            seen["timeout"] = a.gettimeout()
+            seen["deadline"] = kw.get("deadline")
+
+        proxy = rp.ConnectProxy(os.path.join(d, "p.sock"), frozenset({("127.0.0.4", echo.port)}))
+        client, server = socket.socketpair()
+        try:
+            echo.start()
+            client.sendall(f"CONNECT 127.0.0.4:{echo.port} HTTP/1.1\r\n\r\n".encode("ascii"))
+            with mock.patch.object(rp, "CONN_DEADLINE_S", 1.0), mock.patch.object(rp, "pump", side_effect=record):
+                before = time.monotonic()
+                proxy._sem.acquire()
+                proxy._handle(server)  # finally で server を閉じ、semaphore を戻す
+            self.assertEqual(seen.get("timeout"), rp.CONN_TIMEOUT_S)
+            self.assertGreaterEqual(seen["deadline"], before + 1.0)
+            self.assertLessEqual(seen["deadline"], time.monotonic() + 1.0)
+        finally:
+            client.close()
+            server.close()
+            echo.stop()
             shutil.rmtree(d, ignore_errors=True)
 
     @unittest.skipUnless(hasattr(socket, "AF_UNIX"), "AF_UNIX required")
