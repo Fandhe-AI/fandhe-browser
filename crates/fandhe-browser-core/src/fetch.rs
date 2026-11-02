@@ -407,10 +407,49 @@ fn is_ipv6_site_local(v6: Ipv6Addr) -> bool {
     (v6.segments()[0] & 0xffc0) == 0xfec0
 }
 
+/// IPv6 アドレスに埋め込まれた IPv4 が拒否対象か（曖昧で拒否する場合を含む）を返す
+/// （CORE-1・RENDER-3・#1443。[`is_disallowed_address`] から呼ばれ、fetch と
+/// render の egress プロキシの双方に効く）。取り出し位置は形式ごとに次のとおり。
+/// - v4-mapped `::ffff:0:0/96`・IPv4 互換 `::/96`（RFC 4291）・NAT64 既知
+///   `64:ff9b::/96`（RFC 6052）: 末尾 32 ビット
+/// - 6to4 `2002::/16`（RFC 3056）: ビット 16〜47
+/// - Teredo `2001::/32`（RFC 4380）: サーバー（ビット 32〜63）と、反転された
+///   クライアント（末尾 32 ビット）の両方。どちらかが拒否対象なら拒否する
+/// - NAT64 ローカル用 `64:ff9b:1::/48`（RFC 8215）: 運用者が /48〜/96 のどの長さでも
+///   使え IPv4 の位置がアドレスだけでは決まらない（`64:ff9b:1::800:0` は /96 なら
+///   公開 8.0.0.0、/64 なら内部 0.0.0.8）ため、/48 全体を fail-closed で拒否する
+fn is_disallowed_embedded_ipv4(v6: Ipv6Addr) -> bool {
+    let [s0, s1, s2, s3, s4, s5, s6, s7] = v6.segments();
+    let v4 = |hi: u16, lo: u16| Ipv4Addr::from((u32::from(hi) << 16) | u32::from(lo));
+    let tail_zero = s0 == 0 && s1 == 0 && s2 == 0 && s3 == 0 && s4 == 0;
+    if tail_zero && (s5 == 0 || s5 == 0xffff) {
+        return is_disallowed_ipv4(v4(s6, s7));
+    }
+    if s0 == 0x0064 && s1 == 0xff9b {
+        if s2 == 0 && s3 == 0 && s4 == 0 && s5 == 0 {
+            return is_disallowed_ipv4(v4(s6, s7));
+        }
+        if s2 == 0x0001 {
+            // ローカル用 /48 は丸ごと拒否（プレフィクス長が不定で IPv4 位置が決まらない）
+            return true;
+        }
+        return false;
+    }
+    if s0 == 0x2002 {
+        return is_disallowed_ipv4(v4(s1, s2));
+    }
+    if s0 == 0x2001 && s1 == 0 {
+        return is_disallowed_ipv4(v4(s2, s3)) || is_disallowed_ipv4(v4(s6 ^ 0xffff, s7 ^ 0xffff));
+    }
+    false
+}
+
 /// [`IpAddr`] が内部アドレス（ループバック・プライベートアドレス等）か
-/// どうかを判定する（[`SafeResolver`] から使う）。IPv6 の v4-mapped
-/// アドレス（`::ffff:a.b.c.d`）は埋め込まれた IPv4 アドレスとして判定し、
-/// v4 側の分類をすり抜けられないようにする。マルチキャスト（`ff00::/8`）は
+/// どうかを判定する（[`SafeResolver`] から使う）。IPv6 に埋め込まれた IPv4
+/// （v4-mapped・IPv4 互換・NAT64・6to4・Teredo。[`is_disallowed_embedded_ipv4`]）は
+/// 埋め込まれた IPv4 として判定し、v4 側の分類をすり抜けられないようにする
+/// （#1443）。埋め込みが公開 IPv4 なら許可する（NAT64 プレフィクスを丸ごと拒否すると
+/// IPv6 only 環境で公開 IPv4 に届かなくなるため）。マルチキャスト（`ff00::/8`）は
 /// IPv4 側の `224.0.0.0/4`（[`is_disallowed_ipv4`]）に対応する拒否対象で、
 /// `std::net::Ipv6Addr::is_multicast` の安定 API で判定する（CORE-1・
 /// TASK-24.2・#464。IPv4 側にあった判定が IPv6 側に抜けていた分の追補）。
@@ -432,7 +471,7 @@ pub fn is_disallowed_address(ip: IpAddr) -> bool {
                 || v6.is_unicast_link_local()
                 || is_ipv6_site_local(v6)
                 || v6.is_multicast() // ff00::/8 マルチキャスト
-                || v6.to_ipv4_mapped().is_some_and(is_disallowed_ipv4)
+                || is_disallowed_embedded_ipv4(v6)
         }
     }
 }
@@ -1357,6 +1396,56 @@ mod tests {
     fn core_1_is_disallowed_address_allows_global_ipv6() {
         let ip: IpAddr = "2606:4700:4700::1111".parse().expect("valid IPv6 literal");
         assert!(!is_disallowed_address(ip), "global IPv6 should be allowed");
+    }
+
+    /// CORE-1（#1443）: 内部 IPv4 を埋め込んだ NAT64・6to4・IPv4 互換・Teredo は拒否する。
+    #[test]
+    fn core_1_is_disallowed_address_rejects_embedded_internal_ipv4() {
+        for addr in [
+            "64:ff9b::7f00:1",                      // NAT64 127.0.0.1
+            "64:ff9b::a00:1",                       // NAT64 10.0.0.1
+            "64:ff9b::a9fe:a9fe",                   // NAT64 169.254.169.254
+            "64:ff9b::c0a8:1",                      // NAT64 192.168.0.1
+            "64:ff9b:1::a9fe:a9fe",                 // NAT64 ローカル用 /96 169.254.169.254
+            "64:ff9b:1::a00:1",                     // NAT64 ローカル用 /96 10.0.0.1
+            "64:ff9b:1::800:0",                     // /96 では公開 8.0.0.0・/64 では内部 0.0.0.8
+            "64:ff9b:1::808:808",                   // ローカル用 /48 は公開に見えても拒否
+            "64:ff9b:1:a9fe:a9:fe00::",             // NAT64 ローカル用 /48（曖昧・fail-closed）
+            "64:ff9b:1:1::808:808",                 // 中間が 0 でない（fail-closed）
+            "2002:7f00:1::",                        // 6to4 127.0.0.1
+            "2002:a00:1::1",                        // 6to4 10.0.0.1
+            "2002:a9fe:a9fe::",                     // 6to4 169.254.169.254
+            "2002:c0a8:1::1",                       // 6to4 192.168.0.1
+            "::7f00:1",                             // 互換 127.0.0.1
+            "::a00:1",                              // 互換 10.0.0.1
+            "::a9fe:a9fe",                          // 互換 169.254.169.254
+            "::c0a8:1",                             // 互換 192.168.0.1
+            "2001:0:4136:e378:8000:63bf:80ff:fffe", // Teredo client 127.0.0.1
+            "2001:0:4136:e378:8000:63bf:f5ff:fffe", // Teredo client 10.0.0.1
+            "2001:0:4136:e378:8000:63bf:5601:5601", // Teredo client 169.254.169.254
+            "2001:0:4136:e378:8000:63bf:3f57:fffe", // Teredo client 192.168.0.1
+            "2001:0:a00:1:8000:63bf:f7f7:f7f7",     // Teredo server 10.0.0.1
+        ] {
+            let ip: IpAddr = addr.parse().expect("valid IPv6 literal");
+            assert!(is_disallowed_address(ip), "{addr} should be disallowed");
+        }
+    }
+
+    /// CORE-1（#1443）: 公開 IPv4 の埋め込みと形式の範囲外は許可する。
+    #[test]
+    fn core_1_is_disallowed_address_allows_embedded_global_ipv4() {
+        for addr in [
+            "64:ff9b::808:808",                     // NAT64 8.8.8.8
+            "2002:808:808::1",                      // 6to4 8.8.8.8
+            "::808:808",                            // 互換 8.8.8.8
+            "::ffff:808:808",                       // mapped 8.8.8.8
+            "2001:0:4136:e378:8000:63bf:f7f7:f7f7", // Teredo 公開サーバー・公開クライアント
+            "2001:4860:4860::8888",                 // Teredo ではない
+            "2003::1",                              // 6to4 ではない
+        ] {
+            let ip: IpAddr = addr.parse().expect("valid IPv6 literal");
+            assert!(!is_disallowed_address(ip), "{addr} should be allowed");
+        }
     }
 
     /// CORE-1（#464）: `SafeResolver::resolve` は
