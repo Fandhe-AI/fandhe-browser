@@ -121,7 +121,7 @@ macOS・Windows の GitHub ホステッドランナー。結果は #1003 に記�
     macOS では connect が syscall で拒否されソケットが現れない。`servo-host/src` に接続試行のログも無く、追加には Servo の
     net スタックの改変か servo-host の改修が要る。
   - macOS は sudo なしの `log show --style ndjson`（非特権）で拒否行を取る（#1402。xos-measure の実測 run 41309744793・41310673642・41313641135 で、
-    sudo・`log config` なしでも上記 macOS 26 のワイルドカード形式の拒否行が取れ、TCP 4 経路（img・fetch・ws・internal）が pass〔redirect は unobservable〕・自己検査成立。オーナー判断 2026-11-01 で
+    sudo・`log config` なしでも上記 macOS 26 のワイルドカード形式の拒否行が取れ、TCP 4 経路（img・fetch・ws・internal）が pass〔redirect は unobservable。#1415 の予熱で対処中で、pass とは断定しない〕・自己検査成立。オーナー判断 2026-11-01 で
     sudo つき拒否ログの opt-in と `log config` の操作を削除した）。UDP の自己照合が成り立てば TCP 5 経路の deny 行が試行の根拠になり、
     成り立たなければ理由（`deny log unavailable: ...`）つきの `unobservable`。`log stream`・`log erase` など管理者操作は実装しない。
   - 後続の候補（今回は入れない）: SBPL の `(with message ...)` 等の修飾子、`log stream` の並行収集。
@@ -140,6 +140,18 @@ macOS・Windows の GitHub ホステッドランナー。結果は #1003 に記�
     - 結果の読み方: D2 に拒否行があり redirect に無ければ 302 の追従が connect に達していない。どちらも無ければトップレベルナビゲーションの
       接続がこの形式では報告されない。D1 だけにあれば順序の影響（後続で経路順の変更を検討する）。隔離モードで診断経路の外側に受信があれば
       WARNING を出す（判定は変えない）。診断経路は Linux・Windows では有効にしない。
+  - redirect の予熱（#1415。macOS だけ・判定には使わない）。診断（run 41338564798）で、拒否行が取れないのは「最初に読み込む判定経路」
+    だけで、同じ形の 302 を後ろで試す D1 には 1 件出ることが分かった（順序への依存）。オーナー判断 2026-11-02（案 A）で、判定経路の前に
+    予熱を 1 回入れる。
+    - 順序: `/ok`（許可宛先。陽性対照）→ 予熱 → 判定経路 → D1・D2。許可宛先の `/ok` はすでに先頭にあり、それでも redirect は
+      0 件だったため、予熱は同じ形の「遮断ダミー宛先 `127.0.0.2:<専用ポート>` へのトップレベル 302（`/redirect-warmup`）」にして、
+      最初の遮断されたナビゲーションで起きる事象を判定しない経路に吸わせる。
+    - 集計から外す: 予熱は verdict・`attempts`・`loads`・`guard_polls`・`outer_counts`・`deny_log.dest_counts` に入れない。
+      結果の `inner.warmup_load`・`warmup`（外側受信 `outer`・拒否行 `deny`。観測値で根拠にしない）に別に残す。
+      baseline と seatbelt で同じ順序にする（`--warmup` を両方に付ける）。隔離モードで予熱の外側受信が 1 以上なら WARNING を出す。
+    - macOS だけ有効（`--diag-routes` と同じゲート）。Linux・Windows には導入しない。判定基準（`judge.py`）・管理者操作の不使用は変えない。
+    - 直らない場合: redirect の理由に予熱の拒否行・外側受信の件数が付く。予熱 0 件・redirect 0 件なら順序ではなく 302 の追従そのものの
+      事象と読める。次の手（redirect を末尾へ入れ替える案・servo-host から `load_failed` の詳細を返す案）はオーナー判断で、ここでは実装しない。
 - 共有 loopback で内側の写し listener を立てられない。hosts も変えないため、ページは IP リテラル（127.0.0.x）で配る。
 - `internal_real` / `dns` は netns 前提の構造検査で、Seatbelt・AppContainer では成り立たないため `unobservable`
   （実在の内部アドレスにも向けない）。

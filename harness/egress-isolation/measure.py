@@ -89,10 +89,12 @@ def start_outer_listeners(diag: bool = False) -> tuple[dict[str, Any], dict[str,
     """外側の許可外宛先（127.0.0.2/127.0.0.3）の listener を立て、(listener 辞書, ポート辞書) を返す。
 
     `diag=True`（macOS のときだけ呼び出し側が渡す。Issue #1415）は redirect の診断経路の listener を足す。
-    診断経路は判定に使わない（`judge.routes_for_mode` に入れない）。
+    診断経路は判定に使わない（`judge.routes_for_mode` に入れない）。予熱経路（`warmup_redirect`）の listener も
+    同じ `diag` で足す（判定せず、受信件数は `outer_counts` から外して別に記録する）。
     """
     recs: dict[str, Any] = {}
     if diag:
+        recs[fixtures_warmup_route()] = listeners.TcpRecorder(fixtures_warmup_route(), judge.IP_BLOCKED).start()
         for r in fixtures_diag_routes():
             recs[r] = listeners.TcpRecorder(r, judge.IP_BLOCKED).start()
     for r in ("redirect", "img", "fetch", "ws"):
@@ -107,6 +109,13 @@ def fixtures_diag_routes() -> tuple[str, ...]:
     import page_templates
 
     return page_templates.DIAG_ROUTES
+
+
+def fixtures_warmup_route() -> str:
+    """予熱経路名（`page_templates.WARMUP_ROUTE`。Issue #1415）。遅延 import。"""
+    import page_templates
+
+    return page_templates.WARMUP_ROUTE
 
 
 def resolv_bind_args(resolv_file: Path) -> list[str]:
@@ -168,6 +177,9 @@ def build_argv(mode: str, *, host: Path, ports: dict[str, int], out_dir: Path, h
     plat = platform_name or sys.platform
     if plat == "darwin" and all(r in ports for r in fixtures_diag_routes()):
         inner_args.append("--diag-routes")  # redirect の診断（Issue #1415。判定には使わない）
+    if plat == "darwin" and fixtures_warmup_route() in ports:
+        # 予熱（Issue #1415）。baseline・seatbelt の両方に付けて読み込み順を揃える。Linux・Windows には付けない。
+        inner_args.append("--warmup")
     if not plat.startswith("linux"):
         # macOS・Windows: 内側ランナーを（Seatbelt があれば包んで）直接起動する。
         inner_args += ["--page-port", str(page_port)]
@@ -533,10 +545,14 @@ def run_mode(mode: str, *, host: Path, ports: dict[str, int], recs: dict[str, An
     pids: frozenset[int] = frozenset()
     inner: dict[str, Any] = {}
     diag_dests: dict[str, str] = {}
+    warmup_dest: str | None = None
     info_debug: dict[str, Any] | None = None
     started = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time() - 2))
     rc, err = run_argv(argv, container=name)
     outer = {k: r.count - before[k] for k, r in recs.items()}
+    # 予熱の受信は判定用の outer_counts に入れず別に残す（Issue #1415）。
+    warmup_key = fixtures_warmup_route()
+    warmup_outer = outer.pop(warmup_key, None)
     result_path = out_dir / f"{mode}.json"
     # 内側ランナーが正常終了（0）または隔離 abort（2。理由つきの JSON を書く）した場合の今回の結果だけを使う。
     # それ以外の失敗は空 = 判定不能（合格にしない）。--out は空ディレクトリ検査済みで古い結果は混ざらない。
@@ -552,9 +568,11 @@ def run_mode(mode: str, *, host: Path, ports: dict[str, int], recs: dict[str, An
             if isinstance(raw_pids, list) else frozenset()
         # 診断経路（Issue #1415）の宛先も既知の宛先に入れる（入れないとワイルドカード形式が未知ポート扱いになる）。
         diag_dests = {r: f"{judge.IP_BLOCKED}:{ports[r]}" for r in fixtures_diag_routes() if r in ports}
+        warmup_dest = f"{judge.IP_BLOCKED}:{ports[warmup_key]}" if warmup_key in ports else None
         all_dests = (*(f"{judge.IP_INTERNAL_STANDIN if r == 'internal' else judge.IP_BLOCKED}:{ports[r]}"
                        for r in ("redirect", "img", "fetch", "ws", "internal")),
-                     f"{judge.IP_BLOCKED}:{ports['udp_direct']}", *diag_dests.values())
+                     f"{judge.IP_BLOCKED}:{ports['udp_direct']}", *diag_dests.values(),
+                     *((warmup_dest,) if warmup_dest else ()))
         if pids:
             token = _KNOWN_DESTS.set(all_dests)
             try:
@@ -573,6 +591,8 @@ def run_mode(mode: str, *, host: Path, ports: dict[str, int], recs: dict[str, An
     data = {"mode": mode, "exit_code": rc, "binary_sha256": inner.get("host_sha256"),
             "binary_version": inner.get("host_version"), "stderr_tail": err if rc != 0 else "", "inner": inner,
             "outer_counts": outer}
+    if warmup_outer is not None:
+        data["warmup"] = {"outer": warmup_outer}
     if mode == "seatbelt" and inner:
         dest = {r: f"{judge.IP_INTERNAL_STANDIN if r == 'internal' else judge.IP_BLOCKED}:{ports[r]}"
                 for r in ("redirect", "img", "fetch", "ws", "internal")}
@@ -598,7 +618,11 @@ def run_mode(mode: str, *, host: Path, ports: dict[str, int], recs: dict[str, An
             # redirect も経路名で並べる（dest_counts のキーは "ip:port" のため表示側で引けない。判定用の契約は変えない）。
             data["deny_log"]["diagnostic_dest_counts"] = {
                 r: observed.get(d, 0) for r, d in (("redirect", dest["redirect"]), *diag_dests.items())}
-            by_dest = {d: r for r, d in (*dest.items(), ("udp_direct", udp), *diag_dests.items())}
+            if warmup_dest and "warmup" in data:
+                # 予熱の拒否行（観測値。根拠にしない）。判定用の dest_counts には入れない。
+                data["warmup"]["deny"] = observed.get(warmup_dest, 0)
+            by_dest = {d: r for r, d in (*dest.items(), ("udp_direct", udp), *diag_dests.items(),
+                                         *(((warmup_key, warmup_dest),) if warmup_dest else ()))}
             un = (status.get("diagnostics") or {}).get("unattributed_network_dests") or {}
             data["deny_log"]["unattributed_routes"] = {by_dest.get(d, d): n for d, n in un.items()}
             if info_debug is not None:
@@ -653,6 +677,9 @@ def redirect_notes(data: dict[str, Any]) -> dict[str, str]:
         parts.append(f"unattributed deny rows by route={dl['unattributed_routes']}")
     if "diagnostic_info_debug_dest_counts" in dl:
         parts.append(f"info/debug re-read={dl['diagnostic_info_debug_dest_counts']}")
+    wu = data.get("warmup")
+    if isinstance(wu, dict):
+        parts.append(f"warm-up deny rows={wu.get('deny')}, warm-up outer={wu.get('outer')}")
     return {"redirect": "; ".join(parts)}
 
 
@@ -667,9 +694,15 @@ def redirect_diag_block(mode: str, data: dict[str, Any], outer: dict[str, int]) 
     ms = inner.get("load_elapsed_ms") or {}
     alive = inner.get("host_alive_after_load") or {}
     loads = {**(inner.get("loads") or {}), **(inner.get("diag_loads") or {})}
+    wu = data.get("warmup") if isinstance(data.get("warmup"), dict) else None
     out = ["", "redirect diagnostics (not verdicts)", "",
            "| route | outer | deny | load kind | elapsed_ms | host alive after failed load |",
            "| ----- | ----- | ---- | --------- | ---------- | ---------------------------- |"]
+    if wu is not None:
+        wk = fixtures_warmup_route()
+        out.append(f"| {wk} (warm-up) | {wu.get('outer', '-')} | {wu.get('deny', '-')} "
+                   f"| {(inner.get('warmup_load') or {}).get('kind', 'ok' if inner.get('warmup_load') else '-')} "
+                   f"| {ms.get(wk, '-')} | {alive.get(wk, '-')} |")
     for r in routes:
         dv = deny.get(r, "-")
         out.append(f"| {r} | {outer.get(r, '-')} | {dv} | {(loads.get(r) or {}).get('kind', 'ok' if r in loads else '-')} "
@@ -679,6 +712,9 @@ def redirect_diag_block(mode: str, data: dict[str, Any], outer: dict[str, int]) 
             if outer.get(r, 0) >= 1:
                 out.append(f"- WARNING: diagnostic route {r} has {outer[r]} outer receipt(s) in an isolated mode; "
                            "review for a possible real leak")
+    if wu is not None and mode in judge.ISOLATED_MODES and (wu.get("outer") or 0) >= 1:
+        out.append(f"- WARNING: warm-up route has {wu['outer']} outer receipt(s) in an isolated mode; "
+                   "review for a possible real leak")
     for key in ("unattributed_routes", "diagnostic_info_debug_dest_counts"):
         if key in dl:
             out.append(f"- {key}: {dl[key]}")

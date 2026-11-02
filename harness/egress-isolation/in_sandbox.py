@@ -460,6 +460,12 @@ def validate_args(args: argparse.Namespace) -> dict[str, int]:
             if isinstance(value, bool) or not isinstance(value, int) or not (1024 <= value <= 65535):
                 raise ValueError(f"port for {key} must be an int in [1024, 65535]")
         needed = (*needed, *fixtures.DIAG_ROUTES)
+    if getattr(args, "warmup", False):
+        # 予熱経路（Issue #1415。macOS だけ）。指定したときだけ必須。判定経路のポートとは別に検証する。
+        value = ports.get(fixtures.WARMUP_ROUTE)
+        if isinstance(value, bool) or not isinstance(value, int) or not (1024 <= value <= 65535):
+            raise ValueError(f"port for {fixtures.WARMUP_ROUTE} must be an int in [1024, 65535]")
+        needed = (*needed, fixtures.WARMUP_ROUTE)
     return {k: ports[k] for k in needed}
 
 
@@ -511,6 +517,10 @@ def run(args: argparse.Namespace, ports: dict[str, int]) -> dict[str, Any]:
     diag = bool(getattr(args, "diag_routes", False)) and all(r in ports for r in fixtures.DIAG_ROUTES)
     if diag:
         _PageHandler.redirects[fixtures.REDIRECT_LATE_PATH] = fixtures.diag_redirect_location(ports, literal=literal)
+    warmup = bool(getattr(args, "warmup", False)) and fixtures.WARMUP_ROUTE in ports
+    if warmup:
+        _PageHandler.redirects[fixtures.REDIRECT_WARMUP_PATH] = fixtures.warmup_redirect_location(
+            ports, literal=literal)
     with _PageHandler.beacon_lock:
         _PageHandler.beacons = {}
     threading.Thread(target=server.serve_forever, daemon=True).start()
@@ -573,6 +583,15 @@ def run(args: argparse.Namespace, ports: dict[str, int]) -> dict[str, Any]:
             if not res.get("ok"):
                 alive_after[route] = proc.poll() is None
             return res
+
+        if warmup:
+            # 予熱（Issue #1415。macOS だけ）: 最初の遮断されたトップレベルナビゲーションでは redirect の拒否行が
+            # 取れない事象（run 41338564798）を、判定しない経路に吸わせる。許可宛先の /ok は上で読み込み済みで
+            # それでも直らなかったため、遮断ダミー宛先への 302 にしている。loads・guard_polls・attempts には入れない。
+            result["warmup_load"] = timed_load(fixtures.WARMUP_ROUTE, base + fixtures.REDIRECT_WARMUP_PATH)
+            time.sleep(SETTLE_S)
+            host_pids |= descendant_pids(proc.pid)
+            result["host_pids"] = sorted(host_pids)
 
         for r in (x for x in PAGE_ROUTES if x in result["routes"] and (netns or x in TCP_ROUTES)):
             polls_before = guard.snapshot_polls() if guard is not None else 0
@@ -691,6 +710,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--out", required=True, type=Path)
     parser.add_argument("--page-port", type=int, default=0,
                         help="Fixed port for the allowed page server (Seatbelt profile needs it before launch).")
+    parser.add_argument("--warmup", action="store_true",
+                        help="macOS only: load a blocked-302 warm-up route before the verdict routes "
+                             "(Issue #1415). Not part of verdicts.")
     parser.add_argument("--diag-routes", action="store_true",
                         help="macOS only: also run redirect diagnostics (Issue #1415). Not part of verdicts.")
     args = parser.parse_args(argv)
