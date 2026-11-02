@@ -13,6 +13,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::mpsc::{self, RecvTimeoutError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -32,6 +33,9 @@ const ACCEPT_POLL: Duration = Duration::from_millis(25);
 const REJECT_WRITE_TIMEOUT: Duration = Duration::from_millis(100);
 /// エラー応答の書き込み timeout。
 const RESPONSE_WRITE_TIMEOUT: Duration = Duration::from_secs(1);
+/// 名前解決用スレッドの同時数の上限。解決は同期 API（getaddrinfo）で中断できないため、
+/// 期限後に切り離したスレッドが残る。残存数をこの値で有界にする（超えたら解決せず 502）。
+const MAX_RESOLVER_THREADS: usize = 32;
 /// 転送バッファ長。
 const PUMP_BUF: usize = 16 * 1024;
 
@@ -121,6 +125,79 @@ struct Shared {
     counters: Counters,
     stop: AtomicBool,
     active: AtomicUsize,
+    /// 実行中（期限後に切り離されたものを含む）の名前解決スレッド数。
+    resolving: AtomicUsize,
+}
+
+/// 名前解決スレッドの枠（スレッド終了時に返す）。
+struct ResolverSlot(Arc<Shared>);
+
+impl ResolverSlot {
+    fn acquire(shared: &Arc<Shared>) -> Option<Self> {
+        let prev = shared.resolving.fetch_add(1, Ordering::AcqRel);
+        if prev >= MAX_RESOLVER_THREADS {
+            shared.resolving.fetch_sub(1, Ordering::AcqRel);
+            return None;
+        }
+        Some(Self(Arc::clone(shared)))
+    }
+}
+
+impl Drop for ResolverSlot {
+    fn drop(&mut self) {
+        self.0.resolving.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// 期限つき名前解決の結果。
+enum Resolved {
+    Addrs(Vec<SocketAddr>),
+    /// 解決失敗・空応答・期限超過・解決スレッドの枠不足（502）。
+    Failed,
+    /// プロキシ停止で中断（503）。
+    Stopped,
+}
+
+/// 別スレッドで解決し、`connect_timeout` を期限として tick ごとに停止フラグを見て待つ
+/// （getaddrinfo 自体は中断できないため、期限後はスレッドを切り離し、残存数を
+/// [`MAX_RESOLVER_THREADS`] で有界にする。呼び出し側の接続枠は期限で解放される）。
+fn resolve_with_deadline(name: &str, port: u16, shared: &Arc<Shared>) -> Resolved {
+    let Some(slot) = ResolverSlot::acquire(shared) else {
+        return Resolved::Failed;
+    };
+    let (tx, rx) = mpsc::channel();
+    let resolver = Arc::clone(&shared.resolver);
+    let host = name.to_owned();
+    let spawned = thread::Builder::new()
+        .name("egress-proxy-resolve".to_owned())
+        .spawn(move || {
+            let _slot = slot;
+            // 受信側が期限で去っていると送信は失敗するが、結果は不要なので無視してよい。
+            let _ = tx.send(resolver.resolve(&host, port));
+        });
+    if spawned.is_err() {
+        shared.counters.bump(Event::SpawnFailed);
+        return Resolved::Failed;
+    }
+    let started = Instant::now();
+    let tick = shared.limits.tick();
+    loop {
+        if shared.stop.load(Ordering::Relaxed) {
+            return Resolved::Stopped;
+        }
+        let remaining = shared
+            .limits
+            .connect_timeout
+            .saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            return Resolved::Failed;
+        }
+        match rx.recv_timeout(tick.min(remaining)) {
+            Ok(Ok(v)) if !v.is_empty() => return Resolved::Addrs(v),
+            Ok(_) | Err(RecvTimeoutError::Disconnected) => return Resolved::Failed,
+            Err(RecvTimeoutError::Timeout) => {}
+        }
+    }
 }
 
 /// 同時接続数の枠（Drop で返す。トンネルが終わるまで保持する）。
@@ -262,6 +339,7 @@ pub(super) fn start(
         counters: Counters::default(),
         stop: AtomicBool::new(false),
         active: AtomicUsize::new(0),
+        resolving: AtomicUsize::new(0),
     });
     let thread_shared = Arc::clone(&shared);
     let spawned = thread::Builder::new()
@@ -343,14 +421,22 @@ fn reject_response(conn: &mut Conn, reject: Reject, shared: &Shared) {
 }
 
 /// 解決・全 IP 検査・接続。成功なら接続済みの上流を返す。失敗時は応答済みで `None`。
-fn connect_upstream(target: &ConnectTarget, conn: &mut Conn, shared: &Shared) -> Option<TcpStream> {
+fn connect_upstream(
+    target: &ConnectTarget,
+    conn: &mut Conn,
+    shared: &Arc<Shared>,
+) -> Option<TcpStream> {
     let addrs: Vec<SocketAddr> = match &target.host {
         Host::Ip(ip) => vec![SocketAddr::new(*ip, target.port)],
-        Host::Name(name) => match shared.resolver.resolve(name, target.port) {
-            Ok(v) if !v.is_empty() => v,
-            _ => {
+        Host::Name(name) => match resolve_with_deadline(name, target.port, shared) {
+            Resolved::Addrs(v) => v,
+            Resolved::Failed => {
                 shared.counters.bump(Event::ResolveFailed);
                 write_status(conn, 502, "Bad Gateway");
+                return None;
+            }
+            Resolved::Stopped => {
+                write_status(conn, 503, "Service Unavailable");
                 return None;
             }
         },
@@ -453,10 +539,11 @@ fn tunnel(client: Conn, upstream: Conn, shared: &Arc<Shared>) {
         idle_counted: AtomicBool::new(false),
         idle_limit: shared.limits.idle_timeout,
     });
-    // 書き込みが止まった相手でスレッドが永久に塞がらないよう、書き込みにもアイドル上限を課す。
+    // 書き込みも tick で打ち切り、`write_all_checked` が停止フラグとアイドルを見る。
+    // （長い timeout だと、相手が読まない間は停止を確認できない。）
     let setup = |c: &Conn| {
         c.set_read_timeout(Some(tick))?;
-        c.set_write_timeout(Some(shared.limits.idle_timeout))
+        c.set_write_timeout(Some(tick))
     };
     if setup(&client).is_err() || setup(&upstream).is_err() {
         return;
@@ -502,7 +589,7 @@ fn pump(mut reader: Conn, mut writer: Conn, ctx: &TunnelCtx, shared: &Shared) {
                 let Some(chunk) = buf.get(..n) else {
                     break abort(&reader, &writer);
                 };
-                if writer.write_all(chunk).is_err() {
+                if write_all_checked(&mut writer, chunk, ctx, shared).is_err() {
                     break abort(&reader, &writer);
                 }
             }
@@ -523,6 +610,44 @@ fn pump(mut reader: Conn, mut writer: Conn, ctx: &TunnelCtx, shared: &Shared) {
             Err(_) => break abort(&reader, &writer),
         }
     }
+}
+
+/// 書き込み timeout（tick）のたびに停止フラグと無通信時間を見ながら全量を書く。
+/// 相手が読み取りを止めても、停止要求・アイドル上限で抜けられる。
+fn write_all_checked(
+    writer: &mut Conn,
+    mut data: &[u8],
+    ctx: &TunnelCtx,
+    shared: &Shared,
+) -> io::Result<()> {
+    while !data.is_empty() {
+        if shared.stop.load(Ordering::Relaxed) {
+            return Err(io::ErrorKind::Interrupted.into());
+        }
+        match writer.write(data) {
+            Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+            Ok(n) => {
+                ctx.touch();
+                data = data.get(n..).unwrap_or(&[]);
+            }
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) =>
+            {
+                if ctx.idle_exceeded() {
+                    if !ctx.idle_counted.swap(true, Ordering::Relaxed) {
+                        shared.counters.bump(Event::IdleTimeout);
+                    }
+                    return Err(io::ErrorKind::TimedOut.into());
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
 }
 
 /// 両ソケットを閉じ、反対方向のスレッドの read も起こす。

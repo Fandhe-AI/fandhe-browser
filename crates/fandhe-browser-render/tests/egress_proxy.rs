@@ -350,6 +350,110 @@ mod unix_tests {
         assert_eq!(p.stats().idle_timeout, 1);
     }
 
+    /// 応答しない名前解決。
+    struct HangResolver;
+    impl EgressResolver for HangResolver {
+        fn resolve(&self, _host: &str, _port: u16) -> std::io::Result<Vec<SocketAddr>> {
+            thread::sleep(Duration::from_secs(30));
+            Ok(Vec::new())
+        }
+    }
+
+    /// RENDER-3: 応答しない名前解決は connect_timeout で 502 になり、接続枠が解放される。
+    #[test]
+    fn render_3_hanging_resolution_times_out_and_frees_slot() {
+        let cfg = EgressProxyConfig::default()
+            .with_resolver(Arc::new(HangResolver))
+            .with_limits(EgressProxyLimits {
+                connect_timeout: Duration::from_millis(200),
+                max_connections: 1,
+                ..Default::default()
+            });
+        let p = EgressProxy::start(EgressEndpoint::LoopbackTcp, cfg).unwrap();
+        for i in 1..=2 {
+            let started = Instant::now();
+            let mut c = open(p.endpoint());
+            c.write_all(connect_req("hang.example", 443).as_bytes())
+                .unwrap();
+            assert!(read_head(&mut *c).starts_with("HTTP/1.1 502 "));
+            assert!(started.elapsed() < Duration::from_secs(3));
+            assert_eq!(p.stats().resolve_failed, i);
+            assert_eq!(p.stats().over_capacity, 0);
+        }
+    }
+
+    /// RENDER-3: 名前解決の待機中でも停止（Drop）で中断される。
+    #[test]
+    fn render_3_shutdown_interrupts_hanging_resolution() {
+        let cfg = EgressProxyConfig::default().with_resolver(Arc::new(HangResolver));
+        let p = EgressProxy::start(EgressEndpoint::LoopbackTcp, cfg).unwrap();
+        let mut c = open(p.endpoint());
+        c.write_all(connect_req("hang.example", 443).as_bytes())
+            .unwrap();
+        thread::sleep(Duration::from_millis(300));
+        let started = Instant::now();
+        p.shutdown();
+        assert!(read_head(&mut *c).starts_with("HTTP/1.1 503 "));
+        assert!(started.elapsed() < Duration::from_secs(3));
+    }
+
+    /// RENDER-3: 相手が読まず反対方向が EOF 済みでも、停止でトンネルが短時間で閉じる。
+    #[test]
+    fn render_3_shutdown_closes_tunnel_blocked_on_write() {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap();
+        // 受け付けて書き込み側だけ閉じ、以後一切読まない上流。
+        let sink = thread::spawn(move || {
+            let (s, _) = l.accept().unwrap();
+            s.shutdown(std::net::Shutdown::Write).unwrap();
+            thread::sleep(Duration::from_secs(8));
+        });
+        let p = EgressProxy::start(EgressEndpoint::LoopbackTcp, allow_private()).unwrap();
+        let BoundEndpoint::Tcp(ep) = p.endpoint().clone() else {
+            panic!("expected tcp endpoint");
+        };
+        let mut c = TcpStream::connect(ep).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        c.write_all(connect_req("127.0.0.1", addr.port()).as_bytes())
+            .unwrap();
+        assert!(read_head(&mut c).starts_with("HTTP/1.1 200 "));
+        c.set_write_timeout(Some(Duration::from_millis(100)))
+            .unwrap();
+        let chunk = vec![0u8; 64 * 1024];
+        let fill_until = Instant::now() + Duration::from_secs(5);
+        loop {
+            match c.write(&chunk) {
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    break;
+                }
+                Err(e) => panic!("unexpected: {e}"),
+                Ok(_) => assert!(Instant::now() < fill_until, "buffers never filled"),
+            }
+        }
+        let started = Instant::now();
+        p.shutdown();
+        let close_until = Instant::now() + Duration::from_secs(3);
+        loop {
+            if c.write(&chunk).is_err_and(|e| {
+                !matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                )
+            }) {
+                break;
+            }
+            assert!(Instant::now() < close_until, "tunnel stayed open");
+        }
+        assert!(started.elapsed() < Duration::from_secs(3));
+        drop(c);
+        drop(sink);
+    }
+
     /// RENDER-3: Drop でソケットファイルが消え、待ち受けが閉じる。ソケットは 0600。
     #[test]
     fn render_3_drop_removes_socket_and_closes_listener() {

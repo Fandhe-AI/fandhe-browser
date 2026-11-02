@@ -45,7 +45,8 @@ pub const HEADER_DEADLINE: Duration = Duration::from_secs(10);
 /// 同時接続数（トンネル確立後も含む）。ブラウザの同時ソケット数の目安から決めた。1 接続あたり
 /// 最大 2 スレッドなので、スレッド数は高々この 2 倍に有界。
 pub const MAX_CONCURRENT_CONNECTIONS: usize = 128;
-/// 上流への TCP 接続全体の時間（複数アドレスを試す場合も合計でこの値まで）。
+/// 名前解決の待ち時間と、上流への TCP 接続全体の時間（それぞれこの値まで。複数アドレスを
+/// 試す場合も接続は合計でこの値まで）。
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// トンネル確立後の無通信（双方向とも）の上限。片方向だけ流れ続ける長いダウンロードは切らない。
 pub const IDLE_TIMEOUT: Duration = Duration::from_secs(300);
@@ -139,10 +140,9 @@ pub trait EgressResolver: Send + Sync {
 
 /// `ToSocketAddrs`（getaddrinfo）による既定のリゾルバ。
 ///
-/// 注意: getaddrinfo は同期でブロックし、解決そのものには timeout がない
-/// （`connect_timeout` は TCP 接続にしか効かない）。応答しない DNS 宛先を多数同時に
-/// 指定されると、その分だけ同時接続の枠とスレッドが長時間塞がる。枠の上限で有界であり、
-/// 入力元が信頼できる Servo ホストである前提のため既知の制約として受容する。
+/// 注意: getaddrinfo は同期でブロックし中断できない。プロキシ側が別スレッドで呼び、
+/// `connect_timeout` を期限に待ちを打ち切る（停止フラグも見る）。期限後も解決スレッドは
+/// 戻るまで残るが、残存数は上限（32）で有界で、超えた分は解決せず 502 を返す。
 #[derive(Clone, Copy, Debug, Default)]
 pub struct SystemResolver;
 
