@@ -14,10 +14,12 @@ use std::time::{Duration, Instant};
 
 use fandhe_browser_core::EgressIsolationMode;
 #[cfg(unix)]
+use fandhe_browser_render::host_process::EgressIsolationStatus;
+#[cfg(unix)]
 use fandhe_browser_render::host_process::HOST_ARGS;
 use fandhe_browser_render::host_process::{
-    EgressIsolationStatus, EgressIsolationUnavailable, HostProcess, HostProcessConfig,
-    HostProcessError, HostTimeouts, IsolationProbe, TimeoutPhase,
+    EgressIsolationUnavailable, HostProcess, HostProcessConfig, HostProcessError, HostTimeouts,
+    IsolationProbe, TimeoutPhase,
 };
 #[cfg(unix)]
 use fandhe_browser_render::host_process::{FORCED_ENV_NAMES, PASSTHROUGH_ENV_NAMES};
@@ -381,8 +383,11 @@ fn t_required_unavailable_does_not_spawn() {
     assert!(h.pid().is_none());
 }
 
+// 使うテストが unix 限定のため、Windows では dead_code にならないよう cfg を揃える。
+#[cfg(unix)]
 type Warnings = std::sync::Arc<std::sync::Mutex<Vec<EgressIsolationUnavailable>>>;
 
+#[cfg(unix)]
 fn with_warning_sink(cfg: HostProcessConfig) -> (HostProcessConfig, Warnings) {
     let sink: Warnings = Warnings::default();
     let s2 = std::sync::Arc::clone(&sink);
