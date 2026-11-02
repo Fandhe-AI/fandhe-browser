@@ -7,9 +7,12 @@
 //! あり、本モジュールはそれらを OS のコマンドで包む部分を担う。依存追加も `unsafe` もなく、
 //! `pre_exec`・FFI は使わず外部コマンドの引数配列だけで隔離する（シェルを介さない）。
 //!
-//! - Linux: `bwrap --die-with-parent --unshare-net --dev-bind / / --tmpfs /run -- <ホスト>
-//!   --stdio --egress-relay-uds <UDS>`。netns に出口が無くなり、ホストは netns 内の中継を
-//!   経由して WorkDir 配下の UDS（本体側のプロキシ）にだけ届く。
+//! - Linux: `bwrap --die-with-parent --unshare-net --unshare-pid --dev-bind / / --proc /proc
+//!   --tmpfs /run -- <ホスト> --stdio --egress-relay-uds <UDS>`。netns に出口が無くなり、ホストは
+//!   netns 内の中継を経由して WorkDir 配下の UDS（本体側のプロキシ）にだけ届く。`--unshare-pid` と
+//!   新しい `/proc` により、ホストから本体の `/proc/<ppid>`（`mem`・`fd`・`environ`・ptrace）が見えず、
+//!   乗っ取られたホストが本体へ介入して隔離を破る経路を塞ぐ。`--proc` は `--dev-bind / /` が
+//!   ホストの `/proc` を持ち込んだ後に置く（先に置くと上書きされ、本体の pid が見えてしまう）。
 //! - macOS: `sandbox-exec -p <profile> <ホスト> --stdio --egress-proxy-port <port>`。
 //!   profile は loopback の 1 ポート以外への送信を拒否する（`harness/egress-isolation/seatbelt.py`
 //!   と同じ形）。
@@ -24,11 +27,12 @@
 //!   送信だけを絞る）。DNS 経路（mDNSResponder 経由の名前解決）は観測・遮断していない。
 //! - 識別面（UA・ヘッダ・環境変数）は変えない（SEC-2）。プロキシはバイト列を改変しない。
 //! - 外部コマンドは固定の絶対パス候補から選ぶ（PATH は使わない）。
-//! - bwrap の `--die-with-parent` は bwrap 自身を親の死で落とすが、bwrap だけを kill しても子の
-//!   ホストは残る（実測）。終了時・RSS 超過時はホストを先に名指しで落としてからラッパーを kill する
-//!   （[`kill_process`]）。本体プロセス自体が SIGKILL された場合は bwrap だけが落ち、ホストは stdin の
-//!   EOF で終わるのを待つ（既知の制約）。bwrap は呼び出しスレッドの終了でも落ちるため、
-//!   `HostProcess` は専用の親スレッドで起動する。
+//! - pid 名前空間の中の pid 1 は bwrap の init 役で、外から見たプロセスツリーは
+//!   `bwrap(起動した子) -> bwrap(ns 内 pid 1) -> ホスト` の 2 段になる。起動した子を kill すると
+//!   `--die-with-parent` で ns 内 pid 1 も落ち、pid 1 の死で ns 内の全プロセスが SIGKILL される
+//!   （bwrap 0.11.1 で実測）。そのためホストを名指しで kill する必要はなく、pid の再利用による
+//!   取り違えもない。本体が SIGKILL されても同じ連鎖でホストまで落ちる。bwrap は呼び出し
+//!   スレッドの終了でも落ちるため、`HostProcess` は専用の親スレッドで起動する。
 
 use std::ffi::OsString;
 use std::fmt;
@@ -180,14 +184,18 @@ pub fn isolation_warning_message(reason: EgressIsolationUnavailable) -> String {
     )
 }
 
-/// bwrap を包む引数（`--` まで）。プローブと本番で同じフラグを使う。
+/// bwrap を包む引数（`--` まで）。プローブと本番で同じフラグを使う（RENDER-3）。
+/// `--proc /proc` は `--dev-bind / /` の後ろに置く（順序が意味を持つ）。
 fn linux_wrapper_args() -> Vec<OsString> {
     [
         "--die-with-parent",
         "--unshare-net",
+        "--unshare-pid",
         "--dev-bind",
         "/",
         "/",
+        "--proc",
+        "/proc",
         "--tmpfs",
         "/run",
         "--",
@@ -257,32 +265,6 @@ pub(super) fn workdir_hidden_by_sandbox(canonical: &Path) -> bool {
 /// プロキシが WorkDir 配下に作る UDS のファイル名（`egress_proxy` の固定名と一致させる。
 /// 結合テストが bind 済みの実パスと突き合わせる）。
 pub(super) const EGRESS_SOCKET_NAME: &str = "egress-proxy.sock";
-
-/// ラッパー（bwrap）の子として動くホストを SIGKILL する（best-effort）。
-///
-/// 実測（bwrap 0.11.1・`--die-with-parent`・pid namespace なし）で、bwrap だけを kill しても
-/// 子のホストは残った（init に reparent される）。そのためラッパーを kill する前に、ホストを
-/// 名指しで落とす。std には pid 指定の kill が無く `unsafe`・libc を足せないため、絶対パスの
-/// `kill` コマンドに整数の pid だけを渡す（シェルを介さない）。コマンドが無い環境ではホストが
-/// 残りうる（stdin の EOF で終了するのを待つしかない。既知の制約）。呼び出し側は、ラッパーが
-/// 生きていてホストがその子である間にだけ呼ぶこと（pid 再利用の取り違えを避ける）。
-#[cfg(target_os = "linux")]
-pub(super) fn kill_process(pid: u32) {
-    let Some(kill) = ["/bin/kill", "/usr/bin/kill"]
-        .iter()
-        .map(Path::new)
-        .find(|p| is_trusted_executable(p))
-    else {
-        return;
-    };
-    let mut cmd = Command::new(kill);
-    cmd.args(["-s", "KILL", "--"]).arg(pid.to_string());
-    let _ = run_probe(cmd, PROBE_TIMEOUT);
-}
-
-/// Linux 以外ではラッパーが exec するため（macOS）または隔離しないため、何もしない。
-#[cfg(not(target_os = "linux"))]
-pub(super) fn kill_process(_pid: u32) {}
 
 /// bwrap 用に、WorkDir を正規化してソケット用ディレクトリとして返す。`--tmpfs /run` に隠れる、
 /// または UDS のパスが規則に反する場合は隔離できない理由を返す（fail-closed）。
@@ -416,9 +398,12 @@ mod tests {
             [
                 "--die-with-parent",
                 "--unshare-net",
+                "--unshare-pid",
                 "--dev-bind",
                 "/",
                 "/",
+                "--proc",
+                "/proc",
                 "--tmpfs",
                 "/run",
                 "--",

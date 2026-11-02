@@ -90,32 +90,41 @@ pub struct RssStartError;
 
 /// 監視対象の pid の出所。
 ///
-/// bwrap で包むと子プロセスの pid は bwrap になり、Servo ホストはその子になる（macOS の
-/// sandbox-exec は exec するので pid は変わらない。RENDER-4・#1436）。bwrap 自身の RSS は
+/// bwrap で包むと子プロセスの pid は bwrap になる。`--unshare-pid` のため、外から見ると
+/// `bwrap(起動した子) -> bwrap(ns 内 pid 1) -> ホスト` の 2 段で、ホストは孫になる（macOS の
+/// sandbox-exec は exec するので pid は変わらない。RENDER-3・RENDER-4・#1436）。bwrap 自身の RSS は
 /// ホストの使用量を表さないため代用しない。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PidSource {
     /// 起動した子そのもの。
     Direct(u32),
-    /// 起動した子（ラッパー）のただ 1 つの子プロセス。辿れるまで「計測不能」として扱う。
+    /// 起動した子（ラッパー）から子を 2 段、各段ちょうど 1 件ずつ辿った先（ホスト）。
+    /// 辿れるまで「計測不能」として扱う。
     WrappedChildOf(u32),
 }
 
-/// ラッパー（bwrap）の子として動くホストの pid を `/proc/<w>/task/<w>/children` から辿る。
+/// bwrap の pid 名前空間の段数（ラッパー -> ns 内 pid 1 の bwrap -> ホスト）。
+const WRAPPER_DEPTH: usize = 2;
+
+/// ラッパー（bwrap）配下のホストの pid を、外側の pid 名前空間での pid で辿る。
 ///
-/// 空白区切りの pid が**ちょうど 1 件**のときだけ `Some`。0 件・2 件以上・形式不正・読めない
-/// 場合は `None`（曖昧なまま別プロセスの RSS を測らない）。`read` は `/proc` の読み取りを
-/// 差し替えられるようにするための注入点（本番は `std::fs::read_to_string`）。
-/// `CONFIG_PROC_CHILDREN` の無いカーネルでは読めず、`None` が続いて連続失敗の kill に至る
-/// （fail-closed）。
+/// `/proc/<p>/task/<p>/children` を [`WRAPPER_DEPTH`] 段たどり、各段で空白区切りの pid が
+/// **ちょうど 1 件**のときだけ `Some`。0 件・2 件以上・形式不正・読めない場合は `None`
+/// （曖昧なまま別プロセスの RSS を測らない）。`read` は `/proc` の読み取りを差し替えられる
+/// ようにするための注入点（本番は `std::fs::read_to_string`）。`CONFIG_PROC_CHILDREN` の無い
+/// カーネルでは読めず、`None` が続いて連続失敗の kill に至る（fail-closed）。
 pub fn resolve_wrapped_pid(wrapper: u32, read: &dyn Fn(&str) -> Option<String>) -> Option<u32> {
-    let text = read(&format!("/proc/{wrapper}/task/{wrapper}/children"))?;
-    let mut pids = text.split_whitespace();
-    let first = pids.next()?.parse::<u32>().ok()?;
-    if pids.next().is_some() {
-        return None;
+    let mut pid = wrapper;
+    for _ in 0..WRAPPER_DEPTH {
+        let text = read(&format!("/proc/{pid}/task/{pid}/children"))?;
+        let mut pids = text.split_whitespace();
+        let first = pids.next()?.parse::<u32>().ok()?;
+        if pids.next().is_some() {
+            return None;
+        }
+        pid = first;
     }
-    Some(first)
+    Some(pid)
 }
 
 /// 1 回分の監視状態（pid の解決・連続失敗の計数）。スレッドと単体テストが共有する。
@@ -207,15 +216,8 @@ impl RssMonitor {
                     if over {
                         exceeded.store(true, Ordering::SeqCst);
                         if let Ok(mut c) = child.lock() {
-                            // bwrap だけを kill してもホストは残る（`kill_process` の doc）。ラッパーが
-                            // 生きている間に、解決済みの（または今辿れる）ホストを先に落とす。
-                            if let PidSource::WrappedChildOf(w) = source
-                                && matches!(c.try_wait(), Ok(None))
-                                && let Some(host) =
-                                    watch.resolved.or_else(|| resolve_wrapped_pid(w, &read))
-                            {
-                                super::isolation::kill_process(host);
-                            }
+                            // pid 名前空間のため、ラッパーを kill すれば ns 内のホストも落ちる
+                            // （`isolation` のモジュール doc）。名指しの kill はしない。
                             let _ = c.kill();
                         }
                         return;
@@ -257,22 +259,37 @@ mod tests {
         }
     }
 
-    /// RENDER-4（#1436）: ラッパーの子 pid は 1 件のときだけ解決し、読む先は task/<pid>/children。
+    /// RENDER-3・RENDER-4（#1436）: ラッパー -> ns 内 pid 1 の bwrap -> ホストの 2 段を、各段 1 件の
+    /// ときだけ辿る。読む先は task/<pid>/children。
     #[test]
-    fn render4_resolve_wrapped_pid_requires_exactly_one_child() {
-        let one = [("/proc/77/task/77/children", "1234 ")];
-        assert_eq!(resolve_wrapped_pid(77, &children_of(&one)), Some(1234));
-        for (text, why) in [
-            ("", "empty"),
-            ("1 2", "two children"),
-            ("abc", "garbage"),
-            ("-5", "negative"),
-        ] {
-            let m = [("/proc/77/task/77/children", text)];
+    fn render4_resolve_wrapped_pid_walks_two_levels() {
+        let tree = [
+            ("/proc/77/task/77/children", "1234 "),
+            ("/proc/1234/task/1234/children", "1235\n"),
+        ];
+        assert_eq!(resolve_wrapped_pid(77, &children_of(&tree)), Some(1235));
+        // 1 段目しか無い（ホスト未起動）・ホストが複数・ラッパーが複数は曖昧なので None。
+        let first_only = [("/proc/77/task/77/children", "1234")];
+        assert_eq!(resolve_wrapped_pid(77, &children_of(&first_only)), None);
+        let two_hosts = [
+            ("/proc/77/task/77/children", "1234"),
+            ("/proc/1234/task/1234/children", "1235 1236"),
+        ];
+        assert_eq!(resolve_wrapped_pid(77, &children_of(&two_hosts)), None);
+        let two_inits = [
+            ("/proc/77/task/77/children", "1234 1240"),
+            ("/proc/1234/task/1234/children", "1235"),
+        ];
+        assert_eq!(resolve_wrapped_pid(77, &children_of(&two_inits)), None);
+        for (text, why) in [("", "empty"), ("abc", "garbage"), ("-5", "negative")] {
+            let m = [
+                ("/proc/77/task/77/children", "1234"),
+                ("/proc/1234/task/1234/children", text),
+            ];
             assert_eq!(resolve_wrapped_pid(77, &children_of(&m)), None, "{why}");
         }
         // 別 pid のファイルしか無い（読み取り失敗）。
-        assert_eq!(resolve_wrapped_pid(78, &children_of(&one)), None);
+        assert_eq!(resolve_wrapped_pid(78, &children_of(&tree)), None);
     }
 
     /// RENDER-4（#1436）: 未解決のあいだは失敗に数え、10 回で kill 判定になる。解決後は子の RSS で判定する。
@@ -289,7 +306,10 @@ mod tests {
         assert_eq!(w.resolved, None);
 
         // 解決後は子の RSS で判定し、固定する。
-        let m = [("/proc/77/task/77/children", "500")];
+        let m = [
+            ("/proc/77/task/77/children", "400"),
+            ("/proc/400/task/400/children", "500"),
+        ];
         let read = children_of(&m);
         let probe = |pid: u32| if pid == 500 { Some(50) } else { Some(u64::MAX) };
         let mut w = Watch::new(PidSource::WrappedChildOf(77));

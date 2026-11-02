@@ -852,29 +852,8 @@ impl HostProcess {
         let Some(mut r) = self.running.take() else {
             return;
         };
-        // bwrap だけを kill してもホストは残る（`isolation::kill_process` の doc）。ラッパーが生きて
-        // いる間に、ホストを先に名指しで落とす。
-        if matches!(
-            r.isolation,
-            EgressIsolationStatus::Isolated(IsolationBackend::Bwrap)
-        ) {
-            let alive = r
-                .child
-                .lock()
-                .map(|mut c| matches!(c.try_wait(), Ok(None)))
-                .unwrap_or(false);
-            if alive {
-                let read = |p: &str| std::fs::read_to_string(p).ok();
-                let host = r
-                    .monitor
-                    .as_ref()
-                    .and_then(RssMonitor::monitored_pid)
-                    .or_else(|| rss::resolve_wrapped_pid(r.pid, &read));
-                if let Some(host) = host {
-                    isolation::kill_process(host);
-                }
-            }
-        }
+        // bwrap は pid 名前空間を持つため、ラッパーを kill すれば ns 内のホストも落ちる
+        // （`isolation` のモジュール doc。RENDER-3）。
         drop(r.monitor.take());
         if let Ok(mut c) = r.child.lock() {
             let _ = c.kill();
@@ -1038,11 +1017,10 @@ impl HostProcess {
             _ => return Err(self.fail_spawn()),
         };
         let pid = child.id();
-        let wrapped = matches!(launch.sandbox, Some(Sandbox::Bwrap(_)));
         let (Some(mut stdin), Some(mut stdout), Some(mut stderr)) =
             (child.stdin.take(), child.stdout.take(), child.stderr.take())
         else {
-            reap_unregistered(&mut child, wrapped);
+            reap_unregistered(&mut child);
             return Err(self.fail_spawn());
         };
 
@@ -1097,7 +1075,7 @@ impl HostProcess {
         let stderr_thread = match threads {
             Ok(h) => h,
             Err(_) => {
-                reap_unregistered(&mut child, wrapped);
+                reap_unregistered(&mut child);
                 return Err(self.fail_spawn());
             }
         };
@@ -1120,7 +1098,7 @@ impl HostProcess {
             Err(_) => {
                 // 監視できないまま走らせない（RSS 上限が黙って無効になるのを防ぐ）。
                 if let Ok(mut c) = child.lock() {
-                    reap_unregistered(&mut c, wrapped);
+                    reap_unregistered(&mut c);
                 }
                 return Err(self.fail_spawn());
             }
@@ -1191,16 +1169,9 @@ impl Drop for HostProcess {
     }
 }
 
-/// `running` へ未登録のまま起動が失敗したときの後始末（`teardown` と同じ手段）。bwrap 配下では
-/// ラッパーを kill してもホストが残る（`isolation::kill_process` の doc）ため、ラッパーが生きている
-/// 間にホスト本体を名指しで落としてから、ラッパーを kill・wait する（RENDER-3・#1436）。
-fn reap_unregistered(child: &mut Child, wrapped: bool) {
-    if wrapped && matches!(child.try_wait(), Ok(None)) {
-        let read = |p: &str| std::fs::read_to_string(p).ok();
-        if let Some(host) = rss::resolve_wrapped_pid(child.id(), &read) {
-            isolation::kill_process(host);
-        }
-    }
+/// `running` へ未登録のまま起動が失敗したときの後始末（`teardown` と同じ手段）。bwrap 配下でも
+/// pid 名前空間のため、ラッパーを kill・wait すれば ns 内のホストも落ちる（RENDER-3・#1436）。
+fn reap_unregistered(child: &mut Child) {
     let _ = child.kill();
     let _ = child.wait();
 }
@@ -1210,42 +1181,15 @@ mod tests {
     use super::*;
     use crate::protocol::VisibilityParams;
 
-    /// RENDER-3: 未登録の起動失敗でも、ラッパー配下のホスト本体を止めてからラッパーを回収する。
-    #[cfg(target_os = "linux")]
+    /// RENDER-3: 未登録の起動失敗でも、ラッパーを kill・wait で回収する。
+    #[cfg(unix)]
     #[test]
-    fn render3_reap_unregistered_kills_wrapped_host_then_wrapper() {
-        // 「ラッパー」sh が子の sleep（ホスト役）を持つ。sh は wait で生き続ける。
+    fn render3_reap_unregistered_kills_and_waits_wrapper() {
         let mut wrapper = Command::new("/bin/sh")
             .args(["-c", "sleep 60 & wait"])
             .spawn()
             .expect("spawn sh");
-        let read = |p: &str| std::fs::read_to_string(p).ok();
-        let mut host = None;
-        for _ in 0..200 {
-            host = rss::resolve_wrapped_pid(wrapper.id(), &read);
-            if host.is_some() {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        let host = host.expect("wrapped host pid");
-        reap_unregistered(&mut wrapper, true);
-        // ホストは init に reparent されうるため、/proc からの消滅（または zombie）を待つ。
-        let mut gone = false;
-        for _ in 0..200 {
-            match std::fs::read_to_string(format!("/proc/{host}/stat")) {
-                Err(_) => {
-                    gone = true;
-                    break;
-                }
-                Ok(st) if st.contains(") Z ") => {
-                    gone = true;
-                    break;
-                }
-                Ok(_) => std::thread::sleep(Duration::from_millis(10)),
-            }
-        }
-        assert!(gone, "wrapped host {host} must be killed");
+        reap_unregistered(&mut wrapper);
         assert!(matches!(wrapper.try_wait(), Ok(Some(_))));
     }
 

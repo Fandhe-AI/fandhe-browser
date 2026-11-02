@@ -73,7 +73,24 @@ pub fn fake_host() -> ! {
             .map(|(k, _)| k.to_string_lossy().into_owned())
             .collect();
         names.sort();
+        // pid 名前空間の観測（RENDER-3）: 見える pid と自分の PPid。
+        let mut proc_pids: Vec<u32> = std::fs::read_dir("/proc")
+            .map(|d| {
+                d.flatten()
+                    .filter_map(|e| e.file_name().to_str()?.parse().ok())
+                    .collect()
+            })
+            .unwrap_or_default();
+        proc_pids.sort_unstable();
+        let ppid: Option<u32> = std::fs::read_to_string("/proc/self/status")
+            .ok()
+            .and_then(|t| {
+                t.lines()
+                    .find_map(|l| l.strip_prefix("PPid:")?.trim().parse().ok())
+            });
         let obs = json!({
+            "proc_pids": proc_pids,
+            "ppid": ppid,
             "args": std::env::args().skip(1).collect::<Vec<_>>(),
             "env": names,
             "cwd": cwd.to_string_lossy(),

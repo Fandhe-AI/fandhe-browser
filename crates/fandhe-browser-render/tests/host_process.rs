@@ -473,18 +473,43 @@ fn t_system_probe_branch() {
                 args,
                 ["--stdio", "--egress-relay-uds", sock.to_str().unwrap()]
             );
-            // RSS 監視は bwrap ではなくその子（偽ホスト）の pid を辿る。
-            let host_pid = child_pid(&root, 1);
-            assert_ne!(Some(host_pid), h.pid(), "wrapper pid differs from host pid");
+            // pid 名前空間（RENDER-3）: ホストから本体と起動した子（外側の pid）が見えない。
+            // ns 内ではホストの親は init 役の bwrap（pid 1）で、自身の pid（pid-1 ファイル）は 2。
+            let wrapper_pid = h.pid().expect("wrapper pid");
+            let seen: Vec<u64> = obs["proc_pids"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_u64().unwrap())
+                .collect();
+            assert!(seen.contains(&1), "ns init visible: {seen:?}");
+            assert!(
+                !seen.contains(&u64::from(std::process::id())),
+                "parent pid must be hidden: {seen:?}"
+            );
+            assert!(
+                !seen.contains(&u64::from(wrapper_pid)),
+                "wrapper pid must be hidden: {seen:?}"
+            );
+            assert_eq!(obs["ppid"], 1);
+            assert_eq!(child_pid(&root, 1), 2);
+            // RSS 監視は bwrap ではなく 2 段下（外側の pid でのホスト）を辿る。
             let deadline = Instant::now() + Duration::from_secs(5);
-            while h.monitored_pid() != Some(host_pid) && Instant::now() < deadline {
+            while h.monitored_pid().is_none() && Instant::now() < deadline {
                 std::thread::sleep(Duration::from_millis(20));
             }
-            assert_eq!(h.monitored_pid(), Some(host_pid));
-            // 終了処理: ラッパーを kill すると、ホストも残らない。
+            let host_pid = h.monitored_pid().expect("monitored host pid");
+            assert_ne!(host_pid, wrapper_pid, "wrapper pid differs from host pid");
+            let tree = outer_tree(wrapper_pid);
+            assert_eq!(tree.len(), 2, "wrapper -> init -> host: {tree:?}");
+            assert_eq!(tree[1], host_pid);
+            assert_eq!(nspid(host_pid), vec![host_pid, 2], "NSpid of the host");
+            // 終了処理: ラッパーを kill すると、init 役もホストも残らない。
             h.shutdown();
             assert!(!workdir.exists());
             wait_gone(host_pid);
+            wait_gone(tree[0]);
+            wait_gone(wrapper_pid);
         }
         Err(reason) => {
             let root = Root::new("iso-system-ng", "ok");
@@ -502,6 +527,71 @@ fn t_system_probe_branch() {
     }
 }
 
+/// 外側の pid 名前空間で、`wrapper` の子孫を 1 本道で辿った pid 列（子が 1 件の間だけ）。
+#[cfg(target_os = "linux")]
+fn outer_tree(wrapper: u32) -> Vec<u32> {
+    let mut out = Vec::new();
+    let mut cur = wrapper;
+    while let Ok(t) = std::fs::read_to_string(format!("/proc/{cur}/task/{cur}/children")) {
+        let kids: Vec<u32> = t.split_whitespace().map(|p| p.parse().unwrap()).collect();
+        match kids.as_slice() {
+            [only] => {
+                out.push(*only);
+                cur = *only;
+            }
+            _ => break,
+        }
+    }
+    out
+}
+
+/// `/proc/<pid>/status` の `NSpid`（外側から内側へ並ぶ pid）。
+#[cfg(target_os = "linux")]
+fn nspid(pid: u32) -> Vec<u32> {
+    std::fs::read_to_string(format!("/proc/{pid}/status"))
+        .unwrap()
+        .lines()
+        .find_map(|l| l.strip_prefix("NSpid:"))
+        .unwrap()
+        .split_whitespace()
+        .map(|p| p.parse().unwrap())
+        .collect()
+}
+
+/// `root` 配下を cmdline に含むプロセス（bwrap・init 役・ホスト）の外側 pid を、`stop` が立つまで
+/// 集め続ける。ns 内の pid（pid-N ファイル）は外側の `/proc` では引けないため、失敗する load の
+/// 後始末（ホストの消滅）を外側の pid で確かめるために使う。
+#[cfg(target_os = "linux")]
+fn spawn_pid_collector(
+    root: &std::path::Path,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> std::thread::JoinHandle<BTreeSet<u32>> {
+    let needle = root.to_string_lossy().into_owned();
+    std::thread::spawn(move || {
+        let mut found = BTreeSet::new();
+        while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+            if let Ok(d) = std::fs::read_dir("/proc") {
+                for e in d.flatten() {
+                    let Some(pid) = e.file_name().to_str().and_then(|n| n.parse::<u32>().ok())
+                    else {
+                        continue;
+                    };
+                    if pid == std::process::id() {
+                        continue;
+                    }
+                    if let Ok(c) = std::fs::read(e.path().join("cmdline"))
+                        && String::from_utf8_lossy(&c).contains(&needle)
+                    {
+                        found.insert(pid);
+                    }
+                }
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        found
+    })
+}
+
 /// bwrap 越しでも、タイムアウトで kill した後にホストが残らない。
 #[cfg(target_os = "linux")]
 fn t_system_probe_timeout_kills_wrapped_host() {
@@ -509,13 +599,18 @@ fn t_system_probe_timeout_kills_wrapped_host() {
         return; // 隔離できない環境では上のテストが required の拒否を確かめる。
     }
     let root = Root::new("iso-timeout", "hang-load");
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let collector = spawn_pid_collector(&root.0, stop.clone());
     let mut h = HostProcess::new(root.config_system(short_timeouts()));
     let e = h.load(&page(), 1).expect_err("timeout");
     assert!(
         matches!(e, HostProcessError::Timeout(TimeoutPhase::Load)),
         "{e:?}"
     );
-    wait_gone(child_pid(&root, 1));
+    stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    let pids = collector.join().unwrap();
+    assert!(pids.len() >= 3, "bwrap, init and host seen: {pids:?}");
+    pids.into_iter().for_each(wait_gone);
 }
 
 /// bwrap 越しでも RSS 上限超過でホスト本体（bwrap の子）が落ちる。bwrap 自身の RSS では判定しない。
@@ -529,13 +624,18 @@ fn t_system_probe_rss_limit_kills_wrapped_host() {
         .config_system(base_timeouts())
         .with_rss_limit_bytes(48 * 1024 * 1024)
         .with_rss_poll_interval(Duration::from_millis(50));
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let collector = spawn_pid_collector(&root.0, stop.clone());
     let mut h = HostProcess::new(cfg);
     let e = h.load(&page(), 1).expect_err("rss");
     assert!(
         matches!(e, HostProcessError::ResourceLimitExceeded),
         "{e:?}"
     );
-    wait_gone(child_pid(&root, 1));
+    stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    let pids = collector.join().unwrap();
+    assert!(pids.len() >= 3, "bwrap, init and host seen: {pids:?}");
+    pids.into_iter().for_each(wait_gone);
 }
 
 fn main() {
