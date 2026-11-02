@@ -17,9 +17,11 @@ use fandhe_browser_core::EgressIsolationMode;
 use fandhe_browser_render::host_process::EgressIsolationStatus;
 #[cfg(unix)]
 use fandhe_browser_render::host_process::HOST_ARGS;
+#[cfg(unix)]
+use fandhe_browser_render::host_process::HostProcessConfig;
 use fandhe_browser_render::host_process::{
-    EgressIsolationUnavailable, HostProcess, HostProcessConfig, HostProcessError, HostTimeouts,
-    IsolationProbe, TimeoutPhase,
+    EgressIsolationUnavailable, HostProcess, HostProcessError, HostTimeouts, IsolationProbe,
+    TimeoutPhase,
 };
 #[cfg(unix)]
 use fandhe_browser_render::host_process::{FORCED_ENV_NAMES, PASSTHROUGH_ENV_NAMES};
