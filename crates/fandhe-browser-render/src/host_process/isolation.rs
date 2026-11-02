@@ -226,12 +226,13 @@ pub(super) fn macos_argv(host: &Path, port: NonZeroU16) -> (PathBuf, Vec<OsStrin
     (PathBuf::from(SANDBOX_EXEC_PATH), args)
 }
 
-/// 中継 UDS のパスが servo-host の `args.rs` の規則を満たすか（絶対・NUL なし・空要素や `.`・`..`
+/// なし・100 バイト以下）。ホストに拒否されて起動後に失敗するのを避けるため、起動前に検査する。
+/// 絶対判定は `/` 始まりの文字列で行う（UDS は unix 専用で、Windows の `is_absolute` はドライブ指定を要するため）。
 /// なし・100 バイト以下）。ホストに拒否されて起動後に失敗するのを避けるため、起動前に検査する。
 pub(super) fn relay_socket_path_ok(path: &Path) -> Result<(), EgressIsolationUnavailable> {
     let bad = EgressIsolationUnavailable::SocketPathInvalid;
     let value = path.to_str().ok_or(bad)?;
-    if value.contains('\0') || !path.is_absolute() || value.len() > RELAY_UDS_PATH_MAX_BYTES {
+    if value.contains('\0') || !value.starts_with('/') || value.len() > RELAY_UDS_PATH_MAX_BYTES {
         return Err(bad);
     }
     let clean = value.strip_prefix('/').is_some_and(|rest| {
