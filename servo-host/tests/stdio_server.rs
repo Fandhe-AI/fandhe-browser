@@ -834,8 +834,8 @@ fn invalid_egress_arguments_are_rejected_without_frames() {
         assert!(stderr.starts_with("error: "), "stderr: {stderr}");
     }
 }
-/// 受けた接続の先頭行（リクエストライン）を記録する偽 proxy。CONNECT には 502 で答え、
-/// それ以外のリクエストには固定の HTML を返す。
+/// 受けた接続の先頭行（リクエストライン）を記録する偽 proxy。すべてのリクエストに 502 で答える
+/// （CONNECT でも絶対形式 GET でも読み込みは失敗する。成功扱いにしない）。
 /// 戻り値は (ポート, スレッド, 停止通知, 記録した先頭行)。
 #[allow(clippy::type_complexity)]
 fn serve_recording_proxy() -> (
@@ -860,21 +860,10 @@ fn serve_recording_proxy() -> (
                     let n = conn.read(&mut buf).unwrap_or(0);
                     let head = String::from_utf8_lossy(buf.get(..n).unwrap_or(&[]));
                     let first = head.lines().next().unwrap_or("").to_string();
-                    let is_connect = first.starts_with("CONNECT ");
                     if let Ok(mut v) = seen.lock() {
                         v.push(first);
                     }
-                    let resp = if is_connect {
-                        "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-                            .to_string()
-                    } else {
-                        let body =
-                            "<html><head><title>via-proxy</title></head><body>ok</body></html>";
-                        format!(
-                            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                            body.len()
-                        )
-                    };
+                    let resp = "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
                     let _ = conn.write_all(resp.as_bytes());
                 }
                 Err(_) => std::thread::sleep(Duration::from_millis(10)),
@@ -914,11 +903,19 @@ fn load_goes_through_the_egress_proxy() {
     let _ = stop.send(());
     let _ = srv.join();
     let seen = lines.lock().unwrap().clone();
+    // https は CONNECT host:443。平文 http は Servo が HTTPS へ昇格するか否かで形が変わるため、
+    // 絶対形式 GET・CONNECT :80・CONNECT :443 のいずれかが当該ホスト宛てで届けば proxy 経由とみなす。
+    let accepts = |host: &str, l: &str| {
+        l.starts_with(&format!("CONNECT {host}:443 "))
+            || l.starts_with(&format!("CONNECT {host}:80 "))
+            || l.starts_with(&format!("GET http://{host}/"))
+    };
     for host in ["egress-target.invalid", "egress-plain.invalid"] {
-        let want = format!("CONNECT {host}:443 ");
-        assert!(
-            seen.iter().any(|l| l.starts_with(&want)),
-            "proxy saw: {seen:?}"
-        );
+        assert!(seen.iter().any(|l| accepts(host, l)), "proxy saw: {seen:?}");
     }
+    assert!(
+        seen.iter()
+            .any(|l| l.starts_with("CONNECT egress-target.invalid:443 ")),
+        "https must be CONNECT :443, proxy saw: {seen:?}"
+    );
 }
