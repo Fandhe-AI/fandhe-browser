@@ -782,3 +782,140 @@ fn closed_port_is_outside_ephemeral_range_and_not_reassigned() {
         "port {port} was reassigned to a :0 bind"
     );
 }
+
+/// hello を受けて shutdown し、終了コード 0 と stdout がフレームのみであることを確かめる。
+fn assert_starts_and_shuts_down(args: &[&str]) {
+    let mut h = spawn(args);
+    let hello: serde_json::Value = serde_json::from_str(&h.recv()).unwrap();
+    assert_eq!(hello["event"], "hello", "args: {args:?}");
+    h.send(r#"{"v":1,"id":1,"method":"shutdown"}"#);
+    assert_eq!(h.recv(), r#"{"v":1,"id":1,"result":{}}"#);
+    let (code, rest, stderr) = h.finish();
+    assert_eq!(code, Some(0), "args: {args:?} stderr: {stderr}");
+    assert_eq!(rest, 0, "stdout must contain frames only");
+}
+
+/// RENDER-3・SEC-2（#1435）: egress 引数つきでも hello を出し、shutdown で 0 終了する。
+#[test]
+fn egress_arguments_are_accepted() {
+    let port = closed_port().to_string();
+    assert_starts_and_shuts_down(&["--stdio", "--egress-proxy-port", &port]);
+}
+
+#[cfg(unix)]
+#[test]
+fn egress_relay_uds_argument_is_accepted() {
+    // 中継は bind するだけで UDS へは接続しない（接続は Servo の通信時）ため、不在のパスでよい。
+    assert_starts_and_shuts_down(&["--stdio", "--egress-relay-uds", "/nonexistent/proxy.sock"]);
+}
+
+/// RENDER-3・SEC-2（#1435）: 不正な egress 引数は失敗終了（コード 1）し、フレームを出さない。
+#[test]
+fn invalid_egress_arguments_are_rejected_without_frames() {
+    for args in [
+        &["--stdio", "--egress-proxy-port"][..],
+        &["--stdio", "--egress-proxy-port", "0"],
+        &["--stdio", "--egress-proxy-port", "65536"],
+        &[
+            "--stdio",
+            "--egress-proxy-port",
+            "80",
+            "--egress-relay-uds",
+            "/a",
+        ],
+        &["--stdio", "--egress-relay-uds", "rel.sock"],
+        &["--stdio", "--egress-relay-uds", "/a/../b.sock"],
+        &["--stdio", "--bogus", "1"],
+    ] {
+        let h = spawn(args);
+        let (code, rest, stderr) = h.finish();
+        assert_eq!(code, Some(1), "args: {args:?} stderr: {stderr}");
+        assert_eq!(rest, 0, "args: {args:?}: no frames expected");
+        assert!(stderr.starts_with("error: "), "stderr: {stderr}");
+    }
+}
+/// 受けた接続の先頭行（リクエストライン）を記録する偽 proxy。すべてのリクエストに 502 で答える
+/// （CONNECT でも絶対形式 GET でも読み込みは失敗する。成功扱いにしない）。
+/// 戻り値は (ポート, スレッド, 停止通知, 記録した先頭行)。
+#[allow(clippy::type_complexity)]
+fn serve_recording_proxy() -> (
+    u16,
+    std::thread::JoinHandle<()>,
+    mpsc::Sender<()>,
+    std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    listener.set_nonblocking(true).expect("nonblocking");
+    let (stop_tx, stop_rx) = mpsc::channel::<()>();
+    let lines = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen = std::sync::Arc::clone(&lines);
+    let handle = std::thread::spawn(move || {
+        while stop_rx.try_recv().is_err() {
+            match listener.accept() {
+                Ok((mut conn, _)) => {
+                    let _ = conn.set_nonblocking(false);
+                    let _ = conn.set_read_timeout(Some(Duration::from_secs(5)));
+                    let mut buf = [0u8; 4096];
+                    let n = conn.read(&mut buf).unwrap_or(0);
+                    let head = String::from_utf8_lossy(buf.get(..n).unwrap_or(&[]));
+                    let first = head.lines().next().unwrap_or("").to_string();
+                    if let Ok(mut v) = seen.lock() {
+                        v.push(first);
+                    }
+                    let resp = "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                    let _ = conn.write_all(resp.as_bytes());
+                }
+                Err(_) => std::thread::sleep(Duration::from_millis(10)),
+            }
+        }
+    });
+    (port, handle, stop_tx, lines)
+}
+
+/// RENDER-3・SEC-2（#1435）: `--egress-proxy-port` で指定した proxy を Servo の通信が実際に通る。
+/// 解決できないホスト宛て（`.invalid`）の読み込みが、直接のホスト解決ではなく proxy への
+/// CONNECT として届くことで、引数から proxy pref までの受け渡しと CONNECT プロキシとの互換性を
+/// 確かめる（proxy は 502 で拒否するため読み込み自体は失敗する）。外部ネットワークへは出ない。
+#[test]
+fn load_goes_through_the_egress_proxy() {
+    let (proxy_port, srv, stop, lines) = serve_recording_proxy();
+    let port = proxy_port.to_string();
+    let mut h = spawn(&["--stdio", "--egress-proxy-port", &port]);
+    let _hello = h.recv();
+
+    for (id, url) in [
+        (1, "https://egress-target.invalid/"),
+        (2, "http://egress-plain.invalid/page"),
+    ] {
+        h.send(&load_req(id, url, 20_000));
+        let r: serde_json::Value = serde_json::from_str(&h.recv()).unwrap();
+        assert_eq!(r["id"], id, "{r}");
+        assert_eq!(r["error"]["kind"], "load_failed", "{r}");
+    }
+
+    h.send(r#"{"v":1,"id":3,"method":"shutdown"}"#);
+    assert_eq!(h.recv(), r#"{"v":1,"id":3,"result":{}}"#);
+    let (code, rest, stderr) = h.finish();
+    assert_eq!(code, Some(0), "stderr: {stderr}");
+    assert_eq!(rest, 0, "stdout must contain frames only");
+
+    let _ = stop.send(());
+    let _ = srv.join();
+    let seen = lines.lock().unwrap().clone();
+    // https は CONNECT host:443。平文 http は Servo が HTTPS へ昇格するか否かで形が変わるため、
+    // 絶対形式 GET・CONNECT :80・CONNECT :443 のいずれかが当該ホスト宛てで届けば proxy 経由とみなす。
+    let accepts = |host: &str, l: &str| {
+        l.starts_with(&format!("CONNECT {host}:443 "))
+            || l.starts_with(&format!("CONNECT {host}:80 "))
+            || l.starts_with(&format!("GET http://{host}/"))
+    };
+    for host in ["egress-target.invalid", "egress-plain.invalid"] {
+        assert!(seen.iter().any(|l| accepts(host, l)), "proxy saw: {seen:?}");
+    }
+    assert!(
+        seen.iter()
+            .any(|l| l.starts_with("CONNECT egress-target.invalid:443 ")),
+        "https must be CONNECT :443, proxy saw: {seen:?}"
+    );
+}

@@ -94,3 +94,20 @@ fn unknown_and_missing_args_are_rejected() {
         );
     }
 }
+
+/// RENDER-3・SEC-2（#1435）: `--selftest` と `--version` は egress 引数を受け付けない。
+#[test]
+fn selftest_and_version_reject_egress_arguments() {
+    for args in [
+        &["--selftest", "--egress-proxy-port", "80"][..],
+        &["--version", "--egress-proxy-port", "80"],
+    ] {
+        let (code, out, err) = run(args);
+        assert_eq!(code, Some(1), "args: {args:?}");
+        assert_eq!(out, "", "args: {args:?}");
+        assert!(
+            err.contains("supports only --version, --selftest and --stdio"),
+            "stderr: {err}"
+        );
+    }
+}

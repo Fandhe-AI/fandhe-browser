@@ -12,11 +12,13 @@
 //!   [`EngineError::AlreadyCreated`] にする。破棄後も再生成はできず、作り直すときはホストの
 //!   プロセスごと作り直す（設計 §2.7）。
 //! - 起動構成は [`fixed_opts`]・[`fixed_preferences`] のコード内固定値だけで作る。
-//!   argv・環境変数・ファイルから Servo の設定へ流す経路を持たない（SEC-2）。
+//!   argv からは `args` が検証した loopback ポートだけが [`LoopbackProxy`] として proxy pref に入る。
+//!   環境変数・ファイルから Servo の設定へ流す経路は持たない（SEC-2・RENDER-3・#1435）。
 //!   ビューポートも定数 [`VIEWPORT`] で、API にしない。
 //! - 標準出力へは書かない（将来 stdout はフレーム専用になる。設計 §2.1）。
 
 use std::fmt;
+use std::num::NonZeroU16;
 use std::rc::{Rc, Weak};
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -73,16 +75,37 @@ fn fixed_opts() -> Opts {
     }
 }
 
+/// egress プロキシの場所。IP は `127.0.0.1` 固定で、ポートだけを持つ（任意の宛先を運べない型）。
+///
+/// `args` が検証した `--egress-proxy-port`、または netns 内の中継（`relay`）の待ち受けポートから
+/// `main` が作る。Servo の http・https プロキシ pref にだけ使う（RENDER-3・SEC-2・#1435）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct LoopbackProxy(NonZeroU16);
+
+impl LoopbackProxy {
+    pub(crate) fn new(port: NonZeroU16) -> Self {
+        Self(port)
+    }
+
+    /// Servo の proxy pref に渡す URI（`http://127.0.0.1:<port>`）。
+    pub(crate) fn uri(self) -> String {
+        format!("http://127.0.0.1:{}", self.0)
+    }
+}
+
 /// 固定の Servo `Preferences`。
 ///
 /// `Preferences::default()` は `http_proxy` 等の環境変数から proxy を設定するため、
-/// 3 フィールドを空に戻して環境由来の値を持ち込ませない（proxy は識別面・SSRF 経路）。
+/// 3 フィールドを常に明示代入して環境由来の値を持ち込ませない（proxy は識別面・SSRF 経路）。
+/// `proxy` が `Some` のときだけ http・https をその URI にする（`no_proxy` は常に空で、loopback 宛ても
+/// 含めて全通信が proxy 経由になる）。
 /// あわせて IntersectionObserver を有効にする（理由は本体のコメント。#1294・#1297）。
 /// ほかの pref は既定のまま。UA 等の識別面には触れない（SEC-2）。
-fn fixed_preferences() -> Preferences {
+fn fixed_preferences(proxy: Option<LoopbackProxy>) -> Preferences {
+    let proxy_uri = proxy.map(LoopbackProxy::uri).unwrap_or_default();
     Preferences {
-        network_http_proxy_uri: String::new(),
-        network_https_proxy_uri: String::new(),
+        network_http_proxy_uri: proxy_uri.clone(),
+        network_https_proxy_uri: proxy_uri,
         network_http_no_proxy: String::new(),
         // servo 0.6.0 は IntersectionObserver を既定で無効にしており、これを前提にする
         // Next.js 系のページが `ReferenceError` で JS を止め、白紙を撮影成功として返してしまう。
@@ -108,11 +131,11 @@ pub(crate) struct Engine {
 }
 
 impl Engine {
-    /// 固定構成で Servo と描画コンテキストを生成する。引数は取らない（SEC-2）。
+    /// 固定構成で Servo と描画コンテキストを生成する。受け取るのは検証済みの `LoopbackProxy` だけ（SEC-2）。
     ///
     /// 2 回目以降の呼び出しは [`EngineError::AlreadyCreated`]。コンテキスト作成に
     /// 失敗した場合もガードは戻さない（Servo 側の状態を確定できないため fail-closed）。
-    pub(crate) fn new() -> Result<Self, EngineError> {
+    pub(crate) fn new(proxy: Option<LoopbackProxy>) -> Result<Self, EngineError> {
         if ENGINE_CREATED
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
             .is_err()
@@ -126,7 +149,7 @@ impl Engine {
             .map_err(|e| EngineError::RenderingContext(format!("make_current: {e:?}")))?;
         let servo = ServoBuilder::default()
             .opts(fixed_opts())
-            .preferences(fixed_preferences())
+            .preferences(fixed_preferences(proxy))
             .build();
         Ok(Self {
             servo,
@@ -162,11 +185,23 @@ mod tests {
         assert!(!opts.multiprocess);
         assert!(!opts.ignore_certificate_errors);
         assert_eq!(opts.host_file, None);
-        let prefs = fixed_preferences();
+        let prefs = fixed_preferences(None);
         assert_eq!(prefs.network_http_proxy_uri, "");
         assert_eq!(prefs.network_https_proxy_uri, "");
         assert_eq!(prefs.network_http_no_proxy, "");
         // #1294・#1297: IntersectionObserver を公開する（0.7.0 で上流のハング修正を取り込み済み）。
+        assert!(prefs.dom_intersection_observer_enabled);
+    }
+
+    /// RENDER-3・SEC-2（#1435）: 指定時は http・https がその URI になり、`no_proxy` は空のまま。
+    #[test]
+    fn loopback_proxy_sets_http_and_https() {
+        let proxy = LoopbackProxy::new(NonZeroU16::new(8080).unwrap());
+        assert_eq!(proxy.uri(), "http://127.0.0.1:8080");
+        let prefs = fixed_preferences(Some(proxy));
+        assert_eq!(prefs.network_http_proxy_uri, "http://127.0.0.1:8080");
+        assert_eq!(prefs.network_https_proxy_uri, "http://127.0.0.1:8080");
+        assert_eq!(prefs.network_http_no_proxy, "");
         assert!(prefs.dom_intersection_observer_enabled);
     }
 

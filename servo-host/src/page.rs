@@ -28,7 +28,7 @@ use servo::{
     WebView, WebViewBuilder, WebViewDelegate,
 };
 
-use crate::engine::Engine;
+use crate::engine::{Engine, LoopbackProxy};
 use crate::layout;
 use crate::screenshot::{self, SCREENSHOT_TIMEOUT};
 use crate::server::{
@@ -250,14 +250,17 @@ pub(crate) struct ServoHandler {
     engine: Option<Engine>,
     /// 生成に失敗済み。Servo は 1 プロセス 1 回のため再試行しない（親がプロセスを作り直す）。
     engine_failed: bool,
+    /// egress プロキシの場所。`Engine` 生成時に Servo の proxy pref へ渡す（#1435）。
+    proxy: Option<LoopbackProxy>,
 }
 
 impl ServoHandler {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(proxy: Option<LoopbackProxy>) -> Self {
         Self {
             page: None,
             engine: None,
             engine_failed: false,
+            proxy,
         }
     }
 
@@ -268,7 +271,7 @@ impl ServoHandler {
         if self.engine_failed {
             return Err(PageError::Engine);
         }
-        match Engine::new() {
+        match Engine::new(self.proxy) {
             Ok(e) => {
                 self.engine = Some(e);
                 Ok(())
@@ -458,7 +461,7 @@ mod tests {
     /// RENDER-3: 未ロードは not_loaded、full_page は unsupported（Engine を作らない）。
     #[test]
     fn screenshot_without_page_is_rejected() {
-        let mut h = ServoHandler::new();
+        let mut h = ServoHandler::new(None);
         let err = h
             .screenshot(&ScreenshotParams { full_page: false })
             .err()
@@ -482,7 +485,7 @@ mod tests {
     #[test]
     fn capabilities_list_all_implemented_methods() {
         assert_eq!(
-            ServoHandler::new().capabilities(),
+            ServoHandler::new(None).capabilities(),
             &[
                 Method::Load,
                 Method::Screenshot,
@@ -495,7 +498,7 @@ mod tests {
     /// RENDER-3: 未ロードは not_loaded、不正なセレクタは未ロードでも invalid_params。
     #[test]
     fn visibility_without_page_is_rejected() {
-        let mut h = ServoHandler::new();
+        let mut h = ServoHandler::new(None);
         let params = |s: &str| SelectorParams {
             selector: s.to_string(),
         };
@@ -509,7 +512,7 @@ mod tests {
     /// RENDER-3（TASK-38.5・#234）: 未ロードは not_loaded、不正なセレクタは未ロードでも invalid_params。
     #[test]
     fn bounding_box_without_page_is_rejected() {
-        let mut h = ServoHandler::new();
+        let mut h = ServoHandler::new(None);
         let params = |s: &str| SelectorParams {
             selector: s.to_string(),
         };

@@ -37,7 +37,7 @@ servo-host/
 ├── Cargo.toml     # 自前の [workspace] を持つ単一 package（fandhe-browser-servo-host）
 ├── Cargo.lock     # 本体のものとは独立
 ├── deny.toml      # ホスト専用のライセンス・advisories 検査
-├── src/           # main.rs・server.rs（stdio ループ）・engine.rs・page.rs・screenshot.rs・layout.rs
+├── src/           # main.rs・args.rs（起動引数の検査）・relay.rs（netns 内の中継。unix）・server.rs（stdio ループ）・engine.rs・page.rs・screenshot.rs・layout.rs
 └── tests/         # 契約テスト・自己テスト
 ```
 
@@ -99,6 +99,7 @@ servo-host/
 - `user_agent`・ヘッダ・Cookie・locale・タイムゾーン・TLS・proxy・画面サイズのパラメータを持たない。
 - ビューポートは v1 では固定値（例 1280×800）とし API 化しない。画面サイズは識別面に当たりうるため、必要になったら [anti-bot-review](./anti-bot-review.md) の判断を経る。
 - 起動引数は固定の許可リストのみで、クライアントからの任意引数は渡さない。未実装メソッドは成功を装わず `unsupported` を返す。
+- 上記の「proxy のパラメータを持たない」はプロトコルの `*Params` の話である。起動引数の loopback ポート（§2.6）は OS 隔離の部品として別扱いで、クライアントからは指定できない（#1435）。
 
 ### 2.4 上限とタイムアウト（暫定値。実測後に確定）
 
@@ -134,7 +135,8 @@ servo-host/
 - 作業ディレクトリと Servo のユーザーデータは専用の一時ディレクトリ（0700、終了時に削除）で、永続しない。プロファイルごとに別のホストプロセスを使い、共有しない（PROF 境界）。
 - stderr は末尾 8 KiB を上限付きでバッファし、失敗時のログに使う。URL のクエリや機密をログに出さない。
 - **実装（TASK-38・#994・`fandhe_browser_render::host_process`）で決めた値**:
-  - 起動引数は固定の `--stdio` のみ（`HOST_ARGS`）。ホスト側のサーバーモード（#993）はこの引数で stdio モードに入る。クライアントから任意引数は渡さない。
+  - 本体 `HostProcess` が渡す起動引数は現在 `--stdio` のみ（`HOST_ARGS`）。ホスト側のサーバーモード（#993）はこの引数で stdio モードに入る。クライアントから任意引数は渡さない。
+  - ホストは加えて固定形式の `--egress-proxy-port <1-65535>`（macOS 向け）・`--egress-relay-uds <絶対パス>`（Linux 向け）を `--stdio` の後ろに 1 組だけ受け付ける（`RENDER-3`・`SEC-2`・TASK-38・#1435。本体からの付与は #1436）。両方同時・重複・未知・値欠落・形式不正（範囲外ポート、相対パス、`.`・`..`・空の要素、100 バイト超、NUL）は失敗終了（fail-closed）で、URL や任意文字列は受け取らない。Servo の http・https proxy pref は `http://127.0.0.1:<port>` 固定（`no_proxy` は空）。`--egress-relay-uds` 指定時は netns 内で `127.0.0.1:0` を待ち受ける中継（`relay.rs`）を hello の前に起動し、各接続を UDS 1 本へ双方向転送する（同時 128・無通信 300 秒は暫定値で本体プロキシ #1440 と揃える）。`*_PROXY` を環境変数で渡さない方針は変えない。
   - 環境変数は `env_clear` 後に、workdir 配下を指す強制設定（Unix: `HOME`・`TMPDIR`、Linux はさらに `XDG_CONFIG_HOME`・`XDG_CACHE_HOME`・`XDG_DATA_HOME`。Windows: `TMP`・`TEMP`）と、親に値があるときだけ引き継ぐ変数（Linux: `FONTCONFIG_FILE`・`FONTCONFIG_PATH`、Windows: `SystemRoot`、macOS: なし）だけを渡す。`PATH`・`LANG`・`LC_*`・`TZ`・`*_PROXY`（識別面。SEC-2）、`LD_*`・`DYLD_*`（注入経路）は渡さない。実機確認の状態は**すべて未確認**（Windows の `SystemRoot` は js 子プロセスでは実績あり・Servo ホストでは未確認）。HOME を一時ディレクトリにした場合の fontconfig キャッシュ再生成コストも未確認。
   - タイムアウトは handshake 10 s・load 既定 30 s（上限 60 s）・screenshot 20 s・visibility / bounding_box 5 s・shutdown 猶予 3 s。load はホスト自身の `timeout` 応答が先に届くよう、待ち時間に暫定 2 s を上乗せする。タイムアウト時は kill してホストを破棄する。
 
@@ -390,8 +392,8 @@ AGENTS.md の変更はレビュー基準の変更として AI レビューで P0
 | ---- | ---- |
 | インジェクション | URL・セレクタの検証、セレクタを JS に連結しない、引数配列で起動、シェル不使用 |
 | 不安全な設計 | フレーム・URL・セレクタの上限、ページ読み込みのタイムアウト、無制限確保の防止、資源制限、サーキットブレーカー |
-| アクセス制御の不備 | ローカル TCP 不採用でポートを開かない、バイナリ解決は絶対パスのみ・PATH 探索なし、他者書き込み可のバイナリを拒否 |
-| SSRF | scheme 制限、プライベート IP ポリシーを core と揃える。Servo 内部のリダイレクト・サブリソースは残存リスクで GA 前の判断事項 |
+| アクセス制御の不備 | stdio IPC はポートを開かない（ただし `--egress-relay-uds` 指定時は中継が `127.0.0.1` のエフェメラルポートを開く。Linux の netns 内を前提とし、宛先は UDS 1 本固定。netns 外で誤用された場合は同一ホストの他プロセスが届き得るが、到達先は本体の許可リスト付きプロキシだけ）、バイナリ解決は絶対パスのみ・PATH 探索なし、他者書き込み可のバイナリを拒否 |
+| SSRF | scheme 制限、プライベート IP ポリシーを core と揃える。Servo 内部のリダイレクト・サブリソースは残存リスクで GA 前の判断事項。egress の宛先判定は本体の CONNECT プロキシ（#1434）が行い、ホストの中継は宛先を選べない（#1435） |
 | 識別面（`SEC-2`） | UA 等を変えるメソッドを載せない、未実装を成功扱いにしない |
 | 機密情報の露出 | ホストのエラー詳細を `Display` / `Debug` に出さない、stderr は上限付き、ログから URL クエリを除く |
 | 脆弱な依存 | `=x.y.z` 固定、ホスト側 `cargo deny advisories`、更新運用は別 Issue |

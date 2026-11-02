@@ -48,7 +48,7 @@ fandhe-browser/
 │   ├── .cargo/config.toml         #   Windows（msvc）の `-crt-static`。ルートの `+crt-static` を cwd が servo-host/ のときだけ打ち消す（mozjs_sys は動的 CRT 前提）。CI は `--manifest-path` で呼ぶため `servo-host-windows` の `CARGO_ENCODED_RUSTFLAGS` が担う
 │   ├── deny.toml                  #   MPL-2.0 等の例外許可はここだけ
 │   ├── about.toml                 #   cargo-about 設定（ホスト用。MPL-2.0 許可）
-│   ├── src/                       #   main・server・engine・page・screenshot・layout
+│   ├── src/                       #   main・args・relay・server・engine・page・screenshot・layout
 │   └── tests/                     #   結合テスト
 ├── tests/ / benches/              #（予定）結合テスト・ベンチ
 ├── scripts/                       # Makefile の実体（lib.sh・versions.sh・cargo-gate.sh・harness.sh・lint-docs.sh・setup.sh・deny.sh・about.sh・help.sh 等）と依存グラフ検査等のスクリプト。check-render-isolation.sh（TASK-34.1・RENDER-1）・check-servo-host-isolation.sh（TASK-38・RENDER-1・servo-host が本体 members に無いこととルート Cargo.lock に Servo 系が無いことの検査）・check-js-engine-isolation.sh（TASK-32.4・JS-1）・check-static-link.sh（TASK-93.3・PLUG-1・musl 配布バイナリの動的リンクなし検査）・check-dynamic-link-macos.sh（TASK-93.4・PLUG-1・macOS 配布バイナリの動的リンクを許可リストと照合。当面は記録のみ）・check-dynamic-link-windows.sh（TASK-93.5・PLUG-1・Windows 配布バイナリの動的リンクを許可リストと照合。当面は記録のみ）・ci-changes.sh（CI の docs-only 判定）・ci-prune-target.sh（CI cache 保存前の prune）
