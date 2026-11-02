@@ -21,13 +21,22 @@
 //! | [`HostProcessError`] | core の `RenderError` |
 //! | -------------------- | --------------------- |
 //! | `Disabled`・`InvalidHostBinary` | `RenderingDisabled` |
-//! | `SpawnFailed`・`WorkDirFailed`・`Crashed`・`ResourceLimitExceeded`・`CircuitOpen` | `HostUnavailable` |
+//! | `SpawnFailed`・`WorkDirFailed`・`Crashed`・`ResourceLimitExceeded`・`CircuitOpen`・`EgressIsolationUnavailable` | `HostUnavailable` |
 //! | `Timeout` | `Timeout` |
 //! | `ProtocolMismatch`・`ProtocolViolation` | `ProtocolMismatch` |
 //! | `Host`（`not_loaded`） | `PageNotLoaded` |
 //! | `Host`（`not_found`） | `ElementNotFound` |
 //! | `Host`（`timeout`） | `Timeout` |
 //! | `Host`（その他）・`InvalidRequest` | `Internal` |
+//!
+//! # egress 隔離（RENDER-3・SEC-2・XOS-1。#1436）
+//!
+//! 起動時に OS のサンドボックスで包み、ホストの通信を本体側の許可リスト付き CONNECT プロキシ
+//! （[`crate::egress_proxy`]）に限る。実装と制約は [`isolation`] モジュールの doc を参照
+//! （Linux: bwrap・macOS: sandbox-exec・Windows: 隔離なし）。設定 `[rendering] egress_isolation`
+//! の値は [`HostProcessConfig::egress_isolation`] で受ける。`best-effort`（既定）は隔離できなければ
+//! 警告して隔離なしで起動し、`required` は [`HostProcessError::EgressIsolationUnavailable`] で
+//! 起動しない。隔離中は WebSocket が使えない。
 //!
 //! # 未実装・暫定
 //!
@@ -38,13 +47,16 @@
 
 mod breaker;
 mod env;
+mod isolation;
 mod resolve;
 mod rss;
 mod stderr_tail;
 mod workdir;
 
+use std::ffi::OsString;
 use std::fmt;
 use std::io::Read;
+use std::num::NonZeroU16;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -55,6 +67,10 @@ use std::time::{Duration, Instant};
 
 pub use breaker::{BREAKER_COOLDOWN, BREAKER_THRESHOLD, BREAKER_WINDOW};
 pub use env::{FORCED_ENV_NAMES, PASSTHROUGH_ENV_NAMES};
+pub use isolation::{
+    EgressIsolationStatus, EgressIsolationUnavailable, IsolationBackend, IsolationProbe,
+    RELAY_UDS_PATH_MAX_BYTES, isolation_warning_message, probe_system,
+};
 pub use resolve::{
     HOST_BINARY_ENV, HOST_BINARY_STEM, HostBinary, resolve_host_binary,
     resolve_host_binary_from_process,
@@ -65,13 +81,16 @@ use crate::codec::{
     MAX_HELLO_FRAME_BYTES, MAX_REQUEST_FRAME_BYTES, decode_hello, decode_response, effective_limit,
     encode_request, read_frame, response_frame_limit, write_frame,
 };
+use crate::egress_proxy::{BoundEndpoint, EgressEndpoint, EgressProxy, EgressProxyConfig};
 use crate::protocol::{
     Hello, HelloLimits, HostError, HostErrorKind, LoadParams, LoadResult, MAX_LOAD_TIMEOUT_MS,
     MAX_SELECTOR_BYTES, MAX_URL_BYTES, Method, MethodResult, PROTOCOL_VERSION, ProtocolError,
     Request, RequestId,
 };
 use breaker::CircuitBreaker;
-use rss::RssMonitor;
+use fandhe_browser_core::EgressIsolationMode;
+use isolation::{Plan, Sandbox};
+use rss::{PidSource, RssMonitor};
 use stderr_tail::StderrTail;
 use workdir::WorkDir;
 
@@ -142,6 +161,10 @@ pub enum HostProcessError {
     Host(HostError),
     /// `call_on_page` に `Load`・`Shutdown` が渡された、または要求を符号化できなかった。
     InvalidRequest,
+    /// `egress_isolation = required` だが隔離できないため起動しなかった（RENDER-3・#1436）。
+    /// 理由は `Debug` で取れる。環境の問題でありホストの失敗ではないため、ブレーカーには数えない
+    /// （数えると `CircuitOpen` に化けて理由が見えなくなる）。
+    EgressIsolationUnavailable(EgressIsolationUnavailable),
 }
 
 impl fmt::Display for HostProcessError {
@@ -159,6 +182,9 @@ impl fmt::Display for HostProcessError {
             Self::ProtocolViolation(_) => "render host violated the protocol",
             Self::Host(_) => "render host reported an error",
             Self::InvalidRequest => "invalid render host request",
+            Self::EgressIsolationUnavailable(_) => {
+                "render host egress isolation is required but unavailable"
+            }
         })
     }
 }
@@ -179,6 +205,10 @@ impl fmt::Debug for HostProcessError {
             Self::CircuitOpen => f.write_str("CircuitOpen"),
             Self::ProtocolMismatch => f.write_str("ProtocolMismatch"),
             Self::InvalidRequest => f.write_str("InvalidRequest"),
+            Self::EgressIsolationUnavailable(r) => f
+                .debug_tuple("EgressIsolationUnavailable")
+                .field(r)
+                .finish(),
         }
     }
 }
@@ -295,6 +325,29 @@ pub struct HostProcessConfig {
     pub rss_limit_bytes: u64,
     /// RSS のプローブ間隔。
     pub rss_poll_interval: Duration,
+    /// egress 隔離の要求水準（既定 `best-effort`。`RENDER-3`・#1436）。
+    pub egress_isolation: EgressIsolationMode,
+    /// 内部アドレス宛てをプロキシが許すか（既定 false）。`HostRenderer` が自身の
+    /// `allow_private_network_access` と同じ値を書き込み、`load` の URL 検査と食い違わないようにする。
+    pub allow_private_network_access: bool,
+    /// 隔離可否の判定元（既定 [`IsolationProbe::System`]。差し替えはテスト用）。
+    pub isolation_probe: IsolationProbe,
+    isolation_warning: IsolationWarning,
+}
+
+/// `best-effort` で隔離なしに落ちたときの警告の通知先（既定は何もしない）。
+/// render はライブラリのため出力先を持たず、cli が `eprintln!` するコールバックを渡す。
+#[derive(Clone, Default)]
+struct IsolationWarning(Option<Arc<dyn Fn(EgressIsolationUnavailable) + Send + Sync>>);
+
+impl fmt::Debug for IsolationWarning {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(if self.0.is_some() {
+            "IsolationWarning(set)"
+        } else {
+            "IsolationWarning(none)"
+        })
+    }
 }
 
 impl HostProcessConfig {
@@ -306,6 +359,10 @@ impl HostProcessConfig {
             temp_root: std::env::temp_dir(),
             rss_limit_bytes: DEFAULT_RSS_LIMIT_BYTES,
             rss_poll_interval: rss::RSS_POLL_INTERVAL,
+            egress_isolation: EgressIsolationMode::default(),
+            allow_private_network_access: false,
+            isolation_probe: IsolationProbe::default(),
+            isolation_warning: IsolationWarning::default(),
         }
     }
     /// タイムアウトを差し替える。
@@ -326,6 +383,30 @@ impl HostProcessConfig {
     /// RSS のプローブ間隔を差し替える。
     pub fn with_rss_poll_interval(mut self, d: Duration) -> Self {
         self.rss_poll_interval = d;
+        self
+    }
+    /// egress 隔離の要求水準を差し替える。
+    pub fn with_egress_isolation(mut self, mode: EgressIsolationMode) -> Self {
+        self.egress_isolation = mode;
+        self
+    }
+    /// プロキシが内部アドレス宛てを許すかを差し替える（意味は core の `FetchOptions` と同じ）。
+    pub fn with_allow_private_network_access(mut self, allow: bool) -> Self {
+        self.allow_private_network_access = allow;
+        self
+    }
+    /// 隔離可否の判定元を差し替える（テスト用。本番は既定の `System`）。
+    pub fn with_isolation_probe(mut self, probe: IsolationProbe) -> Self {
+        self.isolation_probe = probe;
+        self
+    }
+    /// `best-effort` で隔離なしに落ちたときに 1 度だけ呼ぶ通知先を設定する
+    /// （[`isolation_warning_message`] で文言を作れる）。
+    pub fn with_isolation_warning(
+        mut self,
+        f: Arc<dyn Fn(EgressIsolationUnavailable) + Send + Sync>,
+    ) -> Self {
+        self.isolation_warning = IsolationWarning(Some(f));
         self
     }
 }
@@ -364,6 +445,15 @@ fn needs_reload(
     }
 }
 
+/// 起動コマンドと付随する資源（`build_command` の結果）。
+struct Launch {
+    program: PathBuf,
+    args: Vec<OsString>,
+    status: EgressIsolationStatus,
+    proxy: Option<EgressProxy>,
+    sandbox: Option<Sandbox>,
+}
+
 type FrameResult = Result<Vec<u8>, ProtocolError>;
 
 /// 起動中の子プロセスとその付属スレッド・資源。
@@ -378,6 +468,11 @@ struct Running {
     monitor: Option<RssMonitor>,
     exceeded: Arc<AtomicBool>,
     hello: Option<Hello>,
+    /// 子の親スレッドを生かし続けるための停止用 Sender（`teardown` で drop）。
+    parent_stop: Option<Sender<()>>,
+    isolation: EgressIsolationStatus,
+    /// egress プロキシ。`workdir` より先に落とす（ソケットファイルを消してから WorkDir を消す）。
+    _proxy: Option<EgressProxy>,
     workdir: WorkDir,
 }
 
@@ -390,6 +485,8 @@ pub struct HostProcess {
     loaded: Option<LoadedPage>,
     next_id: u64,
     stderr_tail: Arc<Mutex<StderrTail>>,
+    /// 隔離なしの警告を出したか（HostProcess ごとに 1 回）。
+    isolation_warned: bool,
 }
 
 impl fmt::Debug for HostProcess {
@@ -489,7 +586,21 @@ impl HostProcess {
             loaded: None,
             next_id: 1,
             stderr_tail: Arc::new(Mutex::new(StderrTail::new())),
+            isolation_warned: false,
         }
+    }
+
+    /// 起動中のホストの egress 隔離の状態（診断・テスト用）。
+    pub fn egress_isolation(&self) -> Option<EgressIsolationStatus> {
+        self.running.as_ref().map(|r| r.isolation)
+    }
+
+    /// RSS 監視が解決できた pid（診断・テスト用）。bwrap で包んだ場合は bwrap の子（Servo ホスト）。
+    pub fn monitored_pid(&self) -> Option<u32> {
+        self.running
+            .as_ref()
+            .and_then(|r| r.monitor.as_ref())
+            .and_then(RssMonitor::monitored_pid)
     }
 
     /// ハンドシェイクに成功するたびに +1 されるホスト起動世代。
@@ -741,11 +852,36 @@ impl HostProcess {
         let Some(mut r) = self.running.take() else {
             return;
         };
+        // bwrap だけを kill してもホストは残る（`isolation::kill_process` の doc）。ラッパーが生きて
+        // いる間に、ホストを先に名指しで落とす。
+        if matches!(
+            r.isolation,
+            EgressIsolationStatus::Isolated(IsolationBackend::Bwrap)
+        ) {
+            let alive = r
+                .child
+                .lock()
+                .map(|mut c| matches!(c.try_wait(), Ok(None)))
+                .unwrap_or(false);
+            if alive {
+                let read = |p: &str| std::fs::read_to_string(p).ok();
+                let host = r
+                    .monitor
+                    .as_ref()
+                    .and_then(RssMonitor::monitored_pid)
+                    .or_else(|| rss::resolve_wrapped_pid(r.pid, &read));
+                if let Some(host) = host {
+                    isolation::kill_process(host);
+                }
+            }
+        }
         drop(r.monitor.take());
         if let Ok(mut c) = r.child.lock() {
             let _ = c.kill();
             let _ = c.wait();
         }
+        // 子を wait した後で親スレッドを終わらせる（PDEATHSIG は親スレッドの終了で発火するため）。
+        drop(r.parent_stop.take());
         // stderr は子の終了で EOF になる。診断に取り込むため少しだけ待つ（上限付き）。
         if let Some(h) = r.stderr_thread.take() {
             let deadline = deadline_after(Duration::from_millis(500));
@@ -777,19 +913,129 @@ impl HostProcess {
         self.spawn()
     }
 
+    /// 隔離の方針を決める。Linux の bwrap では WorkDir 配下の UDS のパスも検査し、使えなければ
+    /// モードに従って降格（`best-effort`）または拒否（`required`）する。戻り値の `PathBuf` は
+    /// Linux の bwrap のときだけ `Some`（正規化済みのソケット用ディレクトリ）。
+    fn plan_isolation(
+        &self,
+        workdir: &WorkDir,
+    ) -> Result<(Plan, Option<PathBuf>), HostProcessError> {
+        let mode = self.config.egress_isolation;
+        let availability = match self.config.isolation_probe {
+            IsolationProbe::System => isolation::probe_sandbox(),
+            IsolationProbe::Unavailable(r) => Err(r),
+        };
+        let plan = isolation::decide(mode, availability)?;
+        if !matches!(plan, Plan::Isolated(Sandbox::Bwrap(_))) {
+            return Ok((plan, None));
+        }
+        match isolation::socket_dir_for(workdir.path()) {
+            Ok(dir) => Ok((plan, Some(dir))),
+            Err(reason) => Ok((isolation::decide(mode, Err(reason))?, None)),
+        }
+    }
+
+    /// プロキシを起動し、ホストを包むコマンドを組み立てる。`Unisolated` は従来どおりの直接起動。
+    fn build_command(
+        &mut self,
+        plan: Plan,
+        socket_dir: Option<PathBuf>,
+    ) -> Result<Launch, HostProcessError> {
+        let host = self.config.binary.path().to_path_buf();
+        let sandbox = match plan {
+            Plan::Unisolated(reason) => {
+                if !self.isolation_warned {
+                    self.isolation_warned = true;
+                    if let Some(f) = self.config.isolation_warning.0.as_ref() {
+                        f(reason);
+                    }
+                }
+                return Ok(Launch {
+                    program: host,
+                    args: HOST_ARGS.iter().map(OsString::from).collect(),
+                    status: EgressIsolationStatus::Unisolated(reason),
+                    proxy: None,
+                    sandbox: None,
+                });
+            }
+            Plan::Isolated(s) => s,
+        };
+        let endpoint = match (&sandbox, socket_dir) {
+            (Sandbox::Bwrap(_), Some(dir)) => EgressEndpoint::UnixSocketIn(dir),
+            (Sandbox::SandboxExec, _) => EgressEndpoint::LoopbackTcp,
+            // plan_isolation が Bwrap に必ず dir を付ける。到達しない防御。
+            (Sandbox::Bwrap(_), None) => return Err(self.fail_spawn()),
+        };
+        let proxy_config = EgressProxyConfig::default()
+            .with_allow_private_network_access(self.config.allow_private_network_access);
+        // 隔離が使える環境でプロキシだけ起動できないときは、隔離なしへ落とさず失敗にする。
+        let proxy = match EgressProxy::start(endpoint, proxy_config) {
+            Ok(p) => p,
+            Err(_) => return Err(self.fail_spawn()),
+        };
+        let (program, args) = match (&sandbox, proxy.endpoint()) {
+            (Sandbox::Bwrap(bwrap), BoundEndpoint::Unix(path)) => {
+                if isolation::relay_socket_path_ok(path).is_err() {
+                    return Err(self.fail_spawn());
+                }
+                isolation::linux_argv(bwrap, &host, path)
+            }
+            (Sandbox::SandboxExec, BoundEndpoint::Tcp(addr)) => {
+                let Some(port) = NonZeroU16::new(addr.port()) else {
+                    return Err(self.fail_spawn());
+                };
+                isolation::macos_argv(&host, port)
+            }
+            _ => return Err(self.fail_spawn()),
+        };
+        Ok(Launch {
+            program,
+            args,
+            status: EgressIsolationStatus::Isolated(sandbox.backend()),
+            proxy: Some(proxy),
+            sandbox: Some(sandbox),
+        })
+    }
+
     fn spawn(&mut self) -> Result<(), HostProcessError> {
         let workdir = WorkDir::create(&self.config.temp_root)?;
-        let mut cmd = Command::new(self.config.binary.path());
-        cmd.args(HOST_ARGS)
+        let (plan, socket_dir) = self.plan_isolation(&workdir)?;
+        let mut launch = self.build_command(plan, socket_dir)?;
+        let mut cmd = Command::new(&launch.program);
+        cmd.args(&launch.args)
             .env_clear()
             .current_dir(workdir.path())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         env::apply(&mut cmd, workdir.path(), &workdir.home(), &workdir.tmp());
-        let mut child = match cmd.spawn() {
-            Ok(c) => c,
-            Err(_) => return Err(self.fail_spawn()),
+        // bwrap の `--die-with-parent` は PR_SET_PDEATHSIG を使い、親**スレッド**の終了で発火する。
+        // 呼び出し元のスレッド（tokio の blocking スレッド等）が先に終わると、HostProcess が生きて
+        // いるのにホストが殺されるため、専用の親スレッドで起動し、`teardown` まで生かし続ける。
+        let (child_tx, child_rx) = mpsc::channel::<std::io::Result<Child>>();
+        let (parent_stop, stop_rx) = mpsc::channel::<()>();
+        let parent = std::thread::Builder::new()
+            .name("render-host-parent".into())
+            .spawn(move || {
+                let spawned = cmd.spawn();
+                let ok = spawned.is_ok();
+                if let Err(unsent) = child_tx.send(spawned) {
+                    if let Ok(mut c) = unsent.0 {
+                        let _ = c.kill();
+                        let _ = c.wait();
+                    }
+                    return;
+                }
+                if ok {
+                    let _ = stop_rx.recv();
+                }
+            });
+        if parent.is_err() {
+            return Err(self.fail_spawn());
+        }
+        let mut child = match child_rx.recv() {
+            Ok(Ok(c)) => c,
+            _ => return Err(self.fail_spawn()),
         };
         let pid = child.id();
         let (Some(mut stdin), Some(mut stdout), Some(mut stderr)) =
@@ -859,8 +1105,13 @@ impl HostProcess {
 
         let child = Arc::new(Mutex::new(child));
         let exceeded = Arc::new(AtomicBool::new(false));
+        // bwrap に包むと pid は bwrap になり、ホストはその子になる。
+        let pid_source = match launch.sandbox {
+            Some(Sandbox::Bwrap(_)) => PidSource::WrappedChildOf(pid),
+            _ => PidSource::Direct(pid),
+        };
         let monitor = match RssMonitor::start(
-            pid,
+            pid_source,
             self.config.rss_limit_bytes,
             self.config.rss_poll_interval,
             Arc::clone(&child),
@@ -887,6 +1138,9 @@ impl HostProcess {
             monitor,
             exceeded,
             hello: None,
+            parent_stop: Some(parent_stop),
+            isolation: launch.status,
+            _proxy: launch.proxy.take(),
             workdir,
         });
         self.handshake()

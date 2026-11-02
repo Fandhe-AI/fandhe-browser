@@ -11,7 +11,7 @@
 //!   （REPAIR-3）。プローブが無い OS では「読めない」ことを理由に kill しない。
 
 use std::process::Child;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -88,10 +88,88 @@ fn probe_macos(pid: u32) -> Option<u64> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RssStartError;
 
+/// 監視対象の pid の出所。
+///
+/// bwrap で包むと子プロセスの pid は bwrap になり、Servo ホストはその子になる（macOS の
+/// sandbox-exec は exec するので pid は変わらない。RENDER-4・#1436）。bwrap 自身の RSS は
+/// ホストの使用量を表さないため代用しない。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PidSource {
+    /// 起動した子そのもの。
+    Direct(u32),
+    /// 起動した子（ラッパー）のただ 1 つの子プロセス。辿れるまで「計測不能」として扱う。
+    WrappedChildOf(u32),
+}
+
+/// ラッパー（bwrap）の子として動くホストの pid を `/proc/<w>/task/<w>/children` から辿る。
+///
+/// 空白区切りの pid が**ちょうど 1 件**のときだけ `Some`。0 件・2 件以上・形式不正・読めない
+/// 場合は `None`（曖昧なまま別プロセスの RSS を測らない）。`read` は `/proc` の読み取りを
+/// 差し替えられるようにするための注入点（本番は `std::fs::read_to_string`）。
+/// `CONFIG_PROC_CHILDREN` の無いカーネルでは読めず、`None` が続いて連続失敗の kill に至る
+/// （fail-closed）。
+pub fn resolve_wrapped_pid(wrapper: u32, read: &dyn Fn(&str) -> Option<String>) -> Option<u32> {
+    let text = read(&format!("/proc/{wrapper}/task/{wrapper}/children"))?;
+    let mut pids = text.split_whitespace();
+    let first = pids.next()?.parse::<u32>().ok()?;
+    if pids.next().is_some() {
+        return None;
+    }
+    Some(first)
+}
+
+/// 1 回分の監視状態（pid の解決・連続失敗の計数）。スレッドと単体テストが共有する。
+struct Watch {
+    source: PidSource,
+    resolved: Option<u32>,
+    failures: u32,
+}
+
+impl Watch {
+    fn new(source: PidSource) -> Self {
+        let resolved = match source {
+            PidSource::Direct(p) => Some(p),
+            PidSource::WrappedChildOf(_) => None,
+        };
+        Self {
+            source,
+            resolved,
+            failures: 0,
+        }
+    }
+
+    /// 1 tick 分。上限超過、または連続失敗が上限に達したら true（kill すべき）。
+    /// pid が未解決のあいだは失敗に数える。
+    fn step(
+        &mut self,
+        limit_bytes: u64,
+        read: &dyn Fn(&str) -> Option<String>,
+        probe: &dyn Fn(u32) -> Option<u64>,
+    ) -> bool {
+        if self.resolved.is_none()
+            && let PidSource::WrappedChildOf(w) = self.source
+        {
+            self.resolved = resolve_wrapped_pid(w, read);
+        }
+        match self.resolved.and_then(probe) {
+            Some(rss) => {
+                self.failures = 0;
+                rss > limit_bytes
+            }
+            None => {
+                self.failures += 1;
+                self.failures >= MAX_CONSECUTIVE_PROBE_FAILURES
+            }
+        }
+    }
+}
+
 /// 監視スレッドのハンドル。Drop で停止を通知する（スレッドは detach され、次の待機で終わる）。
 #[derive(Debug)]
 pub struct RssMonitor {
     _stop: Sender<()>,
+    /// 解決済みの監視対象 pid（未解決は 0。診断・テスト用）。
+    resolved: Arc<AtomicU32>,
 }
 
 impl RssMonitor {
@@ -99,7 +177,7 @@ impl RssMonitor {
     /// スレッドを起動できなければ `Err`（呼び出し側が子を kill・wait して失敗を返す）。
     /// 上限超過または連続読み取り失敗で `exceeded` を立てて `child` を kill する。
     pub fn start(
-        pid: u32,
+        source: PidSource,
         limit_bytes: u64,
         interval: Duration,
         child: Arc<Mutex<Child>>,
@@ -109,28 +187,35 @@ impl RssMonitor {
             return Ok(None);
         }
         let (tx, rx) = mpsc::channel::<()>();
+        let resolved = Arc::new(AtomicU32::new(match source {
+            PidSource::Direct(p) => p,
+            PidSource::WrappedChildOf(_) => 0,
+        }));
+        let resolved_out = Arc::clone(&resolved);
         std::thread::Builder::new()
             .name("render-host-rss".into())
             .spawn(move || {
-                let mut failures = 0u32;
+                let mut watch = Watch::new(source);
+                let read = |path: &str| std::fs::read_to_string(path).ok();
                 loop {
                     match rx.recv_timeout(interval) {
                         Err(RecvTimeoutError::Timeout) => {}
                         _ => return,
                     }
-                    let over = match probe_rss(pid) {
-                        Some(rss) => {
-                            failures = 0;
-                            rss > limit_bytes
-                        }
-                        None => {
-                            failures += 1;
-                            failures >= MAX_CONSECUTIVE_PROBE_FAILURES
-                        }
-                    };
+                    let over = watch.step(limit_bytes, &read, &probe_rss);
+                    resolved_out.store(watch.resolved.unwrap_or(0), Ordering::SeqCst);
                     if over {
                         exceeded.store(true, Ordering::SeqCst);
                         if let Ok(mut c) = child.lock() {
+                            // bwrap だけを kill してもホストは残る（`kill_process` の doc）。ラッパーが
+                            // 生きている間に、解決済みの（または今辿れる）ホストを先に落とす。
+                            if let PidSource::WrappedChildOf(w) = source
+                                && matches!(c.try_wait(), Ok(None))
+                                && let Some(host) =
+                                    watch.resolved.or_else(|| resolve_wrapped_pid(w, &read))
+                            {
+                                super::isolation::kill_process(host);
+                            }
                             let _ = c.kill();
                         }
                         return;
@@ -138,7 +223,18 @@ impl RssMonitor {
                 }
             })
             .map_err(|_| RssStartError)?;
-        Ok(Some(Self { _stop: tx }))
+        Ok(Some(Self {
+            _stop: tx,
+            resolved,
+        }))
+    }
+
+    /// 監視対象として解決できた pid。未解決は `None`。
+    pub fn monitored_pid(&self) -> Option<u32> {
+        match self.resolved.load(Ordering::SeqCst) {
+            0 => None,
+            p => Some(p),
+        }
     }
 }
 
@@ -151,6 +247,72 @@ mod tests {
     fn render4_probe_reads_own_rss() {
         let rss = probe_rss(std::process::id()).expect("rss");
         assert!(rss > 0);
+    }
+
+    fn children_of<'a>(map: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
+        move |path: &str| {
+            map.iter()
+                .find(|(k, _)| *k == path)
+                .map(|(_, v)| (*v).to_string())
+        }
+    }
+
+    /// RENDER-4（#1436）: ラッパーの子 pid は 1 件のときだけ解決し、読む先は task/<pid>/children。
+    #[test]
+    fn render4_resolve_wrapped_pid_requires_exactly_one_child() {
+        let one = [("/proc/77/task/77/children", "1234 ")];
+        assert_eq!(resolve_wrapped_pid(77, &children_of(&one)), Some(1234));
+        for (text, why) in [
+            ("", "empty"),
+            ("1 2", "two children"),
+            ("abc", "garbage"),
+            ("-5", "negative"),
+        ] {
+            let m = [("/proc/77/task/77/children", text)];
+            assert_eq!(resolve_wrapped_pid(77, &children_of(&m)), None, "{why}");
+        }
+        // 別 pid のファイルしか無い（読み取り失敗）。
+        assert_eq!(resolve_wrapped_pid(78, &children_of(&one)), None);
+    }
+
+    /// RENDER-4（#1436）: 未解決のあいだは失敗に数え、10 回で kill 判定になる。解決後は子の RSS で判定する。
+    #[test]
+    fn render4_watch_counts_unresolved_as_failure_and_never_uses_wrapper_rss() {
+        let none = |_: &str| None;
+        // ラッパー自身 (77) の RSS は大きいが、使ってはならない。
+        let probe = |pid: u32| if pid == 77 { Some(u64::MAX) } else { None };
+        let mut w = Watch::new(PidSource::WrappedChildOf(77));
+        for i in 1..MAX_CONSECUTIVE_PROBE_FAILURES {
+            assert!(!w.step(100, &none, &probe), "tick {i}");
+        }
+        assert!(w.step(100, &none, &probe), "10th failure must kill");
+        assert_eq!(w.resolved, None);
+
+        // 解決後は子の RSS で判定し、固定する。
+        let m = [("/proc/77/task/77/children", "500")];
+        let read = children_of(&m);
+        let probe = |pid: u32| if pid == 500 { Some(50) } else { Some(u64::MAX) };
+        let mut w = Watch::new(PidSource::WrappedChildOf(77));
+        assert!(!w.step(100, &read, &probe));
+        assert_eq!(w.resolved, Some(500));
+        assert!(!w.step(100, &none, &probe), "resolved pid is kept");
+        let over = |pid: u32| (pid == 500).then_some(101);
+        assert!(w.step(100, &none, &over));
+    }
+
+    /// RENDER-4: 直接の子は即座に解決済みで、読めなければ従来どおり 10 回で kill 判定。
+    #[test]
+    fn render4_watch_direct_pid_is_resolved_immediately() {
+        let none = |_: &str| None;
+        let mut w = Watch::new(PidSource::Direct(9));
+        assert_eq!(w.resolved, Some(9));
+        assert!(!w.step(100, &none, &|_| Some(100)));
+        assert!(w.step(100, &none, &|_| Some(101)));
+        let mut w = Watch::new(PidSource::Direct(9));
+        for _ in 1..MAX_CONSECUTIVE_PROBE_FAILURES {
+            assert!(!w.step(100, &none, &|_| None));
+        }
+        assert!(w.step(100, &none, &|_| None));
     }
 
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]

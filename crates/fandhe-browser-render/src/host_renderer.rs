@@ -110,9 +110,13 @@ pub struct HostRenderer {
 impl HostRenderer {
     /// 設定から作る。ホストは最初の `load` で起動する。
     pub fn new(config: HostRendererConfig) -> Self {
+        // egress プロキシの内部アドレス判定と `load` の URL 検査を同じ設定値にそろえる（SSRF。
+        // 食い違うと片方だけが許す経路ができる）。
+        let mut process = config.process;
+        process.allow_private_network_access = config.allow_private_network_access;
         Self {
             inner: Mutex::new(Inner {
-                process: HostProcess::new(config.process),
+                process: HostProcess::new(process),
                 nav_generation: 0,
                 current: None,
             }),
@@ -208,7 +212,8 @@ fn map_host_error(err: HostProcessError) -> RenderError {
         | HostProcessError::WorkDirFailed
         | HostProcessError::Crashed
         | HostProcessError::ResourceLimitExceeded
-        | HostProcessError::CircuitOpen => RenderError::HostUnavailable,
+        | HostProcessError::CircuitOpen
+        | HostProcessError::EgressIsolationUnavailable(_) => RenderError::HostUnavailable,
         HostProcessError::Timeout(_) => RenderError::Timeout,
         HostProcessError::ProtocolMismatch | HostProcessError::ProtocolViolation(_) => {
             RenderError::ProtocolMismatch
@@ -331,6 +336,12 @@ mod tests {
             (HostProcessError::Crashed, R::HostUnavailable),
             (HostProcessError::ResourceLimitExceeded, R::HostUnavailable),
             (HostProcessError::CircuitOpen, R::HostUnavailable),
+            (
+                HostProcessError::EgressIsolationUnavailable(
+                    crate::host_process::EgressIsolationUnavailable::SandboxToolNotFound,
+                ),
+                R::HostUnavailable,
+            ),
             (HostProcessError::Timeout(TimeoutPhase::Load), R::Timeout),
             (HostProcessError::ProtocolMismatch, R::ProtocolMismatch),
             (

@@ -12,13 +12,15 @@ mod support;
 use std::collections::BTreeSet;
 use std::time::{Duration, Instant};
 
+use fandhe_browser_core::EgressIsolationMode;
 #[cfg(unix)]
 use fandhe_browser_render::host_process::HOST_ARGS;
+use fandhe_browser_render::host_process::{
+    EgressIsolationStatus, EgressIsolationUnavailable, HostProcess, HostProcessConfig,
+    HostProcessError, HostTimeouts, IsolationProbe, TimeoutPhase,
+};
 #[cfg(unix)]
 use fandhe_browser_render::host_process::{FORCED_ENV_NAMES, PASSTHROUGH_ENV_NAMES};
-use fandhe_browser_render::host_process::{
-    HostProcess, HostProcessError, HostTimeouts, TimeoutPhase,
-};
 use fandhe_browser_render::protocol::{
     BoundingBoxParams, LoadParams, MethodResult, ProtocolError, Request, ScreenshotParams,
     VisibilityParams,
@@ -342,6 +344,193 @@ fn t_rss_limit() {
     assert_gone(child_pid(&root, 1));
 }
 
+// ---------------------------------------------------------------------------
+// egress 隔離（RENDER-3・#1436）
+// ---------------------------------------------------------------------------
+
+/// 隔離できない環境で `required` なら起動せず、理由つきのエラーを返す。ブレーカーには数えない。
+fn t_required_unavailable_does_not_spawn() {
+    let root = Root::new("iso-required", "ok");
+    let cfg = root
+        .config(base_timeouts())
+        .with_egress_isolation(EgressIsolationMode::Required)
+        .with_isolation_probe(IsolationProbe::Unavailable(
+            EgressIsolationUnavailable::SandboxToolNotFound,
+        ));
+    let mut h = HostProcess::new(cfg);
+    for _ in 0..5 {
+        let e = h.load(&page(), 1).expect_err("required must refuse");
+        assert!(
+            matches!(
+                e,
+                HostProcessError::EgressIsolationUnavailable(
+                    EgressIsolationUnavailable::SandboxToolNotFound
+                )
+            ),
+            "{e:?}"
+        );
+    }
+    assert_eq!(count(&root.0, "spawns"), 0, "host must never be started");
+    assert_eq!(
+        HostProcessError::EgressIsolationUnavailable(
+            EgressIsolationUnavailable::SandboxToolNotFound
+        )
+        .to_string(),
+        "render host egress isolation is required but unavailable"
+    );
+    assert!(h.pid().is_none());
+}
+
+type Warnings = std::sync::Arc<std::sync::Mutex<Vec<EgressIsolationUnavailable>>>;
+
+fn with_warning_sink(cfg: HostProcessConfig) -> (HostProcessConfig, Warnings) {
+    let sink: Warnings = Warnings::default();
+    let s2 = std::sync::Arc::clone(&sink);
+    let cfg = cfg.with_isolation_warning(std::sync::Arc::new(move |r| {
+        s2.lock().unwrap().push(r);
+    }));
+    (cfg, sink)
+}
+
+/// 隔離できない環境で `best-effort` なら、警告を 1 回だけ出して従来どおり起動する。
+#[cfg(unix)]
+fn t_best_effort_warns_once_and_starts_unwrapped() {
+    let root = Root::new("iso-besteffort", "dump");
+    let reason = EgressIsolationUnavailable::UnsupportedPlatform;
+    let (cfg, sink) = with_warning_sink(
+        root.config(base_timeouts())
+            .with_egress_isolation(EgressIsolationMode::BestEffort)
+            .with_isolation_probe(IsolationProbe::Unavailable(reason)),
+    );
+    let mut h = HostProcess::new(cfg);
+    h.load(&page(), 1).expect("starts without isolation");
+    assert_eq!(
+        h.egress_isolation(),
+        Some(EgressIsolationStatus::Unisolated(reason))
+    );
+    let obs: Value =
+        serde_json::from_str(&std::fs::read_to_string(root.0.join("obs-dump.json")).unwrap())
+            .unwrap();
+    assert_eq!(obs["args"], serde_json::json!(["--stdio"]));
+    assert_eq!(*sink.lock().unwrap(), vec![reason]);
+    // 再起動しても警告は HostProcess ごとに 1 回。
+    h.shutdown();
+    h.load(&page(), 1).expect("restart");
+    assert_eq!(count(&root.0, "spawns"), 2);
+    assert_eq!(*sink.lock().unwrap(), vec![reason]);
+}
+
+#[cfg(target_os = "linux")]
+fn wait_gone(pid: u32) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if !std::path::Path::new(&format!("/proc/{pid}")).exists() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    panic!("process {pid} is still alive");
+}
+
+/// 実環境（Linux）の判定に従う。bwrap が使える環境では argv・RSS の pid・終了処理を確かめ、
+/// 使えない環境では `required` が起動しないことを確かめる（どちらの分岐も具体値で assert）。
+#[cfg(target_os = "linux")]
+fn t_system_probe_branch() {
+    use fandhe_browser_render::host_process::{IsolationBackend, probe_system};
+    match probe_system() {
+        Ok(()) => {
+            let root = Root::new("iso-system-ok", "dump");
+            let cfg = root
+                .config_system(base_timeouts())
+                .with_egress_isolation(EgressIsolationMode::Required)
+                .with_rss_poll_interval(Duration::from_millis(50));
+            let mut h = HostProcess::new(cfg);
+            h.load(&page(), 1).expect("wrapped host starts");
+            assert_eq!(
+                h.egress_isolation(),
+                Some(EgressIsolationStatus::Isolated(IsolationBackend::Bwrap))
+            );
+            let workdir = std::fs::canonicalize(h.workdir_path().unwrap()).unwrap();
+            let obs: Value = serde_json::from_str(
+                &std::fs::read_to_string(root.0.join("obs-dump.json")).unwrap(),
+            )
+            .unwrap();
+            let args: Vec<&str> = obs["args"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_str().unwrap())
+                .collect();
+            let sock = workdir.join("egress-proxy.sock");
+            assert_eq!(
+                args,
+                ["--stdio", "--egress-relay-uds", sock.to_str().unwrap()]
+            );
+            // RSS 監視は bwrap ではなくその子（偽ホスト）の pid を辿る。
+            let host_pid = child_pid(&root, 1);
+            assert_ne!(Some(host_pid), h.pid(), "wrapper pid differs from host pid");
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while h.monitored_pid() != Some(host_pid) && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            assert_eq!(h.monitored_pid(), Some(host_pid));
+            // 終了処理: ラッパーを kill すると、ホストも残らない。
+            h.shutdown();
+            assert!(!workdir.exists());
+            wait_gone(host_pid);
+        }
+        Err(reason) => {
+            let root = Root::new("iso-system-ng", "ok");
+            let cfg = root
+                .config_system(base_timeouts())
+                .with_egress_isolation(EgressIsolationMode::Required);
+            let mut h = HostProcess::new(cfg);
+            let e = h.load(&page(), 1).expect_err("required must refuse");
+            assert!(
+                matches!(&e, HostProcessError::EgressIsolationUnavailable(r) if *r == reason),
+                "{e:?}"
+            );
+            assert_eq!(count(&root.0, "spawns"), 0);
+        }
+    }
+}
+
+/// bwrap 越しでも、タイムアウトで kill した後にホストが残らない。
+#[cfg(target_os = "linux")]
+fn t_system_probe_timeout_kills_wrapped_host() {
+    if fandhe_browser_render::host_process::probe_system().is_err() {
+        return; // 隔離できない環境では上のテストが required の拒否を確かめる。
+    }
+    let root = Root::new("iso-timeout", "hang-load");
+    let mut h = HostProcess::new(root.config_system(short_timeouts()));
+    let e = h.load(&page(), 1).expect_err("timeout");
+    assert!(
+        matches!(e, HostProcessError::Timeout(TimeoutPhase::Load)),
+        "{e:?}"
+    );
+    wait_gone(child_pid(&root, 1));
+}
+
+/// bwrap 越しでも RSS 上限超過でホスト本体（bwrap の子）が落ちる。bwrap 自身の RSS では判定しない。
+#[cfg(target_os = "linux")]
+fn t_system_probe_rss_limit_kills_wrapped_host() {
+    if fandhe_browser_render::host_process::probe_system().is_err() {
+        return;
+    }
+    let root = Root::new("iso-rss", "rss");
+    let cfg = root
+        .config_system(base_timeouts())
+        .with_rss_limit_bytes(48 * 1024 * 1024)
+        .with_rss_poll_interval(Duration::from_millis(50));
+    let mut h = HostProcess::new(cfg);
+    let e = h.load(&page(), 1).expect_err("rss");
+    assert!(
+        matches!(e, HostProcessError::ResourceLimitExceeded),
+        "{e:?}"
+    );
+    wait_gone(child_pid(&root, 1));
+}
+
 fn main() {
     maybe_run_fake_host();
     #[allow(unused_mut)]
@@ -361,6 +550,27 @@ fn main() {
         ("profile_isolation", t_profile_isolation),
         ("stderr_tail", t_stderr_tail),
     ];
+    tests.push((
+        "egress_required_unavailable",
+        t_required_unavailable_does_not_spawn,
+    ));
+    #[cfg(unix)]
+    tests.push((
+        "egress_best_effort_warns_once",
+        t_best_effort_warns_once_and_starts_unwrapped,
+    ));
+    #[cfg(target_os = "linux")]
+    {
+        tests.push(("egress_system_probe_branch", t_system_probe_branch));
+        tests.push((
+            "egress_system_rss_limit_kills_wrapped_host",
+            t_system_probe_rss_limit_kills_wrapped_host,
+        ));
+        tests.push((
+            "egress_system_timeout_kills_wrapped_host",
+            t_system_probe_timeout_kills_wrapped_host,
+        ));
+    }
     #[cfg(unix)]
     tests.push(("dump_env_args_cwd", t_dump_env_args_cwd));
     #[cfg(any(target_os = "linux", target_os = "macos"))]

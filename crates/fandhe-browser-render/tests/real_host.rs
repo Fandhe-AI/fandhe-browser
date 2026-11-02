@@ -23,8 +23,8 @@ use fandhe_browser_core::render::{
     ElementRef, ImageFormat, PageRef, RenderError, Renderer, ScreenshotOptions,
 };
 use fandhe_browser_render::host_process::{
-    HOST_BINARY_ENV, HostProcess, HostProcessConfig, HostProcessError, HostTimeouts,
-    resolve_host_binary,
+    EgressIsolationUnavailable, HOST_BINARY_ENV, HostProcess, HostProcessConfig, HostProcessError,
+    HostTimeouts, IsolationProbe, resolve_host_binary,
 };
 use fandhe_browser_render::host_renderer::{HostRenderer, HostRendererConfig};
 use fandhe_browser_render::protocol::{HostErrorKind, LoadParams};
@@ -55,7 +55,12 @@ fn host_config(timeouts: HostTimeouts) -> HostProcessConfig {
     // exe_dir は渡さない（隣接ファイルを誤って拾わない）。
     let bin = resolve_host_binary(None, Some(env.as_os_str()), None)
         .unwrap_or_else(|e| panic!("invalid host binary: {e}"));
-    HostProcessConfig::new(bin).with_timeouts(timeouts)
+    // 隔離なしに固定する（隔離の実ホスト検証は #1437。本テストは従来どおりの起動を確かめる）。
+    HostProcessConfig::new(bin)
+        .with_timeouts(timeouts)
+        .with_isolation_probe(IsolationProbe::Unavailable(
+            EgressIsolationUnavailable::SandboxToolNotFound,
+        ))
 }
 
 fn renderer(timeouts: HostTimeouts, allow_private: bool, load_ms: Option<u32>) -> HostRenderer {
