@@ -8,8 +8,10 @@ import shutil
 import socket
 import sys
 import tempfile
+import threading
 import time
 import unittest
+from unittest import mock
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -46,6 +48,7 @@ class ParseTest(unittest.TestCase):
     def test_rejects(self) -> None:
         cases = {
             b"GET 127.0.0.4:5000 HTTP/1.1\r\n\r\n": 405,
+            b"CONNECT 127.0.0.4:5000\n HTTP/1.1\r\n\r\n": 400,  # authority 末尾の改行（#1433）
             b"CONNECT example.test:443 HTTP/1.1\r\n\r\n": 400,
             b"CONNECT 127.0.0.4:0 HTTP/1.1\r\n\r\n": 400,
             b"CONNECT 127.0.0.4:70000 HTTP/1.1\r\n\r\n": 400,
@@ -70,7 +73,7 @@ class PolicyTest(unittest.TestCase):
 
 class ArgvTest(unittest.TestCase):
     def args(self, netns: bool) -> list[str]:
-        return rp.build_relay_argv(netns=netns, sockdir="/tmp/fer-x", inner_out="/tmp/o.json",
+        return rp.build_relay_argv(netns=netns, sockdir="/tmp/fer-x", out_dir="/tmp/out", inner_out="/tmp/out/o.json",
                                    ports={"target": 5000, "internal": 5001}, phase="netns")
 
     def test_netns_flag(self) -> None:
@@ -81,10 +84,20 @@ class ArgvTest(unittest.TestCase):
         a = self.args(True)
         self.assertTrue(all(isinstance(x, str) for x in a))
         self.assertEqual(a[:2], ["bwrap", "--die-with-parent"])
-        self.assertLess(a.index("--tmpfs"), a.index("--bind"))
-        self.assertLess(a.index("--tmpfs"), a.index("--ro-bind"))
-        self.assertEqual(a[a.index("--bind") + 2], rp.MOUNT_RW)
-        self.assertEqual(a[a.index("--ro-bind") + 2], rp.MOUNT_RO)
+        self.assertNotIn("--dev-bind", a)
+        self.assertEqual(a[a.index("--ro-bind") : a.index("--ro-bind") + 3], ["--ro-bind", "/", "/"])
+        self.assertEqual(a[a.index("--dev") : a.index("--dev") + 2], ["--dev", "/dev"])
+        rw = a.index("--bind")
+        ro = a.index(rp.MOUNT_RO) - 2
+        self.assertEqual(a[rw + 2], rp.MOUNT_RW)
+        self.assertEqual(a[ro], "--ro-bind")
+        self.assertLess(a.index("--tmpfs"), rw)
+        self.assertLess(a.index("--tmpfs"), ro)
+        out = [k for k in range(len(a) - 2) if a[k] == "--bind" and a[k + 1] == "/tmp/out"]
+        self.assertEqual(len(out), 1)
+        self.assertEqual(a[out[0] + 2], "/tmp/out")
+        self.assertGreater(out[0], rw)
+        self.assertGreater(out[0], ro)
 
 
 class JudgeTest(unittest.TestCase):
@@ -200,6 +213,109 @@ class OuterTest(unittest.TestCase):
                     '{"target": true, "internal": 5001}'):
             with self.assertRaises(ValueError):
                 rp.valid_ports(bad)
+
+
+class _Recorder(socket.socket):
+    """settimeout の呼び出しを記録するソケット。"""
+
+    calls: list = []
+
+    def settimeout(self, value) -> None:  # type: ignore[override]
+        type(self).calls.append(value)
+        super().settimeout(value)
+
+
+class DeadlineTest(unittest.TestCase):
+    """接続ごとの総時間の期限・conn の timeout・fd 例外（#1433）。"""
+
+    def test_pump_stops_at_deadline_despite_drip(self) -> None:
+        a_in, a = socket.socketpair()
+        b_in, b = socket.socketpair()
+        stop = threading.Event()
+
+        def drip() -> None:
+            while not stop.is_set():
+                try:
+                    a_in.send(b"x")
+                except OSError:
+                    return
+                time.sleep(0.2)
+
+        t = threading.Thread(target=drip, daemon=True)
+        t.start()
+        start = time.monotonic()
+        try:
+            rp.pump(a, b, deadline=start + 0.6)
+            elapsed = time.monotonic() - start
+        finally:
+            stop.set()
+            t.join(2)
+            for x in (a_in, a, b_in, b):
+                x.close()
+        self.assertGreaterEqual(elapsed, 0.55)
+        self.assertLess(elapsed, 2.1)
+
+    def test_pump_closed_socket_returns(self) -> None:
+        a, a2 = socket.socketpair()
+        b, b2 = socket.socketpair()
+        a.close()
+        rp.pump(a, b)  # ValueError / OSError を握りつぶして返る
+        for x in (a2, b, b2):
+            x.close()
+
+    @unittest.skipUnless(hasattr(socket, "AF_UNIX"), "AF_UNIX required")
+    def test_proxy_closes_slow_header_connection(self) -> None:
+        d = tempfile.mkdtemp(prefix="fer-t-", dir="/tmp")
+        try:
+            path = os.path.join(d, "p.sock")
+            proxy = rp.ConnectProxy(path, ALLOW)
+            with mock.patch.object(rp, "CONN_DEADLINE_S", 0.6):
+                proxy.start()
+                try:
+                    c = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                    c.settimeout(5)
+                    c.connect(path)
+                    start = time.monotonic()
+                    closed = False
+                    while time.monotonic() - start < 4:
+                        try:
+                            c.send(b"C")
+                        except OSError:
+                            closed = True
+                            break
+                        time.sleep(0.2)
+                        c.settimeout(0.01)
+                        try:
+                            if c.recv(1) == b"":
+                                closed = True
+                                break
+                        except socket.timeout:
+                            pass
+                        except OSError:
+                            closed = True
+                            break
+                    c.close()
+                    time.sleep(0.3)
+                    self.assertTrue(closed)
+                    self.assertEqual(proxy.snapshot()["codes"].get("deadline"), 1)
+                finally:
+                    proxy.stop()
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    @unittest.skipUnless(hasattr(socket, "AF_UNIX"), "AF_UNIX required")
+    def test_relay_serve_sets_conn_timeout(self) -> None:
+        relay = rp.Relay("/nonexistent/p.sock")
+        try:
+            a, b = socket.socketpair()
+            _Recorder.calls = []
+            wrapped = _Recorder(fileno=a.detach())
+            relay._sem.acquire()
+            relay._serve(wrapped)  # connect 失敗の経路でも設定される
+            self.assertIn(rp.CONN_TIMEOUT_S, _Recorder.calls)
+            b.close()
+        finally:
+            relay.stop()
 
 
 if __name__ == "__main__":
