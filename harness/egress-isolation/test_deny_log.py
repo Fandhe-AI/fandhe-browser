@@ -95,6 +95,31 @@ class RunModeTest(unittest.TestCase):
         v = judge.judge_all("seatbelt", data["inner"], {}, {r: 1 for r in PORTS})
         self.assertEqual(v["img"]["verdict"], judge.UNOBSERVABLE)
 
+    def test_warmup_unattributed_dest_is_reported_by_route_name(self) -> None:
+        """予熱宛先の PID 帰属できない拒否行が、ip:port ではなく経路名 warmup_redirect で出る（Issue #1415）。"""
+        import page_templates
+
+        warmup = page_templates.WARMUP_ROUTE
+        diag = list(page_templates.DIAG_ROUTES)
+        ports = {**PORTS, **{r: 3000 + i for i, r in enumerate([*diag, warmup])}}
+        warmup_dest = f"{judge.IP_BLOCKED}:{ports[warmup]}"
+        recs = {k: SimpleNamespace(count=0) for k in ports}
+        with tempfile.TemporaryDirectory() as td:
+            out_dir = Path(td)
+            (out_dir / "seatbelt.json").write_text(json.dumps({
+                "host_pids": [101], "probes": {"udp_direct": "EPERM"}, "positive_ok": True,
+                "guard": {"unavailable": "n/a"}, "attempts": {"udp_direct": True},
+                "attempt_evidence": {"udp_direct": "errno"}}), encoding="utf-8")
+            status = {"available": True, "deny_lines": 1,
+                      "diagnostics": {"unattributed_network_dests": {warmup_dest: 2}}}
+            with mock.patch.object(measure, "run_argv", lambda *a, **k: (0, "")), \
+                    mock.patch.object(measure, "collect_denies",
+                                      lambda *a, **k: ({UDP_DEST: 1}, dict(status))), \
+                    mock.patch.object(measure, "build_argv", lambda *a, **k: ["true"]):
+                data = measure.run_mode("seatbelt", host=Path("h"), ports=ports, recs=recs, out_dir=out_dir,
+                                        hosts_file=Path("hosts"), image=None)
+        self.assertEqual(data["deny_log"]["unattributed_routes"], {"warmup_redirect": 2})
+
 
 class _FakePipe:
     """`_TimedLineReader` の `select.select` と `os.read` を差し替える偽のパイプ（OS 非依存）。

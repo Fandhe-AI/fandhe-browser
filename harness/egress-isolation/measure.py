@@ -622,7 +622,7 @@ def run_mode(mode: str, *, host: Path, ports: dict[str, int], recs: dict[str, An
                 # 予熱の拒否行（観測値。根拠にしない）。判定用の dest_counts には入れない。
                 data["warmup"]["deny"] = observed.get(warmup_dest, 0)
             by_dest = {d: r for r, d in (*dest.items(), ("udp_direct", udp), *diag_dests.items(),
-                                         *(((warmup_dest, warmup_key),) if warmup_dest else ()))}
+                                         *(((warmup_key, warmup_dest),) if warmup_dest else ()))}
             un = (status.get("diagnostics") or {}).get("unattributed_network_dests") or {}
             data["deny_log"]["unattributed_routes"] = {by_dest.get(d, d): n for d, n in un.items()}
             if info_debug is not None:
