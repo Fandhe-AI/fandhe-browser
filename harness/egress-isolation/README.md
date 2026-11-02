@@ -95,6 +95,8 @@ macOS・Windows の GitHub ホステッドランナー。結果は #1003 に記�
 
 - プロセス単位の監視（`egress_guard`）が無い。pass の条件から外す代わりに、外側 listener の受信 0 件・baseline の到達・
   試行の観測・`--selftest` と loopback の `load` の成功をすべて要する。
+- Windows では Servo ホストが結果の出力後に Servo の後始末を通さず `process::exit` で終わる（AppContainer 内の ROUTER の panic 回避。#1413）。
+  この修正後は `selftest_rc`・`host_exit_rc` が 0 になる想定で、マージ後の xos-measure で確認する。
 - 異常終了の診断（#1413）。内側の結果 JSON に次を残す。`selftest_rc` が 0 以外のときだけ `selftest_stderr_tail`
   （`--selftest` の stderr の末尾。段階マーカー `selftest: <stage>` と panic メッセージ）、`shutdown` 後にホストを待って
   `host_exit_rc`（待ちが時間切れなら `host_exit_timed_out: true`）、0 以外のときだけ `host_stderr_tail`。どれも上限つきで、

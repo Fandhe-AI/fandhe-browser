@@ -56,22 +56,30 @@ fn run(args: &[&str]) -> (Option<i32>, String, String) {
     (status.code(), out, err)
 }
 
+/// #1413: Windows ではホストが結果の出力後に Servo の後始末を通さず終了する（AppContainer 内の
+/// ROUTER の panic 回避）ため、`engine dropped` の段階は出ず終了マーカーが出る。他 OS は従来どおり。
 #[test]
 fn selftest_creates_and_drops_engine_within_limit() {
     let (code, out, err) = run(&["--selftest"]);
     assert_eq!(code, Some(0), "stderr: {err}");
     assert!(out.starts_with("selftest ok:"), "stdout: {out}");
-    // #1413: 異常終了時に死んだ段階を絞れるよう、進行段階が stderr に出る。
+    let has = |s: &str| err.contains(s);
     for stage in [
         "engine created",
         "page loaded",
-        "engine dropped",
+        "webview dropped",
         "second engine rejected",
     ] {
-        assert!(
-            err.contains(&format!("selftest: {stage}")),
-            "missing stage {stage}: {err}"
-        );
+        assert!(has(&format!("selftest: {stage}")), "missing {stage}: {err}");
+    }
+    let marker = "host exiting before servo teardown";
+    if cfg!(windows) {
+        assert!(has("selftest: exiting before engine drop"), "{err}");
+        assert!(has(marker), "{err}");
+        assert!(!has("selftest: engine dropped"), "{err}");
+    } else {
+        assert!(has("selftest: engine dropped"), "{err}");
+        assert!(!has(marker), "{err}");
     }
 }
 

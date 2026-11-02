@@ -88,11 +88,31 @@ impl Host {
     /// stdin を閉じて終了を待ち、(終了コード, 残りの stdout バイト数, stderr) を返す。
     fn finish(mut self) -> (Option<i32>, usize, String) {
         drop(self.stdin.take());
-        let mut rest = Vec::new();
-        if let Some(mut o) = self.child.stdout.take() {
-            let _ = o.read_to_end(&mut rest);
-        }
-        let status = self.child.wait().expect("wait");
+        // 残りの stdout は別スレッドで読む。EOF 待ちで期限判定より前に固まらないため（#1413）。
+        let rest_reader = self.child.stdout.take().map(|mut o| {
+            std::thread::spawn(move || {
+                let mut rest = Vec::new();
+                let _ = o.read_to_end(&mut rest);
+                rest
+            })
+        });
+        // 終了処理が固まってもテストが固まらないよう上限つきで待つ（#1413）。
+        let start = std::time::Instant::now();
+        let status = loop {
+            if let Some(s) = self.child.try_wait().expect("try_wait") {
+                break s;
+            }
+            if start.elapsed() > LIMIT {
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+                panic!("servo host did not exit within {LIMIT:?}");
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        // 終了または kill 後は stdout が閉じるため読み取り結果を回収できる。
+        let rest = rest_reader
+            .map(|h| h.join().unwrap_or_default())
+            .unwrap_or_default();
         (
             status.code(),
             rest.len(),
@@ -298,6 +318,12 @@ fn load_succeeds_fails_and_recovers_in_one_process() {
     let (code, rest, stderr) = h.finish();
     assert_eq!(code, Some(0), "stderr: {stderr}");
     assert_eq!(rest, 0, "stdout must contain frames only");
+    // #1413: Windows では Engine 生成後も後始末を通さず終了する。
+    assert_eq!(
+        stderr.contains("host exiting before servo teardown"),
+        cfg!(windows),
+        "{stderr}"
+    );
     assert!(
         !stderr.contains("abc123") && !stderr.contains("127.0.0.1"),
         "{stderr}"
