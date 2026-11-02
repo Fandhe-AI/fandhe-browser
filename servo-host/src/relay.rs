@@ -26,6 +26,8 @@ use std::time::{Duration, Instant};
 const MAX_CONNECTIONS: usize = 128;
 /// 双方向とも無通信が続いたら切る時間（暫定。#1440 と同値）。
 const IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+/// UDS への接続待ちの上限。本体プロキシが accept を止めても枠を返却するための期限。
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// 読み取りタイムアウト。アイドル判定の刻みとして使う。
 const TICK: Duration = Duration::from_millis(250);
 /// 転送バッファ（固定長。無制限確保をしない）。
@@ -37,6 +39,7 @@ pub(crate) struct RelayLimits {
     pub(crate) max_connections: usize,
     pub(crate) idle_timeout: Duration,
     pub(crate) tick: Duration,
+    pub(crate) connect_timeout: Duration,
 }
 
 impl Default for RelayLimits {
@@ -45,6 +48,7 @@ impl Default for RelayLimits {
             max_connections: MAX_CONNECTIONS,
             idle_timeout: IDLE_TIMEOUT,
             tick: TICK,
+            connect_timeout: CONNECT_TIMEOUT,
         }
     }
 }
@@ -56,6 +60,7 @@ impl RelayLimits {
             max_connections: self.max_connections.min(MAX_CONNECTIONS),
             idle_timeout: self.idle_timeout.min(IDLE_TIMEOUT),
             tick: self.tick.clamp(Duration::from_millis(1), TICK),
+            connect_timeout: self.connect_timeout.min(CONNECT_TIMEOUT),
         }
     }
 }
@@ -97,9 +102,10 @@ pub(crate) fn start_with(uds: PathBuf, limits: RelayLimits) -> io::Result<Relay>
         .ok_or_else(|| io::Error::other("cannot determine relay port"))?;
     let active = Arc::new(AtomicUsize::new(0));
     let accept_active = Arc::clone(&active);
+    let connecting = Arc::new(AtomicUsize::new(0));
     std::thread::Builder::new()
         .name("egress-relay-accept".to_string())
-        .spawn(move || accept_loop(&listener, &uds, limits, &accept_active))?;
+        .spawn(move || accept_loop(&listener, &uds, limits, &accept_active, &connecting))?;
     Ok(Relay {
         port,
         #[cfg(test)]
@@ -107,7 +113,13 @@ pub(crate) fn start_with(uds: PathBuf, limits: RelayLimits) -> io::Result<Relay>
     })
 }
 
-fn accept_loop(listener: &TcpListener, uds: &Path, limits: RelayLimits, active: &Arc<AtomicUsize>) {
+fn accept_loop(
+    listener: &TcpListener,
+    uds: &Path,
+    limits: RelayLimits,
+    active: &Arc<AtomicUsize>,
+    connecting: &Arc<AtomicUsize>,
+) {
     for incoming in listener.incoming() {
         let Ok(tcp) = incoming else {
             // EMFILE 等でのビジーループを避ける。
@@ -121,10 +133,11 @@ fn accept_loop(listener: &TcpListener, uds: &Path, limits: RelayLimits, active: 
         active.fetch_add(1, Ordering::SeqCst);
         let guard = Guard(Arc::clone(active));
         let path = uds.to_path_buf();
+        let connecting = Arc::clone(connecting);
         // spawn 失敗時はクロージャごと drop され、guard が減算し tcp が閉じる。
         let _ = std::thread::Builder::new()
             .name("egress-relay-conn".to_string())
-            .spawn(move || handle(tcp, &path, limits, guard));
+            .spawn(move || handle(tcp, &path, limits, guard, &connecting));
     }
 }
 
@@ -137,8 +150,40 @@ impl Drop for Guard {
     }
 }
 
-fn handle(tcp: TcpStream, uds: &Path, limits: RelayLimits, _guard: Guard) {
-    let Ok(unix) = UnixStream::connect(uds) else {
+/// UDS へ期限つきで接続する。std の `UnixStream::connect` はブロッキングで、相手の accept
+/// キューが満杯だと戻らないため、接続は別スレッドで行い `connect_timeout` で待ちを切る。
+/// 期限超過時は呼び出し側が枠（`active`）を返却する。接続スレッドは接続が成否いずれかで戻るまで
+/// 残り得るため、`connecting` で同時に残る数を `max_connections` までに抑える（無制限増殖の防止）。
+fn connect_uds(
+    uds: &Path,
+    limits: RelayLimits,
+    connecting: &Arc<AtomicUsize>,
+) -> Option<UnixStream> {
+    if connecting.load(Ordering::SeqCst) >= limits.max_connections {
+        return None;
+    }
+    connecting.fetch_add(1, Ordering::SeqCst);
+    let guard = Guard(Arc::clone(connecting));
+    let (tx, rx) = std::sync::mpsc::channel();
+    let path = uds.to_path_buf();
+    std::thread::Builder::new()
+        .name("egress-relay-dial".to_string())
+        .spawn(move || {
+            let _guard = guard;
+            let _ = tx.send(UnixStream::connect(path));
+        })
+        .ok()?;
+    rx.recv_timeout(limits.connect_timeout).ok()?.ok()
+}
+
+fn handle(
+    tcp: TcpStream,
+    uds: &Path,
+    limits: RelayLimits,
+    _guard: Guard,
+    connecting: &Arc<AtomicUsize>,
+) {
+    let Some(unix) = connect_uds(uds, limits, connecting) else {
         return;
     };
     let _ = tcp.set_nodelay(true);
@@ -430,6 +475,41 @@ mod tests {
     fn missing_uds_closes_connection() {
         let dir = TmpDir::new();
         let relay = start(dir.sock()).unwrap();
+        let mut c = connect(&relay);
+        let mut buf = [0u8; 1];
+        assert!(matches!(c.read(&mut buf), Ok(0) | Err(_)));
+        assert!(wait_until(|| relay.active() == 0));
+    }
+
+    /// UDS の accept キューが満杯でも接続待ちは `connect_timeout` で切れ、枠が返却される。
+    #[test]
+    fn stuck_uds_connect_times_out_and_releases_slot() {
+        let dir = TmpDir::new();
+        let sock = dir.sock();
+        // accept しない listener。accept キューが埋まって connect が戻らなくなるまで、
+        // フィラースレッドが順に接続して保持する（戻らなくなった時点で進捗が止まる）。
+        let _listener = UnixListener::bind(&sock).unwrap();
+        let held: Arc<Mutex<Vec<UnixStream>>> = Arc::new(Mutex::new(Vec::new()));
+        let filler_held = Arc::clone(&held);
+        let filler_path = sock.clone();
+        std::thread::spawn(move || {
+            while let Ok(s) = UnixStream::connect(&filler_path) {
+                filler_held.lock().unwrap().push(s);
+            }
+        });
+        let mut last = 0;
+        let mut stable = 0;
+        while stable < 6 {
+            std::thread::sleep(Duration::from_millis(100));
+            let n = held.lock().unwrap().len();
+            stable = if n == last && n > 0 { stable + 1 } else { 0 };
+            last = n;
+        }
+        let limits = RelayLimits {
+            connect_timeout: Duration::from_millis(300),
+            ..RelayLimits::default()
+        };
+        let relay = start_with(sock, limits).unwrap();
         let mut c = connect(&relay);
         let mut buf = [0u8; 1];
         assert!(matches!(c.read(&mut buf), Ok(0) | Err(_)));
