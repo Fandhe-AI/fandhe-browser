@@ -7,7 +7,8 @@
 //! - `--version`: 版を表示して成功終了する。
 //! - `--selftest`: Servo の初期化・小さな `data:` ページの読み込み完了・終了までを行い、
 //!   成功時のみ終了コード 0 を返す（RENDER-3・#988。設計 §1.4・§2.6・§2.7）。
-//!   ネットワークへは出ない。呼び出し元は開発者と CI のみ。
+//!   ネットワークへは出ない。呼び出し元は開発者と CI のみ。Windows では結果の出力後に Servo の後始末を
+//!   通さず `process::exit` で終わる（AppContainer 内の ROUTER の panic 回避。#1413。`EXIT_BEFORE_SERVO_TEARDOWN`）。
 //! - `--stdio`: 本体 render crate から起動される stdio サーバー（#993。`server`）。`load`（#231）と
 //!   `screenshot`（PNG の base64 inline。#232）・`visibility`（JS 評価。#233。`layout`）は
 //!   `page::ServoHandler` で実装済み。`bounding_box`（JS 評価。#234）も同じ `layout` 経由で実装済み。
@@ -42,6 +43,30 @@ const SELFTEST_URL: &str = "data:text/html,<h1>selftest</h1>";
 /// `--stdio` の終了コード: プロトコル違反（応答なしで終了した）。
 const EXIT_PROTOCOL_VIOLATION: u8 = 2;
 
+/// Servo の後始末（`Engine` の drop）を通さずに `process::exit` で終わるか（#1413）。
+///
+/// Windows の AppContainer 内では、Servo の `Constellation` スレッドが終了処理（`handle_shutdown`）で
+/// `ipc-channel` の `ROUTER`（遅延初期化）を初めて参照し、`RouterProxy::new` の `ipc::channel().unwrap()`
+/// が名前付きパイプの作成拒否（`E_ACCESSDENIED`）で panic して 0xC0000409 になる。Servo・`ipc-channel`
+/// は改変できない（licensing）ため、結果を出力して flush した直後に終了して後始末を飛ばす。
+/// WebView の drop は `ROUTER` を参照しないので通す。AppContainer かどうかの判定には `unsafe` か依存が
+/// 要るため判定せず、Windows 全体に適用する（Linux・macOS は名前付きパイプを使わず従来どおり後始末する）。
+/// 実行時の引数や環境変数では切り替えない（固定の許可リスト。SEC-2）。
+const EXIT_BEFORE_SERVO_TEARDOWN: bool = cfg!(windows);
+
+/// 終了コード `code` で終わる。`EXIT_BEFORE_SERVO_TEARDOWN` が真なら stdout・stderr を flush して
+/// その場で `process::exit` する（呼び出し元の `Engine` は drop されない）。偽なら `ExitCode` を返す。
+fn finish(code: u8) -> ExitCode {
+    if EXIT_BEFORE_SERVO_TEARDOWN {
+        use std::io::Write;
+        let _ = std::io::stdout().flush();
+        eprintln!("host exiting before servo teardown");
+        let _ = std::io::stderr().flush();
+        std::process::exit(i32::from(code));
+    }
+    ExitCode::from(code)
+}
+
 /// 引数に応じて `--version`・`--selftest`・`--stdio` を処理し、他は失敗終了する。
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -54,16 +79,7 @@ fn main() -> ExitCode {
             println!("fandhe-browser-servo-host {}", env!("CARGO_PKG_VERSION"));
             ExitCode::SUCCESS
         }
-        Some("--selftest") => match selftest() {
-            Ok(elapsed) => {
-                println!("selftest ok: page load completed in {elapsed:?}");
-                ExitCode::SUCCESS
-            }
-            Err(message) => {
-                eprintln!("error: selftest failed: {message}");
-                ExitCode::FAILURE
-            }
-        },
+        Some("--selftest") => run_selftest(),
         _ => {
             eprintln!(
                 "error: fandhe-browser-servo-host supports only --version, --selftest and --stdio"
@@ -79,6 +95,7 @@ fn main() -> ExitCode {
 /// `Engine`（Servo）は hello の送信後、最初の `load` で作る（ハンドシェイクの 10 秒以内に
 /// hello を出すため）。Servo 自身が stdout へ書き出すリスクは設計 §2.1 を参照。
 fn run_stdio() -> ExitCode {
+    // `handler` が `Engine` を持つ。Windows では drop の前に `finish` で終了する（#1413）。
     let mut handler = page::ServoHandler::new();
     let outcome = server::serve(
         std::io::stdin().lock(),
@@ -86,11 +103,12 @@ fn run_stdio() -> ExitCode {
         &mut handler,
         &mut std::io::stderr().lock(),
     );
-    match outcome {
-        ServeOutcome::Shutdown | ServeOutcome::InputClosed => ExitCode::SUCCESS,
-        ServeOutcome::ProtocolViolation(_) => ExitCode::from(EXIT_PROTOCOL_VIOLATION),
-        ServeOutcome::Io(_) => ExitCode::FAILURE,
-    }
+    let code = match outcome {
+        ServeOutcome::Shutdown | ServeOutcome::InputClosed => 0,
+        ServeOutcome::ProtocolViolation(_) => EXIT_PROTOCOL_VIOLATION,
+        ServeOutcome::Io(_) => 1,
+    };
+    finish(code)
 }
 
 /// `--selftest` の進行段階を stderr に 1 行出す（#1413）。
@@ -102,35 +120,85 @@ fn selftest_stage(stage: &str) {
     eprintln!("selftest: {stage}");
 }
 
-/// Servo を生成して `data:` ページの読み込み完了を待ち、破棄と解放を確かめて所要時間を返す。
-///
-/// 失敗（生成・URL 解析・タイムアウト・解放漏れ・二重生成の許容）は `Err` に倒す。
-/// WebView の生成と読み込み待ちは `page::navigate` を使う。
-fn selftest() -> Result<Duration, String> {
-    let engine = Engine::new().map_err(|e| e.to_string())?;
+/// `--selftest` を実行して終了コードへ写す。`Engine` はこの関数が所有し、Windows では drop の前に
+/// `finish` で終了する（#1413。成功・失敗とも。失敗が 0xC0000409 に化けないようにする）。
+fn run_selftest() -> ExitCode {
+    let engine = match Engine::new() {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("error: selftest failed: {e}");
+            return finish(1);
+        }
+    };
     selftest_stage("engine created");
-    let weak_context = engine.context_weak();
+    let result = selftest_run(&engine);
+    match result {
+        Ok(elapsed) if EXIT_BEFORE_SERVO_TEARDOWN => {
+            // Engine は生かしたまま 2 回目の生成が拒否されることだけ確かめる（drop 後の確認は Windows では省く）。
+            match selftest_second_engine() {
+                Ok(()) => {
+                    selftest_stage("exiting before engine drop");
+                    println!("selftest ok: page load completed in {elapsed:?}");
+                    finish(0)
+                }
+                Err(message) => {
+                    eprintln!("error: selftest failed: {message}");
+                    finish(1)
+                }
+            }
+        }
+        Ok(elapsed) => match selftest_teardown_checks(engine) {
+            Ok(()) => {
+                println!("selftest ok: page load completed in {elapsed:?}");
+                ExitCode::SUCCESS
+            }
+            Err(message) => {
+                eprintln!("error: selftest failed: {message}");
+                ExitCode::FAILURE
+            }
+        },
+        Err(message) => {
+            eprintln!("error: selftest failed: {message}");
+            finish(1)
+        }
+    }
+}
+
+/// `data:` ページの読み込み完了を待ち、WebView を破棄して所要時間を返す。
+///
+/// 失敗（URL 解析・タイムアウト）は `Err`。WebView の生成と読み込み待ちは `page::navigate` を使う。
+/// WebView の drop は Servo の `ROUTER` を参照しないので Windows でも通す（#1413）。
+fn selftest_run(engine: &Engine) -> Result<Duration, String> {
     let url = ServoUrl::parse(SELFTEST_URL).map_err(|e| format!("invalid selftest url: {e}"))?;
     let start = Instant::now();
-    let webview = page::navigate(&engine, url, start + SELFTEST_TIMEOUT)
+    let webview = page::navigate(engine, url, start + SELFTEST_TIMEOUT)
         .map_err(|e| format!("page load did not complete within {SELFTEST_TIMEOUT:?}: {e:?}"))?;
     let elapsed = start.elapsed();
     selftest_stage("page loaded");
-
-    // WebView を先に解放してから Engine を破棄する（Servo の Drop が終了を待つ）。
     drop(webview);
     selftest_stage("webview dropped");
-    drop(engine);
-    selftest_stage("engine dropped");
-    if weak_context.upgrade().is_some() {
-        return Err("rendering context leaked after engine drop".to_string());
-    }
-    // 1 プロセス 1 回の制約: 2 回目の生成は panic せず AlreadyCreated で拒否される。
+    Ok(elapsed)
+}
+
+/// 1 プロセス 1 回の制約: 2 回目の生成は panic せず `AlreadyCreated` で拒否される。
+fn selftest_second_engine() -> Result<(), String> {
     match Engine::new() {
         Err(EngineError::AlreadyCreated) => {}
         Err(e) => return Err(format!("unexpected error on second engine: {e}")),
         Ok(_) => return Err("second engine creation was not rejected".to_string()),
     }
     selftest_stage("second engine rejected");
-    Ok(elapsed)
+    Ok(())
+}
+
+/// Linux・macOS: Engine を破棄して描画コンテキストの解放漏れと二重生成の拒否を確かめる。
+fn selftest_teardown_checks(engine: Engine) -> Result<(), String> {
+    let weak_context = engine.context_weak();
+    // Servo の Drop が終了を待つ。
+    drop(engine);
+    selftest_stage("engine dropped");
+    if weak_context.upgrade().is_some() {
+        return Err("rendering context leaked after engine drop".to_string());
+    }
+    selftest_second_engine()
 }

@@ -1,7 +1,7 @@
 //! Servo ホストの Servo インスタンスと `SoftwareRenderingContext` のライフサイクル管理。
 //!
 //! 役割: 固定の許可リスト構成で Servo とソフトウェア描画コンテキストを 1 組生成し、
-//! `Drop` で確実に破棄する層（RENDER-3・TASK-38.1・#230。設計 §1・§2.3・§2.6）。
+//! `Drop` で確実に破棄する層（Windows の `main` は #1413 の ROUTER 回避で drop 前に終了する）（RENDER-3・TASK-38.1・#230。設計 §1・§2.3・§2.6）。
 //! 呼び出し元は `main` の `--selftest`。将来は stdio サーバー（#993）と WebView を扱う
 //! `page`（#231）がこの層の上に載る。
 //!

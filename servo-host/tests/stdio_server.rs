@@ -92,7 +92,19 @@ impl Host {
         if let Some(mut o) = self.child.stdout.take() {
             let _ = o.read_to_end(&mut rest);
         }
-        let status = self.child.wait().expect("wait");
+        // 終了処理が固まってもテストが固まらないよう上限つきで待つ（#1413）。
+        let start = std::time::Instant::now();
+        let status = loop {
+            if let Some(s) = self.child.try_wait().expect("try_wait") {
+                break s;
+            }
+            if start.elapsed() > LIMIT {
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+                panic!("servo host did not exit within {LIMIT:?}");
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        };
         (
             status.code(),
             rest.len(),
@@ -298,6 +310,12 @@ fn load_succeeds_fails_and_recovers_in_one_process() {
     let (code, rest, stderr) = h.finish();
     assert_eq!(code, Some(0), "stderr: {stderr}");
     assert_eq!(rest, 0, "stdout must contain frames only");
+    // #1413: Windows では Engine 生成後も後始末を通さず終了する。
+    assert_eq!(
+        stderr.contains("host exiting before servo teardown"),
+        cfg!(windows),
+        "{stderr}"
+    );
     assert!(
         !stderr.contains("abc123") && !stderr.contains("127.0.0.1"),
         "{stderr}"
