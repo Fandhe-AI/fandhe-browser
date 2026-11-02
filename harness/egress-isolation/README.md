@@ -109,7 +109,7 @@ macOS・Windows の GitHub ホステッドランナー。結果は #1003 に記�
     `attempts` の根拠にも判定にも使わない（ビーコンだけでは `unobservable`）。Linux のページは変えない。
   - サンドボックス拒否ログ（TCP 経路の唯一の根拠。`log show`）: 取りこぼしの原因を切り分けるため、診断カウンタ（読んだ行・JSON 行・拒否行・
     宛先を取れた行・pid の帰属で除外した行・帰属した行。`deny_log.diagnostics`）を記録する。あわせて形式の確認用に、対象 pid に帰属する `deny(` 行で正規表現に一致しなかったものの「形」だけを最大 16 件（プロセス名・pid・パス・外部 IP・クエリは `<proc>`・`<pid>`・`<path>`・`<ipv4>`・`<redacted>` に置換。127.0.0.0/8 の宛先は実値）と、pid 帰属で除外した行の `{pid, dest}` を最大 8 件（本文は保存しない。127.0.0.0/8 以外の dest は `<ipv4>:port`）記録する。無関係なプロセスの不一致行は件数（`unmatched_deny_unattributed`）だけ。内側ランナー自身の UDP
-    プローブが拒否されたのに拒否ログに無いときは自己検査が不成立（`deny_log.available=false`）となり、拒否ログを根拠にしない。
+    プローブが拒否されたのに拒否ログに無いとき、または隔離モードで予熱・診断経路の外側受信が 1 以上のとき（#1422。理由に経路名と件数。複数の理由は連結する）は、自己検査が不成立（`deny_log.available=false`）となり、拒否ログを根拠にしない。
     macOS 26 の拒否ログは宛先アドレスを `*` で出す形式（`deny(1) network-outbound <語>:*:<port>`。実測 xos-measure run 41305443526）もある。
     既存の IPv4 形式は変えず、この形式は「pid が対象 pid に含まれ、かつポートがこの run の既知の宛先ポート集合で一意」のときだけその宛先へ帰属させる
     （IPv4 形式より厳しい結合条件。判定ロジックは変えない）。既知集合に無いポートは `wildcard_unknown_port`、複数の宛先が共有するポートは帰属させず
@@ -141,7 +141,8 @@ macOS・Windows の GitHub ホステッドランナー。結果は #1003 に記�
       `deny_log.diagnostic_info_debug_dest_counts` に残す。根拠にはしない。
     - 結果の読み方: D2 に拒否行があり redirect に無ければ 302 の追従が connect に達していない。どちらも無ければトップレベルナビゲーションの
       接続がこの形式では報告されない。D1 だけにあれば順序の影響（後続で経路順の変更を検討する）。隔離モードで診断経路の外側に受信があれば
-      WARNING を出す（判定は変えない）。診断経路は Linux・Windows では有効にしない。
+      WARNING を出し、拒否ログの自己検査を不成立にする（fail-closed。#1422。理由に経路名と件数。baseline は対象外。
+      `judge.py` の判定基準は変えない。`udp_direct` は errno と外側の UDP listener で判定するため影響しない）。診断経路は Linux・Windows では有効にしない。
   - redirect の予熱（#1415。macOS だけ・判定には使わない）。診断（run 41338564798）で、拒否行が取れないのは「最初に読み込む判定経路」
     だけで、同じ形の 302 を後ろで試す D1 には 1 件出ることが分かった（順序への依存）。オーナー判断 2026-11-02（案 A）で、判定経路の前に
     予熱を 1 回入れる。
@@ -150,7 +151,7 @@ macOS・Windows の GitHub ホステッドランナー。結果は #1003 に記�
       最初の遮断されたナビゲーションで起きる事象を判定しない経路に吸わせる。
     - 集計から外す: 予熱は verdict・`attempts`・`loads`・`guard_polls`・`outer_counts`・`deny_log.dest_counts` に入れない。
       結果の `inner.warmup_load`・`warmup`（外側受信 `outer`・拒否行 `deny`。観測値で根拠にしない）に別に残す。
-      baseline と seatbelt で同じ順序にする（`--warmup` を両方に付ける）。隔離モードで予熱の外側受信が 1 以上なら WARNING を出す。
+      baseline と seatbelt で同じ順序にする（`--warmup` を両方に付ける）。隔離モードで予熱の外側受信が 1 以上なら WARNING を出し、診断経路と同じく自己検査を不成立にする（#1422）。
     - macOS だけ有効（`--diag-routes` と同じゲート）。Linux・Windows には導入しない。判定基準（`judge.py`）・管理者操作の不使用は変えない。
     - 直らない場合: redirect の理由に予熱の拒否行・外側受信の件数が付く。予熱 0 件・redirect 0 件なら順序ではなく 302 の追従そのものの
       事象と読める。次の手（redirect を末尾へ入れ替える案・servo-host から `load_failed` の詳細を返す案）はオーナー判断で、ここでは実装しない。

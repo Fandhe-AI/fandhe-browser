@@ -35,27 +35,34 @@ class ArgvTest(unittest.TestCase):
 
 class RunModeTest(unittest.TestCase):
     def _run(self, *, order: list[str], denies: dict[str, int] | None = None,
-             status: dict[str, Any] | None = None, udp_errno: str = "EPERM", mode: str = "seatbelt") -> dict[str, Any]:
-        recs = {k: SimpleNamespace(count=0) for k in PORTS}
+             status: dict[str, Any] | None = None, udp_errno: str = "EPERM", mode: str = "seatbelt",
+             extra_receipts: dict[str, int] | None = None, host_pids: list[int] | None = None) -> dict[str, Any]:
+        import page_templates
+
+        ports = {**PORTS, page_templates.WARMUP_ROUTE: 2010,
+                 **{r: 2011 + i for i, r in enumerate(page_templates.DIAG_ROUTES)}}
+        recs = {k: SimpleNamespace(count=0) for k in ports}
         with tempfile.TemporaryDirectory() as td:
             out_dir = Path(td)
             (out_dir / f"{mode}.json").write_text(json.dumps({
-                "host_pids": [101], "probes": {"udp_direct": udp_errno}, "positive_ok": True,
+                "host_pids": [101] if host_pids is None else host_pids, "probes": {"udp_direct": udp_errno}, "positive_ok": True,
                 "guard": {"unavailable": "n/a"}, "attempts": {"udp_direct": True},
                 "attempt_evidence": {"udp_direct": "errno"}}), encoding="utf-8")
 
             def fake_run(argv: list[str], container: str | None = None) -> tuple[int | None, str]:
                 order.append("run_argv")
+                for r, n in (extra_receipts or {}).items():
+                    recs[r].count += n
                 return 0, ""
 
-            def fake_collect(start: str, pids: Any = None) -> tuple[dict[str, int], dict[str, Any]]:
+            def fake_collect(start: str, pids: Any = None, diagnostic: bool = False) -> tuple[dict[str, int], dict[str, Any]]:
                 order.append("log_show")
                 return dict(denies or {}), dict(status or {"available": True, "deny_lines": 1})
 
             with mock.patch.object(measure, "run_argv", fake_run), \
                     mock.patch.object(measure, "collect_denies", fake_collect), \
                     mock.patch.object(measure, "build_argv", lambda *a, **k: ["true"]):
-                return measure.run_mode(mode, host=Path("h"), ports=PORTS, recs=recs, out_dir=out_dir,
+                return measure.run_mode(mode, host=Path("h"), ports=ports, recs=recs, out_dir=out_dir,
                                         hosts_file=Path("hosts"), image=None)
 
     def test_self_check_holds_tcp_routes_pass(self) -> None:
@@ -87,6 +94,50 @@ class RunModeTest(unittest.TestCase):
         self.assertNotIn("deny log unavailable", v["img"]["reason"])
         v = judge.judge_all("seatbelt", data["inner"], {"img": 1}, {r: 1 for r in PORTS})
         self.assertEqual(v["img"]["verdict"], judge.FAIL)
+
+    def _full_denies(self) -> dict[str, int]:
+        return {UDP_DEST: 1, **{d: 1 for d in TCP_DEST.values()}}
+
+    def test_warmup_receipt_fails_self_check_closed(self) -> None:
+        """予熱への外側受信があれば、拒否ログで pass していた TCP 経路が unobservable になる（Issue #1422）。"""
+        data = self._run(order=[], denies=self._full_denies(), extra_receipts={"warmup_redirect": 1})
+        reason = "outer receipt on non-verdict route(s) in an isolated mode: warmup_redirect=1"
+        self.assertEqual((data["deny_log"]["available"], data["deny_log"]["reason"]), (False, reason))
+        self.assertEqual(data["auxiliary_outer_receipts"], {"warmup_redirect": 1})
+        self.assertNotIn("warmup_redirect", data["outer_counts"])
+        v = judge.judge_all("seatbelt", data["inner"], {}, {r: 1 for r in PORTS}, deny_log_reason=reason)
+        for route in TCP_DEST:
+            self.assertEqual(v[route]["verdict"], judge.UNOBSERVABLE)
+            self.assertIn("warmup_redirect=1", v[route]["reason"])
+
+    def test_diag_receipt_fails_self_check_and_orders_warmup_first(self) -> None:
+        data = self._run(order=[], denies=self._full_denies(),
+                         extra_receipts={"diag_nav_direct": 2, "warmup_redirect": 1})
+        self.assertEqual(data["deny_log"]["reason"], "outer receipt on non-verdict route(s) in an isolated mode: "
+                         "warmup_redirect=1, diag_nav_direct=2")
+        self.assertEqual(data["outer_counts"]["diag_nav_direct"], 2)
+
+    def test_aux_reason_is_appended_to_existing_reason(self) -> None:
+        data = self._run(order=[], denies={d: 1 for d in TCP_DEST.values()}, extra_receipts={"warmup_redirect": 1})
+        self.assertEqual(data["deny_log"]["reason"], "self-probe denial missing from deny log; "
+                         "outer receipt on non-verdict route(s) in an isolated mode: warmup_redirect=1")
+        data = self._run(order=[], extra_receipts={"diag_nav_direct": 1}, host_pids=[])
+        self.assertEqual(data["deny_log"]["reason"], "host pid not recorded; "
+                         "outer receipt on non-verdict route(s) in an isolated mode: diag_nav_direct=1")
+
+    def test_no_aux_receipt_keeps_self_check_passing(self) -> None:
+        data = self._run(order=[], denies=self._full_denies())
+        self.assertIs(data["deny_log"]["available"], True)
+        self.assertNotIn("auxiliary_outer_receipts", data)
+
+    def test_auxiliary_receipts_ignore_baseline_and_zero(self) -> None:
+        outer = {"diag_nav_direct": 3}
+        self.assertEqual(measure.auxiliary_outer_receipts("baseline", outer, 5), {})
+        self.assertEqual(measure.auxiliary_outer_receipts("seatbelt", {}, 0), {})
+        self.assertEqual(measure.auxiliary_outer_receipts("seatbelt", {}, None), {})
+        self.assertEqual(measure.auxiliary_outer_receipts("seatbelt", outer, "x"),
+                         {"warmup_redirect": 1, "diag_nav_direct": 3})
+        self.assertIsNone(measure.auxiliary_receipt_reason({}))
 
     def test_beacons_alone_are_not_evidence(self) -> None:
         order: list[str] = []

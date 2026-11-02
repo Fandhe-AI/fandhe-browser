@@ -395,20 +395,22 @@ class MeasureTest(unittest.TestCase):
             self.assertNotIn("--warmup", measure.build_argv("baseline", ports=ports, platform_name=plat, **kw))
         self.assertNotIn("--warmup", measure.build_argv("baseline", ports=base, platform_name="darwin", **kw))
 
-    def test_summary_shows_warmup_row_warning_and_note_without_changing_verdicts(self) -> None:
+    def test_summary_shows_warmup_row_and_self_check_failure_warning(self) -> None:
         inner = {"loads": {"redirect": {"ok": False, "kind": "load_failed"}},
                  "warmup_load": {"ok": False, "kind": "load_failed"},
                  "diag_loads": {}, "load_elapsed_ms": {"redirect": 120, "warmup_redirect": 90},
                  "host_alive_after_load": {}}
         mode = {"exit_code": 0, "inner": inner, "outer_counts": {"redirect": 0, "diag_nav_direct": 0},
-                "warmup": {"outer": 1, "deny": 2},
+                "warmup": {"outer": 1, "deny": 2}, "auxiliary_outer_receipts": {"warmup_redirect": 1},
                 "deny_log": {"dest_counts": {}, "diagnostic_dest_counts": {"redirect": 0}}, "verdicts": {}}
         results = {"meta": {"date_utc": "d", "kernel": "k", "host_sha256": "s", "host_version": "v",
                             "proxy_env_present": False},
                    "modes": {"baseline": {"outer_counts": {"img": 1, "diag_nav_direct": 1}}, "seatbelt": mode}}
         text = measure.summarize(results)
         self.assertIn("| warmup_redirect (warm-up) | 1 | 2 | load_failed | 90 |", text)
-        self.assertIn("WARNING: warm-up route has 1 outer receipt(s)", text)
+        self.assertIn("WARNING: warm-up route has 1 outer receipt(s) in an isolated mode; "
+                      "deny log self-check failed (fail-closed)", text)
+        self.assertIn("- auxiliary outer receipts (self-check failed): {'warmup_redirect': 1}", text)
         self.assertIn("warm-up deny rows=2, warm-up outer=1", measure.redirect_notes(mode)["redirect"])
         self.assertNotIn("warmup_redirect", mode["outer_counts"])
 
@@ -428,7 +430,8 @@ class MeasureTest(unittest.TestCase):
         self.assertIn("redirect diagnostics (not verdicts)", text)
         self.assertIn("| redirect | 0 | 3 | load_failed |", text)
         self.assertIn("| diag_nav_direct | 1 | 0 |", text)
-        self.assertIn("WARNING: diagnostic route diag_nav_direct has 1 outer receipt(s)", text)
+        self.assertIn("WARNING: diagnostic route diag_nav_direct has 1 outer receipt(s) in an isolated mode; "
+                      "deny log self-check failed (fail-closed)", text)
         notes = measure.redirect_notes(mode)
         self.assertIn("redirect load kind=load_failed in 120 ms", notes["redirect"])
 

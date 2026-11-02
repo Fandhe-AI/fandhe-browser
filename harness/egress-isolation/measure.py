@@ -118,6 +118,34 @@ def fixtures_warmup_route() -> str:
     return page_templates.WARMUP_ROUTE
 
 
+def auxiliary_outer_receipts(mode: str, outer: dict[str, int], warmup_outer: Any) -> dict[str, int]:
+    """隔離モードで外側に届いた予熱・診断経路の受信を `{経路名: 件数}` で返す（Issue #1422・TASK-38・RENDER-3）。
+
+    予熱（`warmup_redirect`）と診断（`diag_*`）は判定に入れない経路で、隔離が効いていれば外側へは届かない。
+    届いたなら穴が開いている疑いがあるため、`run_mode` が拒否ログの自己検査を不成立にする根拠に使う。
+    baseline は届くのが正常なので対象外。受信なしは含めない。件数が int 以外なら安全側（1 件扱い）に倒す。
+    """
+    if mode not in judge.ISOLATED_MODES:
+        return {}
+    res: dict[str, int] = {}
+    for r, c in ((fixtures_warmup_route(), warmup_outer),
+                 *((d, outer.get(d, 0)) for d in fixtures_diag_routes())):
+        if c is None:
+            continue
+        n = c if isinstance(c, int) and not isinstance(c, bool) else 1
+        if n >= 1:
+            res[r] = n
+    return res
+
+
+def auxiliary_receipt_reason(receipts: dict[str, int]) -> str | None:
+    """`auxiliary_outer_receipts` の結果から自己検査不成立の理由（英語・固定書式）を作る。空なら None。"""
+    if not receipts:
+        return None
+    return ("outer receipt on non-verdict route(s) in an isolated mode: "
+            + ", ".join(f"{r}={n}" for r, n in receipts.items()))
+
+
 def resolv_bind_args(resolv_file: Path) -> list[str]:
     """`/etc/resolv.conf` の実体の位置に固定の resolv.conf を重ねる bwrap 引数。
 
@@ -553,6 +581,8 @@ def run_mode(mode: str, *, host: Path, ports: dict[str, int], recs: dict[str, An
     # 予熱の受信は判定用の outer_counts に入れず別に残す（Issue #1415）。
     warmup_key = fixtures_warmup_route()
     warmup_outer = outer.pop(warmup_key, None)
+    aux_receipts = auxiliary_outer_receipts(mode, outer, warmup_outer)
+    aux_reason = auxiliary_receipt_reason(aux_receipts)
     result_path = out_dir / f"{mode}.json"
     # 内側ランナーが正常終了（0）または隔離 abort（2。理由つきの JSON を書く）した場合の今回の結果だけを使う。
     # それ以外の失敗は空 = 判定不能（合格にしない）。--out は空ディレクトリ検査済みで古い結果は混ざらない。
@@ -593,6 +623,9 @@ def run_mode(mode: str, *, host: Path, ports: dict[str, int], recs: dict[str, An
             "outer_counts": outer}
     if warmup_outer is not None:
         data["warmup"] = {"outer": warmup_outer}
+    if aux_receipts:
+        # inner が空で deny_log を作らない場合にも理由が残るよう、モード直下にも記録する（Issue #1422）。
+        data["auxiliary_outer_receipts"] = aux_receipts
     if mode == "seatbelt" and inner:
         dest = {r: f"{judge.IP_INTERNAL_STANDIN if r == 'internal' else judge.IP_BLOCKED}:{ports[r]}"
                 for r in ("redirect", "img", "fetch", "ws", "internal")}
@@ -602,6 +635,11 @@ def run_mode(mode: str, *, host: Path, ports: dict[str, int], recs: dict[str, An
         probe_ok, probe_why = seatbelt.self_check(denies, (inner.get("probes") or {}).get("udp_direct"), udp)
         if not probe_ok and status.get("available"):
             status = {**status, "available": False, "reason": probe_why}
+        if aux_reason:
+            # 予熱・診断経路への外側受信は穴の疑い。拒否ログを根拠にしない（fail-closed。Issue #1422）。
+            # 既に不成立なら理由を失わないよう連結する。
+            prev = status.get("reason")
+            status = {**status, "available": False, "reason": f"{prev}; {aux_reason}" if prev else aux_reason}
         mk = (status.get("diagnostics") or {}).get("match_kind") or {}
         wildcard_routes = sorted(r for r, d in (*dest.items(), ("udp_direct", udp))
                                  if status.get("available") and (mk.get(d) or {}).get(seatbelt.MATCH_KIND_WILDCARD))
@@ -711,10 +749,10 @@ def redirect_diag_block(mode: str, data: dict[str, Any], outer: dict[str, int]) 
         for r in fixtures_diag_routes():
             if outer.get(r, 0) >= 1:
                 out.append(f"- WARNING: diagnostic route {r} has {outer[r]} outer receipt(s) in an isolated mode; "
-                           "review for a possible real leak")
+                           "deny log self-check failed (fail-closed)")
     if wu is not None and mode in judge.ISOLATED_MODES and (wu.get("outer") or 0) >= 1:
         out.append(f"- WARNING: warm-up route has {wu['outer']} outer receipt(s) in an isolated mode; "
-                   "review for a possible real leak")
+                   "deny log self-check failed (fail-closed)")
     for key in ("unattributed_routes", "diagnostic_info_debug_dest_counts"):
         if key in dl:
             out.append(f"- {key}: {dl[key]}")
@@ -753,6 +791,8 @@ def summarize(results: dict[str, Any]) -> str:
                 safe = tail.replace("```", "'" * 3).replace("::", ": :")
                 lines += ["", f"{key} (last 2 KiB at most):", "", "```text", safe, "```"]
         lines.append(f"- guard: {inner.get('guard')}")
+        if data.get("auxiliary_outer_receipts"):
+            lines.append(f"- auxiliary outer receipts (self-check failed): {data['auxiliary_outer_receipts']}")
         if data.get("unavailable"):
             lines.append(f"- mode unavailable: {data['unavailable']}")
         ac = data.get("appcontainer")
