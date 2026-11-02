@@ -411,14 +411,13 @@ fn is_ipv6_site_local(v6: Ipv6Addr) -> bool {
 /// （CORE-1・RENDER-3・#1443。[`is_disallowed_address`] から呼ばれ、fetch と
 /// render の egress プロキシの双方に効く）。取り出し位置は形式ごとに次のとおり。
 /// - v4-mapped `::ffff:0:0/96`・IPv4 互換 `::/96`（RFC 4291）・NAT64 既知
-///   `64:ff9b::/96`（RFC 6052）・NAT64 ローカル用 `64:ff9b:1::/96` 形式（RFC 8215）:
-///   末尾 32 ビット
+///   `64:ff9b::/96`（RFC 6052）: 末尾 32 ビット
 /// - 6to4 `2002::/16`（RFC 3056）: ビット 16〜47
 /// - Teredo `2001::/32`（RFC 4380）: サーバー（ビット 32〜63）と、反転された
 ///   クライアント（末尾 32 ビット）の両方。どちらかが拒否対象なら拒否する
-/// - NAT64 ローカル用 `64:ff9b:1::/48` のうち上記 /96 形式でないもの: 運用者が
-///   /48〜/96 のどの長さでも使え IPv4 の位置がアドレスだけでは決まらないため、
-///   fail-closed で拒否する
+/// - NAT64 ローカル用 `64:ff9b:1::/48`（RFC 8215）: 運用者が /48〜/96 のどの長さでも
+///   使え IPv4 の位置がアドレスだけでは決まらない（`64:ff9b:1::800:0` は /96 なら
+///   公開 8.0.0.0、/64 なら内部 0.0.0.8）ため、/48 全体を fail-closed で拒否する
 fn is_disallowed_embedded_ipv4(v6: Ipv6Addr) -> bool {
     let [s0, s1, s2, s3, s4, s5, s6, s7] = v6.segments();
     let v4 = |hi: u16, lo: u16| Ipv4Addr::from((u32::from(hi) << 16) | u32::from(lo));
@@ -431,11 +430,8 @@ fn is_disallowed_embedded_ipv4(v6: Ipv6Addr) -> bool {
             return is_disallowed_ipv4(v4(s6, s7));
         }
         if s2 == 0x0001 {
-            return if s3 == 0 && s4 == 0 && s5 == 0 {
-                is_disallowed_ipv4(v4(s6, s7))
-            } else {
-                true
-            };
+            // ローカル用 /48 は丸ごと拒否（プレフィクス長が不定で IPv4 位置が決まらない）
+            return true;
         }
         return false;
     }
@@ -1412,6 +1408,8 @@ mod tests {
             "64:ff9b::c0a8:1",                      // NAT64 192.168.0.1
             "64:ff9b:1::a9fe:a9fe",                 // NAT64 ローカル用 /96 169.254.169.254
             "64:ff9b:1::a00:1",                     // NAT64 ローカル用 /96 10.0.0.1
+            "64:ff9b:1::800:0",                     // /96 では公開 8.0.0.0・/64 では内部 0.0.0.8
+            "64:ff9b:1::808:808",                   // ローカル用 /48 は公開に見えても拒否
             "64:ff9b:1:a9fe:a9:fe00::",             // NAT64 ローカル用 /48（曖昧・fail-closed）
             "64:ff9b:1:1::808:808",                 // 中間が 0 でない（fail-closed）
             "2002:7f00:1::",                        // 6to4 127.0.0.1
@@ -1438,7 +1436,6 @@ mod tests {
     fn core_1_is_disallowed_address_allows_embedded_global_ipv4() {
         for addr in [
             "64:ff9b::808:808",                     // NAT64 8.8.8.8
-            "64:ff9b:1::808:808",                   // NAT64 ローカル用 /96 8.8.8.8
             "2002:808:808::1",                      // 6to4 8.8.8.8
             "::808:808",                            // 互換 8.8.8.8
             "::ffff:808:808",                       // mapped 8.8.8.8
