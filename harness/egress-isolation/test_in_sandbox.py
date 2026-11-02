@@ -496,7 +496,7 @@ class MeasureTest(unittest.TestCase):
         argv = measure.build_argv("baseline", ports=base, platform_name="darwin", warmup_wait_ms=10000, **kw)
         self.assertEqual(argv[argv.index("--warmup-count") + 1], "0")
 
-    def test_summary_shows_warmup_row_warning_and_note_without_changing_verdicts(self) -> None:
+    def test_summary_shows_warmup_row_and_self_check_failure_warning(self) -> None:
         inner = {"loads": {"redirect": {"ok": False, "kind": "load_failed"}},
                  "warmup_loads": {"warmup_redirect_1": {"ok": False, "kind": "load_failed"},
                                   "warmup_redirect_2": {"ok": False, "kind": "load_failed"}},
@@ -512,7 +512,7 @@ class MeasureTest(unittest.TestCase):
                 "warmup": {"count": 2, "outer": 1, "deny": 2,
                            "per_route": {"warmup_redirect_1": {"outer": 0, "deny": 0},
                                          "warmup_redirect_2": {"outer": 1, "deny": 2}}},
-                "load_timeline": timeline,
+                "auxiliary_outer_receipts": {"warmup_redirect_2": 1}, "load_timeline": timeline,
                 "deny_log": {"dest_counts": {}, "diagnostic_dest_counts": {"redirect": 0},
                              "first_deny": {"index": 2, "route": "warmup_redirect_2", "start_ms": 3500,
                                             "missed_before": 1}}, "verdicts": {}}
@@ -522,7 +522,10 @@ class MeasureTest(unittest.TestCase):
         text = measure.summarize(results)
         self.assertIn("| warmup_redirect_1 (warm-up) | 0 | 0 | load_failed | 90 |", text)
         self.assertIn("| warmup_redirect_2 (warm-up) | 1 | 2 | load_failed | 80 |", text)
-        self.assertIn("WARNING: warm-up route has 1 outer receipt(s)", text)
+        self.assertIn("WARNING: warm-up route warmup_redirect_2 has 1 outer receipt(s) in an isolated mode; "
+                      "deny log self-check failed (fail-closed)", text)
+        self.assertNotIn("WARNING: warm-up route warmup_redirect_1", text)
+        self.assertIn("- auxiliary outer receipts (self-check failed): {'warmup_redirect_2': 1}", text)
         self.assertIn("| 2 | warmup_redirect_2 | warmup | 3500 | 80 | load_failed | 1 | 2 |", text)
         self.assertIn("- first deny: blocked load #2 (warmup_redirect_2) at 3500 ms; "
                       "1 earlier blocked load(s) had 0 deny rows", text)
@@ -564,7 +567,8 @@ class MeasureTest(unittest.TestCase):
         self.assertIn("redirect diagnostics (not verdicts)", text)
         self.assertIn("| redirect | 0 | 3 | load_failed |", text)
         self.assertIn("| diag_nav_direct | 1 | 0 |", text)
-        self.assertIn("WARNING: diagnostic route diag_nav_direct has 1 outer receipt(s)", text)
+        self.assertIn("WARNING: diagnostic route diag_nav_direct has 1 outer receipt(s) in an isolated mode; "
+                      "deny log self-check failed (fail-closed)", text)
         notes = measure.redirect_notes(mode)
         self.assertIn("redirect load kind=load_failed in 120 ms", notes["redirect"])
 
