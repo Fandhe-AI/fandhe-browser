@@ -217,7 +217,7 @@ Windows の補足（#1401）: `xos-measure.yml` の Windows ジョブに限り�
 | 1. GA の成立範囲 | Linux を先行（B: bwrap `--unshare-net`） | Linux（B: bwrap `--unshare-net`）と macOS（B: Seatbelt）を含める。根拠: macOS 26 の run 41401095620・41402439545 で、TCP 5 経路（redirect・img・fetch・ws・internal）と udp_direct が pass し、拒否ログの自己検査も成立した（予熱 5 回入り。#1415・#1424・#1425）。`dns`・`internal_real` は netns が前提の構造検査のため、macOS では対象外（unobservable） | 本番への組み込みは論点 4 |
 | 2. 既知の制約の文言（D）の置き場所 | 設計 §2.5 か README のどちらか（未定） | README「実装方針（要点）」と設計 §2.5 に置く | 文言は両者で同じ内容 |
 | 3. Windows の扱い | macOS・Windows の実測まで GA の成立範囲から外し、D の扱い | 引き続き D（既知の制約）とし、GA の成立範囲から外す。根拠: AppContainer 内で Servo ホストの陽性対照は成立した（`positive_ok: true`。run 41386861681・41402439545。#1413・#1420）。一方、Servo を使わない preflight で、capability なしでも loopback の外側 listener に届いた（loopback 免除を付けているため）。そのため全経路が「loopback listener では egress の遮断を測れない」理由で unobservable。測り直すには loopback 以外の宛先が要る | 測り方の検討は #1427。AppContainer 内の ipc-channel の制約は #1421 |
-| 4. 本番への組み込み | （新規の論点） | 本番の起動（`crates/fandhe-browser-render` の HostProcess）には、まだ OS 隔離が入っていない。§7 の承認事項（依存・`unsafe`）をオーナーに諮ってから、実装 issue を起票する | 実装 issue は未起票 |
+| 4. 本番への組み込み | （新規の論点） | #1436（PR #1446）で実装済み。HostProcess の起動を Linux は bwrap、macOS は sandbox-exec で包み、通信を本体の許可リスト付きプロキシに限る（`[rendering] egress_isolation`。既定 `best-effort`、`required` は隔離できなければ起動しない）。依存・`unsafe` を足さず外部コマンドで包む方式にしたため、§7 の承認事項のうち依存・`unsafe` を要する案は採っていない。隔離中は WebSocket が使えず（Servo の `websocket_loader` はプロキシを使わない）、v1 ではファイルシステムを隔離しない。実ホストでの検証は #1437 で `real_host` の `render3_egress_*`（`FANDHE_BROWSER_RENDER_EGRESS_ISOLATION=required`）に足し、xos-measure の suite `egress-host` で実測する（実行と記録はマージ後） | #1436・#1437 |
 
 - 「8 経路すべて pass」（§6.4）のうち `internal_real`・`dns` は構造検査で、Servo 自身の DNS・UDP 送信は外部から観測していない
 - AppContainer 内の ipc-channel の制約（ボディ付きリクエストで panic し得る）は推定で、未実測（#1421）
@@ -261,6 +261,11 @@ options §7 を引き継ぐ。本書で新たに加わる未確認事項は §9.
 | AppContainer 内の ipc-channel の制約（ボディ付きリクエストで panic し得る。推定・未実測） | #1421 |
 | Docker 内での bwrap の可否（イメージに bwrap が無い） | 未起票 |
 | Servo 自身の DNS・UDP 送信の外部観測（root か `CAP_NET_ADMIN` が要る） | 未起票 |
-| Landlock ルール適用下の動作・seccomp・許可リスト付きプロキシとの併用（netns 内の中継 → UDS → プロキシの成立性は §6.5 で確認済み。本番のプロキシは §7 の承認事項のまま） | §7 の承認事項 |
+| Landlock ルール適用下の動作・seccomp との併用（許可リスト付きプロキシは #1434・#1440・#1436 で本番に実装済み。netns 内の中継 → UDS → プロキシの成立性は §6.5 で確認済み） | 未起票 |
+| 実ホスト（GitHub の ubuntu・macOS runner）での隔離下の動作（xos-measure の `egress-host`。マージ後に実施し、結果は #1003 へ） | #1003 |
+| GitHub の ubuntu runner の AppArmor 下で bwrap が使えるか（`egress-host` の記録で確認） | 未起票 |
+| bwrap のファイルシステム隔離（`--ro-bind` 化。v1 は `--dev-bind / /`） | 未起票 |
+| 作業ディレクトリが `/run` 配下のときの扱い（`WorkDirHiddenBySandbox` で隔離不能になる） | 未起票 |
+| 隔離中の WebSocket（現状は遮断。必要なら proxy 経由の対応を別途検討） | 未起票 |
 | AppArmor の制限が無い環境・6.7 未満のカーネル | 未起票 |
 | net 層の直接接続の網羅 | options §7 の 1 |

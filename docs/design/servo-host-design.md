@@ -124,7 +124,7 @@ servo-host/
 ### 2.5 URL・セレクタの検証
 
 - URL はクライアントで送信前に検証し、ホストでも再検証する（二重化）。scheme は `http` / `https` のみ。`file:`・`data:`・`javascript:`・`about:` と userinfo は拒否。ループバック・プライベート IP・`localhost` は core の fetch と同じポリシー（`allow_private_network_access`、既定 false）に従う。
-- **既知の制約（残存リスク）**: 現時点では、Servo ホストの egress は OS で遮断されていない（本番の起動経路に OS 隔離は未実装）。Servo 内部のリダイレクト・サブリソース・DNS リバインディングは、URL の検証では防げない。GA では Linux・macOS で OS 隔離（B）を予定し、Windows は既知の制約（D）とする（オーナー判断 2026-11-02・#1003・TASK-38・`RENDER-3`）。方式の比較・実測・判断は [servo-host-egress-isolation.md](./servo-host-egress-isolation.md)（§8.1）を参照。
+- **既知の制約（残存リスク）**: Linux（bwrap）と macOS（sandbox-exec）では、`[rendering] egress_isolation` で Servo ホストを OS 隔離し、通信を本体の許可リスト付きプロキシに限る（#1436。`best-effort` が既定、`required` は隔離できなければ起動しない）。Windows は隔離できず既知の制約（D）とする（オーナー判断 2026-11-02・#1003・TASK-38・`RENDER-3`）。隔離していないとき（`best-effort` で隔離できなかった場合・Windows）は、Servo 内部のリダイレクト・サブリソース・DNS リバインディングを URL の検証では防げない。隔離中は WebSocket が使えず、v1 ではファイルシステムを隔離しない。macOS では loopback のプロキシに同じユーザーの他プロセスも届き、DNS の経路（mDNSResponder）は観測・遮断していない。実ホストでの検証は `real_host` の `render3_egress_*` と xos-measure の suite `egress-host`（#1437）。方式の比較・実測・判断は [servo-host-egress-isolation.md](./servo-host-egress-isolation.md)（§8.1）を参照。
 - 可視性・境界ボックスの取得に JS 評価を使う場合、セレクタは JSON エスケープした文字列リテラルとしてのみ埋め込み、連結しない。長さと文字種も検証する。取得手段（埋込 API のレイアウト取得か JS 評価か）は**未検証**で、実装 Issue の先頭ステップで確認する。
 
 ### 2.6 起動
