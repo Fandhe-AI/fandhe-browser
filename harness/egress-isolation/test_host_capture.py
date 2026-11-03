@@ -47,15 +47,18 @@ def make_index(servo=None, sockets=None, bwrap=True, netns=ISO_NS, ticks=3, end=
     for i in range(ticks):
         idx.feed({"type": "tick", "t": 100.2 + i * 0.2})
     if end:
-        idx.feed({"type": "end", "t": 101.0, "truncated": False, "reason": "stop"})
+        idx.feed({"type": "end", "t": 101.0, "truncated": False, "reason": "stop", "final_canary_t": 100.65})
     return idx
 
 
 CANARY_LINE = line(100.3, "lo", "Out", f"127.0.0.1.{CANARY} > 127.0.0.1.50000: UDP, length 26")
 # make_index の観測区間は [100.0, 100.6]。キャプチャがその終端以降まで続いている（区間を覆う）ことを示す後続パケット
+# サンプラーが停止時に送る最終カナリア（end 記録の final_canary_t=100.65 の直後）
+FINAL_CANARY_LINE = line(100.650100, "lo", "Out", f"127.0.0.1.{CANARY} > 127.0.0.1.50000: UDP, length 26")
 OUT_TCP = line(100.7, "eth0", "Out", "10.0.0.5.6000 > 8.8.8.8.443: Flags [S], seq 1, win 1000, length 0")
 
 
+EARLY_ACK = line(100.2, "eth0", "Out", "10.0.0.5.9998 > 8.8.8.8.443: Flags [.], ack 1, win 1, length 0")
 LATE_ACK = line(100.7, "eth0", "Out", "10.0.0.5.9999 > 8.8.8.8.443: Flags [.], ack 1, win 1, length 0")
 
 
@@ -130,7 +133,7 @@ class AttributionTests(unittest.TestCase):
                 line(100.3, "eth0", "Out", "10.0.0.5.5001 > 8.8.8.8.5353: UDP, length 5"),
                 line(100.3, "eth0", "Out", "10.0.0.5.6000 > 8.8.8.8.443: Flags [S], seq 1, win 1, length 0"),
                 line(100.3, "eth0", "Out", "10.0.0.5.7777 > 8.8.8.8.53: UDP, length 5"),
-                LATE_ACK,
+                FINAL_CANARY_LINE,
             ],
             idx,
         )
@@ -143,26 +146,26 @@ class AttributionTests(unittest.TestCase):
 
     def test_isolated_servo_packet_fails(self):
         socks = [{"proto": "udp", "port": 5000, "pid": 200, "role": hc.ROLE_ISOLATED}]
-        v = run([CANARY_LINE, OUT_TCP, line(100.3, "eth0", "Out", "10.0.0.5.5000 > 8.8.8.8.53: UDP, length 5")], make_index(sockets=socks))
+        v = run([CANARY_LINE, FINAL_CANARY_LINE, OUT_TCP, line(100.3, "eth0", "Out", "10.0.0.5.5000 > 8.8.8.8.53: UDP, length 5")], make_index(sockets=socks))
         self.assertEqual(v["verdict"], "fail")
         self.assertEqual(v["counts"][hc.ROLE_ISOLATED]["dns"], 1)
 
     def test_packet_outside_window_not_attributed(self):
         socks = [{"proto": "udp", "port": 5000, "pid": 200, "role": hc.ROLE_ISOLATED}]
-        v = run([CANARY_LINE, OUT_TCP, line(150.0, "eth0", "Out", "10.0.0.5.5000 > 8.8.8.8.53: UDP, length 5")], make_index(sockets=socks))
+        v = run([CANARY_LINE, FINAL_CANARY_LINE, OUT_TCP, line(150.0, "eth0", "Out", "10.0.0.5.5000 > 8.8.8.8.53: UDP, length 5")], make_index(sockets=socks))
         self.assertEqual(v["counts"][hc.ROLE_NONE]["dns"], 1)
         self.assertEqual(v["verdict"], "pass")
 
 
 class VerdictTests(unittest.TestCase):
     def ok(self, idx=None, lines=None, **kw):
-        return run(lines if lines is not None else [CANARY_LINE, OUT_TCP], idx or make_index(), **kw)
+        return run(lines if lines is not None else [CANARY_LINE, FINAL_CANARY_LINE, OUT_TCP], idx or make_index(), **kw)
 
     def test_pass(self):
         v = self.ok()
         self.assertEqual(v["verdict"], "pass", v)
         self.assertEqual(v["servo_pids"], {"isolated": 1, "unisolated": 0})
-        self.assertEqual(v["canary"], {"port": CANARY, "seen": 1, "attributed_to_self": 1, "in_servo_window": 1})
+        self.assertEqual(v["canary"], {"port": CANARY, "seen": 2, "attributed_to_self": 2, "in_servo_window": 1})
         self.assertIn("**pass**", hc.render_summary(v))
 
     def test_bwrap_with_same_netns_fails(self):
@@ -176,7 +179,7 @@ class VerdictTests(unittest.TestCase):
         for t, ns in ((100.0, first_ns), (100.4, second_ns)):
             idx.feed({"type": "sample", "t": t, "servo": [{"pid": 200, "bwrap": True, "netns": ns}], "sockets": [canary]})
         idx.feed({"type": "tick", "t": 100.6})
-        idx.feed({"type": "end", "t": 101.0, "truncated": False, "reason": "stop"})
+        idx.feed({"type": "end", "t": 101.0, "truncated": False, "reason": "stop", "final_canary_t": 100.65})
         return idx
 
     def test_same_pid_isolated_first_then_shared_netns_fails(self):
@@ -211,7 +214,7 @@ class VerdictTests(unittest.TestCase):
         self.assertEqual(self.ok(make_index(servo=[]))["verdict"], "unobservable")
 
     def test_no_samples_is_unobservable(self):
-        v = run([CANARY_LINE, OUT_TCP], hc.SampleIndex())
+        v = run([CANARY_LINE, FINAL_CANARY_LINE, OUT_TCP], hc.SampleIndex())
         self.assertEqual(v["verdict"], "unobservable")
 
     def test_no_nonlo_packets_is_unobservable(self):
@@ -241,12 +244,13 @@ class VerdictTests(unittest.TestCase):
 
     def test_lo_in_canary_is_observed(self):
         canary_in = line(100.3, "lo", "In", f"127.0.0.1.{CANARY} > 127.0.0.1.50000: UDP, length 26")
-        v = run([canary_in, OUT_TCP], make_index())
+        final_in = line(100.650200, "lo", "In", f"127.0.0.1.{CANARY} > 127.0.0.1.50000: UDP, length 26")
+        v = run([canary_in, final_in, OUT_TCP], make_index())
         self.assertEqual(v["verdict"], "pass")
 
     def test_convert_failure_and_drops_are_unobservable(self):
         for kw in ({"convert_exit": 1}, {"convert_exit": None}, {"kernel_dropped": 2}, {"kernel_dropped": None}):
-            v = run([CANARY_LINE, OUT_TCP], make_index(), **kw)
+            v = run([CANARY_LINE, FINAL_CANARY_LINE, OUT_TCP], make_index(), **kw)
             self.assertEqual(v["verdict"], "unobservable", kw)
 
     def test_fail_takes_precedence_over_unobservable(self):
@@ -258,13 +262,13 @@ class IoTests(unittest.TestCase):
     def test_judge_command_writes_verdict_and_returns_exit_code(self):
         with tempfile.TemporaryDirectory() as d:
             out = Path(d)
-            (out / "capture.txt").write_text(CANARY_LINE + "\n" + OUT_TCP + "\n")
+            (out / "capture.txt").write_text(CANARY_LINE + "\n" + FINAL_CANARY_LINE + "\n" + OUT_TCP + "\n")
             recs = [
                 {"type": "meta", "self_netns": SELF_NS, "canary_port": CANARY, "pid": 10},
                 {"type": "sample", "t": 100.0, "servo": [{"pid": 200, "bwrap": True, "netns": ISO_NS}],
                  "sockets": [{"proto": "udp", "port": CANARY, "pid": 10, "role": "self"}]},
                 {"type": "tick", "t": 100.5},
-                {"type": "end", "t": 101.0, "truncated": False, "reason": "stop"},
+                {"type": "end", "t": 101.0, "truncated": False, "reason": "stop", "final_canary_t": 100.65},
             ]
             (out / "samples.jsonl").write_text("\n".join(json.dumps(r) for r in recs) + "\n")
             (out / "tcpdump.exit").write_text("0\n")
@@ -479,13 +483,13 @@ class SelfNetnsTests(unittest.TestCase):
         )
         for i in range(3):
             idx.feed({"type": "tick", "t": 100.2 + i * 0.2})
-        idx.feed({"type": "end", "t": 101.0, "truncated": False, "reason": "stop"})
+        idx.feed({"type": "end", "t": 101.0, "truncated": False, "reason": "stop", "final_canary_t": 100.65})
         return idx
 
     def test_servo_netns_is_not_isolated_when_self_netns_unknown(self):
         idx = self._idx(None)
         self.assertFalse(idx.servo[200]["isolated_seen"])
-        v = run([CANARY_LINE, OUT_TCP], idx)
+        v = run([CANARY_LINE, FINAL_CANARY_LINE, OUT_TCP], idx)
         self.assertEqual(v["verdict"], "unobservable")
         self.assertTrue(any("netns of the sampler" in r for r in v["unobservable_reasons"]))
         self.assertEqual(v["servo_pids"], {"isolated": 0, "unisolated": 1})
@@ -493,7 +497,7 @@ class SelfNetnsTests(unittest.TestCase):
     def test_known_self_netns_still_isolates_by_netns_difference(self):
         idx = self._idx(SELF_NS)
         self.assertTrue(idx.servo[200]["isolated_seen"])
-        self.assertEqual(run([CANARY_LINE, OUT_TCP], idx)["verdict"], "pass")
+        self.assertEqual(run([CANARY_LINE, FINAL_CANARY_LINE, OUT_TCP], idx)["verdict"], "pass")
 
 class UdpHintTests(unittest.TestCase):
     def test_suspicious_udp_text_truth_table(self):
@@ -512,17 +516,17 @@ class UdpHintTests(unittest.TestCase):
         self.assertEqual((udp["proto"], udp["udp_hint"]), ("udp", False))
 
     def test_single_udp_like_unparsed_line_is_unobservable(self):
-        v = run([CANARY_LINE, OUT_TCP], make_index(), unparsed=1, unparsed_udp_like=1, total_lines=1000)
+        v = run([CANARY_LINE, FINAL_CANARY_LINE, OUT_TCP], make_index(), unparsed=1, unparsed_udp_like=1, total_lines=1000)
         self.assertEqual(v["verdict"], "unobservable")
         self.assertEqual(v["unparsed_udp_like"], 1)
         self.assertIn("1 unparsed packet line(s) look like UDP/DNS", v["unobservable_reasons"])
         # 痕跡の無い解析不能行は従来の許容枠のまま
-        v = run([CANARY_LINE, OUT_TCP], make_index(), unparsed=5, unparsed_udp_like=0, total_lines=100)
+        v = run([CANARY_LINE, FINAL_CANARY_LINE, OUT_TCP], make_index(), unparsed=5, unparsed_udp_like=0, total_lines=100)
         self.assertEqual(v["verdict"], "pass", v)
 
     def test_single_other_proto_udp_like_packet_is_unobservable(self):
         frag = line(100.5, "eth0", "Out", "10.0.0.5 > 8.8.8.8: ip-proto-17, length 40")
-        v = run([CANARY_LINE, OUT_TCP, frag], make_index())
+        v = run([CANARY_LINE, FINAL_CANARY_LINE, OUT_TCP, frag], make_index())
         self.assertEqual(v["verdict"], "unobservable")
         self.assertEqual(v["other_udp_like"], 1)
         self.assertTrue(any("1 packet(s) with unknown protocol look like UDP/DNS" in r for r in v["unobservable_reasons"]))
@@ -547,14 +551,39 @@ class UdpHintTests(unittest.TestCase):
 
 
 class CoverageTests(unittest.TestCase):
-    def test_capture_ending_before_last_servo_sample_is_unobservable(self):
-        early = line(100.5, "eth0", "Out", "10.0.0.5.6000 > 8.8.8.8.443: Flags [S], seq 1, win 1000, length 0")
-        v = run([CANARY_LINE, early], make_index())
+    def test_final_canary_after_last_sample_passes(self):
+        v = run([EARLY_ACK, CANARY_LINE, FINAL_CANARY_LINE], make_index())
+        self.assertEqual(v["verdict"], "pass", v)
+
+    def test_runner_traffic_after_last_sample_without_final_canary_is_unobservable(self):
+        # 最後のパケットが Servo の最後のサンプル（100.6）より後でも、runner の通常通信は終端の証拠にならない（#1470 の回帰）
+        v = run([CANARY_LINE, OUT_TCP, LATE_ACK], make_index())
         self.assertEqual(v["verdict"], "unobservable")
         self.assertTrue(
-            any(r.startswith("capture ended before the last Servo sample (last packet ts=100.5, servo last=100.6") for r in v["unobservable_reasons"]),
+            any(r.startswith("final canary not observed after the last Servo sample (final_canary_t=100.65, servo last=100.6") for r in v["unobservable_reasons"]),
             v["unobservable_reasons"],
         )
+
+    def test_regular_canary_before_final_canary_t_is_not_the_final_canary(self):
+        v = run([CANARY_LINE, OUT_TCP], make_index())
+        self.assertEqual(v["verdict"], "unobservable")
+
+    def test_end_record_without_final_canary_t_is_unobservable(self):
+        idx = make_index(end=False)
+        idx.feed({"type": "end", "t": 101.0, "truncated": False, "reason": "stop"})
+        v = run([CANARY_LINE, FINAL_CANARY_LINE, OUT_TCP], idx)
+        self.assertEqual(v["verdict"], "unobservable")
+        self.assertTrue(any("no final_canary_t" in r for r in v["unobservable_reasons"]), v["unobservable_reasons"])
+        idx = make_index(end=False)
+        idx.feed({"type": "end", "t": 101.0, "truncated": False, "reason": "stop", "final_canary_t": None})
+        self.assertEqual(run([CANARY_LINE, FINAL_CANARY_LINE], idx)["verdict"], "unobservable")
+
+    def test_quiet_period_after_last_sample_with_only_final_canary_passes(self):
+        # 今回の現象の回帰: Servo の最後のサンプルの後はカナリア以外に通信が無い。パケットの最終時刻が観測区間の終端より
+        # 前でも（通常のカナリア 100.3 と最終カナリア 100.6501 だけ）、最終カナリアが入っていれば pass
+        v = run([EARLY_ACK, CANARY_LINE, FINAL_CANARY_LINE], make_index())
+        self.assertEqual(v["verdict"], "pass", v)
+        self.assertEqual(v["canary"]["attributed_to_self"], 2)
 
     def test_canary_outside_servo_window_is_unobservable(self):
         out_win = [
@@ -568,14 +597,14 @@ class CoverageTests(unittest.TestCase):
         self.assertEqual(v["verdict"], "unobservable", v)
         self.assertEqual(v["canary"]["in_servo_window"], 0)
         self.assertIn("canary not observed within the Servo observation window", v["unobservable_reasons"])
-        v = run([CANARY_LINE, OUT_TCP], make_index())
+        v = run([CANARY_LINE, FINAL_CANARY_LINE, OUT_TCP], make_index())
         self.assertEqual(v["verdict"], "pass", v)
         self.assertEqual(v["canary"]["in_servo_window"], 1)
 
     def test_malformed_sample_line_is_unobservable(self):
         idx = make_index()
         idx.bad_lines = 1
-        v = run([CANARY_LINE, OUT_TCP], idx)
+        v = run([CANARY_LINE, FINAL_CANARY_LINE, OUT_TCP], idx)
         self.assertEqual(v["verdict"], "unobservable")
         self.assertIn("1 malformed sample line(s)", v["unobservable_reasons"])
 
@@ -593,12 +622,12 @@ class CoverageTests(unittest.TestCase):
             with mock.patch.object(hc, "MAX_SAMPLES", 2):
                 idx = hc.load_samples(f)
         self.assertEqual(idx.lines_over_limit, 3)
-        v = run([CANARY_LINE, OUT_TCP], idx)
+        v = run([CANARY_LINE, FINAL_CANARY_LINE, OUT_TCP], idx)
         self.assertEqual(v["verdict"], "unobservable")
         self.assertTrue(any("samples file exceeded the line limit (3 line(s) not read)" in r for r in v["unobservable_reasons"]))
 
     def test_packet_limit_counts_unparsed_lines(self):
-        v = run([CANARY_LINE, OUT_TCP], make_index(), max_packets=3, unparsed=1, total_lines=3)
+        v = run([CANARY_LINE, FINAL_CANARY_LINE, OUT_TCP], make_index(), max_packets=3, unparsed=1, total_lines=3)
         self.assertEqual(v["verdict"], "unobservable")
         self.assertIn("capture reached the packet limit (3)", v["unobservable_reasons"])
 
@@ -629,12 +658,14 @@ class FinalCanaryTests(unittest.TestCase):
             recs = [json.loads(x) for x in out.read_text().splitlines()]
         self.assertEqual(recs[-1]["type"], "end")
         self.assertEqual(sent, [hc._CANARY_PAYLOAD])
+        self.assertIsInstance(recs[-1]['final_canary_t'], float)
+        self.assertLessEqual(recs[-1]['final_canary_t'], recs[-1]['t'])
 
 
 class UnattributedWindowTests(unittest.TestCase):
     def test_packet_outside_window_not_counted_in_window(self):
         out = line(150.0, "eth0", "Out", "10.0.0.5.5000 > 8.8.8.8.53: UDP, length 5")
-        v = run([CANARY_LINE, OUT_TCP, out], make_index())
+        v = run([CANARY_LINE, FINAL_CANARY_LINE, OUT_TCP, out], make_index())
         self.assertEqual(v["counts"][hc.ROLE_NONE]["dns"], 1)
         u = v["unattributed_in_servo_window"]
         self.assertEqual((u["dns"], u["udp_other"], u["destinations"]), (0, 0, []))
@@ -642,7 +673,7 @@ class UnattributedWindowTests(unittest.TestCase):
         self.assertAlmostEqual(u["window"][1], 100.6)
 
     def test_destinations_are_cut_to_top_n(self):
-        lines = [CANARY_LINE, OUT_TCP]
+        lines = [CANARY_LINE, FINAL_CANARY_LINE, OUT_TCP]
         for i in range(11):
             lines.append(line(100.3, "eth0", "Out", f"10.0.0.5.{5000 + i} > 9.9.9.{i + 1}.53: UDP, length 5"))
         lines.append(line(100.3, "eth0", "Out", "10.0.0.5.5999 > 9.9.9.1.53: UDP, length 5"))
@@ -655,7 +686,7 @@ class UnattributedWindowTests(unittest.TestCase):
 
     def test_unattributed_dns_keeps_verdict_pass_and_is_summarized(self):
         dns = line(100.3, "eth0", "Out", "10.0.0.5.5000 > 8.8.8.8.53: UDP, length 5")
-        v = run([CANARY_LINE, OUT_TCP, dns], make_index())
+        v = run([CANARY_LINE, FINAL_CANARY_LINE, OUT_TCP, dns], make_index())
         self.assertEqual(v["verdict"], "pass", v)
         u = v["unattributed_in_servo_window"]
         self.assertEqual((u["dns"], u["udp_other"]), (1, 0))
@@ -668,13 +699,13 @@ class UnattributedWindowTests(unittest.TestCase):
     def test_loopback_stub_dns_is_counted_in_window(self):
         out = line(100.3, "lo", "Out", "127.0.0.1.4000 > 127.0.0.53.53: UDP, length 5")
         inn = line(100.4, "lo", "In", "127.0.0.1.4001 > 127.0.0.53.53: UDP, length 5")
-        v = run([CANARY_LINE, OUT_TCP, out, inn], make_index())
+        v = run([CANARY_LINE, FINAL_CANARY_LINE, OUT_TCP, out, inn], make_index())
         u = v["unattributed_in_servo_window"]
         self.assertEqual((u["dns"], u["udp_other"]), (2, 0))
         self.assertEqual(u["destinations"], [{"dst": "127.0.0.53", "dport": 53, "count": 2}])
 
     def test_zero_count_line_is_still_in_summary(self):
-        v = run([CANARY_LINE, OUT_TCP], make_index())
+        v = run([CANARY_LINE, FINAL_CANARY_LINE, OUT_TCP], make_index())
         summary = hc.render_summary(v)
         self.assertIn("within the isolated Servo window [100.000..100.600]: dns=0 udp_other=0", summary)
         self.assertIn("| none | | |", summary)

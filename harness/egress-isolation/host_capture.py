@@ -64,6 +64,8 @@ MAX_PACKET_LINE_CHARS = 1024
 DEFAULT_MAX_PACKETS = 300_000
 UNATTRIBUTED_TOP_N = 10
 ATTRIBUTION_WINDOW_SECONDS = 0.5
+# final_canary_t と pcap 上の時刻（マイクロ秒切り捨て）の比較に許す下駄（秒）。
+FINAL_CANARY_EPSILON_SECONDS = 0.001
 UNPARSED_RATIO_LIMIT = 0.01
 UNPARSED_MIN = 10
 MIN_CANARY_SAMPLES = 3
@@ -341,7 +343,7 @@ def judge(
     """verdict（"pass" / "fail" / "unobservable"）・理由・件数を返す。観測不能を合格にしない（fail-closed）。
 
     観測しきれていないものは unobservable にする: 解析できない行・proto=other の行に UDP・DNS の痕跡がある、
-    キャプチャが Servo の最後のサンプルより前に終わっている、カナリアが Servo の観測区間内に無い、sample 行の欠損。
+    最終カナリア（end 記録の final_canary_t 以降のサンプラー帰属カナリア）が観測されない、カナリアが Servo の観測区間内に無い、sample 行の欠損。
     帰属できない DNS・UDP は verdict に使わず、観測区間内の件数・宛先上位を記録する（#1457 案 A）。
     """
     fails: list[str] = []
@@ -355,15 +357,22 @@ def judge(
     ifaces: set[str] = set()
     window = index.isolated_window()
     canary_in_window = 0
+    canary_after_last = 0
+    final_canary_t = index.end.get("final_canary_t") if index.end else None
+    if isinstance(final_canary_t, bool) or not isinstance(final_canary_t, (int, float)):
+        final_canary_t = None
+    # pcap の時刻表記（マイクロ秒切り捨て）との差を吸収する下駄。通常カナリア（2 秒間隔）を最終扱いしない幅に留める。
+    after_threshold: float | None = None
+    if final_canary_t is not None:
+        after_threshold = float(final_canary_t) - FINAL_CANARY_EPSILON_SECONDS
+        if window is not None:
+            after_threshold = max(after_threshold, window[1])
     other_udp_like = 0
-    max_ts: float | None = None
     win_counts = {"dns": 0, "udp_other": 0}
     win_dests: Counter = Counter()
 
     for pkt in packets:
         packet_total += 1
-        if max_ts is None or pkt["ts"] > max_ts:
-            max_ts = pkt["ts"]
         if pkt.get("proto") == "other" and pkt.get("udp_hint"):
             other_udp_like += 1
         if pkt["iface"] != "lo" and pkt["dir"] == "Out":
@@ -381,6 +390,8 @@ def judge(
                 canary_ok += 1
                 if window is not None and window[0] <= pkt["ts"] <= window[1]:
                     canary_in_window += 1
+                if after_threshold is not None and pkt["ts"] >= after_threshold:
+                    canary_after_last += 1
         cat = count_category(pkt)
         if cat is None:
             continue
@@ -462,11 +473,14 @@ def judge(
         unobs.append(f"{index.bad_lines} malformed sample line(s)")
     if index.lines_over_limit:
         unobs.append(f"samples file exceeded the line limit ({index.lines_over_limit} line(s) not read)")
+    if index.end is not None and final_canary_t is None:
+        unobs.append("sampler end record has no final_canary_t (the final canary was not sent)")
+    elif final_canary_t is not None and canary_after_last == 0:
+        unobs.append(
+            f"final canary not observed after the last Servo sample (final_canary_t={final_canary_t}, "
+            f"servo last={window[1] if window is not None else None}); capture may have stopped early"
+        )
     if window is not None:
-        if max_ts is None or max_ts < window[1]:
-            unobs.append(
-                f"capture ended before the last Servo sample (last packet ts={max_ts}, servo last={window[1]})"
-            )
         if canary_ok > 0 and canary_in_window == 0:
             unobs.append("canary not observed within the Servo observation window")
 
@@ -946,6 +960,29 @@ def run_sampler(
             fh.write(line)
             fh.flush()
 
+        def do_sample() -> None:
+            nonlocal prev
+            try:
+                while True:
+                    recv.recvfrom(256)
+            except (BlockingIOError, OSError):
+                pass
+            servo, sockets, limits = take_sample(servo_exe, self_pid, self_netns)
+            for lim in limits:
+                _mark(lim)
+            if len(sockets) > MAX_SOCKETS_PER_SAMPLE:
+                sockets = sockets[:MAX_SOCKETS_PER_SAMPLE]
+                _mark("sockets-per-sample-limit")
+            state = (
+                tuple((s["pid"], s["bwrap"], s["netns"]) for s in servo),
+                tuple((s["proto"], s["port"], s["pid"], s["role"]) for s in sockets),
+            )
+            if state != prev:
+                emit({"type": "sample", "t": time.time(), "servo": servo, "sockets": sockets})
+                prev = state
+            else:
+                emit({"type": "tick", "t": time.time()})
+
         emit(
             {
                 "type": "meta",
@@ -974,35 +1011,34 @@ def run_sampler(
                 except OSError:
                     pass
                 next_canary = now + 2.0
-            try:
-                while True:
-                    recv.recvfrom(256)
-            except (BlockingIOError, OSError):
-                pass
-            servo, sockets, limits = take_sample(servo_exe, self_pid, self_netns)
-            for lim in limits:
-                _mark(lim)
-            if len(sockets) > MAX_SOCKETS_PER_SAMPLE:
-                sockets = sockets[:MAX_SOCKETS_PER_SAMPLE]
-                _mark("sockets-per-sample-limit")
-            state = (
-                tuple((s["pid"], s["bwrap"], s["netns"]) for s in servo),
-                tuple((s["proto"], s["port"], s["pid"], s["role"]) for s in sockets),
-            )
-            if state != prev:
-                emit({"type": "sample", "t": time.time(), "servo": servo, "sockets": sockets})
-                prev = state
-            else:
-                emit({"type": "tick", "t": time.time()})
+            do_sample()
             n += 1
             time.sleep(interval)
-        # 停止直前に最後のカナリアを送る。workflow はサンプラー停止後に tcpdump を止めるため、このカナリアが
-        # Servo の最後のサンプルより後に記録され、judge が「キャプチャ区間が観測区間を覆う」ことを確かめられる。
+        # 停止要求の後、最後に 1 回だけ実サンプルを取ってから最終カナリアを送る。カナリアのソケットの存在区間が
+        # 最終カナリアまで続くため、judge が自己帰属として数えられる。送信直前の時刻を final_canary_t として
+        # end 記録に残す（pcap 上の時刻は送信後なので、これ以上になる）。judge は Servo の最後のサンプル以降に
+        # final_canary_t 以降のカナリアが観測されたことで「キャプチャが観測区間の終端を覆う」ことを確かめる
+        # （#1470 の回帰。終端を runner の通常通信ではなく自前のカナリアで確かめる。#1473 P3 の一部）。
+        # workflow は end 記録を確認した後、有界の猶予を置いてから tcpdump を止める。
+        do_sample()
+        n += 1
+        final_canary_t: float | None = None
+        t_before = time.time()
         try:
             send.sendto(_CANARY_PAYLOAD, recv_addr)
+            final_canary_t = t_before
         except OSError:
             pass
-        emit({"type": "end", "t": time.time(), "truncated": truncated, "reason": reason, "samples": n})
+        emit(
+            {
+                "type": "end",
+                "t": time.time(),
+                "truncated": truncated,
+                "reason": reason,
+                "samples": n,
+                "final_canary_t": final_canary_t,
+            }
+        )
     recv.close()
     send.close()
     return 0
