@@ -670,7 +670,17 @@ mod tests {
         let mut buf = [0u8; 1];
         assert_eq!(client.read(&mut buf).unwrap(), 0);
         let mut peer = peer_rx.recv_timeout(Duration::from_secs(2)).unwrap();
-        peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        // macOS は相手（handle 側）が既に閉じたソケットへの setsockopt が EINVAL
+        // （InvalidInput）を返す。ここへ来た時点で相手側は閉じ済みなので、この種別だけ
+        // 許容し、それ以外のエラーは従来どおり panic させる。以降の read が EOF（0）を
+        // 返すことの検証は維持する。
+        if let Err(e) = peer.set_read_timeout(Some(Duration::from_secs(5))) {
+            assert_eq!(
+                e.kind(),
+                io::ErrorKind::InvalidInput,
+                "unexpected error: {e}"
+            );
+        }
         assert_eq!(peer.read(&mut buf).unwrap(), 0);
         assert_eq!(active.load(Ordering::SeqCst), 0);
     }
