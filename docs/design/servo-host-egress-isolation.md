@@ -250,7 +250,7 @@ options §7 を引き継ぐ。本書で新たに加わる未確認事項は §9.
 - Ubuntu の AppArmor 制限（`kernel.apparmor_restrict_unprivileged_userns=1`）下での netns の作り方: 特権なしの `unshare -n`・`unshare -rn` は EPERM、`bwrap --unshare-net` は成功。ns 内に `CAP_NET_ADMIN` は無い
 - Landlock の対応: カーネル 7.0.0-34 で LSM に有効・ABI 8（問い合わせのみ）
 - 現在のコミットのホストでの再測定: c56f11c2 の dev ビルドで測り、bwrap `--unshare-net` は 8 経路すべて pass
-- GitHub の ubuntu runner の AppArmor 下で bwrap が使えるか: 使える。PR #1456 の CI ログ（`rust-test-ubuntu`・Ubuntu 26.04 image）に `egress isolation probe: bwrap available` が出た（#1458）
+- GitHub の ubuntu runner の AppArmor 下で bwrap が使えるか: Ubuntu 26.04 image の runner では使える（根拠は PR #1456 の同 image の CI ログだけで、他の image・AppArmor の設定は未確認）。同ログ（`rust-test-ubuntu`）に `egress isolation probe: bwrap available` が出た（#1458）
 - docker `--network none` の判定（配布コンテナとホストの glibc をそろえた同一バイナリ。#1386）: 8 経路すべて pass（§6.4）
 
 ### 9.2 残る未確認事項と追跡先
@@ -265,7 +265,6 @@ options §7 を引き継ぐ。本書で新たに加わる未確認事項は §9.
 | Landlock ルール適用下の動作・seccomp との併用（許可リスト付きプロキシは #1434・#1440・#1436 で本番に実装済み。netns 内の中継 → UDS → プロキシの成立性は §6.5 で確認済み） | #1457 |
 | 実ホスト（GitHub の ubuntu・macOS runner）での隔離下の動作（xos-measure の `egress-host`。マージ後に実施し、結果は #1003 へ） | #1003 |
 | bwrap のファイルシステム隔離（`--ro-bind` 化。v1 は `--dev-bind / /`） | #1457 |
-| 作業ディレクトリが `/run` 配下のときの扱い（`WorkDirHiddenBySandbox` で隔離不能になる） | #1457 |
 | 隔離中の WebSocket（現状は遮断。必要なら proxy 経由の対応を別途検討） | #1457 |
 | AppArmor の制限が無い環境・6.7 未満のカーネル | #1457 |
 | net 層の直接接続の網羅 | options §7 の 1 |
@@ -277,3 +276,8 @@ options §7 を引き継ぐ。本書で新たに加わる未確認事項は §9.
 - Linux: FS を隔離しない（`--dev-bind / /`）ため、FS 上の UDS（ssh-agent・X11・gnupg・同じ uid の他インスタンスのプロキシの UDS 等）を通る迂回が残る。
 - macOS: Seatbelt は IP の送信だけを絞る。mach/XPC 経由の通信は止めない。観測したのは `mDNSResponder` 経由の経路だけで、それ以外は観測していない。
 - 測定（#1433）は `--ro-bind / /` で行ったが、本番は `--dev-bind / /` である。そのため、測定は本番の FS 上の UDS の迂回を覆っていない。
+
+### 9.4 判断済みの事項（#1459）
+
+- プローブの判定方法（2026-11-03）: Linux のプローブは終了コードに加えて、サンドボックス内の `readlink /proc/self/ns/net` の出力（netns の inode）が本体の値と異なることまで確かめる。exit 0 だけの偽物や、ns を作らない偽物は失敗する。詳細は `isolation.rs` の doc を正とする。
+- 作業ディレクトリが `/run` 配下のときの扱い（2026-11-03）: `WorkDirHiddenBySandbox` で隔離不能とする fail-closed のまま変えない。回避策は `/run` の外を `temp_root` または `TMPDIR` に指定すること。挙動は `isolation.rs` の doc を正とする。

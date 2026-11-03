@@ -34,6 +34,11 @@
 //! - macOS の Seatbelt は `(allow default)` で、絞るのは IP の送信だけ。mach/XPC 経由の通信
 //!   （他のデーモンを介した通信）は止めない。DNS 経路（mDNSResponder 経由の名前解決・DNS
 //!   トンネリング）も同じ理由で観測・遮断していない。
+//! - WorkDir（`HostProcessConfig::temp_root`。既定は `TMPDIR`）が正規化後に `/run` 配下だと
+//!   （例: `TMPDIR=/run/user/<uid>`）`--tmpfs /run` に隠れて UDS に届かないため、隔離できないと
+//!   判定する（`required` は起動を拒否し、`best-effort` は警告つきで隔離なしで起動する）。これは
+//!   意図した fail-closed で変えない（#1457・#1459）。回避策は `/run` の外を `temp_root` または
+//!   `TMPDIR` に指定すること。
 //! - 識別面（UA・ヘッダ・環境変数）は変えない（SEC-2）。プロキシはバイト列を改変しない。
 //! - 外部コマンドは固定の絶対パス候補から選ぶ（PATH は使わない）。
 //! - pid 名前空間の中の pid 1 は bwrap の init 役で、外から見たプロセスツリーは
@@ -69,12 +74,18 @@ pub const RELAY_UDS_PATH_MAX_BYTES: usize = 100;
 /// 書き込める運用（Linuxbrew 等）があるため含めない。候補は [`trusted_realpath`] で実体パスに解決し、
 /// 実体ファイルと `/` までの全祖先が root 所有・group / other 書き込み不可であることを確かめる。
 /// bwrap の以後の probe・exec はその実体パスを使う（判定と exec のパスを一致させる。bwrap は
-/// multicall ではない）。試走用の `true` だけは候補パスで exec する（[`TRUE_CANDIDATES`]）。
+/// multicall ではない）。試走用の `readlink` だけは候補パスで exec する（[`READLINK_CANDIDATES`]）。
 ///
-/// 残余リスク（RENDER-3。未対応）: 信頼判定を通った実行ファイルが bwrap 互換かは、プローブ
-/// （本番と同じフラグでの試走の終了コード）でしか確かめない。引数を無視して exit 0 する
-/// root 所有コマンドは成功してしまう。プローブで「外へ出られないこと」まで実測する対策は
-/// 未起票の残課題として #1457 で追跡する。bwrap が Nix 等の root 所有でない場所にある環境は
+/// プローブは、サンドボックス内の `readlink /proc/self/ns/net` の出力を本体の値と比べ、ネット
+/// ワーク名前空間が**異なるときだけ**成功とする（RENDER-3・#1459。終了コードだけを見ると、引数を
+/// 無視して exit 0 する root 所有コマンドを隔離できたと誤認する）。exit 0 だけの偽物は出力が空、
+/// ns を作らず中身だけ実行する偽物は inode が同じなので、どちらも失敗する。`--unshare-net` で
+/// 作った netns には `lo` しかないため、別の netns にいることが「外部への出口が無い」ことの
+/// 十分条件になる。`/sys/class/net` は `--dev-bind / /` でホストの sysfs が見えるため判定に使えない。
+///
+/// 残る限界: root 所有の候補パスを差し替えられる攻撃者（それらしい別の inode を出力する悪意ある
+/// バイナリを置ける者）は脅威モデルの外にある（その権限があれば隔離そのものを外せる）。
+/// bwrap が Nix 等の root 所有でない場所にある環境は
 /// `SandboxToolUntrusted` となり、`required` では起動できない（`best-effort` は警告つきで隔離なし）。
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 const BWRAP_CANDIDATES: [&str; 1] = ["/usr/bin/bwrap"];
@@ -87,8 +98,20 @@ const SANDBOX_EXEC_PATH: &str = "/usr/bin/sandbox-exec";
 /// 実体パス（例: `/usr/lib/cargo/bin/coreutils`）で exec すると `true` として動かず、
 /// `required` で起動できなくなる（fail-closed だが可用性の問題。#1458）。信頼判定は実体の
 /// チェーンと、候補パス側の symlink チェーンの両方で行う。
-#[cfg_attr(not(unix), allow(dead_code))]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 const TRUE_CANDIDATES: [&str; 2] = ["/usr/bin/true", "/bin/true"];
+/// Linux のプローブでサンドボックス内から netns を読ませる `readlink` の候補（#1459）。
+///
+/// [`TRUE_CANDIDATES`] と同じく、exec するのは**候補パスのまま**（multicall の argv[0] 対策。
+/// #1458）で、信頼判定は [`select_trusted_exec`] で行う。
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+const READLINK_CANDIDATES: [&str; 2] = ["/usr/bin/readlink", "/bin/readlink"];
+/// 自プロセス（サンドボックス内では内側のプロセス）の netns を指す symlink。
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+const NETNS_LINK: &str = "/proc/self/ns/net";
+/// プローブの stdout を読む上限（`net:[<u64>]` は 30 バイト未満。超過は fail-closed）。
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+const PROBE_STDOUT_MAX: u64 = 256;
 /// プローブ 1 回の上限時間。
 #[cfg_attr(not(unix), allow(dead_code))]
 const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -106,7 +129,9 @@ pub enum EgressIsolationUnavailable {
     SandboxToolUntrusted,
     /// サンドボックスの試走に失敗した（`--unshare-net` が許されない環境・timeout を含む）。
     SandboxProbeFailed,
-    /// 作業ディレクトリが `/run` 配下で、`--tmpfs /run` に隠れて UDS に届かない。
+    /// 作業ディレクトリが `/run` 配下で、`--tmpfs /run` に隠れて UDS に届かない。意図した
+    /// fail-closed で、`required` は起動を拒否する。回避策は `/run` の外を `temp_root`
+    /// （`with_temp_root`）または `TMPDIR` に指定すること（#1459）。
     WorkDirHiddenBySandbox,
     /// 中継用 UDS のパスが servo-host の規則（絶対・正規化済み・100 バイト以下）に反する。
     SocketPathInvalid,
@@ -249,13 +274,50 @@ pub(super) fn linux_argv(bwrap: &Path, host: &Path, relay_uds: &Path) -> (PathBu
     (bwrap.to_path_buf(), args)
 }
 
-/// プローブ用の bwrap 起動コマンド。本番と同じフラグ（[`linux_wrapper_args`]）の後ろに、試走する
-/// コマンドを `true_exec`（候補パスのまま。multicall の argv[0] 対策。#1458）で置く。
+/// プローブ用の bwrap 起動コマンド。本番と同じフラグ（[`linux_wrapper_args`]）の後ろに、
+/// `readlink_exec`（候補パスのまま。multicall の argv[0] 対策。#1458）と [`NETNS_LINK`] を置く
+/// （内側の netns を標準出力へ出させる。RENDER-3・#1459）。
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-fn linux_probe_argv(bwrap: &Path, true_exec: &Path) -> (PathBuf, Vec<OsString>) {
+fn linux_probe_argv(bwrap: &Path, readlink_exec: &Path) -> (PathBuf, Vec<OsString>) {
     let mut args = linux_wrapper_args();
-    args.push(true_exec.as_os_str().to_owned());
+    args.push(readlink_exec.as_os_str().to_owned());
+    args.push(OsString::from(NETNS_LINK));
     (bwrap.to_path_buf(), args)
+}
+
+/// `net:[<10 進数>]`（末尾の改行は 1 個まで）だけを netns の inode 番号として読む。それ以外
+/// （空・前後のゴミ・桁あふれ）は `None`（fail-closed）。
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn parse_netns_id(s: &[u8]) -> Option<u64> {
+    let text = std::str::from_utf8(s).ok()?;
+    let text = text.strip_suffix('\n').unwrap_or(text);
+    let digits = text.strip_prefix("net:[")?.strip_suffix(']')?;
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse::<u64>().ok()
+}
+
+/// 外側と内側の netns がどちらも読め、かつ**異なる**ときだけ真（RENDER-3・#1459）。
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn netns_separated(outside: &[u8], inside_stdout: &[u8]) -> bool {
+    match (parse_netns_id(outside), parse_netns_id(inside_stdout)) {
+        (Some(o), Some(i)) => o != i,
+        _ => false,
+    }
+}
+
+/// netns プローブの結果（テストで具体値を assert するための内部用。公開エラーには
+/// `Separated` 以外をすべて `SandboxProbeFailed` として写す）。
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NetnsProbe {
+    SpawnFailed,
+    Timeout,
+    ExitFailure,
+    OutputUnreadable,
+    NotSeparated,
+    Separated,
 }
 
 /// プローブ用の sandbox-exec 起動コマンド（profile は何も絞らない。`true_exec` は候補パスのまま）。
@@ -508,7 +570,8 @@ fn select_trusted_exec(candidates: &[&str]) -> Result<PathBuf, EgressIsolationUn
 }
 
 /// `cmd` を stdio なしで走らせ、`timeout` 内に成功終了したかを返す。超過したら kill して失敗。
-#[cfg(unix)]
+/// macOS のプローブ用（Seatbelt には netns が無く、終了コードで判定する）。
+#[cfg(target_os = "macos")]
 fn run_probe(mut cmd: Command, timeout: Duration) -> bool {
     cmd.env_clear()
         .stdin(Stdio::null())
@@ -533,17 +596,71 @@ fn run_probe(mut cmd: Command, timeout: Duration) -> bool {
     }
 }
 
+/// `bwrap` で `readlink_exec /proc/self/ns/net` を本番と同じフラグで試走し、内側の netns が
+/// 本体と別かを判定する（RENDER-3・#1459）。信頼判定は呼び出し側（[`probe_uncached`]）が行い、
+/// 本関数は渡されたパスをそのまま使う（テストが偽物の bwrap を渡せる）。stdout は
+/// [`PROBE_STDOUT_MAX`] バイトまで、終了後に読む（出力が小さくパイプの容量に収まるため
+/// デッドロックしない。大量出力で詰まる場合は timeout で kill して失敗にする）。
+#[cfg(target_os = "linux")]
+fn probe_netns_with(bwrap: &Path, readlink_exec: &Path, timeout: Duration) -> NetnsProbe {
+    use std::io::Read;
+    let Ok(outside) = std::fs::read_link(NETNS_LINK) else {
+        return NetnsProbe::OutputUnreadable;
+    };
+    let outside = outside.into_os_string().into_encoded_bytes();
+    let (prog, args) = linux_probe_argv(bwrap, readlink_exec);
+    let mut cmd = Command::new(prog);
+    cmd.args(args)
+        .env_clear()
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let Ok(mut child) = cmd.spawn() else {
+        return NetnsProbe::SpawnFailed;
+    };
+    let deadline = Instant::now().checked_add(timeout);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if deadline.is_some_and(|d| Instant::now() < d) => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return NetnsProbe::Timeout;
+            }
+        }
+    };
+    if !status.success() {
+        return NetnsProbe::ExitFailure;
+    }
+    let mut buf = Vec::new();
+    let Some(out) = child.stdout.take() else {
+        return NetnsProbe::OutputUnreadable;
+    };
+    if out
+        .take(PROBE_STDOUT_MAX.saturating_add(1))
+        .read_to_end(&mut buf)
+        .is_err()
+        || u64::try_from(buf.len()).map_or(true, |n| n > PROBE_STDOUT_MAX)
+    {
+        return NetnsProbe::OutputUnreadable;
+    }
+    if netns_separated(&outside, &buf) {
+        NetnsProbe::Separated
+    } else {
+        NetnsProbe::NotSeparated
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn probe_uncached() -> Result<Sandbox, EgressIsolationUnavailable> {
     let bwrap = select_trusted(&BWRAP_CANDIDATES)?;
-    let true_exec = select_trusted_exec(&TRUE_CANDIDATES)?;
-    let (prog, args) = linux_probe_argv(&bwrap, &true_exec);
-    let mut cmd = Command::new(prog);
-    cmd.args(args);
-    if run_probe(cmd, PROBE_TIMEOUT) {
-        Ok(Sandbox::Bwrap(bwrap))
-    } else {
-        Err(EgressIsolationUnavailable::SandboxProbeFailed)
+    let readlink_exec = select_trusted_exec(&READLINK_CANDIDATES)?;
+    match probe_netns_with(&bwrap, &readlink_exec, PROBE_TIMEOUT) {
+        NetnsProbe::Separated => Ok(Sandbox::Bwrap(bwrap)),
+        _ => Err(EgressIsolationUnavailable::SandboxProbeFailed),
     }
 }
 
@@ -683,6 +800,14 @@ mod tests {
         assert!(!trusted_chain((true, 0, 0o775), &[dir]));
     }
 
+    /// CI（GitHub Actions の Linux）では標準配置であること自体を必須にする（`trusted_chain` が
+    /// 壊れて常に false になる退行や、Err 分岐への空振りを CI で検出するため。大文字小文字を
+    /// 区別する完全一致は `tests/host_process.rs` の `ci_requires_sandbox` と同じ）。
+    #[cfg(unix)]
+    fn ci_requires_ok() -> bool {
+        cfg!(target_os = "linux") && std::env::var("GITHUB_ACTIONS").as_deref() == Ok("true")
+    }
+
     /// 存在する最初の `TRUE_CANDIDATES` の実体パスと、その実体が標準配置（実体と全祖先が root 所有
     /// 0755 相当）かを返す。どれも無ければ各候補が Missing であることを assert して `None`
     /// （環境の事実を assert する。skip にしない）。
@@ -701,6 +826,12 @@ mod tests {
                     })
                     .collect();
                 let standard = trusted_chain((m.is_file(), m.uid(), m.mode()), &ancestors);
+                if ci_requires_ok() {
+                    assert!(
+                        standard,
+                        "CI must have a standard (root-owned) true: {real:?}"
+                    );
+                }
                 return Some((real, standard));
             }
         }
@@ -807,19 +938,25 @@ mod tests {
     #[test]
     fn render3_select_trusted_exec_returns_candidate_path_not_realpath() {
         // Nix 等の非標準配置では Untrusted、候補が全く無ければ NotFound。Err でも空振りさせない
-        match select_trusted_exec(&TRUE_CANDIDATES) {
-            Ok(path) => assert!(
-                TRUE_CANDIDATES.iter().any(|c| Path::new(c) == path),
-                "must return a candidate path as-is: {path:?}"
-            ),
-            Err(e) => assert!(
-                matches!(
-                    e,
-                    EgressIsolationUnavailable::SandboxToolUntrusted
-                        | EgressIsolationUnavailable::SandboxToolNotFound
+        for cands in [&TRUE_CANDIDATES[..], &READLINK_CANDIDATES[..]] {
+            match select_trusted_exec(cands) {
+                Ok(path) => assert!(
+                    cands.iter().any(|c| Path::new(c) == path),
+                    "must return a candidate path as-is: {path:?}"
                 ),
-                "unexpected error: {e:?}"
-            ),
+                Err(e) => {
+                    // CI では Ok を必須にする（Err 分岐は CI 以外だけ）
+                    assert!(!ci_requires_ok(), "CI must trust {cands:?}: {e:?}");
+                    assert!(
+                        matches!(
+                            e,
+                            EgressIsolationUnavailable::SandboxToolUntrusted
+                                | EgressIsolationUnavailable::SandboxToolNotFound
+                        ),
+                        "unexpected error: {e:?}"
+                    );
+                }
+            }
         }
         // 存在する候補ごとに単独で判定し、両方が存在する環境でも各 symlink 判定を検証する
         for c in TRUE_CANDIDATES {
@@ -833,19 +970,129 @@ mod tests {
         }
     }
 
-    /// RENDER-3（#1458）: Linux のプローブ argv は本番と同じフラグ + 候補パスのまま（実体パスでない）。
-    /// multicall では実体（例: `/usr/lib/cargo/bin/coreutils`）で exec すると argv[0] が変わり
-    /// `true` として動かないため、内側のプログラムは候補パスで渡す。
+    /// RENDER-3（#1458・#1459）: Linux のプローブ argv は本番と同じフラグ + 候補パスのまま（実体
+    /// パスでない）+ netns のリンク。multicall では実体で exec すると argv[0] が変わり動かない。
     #[test]
     fn render3_linux_probe_argv_uses_candidate_path_as_argv0() {
         let (prog, args) =
-            linux_probe_argv(Path::new("/usr/bin/bwrap"), Path::new("/usr/bin/true"));
+            linux_probe_argv(Path::new("/usr/bin/bwrap"), Path::new("/usr/bin/readlink"));
         assert_eq!(prog, PathBuf::from("/usr/bin/bwrap"));
         let mut want = linux_wrapper_args();
-        want.push(OsString::from("/usr/bin/true"));
+        want.push(OsString::from("/usr/bin/readlink"));
+        want.push(OsString::from("/proc/self/ns/net"));
         assert_eq!(args, want);
-        assert_eq!(args.last().unwrap(), "/usr/bin/true");
-        assert_ne!(args.last().unwrap(), "/usr/lib/cargo/bin/coreutils");
+    }
+
+    /// RENDER-3（#1459）: netns の読み取りは `net:[<数字>]`（改行 1 個まで）だけを受け付ける。
+    #[test]
+    fn render3_parse_netns_id_strict() {
+        assert_eq!(parse_netns_id(b"net:[4026531833]\n"), Some(4026531833));
+        assert_eq!(parse_netns_id(b"net:[1]"), Some(1));
+        for bad in [
+            &b""[..],
+            b"net:[]",
+            b"net:[abc]",
+            b"mnt:[1]",
+            b" net:[1]",
+            b"net:[1]\n\n",
+            b"net:[1] ",
+            b"net:[99999999999999999999999]",
+            b"net:[+1]",
+            b"\xff",
+        ] {
+            assert_eq!(parse_netns_id(bad), None, "{bad:?}");
+        }
+        let long = vec![b'1'; 300];
+        assert_eq!(parse_netns_id(&long), None);
+    }
+
+    /// RENDER-3（#1459）: 外と中が異なる値のときだけ分離とみなす。
+    #[test]
+    fn render3_netns_separated_requires_different_ids() {
+        assert!(netns_separated(b"net:[1]", b"net:[2]\n"));
+        assert!(!netns_separated(b"net:[1]", b"net:[1]\n"));
+        assert!(!netns_separated(b"net:[1]", b""));
+        assert!(!netns_separated(b"garbage", b"net:[2]"));
+    }
+
+    /// 0755 のシェルスクリプトを一時ディレクトリに作る。ETXTBSY（並列テストの fork が書き込み fd を
+    /// 継ぐ既知の問題）は呼び出し側が `SpawnFailed` のやり直しで吸収する。
+    #[cfg(target_os = "linux")]
+    fn fake_script(tag: &str, body: &str) -> (PathBuf, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("fb-netns-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("fake-bwrap");
+        std::fs::write(&f, body).unwrap();
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o755)).unwrap();
+        (dir, f)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn probe_retrying(bwrap: &Path, readlink: &Path) -> NetnsProbe {
+        let mut r = NetnsProbe::SpawnFailed;
+        for _ in 0..20 {
+            r = probe_netns_with(bwrap, readlink, Duration::from_secs(5));
+            if r != NetnsProbe::SpawnFailed {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        r
+    }
+
+    /// RENDER-3（#1459）: 引数を無視して exit 0 するだけの偽 bwrap は、出力が無いので失敗する。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn render3_probe_rejects_fake_bwrap_that_only_exits_zero() {
+        let (dir, fake) = fake_script("exit0", "#!/bin/sh\nexit 0\n");
+        let r = probe_retrying(&fake, Path::new("/usr/bin/readlink"));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(r, NetnsProbe::NotSeparated);
+        assert_ne!(r, NetnsProbe::Separated);
+    }
+
+    /// RENDER-3（#1459）: ns を作らず、内側のコマンドだけを実行する偽 bwrap は inode が同じで失敗する。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn render3_probe_rejects_fake_bwrap_without_new_netns() {
+        let Ok(readlink) = select_trusted_exec(&READLINK_CANDIDATES) else {
+            return assert!(!ci_requires_ok(), "CI must trust readlink");
+        };
+        // 本番のフラグ列（`--` まで）を読み飛ばし、残り（readlink と引数）をそのまま exec する
+        let body = "#!/bin/sh\nwhile [ \"$1\" != -- ]; do shift; done\nshift\nexec \"$@\"\n";
+        let (dir, fake) = fake_script("nons", body);
+        let r = probe_retrying(&fake, &readlink);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(r, NetnsProbe::NotSeparated);
+    }
+
+    /// RENDER-3（#1459）: 本物の bwrap では netns が分離され、成功する。CI の Linux では bwrap と
+    /// readlink が信頼判定を通ること自体を必須にする。bwrap が無い環境では NotFound を確かめて終える。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn render3_probe_accepts_real_bwrap_with_separated_netns() {
+        match (
+            select_trusted(&BWRAP_CANDIDATES),
+            select_trusted_exec(&READLINK_CANDIDATES),
+        ) {
+            (Ok(bwrap), Ok(readlink)) => {
+                assert_eq!(probe_retrying(&bwrap, &readlink), NetnsProbe::Separated);
+            }
+            (b, r) => {
+                assert!(
+                    !ci_requires_ok(),
+                    "CI must have bwrap and readlink: {b:?} {r:?}"
+                );
+                for e in [b.err(), r.err()].into_iter().flatten() {
+                    assert!(matches!(
+                        e,
+                        EgressIsolationUnavailable::SandboxToolNotFound
+                            | EgressIsolationUnavailable::SandboxToolUntrusted
+                    ));
+                }
+            }
+        }
     }
 
     /// RENDER-3（#1458）: macOS のプローブ argv も候補パスのまま。
