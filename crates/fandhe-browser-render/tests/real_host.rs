@@ -821,17 +821,19 @@ fn record_proc_tree(p: &HostProcess, test: &str) {
         return;
     }
     let wrapper = p.pid().expect("wrapper pid");
-    // 監視スレッドは 500 ms 間隔で解決する。解決できたことが本番の前提の主たる確認。
-    assert!(
-        wait_until(Duration::from_secs(10), || p.monitored_pid().is_some()),
-        "rss monitor never resolved the wrapped host pid"
-    );
+    // 監視が pid を解決できず wrapper を kill する前に、先にツリーを走査して記録する（#1460）。
     let tree = walk_wrapped_proc_tree(wrapper, &read_proc_text, &list_proc_tasks)
         .unwrap_or_else(|e| panic!("proc tree walk failed: {e:?}"));
     println!(
         "EGRESS-PROCTREE test={test} backend=Bwrap {}",
         tree.summary_line()
     );
+    // 監視スレッドは 500 ms 間隔で解決する。解決できたことが本番の前提の主たる確認。
+    // 未解決でも上の行は出済み。失敗時は unresolved を明記してから落とす。
+    if !wait_until(Duration::from_secs(10), || p.monitored_pid().is_some()) {
+        println!("EGRESS-PROCTREE test={test} backend=Bwrap monitored_pid=unresolved");
+        panic!("rss monitor never resolved the wrapped host pid; {tree:?}");
+    }
     assert_eq!(tree.wrapper_children.len(), 1, "{tree:?}");
     assert_eq!(tree.init_children.len(), 1, "{tree:?}");
     assert_eq!(

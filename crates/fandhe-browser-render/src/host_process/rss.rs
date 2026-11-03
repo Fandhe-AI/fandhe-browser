@@ -284,6 +284,11 @@ pub fn walk_wrapped_proc_tree(
             Ok(v) => v,
             // 子孫が列挙後に終了した競合は子なし扱い。ホスト自身が読めないのは異常。
             Err(ProcTreeError::NoTasks { .. }) if !first => (Vec::new(), 0),
+            // children の読み取り失敗も、task 一覧が再取得できない（消滅した）ときだけ競合とみなす。
+            // 存続中のプロセスの読み取り異常は Unreadable のまま返す。
+            Err(ProcTreeError::Unreadable { .. }) if !first && list_tasks(pid).is_none() => {
+                (Vec::new(), 0)
+            }
             Err(e) => return Err(e),
         };
         if first {
@@ -579,6 +584,48 @@ mod tests {
                 "{bad}"
             );
         }
+    }
+
+    /// RENDER-3（#1460）: 子孫が task 列挙後・children 読み取り前に消えても子なしで続行する。
+    /// 存続中の子孫の読み取り失敗は Unreadable のまま。
+    #[test]
+    fn render3_walk_wrapped_proc_tree_tolerates_descendant_vanishing_before_children_read() {
+        let files = [
+            f(77, 77, "1234"),
+            f(1234, 1234, "1235"),
+            f(1235, 1235, "2000"),
+        ];
+        let calls = std::cell::Cell::new(0u32);
+        let read = move |p: &str| files.iter().find(|(k, _)| k == p).map(|(_, v)| v.clone());
+        let list = |pid: u32| match pid {
+            77 => Some(vec![77]),
+            1234 => Some(vec![1234]),
+            1235 => Some(vec![1235]),
+            // 2000 は 1 回目の列挙だけ成功し、その後は消滅（children ファイルも無い）。
+            2000 => {
+                calls.set(calls.get() + 1);
+                (calls.get() == 1).then(|| vec![2000])
+            }
+            _ => None,
+        };
+        let t = walk_wrapped_proc_tree(77, &read, &list).expect("tree");
+        assert_eq!(t.host_descendants, vec![2000]);
+        assert!(!t.truncated);
+
+        // 存続中（再列挙できる）なのに children が読めないのは異常。
+        let list_alive = |pid: u32| match pid {
+            77 => Some(vec![77]),
+            1234 => Some(vec![1234]),
+            1235 => Some(vec![1235]),
+            2000 => Some(vec![2000]),
+            _ => None,
+        };
+        assert_eq!(
+            walk_wrapped_proc_tree(77, &read, &list_alive),
+            Err(ProcTreeError::Unreadable {
+                path: "/proc/2000/task/2000/children".to_string()
+            })
+        );
     }
 
     /// RENDER-3（#1460）: 循環は二重に数えず、深すぎるツリーは truncated で打ち切る。
