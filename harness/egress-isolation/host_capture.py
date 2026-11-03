@@ -150,14 +150,15 @@ def parse_tcpdump_line(line: str) -> dict | None:
 def count_category(pkt: dict) -> str | None:
     """判定対象の外向き送信なら "dns" / "udp_other" / "tcp_syn"、対象外なら None。
 
-    対象: 非 lo の Out で UDP 全ポートまたは TCP SYN、および lo の Out で宛先 53 番（スタブ resolver 経由の
+    対象: 非 lo の Out で UDP 全ポートまたは TCP SYN、および lo の Out / In で宛先 53 番（スタブ resolver 経由の
     問い合わせを拾うため）。TCP の 53 番は dns に数える。
+    lo は libpcap が送信側の重複を除外し通常 In で記録されるため、lo だけ In も扱う（重複計上は 0 件判定に影響しない）。
     """
-    if pkt.get("dir") != "Out" or pkt.get("proto") not in ("udp", "tcp"):
+    on_lo = pkt.get("iface") == "lo"
+    if pkt.get("dir") not in (("Out", "In") if on_lo else ("Out",)) or pkt.get("proto") not in ("udp", "tcp"):
         return None
     if pkt["proto"] == "tcp" and not pkt.get("syn"):
         return None
-    on_lo = pkt.get("iface") == "lo"
     if on_lo and pkt.get("dport") != 53:
         return None
     if pkt.get("dport") == 53:
@@ -273,6 +274,8 @@ def judge(
     tcpdump_exit: int | None = 0,
     tcpdump_version: str = "",
     truncated_lines: bool = False,
+    convert_exit: int | None = 0,
+    kernel_dropped: int | None = 0,
 ) -> dict:
     """verdict（"pass" / "fail" / "unobservable"）・理由・件数を返す。観測不能を合格にしない（fail-closed）。"""
     fails: list[str] = []
@@ -293,7 +296,7 @@ def judge(
         if (
             canary_port is not None
             and pkt["iface"] == "lo"
-            and pkt["dir"] == "Out"
+            and pkt["dir"] in ("Out", "In")
             and pkt["proto"] == "udp"
             and pkt["sport"] == canary_port
         ):
@@ -343,6 +346,14 @@ def judge(
         unobs.append("tcpdump exit status is missing")
     elif tcpdump_exit != 0:
         unobs.append(f"tcpdump exited with status {tcpdump_exit}")
+    if convert_exit is None:
+        unobs.append("pcap conversion exit status is missing")
+    elif convert_exit != 0:
+        unobs.append(f"pcap conversion exited with status {convert_exit} (capture text may be partial)")
+    if kernel_dropped is None:
+        unobs.append("kernel drop statistics are missing from tcpdump stderr")
+    elif kernel_dropped != 0:
+        unobs.append(f"tcpdump reported {kernel_dropped} packet(s) dropped by kernel")
     if packet_total == 0:
         unobs.append("no packets were captured")
     elif nonlo_out == 0:
@@ -373,6 +384,8 @@ def judge(
         "interfaces": sorted(ifaces),
         "tcpdump_version": tcpdump_version,
         "tcpdump_exit": tcpdump_exit,
+        "convert_exit": convert_exit,
+        "kernel_dropped": kernel_dropped,
     }
 
 
@@ -391,7 +404,7 @@ def render_summary(v: dict) -> str:
         f"- Servo pids: isolated={v['servo_pids']['isolated']} unisolated={v['servo_pids']['unisolated']}"
         f" (netns inodes: {', '.join(v['servo_netns_inodes']) or 'n/a'}; sampler netns: {v['self_netns']})",
         f"- canary: seen={v['canary']['seen']} attributed_to_self={v['canary']['attributed_to_self']}",
-        f"- interfaces: {', '.join(v['interfaces']) or 'n/a'} / tcpdump: {v['tcpdump_version'] or 'n/a'} (exit {v['tcpdump_exit']})",
+        f"- interfaces: {', '.join(v['interfaces']) or 'n/a'} / tcpdump: {v['tcpdump_version'] or 'n/a'} (exit {v['tcpdump_exit']}, convert exit {v['convert_exit']}, kernel dropped {v['kernel_dropped']})",
         "",
         "| attribution | dns | udp_other | tcp_syn |",
         "| --- | ---: | ---: | ---: |",
@@ -449,6 +462,24 @@ def load_samples(path: Path) -> SampleIndex:
     return index
 
 
+_DROPPED_RE = re.compile(r"^(\d+) packets? dropped by kernel", re.MULTILINE)
+
+
+def parse_kernel_dropped(stderr_text: str) -> int | None:
+    """tcpdump 終了時の統計行 `N packets dropped by kernel` から N を返す。行が無ければ None（確認不能）。"""
+    m = _DROPPED_RE.search(stderr_text)
+    return int(m.group(1)) if m else None
+
+
+def _read_int(path: Path) -> int | None:
+    if not path.is_file():
+        return None
+    try:
+        return int(path.read_text().strip())
+    except ValueError:
+        return None
+
+
 def cmd_judge(args: argparse.Namespace) -> int:
     out_dir = Path(args.out_dir)
     text = out_dir / "capture.txt"
@@ -458,12 +489,12 @@ def cmd_judge(args: argparse.Namespace) -> int:
     vfile = out_dir / "tcpdump.version"
     if vfile.is_file():
         version = vfile.read_text(encoding="utf-8", errors="replace").splitlines()[0][:80] if vfile.stat().st_size else ""
-    tcpdump_exit: int | None = None
-    if exit_file.is_file():
-        try:
-            tcpdump_exit = int(exit_file.read_text().strip())
-        except ValueError:
-            tcpdump_exit = None
+    tcpdump_exit = _read_int(exit_file)
+    convert_exit = _read_int(out_dir / "convert.exit")
+    kernel_dropped: int | None = None
+    stderr_file = out_dir / "tcpdump.stderr"
+    if stderr_file.is_file():
+        kernel_dropped = parse_kernel_dropped(stderr_file.read_text(encoding="utf-8", errors="replace")[-65536:])
     if text.is_file() and samples.is_file():
         packets, unparsed, total, truncated = load_packets(text, args.max_packets)
         index = load_samples(samples)
@@ -479,6 +510,8 @@ def cmd_judge(args: argparse.Namespace) -> int:
         tcpdump_exit=tcpdump_exit,
         tcpdump_version=version,
         truncated_lines=truncated,
+        convert_exit=convert_exit,
+        kernel_dropped=kernel_dropped,
     )
     if not text.is_file() or not samples.is_file():
         verdict["unobservable_reasons"].append("capture text or samples file is missing")

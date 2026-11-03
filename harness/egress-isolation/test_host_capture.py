@@ -88,6 +88,17 @@ class ParseTests(unittest.TestCase):
         other = hc.parse_tcpdump_line(line(1.0, "lo", "Out", "127.0.0.1.4000 > 127.0.0.1.9999: UDP, length 5"))
         self.assertIsNone(hc.count_category(other))
 
+    def test_lo_in_direction_is_handled(self):
+        dns = hc.parse_tcpdump_line(line(1.0, "lo", "In", "127.0.0.1.4000 > 127.0.0.53.53: UDP, length 5"))
+        self.assertEqual(hc.count_category(dns), "dns")
+        nonlo_in = hc.parse_tcpdump_line(line(1.0, "eth0", "In", "8.8.8.8.53 > 10.0.0.5.5000: UDP, length 5"))
+        self.assertIsNone(hc.count_category(nonlo_in))
+
+    def test_kernel_dropped_parse(self):
+        self.assertEqual(hc.parse_kernel_dropped("1 packet captured\n0 packets dropped by kernel\n"), 0)
+        self.assertEqual(hc.parse_kernel_dropped("7 packets dropped by kernel\n"), 7)
+        self.assertIsNone(hc.parse_kernel_dropped("listening on any\n"))
+
     def test_garbage_is_none(self):
         self.assertIsNone(hc.parse_tcpdump_line("reading from file -, link-type LINUX_SLL2"))
         self.assertIsNone(hc.parse_tcpdump_line("   0x0000:  4500 0021"))
@@ -197,6 +208,16 @@ class VerdictTests(unittest.TestCase):
         self.assertEqual(self.ok(unparsed=5, total_lines=100)["verdict"], "pass")
         self.assertEqual(self.ok(unparsed=50, total_lines=100)["verdict"], "unobservable")
 
+    def test_lo_in_canary_is_observed(self):
+        canary_in = line(100.3, "lo", "In", f"127.0.0.1.{CANARY} > 127.0.0.1.50000: UDP, length 26")
+        v = run([canary_in, OUT_TCP], make_index())
+        self.assertEqual(v["verdict"], "pass")
+
+    def test_convert_failure_and_drops_are_unobservable(self):
+        for kw in ({"convert_exit": 1}, {"convert_exit": None}, {"kernel_dropped": 2}, {"kernel_dropped": None}):
+            v = run([CANARY_LINE, OUT_TCP], make_index(), **kw)
+            self.assertEqual(v["verdict"], "unobservable", kw)
+
     def test_fail_takes_precedence_over_unobservable(self):
         v = self.ok(make_index(netns=SELF_NS), tcpdump_exit=1)
         self.assertEqual(v["verdict"], "fail")
@@ -216,12 +237,25 @@ class IoTests(unittest.TestCase):
             ]
             (out / "samples.jsonl").write_text("\n".join(json.dumps(r) for r in recs) + "\n")
             (out / "tcpdump.exit").write_text("0\n")
+            (out / "convert.exit").write_text("0\n")
+            (out / "tcpdump.stderr").write_text("5 packets captured\n5 packets received by filter\n0 packets dropped by kernel\n")
             ns = type("A", (), {"out_dir": str(out), "max_packets": 1000})()
             self.assertEqual(hc.cmd_judge(ns), 0)
             verdict = json.loads((out / "verdict.json").read_text())
             self.assertEqual(verdict["verdict"], "pass")
             self.assertTrue((out / "summary.md").is_file())
             (out / "tcpdump.exit").write_text("2\n")
+            self.assertEqual(hc.cmd_judge(ns), 1)
+            (out / "tcpdump.exit").write_text("0\n")
+            (out / "convert.exit").write_text("1\n")
+            self.assertEqual(hc.cmd_judge(ns), 1)
+            (out / "convert.exit").write_text("0\n")
+            (out / "tcpdump.stderr").write_text("5 packets captured\n3 packets dropped by kernel\n")
+            self.assertEqual(hc.cmd_judge(ns), 1)
+            (out / "tcpdump.stderr").write_text("no stats\n")
+            self.assertEqual(hc.cmd_judge(ns), 1)
+            (out / "tcpdump.stderr").write_text("0 packets dropped by kernel\n")
+            (out / "convert.exit").unlink()
             self.assertEqual(hc.cmd_judge(ns), 1)
 
     def test_missing_files_are_unobservable(self):

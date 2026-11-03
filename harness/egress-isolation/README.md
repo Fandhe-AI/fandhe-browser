@@ -272,9 +272,9 @@ host netns を記録し、bwrap 配下の Servo ホストに帰属する外向�
   その netns、host netns のソケット所有 pid（同一ユーザーの `/proc/<pid>/fd`）を記録する。パケットの送信元（proto・port）を時刻が近い所有者へ突き合わせる。
   隔離は「bwrap の祖先がいる」または「netns が host と異なる」。bwrap の祖先がいて netns が host と同じなら隔離破れで fail。
 - 判定: 隔離下の Servo に帰属する DNS・UDP・直接 TCP SYN が 1 件でもあれば fail。隔離外 Servo（WebSocket の対照）・自身・他プロセス・帰属不能は件数を記録するだけ。
-  対象は非 `lo` の Out（UDP 全ポート・TCP SYN）と `lo` の宛先 53 番（systemd-resolved スタブ経由を拾う）。
+  対象は非 `lo` の Out（UDP 全ポート・TCP SYN）と `lo` の Out・In の宛先 53 番（lo は libpcap が送信側重複を除外し In で記録される）（systemd-resolved スタブ経由を拾う）。
 - 観測不能は合格にしない（unobservable）: カナリア（サンプラーが 127.0.0.1 の UDP で自分宛てに送る陽性対照）が `lo` の記録に現れて自分に帰属しない、
-  隔離下の Servo pid を一度も観測しない、サンプル 0、外向きパケット 0、tcpdump の異常終了、上限による打ち切り、解析不能行の超過。
+  隔離下の Servo pid を一度も観測しない、サンプル 0、外向きパケット 0、tcpdump の異常終了・pcap 変換の失敗・カーネルドロップの検出または統計の欠落、上限による打ち切り、解析不能行の超過。
 - 限界: サンプル間隔より短命なソケット・root のプロセス（systemd-resolved 等）は帰属できない。隔離下のホストの ns 内の `lo` で閉じる問い合わせは host に届かないため観測対象外。
   テストのページは IP リテラルで、宛先の DNS を誘発しない（Servo が自発的に出す送信だけを見る）。fd 受け渡しによる netns 越えのソケットは想定外。ubuntu のみ。
 - 自己テスト: `test_host_capture.py`（合成 tcpdump テキスト・合成サンプル。`make check-egress-isolation`）。行形式は tcpdump 4.99.6（SLL2）の実出力に合わせてある。

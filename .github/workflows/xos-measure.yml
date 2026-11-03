@@ -795,8 +795,9 @@ jobs:
             sleep 0.5
           done
           if [ ! -f "$cap/tcpdump.exit" ]; then echo "note: tcpdump.exit is missing (judge reports unobservable)"; fi
-          tcpdump -r "$cap/capture.pcap" -nn -tt > "$cap/capture.txt" 2> "$cap/convert.stderr" \
-            || echo "note: pcap conversion failed"
+          # 変換の終了状態は convert.exit に残す（途中切れ pcap の部分出力を合格にしないため。非 0・欠落は判定で unobservable）。
+          tcpdump -r "$cap/capture.pcap" -nn -tt > "$cap/capture.txt" 2> "$cap/convert.stderr"
+          echo $? > "$cap/convert.exit"
           true
       - name: "[egress-host] host-capture judge（隔離下の Servo への帰属が 0 件か。fail-closed）"
         if: ${{ !cancelled() }}
