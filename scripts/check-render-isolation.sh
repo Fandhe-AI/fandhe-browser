@@ -7,7 +7,7 @@
 # .github/workflows/ci.yml の harness-* ジョブの [render-isolation] ステップで、判定
 # ロジックの二重管理を避けるためロジックの正本はこのファイルに一本化する。
 #
-# 検査は 5 本立て（A〜E）:
+# 検査は 6 本立て（A〜F）:
 #   A. 本体 workspace 全体の既定ビルドに Servo 系クレートが無いこと
 #      （render crate 自体は Servo 非依存の IPC クライアントなので許容し、検査対象にも含める）
 #   B. fandhe-browser-cli の既定 feature に Servo 系クレートが無いこと（TASK-41.5・#174。
@@ -23,6 +23,9 @@
 #      musl・aarch64 Windows 等に限定された依存も検出する）。mozangle だけは Windows ターゲット
 #      （`no-wgl`・ANGLE。#999）に限り許すため、非 Windows ターゲットごとの cargo tree で禁止する。
 #      非 Windows の対象一覧が servo-host/deny.toml の [graph] targets と一致することも検査する
+#   F. egress プロキシ（本体）と servo-host の中継で複製している上限値の一致（RENDER-3・#1450）。
+#      分離検査ではないが、servo=true・rust=true のどちらでも走る既存の CI 経路（ci.yml 無変更）で
+#      回すためここに置く。正本は scripts/check-egress-constants.sh
 #   servo-host の manifest / Cargo.lock が無い場合は D・E を NG とする（fail-closed）。
 #
 # 判定は cargo tree の package 名（先頭フィールド）に限る。path 依存に付く (/abs/path) を
@@ -325,6 +328,8 @@ self_test() {
 
   # --- 検査 C（判定の正本は check-servo-host-isolation.sh の自己テスト） ---
   expect "C: check-servo-host-isolation.sh self-test passes" ok bash scripts/check-servo-host-isolation.sh --self-test
+  # --- 検査 F（判定の正本は check-egress-constants.sh の自己テスト） ---
+  expect "F: check-egress-constants.sh self-test passes" ok bash scripts/check-egress-constants.sh --self-test
 
   # --- manifest の不在は NG（fail-closed・#633・#992）。存在側は自スクリプトで代用し、
   # 実リポの有無に依存させない ---
@@ -413,6 +418,11 @@ fi
 # 検査 C: servo-host が本体 workspace・ルート Cargo.lock に混入していないこと。
 # 判定の正本は check-servo-host-isolation.sh（jq 欠落は exit 2。いずれも NG 扱い）。
 if ! bash scripts/check-servo-host-isolation.sh; then
+  STATUS=1
+fi
+
+# 検査 F: 複製している egress の上限値が本体プロキシと中継で一致していること（#1450）。
+if ! bash scripts/check-egress-constants.sh; then
   STATUS=1
 fi
 

@@ -316,6 +316,7 @@ fn verify_socket_dir(
 /// `dir` 配下に UDS を bind する。`dir` は呼び出し側が自プロセスで作った 0700 のディレクトリ
 /// （[`EgressEndpoint::UnixSocketIn`] の契約）。stat から bind までの競合は bind の前後の
 /// 照合（[`verify_socket_dir`]）で縮めるが、`openat` 系なしでは閉じきれず契約を前提にする。
+/// 契約は呼び出し側のテストで固定している（`EgressEndpoint::UnixSocketIn` の doc 参照。#1450）。
 fn bind_unix(dir: &Path) -> Result<(Listener, BoundEndpoint, PathBuf), EgressProxyError> {
     if !dir.is_absolute() {
         return Err(EgressProxyError::InvalidSocketDir);
