@@ -5,6 +5,10 @@
 //! `harness = false` の理由は `Cargo.toml` の `[[test]]` コメント。
 //! 待ち時間は短縮値で検証し、実秒（10 s・30 s）は待たない。既定値の assert は単体テスト側。
 //! 外部入力の経路ではないため `unwrap` / `expect` / `panic!` を使う。
+//!
+//! Linux の隔離系テストは入口で `egress isolation probe: ...` を 1 行出し（CI ログで bwrap の
+//! 分岐を読める）、`GITHUB_ACTIONS=true` で `probe_system()` が Err なら失敗にする
+//! （RENDER-3・#1451。bwrap が無くて Err 分岐だけ通り緑になるのを防ぐ）。
 
 mod support;
 
@@ -439,12 +443,45 @@ fn wait_gone(pid: u32) {
     panic!("process {pid} is still alive");
 }
 
+/// CI（GitHub Actions）では隔離が使えることを必須にするか（RENDER-3・#1451）。
+/// GitHub が設定する値 `true` と完全一致する場合だけ true（大文字小文字は区別する）。
+fn ci_requires_sandbox(github_actions: Option<&str>) -> bool {
+    github_actions == Some("true")
+}
+
+fn t_ci_guard_requires_sandbox_only_on_github_actions() {
+    assert!(ci_requires_sandbox(Some("true")));
+    assert!(!ci_requires_sandbox(None));
+    for v in ["false", "TRUE", "1", ""] {
+        assert!(!ci_requires_sandbox(Some(v)), "{v:?}");
+    }
+}
+
+/// 隔離系テストの入口。`probe_system()` の結果を 1 行出し、CI 上で Err なら理由つきで panic する。
+/// ローカルで bwrap が無い場合は Err を返し、呼び出し側が Err の分岐を検証する。
+#[cfg(target_os = "linux")]
+fn system_probe_for(test: &str) -> Result<(), EgressIsolationUnavailable> {
+    let r = fandhe_browser_render::host_process::probe_system();
+    match &r {
+        Ok(()) => eprintln!("{test}: egress isolation probe: bwrap available"),
+        Err(reason) => {
+            eprintln!("{test}: egress isolation probe: unavailable ({reason})");
+            if ci_requires_sandbox(std::env::var("GITHUB_ACTIONS").ok().as_deref()) {
+                panic!(
+                    "GITHUB_ACTIONS=true requires bwrap egress isolation on Linux, but probe failed: {reason}"
+                );
+            }
+        }
+    }
+    r
+}
+
 /// 実環境（Linux）の判定に従う。bwrap が使える環境では argv・RSS の pid・終了処理を確かめ、
 /// 使えない環境では `required` が起動しないことを確かめる（どちらの分岐も具体値で assert）。
 #[cfg(target_os = "linux")]
 fn t_system_probe_branch() {
-    use fandhe_browser_render::host_process::{IsolationBackend, probe_system};
-    match probe_system() {
+    use fandhe_browser_render::host_process::IsolationBackend;
+    match system_probe_for("egress_system_probe_branch") {
         Ok(()) => {
             let root = Root::new("iso-system-ok", "dump");
             let cfg = root
@@ -595,7 +632,7 @@ fn spawn_pid_collector(
 /// bwrap 越しでも、タイムアウトで kill した後にホストが残らない。
 #[cfg(target_os = "linux")]
 fn t_system_probe_timeout_kills_wrapped_host() {
-    if fandhe_browser_render::host_process::probe_system().is_err() {
+    if system_probe_for("egress_system_timeout_kills_wrapped_host").is_err() {
         return; // 隔離できない環境では上のテストが required の拒否を確かめる。
     }
     let root = Root::new("iso-timeout", "hang-load");
@@ -616,7 +653,7 @@ fn t_system_probe_timeout_kills_wrapped_host() {
 /// bwrap 越しでも RSS 上限超過でホスト本体（bwrap の子）が落ちる。bwrap 自身の RSS では判定しない。
 #[cfg(target_os = "linux")]
 fn t_system_probe_rss_limit_kills_wrapped_host() {
-    if fandhe_browser_render::host_process::probe_system().is_err() {
+    if system_probe_for("egress_system_rss_limit_kills_wrapped_host").is_err() {
         return;
     }
     let root = Root::new("iso-rss", "rss");
@@ -657,6 +694,10 @@ fn main() {
         ("profile_isolation", t_profile_isolation),
         ("stderr_tail", t_stderr_tail),
     ];
+    tests.push((
+        "egress_ci_guard_logic",
+        t_ci_guard_requires_sandbox_only_on_github_actions,
+    ));
     tests.push((
         "egress_required_unavailable",
         t_required_unavailable_does_not_spawn,

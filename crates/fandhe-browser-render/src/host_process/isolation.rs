@@ -23,14 +23,24 @@
 //! - ファイルシステムは隔離しない（v1。`--dev-bind / /`）。隔離するのはネットワーク送信だけ。
 //! - 隔離中は WebSocket が使えない（Servo の `websocket_loader` はプロキシを使わず直接接続する
 //!   ため、遮断されて失敗する）。
-//! - macOS の loopback プロキシは同一ユーザーの他プロセスからも届く（Seatbelt はホスト側の
-//!   送信だけを絞る）。DNS 経路（mDNSResponder 経由の名前解決）は観測・遮断していない。
+//! - macOS の loopback プロキシは同一マシンの全ユーザー・全プロセスから届く（認証なし。Seatbelt
+//!   はホスト側の送信だけを絞る）。宛先は許可リスト（公開 IP）に限られるので SSRF にはならないが、
+//!   本体の送信元 IP を踏み台にされうる。UDS 化や接続トークンは、Servo のプロキシ設定が TCP
+//!   （`http://127.0.0.1:<port>`）しか扱えず、macOS には netns が無く中継を置いても loopback の
+//!   待ち受けが残るため、別途検討する（RENDER-3・#1451）。
+//! - Linux でも FS は隔離しない（`--dev-bind / /`）ため、FS 上の UDS が迂回路として残る。`/run` は
+//!   tmpfs で隠すが、`/tmp/ssh-*/agent.*`・`/tmp/.X11-unix`・`~/.gnupg/S.*`・同じ uid の他
+//!   インスタンスのプロキシ UDS には届く。`/tmp`・`$HOME` を分けるかは別途判断する（残余リスク）。
+//! - macOS の Seatbelt は `(allow default)` で、絞るのは IP の送信だけ。mach/XPC 経由の通信
+//!   （他のデーモンを介した通信）は止めない。DNS 経路（mDNSResponder 経由の名前解決・DNS
+//!   トンネリング）も同じ理由で観測・遮断していない。
 //! - 識別面（UA・ヘッダ・環境変数）は変えない（SEC-2）。プロキシはバイト列を改変しない。
 //! - 外部コマンドは固定の絶対パス候補から選ぶ（PATH は使わない）。
 //! - pid 名前空間の中の pid 1 は bwrap の init 役で、外から見たプロセスツリーは
 //!   `bwrap(起動した子) -> bwrap(ns 内 pid 1) -> ホスト` の 2 段になる。起動した子を kill すると
 //!   `--die-with-parent` で ns 内 pid 1 も落ち、pid 1 の死で ns 内の全プロセスが SIGKILL される
-//!   （bwrap 0.11.1 で実測）。そのためホストを名指しで kill する必要はなく、pid の再利用による
+//!   （bwrap 0.11.1 で実測）。ns 内の全滅は bwrap の `--die-with-parent` に依存しており、確かめた
+//!   のは 0.11.1 だけで、それより古い版は未検証（最低版は決めていない）。そのためホストを名指しで kill する必要はなく、pid の再利用による
 //!   取り違えもない。本体が SIGKILL されても同じ連鎖でホストまで落ちる。bwrap は呼び出し
 //!   スレッドの終了でも落ちるため、`HostProcess` は専用の親スレッドで起動する。
 
@@ -54,6 +64,12 @@ use super::{HOST_ARGS, HostProcessError};
 pub const RELAY_UDS_PATH_MAX_BYTES: usize = 100;
 
 /// bwrap の候補（絶対パス。PATH は使わない）。
+///
+/// `/usr/local/bin/bwrap` も候補に残すが、[`is_trusted_executable`] が root 所有・group / other
+/// 書き込み不可を課すため、ユーザー所有の `/usr/local/bin`（Linuxbrew 等）に置かれた偽物は
+/// 拒否される。親ディレクトリの検査やプローブでの外部到達の実測は採らない（プローブは本番と同じ
+/// フラグで試走するので、bwrap の引数を受け付けない実行ファイルは `SandboxProbeFailed` になる。
+/// 外への到達の実測は #1437 の担当）。
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 const BWRAP_CANDIDATES: [&str; 2] = ["/usr/bin/bwrap", "/usr/local/bin/bwrap"];
 /// sandbox-exec の絶対パス。
@@ -71,7 +87,8 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 pub enum EgressIsolationUnavailable {
     /// この OS には隔離の手段が無い（Windows ほか。既知の制約）。
     UnsupportedPlatform,
-    /// bwrap・sandbox-exec が無い、または検証に失敗した。
+    /// bwrap・sandbox-exec が無い、信頼判定（root 所有・group / other 書き込み不可）に通らない、
+    /// または検証に失敗した。
     SandboxToolNotFound,
     /// サンドボックスの試走に失敗した（`--unshare-net` が許されない環境・timeout を含む）。
     SandboxProbeFailed,
@@ -278,16 +295,21 @@ pub(super) fn socket_dir_for(workdir: &Path) -> Result<PathBuf, EgressIsolationU
     Ok(canonical)
 }
 
-/// 外部コマンドとして信頼できる実行ファイルか（通常ファイル・実行可能・他者書き込み不可）。
+/// メタデータが外部コマンドとして信頼できるか（RENDER-3・#1451）。通常ファイル・実行ビットあり・
+/// 所有者が root・group / other に書き込み権限なし。root 所有のファイルはテストで作れないため
+/// 純関数に分けている。
+#[cfg(unix)]
+fn trusted_metadata(is_file: bool, uid: u32, mode: u32) -> bool {
+    is_file && uid == 0 && mode & 0o111 != 0 && mode & 0o022 == 0
+}
+
+/// 外部コマンドとして信頼できる実行ファイルか。シンボリックリンクは辿り、リンク先を見る。
+/// `resolve_sandbox_plan` が bwrap・sandbox-exec・true の選定に使う（RENDER-3）。
 #[cfg(unix)]
 fn is_trusted_executable(path: &Path) -> bool {
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::MetadataExt;
     match std::fs::metadata(path) {
-        Ok(m) => {
-            m.is_file()
-                && m.permissions().mode() & 0o111 != 0
-                && m.permissions().mode() & 0o002 == 0
-        }
+        Ok(m) => trusted_metadata(m.is_file(), m.uid(), m.mode()),
         Err(_) => false,
     }
 }
@@ -381,6 +403,62 @@ mod tests {
 
     fn p(n: u16) -> NonZeroU16 {
         NonZeroU16::new(n).unwrap()
+    }
+
+    /// RENDER-3（#1451）: root 所有で group / other 書き込み不可の実行ファイルは信頼する。
+    #[cfg(unix)]
+    #[test]
+    fn render3_trusted_metadata_accepts_root_owned_executable() {
+        assert!(trusted_metadata(true, 0, 0o755));
+        assert!(trusted_metadata(true, 0, 0o555));
+        // 古い Debian の setuid bwrap。
+        assert!(trusted_metadata(true, 0, 0o4755));
+    }
+
+    /// RENDER-3（#1451）: root 以外が所有するファイルは拒否する。
+    #[cfg(unix)]
+    #[test]
+    fn render3_trusted_metadata_rejects_non_root_owner() {
+        assert!(!trusted_metadata(true, 1000, 0o755));
+        assert!(!trusted_metadata(true, 1, 0o755));
+    }
+
+    /// RENDER-3（#1451）: group / other が書き込めるファイルは拒否する。
+    #[cfg(unix)]
+    #[test]
+    fn render3_trusted_metadata_rejects_group_or_other_writable() {
+        assert!(!trusted_metadata(true, 0, 0o775));
+        assert!(!trusted_metadata(true, 0, 0o757));
+        assert!(!trusted_metadata(true, 0, 0o777));
+    }
+
+    /// RENDER-3（#1451）: 実行ビットが無いもの・通常ファイルでないものは拒否する。
+    #[cfg(unix)]
+    #[test]
+    fn render3_trusted_metadata_rejects_non_executable_or_non_file() {
+        assert!(!trusted_metadata(true, 0, 0o644));
+        assert!(!trusted_metadata(false, 0, 0o755));
+    }
+
+    /// RENDER-3（#1451）: 実ファイルでも、自分が所有する 0755 のファイルは拒否される
+    /// （root で実行する環境では所有者が 0 になるため、group 書き込み可の 0775 で確かめる）。
+    #[cfg(unix)]
+    #[test]
+    fn render3_is_trusted_executable_rejects_user_owned_file() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let dir = std::env::temp_dir().join(format!("fb-trust-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("fake-bwrap");
+        std::fs::write(&f, b"#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let owner = std::fs::metadata(&f).unwrap().uid();
+        if owner != 0 {
+            assert!(!is_trusted_executable(&f));
+        } else {
+            std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o775)).unwrap();
+            assert!(!is_trusted_executable(&f));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// RENDER-3（#1436）: Linux の argv は bwrap の固定フラグ + ホスト + 中継 UDS と完全一致する。

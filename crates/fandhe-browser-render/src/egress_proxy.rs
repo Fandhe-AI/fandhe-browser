@@ -19,7 +19,7 @@
 //!
 //! `HostProcess` への組み込み（WorkDir 配下へのソケット配置・netns 内の中継・servo-host の proxy
 //! pref 注入）、bwrap / Seatbelt、Windows の隔離は本モジュールの範囲外。macOS の TCP 待ち受けは
-//! 同一ユーザーの他プロセスからも届くため、Seatbelt 側で絞る前提。認証は置かない（loopback / UDS
+//! 同一マシンの全ユーザー・全プロセスから届く（認証なし）ため、Seatbelt 側で絞る前提。認証は置かない（loopback / UDS
 //! のみ。設計 §2）。
 
 use std::fmt;
@@ -236,7 +236,8 @@ pub enum EgressEndpoint {
     UnixSocketIn(PathBuf),
     /// `127.0.0.1:0` の TCP（macOS 向け。loopback 以外へは bind しない）。
     ///
-    /// 認証が無く、同一ホストの他プロセスからも届く。[`EgressProxyConfig::allow_private_network_access`]
+    /// 認証が無く、同一ホストの他ユーザーを含む全プロセスからも届く。宛先は許可リスト内に限られる
+    /// ので SSRF にはならないが、本体の送信元 IP の踏み台になりうる（#1451）。[`EgressProxyConfig::allow_private_network_access`]
     /// を true にするとローカル向けの開放プロキシになり得る（既定は false）。macOS では
     /// Seatbelt 側で届く先を絞る前提（#1444）。
     LoopbackTcp,
