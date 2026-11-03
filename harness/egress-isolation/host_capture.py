@@ -40,6 +40,7 @@ import signal
 import socket
 import sys
 import time
+from collections import Counter
 from pathlib import Path
 from typing import Iterable
 
@@ -58,11 +59,19 @@ MAX_SAMPLE_BYTES = 64 * 1024 * 1024
 MAX_SOCKETS_PER_SAMPLE = 512
 MAX_JSONL_LINE_CHARS = 262_144
 MAX_PACKET_LINE_CHARS = 1024
+# ローカル実行の既定値。workflow は job env の HOST_CAPTURE_MAX_PACKETS を tcpdump の -c と judge の --max-packets の
+# 両方へ明示的に渡して一本化する（二重管理のずれを防ぐ）。
 DEFAULT_MAX_PACKETS = 300_000
+UNATTRIBUTED_TOP_N = 10
 ATTRIBUTION_WINDOW_SECONDS = 0.5
 UNPARSED_RATIO_LIMIT = 0.01
 UNPARSED_MIN = 10
 MIN_CANARY_SAMPLES = 3
+
+PASS_BASIS_NOTE = (
+    "pass rests on the netns structural check (bwrap ancestor / distinct netns inode) and the observed range only; "
+    "unattributed DNS/UDP cannot be ruled out as Servo's, review this summary manually"
+)
 
 ROLE_ISOLATED = "servo_isolated"
 ROLE_UNISOLATED = "servo_unisolated"
@@ -77,6 +86,9 @@ _LINE_RE = re.compile(
 )
 _HOSTPORT_RE = re.compile(r"^(?P<host>[0-9a-fA-F:.]+?)\.(?P<port>\d{1,5})$")
 _CANARY_PAYLOAD = b"fandhe-host-capture-canary"
+# 解析できない行・proto=other の行に UDP・DNS の痕跡があるかの判定（非先頭フラグメントは `ip-proto-17` と出る）
+_UDP_TEXT_RE = re.compile(r"ip-proto-17|\bUDP\b|\.53(?=[:\s,]|$)")
+_ICMP_RE = re.compile(r"\bICMP6?\b")
 
 
 # --------------------------------------------------------------------------------------
@@ -98,10 +110,24 @@ def _split_hostport(token: str, fam: str) -> tuple[str, int | None]:
     return host, port
 
 
+def suspicious_udp_text(text: str) -> bool:
+    """行のテキストに UDP・DNS の痕跡（`ip-proto-17`・`UDP`・ポート 53 らしいトークン）があるか。
+
+    解析できない行や proto=other の行の中に UDP・DNS が紛れても、許容枠の範囲で気づかず pass になるのを防ぐ
+    ための粗い検出（過検出は unobservable 側＝安全側）。ICMP の行（`udp port 53 unreachable` 等）は対象外にする。
+    """
+    m = _LINE_RE.match(text[:MAX_PACKET_LINE_CHARS].rstrip("\n"))
+    body = m.group("rest") if m else text[:MAX_PACKET_LINE_CHARS]
+    if _ICMP_RE.search(body):
+        return False
+    return _UDP_TEXT_RE.search(body) is not None
+
+
 def parse_tcpdump_line(line: str) -> dict | None:
     """`tcpdump -nn -tt`（`-i any` の pcap を読んだ形）の 1 行を dict にする。解析できない行は None。
 
-    キー: ts・iface・dir・proto（"udp" / "tcp" / "other"）・src・sport・dst・dport・syn（TCP の SYN のみ真）。
+    キー: ts・iface・dir・proto（"udp" / "tcp" / "other"）・src・sport・dst・dport・syn（TCP の SYN のみ真）・
+    udp_hint（proto が "other" で、行に UDP・DNS の痕跡があるとき真。judge が観測不能にする）。
     形式は SLL2 の `1730000000.000000 eth0  Out IP 10.0.0.5.5000 > 8.8.8.8.53: ...`（実機の tcpdump 4.99 で確認）。
     """
     m = _LINE_RE.match(line[:MAX_PACKET_LINE_CHARS].rstrip("\n"))
@@ -121,12 +147,12 @@ def parse_tcpdump_line(line: str) -> dict | None:
         "dst": None,
         "dport": None,
         "syn": False,
+        "udp_hint": False,
     }
     fam = m.group("fam")
-    if fam not in ("IP", "IP6"):
-        return pkt
     body = m.group("rest")
-    if " > " not in body:
+    if fam not in ("IP", "IP6") or " > " not in body:
+        pkt["udp_hint"] = suspicious_udp_text(body)
         return pkt
     left, right = body.split(" > ", 1)
     dst_token, _, rest = right.partition(": ")
@@ -140,10 +166,14 @@ def parse_tcpdump_line(line: str) -> dict | None:
         if sport is not None and dport is not None:
             pkt["proto"] = "tcp"
             pkt["syn"] = "S" in flags and "." not in flags
+        else:
+            pkt["udp_hint"] = suspicious_udp_text(body)
         return pkt
     if sport is not None and dport is not None:
         # `UDP, length N` のほか、DNS 等はデコードされた形（`domain [...]`）で出る
         pkt["proto"] = "udp"
+    else:
+        pkt["udp_hint"] = suspicious_udp_text(body)
     return pkt
 
 
@@ -184,6 +214,7 @@ class SampleIndex:
         self.sample_count = 0
         self.record_count = 0
         self.bad_lines = 0
+        self.lines_over_limit = 0
         self.servo: dict[int, dict] = {}
         self._intervals: dict[tuple[str, int], list[list]] = {}
         self._state_sockets: list[dict] = []
@@ -263,6 +294,13 @@ class SampleIndex:
         for key in [k for k in self._open if k not in present]:
             del self._open[key]
 
+    def isolated_window(self) -> tuple[float, float] | None:
+        """隔離下と判定された Servo pid の観測区間 [最小 first, 最大 last]。観測が無ければ None。"""
+        spans = [(i["first"], i["last"]) for i in self.servo.values() if i.get("isolated_seen")]
+        if not spans:
+            return None
+        return min(a for a, _ in spans), max(b for _, b in spans)
+
     def roles_for(self, proto: str, port: int | None, ts: float, window: float) -> set[str]:
         if port is None:
             return set()
@@ -291,6 +329,7 @@ def judge(
     index: SampleIndex,
     *,
     unparsed: int = 0,
+    unparsed_udp_like: int = 0,
     total_lines: int = 0,
     max_packets: int = DEFAULT_MAX_PACKETS,
     tcpdump_exit: int | None = 0,
@@ -299,7 +338,12 @@ def judge(
     convert_exit: int | None = 0,
     kernel_dropped: int | None = 0,
 ) -> dict:
-    """verdict（"pass" / "fail" / "unobservable"）・理由・件数を返す。観測不能を合格にしない（fail-closed）。"""
+    """verdict（"pass" / "fail" / "unobservable"）・理由・件数を返す。観測不能を合格にしない（fail-closed）。
+
+    観測しきれていないものは unobservable にする: 解析できない行・proto=other の行に UDP・DNS の痕跡がある、
+    キャプチャが Servo の最後のサンプルより前に終わっている、カナリアが Servo の観測区間内に無い、sample 行の欠損。
+    帰属できない DNS・UDP は verdict に使わず、観測区間内の件数・宛先上位を記録する（#1457 案 A）。
+    """
     fails: list[str] = []
     unobs: list[str] = []
     counts = _empty_counts()
@@ -309,9 +353,19 @@ def judge(
     canary_ok = 0
     canary_port = index.meta.get("canary_port") if index.meta else None
     ifaces: set[str] = set()
+    window = index.isolated_window()
+    canary_in_window = 0
+    other_udp_like = 0
+    max_ts: float | None = None
+    win_counts = {"dns": 0, "udp_other": 0}
+    win_dests: Counter = Counter()
 
     for pkt in packets:
         packet_total += 1
+        if max_ts is None or pkt["ts"] > max_ts:
+            max_ts = pkt["ts"]
+        if pkt.get("proto") == "other" and pkt.get("udp_hint"):
+            other_udp_like += 1
         if pkt["iface"] != "lo" and pkt["dir"] == "Out":
             nonlo_out += 1
             ifaces.add(pkt["iface"])
@@ -325,10 +379,23 @@ def judge(
             canary_seen += 1
             if attribute(index, pkt) == ROLE_SELF:
                 canary_ok += 1
+                if window is not None and window[0] <= pkt["ts"] <= window[1]:
+                    canary_in_window += 1
         cat = count_category(pkt)
         if cat is None:
             continue
-        counts[attribute(index, pkt)][cat] += 1
+        role = attribute(index, pkt)
+        counts[role][cat] += 1
+        if (
+            role == ROLE_NONE
+            and cat in win_counts
+            and pkt["iface"] != "lo"
+            and pkt["dir"] == "Out"
+            and window is not None
+            and window[0] <= pkt["ts"] <= window[1]
+        ):
+            win_counts[cat] += 1
+            win_dests[(str(pkt.get("dst")), pkt.get("dport"))] += 1
 
     isolated_attr = sum(counts[ROLE_ISOLATED].values())
     if isolated_attr:
@@ -382,14 +449,28 @@ def judge(
         unobs.append("no packets were captured")
     elif nonlo_out == 0:
         unobs.append("no outbound packet on a non-loopback interface was captured")
-    if packet_total >= max_packets:
+    # 解析できない行は packet_total に入らないため、行数との大きい方で打ち切り（-c）への到達を見る
+    if max(packet_total, total_lines) >= max_packets:
         unobs.append(f"capture reached the packet limit ({max_packets})")
     if truncated_lines:
         unobs.append("packet text exceeded the line limit")
+    if unparsed_udp_like:
+        unobs.append(f"{unparsed_udp_like} unparsed packet line(s) look like UDP/DNS")
+    if other_udp_like:
+        unobs.append(f"{other_udp_like} packet(s) with unknown protocol look like UDP/DNS (e.g. non-first fragment)")
     if total_lines and unparsed > UNPARSED_MIN and unparsed / total_lines > UNPARSED_RATIO_LIMIT:
         unobs.append(f"too many unparsed packet lines ({unparsed}/{total_lines})")
-    if index.bad_lines > UNPARSED_MIN:
-        unobs.append(f"too many malformed sample lines ({index.bad_lines})")
+    if index.bad_lines > 0:
+        unobs.append(f"{index.bad_lines} malformed sample line(s)")
+    if index.lines_over_limit:
+        unobs.append(f"samples file exceeded the line limit ({index.lines_over_limit} line(s) not read)")
+    if window is not None:
+        if max_ts is None or max_ts < window[1]:
+            unobs.append(
+                f"capture ended before the last Servo sample (last packet ts={max_ts}, servo last={window[1]})"
+            )
+        if canary_ok > 0 and canary_in_window == 0:
+            unobs.append("canary not observed within the Servo observation window")
 
     verdict = "fail" if fails else ("unobservable" if unobs else "pass")
     return {
@@ -404,7 +485,28 @@ def judge(
         "samples": index.sample_count,
         "packets": packet_total,
         "nonlo_out_packets": nonlo_out,
-        "canary": {"port": canary_port, "seen": canary_seen, "attributed_to_self": canary_ok},
+        "canary": {
+            "port": canary_port,
+            "seen": canary_seen,
+            "attributed_to_self": canary_ok,
+            "in_servo_window": canary_in_window,
+        },
+        "unparsed_udp_like": unparsed_udp_like,
+        "other_udp_like": other_udp_like,
+        "unattributed_in_servo_window": {
+            "window": list(window) if window is not None else None,
+            "dns": win_counts["dns"],
+            "udp_other": win_counts["udp_other"],
+            "destinations": [
+                {"dst": d, "dport": port, "count": c}
+                for (d, port), c in sorted(win_dests.items(), key=lambda kv: (-kv[1], kv[0][0], kv[0][1] or 0))[
+                    :UNATTRIBUTED_TOP_N
+                ]
+            ],
+            "destinations_total": len(win_dests),
+            "destinations_omitted": max(0, len(win_dests) - UNATTRIBUTED_TOP_N),
+        },
+        "pass_basis_note": PASS_BASIS_NOTE,
         "interfaces": sorted(ifaces),
         "tcpdump_version": tcpdump_version,
         "tcpdump_exit": tcpdump_exit,
@@ -430,12 +532,30 @@ def render_summary(v: dict) -> str:
         f"- canary: seen={v['canary']['seen']} attributed_to_self={v['canary']['attributed_to_self']}",
         f"- interfaces: {', '.join(v['interfaces']) or 'n/a'} / tcpdump: {v['tcpdump_version'] or 'n/a'} (exit {v['tcpdump_exit']}, convert exit {v['convert_exit']}, kernel dropped {v['kernel_dropped']})",
         "",
+        "Counts over the whole capture:",
+        "",
         "| attribution | dns | udp_other | tcp_syn |",
         "| --- | ---: | ---: | ---: |",
     ]
     for role, c in v["counts"].items():
         lines.append(f"| {role} | {c['dns']} | {c['udp_other']} | {c['tcp_syn']} |")
-    lines.append("")
+    u = v["unattributed_in_servo_window"]
+    win = u["window"]
+    span = f"[{win[0]:.3f}..{win[1]:.3f}]" if win else "n/a"
+    lines += [
+        "",
+        f"- unattributed DNS/UDP within the isolated Servo window {span}: dns={u['dns']} udp_other={u['udp_other']}",
+        "",
+        "| dst | dport | count |",
+        "| --- | ---: | ---: |",
+    ]
+    for d in u["destinations"]:
+        lines.append(f"| {d['dst']} | {d['dport']} | {d['count']} |")
+    if not u["destinations"]:
+        lines.append("| none | | |")
+    if u["destinations_omitted"]:
+        lines.append(f"(+{u['destinations_omitted']} more)")
+    lines += ["", f"> {v['pass_basis_note']}", ""]
     return "\n".join(lines) + "\n"
 
 
@@ -444,10 +564,15 @@ def render_summary(v: dict) -> str:
 # --------------------------------------------------------------------------------------
 
 
-def load_packets(path: Path, max_packets: int) -> tuple[list[dict], int, int, bool]:
-    """tcpdump テキストを読む。戻り値は (packets, unparsed, total_lines, truncated)。行数・行長は上限つき。"""
+def load_packets(path: Path, max_packets: int) -> dict:
+    """tcpdump テキストを読む。行数・行長は上限つき。
+
+    戻り値のキー: packets・unparsed・unparsed_udp_like（解析できない行のうち UDP・DNS の痕跡があるもの）・
+    total_lines・truncated。
+    """
     packets: list[dict] = []
     unparsed = 0
+    unparsed_udp_like = 0
     total = 0
     truncated = False
     with path.open("r", encoding="utf-8", errors="replace") as fh:
@@ -461,9 +586,17 @@ def load_packets(path: Path, max_packets: int) -> tuple[list[dict], int, int, bo
             pkt = parse_tcpdump_line(raw)
             if pkt is None:
                 unparsed += 1
+                if suspicious_udp_text(raw):
+                    unparsed_udp_like += 1
             else:
                 packets.append(pkt)
-    return packets, unparsed, total, truncated
+    return {
+        "packets": packets,
+        "unparsed": unparsed,
+        "unparsed_udp_like": unparsed_udp_like,
+        "total_lines": total,
+        "truncated": truncated,
+    }
 
 
 def load_samples(path: Path) -> SampleIndex:
@@ -472,7 +605,10 @@ def load_samples(path: Path) -> SampleIndex:
     with path.open("r", encoding="utf-8", errors="replace") as fh:
         for raw in fh:
             count += 1
-            if count > MAX_SAMPLES * 2 or not raw.strip():
+            if not raw.strip():
+                continue
+            if count > MAX_SAMPLES * 2:
+                index.lines_over_limit += 1
                 continue
             try:
                 rec = json.loads(raw[:MAX_JSONL_LINE_CHARS])
@@ -520,20 +656,21 @@ def cmd_judge(args: argparse.Namespace) -> int:
     if stderr_file.is_file():
         kernel_dropped = parse_kernel_dropped(stderr_file.read_text(encoding="utf-8", errors="replace")[-65536:])
     if text.is_file() and samples.is_file():
-        packets, unparsed, total, truncated = load_packets(text, args.max_packets)
+        loaded = load_packets(text, args.max_packets)
         index = load_samples(samples)
     else:
-        packets, unparsed, total, truncated = [], 0, 0, False
+        loaded = {"packets": [], "unparsed": 0, "unparsed_udp_like": 0, "total_lines": 0, "truncated": False}
         index = SampleIndex()
     verdict = judge(
-        packets,
+        loaded["packets"],
         index,
-        unparsed=unparsed,
-        total_lines=total,
+        unparsed=loaded["unparsed"],
+        unparsed_udp_like=loaded["unparsed_udp_like"],
+        total_lines=loaded["total_lines"],
         max_packets=args.max_packets,
         tcpdump_exit=tcpdump_exit,
         tcpdump_version=version,
-        truncated_lines=truncated,
+        truncated_lines=loaded["truncated"],
         convert_exit=convert_exit,
         kernel_dropped=kernel_dropped,
     )
@@ -608,16 +745,33 @@ def _list_pids() -> tuple[list[int], bool, bool]:
     return pids, False, False
 
 
-def _socket_owners(pids: list[int]) -> tuple[dict[int, int], bool]:
+def _socket_owners(
+    pids: list[int], servo_pids: frozenset[int] | set[int] = frozenset()
+) -> tuple[dict[int, int], bool, list[str]]:
     """読める範囲の fd から inode -> pid を作る（同一ユーザーのプロセスだけ。root は読めず帰属不能）。
 
-    戻り値の bool は fd 数の上限で打ち切ったか。
+    戻り値は (owners, fd 数の上限で打ち切ったか, 読み取り失敗の記録)。記録するのは Servo ホストと同定済みの pid の
+    fd が PermissionError で読めなかったときだけ（`proc-read-error:fd-<pid>`）。消えたプロセス
+    （FileNotFoundError・ProcessLookupError）は通常の競合で記録しない。他ユーザーの pid は帰属不能が前提で記録しない。
+    本番で誤って unobservable にならない根拠: `/proc/<pid>/exe` の readlink と `/proc/<pid>/fd` の listdir は同じ
+    ptrace-read のアクセス検査を通るため、`_exe` で同定できた pid の fd が正当な理由で EACCES になることは通常ない
+    （参考実測 run 41650422295 でも、隔離下の pid を検出したうえで fd が読めていた）。
     """
     owners: dict[int, int] = {}
+    errors: list[str] = []
     hit = False
+
+    def _note(pid: int) -> None:
+        tag = f"proc-read-error:fd-{pid}"
+        if pid in servo_pids and tag not in errors:
+            errors.append(tag)
+
     for pid in pids:
         try:
             names = os.listdir(f"/proc/{pid}/fd")
+        except PermissionError:
+            _note(pid)
+            continue
         except OSError:
             continue
         if len(names) > MAX_FDS_PER_PROCESS:
@@ -625,6 +779,9 @@ def _socket_owners(pids: list[int]) -> tuple[dict[int, int], bool]:
         for name in names[:MAX_FDS_PER_PROCESS]:
             try:
                 target = os.readlink(f"/proc/{pid}/fd/{name}")
+            except PermissionError:
+                _note(pid)
+                continue
             except OSError:
                 continue
             if target.startswith("socket:["):
@@ -632,18 +789,36 @@ def _socket_owners(pids: list[int]) -> tuple[dict[int, int], bool]:
                     owners.setdefault(int(target[8:-1]), pid)
                 except ValueError:
                     continue
-    return owners, hit
+    return owners, hit, errors
 
 
-def _read_table(name: str, optional: bool = False) -> tuple[list[tuple[int, int]], bool, bool]:
-    """`/proc/self/net/<name>` から ((local_port, inode) の列, 上限到達, 読み取り失敗) を返す（行数上限つき）。
+def _ipv6_absent() -> bool:
+    """IPv6 が無効（カーネルが IPv6 を持たない）と確かめられたときだけ True。確認不能は不在と扱わない。
+
+    tcp6・udp6 の不在を許す根拠: `ipv6.disable=1` のカーネルでは `/proc/net/if_inet6` も tcp6・udp6 も存在しない。
+    sysctl の `disable_ipv6` では表は存在する。したがって `if_inet6` があるのに表が無い状態（片方だけ無い場合を含む）は
+    異常として記録する。
+    """
+    try:
+        os.stat("/proc/self/net/if_inet6")
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+    return False
+
+
+def _read_table(name: str, optional: bool = False) -> tuple[list[tuple[int, int]], bool, bool, int]:
+    """`/proc/self/net/<name>` から ((local_port, inode) の列, 上限到達, 読み取り失敗, 解析できない行数) を返す。
 
     読み取り失敗は表の内容が空だったこととは別物で、呼び出し側が観測不能として記録する。
-    optional な表（IPv6 無効時に存在しない tcp6・udp6）の不在（FileNotFoundError）だけは失敗に数えない。
+    optional な表（tcp6・udp6。`_ipv6_absent` で IPv6 無効と確かめたときだけ）の不在（FileNotFoundError）は失敗に数えない。
+    解析できない行数はヘッダ（1 行目）と空白だけの行を除いて数える（捨てずに呼び出し側が記録する）。
     """
     rows: list[tuple[int, int]] = []
     hit = False
     failed = False
+    unparsed = 0
     try:
         with open(f"/proc/self/net/{name}", "r", encoding="ascii", errors="replace") as fh:
             for i, line in enumerate(fh):
@@ -651,13 +826,16 @@ def _read_table(name: str, optional: bool = False) -> tuple[list[tuple[int, int]
                     hit = True
                     break
                 parsed = egress_guard.parse_net_line(line)
-                if parsed is not None and parsed[3] != 0:
+                if parsed is None:
+                    if i > 0 and line.strip():
+                        unparsed += 1
+                elif parsed[3] != 0:
                     rows.append((parsed[4], parsed[3]))
     except FileNotFoundError:
         failed = not optional
     except OSError:
         failed = True
-    return rows, hit, failed
+    return rows, hit, failed, unparsed
 
 
 def take_sample(
@@ -684,21 +862,25 @@ def take_sample(
         servo.append({"pid": pid, "bwrap": bwrap, "netns": netns})
         isolated = bwrap or (netns is not None and self_netns is not None and netns != self_netns)
         servo_roles[pid] = ROLE_ISOLATED if isolated else ROLE_UNISOLATED
-    owners, hit = _socket_owners(pids)
+    owners, hit, fd_errors = _socket_owners(pids, frozenset(servo_roles))
     if hit:
         limits.append("fds-per-process-limit")
+    limits.extend(fd_errors)
     sockets: list[dict] = []
+    ipv6_absent = _ipv6_absent()
     for table, proto, optional in (
         ("udp", "udp", False),
-        ("udp6", "udp", True),
+        ("udp6", "udp", ipv6_absent),
         ("tcp", "tcp", False),
-        ("tcp6", "tcp", True),
+        ("tcp6", "tcp", ipv6_absent),
     ):
-        rows, hit, failed = _read_table(table, optional)
+        rows, hit, failed, unparsed = _read_table(table, optional)
         if hit:
             limits.append("net-lines-limit")
         if failed:
             limits.append(f"proc-read-error:net-{table}")
+        if unparsed:
+            limits.append(f"proc-read-error:net-{table}-unparsed")
         for port, inode in rows:
             pid = owners.get(inode)
             if pid is None:
@@ -816,6 +998,12 @@ def run_sampler(
                 emit({"type": "tick", "t": time.time()})
             n += 1
             time.sleep(interval)
+        # 停止直前に最後のカナリアを送る。workflow はサンプラー停止後に tcpdump を止めるため、このカナリアが
+        # Servo の最後のサンプルより後に記録され、judge が「キャプチャ区間が観測区間を覆う」ことを確かめられる。
+        try:
+            send.sendto(_CANARY_PAYLOAD, recv_addr)
+        except OSError:
+            pass
         emit({"type": "end", "t": time.time(), "truncated": truncated, "reason": reason, "samples": n})
     recv.close()
     send.close()
@@ -827,6 +1015,14 @@ def cmd_sample(args: argparse.Namespace) -> int:
     interval = max(0.05, min(args.interval_ms / 1000.0, 5.0))
     stop_file = Path(args.stop_file) if args.stop_file else None
     return run_sampler(servo_exe, Path(args.out), interval, stop_file, args.max_seconds)
+
+
+def _positive_int(value: str) -> int:
+    """argparse 用。tcpdump の -c と共用する上限なので 1 以上だけを受け付ける。"""
+    n = int(value)
+    if n < 1:
+        raise argparse.ArgumentTypeError("must be >= 1")
+    return n
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -841,7 +1037,7 @@ def main(argv: list[str] | None = None) -> int:
     s.set_defaults(func=cmd_sample)
     j = sub.add_parser("judge", help="capture.txt と samples.jsonl から verdict を出す")
     j.add_argument("--out-dir", required=True)
-    j.add_argument("--max-packets", type=int, default=DEFAULT_MAX_PACKETS)
+    j.add_argument("--max-packets", type=_positive_int, default=DEFAULT_MAX_PACKETS)
     j.set_defaults(func=cmd_judge)
     args = ap.parse_args(argv)
     return args.func(args)

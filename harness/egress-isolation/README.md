@@ -267,16 +267,26 @@ host netns を記録し、bwrap 配下の Servo ホストに帰属する外向�
 
 - 権限: sudo は tcpdump の導入・起動・停止だけ（`-Z` で実行ユーザーへ即座に権限を落とし、`-w -` で runner のシェルが書く）。
   サンプラーと判定は非特権。sysctl・ルーティング・nftables・ruleset は変えない。承認は #1457 のコメント（オーナー承認 2026-11-03）で、使い捨てランナー限定。
-- 記録: `tcpdump -i any -nn -U -s 256 -c 300000 "udp or tcp"`。ペイロードの大半を落とす。pcap と変換テキストはランナー自身の通信ヘッダを含むためアーティファクトに載せず削除する。
-- 帰属: サンプラー（`host_capture.py sample`）が 200 ms ごとに Servo ホスト pid（`/proc/<pid>/exe` の実体が `$FANDHE_BROWSER_RENDER_HOST` と一致）、
+- 記録: `tcpdump -i any -nn -U -s 256 -c "$HOST_CAPTURE_MAX_PACKETS" "udp or tcp"`（既定 300000。job env で judge の `--max-packets` と共用）。ペイロードの大半を落とす。pcap と変換テキストはランナー自身の通信ヘッダを含むためアーティファクトに載せず削除する。
+- 帰属: サンプラー（`host_capture.py sample`）が 200 ms ごとに Servo ホスト pid（`/proc/<pid>/exe` の実体が `--servo-exe`〔workflow では `$SERVO_HOST_TARGET_DIR/release/fandhe-browser-servo-host`〕と一致）、
   その netns、host netns のソケット所有 pid（同一ユーザーの `/proc/<pid>/fd`）を記録する。パケットの送信元（proto・port）を時刻が近い所有者へ突き合わせる。
   隔離は「bwrap の祖先がいる」または「netns が host と異なる」。bwrap の祖先がいて netns が host と同じなら隔離破れで fail。判定は同一 pid のサンプルごとに行い、違反（host netns 共有）・確認不能（netns 読み取り失敗）を pid ごとに累積する（初回値で固定しない）。
 - 判定: 隔離下の Servo に帰属する DNS・UDP・直接 TCP SYN が 1 件でもあれば fail。隔離外 Servo（WebSocket の対照）・自身・他プロセス・帰属不能は件数を記録するだけ。
   対象は非 `lo` の Out（UDP 全ポート・TCP SYN）と `lo` の Out・In の宛先 53 番（lo は libpcap が送信側重複を除外し In で記録される）（systemd-resolved スタブ経由を拾う）。
 - 観測不能は合格にしない（unobservable）: カナリア（サンプラーが 127.0.0.1 の UDP で自分宛てに送る陽性対照）が `lo` の記録に現れて自分に帰属しない、
-  隔離下の Servo pid を一度も観測しない、サンプル 0、外向きパケット 0、tcpdump の異常終了・pcap 変換の失敗・カーネルドロップの検出または統計の欠落、上限による打ち切り、解析不能行の超過。
+  隔離下の Servo pid を一度も観測しない、サンプル 0、外向きパケット 0、tcpdump の異常終了・pcap 変換の失敗・カーネルドロップの検出または統計の欠落、上限による打ち切り
+  （解析できない行も数える）、解析不能行の超過。次も #1467 で観測不能に加えた（pass にしない）。
+  解析できない行・`proto=other` の行に UDP・DNS の痕跡（`ip-proto-17`・`UDP`・ポート 53）が 1 件でもある、
+  最後のパケットの時刻が Servo の最後のサンプルより前（キャプチャが観測区間を覆わない）、カナリアが Servo の観測区間内に無い
+  （サンプラーは停止直前に最後のカナリアを 1 回送る）、sample 行の欠損が 1 件でもある、samples の行数上限の超過。
+  サンプラー側では、`/proc/net` の解析できない行、Servo と同定した pid の fd の EACCES、`/proc/net/if_inet6` があるのに tcp6・udp6 が無い状態を記録して観測不能にする
+  （tcp6・udp6 の不在を許すのは `if_inet6` が無いときだけ）。
 - 限界: サンプル間隔より短命なソケット・root のプロセス（systemd-resolved 等）は帰属できない。隔離下のホストの ns 内の `lo` で閉じる問い合わせは host に届かないため観測対象外。
   テストのページは IP リテラルで、宛先の DNS を誘発しない（Servo が自発的に出す送信だけを見る）。fd 受け渡しによる netns 越えのソケットは想定外。ubuntu のみ。
+  隔離下の pid 全体の観測区間がカナリアの間隔（2 秒）より短いと、区間内のカナリアが無く観測不能になりうる（`render3_egress_*` は 3 件を順に走らせるので通常は十分に長い）。
+- 帰属できない DNS・UDP（#1457・2026-11-03 のオーナー判断・案 A）: 合否には使わず、人が判断する。Servo の観測区間（隔離下 pid の first〜last）内にある
+  帰属できない DNS・UDP の件数と宛先（dst・dport）の上位 10 件、pass の根拠の注記を Summary と `verdict.json`（`unattributed_in_servo_window`・`pass_basis_note`）に出す。
+  pass は netns の構造検査と観測範囲だけに基づき、帰属できない通信が Servo のものでないとは言えない。ペイロードは出さず、pcap と変換テキストは削除する（アーティファクトは許可リスト）。
 - 自己テスト: `test_host_capture.py`（合成 tcpdump テキスト・合成サンプル。`make check-egress-isolation`）。行形式は tcpdump 4.99.6（SLL2）の実出力に合わせてある。
 
 ## 承認事項（この issue では実装しない）

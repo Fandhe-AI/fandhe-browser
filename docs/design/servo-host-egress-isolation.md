@@ -165,7 +165,7 @@ Windows の補足（#1401）: `xos-measure.yml` の Windows ジョブに限り�
 
 未測定（残りの追跡は §9.2）:
 
-- Servo 自身の DNS・UDP 送信の外部観測（root か `CAP_NET_ADMIN` が要る）。#1461 で xos-measure の `egress-host-ubuntu` に host-capture（tcpdump とサンプラーによる帰属判定）を追加した。実測はマージ後で、結果は未記録
+- Servo 自身の DNS・UDP 送信の外部観測（root か `CAP_NET_ADMIN` が要る）。#1461 で xos-measure の `egress-host-ubuntu` に host-capture（tcpdump とサンプラーによる帰属判定）を追加した。実測はマージ後で、結果は未記録。帰属できない DNS・UDP は記録だけで合否に使わず（案 A・#1457）、Servo の観測区間内の件数と宛先の上位 10 件を Summary と `verdict.json` に出す（#1467）
 - Landlock ルールの適用・seccomp・許可リスト付きプロキシとの併用（§7 の承認事項）
 - macOS・Windows（#1387）、AppArmor の制限が無い環境・古いカーネル
 
