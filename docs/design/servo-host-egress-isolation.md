@@ -165,7 +165,7 @@ Windows の補足（#1401）: `xos-measure.yml` の Windows ジョブに限り�
 
 未測定（残りの追跡は §9.2）:
 
-- Servo 自身の DNS・UDP 送信の外部観測（root か `CAP_NET_ADMIN` が要る）
+- Servo 自身の DNS・UDP 送信の外部観測（root か `CAP_NET_ADMIN` が要る）。#1461 で xos-measure の `egress-host-ubuntu` に host-capture（tcpdump とサンプラーによる帰属判定）を追加した。実測はマージ後で、結果は未記録
 - Landlock ルールの適用・seccomp・許可リスト付きプロキシとの併用（§7 の承認事項）
 - macOS・Windows（#1387）、AppArmor の制限が無い環境・古いカーネル
 
@@ -219,7 +219,7 @@ Windows の補足（#1401）: `xos-measure.yml` の Windows ジョブに限り�
 | 3. Windows の扱い | macOS・Windows の実測まで GA の成立範囲から外し、D の扱い | 引き続き D（既知の制約）とし、GA の成立範囲から外す。根拠: AppContainer 内で Servo ホストの陽性対照は成立した（`positive_ok: true`。run 41386861681・41402439545。#1413・#1420）。一方、Servo を使わない preflight で、capability なしでも loopback の外側 listener に届いた（loopback 免除を付けているため）。そのため全経路が「loopback listener では egress の遮断を測れない」理由で unobservable。測り直すには loopback 以外の宛先が要る | 測り方の検討は #1427。AppContainer 内の ipc-channel の制約は #1421 |
 | 4. 本番への組み込み | （新規の論点） | #1436（PR #1446）で実装済み。HostProcess の起動を Linux は bwrap、macOS は sandbox-exec で包み、通信を本体の許可リスト付きプロキシに限る（`[rendering] egress_isolation`。既定 `best-effort`、`required` は隔離できなければ起動しない）。依存・`unsafe` を足さず外部コマンドで包む方式にしたため、§7 の承認事項のうち依存・`unsafe` を要する案は採っていない。隔離中は WebSocket が使えず（Servo の `websocket_loader` はプロキシを使わない）、v1 ではファイルシステムを隔離しない。実ホストでの検証は #1437 で `real_host` の `render3_egress_*`（`FANDHE_BROWSER_RENDER_EGRESS_ISOLATION=required`）に足し、xos-measure の suite `egress-host` で実測する（実行と記録はマージ後） | #1436・#1437 |
 
-- 「8 経路すべて pass」（§6.4）のうち `internal_real`・`dns` は構造検査で、Servo 自身の DNS・UDP 送信は外部から観測していない
+- 「8 経路すべて pass」（§6.4）のうち `internal_real`・`dns` は構造検査で、Servo 自身の DNS・UDP 送信の外部観測は #1461 の host-capture で追加した（実測はマージ後）
 - AppContainer 内の ipc-channel の制約（ボディ付きリクエストで panic し得る）は推定で、未実測（#1421）
 
 ### 8.2 暫定判断（2026-10-31・履歴。§8.1 で見直し済み）
@@ -234,7 +234,7 @@ Windows の補足（#1401）: `xos-measure.yml` の Windows ジョブに限り�
 | 2. B が成立しない OS・環境での既知の制約の文言（D） | OS 隔離が使えない環境では A（アプリ側の検知）だけで動作し、「egress を完全には遮断できない」と明記する。既定ではそのことを警告する | 文言の置き場所は §4 の候補（設計 §2.5・README）から選ぶ（未定。§8.1 の論点 2 で決定） |
 | 3. Windows の扱い（弱い保証にとどめるか、対象外とするか） | macOS・Windows の実測が済むまで GA の成立範囲から外し、D の扱いとする | #1387（§8.1 の論点 1・3 で更新） |
 
-- 「8 経路すべて pass」のうち `internal_real`・`dns` は構造検査で、Servo 自身の DNS・UDP 送信は外部から観測していない（§6.4）
+- 「8 経路すべて pass」のうち `internal_real`・`dns` は構造検査で、Servo 自身の DNS・UDP 送信の外部観測は #1461 の host-capture で追加した（実測はマージ後）（§6.4）
 
 ## 9. 未確認事項
 
@@ -262,7 +262,7 @@ options §7 を引き継ぐ。本書で新たに加わる未確認事項は §9.
 | AppContainer 内の ipc-channel の制約（ボディ付きリクエストで panic し得る。推定・未実測） | #1421 |
 | Docker 内での bwrap の可否（イメージに bwrap が無い） | #1457 |
 | 実ホストの子プロセス数（rss の pid 解決の前提。ns 内 pid 1 の子が 1 件）。記録は `real_host` の `EGRESS-PROCTREE` 行（#1460）、実測は xos-measure の `egress-host`（マージ後） | #1457 |
-| Servo 自身の DNS・UDP 送信の外部観測（root か `CAP_NET_ADMIN` が要る） | #1457 |
+| Servo 自身の DNS・UDP 送信の外部観測（root か `CAP_NET_ADMIN` が要る） | #1461 |
 | Landlock ルール適用下の動作・seccomp との併用（許可リスト付きプロキシは #1434・#1440・#1436 で本番に実装済み。netns 内の中継 → UDS → プロキシの成立性は §6.5 で確認済み） | #1457 |
 | 実ホスト（GitHub の ubuntu・macOS runner）での隔離下の動作（xos-measure の `egress-host`。マージ後に実施し、結果は #1003 へ） | #1003 |
 | bwrap のファイルシステム隔離（`--ro-bind` 化。v1 は `--dev-bind / /`） | #1457 |

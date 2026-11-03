@@ -70,8 +70,8 @@ measure.py は全モードで同一バイナリ（sha256 一致。`binary_match`
 
 ## 限界
 
-- `dns` / `udp_direct` はハーネス自身のプローブで、Servo 自身の DNS・UDP 送信は外から観測していない
-  （root か CAP_NET_ADMIN が要る。承認事項）。
+- `dns` / `udp_direct` はハーネス自身のプローブで、Servo 自身の DNS・UDP 送信の外部観測は xos-measure の
+  `egress-host-ubuntu` の host-capture（#1461。次節）が担う（root が要るため使い捨てランナーに限る）。
 - 送信先の監視は `monitor.py`（`egress_guard` の走査関数を流用し、ハーネスが意図的に接続させるダミー宛先を除外して継続する）。接続済みソケットを 25 ms 間隔で走査するため短命な接続は拾えず、経路ごとに走査が 1 回以上完了していなければ合格にしない。補助の観測手段。
 - `dns` は `/etc/resolv.conf` の実体位置に固定の非ループバック nameserver（192.0.2.53）を重ね、その宛先への UDP connect が経路なしで失敗したときだけ試行を観測した扱いにする（`/run` の隠蔽による resolv.conf 欠落と netns 由来の失敗を区別する。区別できなければ unobservable）。docker-none は resolv.conf を差し替えないため、nameserver が得られなければ unobservable になる。
 - docker-none の不採用案: render-screenshot のイメージの流用（Chromium の導入で遅く無関係な依存が入る）、
@@ -259,8 +259,28 @@ macOS・Windows の GitHub ホステッドランナー。結果は #1003 に記�
 
 - Windows の runner は管理者で動くため、「非管理者で loopback 例外を作れるか」には答えられない（設計 §6.2）。
 
+## host-capture（#1461。隔離下の実ホストの DNS・UDP・直接 TCP 送信の外部観測）
+
+`xos-measure.yml` の `egress-host-ubuntu`（`render3_egress_*` の前後に `host-capture start / stop / judge`）で、テスト中の
+host netns を記録し、bwrap 配下の Servo ホストに帰属する外向き送信が 0 件かを判定する（`host_capture.py`・`RENDER-3`・`SEC-2`）。
+合否は Step Summary とアーティファクト（`host-capture/verdict.json`・`summary.md`・`samples.jsonl`）に出し、最終判断は人間が行う。
+
+- 権限: sudo は tcpdump の導入・起動・停止だけ（`-Z` で実行ユーザーへ即座に権限を落とし、`-w -` で runner のシェルが書く）。
+  サンプラーと判定は非特権。sysctl・ルーティング・nftables・ruleset は変えない。承認は #1457 のコメント（オーナー承認 2026-11-03）で、使い捨てランナー限定。
+- 記録: `tcpdump -i any -nn -U -s 256 -c 300000 "udp or tcp"`。ペイロードの大半を落とす。pcap と変換テキストはランナー自身の通信ヘッダを含むためアーティファクトに載せず削除する。
+- 帰属: サンプラー（`host_capture.py sample`）が 200 ms ごとに Servo ホスト pid（`/proc/<pid>/exe` の実体が `$FANDHE_BROWSER_RENDER_HOST` と一致）、
+  その netns、host netns のソケット所有 pid（同一ユーザーの `/proc/<pid>/fd`）を記録する。パケットの送信元（proto・port）を時刻が近い所有者へ突き合わせる。
+  隔離は「bwrap の祖先がいる」または「netns が host と異なる」。bwrap の祖先がいて netns が host と同じなら隔離破れで fail。判定は同一 pid のサンプルごとに行い、違反（host netns 共有）・確認不能（netns 読み取り失敗）を pid ごとに累積する（初回値で固定しない）。
+- 判定: 隔離下の Servo に帰属する DNS・UDP・直接 TCP SYN が 1 件でもあれば fail。隔離外 Servo（WebSocket の対照）・自身・他プロセス・帰属不能は件数を記録するだけ。
+  対象は非 `lo` の Out（UDP 全ポート・TCP SYN）と `lo` の Out・In の宛先 53 番（lo は libpcap が送信側重複を除外し In で記録される）（systemd-resolved スタブ経由を拾う）。
+- 観測不能は合格にしない（unobservable）: カナリア（サンプラーが 127.0.0.1 の UDP で自分宛てに送る陽性対照）が `lo` の記録に現れて自分に帰属しない、
+  隔離下の Servo pid を一度も観測しない、サンプル 0、外向きパケット 0、tcpdump の異常終了・pcap 変換の失敗・カーネルドロップの検出または統計の欠落、上限による打ち切り、解析不能行の超過。
+- 限界: サンプル間隔より短命なソケット・root のプロセス（systemd-resolved 等）は帰属できない。隔離下のホストの ns 内の `lo` で閉じる問い合わせは host に届かないため観測対象外。
+  テストのページは IP リテラルで、宛先の DNS を誘発しない（Servo が自発的に出す送信だけを見る）。fd 受け渡しによる netns 越えのソケットは想定外。ubuntu のみ。
+- 自己テスト: `test_host_capture.py`（合成 tcpdump テキスト・合成サンプル。`make check-egress-isolation`）。行形式は tcpdump 4.99.6（SLL2）の実出力に合わせてある。
+
 ## 承認事項（この issue では実装しない）
 
 Landlock ルールの適用（`landlock` クレートまたは `unsafe`）・seccomp-bpf・許可リスト付きプロキシ（本番の実装。netns 内の中継の成立性だけは #1431 の proxy-relay で確認済み）・
-Servo 自身の DNS/UDP の外部観測・Windows の TCP 経路の試行の観測手段（WFP の監査等）・古いカーネルでの再測定。
+Windows の TCP 経路の試行の観測手段（WFP の監査等）・古いカーネルでの再測定。
 （`CheckNetIsolation LoopbackExempt` は #1401 で承認済みの opt-in〔xos-measure の Windows のみ〕として実装済み。Windows の AppContainer ランチャー〔ctypes〕は #1396 でオーナー承認のうえ実装済み。範囲はこのディレクトリの Python ハーネスに限る。）

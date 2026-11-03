@@ -12,6 +12,9 @@ name: XOS Measure
 #   suite=egress-host      render の real_host で、隔離（Linux: bwrap・macOS: sandbox-exec）下の実 Servo ホストを検証する
 #                          （#1437・TASK-38・RENDER-3。`render3_egress_*` の 3 本。Windows は対象外〔既知の制約 D〕。
 #                          起動例: gh workflow run xos-measure.yml -f suite=egress-host）
+#                          egress-host-ubuntu はさらに host-capture（#1461）で、隔離下の Servo ホストの DNS・UDP・直接 TCP 送信を
+#                          host netns の外から tcpdump で観測する。sudo は tcpdump の導入・起動・停止だけに使う
+#                          （使い捨てランナー限定。オーナー承認 2026-11-03〔#1457 のコメント〕）
 # Windows の egress-isolation は #1401 で opt-in のループバック免除（CheckNetIsolation LoopbackExempt。ハーネスが作った
 # AppContainer の SID だけ・計測後に解除）を付ける（オーナー承認 2026-11-01。使い捨て runner に限る）。
 # macOS の egress-isolation は sudo なしの `log show` で拒否行を取る（#1402。実測で sudo・`log config` が不要と分かり、
@@ -714,6 +717,46 @@ jobs:
             echo "$key=$(sysctl -n "$key" 2>/dev/null || echo unknown)"
             python3 -I -B harness/egress-isolation/platform_probe.py || true
           } 2>&1 | tee "$OUT_DIR/platform.txt"
+      # host-capture（#1461・RENDER-3・SEC-2）。隔離下の Servo ホストの DNS・UDP・直接 TCP 送信を host netns の外から観測する。
+      # sudo は tcpdump の起動・停止（と apt の導入）だけに使い、-Z で直ちに実行ユーザーへ権限を落とす。サンプラーと判定は非特権。
+      # sysctl・ルーティング・nftables・ruleset は変えない。pcap は書き込みを runner のシェルのリダイレクトで行う（-w -）。
+      # 帰属の方法と限界は harness/egress-isolation/README.md「host-capture」。
+      - name: "[egress-host] host-capture start（tcpdump は Ubuntu 公式 apt。sudo は起動のみ）"
+        run: |
+          set -euo pipefail
+          cap="$OUT_DIR/host-capture"
+          mkdir -p "$cap"
+          sudo apt-get install -y --no-install-recommends tcpdump
+          { tcpdump --version 2>&1 || true; } | tee "$cap/tcpdump.version"
+          me="$(id -un)"
+          # 送信元ポートで帰属させるため UDP・TCP を全て記録する（-s 256 でペイロードの大半を落とす。-c で件数上限）。
+          # tcpdump の終了コードは tcpdump.exit に残す（異常終了は判定で unobservable）。
+          setsid nohup bash -c '
+            sudo tcpdump -i any -nn -U -s 256 -c 300000 -Z "$1" -w - "udp or tcp" \
+              2> "$2/tcpdump.stderr" > "$2/capture.pcap"
+            echo $? > "$2/tcpdump.exit"
+          ' _ "$me" "$cap" >/dev/null 2>&1 &
+          for _ in $(seq 1 40); do
+            if grep -q "listening on" "$cap/tcpdump.stderr" 2>/dev/null; then break; fi
+            sleep 0.5
+          done
+          if ! grep -q "listening on" "$cap/tcpdump.stderr" 2>/dev/null; then
+            echo "error: tcpdump did not start listening" >&2
+            cat "$cap/tcpdump.stderr" >&2 || true
+            exit 1
+          fi
+          setsid nohup python3 -I -B harness/egress-isolation/host_capture.py sample \
+            --servo-exe "$SERVO_HOST_TARGET_DIR/release/fandhe-browser-servo-host" \
+            --out "$cap/samples.jsonl" --stop-file "$cap/stop" >"$cap/sampler.log" 2>&1 &
+          for _ in $(seq 1 20); do
+            if [ -s "$cap/samples.jsonl" ]; then break; fi
+            sleep 0.5
+          done
+          if [ ! -s "$cap/samples.jsonl" ]; then
+            echo "error: sampler did not start" >&2
+            cat "$cap/sampler.log" >&2 || true
+            exit 1
+          fi
       - name: "[egress-host] real_host の render3_egress_*（隔離を明示。fail-closed）"
         env:
           FANDHE_BROWSER_RENDER_EGRESS_ISOLATION: required
@@ -741,10 +784,45 @@ jobs:
             echo "error: egress-host verification incomplete" >&2
             exit 1
           fi
+      - name: "[egress-host] host-capture stop（サンプラー停止・tcpdump に SIGINT・pcap をテキストへ変換）"
+        if: ${{ !cancelled() }}
+        run: |
+          set -uo pipefail
+          cap="$OUT_DIR/host-capture"
+          touch "$cap/stop"
+          for _ in $(seq 1 30); do
+            if grep -q '"type":"end"' "$cap/samples.jsonl" 2>/dev/null; then break; fi
+            sleep 0.5
+          done
+          sudo pkill -INT -x tcpdump || echo "note: no tcpdump process to stop"
+          for _ in $(seq 1 60); do
+            if [ -f "$cap/tcpdump.exit" ]; then break; fi
+            sleep 0.5
+          done
+          if [ ! -f "$cap/tcpdump.exit" ]; then echo "note: tcpdump.exit is missing (judge reports unobservable)"; fi
+          # 変換の終了状態は convert.exit に残す（途中切れ pcap の部分出力を合格にしないため。非 0・欠落は判定で unobservable）。
+          # Actions 既定の errexit が残るため、tcpdump -r 失敗でも convert.exit を必ず書けるよう明示的に解除する。
+          set +e
+          tcpdump -r "$cap/capture.pcap" -nn -tt > "$cap/capture.txt" 2> "$cap/convert.stderr"
+          echo $? > "$cap/convert.exit"
+          exit 0
+      - name: "[egress-host] host-capture judge（隔離下の Servo への帰属が 0 件か。fail-closed）"
+        if: ${{ !cancelled() }}
+        run: |
+          set +e
+          cap="$OUT_DIR/host-capture"
+          python3 -I -B harness/egress-isolation/host_capture.py judge --out-dir "$cap"
+          rc=$?
+          # pcap と変換テキストはランナー自身の通信ヘッダを含むため、アーティファクトには載せず削除する
+          # （verdict.json・summary.md・samples.jsonl〔pid・ポートのみ〕を残す）。
+          rm -f "$cap/capture.pcap" "$cap/capture.txt"
+          exit "$rc"
       - name: "[egress-host] 結果を Step Summary へ"
         if: ${{ !cancelled() }}
         run: |
           if [ -f "$OUT_DIR/summary.md" ]; then cat "$OUT_DIR/summary.md" >> "$GITHUB_STEP_SUMMARY"; fi
+          hc="$OUT_DIR/host-capture/summary.md"
+          if [ -f "$hc" ]; then cat "$hc" >> "$GITHUB_STEP_SUMMARY"; fi
           if [ -f "$OUT_DIR/platform.txt" ]; then
             { echo '```'; cat "$OUT_DIR/platform.txt"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
           fi
