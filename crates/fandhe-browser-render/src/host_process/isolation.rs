@@ -73,7 +73,7 @@ pub const RELAY_UDS_PATH_MAX_BYTES: usize = 100;
 /// 残余リスク（RENDER-3。未対応）: 信頼判定を通った実行ファイルが bwrap 互換かは、プローブ
 /// （本番と同じフラグでの試走の終了コード）でしか確かめない。引数を無視して exit 0 する
 /// root 所有コマンドは成功してしまう。プローブで「外へ出られないこと」まで実測する対策は
-/// #1437（実ホスト検証）に委ねる。bwrap が Nix 等の root 所有でない場所にある環境は
+/// 未起票の残課題として #1457 で追跡する。bwrap が Nix 等の root 所有でない場所にある環境は
 /// `SandboxToolUntrusted` となり、`required` では起動できない（`best-effort` は警告つきで隔離なし）。
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 const BWRAP_CANDIDATES: [&str; 1] = ["/usr/bin/bwrap"];
