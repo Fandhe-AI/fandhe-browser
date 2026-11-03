@@ -412,17 +412,32 @@ fn is_ipv6_site_local(v6: Ipv6Addr) -> bool {
 /// render の egress プロキシの双方に効く）。取り出し位置は形式ごとに次のとおり。
 /// - v4-mapped `::ffff:0:0/96`・IPv4 互換 `::/96`（RFC 4291）・NAT64 既知
 ///   `64:ff9b::/96`（RFC 6052）: 末尾 32 ビット
+/// - IPv4-translated `::ffff:0:0:0/96`（RFC 2765・RFC 6145 の SIIT）: 末尾 32 ビット
+///   （#1449。`::ffff:0:7f00:1` は 127.0.0.1 として拒否する）
 /// - 6to4 `2002::/16`（RFC 3056）: ビット 16〜47
 /// - Teredo `2001::/32`（RFC 4380）: サーバー（ビット 32〜63）と、反転された
 ///   クライアント（末尾 32 ビット）の両方。どちらかが拒否対象なら拒否する
 /// - NAT64 ローカル用 `64:ff9b:1::/48`（RFC 8215）: 運用者が /48〜/96 のどの長さでも
 ///   使え IPv4 の位置がアドレスだけでは決まらない（`64:ff9b:1::800:0` は /96 なら
 ///   公開 8.0.0.0、/64 なら内部 0.0.0.8）ため、/48 全体を fail-closed で拒否する
+///
+/// 判定しないもの（残余リスク。CORE-1・RENDER-3・#1449）:
+/// - 運用者が独自に決めた NAT64 プレフィクス（RFC 6052 §2.2 の /32〜/64 を含むネットワーク
+///   固有プレフィクス。例: `2001:db8:64::/96`）: プレフィクス長と IPv4 の位置がアドレス
+///   だけでは決まらずコードでは判別できない。独自プレフィクスで DNS64/NAT64 を運用する環境では、
+///   内部 IPv4 宛ての合成アドレスが許可されうる。egress は netns 隔離（RENDER-3）など
+///   別の層でも抑える前提とする
+/// - ISATAP（`…:0:5efe:a.b.c.d`）: ISATAP ルーター宛ての通信で、埋め込まれた IPv4 へ
+///   直接は届かないため対象外
 fn is_disallowed_embedded_ipv4(v6: Ipv6Addr) -> bool {
     let [s0, s1, s2, s3, s4, s5, s6, s7] = v6.segments();
     let v4 = |hi: u16, lo: u16| Ipv4Addr::from((u32::from(hi) << 16) | u32::from(lo));
     let tail_zero = s0 == 0 && s1 == 0 && s2 == 0 && s3 == 0 && s4 == 0;
     if tail_zero && (s5 == 0 || s5 == 0xffff) {
+        return is_disallowed_ipv4(v4(s6, s7));
+    }
+    if s0 == 0 && s1 == 0 && s2 == 0 && s3 == 0 && s4 == 0xffff && s5 == 0 {
+        // IPv4-translated `::ffff:0:0:0/96`（RFC 2765・RFC 6145。#1449）
         return is_disallowed_ipv4(v4(s6, s7));
     }
     if s0 == 0x0064 && s1 == 0xff9b {
@@ -446,7 +461,8 @@ fn is_disallowed_embedded_ipv4(v6: Ipv6Addr) -> bool {
 
 /// [`IpAddr`] が内部アドレス（ループバック・プライベートアドレス等）か
 /// どうかを判定する（[`SafeResolver`] から使う）。IPv6 に埋め込まれた IPv4
-/// （v4-mapped・IPv4 互換・NAT64・6to4・Teredo。[`is_disallowed_embedded_ipv4`]）は
+/// （v4-mapped・IPv4 互換・IPv4-translated・NAT64・6to4・Teredo。
+/// [`is_disallowed_embedded_ipv4`]。運用者独自の NAT64 プレフィクスは判定外で残余リスク）は
 /// 埋め込まれた IPv4 として判定し、v4 側の分類をすり抜けられないようにする
 /// （#1443）。埋め込みが公開 IPv4 なら許可する（NAT64 プレフィクスを丸ごと拒否すると
 /// IPv6 only 環境で公開 IPv4 に届かなくなるため）。マルチキャスト（`ff00::/8`）は
@@ -1396,6 +1412,49 @@ mod tests {
     fn core_1_is_disallowed_address_allows_global_ipv6() {
         let ip: IpAddr = "2606:4700:4700::1111".parse().expect("valid IPv6 literal");
         assert!(!is_disallowed_address(ip), "global IPv6 should be allowed");
+    }
+
+    /// CORE-1・RENDER-3・SEC-4（#1449）: IPv4-translated の内部 IPv4 を拒否する。
+    #[test]
+    fn core_1_is_disallowed_address_rejects_ipv4_translated_internal() {
+        for s in [
+            "::ffff:0:7f00:1",
+            "::ffff:0:a00:1",
+            "::ffff:0:a9fe:a9fe",
+            "::ffff:0:c0a8:1",
+            "::ffff:0:0:0",
+        ] {
+            let ip: IpAddr = s.parse().expect("valid ipv6");
+            assert!(is_disallowed_address(ip), "{s} must be rejected");
+        }
+    }
+
+    /// CORE-1（#1449）: IPv4-translated の公開 IPv4 は許可する。
+    #[test]
+    fn core_1_is_disallowed_address_allows_ipv4_translated_global() {
+        for s in ["::ffff:0:808:808", "::ffff:0:101:101"] {
+            let ip: IpAddr = s.parse().expect("valid ipv6");
+            assert!(!is_disallowed_address(ip), "{s} must be allowed");
+        }
+    }
+
+    /// CORE-1・RENDER-3（#1449）: v4-mapped の内部 IPv4 と、Teredo のサーバー / クライアント
+    /// 片方だけが内部のアドレスを拒否する。Teredo のクライアントは IPv4 のビット反転
+    /// （127.0.0.1 = 7f00:0001 -> 80ff:fffe、10.0.0.1 = 0a00:0001 -> f5ff:fffe）。
+    #[test]
+    fn core_1_is_disallowed_address_rejects_mapped_and_teredo_mixed() {
+        for s in [
+            "::ffff:127.0.0.1",
+            "2001:0:808:808:8000:63bf:80ff:fffe",
+            "2001:0:808:808:8000:63bf:f5ff:fffe",
+            "2001:0:c0a8:1:8000:63bf:fefe:fefe",
+        ] {
+            let ip: IpAddr = s.parse().expect("valid ipv6");
+            assert!(is_disallowed_address(ip), "{s} must be rejected");
+        }
+        // サーバー・クライアントとも公開（8.8.8.8 / 1.1.1.1）
+        let ok: IpAddr = "2001:0:808:808:8000:63bf:fefe:fefe".parse().expect("valid");
+        assert!(!is_disallowed_address(ok));
     }
 
     /// CORE-1（#1443）: 内部 IPv4 を埋め込んだ NAT64・6to4・IPv4 互換・Teredo は拒否する。

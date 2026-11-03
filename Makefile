@@ -25,7 +25,7 @@
 .PHONY: help setup rustup submodule hooks \
 	lint-md lint-yaml lint-editorconfig lint-commits lint-docs \
 	check-workspace-manifest fmt fmt-check lint test test-harness lint-rendering test-rendering \
-	check-render-isolation check-js-engine-isolation check-publish-private deny deny-servo-host license-inventory license-inventory-servo-host check-deny-license-reject ci \
+	check-render-isolation check-egress-constants check-js-engine-isolation check-publish-private deny deny-servo-host license-inventory license-inventory-servo-host check-deny-license-reject ci \
 	check-compat-practical check-cli-conformance measure-cli-conformance check-compat-regression bench-record check-ci-changes check-bench-record \
 	check-binary-size check-static-link check-dynamic-link-macos check-dynamic-link-windows measure-mcp-envelope check-mcp-envelope measure-plugin-overhead check-plugin-overhead measure-js-binary-size measure-container-size check-container-smoke check-container-js-smoke check-container-memory check-egress-isolation measure-container-memory compare-container-memory measure-cssom-profile-cost \
 	docker-build docker-shell docker-ci trace-playwright check-playwright-trace check-puppeteer-connect check-playwright-connect test-playwright-connect
@@ -94,6 +94,9 @@ lint-rendering: ## cargo clippy -D warnings（--features rendering。Servo 込�
 
 test-rendering: ## cargo test（--features rendering。Servo 込みの検証）
 	@scripts/cargo-gate.sh test-rendering
+
+check-egress-constants: ## egress プロキシと servo-host の中継で複製している上限値が一致するかを検査する（RENDER-3・#1450。check-render-isolation 経由で ci にも含まれる）
+	@scripts/check-egress-constants.sh
 
 check-render-isolation: ## 既定ビルド（cli 既定 feature 含む）の依存グラフに Servo 系クレートが含まれないことを検証する
 	@scripts/cargo-gate.sh check-render-isolation

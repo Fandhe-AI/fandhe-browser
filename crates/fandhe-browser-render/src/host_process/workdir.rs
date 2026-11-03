@@ -105,6 +105,15 @@ impl Drop for WorkDir {
 mod tests {
     use super::*;
 
+    /// RENDER-3・SEC-2（#1450）: `make_dir` は排他作成で、既存のディレクトリを再利用しない
+    /// （`UnixSocketIn` の「自プロセスが作った 0700」の契約の根拠）。
+    #[test]
+    fn render_3_workdir_make_dir_is_exclusive() {
+        let wd = WorkDir::create(&std::env::temp_dir()).expect("workdir");
+        let err = make_dir(wd.path()).expect_err("existing dir must not be reused");
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+    }
+
     #[test]
     fn render3_workdir_is_private_unique_and_removed_on_drop() {
         let root = std::env::temp_dir();

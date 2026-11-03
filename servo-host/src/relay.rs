@@ -12,8 +12,9 @@
 //!
 //! 不変条件:
 //! - 宛先は UDS 1 本固定で、CONNECT の内容は解釈・改変しない。宛先の許可判定は本体のプロキシ
-//!   （#1434）の責務で、この中継は開放プロキシにならない。中継が自分で出すバイト列は、同時接続数の
-//!   上限を超えた接続への固定の 503 応答だけ（転送する内容への介入ではない）。
+//!   （#1434）の責務で、この中継は開放プロキシにならない。中継が自分で出すバイト列は、固定の 503 応答
+//!   だけ（同時接続数の上限超過、および本体プロキシへの dial の失敗・タイムアウト。転送する内容への
+//!   介入ではない。#1450）。
 //! - `127.0.0.1` にだけ bind する。外部入力経路で `unwrap`/`expect`/添字を使わない。
 //! - 同時接続数・無通信時間に上限を持つ。上限値は本体プロキシ（`fandhe_browser_render::egress_proxy`
 //!   の `MAX_CONCURRENT_CONNECTIONS`・`IDLE_TIMEOUT`・`CONNECT_TIMEOUT`）と揃える
@@ -29,7 +30,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// 同時に転送する接続数の上限。本体の `egress_proxy::MAX_CONCURRENT_CONNECTIONS` の複製
-/// （変えるときは両方を同時に変える。根拠は本体側の doc）。
+/// （変えるときは両方を同時に変える。根拠は本体側の doc。一致は `scripts/check-egress-constants.sh` が検査）。
 const MAX_CONNECTIONS: usize = 128;
 /// 双方向とも無通信が続いたら切る時間。本体の `egress_proxy::IDLE_TIMEOUT` の複製
 /// （変えるときは両方を同時に変える。根拠は本体側の doc）。
@@ -40,10 +41,11 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// timeout 後も UDS 接続でブロックして残り得る dial スレッドの同時数の上限。接続枠（`active`）とは
 /// 別で、本体の `egress_proxy::MAX_RESOLVER_THREADS` と同じ考え方（#1444）。
 const MAX_DIAL_THREADS: usize = 32;
-/// 上限超過時に accept スレッドが 503 を書く際の timeout（本体の `REJECT_WRITE_TIMEOUT` と同値）。
+/// 503 を書く際の timeout（本体の `REJECT_WRITE_TIMEOUT` と同値の複製。値の一致は
+/// `scripts/check-egress-constants.sh` が検査する。#1450）。
 const REJECT_WRITE_TIMEOUT: Duration = Duration::from_millis(100);
-/// 上限超過の接続へ返す固定の応答。
-const OVER_CAPACITY_RESPONSE: &[u8] =
+/// 上限超過、および本体プロキシへの dial の失敗・タイムアウトで返す固定の応答（RENDER-3・SEC-2・#1450）。
+const UNAVAILABLE_RESPONSE: &[u8] =
     b"HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nContent-Length: 0\r\n\r\n";
 /// 読み取りタイムアウト。アイドル判定の刻みとして使う。
 const TICK: Duration = Duration::from_millis(250);
@@ -150,8 +152,7 @@ fn accept_loop(
         // 上限超過は固定の 503 を短い timeout で書いて閉じる（accept スレッドを塞がない）。
         // accept スレッドだけが増やすため判定と加算は競合しない。
         if active.load(Ordering::SeqCst) >= limits.max_connections {
-            let _ = tcp.set_write_timeout(Some(REJECT_WRITE_TIMEOUT));
-            let _ = tcp.write_all(OVER_CAPACITY_RESPONSE);
+            reject_unavailable(&mut tcp);
             continue;
         }
         active.fetch_add(1, Ordering::SeqCst);
@@ -161,8 +162,29 @@ fn accept_loop(
         // spawn 失敗時はクロージャごと drop され、guard が減算し tcp が閉じる。
         let _ = std::thread::Builder::new()
             .name("egress-relay-conn".to_string())
-            .spawn(move || handle(tcp, &path, limits, guard, &dialing));
+            .spawn(move || handle(tcp, &path, limits, guard, &dialing, spawn_up_thread));
     }
+}
+
+/// 固定の 503 を短い timeout で書く（相手が読まなくても呼び出しスレッドを塞がない）。
+/// 上限超過（accept スレッド）と dial の失敗・タイムアウト（接続スレッド）で共用する。
+/// 受信内容は解釈しないため、未読データがあると close が RST になり得るが、それは許容する。
+fn reject_unavailable(tcp: &mut TcpStream) {
+    let _ = tcp.set_write_timeout(Some(REJECT_WRITE_TIMEOUT));
+    let _ = tcp.write_all(UNAVAILABLE_RESPONSE);
+}
+
+/// 上りの転送スレッドの生成関数。本番は [`spawn_up_thread`]。生成失敗の経路をテストで通すため
+/// `handle` の引数にしている（`cfg(test)` 分岐を作らず本番と同じ経路を通す）。
+type SpawnUp = fn(Box<dyn FnOnce() + Send + 'static>) -> io::Result<std::thread::JoinHandle<()>>;
+
+/// 本番の [`SpawnUp`]。名前つきスレッドを生成する。
+fn spawn_up_thread(
+    f: Box<dyn FnOnce() + Send + 'static>,
+) -> io::Result<std::thread::JoinHandle<()>> {
+    std::thread::Builder::new()
+        .name("egress-relay-up".to_string())
+        .spawn(f)
 }
 
 /// 接続の終了時に `active` を 1 回だけ減らす。
@@ -209,31 +231,39 @@ fn connect_uds(uds: &Path, limits: RelayLimits, dialing: &Arc<AtomicUsize>) -> O
     rx.recv_timeout(limits.connect_timeout).ok()?.ok()
 }
 
+/// 1 接続の転送。`accept_loop` の接続スレッドから呼ばれる。dial の失敗・タイムアウトでは固定の
+/// 503 を返して閉じる。上りスレッドの生成に失敗したときは、下りだけが滞留しないよう両端を
+/// 即座に閉じて接続枠を返す（RENDER-3・SEC-2・#1450）。
 fn handle(
-    tcp: TcpStream,
+    mut tcp: TcpStream,
     uds: &Path,
     limits: RelayLimits,
     _guard: Guard,
     dialing: &Arc<AtomicUsize>,
+    spawn_up: SpawnUp,
 ) {
     let Some(unix) = connect_uds(uds, limits, dialing) else {
+        reject_unavailable(&mut tcp);
         return;
     };
     let _ = tcp.set_nodelay(true);
     let last = Arc::new(Mutex::new(Instant::now()));
     let (Ok(tcp_r), Ok(unix_r)) = (tcp.try_clone(), unix.try_clone()) else {
+        let _ = tcp.shutdown(Shutdown::Both);
+        let _ = unix.shutdown(Shutdown::Both);
         return;
     };
-    let forward_up = {
-        let last = Arc::clone(&last);
-        std::thread::Builder::new()
-            .name("egress-relay-up".to_string())
-            .spawn(move || pump(PumpEnd::Tcp(tcp_r), PumpEnd::Unix(unix), &last, limits))
+    let up_last = Arc::clone(&last);
+    let Ok(forward_up) = spawn_up(Box::new(move || {
+        pump(PumpEnd::Tcp(tcp_r), PumpEnd::Unix(unix), &up_last, limits);
+    })) else {
+        // 失敗したクロージャの drop で閉じるのは clone 側の fd だけなので、元の fd を明示的に閉じる。
+        let _ = tcp.shutdown(Shutdown::Both);
+        let _ = unix_r.shutdown(Shutdown::Both);
+        return;
     };
     pump(PumpEnd::Unix(unix_r), PumpEnd::Tcp(tcp), &last, limits);
-    if let Ok(h) = forward_up {
-        let _ = h.join();
-    }
+    let _ = forward_up.join();
 }
 
 /// TCP・UDS のどちらでも同じ転送処理を使うための薄い列挙。
@@ -431,6 +461,13 @@ mod tests {
         assert_eq!(got, msg);
     }
 
+    /// EOF まで読み、固定の 503 とバイト単位で一致することを確かめる（クライアントは何も送らない）。
+    fn assert_unavailable_then_eof(c: &mut TcpStream) {
+        let mut got = Vec::new();
+        let _ = c.read_to_end(&mut got);
+        assert_eq!(got, UNAVAILABLE_RESPONSE);
+    }
+
     fn wait_until(mut cond: impl FnMut() -> bool) -> bool {
         let deadline = Instant::now() + Duration::from_secs(10);
         while Instant::now() < deadline {
@@ -476,10 +513,7 @@ mod tests {
         let mut c = connect(&relay);
         let mut got = Vec::new();
         let _ = c.read_to_end(&mut got);
-        assert!(
-            got.starts_with(b"HTTP/1.1 503 "),
-            "unexpected over-limit response: {got:?}"
-        );
+        assert_eq!(got, UNAVAILABLE_RESPONSE);
         assert_eq!(accepted.load(Ordering::SeqCst), 2);
         drop(a);
         assert!(wait_until(|| relay.active() == 1));
@@ -534,20 +568,21 @@ mod tests {
         assert_eq!(&got, b"xxxxxxxxxxxx");
     }
 
-    /// UDS が存在しなくても panic せず接続を閉じ、`active` が 0 に戻る。
+    /// RENDER-3・SEC-2（#1450）: UDS が存在しなくても panic せず固定の 503 を返して閉じ、
+    /// `active` が 0 に戻る。
     #[test]
-    fn missing_uds_closes_connection() {
+    fn render_3_missing_uds_returns_503() {
         let dir = TmpDir::new();
         let relay = start(dir.sock()).unwrap();
         let mut c = connect(&relay);
-        let mut buf = [0u8; 1];
-        assert!(matches!(c.read(&mut buf), Ok(0) | Err(_)));
+        assert_unavailable_then_eof(&mut c);
         assert!(wait_until(|| relay.active() == 0));
     }
 
-    /// UDS の accept キューが満杯でも接続待ちは `connect_timeout` で切れ、枠が返却される。
+    /// RENDER-3・SEC-2（#1450）: UDS の accept キューが満杯でも接続待ちは `connect_timeout` で切れ、
+    /// 固定の 503 を返して枠が返却される。
     #[test]
-    fn stuck_uds_connect_times_out_and_releases_slot() {
+    fn render_3_stuck_uds_connect_times_out_with_503_and_releases_slot() {
         let dir = TmpDir::new();
         let sock = dir.sock();
         // accept しない listener。accept キューが埋まって connect が戻らなくなるまで、
@@ -587,9 +622,57 @@ mod tests {
         };
         let relay = start_with(sock, limits).unwrap();
         let mut c = connect(&relay);
-        let mut buf = [0u8; 1];
-        assert!(matches!(c.read(&mut buf), Ok(0) | Err(_)));
+        assert_unavailable_then_eof(&mut c);
         assert!(wait_until(|| relay.active() == 0));
+    }
+
+    /// RENDER-3・SEC-2（#1450）: 上りスレッドの生成に失敗したら、アイドル上限（300 秒）を待たず
+    /// 即座に両端を閉じ、接続枠を返す。
+    #[test]
+    fn render_3_spawn_up_failure_closes_both_ends_and_releases_slot() {
+        let dir = TmpDir::new();
+        let sock = dir.sock();
+        let listener = UnixListener::bind(&sock).unwrap();
+        let (peer_tx, peer_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            if let Ok((s, _)) = listener.accept() {
+                let _ = peer_tx.send(s);
+            }
+        });
+        let tcp_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let addr = tcp_listener.local_addr().unwrap();
+        let mut client = TcpStream::connect(addr).unwrap();
+        let (server_side, _) = tcp_listener.accept().unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+
+        let active = Arc::new(AtomicUsize::new(1));
+        let guard = Guard(Arc::clone(&active));
+        let dialing = Arc::new(AtomicUsize::new(0));
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker_dialing = Arc::clone(&dialing);
+        std::thread::spawn(move || {
+            handle(
+                server_side,
+                &sock,
+                RelayLimits::default(),
+                guard,
+                &worker_dialing,
+                |_| Err(io::Error::other("injected spawn failure")),
+            );
+            let _ = done_tx.send(());
+        });
+        assert!(
+            done_rx.recv_timeout(Duration::from_secs(2)).is_ok(),
+            "handle must return promptly when the up thread cannot be spawned"
+        );
+        let mut buf = [0u8; 1];
+        assert_eq!(client.read(&mut buf).unwrap(), 0);
+        let mut peer = peer_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        assert_eq!(peer.read(&mut buf).unwrap(), 0);
+        assert_eq!(active.load(Ordering::SeqCst), 0);
     }
 
     /// 上限は既定以下にだけ締められる（dial スレッド枠を含む）。
@@ -605,10 +688,10 @@ mod tests {
         assert_eq!(l.max_dial_threads, MAX_DIAL_THREADS);
     }
 
-    /// RENDER-3・SEC-2（#1444）: dial スレッド枠が尽きたら待たずに失敗して接続枠を返し、
+    /// RENDER-3・SEC-2（#1444・#1450）: dial スレッド枠が尽きたら待たずに 503 で失敗して接続枠を返し、
     /// dial スレッドが後で終わっても接続枠を二重に返さない（`active` が巻き戻らない）。
     #[test]
-    fn dial_thread_cap_fails_fast_and_active_slot_is_released_once() {
+    fn dial_thread_cap_fails_fast_with_503_and_active_slot_is_released_once() {
         let dir = TmpDir::new();
         let sock = dir.sock();
         let listener = UnixListener::bind(&sock).unwrap();
@@ -646,17 +729,16 @@ mod tests {
             ..RelayLimits::default()
         };
         let relay = start_with(sock, limits).unwrap();
-        let mut buf = [0u8; 1];
         // 2 本は dial スレッドを使い、timeout で閉じられて接続枠が返る。
         for _ in 0..2 {
             let mut c = connect(&relay);
-            assert!(matches!(c.read(&mut buf), Ok(0) | Err(_)));
+            assert_unavailable_then_eof(&mut c);
         }
         assert!(wait_until(|| relay.active() == 0));
         // 3 本目: dial スレッドは 2 本ともブロックしたままで枠が無く、timeout を待たず閉じられる。
         let started = Instant::now();
         let mut c = connect(&relay);
-        assert!(matches!(c.read(&mut buf), Ok(0) | Err(_)));
+        assert_unavailable_then_eof(&mut c);
         assert!(started.elapsed() < Duration::from_secs(1));
         assert!(wait_until(|| relay.active() == 0));
         // 詰まりを解く: 溜めた接続を捨て、listener が accept を始める。dial スレッドが戻っても

@@ -31,6 +31,7 @@ Rust checks (skipped while Cargo.toml or member crates are absent)
   lint / test                scripts/cargo-gate.sh lint | test             clippy -D warnings / cargo test (default features)
   lint-rendering / test-rendering  scripts/cargo-gate.sh lint-rendering | test-rendering  --features rendering (with Servo)
   check-render-isolation     scripts/cargo-gate.sh check-render-isolation  Servo isolation check
+  check-egress-constants     scripts/check-egress-constants.sh             egress proxy / servo-host relay duplicated limits must match
   check-js-engine-isolation  scripts/cargo-gate.sh check-js-engine-isolation  JS engine isolation check
   check-publish-private      scripts/cargo-gate.sh check-publish-private   every member crate has publish = false
   deny                       scripts/deny.sh                               cargo deny check (main + servo-host)
