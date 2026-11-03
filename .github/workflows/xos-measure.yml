@@ -769,13 +769,18 @@ jobs:
           passed="$(sed -nE 's/^test result: ok\. ([0-9]+) passed.*/\1/p' "$log" | tail -n 1)"
           verified="$(grep -c 'EGRESS-VERIFIED ' "$log" || true)"
           backend="$(grep -c 'EGRESS-VERIFIED .* backend=Bwrap$' "$log" || true)"
+          proctree="$(grep -c 'EGRESS-PROCTREE ' "$log" || true)"
           {
             echo "## egress-host (ubuntu)"
             echo "- passed: ${passed:-none} (expected 3)"
             echo "- EGRESS-VERIFIED lines: $verified (expected 3)"
             echo "- backend=Bwrap lines: $backend (expected >= 2)"
+            echo "- EGRESS-PROCTREE lines: $proctree (expected 3)"
+            echo '```'
+            grep -o 'EGRESS-PROCTREE .*' "$log" || true
+            echo '```'
           } > "$OUT_DIR/summary.md"
-          if [ "${passed:-}" != "3" ] || [ "$verified" != "3" ] || [ "$backend" -lt 2 ]; then
+          if [ "${passed:-}" != "3" ] || [ "$verified" != "3" ] || [ "$backend" -lt 2 ] || [ "$proctree" != "3" ]; then
             echo "error: egress-host verification incomplete" >&2
             exit 1
           fi

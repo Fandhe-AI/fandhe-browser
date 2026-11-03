@@ -17,6 +17,10 @@
 //! 未設定のときは隔離なしの既存実行を壊さないよう、`Required` が隔離不能の環境で起動を拒否する
 //! ことだけを確かめて終わる。他の値は panic する。手動の実測は xos-measure の suite `egress-host`。
 //! 使うのは loopback のテストサーバーだけで、外部ネットワークには出ない。
+//!
+//! Linux（bwrap）では、隔離下の読み込み後にプロセスツリー（ラッパー -> ns 内 pid 1 -> ホスト ->
+//! 子孫）を辿り、`EGRESS-PROCTREE` 接頭辞の 1 行を 3 本のテストが 1 行ずつ（計 3 行）出す
+//! （rss 監視の pid 解決の前提の実測。#1460）。ns 内 pid 1 の子が 1 件でなければテストは失敗する。
 //! `status`: core の `PageLoad` は `final_url` しか持たず、Servo 0.7.0 のホストも返さないため、
 //! `HostProcess` 層で `status() == None` を確認する（作り出さない。REPAIR-3）。
 //! 外部入力の経路ではないため `unwrap` / `expect` / `panic!` を使う。
@@ -35,7 +39,7 @@ use fandhe_browser_core::render::{
 use fandhe_browser_render::host_process::{
     EgressIsolationStatus, EgressIsolationUnavailable, HOST_BINARY_ENV, HostProcess,
     HostProcessConfig, HostProcessError, HostTimeouts, IsolationBackend, IsolationProbe,
-    resolve_host_binary,
+    list_proc_tasks, read_proc_text, resolve_host_binary, walk_wrapped_proc_tree,
 };
 use fandhe_browser_render::host_renderer::{HostRenderer, HostRendererConfig};
 use fandhe_browser_render::protocol::{HostErrorKind, LoadParams, Request, VisibilityParams};
@@ -806,6 +810,40 @@ fn wait_until(limit: Duration, mut cond: impl FnMut() -> bool) -> bool {
     cond()
 }
 
+/// 隔離下のホストのプロセスツリーを記録し、rss 監視の pid 解決の前提を確かめる（RENDER-3・RENDER-4・#1460）。
+///
+/// Linux（bwrap）だけ。macOS の sandbox-exec は exec するのでラッパーも ns 内 pid 1 も無い。
+/// `EGRESS-PROCTREE` 行を assert より先に出し、失敗時にも記録を残す。合否は「ns 内 pid 1 の子が
+/// 1 件」「主スレッドだけの数と全スレッドの数が一致」「打ち切りなし」「本番の pid 解決と同じ
+/// ホスト」。ホストの子孫数は記録だけで合否に使わない。
+fn record_proc_tree(p: &HostProcess, test: &str) {
+    if expected_backend() != IsolationBackend::Bwrap {
+        return;
+    }
+    let wrapper = p.pid().expect("wrapper pid");
+    // 監視が pid を解決できず wrapper を kill する前に、先にツリーを走査して記録する（#1460）。
+    let tree = walk_wrapped_proc_tree(wrapper, &read_proc_text, &list_proc_tasks)
+        .unwrap_or_else(|e| panic!("proc tree walk failed: {e:?}"));
+    println!(
+        "EGRESS-PROCTREE test={test} backend=Bwrap {}",
+        tree.summary_line()
+    );
+    // 監視スレッドは 500 ms 間隔で解決する。解決できたことが本番の前提の主たる確認。
+    // 未解決でも上の行は出済み。失敗時は unresolved を明記してから落とす。
+    if !wait_until(Duration::from_secs(10), || p.monitored_pid().is_some()) {
+        println!("EGRESS-PROCTREE test={test} backend=Bwrap monitored_pid=unresolved");
+        panic!("rss monitor never resolved the wrapped host pid; {tree:?}");
+    }
+    assert_eq!(tree.wrapper_children.len(), 1, "{tree:?}");
+    assert_eq!(tree.init_children.len(), 1, "{tree:?}");
+    assert_eq!(
+        tree.init_children, tree.init_children_main_thread,
+        "{tree:?}"
+    );
+    assert!(!tree.truncated, "{tree:?}");
+    assert_eq!(tree.host, p.monitored_pid(), "{tree:?}");
+}
+
 /// RENDER-3: 隔離下でも、内部アドレスを許可すれば loopback のページがプロキシ経由で読める。
 #[test]
 fn render3_egress_required_loads_loopback_via_proxy() {
@@ -827,6 +865,7 @@ fn render3_egress_required_loads_loopback_via_proxy() {
     );
     // 隔離下の出口はプロキシだけなので、成功自体がプロキシ経由の証拠になる。
     assert!(srv.accepted() >= 1, "server saw no connection");
+    record_proc_tree(&p, "render3_egress_required_loads_loopback_via_proxy");
     p.shutdown();
     println!(
         "EGRESS-VERIFIED render3_egress_required_loads_loopback_via_proxy backend={backend:?}"
@@ -875,6 +914,10 @@ fn render3_egress_required_denies_internal_address_at_proxy() {
         Some(EgressIsolationStatus::Isolated(backend))
     );
     assert!(srv.accepted() >= 1, "control: server saw no connection");
+    record_proc_tree(
+        &allowed,
+        "render3_egress_required_denies_internal_address_at_proxy",
+    );
     allowed.shutdown();
     println!(
         "EGRESS-VERIFIED render3_egress_required_denies_internal_address_at_proxy mode=required"
@@ -937,6 +980,7 @@ fn render3_egress_required_blocks_direct_websocket() {
     // （隔離なしの対照では `>= 1` になる）が担う。
     std::thread::sleep(Duration::from_millis(500));
     assert_eq!(ws.accepted(), 0, "websocket reached the listener directly");
+    record_proc_tree(&p, "render3_egress_required_blocks_direct_websocket");
     p.shutdown();
     println!("EGRESS-VERIFIED render3_egress_required_blocks_direct_websocket backend={backend:?}");
 }
