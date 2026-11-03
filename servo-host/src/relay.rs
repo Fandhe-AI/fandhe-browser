@@ -671,15 +671,13 @@ mod tests {
         assert_eq!(client.read(&mut buf).unwrap(), 0);
         let mut peer = peer_rx.recv_timeout(Duration::from_secs(2)).unwrap();
         // macOS は相手（handle 側）が既に閉じたソケットへの setsockopt が EINVAL
-        // （InvalidInput）を返す。ここへ来た時点で相手側は閉じ済みなので、この種別だけ
-        // 許容し、それ以外のエラーは従来どおり panic させる。以降の read が EOF（0）を
-        // 返すことの検証は維持する。
-        if let Err(e) = peer.set_read_timeout(Some(Duration::from_secs(5))) {
-            assert_eq!(
-                e.kind(),
-                io::ErrorKind::InvalidInput,
-                "unexpected error: {e}"
-            );
+        // （InvalidInput）を返す。この許容は macOS に限る（#1468・#1469）。macOS 以外では
+        // Ok を要求し、そこでの失敗は本物の不具合として検出する。以降の read が EOF（0）を
+        // 返すことと active == 0 の検証は維持する。
+        match peer.set_read_timeout(Some(Duration::from_secs(5))) {
+            Ok(()) => {}
+            Err(e) if cfg!(target_os = "macos") && e.kind() == io::ErrorKind::InvalidInput => {}
+            Err(e) => panic!("set_read_timeout failed: {e}"),
         }
         assert_eq!(peer.read(&mut buf).unwrap(), 0);
         assert_eq!(active.load(Ordering::SeqCst), 0);
