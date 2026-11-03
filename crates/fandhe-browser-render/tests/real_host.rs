@@ -8,26 +8,37 @@
 //! `FANDHE_BROWSER_RENDER_HOST=<絶対パス> cargo test -p fandhe-browser-render --test real_host -- --test-threads=1`
 //!
 //! 環境変数が未設定・不正なら skip せず panic する（fail-closed。通ったように見せない）。
+//!
+//! # egress 隔離の実ホスト検証（RENDER-3・SEC-2・TASK-38・#1437）
+//!
+//! `render3_egress_*` の 3 本は、`FANDHE_BROWSER_RENDER_EGRESS_ISOLATION=required` のときだけ
+//! 実ホストを bwrap（Linux）・sandbox-exec（macOS）で隔離して検証する。隔離できない環境では
+//! `Required` の起動が `EgressIsolationUnavailable` で失敗し、テストも落ちる（pass にしない）。
+//! 未設定のときは隔離なしの既存実行を壊さないよう、`Required` が隔離不能の環境で起動を拒否する
+//! ことだけを確かめて終わる。他の値は panic する。手動の実測は xos-measure の suite `egress-host`。
+//! 使うのは loopback のテストサーバーだけで、外部ネットワークには出ない。
 //! `status`: core の `PageLoad` は `final_url` しか持たず、Servo 0.7.0 のホストも返さないため、
 //! `HostProcess` 層で `status() == None` を確認する（作り出さない。REPAIR-3）。
 //! 外部入力の経路ではないため `unwrap` / `expect` / `panic!` を使う。
 
 use std::io::{Read, Write};
 use std::net::TcpListener;
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::{Arc, mpsc};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use fandhe_browser_core::EgressIsolationMode;
 use fandhe_browser_core::render::{
     ElementRef, ImageFormat, PageRef, RenderError, Renderer, ScreenshotOptions,
 };
 use fandhe_browser_render::host_process::{
-    EgressIsolationUnavailable, HOST_BINARY_ENV, HostProcess, HostProcessConfig, HostProcessError,
-    HostTimeouts, IsolationProbe, resolve_host_binary,
+    EgressIsolationStatus, EgressIsolationUnavailable, HOST_BINARY_ENV, HostProcess,
+    HostProcessConfig, HostProcessError, HostTimeouts, IsolationBackend, IsolationProbe,
+    resolve_host_binary,
 };
 use fandhe_browser_render::host_renderer::{HostRenderer, HostRendererConfig};
-use fandhe_browser_render::protocol::{HostErrorKind, LoadParams};
+use fandhe_browser_render::protocol::{HostErrorKind, LoadParams, Request, VisibilityParams};
 
 /// スクリーンショット用（上半分が赤・下半分が青）。
 const SHOT_BODY: &str = "<html><head><title>fixture</title></head><body style=\"margin:0\"><div style=\"height:400px;background:#f00\"></div><div style=\"height:400px;background:#00f\"></div></body></html>";
@@ -55,7 +66,7 @@ fn host_config(timeouts: HostTimeouts) -> HostProcessConfig {
     // exe_dir は渡さない（隣接ファイルを誤って拾わない）。
     let bin = resolve_host_binary(None, Some(env.as_os_str()), None)
         .unwrap_or_else(|e| panic!("invalid host binary: {e}"));
-    // 隔離なしに固定する（隔離の実ホスト検証は #1437。本テストは従来どおりの起動を確かめる）。
+    // 隔離なしに固定する（隔離の検証は `render3_egress_*` を参照。本テストは従来どおりの起動を確かめる）。
     HostProcessConfig::new(bin)
         .with_timeouts(timeouts)
         .with_isolation_probe(IsolationProbe::Unavailable(
@@ -91,21 +102,52 @@ fn variant(e: &RenderError) -> &'static str {
 /// ループバックの小さな HTTP サーバー。パスで本文を出し分け、`hang` なら応答しない。
 struct Server {
     port: u16,
+    accepted: Arc<AtomicUsize>,
     stop: mpsc::Sender<()>,
     handle: Option<JoinHandle<()>>,
 }
 
+/// `/ws` のページ。ページ内から loopback の別ポートへ WebSocket を張り、結果を要素の出現で示す。
+fn ws_page(ws_port: u16) -> String {
+    format!(
+        "<html><body><script>\
+function mark(id){{var d=document.createElement('div');d.id=id;d.style.width='10px';d.style.height='10px';document.body.appendChild(d);}}\
+try{{var w=new WebSocket('ws://127.0.0.1:{ws_port}/');\
+w.onopen=function(){{mark('ws-open');}};\
+w.onerror=function(){{mark('ws-error');}};\
+w.onclose=function(){{mark('ws-closed');}};}}catch(e){{mark('ws-throw');}}\
+</script></body></html>"
+    )
+}
+
 impl Server {
     fn start(hang: bool) -> Self {
+        Self::start_inner(hang, None)
+    }
+
+    /// `/ws` で WebSocket の接続先を `ws_port` にしたページを返す。
+    fn start_with_ws_page(ws_port: u16) -> Self {
+        Self::start_inner(false, Some(ws_page(ws_port)))
+    }
+
+    /// accept した接続の件数（プロキシ経由の到達を数える）。
+    fn accepted(&self) -> usize {
+        self.accepted.load(Ordering::SeqCst)
+    }
+
+    fn start_inner(hang: bool, ws_body: Option<String>) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
         let port = listener.local_addr().expect("addr").port();
         listener.set_nonblocking(true).expect("nonblocking");
         let (stop, stop_rx) = mpsc::channel::<()>();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&accepted);
         let handle = std::thread::spawn(move || {
             let mut held = Vec::new();
             while stop_rx.try_recv().is_err() {
                 match listener.accept() {
                     Ok((mut conn, _)) => {
+                        counter.fetch_add(1, Ordering::SeqCst);
                         let _ = conn.set_nonblocking(false);
                         if hang {
                             held.push(conn);
@@ -117,10 +159,11 @@ impl Server {
                         let n = conn.read(&mut buf).unwrap_or(0);
                         let head = String::from_utf8_lossy(buf.get(..n).unwrap_or(&[]));
                         let path = head.split_whitespace().nth(1).unwrap_or("");
-                        let (status, body) = match path {
-                            "/shot" => ("200 OK", SHOT_BODY),
-                            "/vis" => ("200 OK", VIS_BODY),
-                            "/box" => ("200 OK", BOX_BODY),
+                        let (status, body) = match (path, ws_body.as_deref()) {
+                            ("/shot", _) => ("200 OK", SHOT_BODY),
+                            ("/vis", _) => ("200 OK", VIS_BODY),
+                            ("/box", _) => ("200 OK", BOX_BODY),
+                            ("/ws", Some(b)) => ("200 OK", b),
                             _ => ("404 Not Found", "<html><body>nf</body></html>"),
                         };
                         let resp = format!(
@@ -135,6 +178,7 @@ impl Server {
         });
         Self {
             port,
+            accepted,
             stop,
             handle: Some(handle),
         }
@@ -146,6 +190,56 @@ impl Server {
 }
 
 impl Drop for Server {
+    fn drop(&mut self) {
+        let _ = self.stop.send(());
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+/// 接続を受けて数えるだけの loopback リスナー（WebSocket の到達検出用。ハンドシェイクはしない）。
+struct CountingListener {
+    port: u16,
+    accepted: Arc<AtomicUsize>,
+    stop: mpsc::Sender<()>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl CountingListener {
+    /// エフェメラル範囲の外のポートで待ち受ける（netns 内の中継が `:0` で取るポートと衝突させない）。
+    fn start() -> Self {
+        let listener = bind_non_ephemeral_loopback();
+        let port = listener.local_addr().expect("addr").port();
+        listener.set_nonblocking(true).expect("nonblocking");
+        let (stop, stop_rx) = mpsc::channel::<()>();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&accepted);
+        let handle = std::thread::spawn(move || {
+            while stop_rx.try_recv().is_err() {
+                match listener.accept() {
+                    Ok((conn, _)) => {
+                        counter.fetch_add(1, Ordering::SeqCst);
+                        drop(conn);
+                    }
+                    Err(_) => std::thread::sleep(Duration::from_millis(10)),
+                }
+            }
+        });
+        Self {
+            port,
+            accepted,
+            stop,
+            handle: Some(handle),
+        }
+    }
+
+    fn accepted(&self) -> usize {
+        self.accepted.load(Ordering::SeqCst)
+    }
+}
+
+impl Drop for CountingListener {
     fn drop(&mut self) {
         let _ = self.stop.send(());
         if let Some(h) = self.handle.take() {
@@ -638,4 +732,185 @@ fn render3_real_host_process_layer() {
     assert!(workdir.exists());
     p.shutdown();
     assert!(!workdir.exists(), "workdir must be removed after shutdown");
+}
+
+/// 隔離検証を明示する環境変数（値は `required` のみ。RENDER-3・#1437）。
+const EGRESS_ENV: &str = "FANDHE_BROWSER_RENDER_EGRESS_ISOLATION";
+
+/// 隔離検証を明示されたか。未設定は false、`required` は true、それ以外は panic（fail-closed）。
+fn egress_requested() -> bool {
+    match std::env::var(EGRESS_ENV) {
+        Err(std::env::VarError::NotPresent) => false,
+        Ok(v) if v == "required" => true,
+        other => panic!("{EGRESS_ENV} must be unset or \"required\": {other:?}"),
+    }
+}
+
+/// 実行 OS で期待する隔離バックエンド。対象外の OS は panic する。
+fn expected_backend() -> IsolationBackend {
+    match std::env::consts::OS {
+        "linux" => IsolationBackend::Bwrap,
+        "macos" => IsolationBackend::SandboxExec,
+        os => panic!("egress isolation is not supported on this OS: {os}"),
+    }
+}
+
+/// 隔離を明示した `HostProcess`（`Required`・実環境の判定）。
+fn required_host(allow_private: bool) -> HostProcess {
+    let env = std::env::var_os(HOST_BINARY_ENV)
+        .unwrap_or_else(|| panic!("{HOST_BINARY_ENV} must be set to the servo host binary"));
+    let bin = resolve_host_binary(None, Some(env.as_os_str()), None)
+        .unwrap_or_else(|e| panic!("invalid host binary: {e}"));
+    HostProcess::new(
+        HostProcessConfig::new(bin)
+            .with_egress_isolation(EgressIsolationMode::Required)
+            .with_isolation_probe(IsolationProbe::System)
+            .with_allow_private_network_access(allow_private),
+    )
+}
+
+/// 隔離を明示しないときの確認。`Required` が隔離不能の環境で起動を拒否し、子を作らないこと。
+fn assert_required_refuses_without_sandbox() {
+    let mut p = HostProcess::new(
+        host_config(HostTimeouts::default())
+            .with_egress_isolation(EgressIsolationMode::Required)
+            .with_isolation_probe(IsolationProbe::Unavailable(
+                EgressIsolationUnavailable::SandboxToolNotFound,
+            )),
+    );
+    let params = LoadParams::new("http://127.0.0.1:9/", Some(1_000)).expect("params");
+    let e = p.load(&params, 1).expect_err("required must refuse");
+    assert!(
+        matches!(
+            e,
+            HostProcessError::EgressIsolationUnavailable(
+                EgressIsolationUnavailable::SandboxToolNotFound
+            )
+        ),
+        "{e:?}"
+    );
+    assert_eq!(p.pid(), None);
+}
+
+/// 条件が成立するまで最大 `limit` 待つ（上限つきポーリング）。
+fn wait_until(limit: Duration, mut cond: impl FnMut() -> bool) -> bool {
+    let end = Instant::now() + limit;
+    while Instant::now() < end {
+        if cond() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    cond()
+}
+
+/// RENDER-3: 隔離下でも、内部アドレスを許可すれば loopback のページがプロキシ経由で読める。
+#[test]
+fn render3_egress_required_loads_loopback_via_proxy() {
+    if !egress_requested() {
+        assert_required_refuses_without_sandbox();
+        return;
+    }
+    let backend = expected_backend();
+    let srv = Server::start(false);
+    let mut p = required_host(true);
+    let url = srv.url("/shot");
+    let res = p
+        .load(&LoadParams::new(&url, Some(20_000)).expect("params"), 1)
+        .expect("load via proxy");
+    assert_eq!(res.final_url(), url);
+    assert_eq!(
+        p.egress_isolation(),
+        Some(EgressIsolationStatus::Isolated(backend))
+    );
+    // 隔離下の出口はプロキシだけなので、成功自体がプロキシ経由の証拠になる。
+    assert!(srv.accepted() >= 1, "server saw no connection");
+    p.shutdown();
+    println!(
+        "EGRESS-VERIFIED render3_egress_required_loads_loopback_via_proxy backend={backend:?}"
+    );
+}
+
+/// RENDER-3・SEC-2: 内部アドレスを許可しないと、プロキシが拒否して読み込みが失敗する。
+#[test]
+fn render3_egress_required_denies_internal_address_at_proxy() {
+    if !egress_requested() {
+        assert_required_refuses_without_sandbox();
+        return;
+    }
+    // 失敗した load はホストを破棄するため、隔離状態は起動の成否（Required）とエラー種別で示す。
+    let srv = Server::start(false);
+    let mut p = required_host(false);
+    let url = srv.url("/shot");
+    let e = p
+        .load(&LoadParams::new(&url, Some(20_000)).expect("params"), 1)
+        .expect_err("internal address must be denied");
+    assert!(
+        matches!(&e, HostProcessError::Host(_) | HostProcessError::Timeout(_)),
+        "unexpected error kind (not a load failure): {e:?}"
+    );
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(srv.accepted(), 0, "request reached the server");
+    p.shutdown();
+    println!(
+        "EGRESS-VERIFIED render3_egress_required_denies_internal_address_at_proxy mode=required"
+    );
+}
+
+/// RENDER-3: 隔離下ではページ内の WebSocket が loopback の別ポートへ直接届かない。
+/// 同じページを隔離なしで読む対照で、受信 0 件が空振りでないことを示す。
+#[test]
+fn render3_egress_required_blocks_direct_websocket() {
+    if !egress_requested() {
+        assert_required_refuses_without_sandbox();
+        return;
+    }
+    let backend = expected_backend();
+
+    // 対照: 隔離なし（隔離不能固定）では WebSocket が届く。
+    {
+        let ws = CountingListener::start();
+        let srv = Server::start_with_ws_page(ws.port);
+        let mut p = HostProcess::new(
+            host_config(HostTimeouts::default()).with_allow_private_network_access(true),
+        );
+        let page = LoadParams::new(&srv.url("/ws"), Some(20_000)).expect("params");
+        p.load(&page, 1).expect("control load");
+        assert!(
+            wait_until(Duration::from_secs(10), || ws.accepted() >= 1),
+            "control: websocket did not reach the listener"
+        );
+        p.shutdown();
+    }
+
+    // 本検証: 隔離下では届かない。
+    let ws = CountingListener::start();
+    let srv = Server::start_with_ws_page(ws.port);
+    let mut p = required_host(true);
+    let page = LoadParams::new(&srv.url("/ws"), Some(20_000)).expect("params");
+    p.load(&page, 1).expect("load via proxy");
+    assert_eq!(
+        p.egress_isolation(),
+        Some(EgressIsolationStatus::Isolated(backend))
+    );
+    let mut probe = |id: &str| -> bool {
+        let req = Request::Visibility(VisibilityParams::new(id).expect("selector"));
+        match p.call_on_page(&page, 1, req) {
+            Ok(_) => true,
+            Err(HostProcessError::Host(h)) if h.kind() == HostErrorKind::NotFound => false,
+            Err(e) => panic!("visibility {id}: {e:?}"),
+        }
+    };
+    // 接続を試みて失敗した（error / close / 例外のいずれかの印が出る）まで待つ。
+    let attempted = wait_until(Duration::from_secs(10), || {
+        ["#ws-error", "#ws-closed", "#ws-throw"]
+            .iter()
+            .any(|id| probe(id))
+    });
+    assert!(attempted, "page never reported a websocket failure");
+    assert!(!probe("#ws-open"), "websocket opened under isolation");
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(ws.accepted(), 0, "websocket reached the listener directly");
+    p.shutdown();
+    println!("EGRESS-VERIFIED render3_egress_required_blocks_direct_websocket backend={backend:?}");
 }

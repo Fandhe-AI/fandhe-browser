@@ -9,6 +9,9 @@ name: XOS Measure
 #   suite=egress-isolation Servo ホストの egress 隔離を macOS・Windows で実測する（#1387・TASK-38・RENDER-3。
 #                          harness/egress-isolation/measure.py。macOS は Seatbelt、Windows は baseline と
 #                          AppContainer〔ctypes のランチャー。#1396・loopback の切り分けつき〕。ubuntu は対象外）
+#   suite=egress-host      render の real_host で、隔離（Linux: bwrap・macOS: sandbox-exec）下の実 Servo ホストを検証する
+#                          （#1437・TASK-38・RENDER-3。`render3_egress_*` の 3 本。Windows は対象外〔既知の制約 D〕。
+#                          起動例: gh workflow run xos-measure.yml -f suite=egress-host）
 # Windows の egress-isolation は #1401 で opt-in のループバック免除（CheckNetIsolation LoopbackExempt。ハーネスが作った
 # AppContainer の SID だけ・計測後に解除）を付ける（オーナー承認 2026-11-01。使い捨て runner に限る）。
 # macOS の egress-isolation は sudo なしの `log show` で拒否行を取る（#1402。実測で sudo・`log config` が不要と分かり、
@@ -20,7 +23,8 @@ name: XOS Measure
 #   ここで出る check-run は required に登録しない（登録すると PR で pending のままになりマージできなくなる）。
 # - ci.yml とは別 workflow にする理由: ci.yml が出す check-run はすべて required にする規約のため、非 required の
 #   補助ジョブを足せない（.claude/rules/ci.md「ジョブ構成と required checks」）。bench-competitor.yml と同じ事情。
-# - ジョブは OS × suite の明示ジョブ 8 本（egress-isolation は macOS・Windows のみ）。required にしないので matrix でもよいが、OS ごとに前提ステップの形が
+# - ジョブは OS × suite の明示ジョブ 10 本（egress-isolation は macOS・Windows、egress-host は ubuntu・macOS のみ）。
+#   required にしないので matrix でもよいが、OS ごとに前提ステップの形が
 #   大きく違う（Windows は Servo の MSVC v143・ATL・MozTools・ANGLE、macOS は LLVM_OBJDUMP）ため、
 #   matrix にすると `if: runner.os` だらけになる。timeout も suite × OS で違う。
 # - concurrency は設けない。計測はジョブごとに別 VM で、固定ポート（9333）は VM 内で閉じる。途中キャンセルしない。
@@ -44,13 +48,14 @@ on:
   workflow_dispatch:
     inputs:
       suite:
-        description: "実行する計測（cli-conformance: TASK-49 / compat-practical: TASK-59 / egress-isolation: #1387）"
+        description: "実行する計測（cli-conformance: TASK-49 / compat-practical: TASK-59 / egress-*: #1387・#1437）"
         type: choice
         required: true
         options:
           - cli-conformance
           - compat-practical
           - egress-isolation
+          - egress-host
       repeat:
         description: "compat-practical の繰り返し回数（1〜5。cli-conformance では使わない）"
         type: string
@@ -635,6 +640,216 @@ jobs:
         with:
           name: egress-isolation-macos
           path: ${{ runner.temp }}/egress-isolation
+          retention-days: 30
+          if-no-files-found: error
+
+  # --------------------------------------------------
+  # egress-host（#1437・TASK-38・RENDER-3）。render の real_host で隔離下の実ホストを検証する（ubuntu・macOS。Windows は対象外）
+  # --------------------------------------------------
+  egress-host-ubuntu:
+    if: ${{ inputs.suite == 'egress-host' }}
+    runs-on: ubuntu-latest
+    # cli-conformance-ubuntu と同じ根拠（Servo ホストの release ビルド約 15 分）+ 本体 workspace の debug ビルドと実行
+    timeout-minutes: 75
+    permissions:
+      contents: read
+    env:
+      CARGO_INCREMENTAL: "0"
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: false
+      - name: "出力先の決定（runner context は job env で使えないため GITHUB_ENV 経由）"
+        run: |
+          echo "SERVO_HOST_TARGET_DIR=$RUNNER_TEMP/servo-host-release" >> "$GITHUB_ENV"
+          echo "OUT_DIR=$RUNNER_TEMP/egress-host" >> "$GITHUB_ENV"
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
+        with:
+          toolchain: stable
+      - name: "Servo ホストの system 依存と bubblewrap の導入"
+        run: |
+          df -h /
+          sudo apt-get update -qq
+          # docs/setup/linux.md の apt パッケージ（Ubuntu 公式リポジトリのみ）+ 隔離に使う bubblewrap（Cargo の依存ではない）
+          sudo apt-get install -y --no-install-recommends \
+            libfontconfig1-dev libfreetype-dev libgl1-mesa-dev libx11-dev libssl-dev \
+            llvm bubblewrap
+          for t in clang cmake pkg-config python3 make llvm-objdump jq curl; do
+            if ! command -v "$t" >/dev/null 2>&1; then
+              echo "error: $t is required but was not found on PATH" >&2
+              exit 1
+            fi
+          done
+          if [ ! -x /usr/bin/bwrap ]; then
+            echo "error: /usr/bin/bwrap was not found" >&2
+            exit 1
+          fi
+          # bindgen（clang-sys）が別版 libclang を拾うと mozjs_sys が落ちるため、clang と同じ major の
+          # libclang を導入し LIBCLANG_PATH で固定する（ci.yml の servo-host-ubuntu と同じ手順）
+          major="$(clang --version | sed -n 's/.*clang version \([0-9]*\)\..*/\1/p' | head -1)"
+          sudo apt-get install -y --no-install-recommends "libclang-${major}-dev"
+          libdir="/usr/lib/llvm-${major}/lib"
+          if ! ls "$libdir"/libclang*.so* >/dev/null 2>&1; then
+            echo "error: libclang for LLVM ${major} not found under $libdir" >&2
+            exit 1
+          fi
+          echo "LIBCLANG_PATH=$libdir" >> "$GITHUB_ENV"
+      - name: "[servo-host] cargo build --release"
+        run: cargo build --manifest-path servo-host/Cargo.toml --locked --release --target-dir "$SERVO_HOST_TARGET_DIR"
+      - name: "[servo-host] --selftest"
+        run: |
+          out="$("$SERVO_HOST_TARGET_DIR/release/fandhe-browser-servo-host" --selftest)"
+          echo "$out"
+          case "$out" in "selftest ok:"*) ;; *) echo "error: unexpected --selftest output" >&2; exit 1 ;; esac
+      - name: "[egress-host] プラットフォームの記録（読み取りのみ。sysctl は書き換えない）"
+        run: |
+          mkdir -p "$OUT_DIR"
+          {
+            uname -a
+            /usr/bin/bwrap --version || true
+            key=kernel.apparmor_restrict_unprivileged_userns
+            echo "$key=$(sysctl -n "$key" 2>/dev/null || echo unknown)"
+            python3 -I -B harness/egress-isolation/platform_probe.py || true
+          } 2>&1 | tee "$OUT_DIR/platform.txt"
+      - name: "[egress-host] real_host の render3_egress_*（隔離を明示。fail-closed）"
+        env:
+          FANDHE_BROWSER_RENDER_EGRESS_ISOLATION: required
+        run: |
+          set -euo pipefail
+          export FANDHE_BROWSER_RENDER_HOST="$SERVO_HOST_TARGET_DIR/release/fandhe-browser-servo-host"
+          log="$OUT_DIR/real_host_egress.log"
+          cargo test -p fandhe-browser-render --locked --test real_host render3_egress_ \
+            -- --test-threads=1 --nocapture 2>&1 | tee "$log"
+          passed="$(sed -nE 's/^test result: ok\. ([0-9]+) passed.*/\1/p' "$log" | tail -n 1)"
+          verified="$(grep -c 'EGRESS-VERIFIED ' "$log" || true)"
+          backend="$(grep -c 'EGRESS-VERIFIED .* backend=Bwrap$' "$log" || true)"
+          {
+            echo "## egress-host (ubuntu)"
+            echo "- passed: ${passed:-none} (expected 3)"
+            echo "- EGRESS-VERIFIED lines: $verified (expected 3)"
+            echo "- backend=Bwrap lines: $backend (expected >= 2)"
+          } > "$OUT_DIR/summary.md"
+          if [ "${passed:-}" != "3" ] || [ "$verified" != "3" ] || [ "$backend" -lt 2 ]; then
+            echo "error: egress-host verification incomplete" >&2
+            exit 1
+          fi
+      - name: "[egress-host] 結果を Step Summary へ"
+        if: ${{ !cancelled() }}
+        run: |
+          if [ -f "$OUT_DIR/summary.md" ]; then cat "$OUT_DIR/summary.md" >> "$GITHUB_STEP_SUMMARY"; fi
+          if [ -f "$OUT_DIR/platform.txt" ]; then
+            { echo '```'; cat "$OUT_DIR/platform.txt"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: "[egress-host] 結果をアーティファクトへ"
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: egress-host-ubuntu
+          path: ${{ runner.temp }}/egress-host
+          retention-days: 30
+          if-no-files-found: error
+
+  egress-host-macos:
+    if: ${{ inputs.suite == 'egress-host' }}
+    runs-on: macos-latest
+    # egress-isolation-macos と同じ根拠（release 込み 35.3 分 × 約 1.5）+ 本体 workspace の debug ビルド
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    env:
+      CARGO_INCREMENTAL: "0"
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: false
+      - name: "出力先の決定（runner context は job env で使えないため GITHUB_ENV 経由）"
+        run: |
+          echo "SERVO_HOST_TARGET_DIR=$RUNNER_TEMP/servo-host-release" >> "$GITHUB_ENV"
+          echo "OUT_DIR=$RUNNER_TEMP/egress-host" >> "$GITHUB_ENV"
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
+        with:
+          toolchain: stable
+      - name: "Servo ホストの system 依存の確認"
+        run: |
+          df -h /
+          # egress-isolation-macos と同じ（mozjs_sys の configure が LLVM_OBJDUMP を要求する）
+          objdump=""
+          for name in llvm-objdump objdump; do
+            if found="$(xcrun --find "$name" 2>/dev/null)" && [ -x "$found" ]; then
+              objdump="$found"
+              break
+            fi
+          done
+          if [ -z "$objdump" ]; then
+            echo "error: neither llvm-objdump nor objdump was found via xcrun" >&2
+            exit 1
+          fi
+          echo "LLVM_OBJDUMP=$objdump" >> "$GITHUB_ENV"
+          for t in clang cmake pkg-config python3 make jq curl; do
+            if ! command -v "$t" >/dev/null 2>&1; then
+              echo "error: $t is required but was not found on PATH" >&2
+              exit 1
+            fi
+          done
+          if [ ! -x /usr/bin/sandbox-exec ]; then
+            echo "error: /usr/bin/sandbox-exec was not found" >&2
+            exit 1
+          fi
+      - name: "[servo-host] cargo build --release"
+        run: cargo build --manifest-path servo-host/Cargo.toml --locked --release --target-dir "$SERVO_HOST_TARGET_DIR"
+      - name: "[servo-host] --selftest"
+        run: |
+          out="$("$SERVO_HOST_TARGET_DIR/release/fandhe-browser-servo-host" --selftest)"
+          echo "$out"
+          case "$out" in "selftest ok:"*) ;; *) echo "error: unexpected --selftest output" >&2; exit 1 ;; esac
+      - name: "[egress-host] プラットフォームの記録（読み取りのみ）"
+        run: |
+          mkdir -p "$OUT_DIR"
+          {
+            uname -a
+            python3 -I -B harness/egress-isolation/platform_probe.py || true
+          } 2>&1 | tee "$OUT_DIR/platform.txt"
+      - name: "[egress-host] real_host の render3_egress_*（隔離を明示。fail-closed）"
+        env:
+          FANDHE_BROWSER_RENDER_EGRESS_ISOLATION: required
+        run: |
+          set -euo pipefail
+          export FANDHE_BROWSER_RENDER_HOST="$SERVO_HOST_TARGET_DIR/release/fandhe-browser-servo-host"
+          log="$OUT_DIR/real_host_egress.log"
+          cargo test -p fandhe-browser-render --locked --test real_host render3_egress_ \
+            -- --test-threads=1 --nocapture 2>&1 | tee "$log"
+          passed="$(sed -nE 's/^test result: ok\. ([0-9]+) passed.*/\1/p' "$log" | tail -n 1)"
+          verified="$(grep -c 'EGRESS-VERIFIED ' "$log" || true)"
+          backend="$(grep -c 'EGRESS-VERIFIED .* backend=SandboxExec$' "$log" || true)"
+          {
+            echo "## egress-host (macos)"
+            echo "- passed: ${passed:-none} (expected 3)"
+            echo "- EGRESS-VERIFIED lines: $verified (expected 3)"
+            echo "- backend=SandboxExec lines: $backend (expected >= 2)"
+          } > "$OUT_DIR/summary.md"
+          if [ "${passed:-}" != "3" ] || [ "$verified" != "3" ] || [ "$backend" -lt 2 ]; then
+            echo "error: egress-host verification incomplete" >&2
+            exit 1
+          fi
+      - name: "[egress-host] 結果を Step Summary へ"
+        if: ${{ !cancelled() }}
+        run: |
+          if [ -f "$OUT_DIR/summary.md" ]; then cat "$OUT_DIR/summary.md" >> "$GITHUB_STEP_SUMMARY"; fi
+          if [ -f "$OUT_DIR/platform.txt" ]; then
+            { echo '```'; cat "$OUT_DIR/platform.txt"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: "[egress-host] 結果をアーティファクトへ"
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: egress-host-macos
+          path: ${{ runner.temp }}/egress-host
           retention-days: 30
           if-no-files-found: error
 
