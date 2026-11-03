@@ -1234,10 +1234,15 @@ mod tests {
         assert!(out.is_empty());
     }
 
-    /// RENDER-3・SEC-2（#1444・#1450）: `HostProcess` の経路（`WorkDir::create` →
-    /// `isolation::socket_dir_for` → `EgressProxy::start(UnixSocketIn)`）で渡る UDS ディレクトリが、
-    /// 自プロセスが排他的に作った 0700・非 symlink・自 uid 所有で、ソケットは 0600 であること。
-    /// `EgressEndpoint::UnixSocketIn` の呼び出し側の契約を固定する。
+    /// RENDER-3・SEC-2（#1444・#1450・#1458）: `spawn` が使うのと**同じ部品**（`WorkDir::create` →
+    /// `isolation::socket_dir_for` → `EgressProxy::start(UnixSocketIn)` → `isolation::linux_argv`）を
+    /// 直接呼び、UDS ディレクトリが自プロセスが排他的に作った 0700・非 symlink・自 uid 所有で、
+    /// ソケットは 0600、ホストへ渡す引数の末尾が `--egress-relay-uds <ソケット>` であることを固定する。
+    /// `EgressEndpoint::UnixSocketIn` の呼び出し側の契約の固定が目的。
+    ///
+    /// 通していない区間: `spawn` 自体と、`plan_isolation`・`build_command` の組み合わせ
+    /// （`Plan::Isolated(Bwrap)` のときに `socket_dir` を渡すディスパッチ）。実バイナリと
+    /// 環境依存の bwrap プローブが要るため、その区間が変わっても本テストは検出しない。
     #[cfg(unix)]
     #[test]
     fn render_3_sec_2_uds_dir_is_created_by_host_process_0700_and_owned() {
@@ -1271,6 +1276,23 @@ mod tests {
         assert_eq!(sock_meta.permissions().mode() & 0o777, 0o600);
         // std に geteuid が無いため、このプロセスが bind したソケットの uid を自 uid として使う。
         assert_eq!(dir_meta.uid(), sock_meta.uid());
+        // ホストへ渡す引数の末尾も同じソケットに繋がる。
+        let (_, args) = isolation::linux_argv(
+            std::path::Path::new("/usr/bin/bwrap"),
+            std::path::Path::new("/host"),
+            &sock,
+        );
+        let tail: Vec<&std::ffi::OsStr> = args
+            .iter()
+            .rev()
+            .take(2)
+            .rev()
+            .map(|a| a.as_os_str())
+            .collect();
+        assert_eq!(
+            tail,
+            [std::ffi::OsStr::new("--egress-relay-uds"), sock.as_os_str()]
+        );
         drop(proxy);
         assert!(!sock.exists());
         let root = workdir.path().to_path_buf();

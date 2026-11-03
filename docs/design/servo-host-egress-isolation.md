@@ -1,7 +1,7 @@
 # Servo ホストの egress 隔離方式: 3 OS の比較設計と実測計画
 
 - **状態**: 設計（比較と実測計画）。**方式の最終決定は実測の後にオーナーが行う**（#1003）。2026-11-02 の見直し（GA の成立範囲は Linux と macOS の B・Windows は D）を §8.1 に、2026-10-31 の暫定判断（履歴）を §8.2 に、Linux の実測結果を §6.4 に記録した
-- **対応**: TASK-38・MS-4・`RENDER-3`・`SEC-2`・`PLUG-1`・`XOS-1`・Issue #1368（親判断 #1003）。関連は `RENDER-1`。docker 経路は #1386 で再実測した（§6.4）。後続は #1387（macOS・Windows の実測ハーネス）
+- **対応**: TASK-38・MS-4・`RENDER-3`・`SEC-2`・`PLUG-1`・`XOS-1`・Issue #1368（親判断 #1003）。関連は `RENDER-1`・#1458（テストの検出力と残余リスク欄）。docker 経路は #1386 で再実測した（§6.4）。後続は #1387（macOS・Windows の実測ハーネス）
 - **入力資料**: [servo-host-egress-options.md](./servo-host-egress-options.md)（#1317。手段ごとの詳細表・Servo 0.7 の net 層の事実・承認事項の洗い出し。以下「options §n」と書く）。設計の親は [servo-host-design.md](./servo-host-design.md) §2.5・§13 項目 6
 - **確度の表記**: 「確認済み」は原文またはコードを確認した事項、「推測」は読んだ範囲からの推論、「未確認」は調べていない事項。一次情報は options の出典（参照日 2026-10-29、Servo は `v0.7.0` タグ）に従い、判断の前に原文で再確認する。本書では新たな外部ページの再取得はしていない
 - **spec 側の課題**（本リポからは編集しない。要報告）: egress 方針に専用のビヘイビア ID が無い。`RENDER-3` の本文はホストのサイズ・ビルド時間とオプトイン配布の設計材料で egress を扱わない。対応づけの確認は spec 側で行う
@@ -189,7 +189,7 @@ Windows の補足（#1401）: `xos-measure.yml` の Windows ジョブに限り�
 
 - プロキシのポリシーは測定用のフィクスチャで、本番のものではない。本番は loopback を含む内部アドレスをすべて拒否するはずで、ここでは 127.0.0.4 を許可先の代役にしている。
 - `direct` は「netns 内の `127.x` は netns 自身の `lo` に向かう」性質に頼る陰性対照で、外へ出る経路の遮断そのものは §6.4 の実測が担う。
-- #1433 で bwrap の FS を `--ro-bind / /` に絞り（書き込めるのは `/run` の tmpfs・UDS ディレクトリ・出力ディレクトリだけ）、同じ構成で 5 項目がすべて pass することを再確認した。
+- #1433 で bwrap の FS を `--ro-bind / /` に絞り（書き込めるのは `/run` の tmpfs・UDS ディレクトリ・出力ディレクトリだけ）、同じ構成で 5 項目がすべて pass することを再確認した。（測定は `--ro-bind / /` だが、本番（#1436・PR #1446）は `--dev-bind / /` のため、FS 上の UDS の迂回は覆っていない。§9.3 を参照。#1458）
 - 結論: この環境では構成が成り立つ。本番のプロキシの実装・`servo-host` への注入・HostProcess への bwrap の組み込みは §7 の承認事項のまま。
 - 未測定: 名前解決後の再検査（DNS rebinding）、CONNECT 上の TLS、Servo 0.7.0 の `Tunnel` との実接続、AppArmor の制限が無い環境・6.7 未満のカーネル。
 
@@ -250,6 +250,7 @@ options §7 を引き継ぐ。本書で新たに加わる未確認事項は §9.
 - Ubuntu の AppArmor 制限（`kernel.apparmor_restrict_unprivileged_userns=1`）下での netns の作り方: 特権なしの `unshare -n`・`unshare -rn` は EPERM、`bwrap --unshare-net` は成功。ns 内に `CAP_NET_ADMIN` は無い
 - Landlock の対応: カーネル 7.0.0-34 で LSM に有効・ABI 8（問い合わせのみ）
 - 現在のコミットのホストでの再測定: c56f11c2 の dev ビルドで測り、bwrap `--unshare-net` は 8 経路すべて pass
+- GitHub の ubuntu runner の AppArmor 下で bwrap が使えるか: 使える。PR #1456 の CI ログ（`rust-test-ubuntu`・Ubuntu 26.04 image）に `egress isolation probe: bwrap available` が出た（#1458）
 - docker `--network none` の判定（配布コンテナとホストの glibc をそろえた同一バイナリ。#1386）: 8 経路すべて pass（§6.4）
 
 ### 9.2 残る未確認事項と追跡先
@@ -259,13 +260,20 @@ options §7 を引き継ぐ。本書で新たに加わる未確認事項は §9.
 | Windows の成立性（§3.3・§6.2）。§8.1 で D（既知の制約）とした。測り直しは次行の #1427 で追跡する | #1387 |
 | Windows の測り直し（loopback 以外の宛先を使う測り方。loopback 免除の下では外側 listener に届くため、現行の測り方では egress を測れない） | #1427 |
 | AppContainer 内の ipc-channel の制約（ボディ付きリクエストで panic し得る。推定・未実測） | #1421 |
-| Docker 内での bwrap の可否（イメージに bwrap が無い） | 未起票 |
-| Servo 自身の DNS・UDP 送信の外部観測（root か `CAP_NET_ADMIN` が要る） | 未起票 |
-| Landlock ルール適用下の動作・seccomp との併用（許可リスト付きプロキシは #1434・#1440・#1436 で本番に実装済み。netns 内の中継 → UDS → プロキシの成立性は §6.5 で確認済み） | 未起票 |
+| Docker 内での bwrap の可否（イメージに bwrap が無い） | #1457 |
+| Servo 自身の DNS・UDP 送信の外部観測（root か `CAP_NET_ADMIN` が要る） | #1457 |
+| Landlock ルール適用下の動作・seccomp との併用（許可リスト付きプロキシは #1434・#1440・#1436 で本番に実装済み。netns 内の中継 → UDS → プロキシの成立性は §6.5 で確認済み） | #1457 |
 | 実ホスト（GitHub の ubuntu・macOS runner）での隔離下の動作（xos-measure の `egress-host`。マージ後に実施し、結果は #1003 へ） | #1003 |
-| GitHub の ubuntu runner の AppArmor 下で bwrap が使えるか（`egress-host` の記録で確認） | 未起票 |
-| bwrap のファイルシステム隔離（`--ro-bind` 化。v1 は `--dev-bind / /`） | 未起票 |
-| 作業ディレクトリが `/run` 配下のときの扱い（`WorkDirHiddenBySandbox` で隔離不能になる） | 未起票 |
-| 隔離中の WebSocket（現状は遮断。必要なら proxy 経由の対応を別途検討） | 未起票 |
-| AppArmor の制限が無い環境・6.7 未満のカーネル | 未起票 |
+| bwrap のファイルシステム隔離（`--ro-bind` 化。v1 は `--dev-bind / /`） | #1457 |
+| 作業ディレクトリが `/run` 配下のときの扱い（`WorkDirHiddenBySandbox` で隔離不能になる） | #1457 |
+| 隔離中の WebSocket（現状は遮断。必要なら proxy 経由の対応を別途検討） | #1457 |
+| AppArmor の制限が無い環境・6.7 未満のカーネル | #1457 |
 | net 層の直接接続の網羅 | options §7 の 1 |
+
+### 9.3 残余リスク（RENDER-3・SEC-2・TASK-38・#1458）
+
+詳細は [servo-host-design.md](./servo-host-design.md) §2.5 の egress 隔離の残余リスク（(4)・(5)。#1451）と、`isolation.rs` のモジュール doc を正とする。ここでは要点だけを記す。
+
+- Linux: FS を隔離しない（`--dev-bind / /`）ため、FS 上の UDS（ssh-agent・X11・gnupg・同じ uid の他インスタンスのプロキシの UDS 等）を通る迂回が残る。
+- macOS: Seatbelt は IP の送信だけを絞る。mach/XPC 経由の通信は止めない。観測したのは `mDNSResponder` 経由の経路だけで、それ以外は観測していない。
+- 測定（#1433）は `--ro-bind / /` で行ったが、本番は `--dev-bind / /` である。そのため、測定は本番の FS 上の UDS の迂回を覆っていない。

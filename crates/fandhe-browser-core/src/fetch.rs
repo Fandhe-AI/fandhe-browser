@@ -1423,6 +1423,9 @@ mod tests {
             "::ffff:0:a9fe:a9fe",
             "::ffff:0:c0a8:1",
             "::ffff:0:0:0",
+            // 224.0.0.1（224/4）・100.64.0.1（100.64/10。#1458）
+            "::ffff:0:e000:1",
+            "::ffff:0:6440:1",
         ] {
             let ip: IpAddr = s.parse().expect("valid ipv6");
             assert!(is_disallowed_address(ip), "{s} must be rejected");
@@ -1433,6 +1436,30 @@ mod tests {
     #[test]
     fn core_1_is_disallowed_address_allows_ipv4_translated_global() {
         for s in ["::ffff:0:808:808", "::ffff:0:101:101"] {
+            let ip: IpAddr = s.parse().expect("valid ipv6");
+            assert!(!is_disallowed_address(ip), "{s} must be allowed");
+        }
+    }
+
+    /// CORE-1・RENDER-3・SEC-4（#1458）: IPv4-translated `::ffff:0:0:0/96` のプレフィクス境界。
+    /// 末尾が内部 IPv4（127.0.0.1・10.0.0.1）でも、プレフィクスが translated と一致しない
+    /// アドレスは許可する。translated 分岐の `s0..s3 == 0`・`s4 == 0xffff`・`s5 == 0` の
+    /// 各条件が落ちると拒否に変わるため、取りこぼしを検出できる。`::/8` の未割当は
+    /// denylist 方式なので「許可」で一貫する（`2003::1` の許可と同じ扱い）。
+    #[test]
+    fn core_1_is_disallowed_address_ipv4_translated_prefix_boundary() {
+        for s in [
+            // s5 != 0（`s5 == 0` の検査を検出）
+            "::ffff:1:7f00:1",
+            "::ffff:1:a00:1",
+            // s0 != 0（`s0 == 0` の検査を検出）
+            "1::ffff:0:7f00:1",
+            // s3 != 0（`s3 == 0` の検査を検出）
+            "0:0:0:1:ffff:0:7f00:1",
+            // 公開 IPv4 の過剰拒否がないことの確認
+            "::ffff:1:808:808",
+            "1::ffff:0:808:808",
+        ] {
             let ip: IpAddr = s.parse().expect("valid ipv6");
             assert!(!is_disallowed_address(ip), "{s} must be allowed");
         }
