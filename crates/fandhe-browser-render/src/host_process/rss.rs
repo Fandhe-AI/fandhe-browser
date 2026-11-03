@@ -113,6 +113,14 @@ const WRAPPER_DEPTH: usize = 2;
 /// （曖昧なまま別プロセスの RSS を測らない）。`read` は `/proc` の読み取りを差し替えられる
 /// ようにするための注入点（本番は `std::fs::read_to_string`）。`CONFIG_PROC_CHILDREN` の無い
 /// カーネルでは読めず、`None` が続いて連続失敗の kill に至る（fail-closed）。
+///
+/// 前提（#1451）: servo-host は Servo を `multiprocess: false`（`servo-host/src/engine.rs`）で起動し、
+/// `servo-host/src` に子プロセスを作る箇所が無いので、ns 内 pid 1 の子はホスト 1 件だけとみなす。
+/// この前提はコード読みによるもので、実ホストで子プロセス数を実測してはいない（Servo 本体や
+/// 依存が内部で子を作る可能性は排除できていない。実測は #1457 で追跡する）。ホストが
+/// ダブルフォークで孤児の子を作ると 2 段目が 2 件になり、解決前に `MAX_CONSECUTIVE_PROBE_FAILURES`
+/// 回失敗すると kill される（解決後は pid が固定されるので影響しない）。前提が崩れた場合
+/// （Servo のメディア系が子を作る等）は cmdline・exe で選ぶ方式に変える。
 pub fn resolve_wrapped_pid(wrapper: u32, read: &dyn Fn(&str) -> Option<String>) -> Option<u32> {
     let mut pid = wrapper;
     for _ in 0..WRAPPER_DEPTH {

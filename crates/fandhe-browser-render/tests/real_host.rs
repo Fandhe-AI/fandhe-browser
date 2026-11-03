@@ -72,6 +72,8 @@ fn host_config(timeouts: HostTimeouts) -> HostProcessConfig {
         .with_isolation_probe(IsolationProbe::Unavailable(
             EgressIsolationUnavailable::SandboxToolNotFound,
         ))
+        // 既定の stderr 警告（RENDER-3・#1451）は CI ログのノイズになるため捨てる。
+        .with_isolation_warning(std::sync::Arc::new(|_| {}))
 }
 
 fn renderer(timeouts: HostTimeouts, allow_private: bool, load_ms: Option<u32>) -> HostRenderer {

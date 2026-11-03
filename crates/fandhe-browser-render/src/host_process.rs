@@ -35,7 +35,7 @@
 //! （[`crate::egress_proxy`]）に限る。実装と制約は [`isolation`] モジュールの doc を参照
 //! （Linux: bwrap・macOS: sandbox-exec・Windows: 隔離なし）。設定 `[rendering] egress_isolation`
 //! の値は [`HostProcessConfig::egress_isolation`] で受ける。`best-effort`（既定）は隔離できなければ
-//! 警告して隔離なしで起動し、`required` は [`HostProcessError::EgressIsolationUnavailable`] で
+//! 警告（コールバック未設定なら stderr に 1 行）して隔離なしで起動し、`required` は [`HostProcessError::EgressIsolationUnavailable`] で
 //! 起動しない。隔離中は WebSocket が使えない。
 //!
 //! # 未実装・暫定
@@ -335,8 +335,25 @@ pub struct HostProcessConfig {
     isolation_warning: IsolationWarning,
 }
 
-/// `best-effort` で隔離なしに落ちたときの警告の通知先（既定は何もしない）。
-/// render はライブラリのため出力先を持たず、cli が `eprintln!` するコールバックを渡す。
+/// 隔離なしに落ちたことを通知する。コールバックがあればそれだけを呼び、無ければ `out`
+/// （本番は stderr）に `warning: <文言>` を 1 行書く（RENDER-3・#1451）。書き込みの失敗は無視する。
+/// render は `tracing` に依存しないため stderr を既定にしている。
+fn report_unisolated(
+    warning: &IsolationWarning,
+    reason: EgressIsolationUnavailable,
+    out: &mut dyn std::io::Write,
+) {
+    match warning.0.as_ref() {
+        Some(f) => f(reason),
+        None => {
+            let _ = writeln!(out, "warning: {}", isolation_warning_message(reason));
+        }
+    }
+}
+
+/// `best-effort` で隔離なしに落ちたときの警告の通知先。コールバックがあればそれだけを呼び、
+/// 無ければ stderr に 1 行出す（RENDER-3・#1451。黙って隔離なしで動く方が危険なため）。
+/// 抑止したい利用側は何もしないコールバックを渡す。cli は `eprintln!` するコールバックを渡す。
 #[derive(Clone, Default)]
 struct IsolationWarning(Option<Arc<dyn Fn(EgressIsolationUnavailable) + Send + Sync>>);
 
@@ -401,7 +418,7 @@ impl HostProcessConfig {
         self
     }
     /// `best-effort` で隔離なしに落ちたときに 1 度だけ呼ぶ通知先を設定する
-    /// （[`isolation_warning_message`] で文言を作れる）。
+    /// （[`isolation_warning_message`] で文言を作れる）。未設定なら stderr に 1 行出す。
     pub fn with_isolation_warning(
         mut self,
         f: Arc<dyn Fn(EgressIsolationUnavailable) + Send + Sync>,
@@ -925,9 +942,11 @@ impl HostProcess {
             Plan::Unisolated(reason) => {
                 if !self.isolation_warned {
                     self.isolation_warned = true;
-                    if let Some(f) = self.config.isolation_warning.0.as_ref() {
-                        f(reason);
-                    }
+                    report_unisolated(
+                        &self.config.isolation_warning,
+                        reason,
+                        &mut std::io::stderr().lock(),
+                    );
                 }
                 return Ok(Launch {
                     program: host,
@@ -1180,6 +1199,40 @@ fn reap_unregistered(child: &mut Child) {
 mod tests {
     use super::*;
     use crate::protocol::VisibilityParams;
+
+    /// RENDER-3（#1451）: コールバックが無いときは stderr に `warning: ` つきの 1 行を出す。
+    #[test]
+    fn render3_unisolated_warning_defaults_to_stderr_line() {
+        let mut out: Vec<u8> = Vec::new();
+        report_unisolated(
+            &IsolationWarning::default(),
+            EgressIsolationUnavailable::SandboxToolNotFound,
+            &mut out,
+        );
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "warning: render host egress isolation is unavailable (sandbox tool (bwrap or sandbox-exec) was not found); starting render host without egress isolation\n"
+        );
+    }
+
+    /// RENDER-3（#1451）: コールバックがあればそれだけを呼び、出力先には書かない（二重出力しない）。
+    #[test]
+    fn render3_unisolated_warning_uses_callback_only() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        let warning = IsolationWarning(Some(Arc::new(move |r| sink.lock().unwrap().push(r))));
+        let mut out: Vec<u8> = Vec::new();
+        report_unisolated(
+            &warning,
+            EgressIsolationUnavailable::SandboxToolNotFound,
+            &mut out,
+        );
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![EgressIsolationUnavailable::SandboxToolNotFound]
+        );
+        assert!(out.is_empty());
+    }
 
     /// RENDER-3・SEC-2（#1444・#1450）: `HostProcess` の経路（`WorkDir::create` →
     /// `isolation::socket_dir_for` → `EgressProxy::start(UnixSocketIn)`）で渡る UDS ディレクトリが、
