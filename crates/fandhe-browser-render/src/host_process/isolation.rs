@@ -68,7 +68,8 @@ pub const RELAY_UDS_PATH_MAX_BYTES: usize = 100;
 /// ディストリビューション標準の `/usr/bin/bwrap` だけを候補にする。`/usr/local/bin` は管理者以外が
 /// 書き込める運用（Linuxbrew 等）があるため含めない。候補は [`trusted_realpath`] で実体パスに解決し、
 /// 実体ファイルと `/` までの全祖先が root 所有・group / other 書き込み不可であることを確かめる。
-/// 以後の probe・exec はその実体パスを使う（判定と exec のパスを一致させる）。
+/// bwrap の以後の probe・exec はその実体パスを使う（判定と exec のパスを一致させる。bwrap は
+/// multicall ではない）。試走用の `true` だけは候補パスで exec する（[`TRUE_CANDIDATES`]）。
 ///
 /// 残余リスク（RENDER-3。未対応）: 信頼判定を通った実行ファイルが bwrap 互換かは、プローブ
 /// （本番と同じフラグでの試走の終了コード）でしか確かめない。引数を無視して exit 0 する
@@ -80,6 +81,12 @@ const BWRAP_CANDIDATES: [&str; 1] = ["/usr/bin/bwrap"];
 /// sandbox-exec の絶対パス。
 const SANDBOX_EXEC_PATH: &str = "/usr/bin/sandbox-exec";
 /// プローブで走らせる無害なコマンドの候補。ホストバイナリは試走に使わない。
+///
+/// bwrap と違い、exec には実体パスではなく**候補パスのまま**を渡す（[`select_trusted_exec`]）。
+/// uutils の `coreutils`・busybox のような multicall バイナリは argv[0] で動作を決めるため、
+/// 実体パス（例: `/usr/lib/cargo/bin/coreutils`）で exec すると `true` として動かず、
+/// `required` で起動できなくなる（fail-closed だが可用性の問題。#1458）。信頼判定は実体の
+/// チェーンと、候補パス側の symlink チェーンの両方で行う。
 #[cfg_attr(not(unix), allow(dead_code))]
 const TRUE_CANDIDATES: [&str; 2] = ["/usr/bin/true", "/bin/true"];
 /// プローブ 1 回の上限時間。
@@ -242,6 +249,26 @@ pub(super) fn linux_argv(bwrap: &Path, host: &Path, relay_uds: &Path) -> (PathBu
     (bwrap.to_path_buf(), args)
 }
 
+/// プローブ用の bwrap 起動コマンド。本番と同じフラグ（[`linux_wrapper_args`]）の後ろに、試走する
+/// コマンドを `true_exec`（候補パスのまま。multicall の argv[0] 対策。#1458）で置く。
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn linux_probe_argv(bwrap: &Path, true_exec: &Path) -> (PathBuf, Vec<OsString>) {
+    let mut args = linux_wrapper_args();
+    args.push(true_exec.as_os_str().to_owned());
+    (bwrap.to_path_buf(), args)
+}
+
+/// プローブ用の sandbox-exec 起動コマンド（profile は何も絞らない。`true_exec` は候補パスのまま）。
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn macos_probe_argv(tool: &Path, true_exec: &Path) -> (PathBuf, Vec<OsString>) {
+    let args = vec![
+        OsString::from("-p"),
+        OsString::from("(version 1)(allow default)"),
+        true_exec.as_os_str().to_owned(),
+    ];
+    (tool.to_path_buf(), args)
+}
+
 /// Seatbelt の profile。loopback の `port` 以外への送信を拒否する。
 /// 埋め込むのは検証済みの整数だけで、文字列の外部入力は入らない。
 pub(super) fn seatbelt_profile(port: NonZeroU16) -> String {
@@ -298,7 +325,8 @@ pub(super) const EGRESS_SOCKET_NAME: &str = "egress-proxy.sock";
 ///
 /// 返すのは `HostProcess` がこの起動のために排他的に作った 0700 の WorkDir ルートで、
 /// `EgressEndpoint::UnixSocketIn` の呼び出し側の契約を満たす（#1444・#1450）。契約はテスト
-/// `render_3_sec_2_uds_dir_is_created_by_host_process_0700_and_owned`（`host_process.rs`）で固定する。
+/// `render_3_sec_2_uds_dir_is_created_by_host_process_0700_and_owned`（`host_process.rs`）が、
+/// `spawn` と同じ部品を直接呼んで固定する（`spawn` 自体は通さない範囲は同テストの doc を参照）。
 pub(super) fn socket_dir_for(workdir: &Path) -> Result<PathBuf, EgressIsolationUnavailable> {
     let canonical = std::fs::canonicalize(workdir)
         .map_err(|_| EgressIsolationUnavailable::SocketPathInvalid)?;
@@ -350,7 +378,8 @@ enum TrustCheck {
 /// 候補を `canonicalize` した実体パスで判定する（RENDER-3）。シンボリックリンクは解決し、
 /// 実体ファイルと `/` までの全祖先を見る。リンクの置き場所（ユーザー所有の `/usr/local/bin` 等）
 /// ではなく実体の側で判定するため、リンク先の実体が信頼できなければ拒否される。
-/// `resolve_sandbox_plan` が bwrap・sandbox-exec・true の選定に使う。
+/// bwrap・sandbox-exec の選定（[`select_trusted`]）と、`true` の実体側の判定
+/// （[`select_trusted_exec`]）が使う。
 #[cfg(unix)]
 fn trusted_realpath(path: &Path) -> TrustCheck {
     use std::os::unix::fs::MetadataExt;
@@ -395,6 +424,89 @@ fn select_trusted(candidates: &[&str]) -> Result<PathBuf, EgressIsolationUnavail
     })
 }
 
+/// symlink を辿る段数の上限（超えたら信頼しない。ループ・過大なチェーンの fail-closed）。
+#[cfg(unix)]
+const MAX_SYMLINK_HOPS: usize = 40;
+
+/// 候補パス側の symlink チェーンの信頼判定（純関数）。各段の祖先ディレクトリのメタデータ
+/// `(is_dir, uid, mode)` の列を受け取り、すべてが [`trusted_dir_metadata`] を満たすときだけ
+/// 真。段が 1 つも無い（証拠が無い）場合は偽（fail-closed。RENDER-3・#1458）。
+#[cfg(unix)]
+fn trusted_hops(hops: &[Vec<(bool, u32, u32)>]) -> bool {
+    !hops.is_empty()
+        && hops.iter().all(|hop| {
+            hop.iter()
+                .all(|&(is_dir, uid, mode)| trusted_dir_metadata(is_dir, uid, mode))
+        })
+}
+
+/// 候補パスから symlink を 1 段ずつ辿り、各段で参照されるパスの字句上の祖先（symlink は辿った
+/// 状態の属性）と、親を `canonicalize` した実体の祖先のメタデータを集める。exec のときに
+/// カーネルが解決する symlink の置き場所（ユーザー所有の `/usr/local/bin` 等）を信頼判定に含めるため。
+/// 上限超過・I/O エラーは `None`（呼び出し側で Untrusted に倒す）。
+#[cfg(unix)]
+fn collect_hops(path: &Path) -> Option<Vec<Vec<(bool, u32, u32)>>> {
+    use std::os::unix::fs::MetadataExt;
+    let dir_meta = |dir: &Path| {
+        std::fs::metadata(dir)
+            .ok()
+            .map(|m| (m.is_dir(), m.uid(), m.mode()))
+    };
+    let mut cur = path.to_path_buf();
+    let mut hops = Vec::new();
+    for _ in 0..MAX_SYMLINK_HOPS {
+        let parent = cur.parent()?.to_path_buf();
+        let mut metas = Vec::new();
+        for dir in cur.ancestors().skip(1) {
+            metas.push(dir_meta(dir)?);
+        }
+        let canonical_parent = std::fs::canonicalize(&parent).ok()?;
+        for dir in canonical_parent.ancestors() {
+            metas.push(dir_meta(dir)?);
+        }
+        hops.push(metas);
+        if !std::fs::symlink_metadata(&cur)
+            .ok()?
+            .file_type()
+            .is_symlink()
+        {
+            return Some(hops);
+        }
+        let target = std::fs::read_link(&cur).ok()?;
+        cur = if target.is_absolute() {
+            target
+        } else {
+            parent.join(target)
+        };
+    }
+    None
+}
+
+/// 試走用 `true` の選定。[`select_trusted`] と違い、返すのは exec に使う**候補パス**そのもの
+/// （multicall の argv[0] 対策。#1458）。信頼判定は、実体のチェーン（[`trusted_realpath`]）と、
+/// 候補パス側の symlink チェーン（[`collect_hops`]・[`trusted_hops`]）の両方を満たすこと。
+/// 存在しなければ `SandboxToolNotFound`、信頼できなければ `SandboxToolUntrusted`。
+#[cfg(unix)]
+fn select_trusted_exec(candidates: &[&str]) -> Result<PathBuf, EgressIsolationUnavailable> {
+    let mut found_untrusted = false;
+    for c in candidates {
+        let path = Path::new(c);
+        match trusted_realpath(path) {
+            TrustCheck::Missing => {}
+            TrustCheck::Untrusted => found_untrusted = true,
+            TrustCheck::Trusted(_) => match collect_hops(path) {
+                Some(hops) if trusted_hops(&hops) => return Ok(path.to_path_buf()),
+                _ => found_untrusted = true,
+            },
+        }
+    }
+    Err(if found_untrusted {
+        EgressIsolationUnavailable::SandboxToolUntrusted
+    } else {
+        EgressIsolationUnavailable::SandboxToolNotFound
+    })
+}
+
 /// `cmd` を stdio なしで走らせ、`timeout` 内に成功終了したかを返す。超過したら kill して失敗。
 #[cfg(unix)]
 fn run_probe(mut cmd: Command, timeout: Duration) -> bool {
@@ -424,9 +536,10 @@ fn run_probe(mut cmd: Command, timeout: Duration) -> bool {
 #[cfg(target_os = "linux")]
 fn probe_uncached() -> Result<Sandbox, EgressIsolationUnavailable> {
     let bwrap = select_trusted(&BWRAP_CANDIDATES)?;
-    let true_bin = select_trusted(&TRUE_CANDIDATES)?;
-    let mut cmd = Command::new(&bwrap);
-    cmd.args(linux_wrapper_args()).arg(&true_bin);
+    let true_exec = select_trusted_exec(&TRUE_CANDIDATES)?;
+    let (prog, args) = linux_probe_argv(&bwrap, &true_exec);
+    let mut cmd = Command::new(prog);
+    cmd.args(args);
     if run_probe(cmd, PROBE_TIMEOUT) {
         Ok(Sandbox::Bwrap(bwrap))
     } else {
@@ -442,10 +555,10 @@ fn probe_uncached() -> Result<Sandbox, EgressIsolationUnavailable> {
     if tool != Path::new(SANDBOX_EXEC_PATH) {
         return Err(EgressIsolationUnavailable::SandboxToolUntrusted);
     }
-    let true_bin = select_trusted(&TRUE_CANDIDATES)?;
-    let mut cmd = Command::new(&tool);
-    cmd.args(["-p", "(version 1)(allow default)"])
-        .arg(&true_bin);
+    let true_exec = select_trusted_exec(&TRUE_CANDIDATES)?;
+    let (prog, args) = macos_probe_argv(&tool, &true_exec);
+    let mut cmd = Command::new(prog);
+    cmd.args(args);
     if run_probe(cmd, PROBE_TIMEOUT) {
         Ok(Sandbox::SandboxExec)
     } else {
@@ -512,24 +625,37 @@ mod tests {
         assert!(!trusted_metadata(false, 0, 0o755));
     }
 
-    /// RENDER-3（#1451）: 実ファイルでも、自分が所有する 0755 のファイルは拒否される
-    /// （root で実行する環境では所有者が 0 になるため、group 書き込み可の 0775 で確かめる）。
+    /// 0755 の通常ファイルを作り、root で実行している場合（作成直後の所有者が 0）は所有者を
+    /// 非 root（nobody 相当の 65534）にして、`(is_file, uid, mode)` を返す。どの実行ユーザーでも
+    /// 「root 以外が所有する 0755」を実ファイルで再現するため（失敗は panic。skip にしない）。
+    #[cfg(unix)]
+    fn make_non_root_owned_executable(f: &Path) -> (bool, u32, u32) {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        std::fs::write(f, b"#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(f, std::fs::Permissions::from_mode(0o755)).unwrap();
+        if std::fs::metadata(f).unwrap().uid() == 0 {
+            std::os::unix::fs::chown(f, Some(65534), None).unwrap();
+        }
+        let m = std::fs::metadata(f).unwrap();
+        assert_ne!(m.uid(), 0, "fixture must be owned by a non-root user");
+        (m.is_file(), m.uid(), m.mode())
+    }
+
+    /// RENDER-3（#1451・#1458）: 実ファイルでも、root 以外が所有する 0755 のファイルは拒否される。
+    /// `/tmp`（1777）の祖先が常に Untrusted の理由になるため、`trusted_realpath` だけでは所有者の
+    /// 分岐を単独で確かめられない。そこで実ファイルのメタデータから `trusted_metadata` を直接評価し、
+    /// uid だけを 0 に置き換えると受理されること（所有者が決め手であること）を示す
+    /// （純関数 `render3_trusted_metadata_rejects_non_root_owner` が所有者の分岐の正本）。
     #[cfg(unix)]
     #[test]
     fn render3_trusted_realpath_rejects_user_owned_file() {
-        use std::os::unix::fs::{MetadataExt, PermissionsExt};
         let dir = std::env::temp_dir().join(format!("fb-trust-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let f = dir.join("fake-bwrap");
-        std::fs::write(&f, b"#!/bin/sh\n").unwrap();
-        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let owner = std::fs::metadata(&f).unwrap().uid();
-        if owner != 0 {
-            assert_eq!(trusted_realpath(&f), TrustCheck::Untrusted);
-        } else {
-            std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o775)).unwrap();
-            assert_eq!(trusted_realpath(&f), TrustCheck::Untrusted);
-        }
+        let (is_file, uid, mode) = make_non_root_owned_executable(&f);
+        assert!(!trusted_metadata(is_file, uid, mode));
+        assert!(trusted_metadata(is_file, 0, mode));
+        assert_eq!(trusted_realpath(&f), TrustCheck::Untrusted);
         assert_eq!(trusted_realpath(&dir.join("absent")), TrustCheck::Missing);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -557,18 +683,51 @@ mod tests {
         assert!(!trusted_chain((true, 0, 0o775), &[dir]));
     }
 
+    /// 存在する最初の `TRUE_CANDIDATES` の実体パスと、その実体が標準配置（実体と全祖先が root 所有
+    /// 0755 相当）かを返す。どれも無ければ各候補が Missing であることを assert して `None`
+    /// （環境の事実を assert する。skip にしない）。
+    #[cfg(unix)]
+    fn existing_true_candidate() -> Option<(PathBuf, bool)> {
+        use std::os::unix::fs::MetadataExt;
+        for c in TRUE_CANDIDATES {
+            if let Ok(real) = std::fs::canonicalize(c) {
+                let m = std::fs::metadata(&real).unwrap();
+                let ancestors: Vec<(bool, u32, u32)> = real
+                    .ancestors()
+                    .skip(1)
+                    .map(|d| {
+                        let dm = std::fs::metadata(d).unwrap();
+                        (dm.is_dir(), dm.uid(), dm.mode())
+                    })
+                    .collect();
+                let standard = trusted_chain((m.is_file(), m.uid(), m.mode()), &ancestors);
+                return Some((real, standard));
+            }
+        }
+        for c in TRUE_CANDIDATES {
+            assert_eq!(trusted_realpath(Path::new(c)), TrustCheck::Missing, "{c}");
+        }
+        None
+    }
+
     /// RENDER-3: ユーザー所有ディレクトリ内の symlink は、リンクの置き場所ではなく実体で判定され、
-    /// 信頼できれば返るパスは実体（exec に使うパス）になる。`/usr/bin/true` は root 所有・祖先も
-    /// root 所有の標準配置を前提とする。実体が信頼できないリンク（自作ファイル宛）は拒否される。
+    /// 信頼できれば返るパスは実体になる。実体が信頼できないリンク（自作ファイル宛）は拒否される。
+    /// 実体は存在する最初の `TRUE_CANDIDATES` を使う。標準配置（root 所有の祖先）でない環境
+    /// （Nix 等）では、前提が崩れていることと Untrusted になることを assert する。
     #[cfg(unix)]
     #[test]
     fn render3_trusted_realpath_judges_symlink_by_target() {
         let dir = std::env::temp_dir().join(format!("fb-trust-link-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let real_true = std::fs::canonicalize("/usr/bin/true").unwrap();
-        let link = dir.join("bwrap");
-        std::os::unix::fs::symlink(&real_true, &link).unwrap();
-        assert_eq!(trusted_realpath(&link), TrustCheck::Trusted(real_true));
+        if let Some((real_true, standard)) = existing_true_candidate() {
+            let link = dir.join("bwrap");
+            std::os::unix::fs::symlink(&real_true, &link).unwrap();
+            if standard {
+                assert_eq!(trusted_realpath(&link), TrustCheck::Trusted(real_true));
+            } else {
+                assert_eq!(trusted_realpath(&link), TrustCheck::Untrusted);
+            }
+        }
 
         let own = dir.join("own");
         std::fs::write(&own, b"#!/bin/sh\n").unwrap();
@@ -578,7 +737,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// RENDER-3: 候補が全て無ければ NotFound、あるが信頼できなければ Untrusted。
+    /// RENDER-3: 候補が全て無ければ NotFound、あるが信頼できなければ Untrusted。後者は所有者の
+    /// 分岐（root 以外所有の 0755）から来ていることを、`trusted_metadata` で示す。
     #[cfg(unix)]
     #[test]
     fn render3_select_trusted_distinguishes_missing_and_untrusted() {
@@ -589,12 +749,93 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("fb-trust-sel-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let f = dir.join("tool");
-        std::fs::write(&f, b"x").unwrap();
+        let (is_file, uid, mode) = make_non_root_owned_executable(&f);
+        assert!(!trusted_metadata(is_file, uid, mode));
+        assert!(trusted_metadata(is_file, 0, mode));
         assert_eq!(
             select_trusted(&[f.to_str().unwrap()]),
             Err(EgressIsolationUnavailable::SandboxToolUntrusted)
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// RENDER-3（#1458）: 候補パス側の symlink チェーンは、各段の祖先がすべて root 所有・
+    /// group / other 書き込み不可のときだけ受理する。段が無い（証拠が無い）場合は拒否する。
+    #[cfg(unix)]
+    #[test]
+    fn render3_trusted_hops_checks_every_hop_and_ancestor() {
+        let dir = (true, 0, 0o755);
+        assert!(trusted_hops(&[vec![dir, dir], vec![dir]]));
+        // 空の列は fail-closed
+        assert!(!trusted_hops(&[]));
+        // 非 root 所有の祖先（中間の段）
+        assert!(!trusted_hops(&[vec![dir], vec![dir, (true, 1000, 0o755)]]));
+        // group / other 書き込み可
+        assert!(!trusted_hops(&[vec![(true, 0, 0o775)]]));
+        assert!(!trusted_hops(&[vec![dir], vec![(true, 0, 0o757)]]));
+        // sticky つきの 1777（/tmp 相当）
+        assert!(!trusted_hops(&[vec![(true, 0, 0o1777)]]));
+    }
+
+    /// RENDER-3（#1458）: 候補パスが「ユーザー所有ではない一時ディレクトリ内の symlink」のとき、
+    /// 実体（`trusted_realpath`）が標準配置でも、置き場所の祖先（`/tmp` は 1777）が理由で
+    /// `select_trusted_exec` は `SandboxToolUntrusted` にする。root でも非 root でも成り立つ
+    /// （実体が標準配置でない環境でも Untrusted）。
+    #[cfg(unix)]
+    #[test]
+    fn render3_select_trusted_exec_rejects_symlink_in_untrusted_dir() {
+        let dir = std::env::temp_dir().join(format!("fb-trust-exec-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        if let Some((real_true, _)) = existing_true_candidate() {
+            let link = dir.join("true");
+            std::os::unix::fs::symlink(&real_true, &link).unwrap();
+            assert_eq!(
+                select_trusted_exec(&[link.to_str().unwrap()]),
+                Err(EgressIsolationUnavailable::SandboxToolUntrusted)
+            );
+        }
+        assert_eq!(
+            select_trusted_exec(&["/nonexistent-fb-dir/true"]),
+            Err(EgressIsolationUnavailable::SandboxToolNotFound)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// RENDER-3（#1458）: 標準配置の環境では、候補パスのまま（実体へ解決せず）返す。
+    /// `/usr/bin/true` が symlink（`gnutrue`・multicall の `coreutils` 等）でも、返すのは候補パス。
+    #[cfg(unix)]
+    #[test]
+    fn render3_select_trusted_exec_returns_candidate_path_not_realpath() {
+        if let Ok(path) = select_trusted_exec(&TRUE_CANDIDATES) {
+            assert!(
+                TRUE_CANDIDATES.iter().any(|c| Path::new(c) == path),
+                "must return a candidate path as-is: {path:?}"
+            );
+        }
+    }
+
+    /// RENDER-3（#1458）: Linux のプローブ argv は本番と同じフラグ + 候補パスのまま（実体パスでない）。
+    /// multicall では実体（例: `/usr/lib/cargo/bin/coreutils`）で exec すると argv[0] が変わり
+    /// `true` として動かないため、内側のプログラムは候補パスで渡す。
+    #[test]
+    fn render3_linux_probe_argv_uses_candidate_path_as_argv0() {
+        let (prog, args) =
+            linux_probe_argv(Path::new("/usr/bin/bwrap"), Path::new("/usr/bin/true"));
+        assert_eq!(prog, PathBuf::from("/usr/bin/bwrap"));
+        let mut want = linux_wrapper_args();
+        want.push(OsString::from("/usr/bin/true"));
+        assert_eq!(args, want);
+        assert_eq!(args.last().unwrap(), "/usr/bin/true");
+        assert_ne!(args.last().unwrap(), "/usr/lib/cargo/bin/coreutils");
+    }
+
+    /// RENDER-3（#1458）: macOS のプローブ argv も候補パスのまま。
+    #[test]
+    fn render3_macos_probe_argv_uses_candidate_path_as_argv0() {
+        let (prog, args) = macos_probe_argv(Path::new(SANDBOX_EXEC_PATH), Path::new("/bin/true"));
+        assert_eq!(prog, PathBuf::from("/usr/bin/sandbox-exec"));
+        let got: Vec<&str> = args.iter().map(|a| a.to_str().unwrap()).collect();
+        assert_eq!(got, ["-p", "(version 1)(allow default)", "/bin/true"]);
     }
 
     /// RENDER-3（#1436）: Linux の argv は bwrap の固定フラグ + ホスト + 中継 UDS と完全一致する。
