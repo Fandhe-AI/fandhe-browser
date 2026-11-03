@@ -285,7 +285,7 @@ host netns を記録し、bwrap 配下の Servo ホストに帰属する外向�
   テストのページは IP リテラルで、宛先の DNS を誘発しない（Servo が自発的に出す送信だけを見る）。fd 受け渡しによる netns 越えのソケットは想定外。ubuntu のみ。
   隔離下の pid 全体の観測区間がカナリアの間隔（2 秒）より短いと、区間内のカナリアが無く観測不能になりうる（`render3_egress_*` は 3 件を順に走らせるので通常は十分に長い）。
 - 帰属できない DNS・UDP（#1457・2026-11-03 のオーナー判断・案 A）: 合否には使わず、人が判断する。Servo の観測区間（隔離下 pid の first〜last）内にある
-  帰属できない DNS・UDP の件数と宛先（dst・dport）の上位 10 件、pass の根拠の注記を Summary と `verdict.json`（`unattributed_in_servo_window`・`pass_basis_note`）に出す。
+  帰属できない DNS・UDP（lo の In/Out で宛先 53 番のスタブ resolver 経由を含む。`count_category()` と同じ対象）の件数と宛先（dst・dport）の上位 10 件、pass の根拠の注記を Summary と `verdict.json`（`unattributed_in_servo_window`・`pass_basis_note`）に出す。
   pass は netns の構造検査と観測範囲だけに基づき、帰属できない通信が Servo のものでないとは言えない。ペイロードは出さず、pcap と変換テキストは削除する（アーティファクトは許可リスト）。
 - 自己テスト: `test_host_capture.py`（合成 tcpdump テキスト・合成サンプル。`make check-egress-isolation`）。行形式は tcpdump 4.99.6（SLL2）の実出力に合わせてある。
 

@@ -665,6 +665,14 @@ class UnattributedWindowTests(unittest.TestCase):
         self.assertIn("| 8.8.8.8 | 53 | 1 |", summary)
         self.assertIn("unattributed DNS/UDP cannot be ruled out as Servo's", summary)
 
+    def test_loopback_stub_dns_is_counted_in_window(self):
+        out = line(100.3, "lo", "Out", "127.0.0.1.4000 > 127.0.0.53.53: UDP, length 5")
+        inn = line(100.4, "lo", "In", "127.0.0.1.4001 > 127.0.0.53.53: UDP, length 5")
+        v = run([CANARY_LINE, OUT_TCP, out, inn], make_index())
+        u = v["unattributed_in_servo_window"]
+        self.assertEqual((u["dns"], u["udp_other"]), (2, 0))
+        self.assertEqual(u["destinations"], [{"dst": "127.0.0.53", "dport": 53, "count": 2}])
+
     def test_zero_count_line_is_still_in_summary(self):
         v = run([CANARY_LINE, OUT_TCP], make_index())
         summary = hc.render_summary(v)

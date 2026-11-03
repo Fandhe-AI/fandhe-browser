@@ -389,8 +389,6 @@ def judge(
         if (
             role == ROLE_NONE
             and cat in win_counts
-            and pkt["iface"] != "lo"
-            and pkt["dir"] == "Out"
             and window is not None
             and window[0] <= pkt["ts"] <= window[1]
         ):
