@@ -292,6 +292,9 @@ impl Root {
             .with_isolation_probe(IsolationProbe::Unavailable(
                 EgressIsolationUnavailable::SandboxToolNotFound,
             ))
+            // 既定の stderr 警告（RENDER-3・#1451）は CI ログを埋めるため、テストでは捨てる。
+            // 警告の仕様は `with_warning_sink` を使うテストで検証する。
+            .with_isolation_warning(std::sync::Arc::new(|_| {}))
     }
     /// 隔離可否を実環境で判定する設定（`IsolationProbe::System`）。
     pub fn config_system(&self, timeouts: HostTimeouts) -> HostProcessConfig {

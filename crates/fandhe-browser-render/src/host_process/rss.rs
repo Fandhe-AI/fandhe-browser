@@ -115,7 +115,9 @@ const WRAPPER_DEPTH: usize = 2;
 /// カーネルでは読めず、`None` が続いて連続失敗の kill に至る（fail-closed）。
 ///
 /// 前提（#1451）: servo-host は Servo を `multiprocess: false`（`servo-host/src/engine.rs`）で起動し、
-/// コードにも子プロセスを作る箇所が無いため、ns 内 pid 1 の子はホスト 1 件だけとみなす。ホストが
+/// `servo-host/src` に子プロセスを作る箇所が無いので、ns 内 pid 1 の子はホスト 1 件だけとみなす。
+/// この前提はコード読みによるもので、実ホストで子プロセス数を実測してはいない（Servo 本体や
+/// 依存が内部で子を作る可能性は排除できていない。実測は #1437 の範囲）。ホストが
 /// ダブルフォークで孤児の子を作ると 2 段目が 2 件になり、解決前に `MAX_CONSECUTIVE_PROBE_FAILURES`
 /// 回失敗すると kill される（解決後は pid が固定されるので影響しない）。前提が崩れた場合
 /// （Servo のメディア系が子を作る等）は cmdline・exe で選ぶ方式に変える。
