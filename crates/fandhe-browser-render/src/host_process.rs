@@ -91,6 +91,10 @@ use breaker::CircuitBreaker;
 use fandhe_browser_core::EgressIsolationMode;
 use isolation::{Plan, Sandbox};
 use rss::{PidSource, RssMonitor};
+/// 診断・テスト用の再公開（`real_host` の `EGRESS-PROCTREE` 記録が使う。RENDER-3・#1460）。
+pub use rss::{
+    ProcTreeError, WrappedProcTree, list_proc_tasks, read_proc_text, walk_wrapped_proc_tree,
+};
 use stderr_tail::StderrTail;
 use workdir::WorkDir;
 
