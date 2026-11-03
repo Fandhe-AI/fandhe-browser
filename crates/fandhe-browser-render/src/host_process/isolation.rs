@@ -76,12 +76,14 @@ pub const RELAY_UDS_PATH_MAX_BYTES: usize = 100;
 /// bwrap の以後の probe・exec はその実体パスを使う（判定と exec のパスを一致させる。bwrap は
 /// multicall ではない）。試走用の `readlink` だけは候補パスで exec する（[`READLINK_CANDIDATES`]）。
 ///
-/// プローブは、サンドボックス内の `readlink /proc/self/ns/net` の出力を本体の値と比べ、ネット
-/// ワーク名前空間が**異なるときだけ**成功とする（RENDER-3・#1459。終了コードだけを見ると、引数を
+/// プローブは、サンドボックス内の `readlink /proc/self/ns/net`・`/proc/self/ns/pid` の出力を本体の
+/// 値と比べ、ネットワーク名前空間と pid 名前空間がどちらも**異なるときだけ**成功とする（pid ns は #1466）（RENDER-3・#1459。終了コードだけを見ると、引数を
 /// 無視して exit 0 する root 所有コマンドを隔離できたと誤認する）。exit 0 だけの偽物は出力が空、
 /// ns を作らず中身だけ実行する偽物は inode が同じなので、どちらも失敗する。`--unshare-net` で
 /// 作った netns には `lo` しかないため、別の netns にいることが「外部への出口が無い」ことの
-/// 十分条件になる。`/sys/class/net` は `--dev-bind / /` でホストの sysfs が見えるため判定に使えない。
+/// 十分条件になる。ただしそれは、その netns が**本物の** bwrap の `--unshare-net` で作られた
+/// という前提に依存する（プローブが確かめるのは別の netns にいることまで）。本物であることは
+/// root 所有の信頼判定で担保する。`/sys/class/net` は `--dev-bind / /` でホストの sysfs が見えるため判定に使えない。
 ///
 /// 残る限界: root 所有の候補パスを差し替えられる攻撃者（それらしい別の inode を出力する悪意ある
 /// バイナリを置ける者）は脅威モデルの外にある（その権限があれば隔離そのものを外せる）。
@@ -106,9 +108,34 @@ const TRUE_CANDIDATES: [&str; 2] = ["/usr/bin/true", "/bin/true"];
 /// #1458）で、信頼判定は [`select_trusted_exec`] で行う。
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 const READLINK_CANDIDATES: [&str; 2] = ["/usr/bin/readlink", "/bin/readlink"];
-/// 自プロセス（サンドボックス内では内側のプロセス）の netns を指す symlink。
+/// プローブで本体と比べる名前空間の種類（RENDER-3・#1459・#1466）。`--unshare-net` の netns に加え、
+/// 本番が渡す `--unshare-pid` の pid ns も分離できているかを確かめる（rss 監視が ns 内 pid 1 と
+/// ラッパーの kill で ns 内のホストも落ちることを前提にするため）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-const NETNS_LINK: &str = "/proc/self/ns/net";
+enum Namespace {
+    Net,
+    Pid,
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+impl Namespace {
+    /// 自プロセス（サンドボックス内では内側のプロセス）の名前空間を指す symlink。
+    fn link(self) -> &'static str {
+        match self {
+            Self::Net => "/proc/self/ns/net",
+            Self::Pid => "/proc/self/ns/pid",
+        }
+    }
+
+    /// `readlink` の出力の接頭辞（`<種別>:[<inode>]`）。
+    fn prefix(self) -> &'static str {
+        match self {
+            Self::Net => "net:[",
+            Self::Pid => "pid:[",
+        }
+    }
+}
 /// プローブの stdout を読む上限（`net:[<u64>]` は 30 バイト未満。超過は fail-closed）。
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 const PROBE_STDOUT_MAX: u64 = 256;
@@ -275,43 +302,44 @@ pub(super) fn linux_argv(bwrap: &Path, host: &Path, relay_uds: &Path) -> (PathBu
 }
 
 /// プローブ用の bwrap 起動コマンド。本番と同じフラグ（[`linux_wrapper_args`]）の後ろに、
-/// `readlink_exec`（候補パスのまま。multicall の argv[0] 対策。#1458）と [`NETNS_LINK`] を置く
-/// （内側の netns を標準出力へ出させる。RENDER-3・#1459）。
+/// `readlink_exec`（候補パスのまま。multicall の argv[0] 対策。#1458）と `link`（[`Namespace::link`]）
+/// を置く（内側の名前空間を標準出力へ出させる。RENDER-3・#1459・#1466）。busybox の `readlink` は
+/// オペランドを 1 つしか取らないため、名前空間ごとに別の起動にする。
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-fn linux_probe_argv(bwrap: &Path, readlink_exec: &Path) -> (PathBuf, Vec<OsString>) {
+fn linux_probe_argv(bwrap: &Path, readlink_exec: &Path, link: &str) -> (PathBuf, Vec<OsString>) {
     let mut args = linux_wrapper_args();
     args.push(readlink_exec.as_os_str().to_owned());
-    args.push(OsString::from(NETNS_LINK));
+    args.push(OsString::from(link));
     (bwrap.to_path_buf(), args)
 }
 
-/// `net:[<10 進数>]`（末尾の改行は 1 個まで）だけを netns の inode 番号として読む。それ以外
-/// （空・前後のゴミ・桁あふれ）は `None`（fail-closed）。
+/// `<種別>:[<10 進数>]`（末尾の改行は 1 個まで）だけを名前空間の inode 番号として読む。それ以外
+/// （空・種別違い・前後のゴミ・桁あふれ）は `None`（fail-closed）。
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-fn parse_netns_id(s: &[u8]) -> Option<u64> {
+fn parse_ns_id(ns: Namespace, s: &[u8]) -> Option<u64> {
     let text = std::str::from_utf8(s).ok()?;
     let text = text.strip_suffix('\n').unwrap_or(text);
-    let digits = text.strip_prefix("net:[")?.strip_suffix(']')?;
+    let digits = text.strip_prefix(ns.prefix())?.strip_suffix(']')?;
     if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
     digits.parse::<u64>().ok()
 }
 
-/// 外側と内側の netns がどちらも読め、かつ**異なる**ときだけ真（RENDER-3・#1459）。
+/// 外側と内側の名前空間がどちらも読め、かつ**異なる**ときだけ真（RENDER-3・#1459・#1466）。
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-fn netns_separated(outside: &[u8], inside_stdout: &[u8]) -> bool {
-    match (parse_netns_id(outside), parse_netns_id(inside_stdout)) {
+fn ns_separated(ns: Namespace, outside: &[u8], inside_stdout: &[u8]) -> bool {
+    match (parse_ns_id(ns, outside), parse_ns_id(ns, inside_stdout)) {
         (Some(o), Some(i)) => o != i,
         _ => false,
     }
 }
 
-/// netns プローブの結果（テストで具体値を assert するための内部用。公開エラーには
+/// 名前空間プローブの結果（テストで具体値を assert するための内部用。公開エラーには
 /// `Separated` 以外をすべて `SandboxProbeFailed` として写す）。
 #[cfg(target_os = "linux")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum NetnsProbe {
+enum NsProbe {
     SpawnFailed,
     Timeout,
     ExitFailure,
@@ -596,19 +624,22 @@ fn run_probe(mut cmd: Command, timeout: Duration) -> bool {
     }
 }
 
-/// `bwrap` で `readlink_exec /proc/self/ns/net` を本番と同じフラグで試走し、内側の netns が
-/// 本体と別かを判定する（RENDER-3・#1459）。信頼判定は呼び出し側（[`probe_uncached`]）が行い、
-/// 本関数は渡されたパスをそのまま使う（テストが偽物の bwrap を渡せる）。stdout は
+/// `bwrap` で `readlink_exec <ns のリンク>` を本番と同じフラグで試走し、内側の名前空間 `ns` が
+/// 本体と別かを判定する（RENDER-3・#1459・#1466）。信頼判定は呼び出し側（[`probe_uncached`]）が行い、
+/// 本関数は渡されたパスをそのまま使う（テストが偽物の bwrap を渡せる）。
+///
+/// 試走は `env_clear` で走るが、本番の起動は許可リストの環境変数で走る。差が出るのは起動できない側
+/// （失敗側）だけで、本番で隔離なしに起動できてしまう fail-open にはならない（設計 §9.4）。stdout は
 /// [`PROBE_STDOUT_MAX`] バイトまで、終了後に読む（出力が小さくパイプの容量に収まるため
 /// デッドロックしない。大量出力で詰まる場合は timeout で kill して失敗にする）。
 #[cfg(target_os = "linux")]
-fn probe_netns_with(bwrap: &Path, readlink_exec: &Path, timeout: Duration) -> NetnsProbe {
+fn probe_ns_with(bwrap: &Path, readlink_exec: &Path, ns: Namespace, timeout: Duration) -> NsProbe {
     use std::io::Read;
-    let Ok(outside) = std::fs::read_link(NETNS_LINK) else {
-        return NetnsProbe::OutputUnreadable;
+    let Ok(outside) = std::fs::read_link(ns.link()) else {
+        return NsProbe::OutputUnreadable;
     };
     let outside = outside.into_os_string().into_encoded_bytes();
-    let (prog, args) = linux_probe_argv(bwrap, readlink_exec);
+    let (prog, args) = linux_probe_argv(bwrap, readlink_exec, ns.link());
     let mut cmd = Command::new(prog);
     cmd.args(args)
         .env_clear()
@@ -616,7 +647,7 @@ fn probe_netns_with(bwrap: &Path, readlink_exec: &Path, timeout: Duration) -> Ne
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
     let Ok(mut child) = cmd.spawn() else {
-        return NetnsProbe::SpawnFailed;
+        return NsProbe::SpawnFailed;
     };
     let deadline = Instant::now().checked_add(timeout);
     let status = loop {
@@ -628,16 +659,16 @@ fn probe_netns_with(bwrap: &Path, readlink_exec: &Path, timeout: Duration) -> Ne
             _ => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return NetnsProbe::Timeout;
+                return NsProbe::Timeout;
             }
         }
     };
     if !status.success() {
-        return NetnsProbe::ExitFailure;
+        return NsProbe::ExitFailure;
     }
     let mut buf = Vec::new();
     let Some(out) = child.stdout.take() else {
-        return NetnsProbe::OutputUnreadable;
+        return NsProbe::OutputUnreadable;
     };
     if out
         .take(PROBE_STDOUT_MAX.saturating_add(1))
@@ -645,22 +676,46 @@ fn probe_netns_with(bwrap: &Path, readlink_exec: &Path, timeout: Duration) -> Ne
         .is_err()
         || u64::try_from(buf.len()).map_or(true, |n| n > PROBE_STDOUT_MAX)
     {
-        return NetnsProbe::OutputUnreadable;
+        return NsProbe::OutputUnreadable;
     }
-    if netns_separated(&outside, &buf) {
-        NetnsProbe::Separated
+    if ns_separated(ns, &outside, &buf) {
+        NsProbe::Separated
     } else {
-        NetnsProbe::NotSeparated
+        NsProbe::NotSeparated
     }
+}
+
+/// 本番と同じフラグで、netns -> pid ns の順に**別々の bwrap 起動**で分離を確かめる（RENDER-3・#1466）。
+/// 最初に分離できなかった名前空間とその結果を `Err` で返す。
+///
+/// 確かめるのは「別の名前空間にいる」ことまで。外部への出口が無いことは、その netns が本物の
+/// bwrap の `--unshare-net` で作られ `lo` しか持たないという前提に依存し、本物であることは
+/// root 所有の信頼判定（[`select_trusted`]）で担保する。
+#[cfg(target_os = "linux")]
+fn probe_bwrap_with(
+    bwrap: &Path,
+    readlink_exec: &Path,
+    timeout: Duration,
+) -> Result<(), (Namespace, NsProbe)> {
+    for ns in [Namespace::Net, Namespace::Pid] {
+        match probe_ns_with(bwrap, readlink_exec, ns, timeout) {
+            NsProbe::Separated => {}
+            other => return Err((ns, other)),
+        }
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
 fn probe_uncached() -> Result<Sandbox, EgressIsolationUnavailable> {
     let bwrap = select_trusted(&BWRAP_CANDIDATES)?;
     let readlink_exec = select_trusted_exec(&READLINK_CANDIDATES)?;
-    match probe_netns_with(&bwrap, &readlink_exec, PROBE_TIMEOUT) {
-        NetnsProbe::Separated => Ok(Sandbox::Bwrap(bwrap)),
-        _ => Err(EgressIsolationUnavailable::SandboxProbeFailed),
+    // 実起動（`build_command`）は、ここでキャッシュした実体パスを `select_trusted` を通し直さず使う。
+    // 実体は root 所有で祖先まで書き込み不可のまま、プロセスの生存中は変わらない前提に立つ
+    // （差し替えには root が要り、脅威モデルの外。設計 §9.3）。
+    match probe_bwrap_with(&bwrap, &readlink_exec, PROBE_TIMEOUT) {
+        Ok(()) => Ok(Sandbox::Bwrap(bwrap)),
+        Err(_) => Err(EgressIsolationUnavailable::SandboxProbeFailed),
     }
 }
 
@@ -974,45 +1029,70 @@ mod tests {
     /// パスでない）+ netns のリンク。multicall では実体で exec すると argv[0] が変わり動かない。
     #[test]
     fn render3_linux_probe_argv_uses_candidate_path_as_argv0() {
-        let (prog, args) =
-            linux_probe_argv(Path::new("/usr/bin/bwrap"), Path::new("/usr/bin/readlink"));
-        assert_eq!(prog, PathBuf::from("/usr/bin/bwrap"));
-        let mut want = linux_wrapper_args();
-        want.push(OsString::from("/usr/bin/readlink"));
-        want.push(OsString::from("/proc/self/ns/net"));
-        assert_eq!(args, want);
-    }
-
-    /// RENDER-3（#1459）: netns の読み取りは `net:[<数字>]`（改行 1 個まで）だけを受け付ける。
-    #[test]
-    fn render3_parse_netns_id_strict() {
-        assert_eq!(parse_netns_id(b"net:[4026531833]\n"), Some(4026531833));
-        assert_eq!(parse_netns_id(b"net:[1]"), Some(1));
-        for bad in [
-            &b""[..],
-            b"net:[]",
-            b"net:[abc]",
-            b"mnt:[1]",
-            b" net:[1]",
-            b"net:[1]\n\n",
-            b"net:[1] ",
-            b"net:[99999999999999999999999]",
-            b"net:[+1]",
-            b"\xff",
-        ] {
-            assert_eq!(parse_netns_id(bad), None, "{bad:?}");
+        for ns in [Namespace::Net, Namespace::Pid] {
+            let (prog, args) = linux_probe_argv(
+                Path::new("/usr/bin/bwrap"),
+                Path::new("/usr/bin/readlink"),
+                ns.link(),
+            );
+            assert_eq!(prog, PathBuf::from("/usr/bin/bwrap"));
+            let mut want = linux_wrapper_args();
+            want.push(OsString::from("/usr/bin/readlink"));
+            want.push(OsString::from(ns.link()));
+            assert_eq!(args, want);
         }
-        let long = vec![b'1'; 300];
-        assert_eq!(parse_netns_id(&long), None);
+        assert_eq!(Namespace::Net.link(), "/proc/self/ns/net");
+        assert_eq!(Namespace::Pid.link(), "/proc/self/ns/pid");
     }
 
-    /// RENDER-3（#1459）: 外と中が異なる値のときだけ分離とみなす。
+    /// RENDER-3（#1459・#1466）: 名前空間の読み取りは `<種別>:[<数字>]`（改行 1 個まで）だけを受け付ける。
+    /// 種別の取り違え（net を期待して pid が来る等）も `None`。
     #[test]
-    fn render3_netns_separated_requires_different_ids() {
-        assert!(netns_separated(b"net:[1]", b"net:[2]\n"));
-        assert!(!netns_separated(b"net:[1]", b"net:[1]\n"));
-        assert!(!netns_separated(b"net:[1]", b""));
-        assert!(!netns_separated(b"garbage", b"net:[2]"));
+    fn render3_parse_ns_id_strict() {
+        assert_eq!(
+            parse_ns_id(Namespace::Net, b"net:[4026531833]\n"),
+            Some(4026531833)
+        );
+        assert_eq!(parse_ns_id(Namespace::Net, b"net:[1]"), Some(1));
+        assert_eq!(
+            parse_ns_id(Namespace::Pid, b"pid:[4026531836]\n"),
+            Some(4026531836)
+        );
+        assert_eq!(parse_ns_id(Namespace::Pid, b"pid:[7]"), Some(7));
+        assert_eq!(parse_ns_id(Namespace::Net, b"pid:[1]"), None);
+        assert_eq!(parse_ns_id(Namespace::Pid, b"net:[1]"), None);
+        for ns in [Namespace::Net, Namespace::Pid] {
+            let p = ns.prefix();
+            let with = |tail: &str| format!("{p}{tail}").into_bytes();
+            let bads: Vec<Vec<u8>> = vec![
+                Vec::new(),
+                with("]"),
+                with("abc]"),
+                b"mnt:[1]".to_vec(),
+                format!(" {p}1]").into_bytes(),
+                with("1]\n\n"),
+                with("1] "),
+                with("99999999999999999999999]"),
+                with("+1]"),
+                vec![0xff],
+                vec![b'1'; 300],
+            ];
+            for bad in &bads {
+                assert_eq!(parse_ns_id(ns, bad), None, "{ns:?} {bad:?}");
+            }
+        }
+    }
+
+    /// RENDER-3（#1459・#1466）: 外と中が異なる値のときだけ分離とみなす（net・pid とも）。
+    #[test]
+    fn render3_ns_separated_requires_different_ids() {
+        assert!(ns_separated(Namespace::Net, b"net:[1]", b"net:[2]\n"));
+        assert!(!ns_separated(Namespace::Net, b"net:[1]", b"net:[1]\n"));
+        assert!(!ns_separated(Namespace::Net, b"net:[1]", b""));
+        assert!(!ns_separated(Namespace::Net, b"garbage", b"net:[2]"));
+        assert!(ns_separated(Namespace::Pid, b"pid:[1]", b"pid:[2]\n"));
+        assert!(!ns_separated(Namespace::Pid, b"pid:[1]", b"pid:[1]\n"));
+        assert!(!ns_separated(Namespace::Pid, b"pid:[1]", b"net:[2]"));
     }
 
     /// 0755 のシェルスクリプトを一時ディレクトリに作る。ETXTBSY（並列テストの fork が書き込み fd を
@@ -1020,8 +1100,19 @@ mod tests {
     #[cfg(target_os = "linux")]
     fn fake_script(tag: &str, body: &str) -> (PathBuf, PathBuf) {
         use std::os::unix::fs::PermissionsExt;
-        let dir = std::env::temp_dir().join(format!("fb-netns-{tag}-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static SEQ: AtomicU32 = AtomicU32::new(0);
+        // 予測しにくい名前（pid・連番・ナノ秒）にし、`create_dir` で作る。既存（他者が先に作った
+        // ディレクトリや symlink）ならエラーにして失敗させる（fail-closed。#1466）。
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.subsec_nanos());
+        let dir = std::env::temp_dir().join(format!(
+            "fb-netns-{tag}-{}-{}-{nanos}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir(&dir).unwrap();
         let f = dir.join("fake-bwrap");
         std::fs::write(&f, body).unwrap();
         std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -1029,11 +1120,11 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
-    fn probe_retrying(bwrap: &Path, readlink: &Path) -> NetnsProbe {
-        let mut r = NetnsProbe::SpawnFailed;
+    fn probe_retrying(bwrap: &Path, readlink: &Path) -> Result<(), (Namespace, NsProbe)> {
+        let mut r = Err((Namespace::Net, NsProbe::SpawnFailed));
         for _ in 0..20 {
-            r = probe_netns_with(bwrap, readlink, Duration::from_secs(5));
-            if r != NetnsProbe::SpawnFailed {
+            r = probe_bwrap_with(bwrap, readlink, Duration::from_secs(5));
+            if !matches!(r, Err((_, NsProbe::SpawnFailed))) {
                 break;
             }
             std::thread::sleep(Duration::from_millis(50));
@@ -1048,8 +1139,7 @@ mod tests {
         let (dir, fake) = fake_script("exit0", "#!/bin/sh\nexit 0\n");
         let r = probe_retrying(&fake, Path::new("/usr/bin/readlink"));
         let _ = std::fs::remove_dir_all(&dir);
-        assert_eq!(r, NetnsProbe::NotSeparated);
-        assert_ne!(r, NetnsProbe::Separated);
+        assert_eq!(r, Err((Namespace::Net, NsProbe::NotSeparated)));
     }
 
     /// RENDER-3（#1459）: ns を作らず、内側のコマンドだけを実行する偽 bwrap は inode が同じで失敗する。
@@ -1064,7 +1154,22 @@ mod tests {
         let (dir, fake) = fake_script("nons", body);
         let r = probe_retrying(&fake, &readlink);
         let _ = std::fs::remove_dir_all(&dir);
-        assert_eq!(r, NetnsProbe::NotSeparated);
+        assert_eq!(r, Err((Namespace::Net, NsProbe::NotSeparated)));
+    }
+
+    /// RENDER-3・RENDER-4（#1466）: netns だけ新しく見せ、pid ns を作らない偽 bwrap は Pid で失敗する。
+    /// 本番のフラグ列を読み飛ばし、最後の引数が netns のリンクなら別の値を出し、それ以外は exec する。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn render3_probe_rejects_fake_bwrap_without_new_pidns() {
+        let Ok(readlink) = select_trusted_exec(&READLINK_CANDIDATES) else {
+            return assert!(!ci_requires_ok(), "CI must trust readlink");
+        };
+        let body = "#!/bin/sh\nwhile [ \"$1\" != -- ]; do shift; done\nshift\nfor a in \"$@\"; do last=\"$a\"; done\nif [ \"$last\" = /proc/self/ns/net ]; then echo 'net:[1]'; exit 0; fi\nexec \"$@\"\n";
+        let (dir, fake) = fake_script("nopid", body);
+        let r = probe_retrying(&fake, &readlink);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(r, Err((Namespace::Pid, NsProbe::NotSeparated)));
     }
 
     /// RENDER-3（#1459）: 本物の bwrap では netns が分離され、成功する。CI の Linux では bwrap と
@@ -1077,7 +1182,7 @@ mod tests {
             select_trusted_exec(&READLINK_CANDIDATES),
         ) {
             (Ok(bwrap), Ok(readlink)) => {
-                assert_eq!(probe_retrying(&bwrap, &readlink), NetnsProbe::Separated);
+                assert_eq!(probe_retrying(&bwrap, &readlink), Ok(()));
             }
             (b, r) => {
                 assert!(

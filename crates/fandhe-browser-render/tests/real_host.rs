@@ -21,6 +21,8 @@
 //! Linux（bwrap）では、隔離下の読み込み後にプロセスツリー（ラッパー -> ns 内 pid 1 -> ホスト ->
 //! 子孫）を辿り、`EGRESS-PROCTREE` 接頭辞の 1 行を 3 本のテストが 1 行ずつ（計 3 行）出す
 //! （rss 監視の pid 解決の前提の実測。#1460）。ns 内 pid 1 の子が 1 件でなければテストは失敗する。
+//! 走査が失敗した・pid が未解決のときは、成功行と別の `EGRESS-PROCTREE-FAIL` 接頭辞の行を出してから落ちる
+//! （成功行の件数判定を崩さない。#1466）。
 //! `status`: core の `PageLoad` は `final_url` しか持たず、Servo 0.7.0 のホストも返さないため、
 //! `HostProcess` 層で `status() == None` を確認する（作り出さない。REPAIR-3）。
 //! 外部入力の経路ではないため `unwrap` / `expect` / `panic!` を使う。
@@ -39,7 +41,7 @@ use fandhe_browser_core::render::{
 use fandhe_browser_render::host_process::{
     EgressIsolationStatus, EgressIsolationUnavailable, HOST_BINARY_ENV, HostProcess,
     HostProcessConfig, HostProcessError, HostTimeouts, IsolationBackend, IsolationProbe,
-    list_proc_tasks, read_proc_text, resolve_host_binary, walk_wrapped_proc_tree,
+    resolve_host_binary, walk_wrapped_proc_tree_live,
 };
 use fandhe_browser_render::host_renderer::{HostRenderer, HostRendererConfig};
 use fandhe_browser_render::protocol::{HostErrorKind, LoadParams, Request, VisibilityParams};
@@ -810,6 +812,25 @@ fn wait_until(limit: Duration, mut cond: impl FnMut() -> bool) -> bool {
     cond()
 }
 
+/// 記録に失敗したときの 1 行（RENDER-3・#1466）。接頭辞を `EGRESS-PROCTREE-FAIL` に分け、
+/// xos-measure の `grep -c 'EGRESS-PROCTREE '`（成功行 3 件の判定）に数えられないようにする。
+/// 失敗行は別の件数（期待値 0）として数える。`reason` は固定の識別子だけを渡す。
+fn proctree_fail_line(test: &str, reason: &str) -> String {
+    format!("EGRESS-PROCTREE-FAIL test={test} backend=Bwrap reason={reason}")
+}
+
+/// RENDER-3（#1466）: 失敗行は成功行の接頭辞（末尾の空白つき）に一致しない。
+/// 名前に `render3_egress_` を含めない（xos-measure のフィルタが拾って passed 件数が変わるため）。
+#[test]
+fn render3_proctree_fail_line_is_distinct_prefix() {
+    let line = proctree_fail_line("t1", "walk_failed");
+    assert_eq!(
+        line,
+        "EGRESS-PROCTREE-FAIL test=t1 backend=Bwrap reason=walk_failed"
+    );
+    assert!(!line.starts_with("EGRESS-PROCTREE "));
+}
+
 /// 隔離下のホストのプロセスツリーを記録し、rss 監視の pid 解決の前提を確かめる（RENDER-3・RENDER-4・#1460）。
 ///
 /// Linux（bwrap）だけ。macOS の sandbox-exec は exec するのでラッパーも ns 内 pid 1 も無い。
@@ -822,8 +843,10 @@ fn record_proc_tree(p: &HostProcess, test: &str) {
     }
     let wrapper = p.pid().expect("wrapper pid");
     // 監視が pid を解決できず wrapper を kill する前に、先にツリーを走査して記録する（#1460）。
-    let tree = walk_wrapped_proc_tree(wrapper, &read_proc_text, &list_proc_tasks)
-        .unwrap_or_else(|e| panic!("proc tree walk failed: {e:?}"));
+    let tree = walk_wrapped_proc_tree_live(wrapper).unwrap_or_else(|e| {
+        println!("{}", proctree_fail_line(test, "walk_failed"));
+        panic!("proc tree walk failed: {e:?}")
+    });
     println!(
         "EGRESS-PROCTREE test={test} backend=Bwrap {}",
         tree.summary_line()
@@ -831,7 +854,7 @@ fn record_proc_tree(p: &HostProcess, test: &str) {
     // 監視スレッドは 500 ms 間隔で解決する。解決できたことが本番の前提の主たる確認。
     // 未解決でも上の行は出済み。失敗時は unresolved を明記してから落とす。
     if !wait_until(Duration::from_secs(10), || p.monitored_pid().is_some()) {
-        println!("EGRESS-PROCTREE test={test} backend=Bwrap monitored_pid=unresolved");
+        println!("{}", proctree_fail_line(test, "monitored_pid_unresolved"));
         panic!("rss monitor never resolved the wrapped host pid; {tree:?}");
     }
     assert_eq!(tree.wrapper_children.len(), 1, "{tree:?}");
