@@ -658,6 +658,8 @@ jobs:
       contents: read
     env:
       CARGO_INCREMENTAL: "0"
+      # tcpdump の -c（打ち切り件数）と host_capture.py judge の --max-packets で共用する（二重管理のずれを防ぐ。#1467）
+      HOST_CAPTURE_MAX_PACKETS: "300000"
     defaults:
       run:
         shell: bash
@@ -729,13 +731,16 @@ jobs:
           sudo apt-get install -y --no-install-recommends tcpdump
           { tcpdump --version 2>&1 || true; } | tee "$cap/tcpdump.version"
           me="$(id -un)"
+          case "$HOST_CAPTURE_MAX_PACKETS" in
+            ''|*[!0-9]*|0) echo "error: HOST_CAPTURE_MAX_PACKETS must be a positive integer" >&2; exit 1 ;;
+          esac
           # 送信元ポートで帰属させるため UDP・TCP を全て記録する（-s 256 でペイロードの大半を落とす。-c で件数上限）。
           # tcpdump の終了コードは tcpdump.exit に残す（異常終了は判定で unobservable）。
           setsid nohup bash -c '
-            sudo tcpdump -i any -nn -U -s 256 -c 300000 -Z "$1" -w - "udp or tcp" \
+            sudo tcpdump -i any -nn -U -s 256 -c "$3" -Z "$1" -w - "udp or tcp" \
               2> "$2/tcpdump.stderr" > "$2/capture.pcap"
             echo $? > "$2/tcpdump.exit"
-          ' _ "$me" "$cap" >/dev/null 2>&1 &
+          ' _ "$me" "$cap" "$HOST_CAPTURE_MAX_PACKETS" >/dev/null 2>&1 &
           for _ in $(seq 1 40); do
             if grep -q "listening on" "$cap/tcpdump.stderr" 2>/dev/null; then break; fi
             sleep 0.5
@@ -817,7 +822,8 @@ jobs:
         run: |
           set +e
           cap="$OUT_DIR/host-capture"
-          python3 -I -B harness/egress-isolation/host_capture.py judge --out-dir "$cap"
+          python3 -I -B harness/egress-isolation/host_capture.py judge --out-dir "$cap" \
+            --max-packets "$HOST_CAPTURE_MAX_PACKETS"
           rc=$?
           # pcap と変換テキストはランナー自身の通信ヘッダを含むため、アーティファクトには載せず削除する
           # （verdict.json・summary.md・samples.jsonl〔pid・ポートのみ〕を残す）。
@@ -837,7 +843,20 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: egress-host-ubuntu
-          path: ${{ runner.temp }}/egress-host
+          # 許可リスト（pcap・変換テキストはランナー自身の通信ヘッダを含むため、削除漏れがあっても載せない。#1467）
+          path: |
+            ${{ runner.temp }}/egress-host/platform.txt
+            ${{ runner.temp }}/egress-host/real_host_egress.log
+            ${{ runner.temp }}/egress-host/summary.md
+            ${{ runner.temp }}/egress-host/host-capture/tcpdump.version
+            ${{ runner.temp }}/egress-host/host-capture/tcpdump.stderr
+            ${{ runner.temp }}/egress-host/host-capture/tcpdump.exit
+            ${{ runner.temp }}/egress-host/host-capture/convert.exit
+            ${{ runner.temp }}/egress-host/host-capture/convert.stderr
+            ${{ runner.temp }}/egress-host/host-capture/sampler.log
+            ${{ runner.temp }}/egress-host/host-capture/samples.jsonl
+            ${{ runner.temp }}/egress-host/host-capture/verdict.json
+            ${{ runner.temp }}/egress-host/host-capture/summary.md
           retention-days: 30
           if-no-files-found: error
 
