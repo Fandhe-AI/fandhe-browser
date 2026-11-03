@@ -10,6 +10,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -307,10 +308,43 @@ class SamplerTests(unittest.TestCase):
             self.assertEqual(idx.servo, {})
 
     def test_take_sample_finds_exe_match_and_classifies(self):
-        servo, _sockets = hc.take_sample(os.path.realpath(sys.executable), os.getpid(), hc._read_ns_net(os.getpid()))
+        servo, _sockets, limits = hc.take_sample(os.path.realpath(sys.executable), os.getpid(), hc._read_ns_net(os.getpid()))
         me = [s for s in servo if s["pid"] == os.getpid()]
         self.assertEqual(len(me), 1)
         self.assertFalse(me[0]["bwrap"])
+        self.assertEqual(limits, [])
+
+    def test_scan_limits_are_reported(self):
+        with mock.patch.object(hc, "MAX_PROCESSES", 1):
+            pids, hit = hc._list_pids()
+        self.assertEqual(len(pids), 1)
+        self.assertTrue(hit)
+        with mock.patch.object(hc, "MAX_FDS_PER_PROCESS", 0):
+            _owners, hit = hc._socket_owners([os.getpid()])
+        self.assertTrue(hit)
+        with mock.patch.object(hc, "MAX_NET_LINES", 0):
+            _rows, hit = hc._read_table("udp")
+        self.assertTrue(hit)
+
+    def test_each_scan_limit_makes_judge_unobservable(self):
+        # 上限到達ごとに end.truncated が立ち、judge が pass にならない（観測の欠落を合格にしない）
+        cases = {
+            "processes-limit": ("MAX_PROCESSES", 1),
+            "fds-per-process-limit": ("MAX_FDS_PER_PROCESS", 0),
+            "net-lines-limit": ("MAX_NET_LINES", 0),
+        }
+        for reason, (attr, value) in cases.items():
+            with self.subTest(reason=reason), tempfile.TemporaryDirectory() as d:
+                out = Path(d) / "samples.jsonl"
+                with mock.patch.object(hc, attr, value):
+                    hc.run_sampler(os.path.join(d, "no-such-servo"), out, 0.05, None, max_seconds=0.3)
+                recs = [json.loads(x) for x in out.read_text().splitlines()]
+                self.assertTrue(recs[-1]["truncated"])
+                self.assertIn(reason, recs[-1]["reason"])
+                idx = hc.SampleIndex()
+                for r in recs:
+                    idx.feed(r)
+                self.assertTrue(idx.end.get("truncated"))
 
 
 if __name__ == "__main__":

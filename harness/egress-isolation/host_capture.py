@@ -592,27 +592,34 @@ def _has_bwrap_ancestor(pid: int) -> bool:
     return False
 
 
-def _list_pids() -> list[int]:
-    pids = []
+def _list_pids() -> tuple[list[int], bool]:
+    """(pids, 上限到達)。上限で打ち切ったら観測が不完全なので True（呼び出し側が unobservable にする）。"""
+    pids: list[int] = []
     try:
         for name in os.listdir("/proc"):
             if name.isdigit():
-                pids.append(int(name))
                 if len(pids) >= MAX_PROCESSES:
-                    break
+                    return pids, True
+                pids.append(int(name))
     except OSError:
         pass
-    return pids
+    return pids, False
 
 
-def _socket_owners(pids: list[int]) -> dict[int, int]:
-    """読める範囲の fd から inode -> pid を作る（同一ユーザーのプロセスだけ。root は読めず帰属不能）。"""
+def _socket_owners(pids: list[int]) -> tuple[dict[int, int], bool]:
+    """読める範囲の fd から inode -> pid を作る（同一ユーザーのプロセスだけ。root は読めず帰属不能）。
+
+    戻り値の bool は fd 数の上限で打ち切ったか。
+    """
     owners: dict[int, int] = {}
+    hit = False
     for pid in pids:
         try:
             names = os.listdir(f"/proc/{pid}/fd")
         except OSError:
             continue
+        if len(names) > MAX_FDS_PER_PROCESS:
+            hit = True
         for name in names[:MAX_FDS_PER_PROCESS]:
             try:
                 target = os.readlink(f"/proc/{pid}/fd/{name}")
@@ -623,28 +630,39 @@ def _socket_owners(pids: list[int]) -> dict[int, int]:
                     owners.setdefault(int(target[8:-1]), pid)
                 except ValueError:
                     continue
-    return owners
+    return owners, hit
 
 
-def _read_table(name: str) -> list[tuple[int, int]]:
-    """`/proc/self/net/<name>` から (local_port, inode) を返す（行数上限つき）。"""
-    rows = []
+def _read_table(name: str) -> tuple[list[tuple[int, int]], bool]:
+    """`/proc/self/net/<name>` から ((local_port, inode) の列, 上限到達) を返す（行数上限つき）。"""
+    rows: list[tuple[int, int]] = []
+    hit = False
     try:
         with open(f"/proc/self/net/{name}", "r", encoding="ascii", errors="replace") as fh:
             for i, line in enumerate(fh):
                 if i > MAX_NET_LINES:
+                    hit = True
                     break
                 parsed = egress_guard.parse_net_line(line)
                 if parsed is not None and parsed[3] != 0:
                     rows.append((parsed[4], parsed[3]))
     except OSError:
         pass
-    return rows
+    return rows, hit
 
 
-def take_sample(servo_exe: str, self_pid: int, self_netns: int | None) -> tuple[list[dict], list[dict]]:
-    """1 回分の走査。戻り値は (servo, sockets)。servo は pid・bwrap 祖先の有無・netns。"""
-    pids = _list_pids()
+def take_sample(
+    servo_exe: str, self_pid: int, self_netns: int | None
+) -> tuple[list[dict], list[dict], list[str]]:
+    """1 回分の走査。戻り値は (servo, sockets, limits)。servo は pid・bwrap 祖先の有無・netns。
+
+    limits は走査上限に到達した理由（空なら完全な走査）。呼び出し側のサンプラーが
+    end.truncated へ累積し、judge が unobservable にする（観測の欠落を合格にしない）。
+    """
+    limits: list[str] = []
+    pids, hit = _list_pids()
+    if hit:
+        limits.append("processes-limit")
     servo: list[dict] = []
     servo_roles: dict[int, str] = {}
     for pid in pids:
@@ -655,10 +673,15 @@ def take_sample(servo_exe: str, self_pid: int, self_netns: int | None) -> tuple[
         servo.append({"pid": pid, "bwrap": bwrap, "netns": netns})
         isolated = bwrap or (netns is not None and self_netns is not None and netns != self_netns)
         servo_roles[pid] = ROLE_ISOLATED if isolated else ROLE_UNISOLATED
-    owners = _socket_owners(pids)
+    owners, hit = _socket_owners(pids)
+    if hit:
+        limits.append("fds-per-process-limit")
     sockets: list[dict] = []
     for table, proto in (("udp", "udp"), ("udp6", "udp"), ("tcp", "tcp"), ("tcp6", "tcp")):
-        for port, inode in _read_table(table):
+        rows, hit = _read_table(table)
+        if hit:
+            limits.append("net-lines-limit")
+        for port, inode in rows:
             pid = owners.get(inode)
             if pid is None:
                 continue
@@ -672,7 +695,7 @@ def take_sample(servo_exe: str, self_pid: int, self_netns: int | None) -> tuple[
                 continue  # 容量のため。他プロセスの TCP は合否に使わない
             sockets.append({"proto": proto, "port": port, "pid": pid, "role": role})
     sockets.sort(key=lambda s: (s["proto"], s["port"], s["pid"]))
-    return servo, sockets
+    return servo, sockets, limits
 
 
 def run_sampler(
@@ -704,6 +727,14 @@ def run_sampler(
     written = 0
     truncated = False
     reason = "stop"
+    reasons: list[str] = []
+
+    def _mark(r: str) -> None:
+        nonlocal truncated, reason
+        if r not in reasons:
+            reasons.append(r)
+        truncated, reason = True, ",".join(reasons)
+
     prev: tuple | None = None
     next_canary = time.time() + 1.0
     canary_sent = 0
@@ -736,7 +767,7 @@ def run_sampler(
             if max_seconds is not None and now - started > max_seconds:
                 break
             if n >= MAX_SAMPLES or written >= MAX_SAMPLE_BYTES:
-                truncated, reason = True, "sample-or-byte-limit"
+                _mark("sample-or-byte-limit")
                 break
             if now >= next_canary and canary_sent < 100_000:
                 try:
@@ -750,10 +781,12 @@ def run_sampler(
                     recv.recvfrom(256)
             except (BlockingIOError, OSError):
                 pass
-            servo, sockets = take_sample(servo_exe, self_pid, self_netns)
+            servo, sockets, limits = take_sample(servo_exe, self_pid, self_netns)
+            for lim in limits:
+                _mark(lim)
             if len(sockets) > MAX_SOCKETS_PER_SAMPLE:
                 sockets = sockets[:MAX_SOCKETS_PER_SAMPLE]
-                truncated, reason = True, "sockets-per-sample-limit"
+                _mark("sockets-per-sample-limit")
             state = (
                 tuple((s["pid"], s["bwrap"], s["netns"]) for s in servo),
                 tuple((s["proto"], s["port"], s["pid"], s["role"]) for s in sockets),
