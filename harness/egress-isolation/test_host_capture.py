@@ -316,14 +316,14 @@ class SamplerTests(unittest.TestCase):
 
     def test_scan_limits_are_reported(self):
         with mock.patch.object(hc, "MAX_PROCESSES", 1):
-            pids, hit = hc._list_pids()
+            pids, hit, _failed = hc._list_pids()
         self.assertEqual(len(pids), 1)
         self.assertTrue(hit)
         with mock.patch.object(hc, "MAX_FDS_PER_PROCESS", 0):
             _owners, hit = hc._socket_owners([os.getpid()])
         self.assertTrue(hit)
         with mock.patch.object(hc, "MAX_NET_LINES", 0):
-            _rows, hit = hc._read_table("udp")
+            _rows, hit, _failed = hc._read_table("udp")
         self.assertTrue(hit)
 
     def test_each_scan_limit_makes_judge_unobservable(self):
@@ -345,6 +345,91 @@ class SamplerTests(unittest.TestCase):
                 for r in recs:
                     idx.feed(r)
                 self.assertTrue(idx.end.get("truncated"))
+
+    def _sample_with_open_error(self, fail_names, errno_exc):
+        real_open = open
+
+        def fake_open(path, *a, **k):
+            for n in fail_names:
+                if str(path) == f"/proc/self/net/{n}":
+                    raise errno_exc
+            return real_open(path, *a, **k)
+
+        with mock.patch("builtins.open", fake_open):
+            return hc.take_sample("/no/such/servo", os.getpid(), hc._read_ns_net(os.getpid()))
+
+    def test_required_table_read_error_is_recorded(self):
+        # tcp 表だけ読めない場合も、udp 表でカナリアを帰属できるだけで pass させない
+        _s, _k, limits = self._sample_with_open_error(["tcp"], PermissionError(13, "denied"))
+        self.assertEqual(limits, ["proc-read-error:net-tcp"])
+        _s, _k, limits = self._sample_with_open_error(["udp"], FileNotFoundError(2, "gone"))
+        self.assertEqual(limits, ["proc-read-error:net-udp"])
+
+    def test_optional_ipv6_table_missing_is_not_an_error(self):
+        _s, _k, limits = self._sample_with_open_error(["tcp6", "udp6"], FileNotFoundError(2, "no ipv6"))
+        self.assertEqual(limits, [])
+        # 不在以外の失敗（権限等）は任意表でも記録する
+        _s, _k, limits = self._sample_with_open_error(["tcp6"], PermissionError(13, "denied"))
+        self.assertEqual(limits, ["proc-read-error:net-tcp6"])
+
+    def test_list_pids_error_is_recorded(self):
+        with mock.patch.object(hc.os, "listdir", side_effect=PermissionError(13, "denied")):
+            pids, hit, failed = hc._list_pids()
+            self.assertEqual((pids, hit, failed), ([], False, True))
+            _s, _k, limits = hc.take_sample("/no/such/servo", os.getpid(), 1)
+        self.assertIn("proc-read-error:list-pids", limits)
+
+    def test_vanished_process_is_not_an_error(self):
+        # 走査中に消えた pid の /proc/<pid> が読めないのは通常の競合
+        self.assertIsNone(hc._exe(2**22 + 12345))
+        _s, _k, limits = hc.take_sample("/no/such/servo", os.getpid(), hc._read_ns_net(os.getpid()))
+        self.assertEqual(limits, [])
+
+    def test_table_read_error_makes_judge_unobservable(self):
+        with tempfile.TemporaryDirectory() as d:
+            out = Path(d) / "samples.jsonl"
+            with mock.patch.object(hc, "_read_table", lambda n, optional=False: ([], False, n == "tcp")):
+                hc.run_sampler(os.path.join(d, "no-such-servo"), out, 0.05, None, max_seconds=0.3)
+            recs = [json.loads(x) for x in out.read_text().splitlines()]
+            self.assertTrue(recs[-1]["truncated"])
+            self.assertEqual(recs[-1]["reason"], "proc-read-error:net-tcp")
+            idx = hc.SampleIndex()
+            for r in recs:
+                idx.feed(r)
+            v = hc.judge([], idx)
+            self.assertEqual(v["verdict"], "unobservable")
+            self.assertTrue(any("proc-read-error:net-tcp" in r for r in v["unobservable_reasons"]))
+
+
+class SelfNetnsTests(unittest.TestCase):
+    def _idx(self, self_netns):
+        idx = hc.SampleIndex()
+        idx.feed({"type": "meta", "self_netns": self_netns, "canary_port": CANARY, "pid": 10})
+        idx.feed(
+            {
+                "type": "sample",
+                "t": 100.0,
+                "servo": [{"pid": 200, "bwrap": False, "netns": ISO_NS}],
+                "sockets": [{"proto": "udp", "port": CANARY, "pid": 10, "role": hc.ROLE_SELF}],
+            }
+        )
+        for i in range(3):
+            idx.feed({"type": "tick", "t": 100.2 + i * 0.2})
+        idx.feed({"type": "end", "t": 101.0, "truncated": False, "reason": "stop"})
+        return idx
+
+    def test_servo_netns_is_not_isolated_when_self_netns_unknown(self):
+        idx = self._idx(None)
+        self.assertFalse(idx.servo[200]["isolated_seen"])
+        v = run([CANARY_LINE, OUT_TCP], idx)
+        self.assertEqual(v["verdict"], "unobservable")
+        self.assertTrue(any("netns of the sampler" in r for r in v["unobservable_reasons"]))
+        self.assertEqual(v["servo_pids"], {"isolated": 0, "unisolated": 1})
+
+    def test_known_self_netns_still_isolates_by_netns_difference(self):
+        idx = self._idx(SELF_NS)
+        self.assertTrue(idx.servo[200]["isolated_seen"])
+        self.assertEqual(run([CANARY_LINE, OUT_TCP], idx)["verdict"], "pass")
 
 
 if __name__ == "__main__":

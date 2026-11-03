@@ -243,7 +243,7 @@ class SampleIndex:
                     info["shared_ns_seen"] = True
                 if bwrap and netns is None:
                     info["ns_unknown_seen"] = True
-                if bwrap or (netns is not None and netns != self_netns):
+                if bwrap or (netns is not None and self_netns is not None and netns != self_netns):
                     info["isolated_seen"] = True
                 if netns is not None:
                     info["netns_seen"].add(netns)
@@ -354,6 +354,8 @@ def judge(
 
     if index.meta is None:
         unobs.append("sampler meta record is missing")
+    elif self_netns is None:
+        unobs.append("netns of the sampler could not be read (isolation cannot be compared)")
     if index.end is None:
         unobs.append("sampler end record is missing (sampler died or was killed)")
     elif index.end.get("truncated"):
@@ -592,18 +594,18 @@ def _has_bwrap_ancestor(pid: int) -> bool:
     return False
 
 
-def _list_pids() -> tuple[list[int], bool]:
-    """(pids, 上限到達)。上限で打ち切ったら観測が不完全なので True（呼び出し側が unobservable にする）。"""
+def _list_pids() -> tuple[list[int], bool, bool]:
+    """(pids, 上限到達, 読み取り失敗)。上限到達・`/proc` の列挙失敗は観測が不完全なので True（呼び出し側が unobservable にする）。"""
     pids: list[int] = []
     try:
         for name in os.listdir("/proc"):
             if name.isdigit():
                 if len(pids) >= MAX_PROCESSES:
-                    return pids, True
+                    return pids, True, False
                 pids.append(int(name))
     except OSError:
-        pass
-    return pids, False
+        return pids, False, True
+    return pids, False, False
 
 
 def _socket_owners(pids: list[int]) -> tuple[dict[int, int], bool]:
@@ -633,10 +635,15 @@ def _socket_owners(pids: list[int]) -> tuple[dict[int, int], bool]:
     return owners, hit
 
 
-def _read_table(name: str) -> tuple[list[tuple[int, int]], bool]:
-    """`/proc/self/net/<name>` から ((local_port, inode) の列, 上限到達) を返す（行数上限つき）。"""
+def _read_table(name: str, optional: bool = False) -> tuple[list[tuple[int, int]], bool, bool]:
+    """`/proc/self/net/<name>` から ((local_port, inode) の列, 上限到達, 読み取り失敗) を返す（行数上限つき）。
+
+    読み取り失敗は表の内容が空だったこととは別物で、呼び出し側が観測不能として記録する。
+    optional な表（IPv6 無効時に存在しない tcp6・udp6）の不在（FileNotFoundError）だけは失敗に数えない。
+    """
     rows: list[tuple[int, int]] = []
     hit = False
+    failed = False
     try:
         with open(f"/proc/self/net/{name}", "r", encoding="ascii", errors="replace") as fh:
             for i, line in enumerate(fh):
@@ -646,9 +653,11 @@ def _read_table(name: str) -> tuple[list[tuple[int, int]], bool]:
                 parsed = egress_guard.parse_net_line(line)
                 if parsed is not None and parsed[3] != 0:
                     rows.append((parsed[4], parsed[3]))
+    except FileNotFoundError:
+        failed = not optional
     except OSError:
-        pass
-    return rows, hit
+        failed = True
+    return rows, hit, failed
 
 
 def take_sample(
@@ -660,9 +669,11 @@ def take_sample(
     end.truncated へ累積し、judge が unobservable にする（観測の欠落を合格にしない）。
     """
     limits: list[str] = []
-    pids, hit = _list_pids()
+    pids, hit, failed = _list_pids()
     if hit:
         limits.append("processes-limit")
+    if failed:
+        limits.append("proc-read-error:list-pids")
     servo: list[dict] = []
     servo_roles: dict[int, str] = {}
     for pid in pids:
@@ -677,10 +688,17 @@ def take_sample(
     if hit:
         limits.append("fds-per-process-limit")
     sockets: list[dict] = []
-    for table, proto in (("udp", "udp"), ("udp6", "udp"), ("tcp", "tcp"), ("tcp6", "tcp")):
-        rows, hit = _read_table(table)
+    for table, proto, optional in (
+        ("udp", "udp", False),
+        ("udp6", "udp", True),
+        ("tcp", "tcp", False),
+        ("tcp6", "tcp", True),
+    ):
+        rows, hit, failed = _read_table(table, optional)
         if hit:
             limits.append("net-lines-limit")
+        if failed:
+            limits.append(f"proc-read-error:net-{table}")
         for port, inode in rows:
             pid = owners.get(inode)
             if pid is None:
