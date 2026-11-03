@@ -806,11 +806,30 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn render3_select_trusted_exec_returns_candidate_path_not_realpath() {
-        if let Ok(path) = select_trusted_exec(&TRUE_CANDIDATES) {
-            assert!(
+        // Nix 等の非標準配置では Untrusted、候補が全く無ければ NotFound。Err でも空振りさせない
+        match select_trusted_exec(&TRUE_CANDIDATES) {
+            Ok(path) => assert!(
                 TRUE_CANDIDATES.iter().any(|c| Path::new(c) == path),
                 "must return a candidate path as-is: {path:?}"
-            );
+            ),
+            Err(e) => assert!(
+                matches!(
+                    e,
+                    EgressIsolationUnavailable::SandboxToolUntrusted
+                        | EgressIsolationUnavailable::SandboxToolNotFound
+                ),
+                "unexpected error: {e:?}"
+            ),
+        }
+        // 存在する候補ごとに単独で判定し、両方が存在する環境でも各 symlink 判定を検証する
+        for c in TRUE_CANDIDATES {
+            if std::fs::symlink_metadata(c).is_err() {
+                continue;
+            }
+            match select_trusted_exec(&[c]) {
+                Ok(path) => assert_eq!(path, PathBuf::from(c)),
+                Err(e) => assert_eq!(e, EgressIsolationUnavailable::SandboxToolUntrusted, "{c}"),
+            }
         }
     }
 
