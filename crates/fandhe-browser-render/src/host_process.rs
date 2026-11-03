@@ -1189,7 +1189,13 @@ mod tests {
     #[test]
     fn render_3_sec_2_uds_dir_is_created_by_host_process_0700_and_owned() {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
-        let workdir = WorkDir::create(&std::env::temp_dir()).expect("workdir");
+        // macOS の temp_dir は canonicalize で /private/var/folders/... と長くなり、UDS パス上限
+        // （RELAY_UDS_PATH_MAX_BYTES）を超えるため、macOS だけ短い /tmp 直下を使う（契約は弱めない）。
+        #[cfg(target_os = "macos")]
+        let base = std::path::PathBuf::from("/tmp");
+        #[cfg(not(target_os = "macos"))]
+        let base = std::env::temp_dir();
+        let workdir = WorkDir::create(&base).expect("workdir");
         let dir = isolation::socket_dir_for(workdir.path()).expect("socket dir");
         assert_eq!(
             dir,
