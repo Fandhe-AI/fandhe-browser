@@ -270,7 +270,7 @@ host netns を記録し、bwrap 配下の Servo ホストに帰属する外向�
 - 記録: `tcpdump -i any -nn -U -s 256 -c 300000 "udp or tcp"`。ペイロードの大半を落とす。pcap と変換テキストはランナー自身の通信ヘッダを含むためアーティファクトに載せず削除する。
 - 帰属: サンプラー（`host_capture.py sample`）が 200 ms ごとに Servo ホスト pid（`/proc/<pid>/exe` の実体が `$FANDHE_BROWSER_RENDER_HOST` と一致）、
   その netns、host netns のソケット所有 pid（同一ユーザーの `/proc/<pid>/fd`）を記録する。パケットの送信元（proto・port）を時刻が近い所有者へ突き合わせる。
-  隔離は「bwrap の祖先がいる」または「netns が host と異なる」。bwrap の祖先がいて netns が host と同じなら隔離破れで fail。
+  隔離は「bwrap の祖先がいる」または「netns が host と異なる」。bwrap の祖先がいて netns が host と同じなら隔離破れで fail。判定は同一 pid のサンプルごとに行い、違反（host netns 共有）・確認不能（netns 読み取り失敗）を pid ごとに累積する（初回値で固定しない）。
 - 判定: 隔離下の Servo に帰属する DNS・UDP・直接 TCP SYN が 1 件でもあれば fail。隔離外 Servo（WebSocket の対照）・自身・他プロセス・帰属不能は件数を記録するだけ。
   対象は非 `lo` の Out（UDP 全ポート・TCP SYN）と `lo` の Out・In の宛先 53 番（lo は libpcap が送信側重複を除外し In で記録される）（systemd-resolved スタブ経由を拾う）。
 - 観測不能は合格にしない（unobservable）: カナリア（サンプラーが 127.0.0.1 の UDP で自分宛てに送る陽性対照）が `lo` の記録に現れて自分に帰属しない、

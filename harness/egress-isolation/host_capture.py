@@ -222,9 +222,31 @@ class SampleIndex:
             if isinstance(pid, int):
                 info = self.servo.setdefault(
                     pid,
-                    {"bwrap": bool(s.get("bwrap")), "netns": s.get("netns"), "first": float(t), "last": float(t)},
+                    {
+                        "bwrap": False,
+                        "netns": s.get("netns"),
+                        "first": float(t),
+                        "last": float(t),
+                        "isolated_seen": False,
+                        "shared_ns_seen": False,
+                        "ns_unknown_seen": False,
+                        "netns_seen": set(),
+                    },
                 )
                 info["last"] = float(t)
+                # 初回値で固定せず、サンプルごとに検査して違反・確認不能を累積する（一時的な違反を失わない）。
+                bwrap = bool(s.get("bwrap"))
+                netns = s.get("netns")
+                self_netns = (self.meta or {}).get("self_netns")
+                info["bwrap"] = info["bwrap"] or bwrap
+                if bwrap and netns is not None and netns == self_netns:
+                    info["shared_ns_seen"] = True
+                if bwrap and netns is None:
+                    info["ns_unknown_seen"] = True
+                if bwrap or (netns is not None and netns != self_netns):
+                    info["isolated_seen"] = True
+                if netns is not None:
+                    info["netns_seen"].add(netns)
         present = set()
         for s in self._state_sockets:
             proto, port, role = s.get("proto"), s.get("port"), s.get("role")
@@ -318,15 +340,15 @@ def judge(
     unisolated_pids = 0
     netns_values: set = set()
     for pid, info in index.servo.items():
-        netns = info.get("netns")
-        if info.get("bwrap") and netns is not None and netns == self_netns:
+        if info.get("shared_ns_seen"):
             fails.append(f"Servo pid {pid} has a bwrap ancestor but shares the host netns")
-        if info.get("bwrap") and netns is None:
+        if info.get("ns_unknown_seen"):
             unobs.append(f"netns of isolated Servo pid {pid} could not be read")
-        if info.get("bwrap") or (netns is not None and netns != self_netns):
+        if info.get("isolated_seen"):
             isolated_pids += 1
-            if netns is not None:
-                netns_values.add(netns)
+            for n in info.get("netns_seen", ()):
+                if n != self_netns:
+                    netns_values.add(n)
         else:
             unisolated_pids += 1
 

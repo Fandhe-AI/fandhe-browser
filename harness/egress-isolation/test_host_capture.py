@@ -161,6 +161,29 @@ class VerdictTests(unittest.TestCase):
         v = self.ok(make_index(netns=SELF_NS))
         self.assertEqual(v["verdict"], "fail")
 
+    def _two_samples(self, first_ns, second_ns):
+        idx = hc.SampleIndex()
+        idx.feed({"type": "meta", "self_netns": SELF_NS, "canary_port": CANARY, "pid": 10})
+        canary = {"proto": "udp", "port": CANARY, "pid": 10, "role": hc.ROLE_SELF}
+        for t, ns in ((100.0, first_ns), (100.4, second_ns)):
+            idx.feed({"type": "sample", "t": t, "servo": [{"pid": 200, "bwrap": True, "netns": ns}], "sockets": [canary]})
+        idx.feed({"type": "tick", "t": 100.6})
+        idx.feed({"type": "end", "t": 101.0, "truncated": False, "reason": "stop"})
+        return idx
+
+    def test_same_pid_isolated_first_then_shared_netns_fails(self):
+        v = self.ok(self._two_samples(ISO_NS, SELF_NS))
+        self.assertEqual(v["verdict"], "fail", v)
+        self.assertEqual(v["counts"][hc.ROLE_ISOLATED], {"dns": 0, "udp_other": 0, "tcp_syn": 0})
+
+    def test_same_pid_shared_first_then_isolated_netns_fails(self):
+        v = self.ok(self._two_samples(SELF_NS, ISO_NS))
+        self.assertEqual(v["verdict"], "fail", v)
+
+    def test_same_pid_unreadable_netns_later_is_unobservable(self):
+        v = self.ok(self._two_samples(ISO_NS, None))
+        self.assertEqual(v["verdict"], "unobservable", v)
+
     def test_unisolated_only_is_unobservable(self):
         v = self.ok(make_index(bwrap=False, netns=SELF_NS))
         self.assertEqual(v["verdict"], "unobservable")
