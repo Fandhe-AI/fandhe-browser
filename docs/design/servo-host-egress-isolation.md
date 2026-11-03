@@ -261,6 +261,7 @@ options §7 を引き継ぐ。本書で新たに加わる未確認事項は §9.
 | Windows の測り直し（loopback 以外の宛先を使う測り方。loopback 免除の下では外側 listener に届くため、現行の測り方では egress を測れない） | #1427 |
 | AppContainer 内の ipc-channel の制約（ボディ付きリクエストで panic し得る。推定・未実測） | #1421 |
 | Docker 内での bwrap の可否（イメージに bwrap が無い） | #1457 |
+| 実ホストの子プロセス数（rss の pid 解決の前提。ns 内 pid 1 の子が 1 件）。記録は `real_host` の `EGRESS-PROCTREE` 行（#1460）、実測は xos-measure の `egress-host`（マージ後） | #1457 |
 | Servo 自身の DNS・UDP 送信の外部観測（root か `CAP_NET_ADMIN` が要る） | #1457 |
 | Landlock ルール適用下の動作・seccomp との併用（許可リスト付きプロキシは #1434・#1440・#1436 で本番に実装済み。netns 内の中継 → UDS → プロキシの成立性は §6.5 で確認済み） | #1457 |
 | 実ホスト（GitHub の ubuntu・macOS runner）での隔離下の動作（xos-measure の `egress-host`。マージ後に実施し、結果は #1003 へ） | #1003 |

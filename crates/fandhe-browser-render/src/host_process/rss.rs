@@ -116,8 +116,9 @@ const WRAPPER_DEPTH: usize = 2;
 ///
 /// 前提（#1451）: servo-host は Servo を `multiprocess: false`（`servo-host/src/engine.rs`）で起動し、
 /// `servo-host/src` に子プロセスを作る箇所が無いので、ns 内 pid 1 の子はホスト 1 件だけとみなす。
-/// この前提はコード読みによるもので、実ホストで子プロセス数を実測してはいない（Servo 本体や
-/// 依存が内部で子を作る可能性は排除できていない。実測は #1457 で追跡する）。ホストが
+/// この前提はコード読みによるもので、Servo 本体や依存が内部で子を作る可能性は排除できていない。
+/// 実ホストでの記録は `real_host` の `EGRESS-PROCTREE` 行（[`walk_wrapped_proc_tree`]・#1460）、
+/// 結果の追跡は #1457。ホストが
 /// ダブルフォークで孤児の子を作ると 2 段目が 2 件になり、解決前に `MAX_CONSECUTIVE_PROBE_FAILURES`
 /// 回失敗すると kill される（解決後は pid が固定されるので影響しない）。前提が崩れた場合
 /// （Servo のメディア系が子を作る等）は cmdline・exe で選ぶ方式に変える。
@@ -133,6 +134,181 @@ pub fn resolve_wrapped_pid(wrapper: u32, read: &dyn Fn(&str) -> Option<String>) 
         pid = first;
     }
     Some(pid)
+}
+
+/// プロセスツリー走査の深さの上限（循環・暴走の打ち切り）。
+const PROC_TREE_MAX_DEPTH: usize = 32;
+/// プロセスツリー走査で訪問するノード数の上限。
+const PROC_TREE_MAX_NODES: usize = 4096;
+
+/// [`walk_wrapped_proc_tree`] の失敗。`/proc` が読めない・形式不正のとき推測で埋めず返す。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProcTreeError {
+    /// `/proc/<pid>/task` の一覧が読めない。
+    NoTasks { pid: u32 },
+    /// `children` ファイルが読めない。
+    Unreadable { path: String },
+    /// `children` の中身が空白区切りの非負整数でない。
+    Malformed { path: String },
+}
+
+/// ラッパー配下のプロセスツリーの記録（RENDER-3・RENDER-4・#1460）。
+///
+/// `real_host` の隔離下結合テストが、`resolve_wrapped_pid` の前提（ns 内 pid 1 の子がホスト 1 件）
+/// を実ホストで確かめるために使う診断用の値。children は全スレッド（tid）の和集合で数える
+/// （`/proc/<pid>/task/<tid>/children` はその tid が作った子だけを返すため）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WrappedProcTree {
+    /// ラッパーの子（全 tid）。期待値は ns 内 pid 1 の 1 件。
+    pub wrapper_children: Vec<u32>,
+    /// ns 内 pid 1 の子（全 tid）。期待値はホスト 1 件。
+    pub init_children: Vec<u32>,
+    /// `resolve_wrapped_pid` が見る主スレッドだけの、ns 内 pid 1 の子。
+    pub init_children_main_thread: Vec<u32>,
+    /// `init_children` がちょうど 1 件のときのそれ。
+    pub host: Option<u32>,
+    /// ホストの子孫（全 tid を幅優先で辿った順）。
+    pub host_descendants: Vec<u32>,
+    /// ホストのスレッド数（参考値）。
+    pub host_threads: usize,
+    /// 深さ・ノード数の上限で打ち切ったか。true は異常として扱う。
+    pub truncated: bool,
+}
+
+impl WrappedProcTree {
+    /// 1 行の `key=value` 形式（ASCII の数値と真偽値だけ。プロセス由来の文字列は載せない）。
+    pub fn summary_line(&self) -> String {
+        format!(
+            "wrapper_children={} init_children={} init_children_main_thread={} host_descendants={} host_threads={} truncated={}",
+            self.wrapper_children.len(),
+            self.init_children.len(),
+            self.init_children_main_thread.len(),
+            self.host_descendants.len(),
+            self.host_threads,
+            self.truncated
+        )
+    }
+}
+
+/// children の本文を pid 列へ解析する（`resolve_wrapped_pid` と同じ規則: 数値以外・負数は不正）。
+fn parse_children(text: &str, path: &str) -> Result<Vec<u32>, ProcTreeError> {
+    text.split_whitespace()
+        .map(|t| t.parse::<u32>())
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| ProcTreeError::Malformed {
+            path: path.to_string(),
+        })
+}
+
+/// 本番の `/proc` 読み取り（[`walk_wrapped_proc_tree`] の `read`）。読めなければ `None`。
+pub fn read_proc_text(path: &str) -> Option<String> {
+    std::fs::read_to_string(path).ok()
+}
+
+/// 本番の `/proc/<pid>/task` の tid 一覧（[`walk_wrapped_proc_tree`] の `list_tasks`）。
+pub fn list_proc_tasks(pid: u32) -> Option<Vec<u32>> {
+    let dir = std::fs::read_dir(format!("/proc/{pid}/task")).ok()?;
+    let mut tids: Vec<u32> = dir
+        .filter_map(|e| e.ok()?.file_name().to_str()?.parse::<u32>().ok())
+        .collect();
+    tids.sort_unstable();
+    Some(tids)
+}
+
+/// 全 tid の children の和集合（重複除去・出現順）と tid 数。
+fn children_all(
+    pid: u32,
+    read: &dyn Fn(&str) -> Option<String>,
+    list_tasks: &dyn Fn(u32) -> Option<Vec<u32>>,
+) -> Result<(Vec<u32>, usize), ProcTreeError> {
+    let tids = list_tasks(pid).ok_or(ProcTreeError::NoTasks { pid })?;
+    let mut out: Vec<u32> = Vec::new();
+    for tid in &tids {
+        let path = format!("/proc/{pid}/task/{tid}/children");
+        match read(&path) {
+            Some(text) => {
+                for c in parse_children(&text, &path)? {
+                    if !out.contains(&c) {
+                        out.push(c);
+                    }
+                }
+            }
+            // 主スレッドが読めないのは異常。他スレッドは列挙後に終了した競合として読み飛ばす。
+            None if *tid == pid => return Err(ProcTreeError::Unreadable { path }),
+            None => {}
+        }
+    }
+    Ok((out, tids.len()))
+}
+
+/// ラッパー -> ns 内 pid 1 -> ホスト -> 子孫のプロセスツリーを辿って記録する（RENDER-3・#1460）。
+///
+/// `real_host` の結合テストから呼ばれる診断用。`read`・`list_tasks` は `/proc` の差し替え点
+/// （本番は [`read_proc_text`]・[`list_proc_tasks`]）。ラッパーの子がちょうど 1 件でなければ、
+/// それ以降は辿らず空のまま返す（呼び出し側が件数で判定する）。深さ・ノード数に上限があり、
+/// 超えたら `truncated` にして打ち切る。
+pub fn walk_wrapped_proc_tree(
+    wrapper: u32,
+    read: &dyn Fn(&str) -> Option<String>,
+    list_tasks: &dyn Fn(u32) -> Option<Vec<u32>>,
+) -> Result<WrappedProcTree, ProcTreeError> {
+    let (wrapper_children, _) = children_all(wrapper, read, list_tasks)?;
+    let mut tree = WrappedProcTree {
+        wrapper_children,
+        init_children: Vec::new(),
+        init_children_main_thread: Vec::new(),
+        host: None,
+        host_descendants: Vec::new(),
+        host_threads: 0,
+        truncated: false,
+    };
+    let [init] = tree.wrapper_children[..] else {
+        return Ok(tree);
+    };
+    tree.init_children = children_all(init, read, list_tasks)?.0;
+    let main_path = format!("/proc/{init}/task/{init}/children");
+    tree.init_children_main_thread = match read(&main_path) {
+        Some(t) => parse_children(&t, &main_path)?,
+        None => return Err(ProcTreeError::Unreadable { path: main_path }),
+    };
+    let [host] = tree.init_children[..] else {
+        return Ok(tree);
+    };
+    tree.host = Some(host);
+    let mut visited: Vec<u32> = vec![host];
+    let mut queue: std::collections::VecDeque<(u32, usize)> = std::collections::VecDeque::new();
+    queue.push_back((host, 0));
+    let mut first = true;
+    while let Some((pid, depth)) = queue.pop_front() {
+        let (kids, threads) = match children_all(pid, read, list_tasks) {
+            Ok(v) => v,
+            // 子孫が列挙後に終了した競合は子なし扱い。ホスト自身が読めないのは異常。
+            Err(ProcTreeError::NoTasks { .. }) if !first => (Vec::new(), 0),
+            // children の読み取り失敗も、task 一覧が再取得できない（消滅した）ときだけ競合とみなす。
+            // 存続中のプロセスの読み取り異常は Unreadable のまま返す。
+            Err(ProcTreeError::Unreadable { .. }) if !first && list_tasks(pid).is_none() => {
+                (Vec::new(), 0)
+            }
+            Err(e) => return Err(e),
+        };
+        if first {
+            tree.host_threads = threads;
+            first = false;
+        }
+        for k in kids {
+            if visited.contains(&k) {
+                continue;
+            }
+            if depth + 1 > PROC_TREE_MAX_DEPTH || visited.len() >= PROC_TREE_MAX_NODES {
+                tree.truncated = true;
+                return Ok(tree);
+            }
+            visited.push(k);
+            tree.host_descendants.push(k);
+            queue.push_back((k, depth + 1));
+        }
+    }
+    Ok(tree)
 }
 
 /// 1 回分の監視状態（pid の解決・連続失敗の計数）。スレッドと単体テストが共有する。
@@ -298,6 +474,196 @@ mod tests {
         }
         // 別 pid のファイルしか無い（読み取り失敗）。
         assert_eq!(resolve_wrapped_pid(78, &children_of(&tree)), None);
+    }
+
+    type Files = Vec<(String, String)>;
+    type Tasks = Vec<(u32, Vec<u32>)>;
+
+    type ReadFn = Box<dyn Fn(&str) -> Option<String>>;
+    type TasksFn = Box<dyn Fn(u32) -> Option<Vec<u32>>>;
+
+    fn tree_fixture(files: Files, tasks: Tasks) -> (ReadFn, TasksFn) {
+        (
+            Box::new(move |p: &str| files.iter().find(|(k, _)| k == p).map(|(_, v)| v.clone())),
+            Box::new(move |pid: u32| {
+                tasks
+                    .iter()
+                    .find(|(k, _)| *k == pid)
+                    .map(|(_, v)| v.clone())
+            }),
+        )
+    }
+
+    fn f(pid: u32, tid: u32, kids: &str) -> (String, String) {
+        (format!("/proc/{pid}/task/{tid}/children"), kids.to_string())
+    }
+
+    /// RENDER-3・RENDER-4（#1460）: 正常なツリー。ワーカースレッドの子も子孫に数える。
+    #[test]
+    fn render3_walk_wrapped_proc_tree_counts_host_descendants_over_all_threads() {
+        let (r, l) = tree_fixture(
+            vec![
+                f(77, 77, "1234"),
+                f(1234, 1234, "1235"),
+                f(1235, 1235, ""),
+                f(1235, 1240, "2000"),
+                f(2000, 2000, "2001"),
+                f(2001, 2001, ""),
+            ],
+            vec![
+                (77, vec![77]),
+                (1234, vec![1234]),
+                (1235, vec![1235, 1240]),
+                (2000, vec![2000]),
+                (2001, vec![2001]),
+            ],
+        );
+        let t = walk_wrapped_proc_tree(77, &*r, &*l).expect("tree");
+        assert_eq!(t.wrapper_children, vec![1234]);
+        assert_eq!(t.init_children, vec![1235]);
+        assert_eq!(t.init_children_main_thread, vec![1235]);
+        assert_eq!(t.host, Some(1235));
+        assert_eq!(t.host_descendants, vec![2000, 2001]);
+        assert_eq!(t.host_threads, 2);
+        assert!(!t.truncated);
+        assert_eq!(
+            t.summary_line(),
+            "wrapper_children=1 init_children=1 init_children_main_thread=1 host_descendants=2 host_threads=2 truncated=false"
+        );
+    }
+
+    /// RENDER-3（#1460）: 孤児の付け替え（ns 内 pid 1 の子が 2 件）は host なし。
+    /// 主スレッド以外にだけ子がいる場合は主スレッドの数と全 tid の数が食い違う。
+    #[test]
+    fn render3_walk_wrapped_proc_tree_detects_broken_premise() {
+        let (r, l) = tree_fixture(
+            vec![f(77, 77, "1234"), f(1234, 1234, "1235 1300")],
+            vec![(77, vec![77]), (1234, vec![1234])],
+        );
+        let t = walk_wrapped_proc_tree(77, &*r, &*l).expect("tree");
+        assert_eq!(t.init_children, vec![1235, 1300]);
+        assert_eq!(t.host, None);
+        assert!(t.host_descendants.is_empty());
+
+        let (r, l) = tree_fixture(
+            vec![
+                f(77, 77, "1234"),
+                f(1234, 1234, ""),
+                f(1234, 1250, "1235"),
+                f(1235, 1235, ""),
+            ],
+            vec![(77, vec![77]), (1234, vec![1234, 1250]), (1235, vec![1235])],
+        );
+        let t = walk_wrapped_proc_tree(77, &*r, &*l).expect("tree");
+        assert_eq!(t.init_children, vec![1235]);
+        assert!(t.init_children_main_thread.is_empty());
+    }
+
+    /// RENDER-3（#1460）: 読めない・形式不正は Err（推測で埋めない）。
+    #[test]
+    fn render3_walk_wrapped_proc_tree_rejects_unreadable_and_malformed() {
+        let (r, l) = tree_fixture(vec![], vec![]);
+        assert_eq!(
+            walk_wrapped_proc_tree(77, &*r, &*l),
+            Err(ProcTreeError::NoTasks { pid: 77 })
+        );
+        let (r, l) = tree_fixture(vec![], vec![(77, vec![77])]);
+        assert_eq!(
+            walk_wrapped_proc_tree(77, &*r, &*l),
+            Err(ProcTreeError::Unreadable {
+                path: "/proc/77/task/77/children".to_string()
+            })
+        );
+        for bad in ["abc", "-5"] {
+            let (r, l) = tree_fixture(vec![f(77, 77, bad)], vec![(77, vec![77])]);
+            assert_eq!(
+                walk_wrapped_proc_tree(77, &*r, &*l),
+                Err(ProcTreeError::Malformed {
+                    path: "/proc/77/task/77/children".to_string()
+                }),
+                "{bad}"
+            );
+        }
+    }
+
+    /// RENDER-3（#1460）: 子孫が task 列挙後・children 読み取り前に消えても子なしで続行する。
+    /// 存続中の子孫の読み取り失敗は Unreadable のまま。
+    #[test]
+    fn render3_walk_wrapped_proc_tree_tolerates_descendant_vanishing_before_children_read() {
+        let files = [
+            f(77, 77, "1234"),
+            f(1234, 1234, "1235"),
+            f(1235, 1235, "2000"),
+        ];
+        let calls = std::cell::Cell::new(0u32);
+        let read = move |p: &str| files.iter().find(|(k, _)| k == p).map(|(_, v)| v.clone());
+        let list = |pid: u32| match pid {
+            77 => Some(vec![77]),
+            1234 => Some(vec![1234]),
+            1235 => Some(vec![1235]),
+            // 2000 は 1 回目の列挙だけ成功し、その後は消滅（children ファイルも無い）。
+            2000 => {
+                calls.set(calls.get() + 1);
+                (calls.get() == 1).then(|| vec![2000])
+            }
+            _ => None,
+        };
+        let t = walk_wrapped_proc_tree(77, &read, &list).expect("tree");
+        assert_eq!(t.host_descendants, vec![2000]);
+        assert!(!t.truncated);
+
+        // 存続中（再列挙できる）なのに children が読めないのは異常。
+        let list_alive = |pid: u32| match pid {
+            77 => Some(vec![77]),
+            1234 => Some(vec![1234]),
+            1235 => Some(vec![1235]),
+            2000 => Some(vec![2000]),
+            _ => None,
+        };
+        assert_eq!(
+            walk_wrapped_proc_tree(77, &read, &list_alive),
+            Err(ProcTreeError::Unreadable {
+                path: "/proc/2000/task/2000/children".to_string()
+            })
+        );
+    }
+
+    /// RENDER-3（#1460）: 循環は二重に数えず、深すぎるツリーは truncated で打ち切る。
+    #[test]
+    fn render3_walk_wrapped_proc_tree_handles_cycle_and_depth_limit() {
+        let (r, l) = tree_fixture(
+            vec![
+                f(77, 77, "1234"),
+                f(1234, 1234, "1235"),
+                f(1235, 1235, "2000"),
+                f(2000, 2000, "2001"),
+                f(2001, 2001, "2000 1235"),
+            ],
+            vec![
+                (77, vec![77]),
+                (1234, vec![1234]),
+                (1235, vec![1235]),
+                (2000, vec![2000]),
+                (2001, vec![2001]),
+            ],
+        );
+        let t = walk_wrapped_proc_tree(77, &*r, &*l).expect("tree");
+        assert_eq!(t.host_descendants, vec![2000, 2001]);
+        assert!(!t.truncated);
+
+        // ホスト 1235 から一直線に続く（pid n の子は n + 1）。
+        let read = |p: &str| -> Option<String> {
+            let pid: u32 = p.split('/').nth(2)?.parse().ok()?;
+            Some(match pid {
+                77 => "1234".to_string(),
+                1234 => "1235".to_string(),
+                n => (n + 1).to_string(),
+            })
+        };
+        let tasks = |pid: u32| Some(vec![pid]);
+        let t = walk_wrapped_proc_tree(77, &read, &tasks).expect("tree");
+        assert!(t.truncated);
+        assert_eq!(t.host_descendants.len(), PROC_TREE_MAX_DEPTH);
     }
 
     /// RENDER-4（#1436）: 未解決のあいだは失敗に数え、10 回で kill 判定になる。解決後は子の RSS で判定する。
