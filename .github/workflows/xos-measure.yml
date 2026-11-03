@@ -687,6 +687,16 @@ jobs:
             echo "error: /usr/bin/bwrap was not found" >&2
             exit 1
           fi
+          # bindgen（clang-sys）が別版 libclang を拾うと mozjs_sys が落ちるため、clang と同じ major の
+          # libclang を導入し LIBCLANG_PATH で固定する（ci.yml の servo-host-ubuntu と同じ手順）
+          major="$(clang --version | sed -n 's/.*clang version \([0-9]*\)\..*/\1/p' | head -1)"
+          sudo apt-get install -y --no-install-recommends "libclang-${major}-dev"
+          libdir="/usr/lib/llvm-${major}/lib"
+          if ! ls "$libdir"/libclang*.so* >/dev/null 2>&1; then
+            echo "error: libclang for LLVM ${major} not found under $libdir" >&2
+            exit 1
+          fi
+          echo "LIBCLANG_PATH=$libdir" >> "$GITHUB_ENV"
       - name: "[servo-host] cargo build --release"
         run: cargo build --manifest-path servo-host/Cargo.toml --locked --release --target-dir "$SERVO_HOST_TARGET_DIR"
       - name: "[servo-host] --selftest"
@@ -714,8 +724,8 @@ jobs:
           cargo test -p fandhe-browser-render --locked --test real_host render3_egress_ \
             -- --test-threads=1 --nocapture 2>&1 | tee "$log"
           passed="$(sed -nE 's/^test result: ok\. ([0-9]+) passed.*/\1/p' "$log" | tail -n 1)"
-          verified="$(grep -c '^EGRESS-VERIFIED ' "$log" || true)"
-          backend="$(grep -c '^EGRESS-VERIFIED .* backend=Bwrap$' "$log" || true)"
+          verified="$(grep -c 'EGRESS-VERIFIED ' "$log" || true)"
+          backend="$(grep -c 'EGRESS-VERIFIED .* backend=Bwrap$' "$log" || true)"
           {
             echo "## egress-host (ubuntu)"
             echo "- passed: ${passed:-none} (expected 3)"
@@ -815,8 +825,8 @@ jobs:
           cargo test -p fandhe-browser-render --locked --test real_host render3_egress_ \
             -- --test-threads=1 --nocapture 2>&1 | tee "$log"
           passed="$(sed -nE 's/^test result: ok\. ([0-9]+) passed.*/\1/p' "$log" | tail -n 1)"
-          verified="$(grep -c '^EGRESS-VERIFIED ' "$log" || true)"
-          backend="$(grep -c '^EGRESS-VERIFIED .* backend=SandboxExec$' "$log" || true)"
+          verified="$(grep -c 'EGRESS-VERIFIED ' "$log" || true)"
+          backend="$(grep -c 'EGRESS-VERIFIED .* backend=SandboxExec$' "$log" || true)"
           {
             echo "## egress-host (macos)"
             echo "- passed: ${passed:-none} (expected 3)"
