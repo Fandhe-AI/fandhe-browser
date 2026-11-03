@@ -805,6 +805,8 @@ jobs:
             if grep -q '"type":"end"' "$cap/samples.jsonl" 2>/dev/null; then break; fi
             sleep 0.5
           done
+          # 最終カナリアが tcpdump に読み切られるまでの有界の待ち（#1470 の回帰。SIGINT が早いと最終カナリアが pcap に入らない）。
+          sleep 2
           sudo pkill -INT -x tcpdump || echo "note: no tcpdump process to stop"
           for _ in $(seq 1 60); do
             if [ -f "$cap/tcpdump.exit" ]; then break; fi
