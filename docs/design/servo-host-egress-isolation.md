@@ -261,7 +261,7 @@ options §7 を引き継ぐ。本書で新たに加わる未確認事項は §9.
 | Windows の測り直し（loopback 以外の宛先を使う測り方。loopback 免除の下では外側 listener に届くため、現行の測り方では egress を測れない） | #1427 |
 | AppContainer 内の ipc-channel の制約（ボディ付きリクエストで panic し得る。推定・未実測） | #1421 |
 | Docker 内での bwrap の可否（イメージに bwrap が無い） | #1457 |
-| 実ホストの子プロセス数（rss の pid 解決の前提。ns 内 pid 1 の子が 1 件）。記録は `real_host` の `EGRESS-PROCTREE` 行（#1460）、実測は xos-measure の `egress-host`（マージ後） | #1457 |
+| 実ホストの子プロセス数（rss の pid 解決の前提。ns 内 pid 1 の子が 1 件）。記録は `real_host` の `EGRESS-PROCTREE` 行（#1460。走査の失敗・pid 未解決のときは別接頭辞の `EGRESS-PROCTREE-FAIL` 行で、件数の期待値は 0。#1466）、実測は xos-measure の `egress-host`（マージ後） | #1457 |
 | Servo 自身の DNS・UDP 送信の外部観測（root か `CAP_NET_ADMIN` が要る） | #1461 |
 | Landlock ルール適用下の動作・seccomp との併用（許可リスト付きプロキシは #1434・#1440・#1436 で本番に実装済み。netns 内の中継 → UDS → プロキシの成立性は §6.5 で確認済み） | #1457 |
 | 実ホスト（GitHub の ubuntu・macOS runner）での隔離下の動作（xos-measure の `egress-host`。マージ後に実施し、結果は #1003 へ） | #1003 |
@@ -277,8 +277,13 @@ options §7 を引き継ぐ。本書で新たに加わる未確認事項は §9.
 - Linux: FS を隔離しない（`--dev-bind / /`）ため、FS 上の UDS（ssh-agent・X11・gnupg・同じ uid の他インスタンスのプロキシの UDS 等）を通る迂回が残る。
 - macOS: Seatbelt は IP の送信だけを絞る。mach/XPC 経由の通信は止めない。観測したのは `mDNSResponder` 経由の経路だけで、それ以外は観測していない。
 - 測定（#1433）は `--ro-bind / /` で行ったが、本番は `--dev-bind / /` である。そのため、測定は本番の FS 上の UDS の迂回を覆っていない。
+- 信頼判定の TOCTOU（#1466）: 実起動は、プローブ時にキャッシュした bwrap の実体パスを `select_trusted` で通し直さずに使う。実体は root 所有で祖先まで書き込み不可のまま、プロセスの生存中は変わらない前提に立つ。差し替えには root が要るため脅威モデルの外とする。
 
 ### 9.4 判断済みの事項（#1459）
 
 - プローブの判定方法（2026-11-03）: Linux のプローブは終了コードに加えて、サンドボックス内の `readlink /proc/self/ns/net` の出力（netns の inode）が本体の値と異なることまで確かめる。exit 0 だけの偽物や、ns を作らない偽物は失敗する。詳細は `isolation.rs` の doc を正とする。
 - 作業ディレクトリが `/run` 配下のときの扱い（2026-11-03）: `WorkDirHiddenBySandbox` で隔離不能とする fail-closed のまま変えない。回避策は `/run` の外を `temp_root` または `TMPDIR` に指定すること。挙動は `isolation.rs` の doc を正とする。
+- プローブの前提（2026-11-03・#1466）:
+  - プローブは `env_clear` で走り、本番の起動は許可リストの環境変数で走る。差が出るのは起動できない側だけで、隔離なしに起動できてしまう fail-open にはならない。
+  - プローブが確かめるのは、別の netns にいることまで。外部への出口が無いことは、その netns が本物の bwrap の `--unshare-net` で作られ `lo` しか持たないという前提に依存する。本物であることは root 所有の信頼判定で担保する。
+  - netns に加えて pid ns（`/proc/self/ns/pid`）の分離も確かめる。rss 監視の pid 解決とラッパーの kill で ns 内のホストも落ちる挙動が、`--unshare-pid` に依存するため。busybox の `readlink` はオペランドを 1 つしか取らないので、名前空間ごとに別の bwrap 起動にする（結果はプロセスごとに 1 回キャッシュ）。
