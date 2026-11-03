@@ -109,13 +109,13 @@ struct Server {
     handle: Option<JoinHandle<()>>,
 }
 
-/// `/ws` のページ。ページ内から loopback の別ポートへ WebSocket を張り、結果を要素の出現で示す。
+/// `/ws` のページ。ページ内から loopback の別ポートへ WebSocket を張り、失敗（error・close・例外）の
+/// 印だけを要素の出現で示す。open の印は出さない（リスナーはハンドシェイクしないため判定に使えない。#1458）。
 fn ws_page(ws_port: u16) -> String {
     format!(
         "<html><body><script>\
 function mark(id){{var d=document.createElement('div');d.id=id;d.style.width='10px';d.style.height='10px';document.body.appendChild(d);}}\
 try{{var w=new WebSocket('ws://127.0.0.1:{ws_port}/');\
-w.onopen=function(){{mark('ws-open');}};\
 w.onerror=function(){{mark('ws-error');}};\
 w.onclose=function(){{mark('ws-closed');}};}}catch(e){{mark('ws-throw');}}\
 </script></body></html>"
@@ -834,6 +834,14 @@ fn render3_egress_required_loads_loopback_via_proxy() {
 }
 
 /// RENDER-3・SEC-2: 内部アドレスを許可しないと、プロキシが拒否して読み込みが失敗する。
+///
+/// 失敗の原因が許可リスト（`allow_private_network_access`）であることを、同じテスト内の対照で
+/// 示す（#1458）。拒否側の後に、**同じ `Server`** へ `required_host(true)` で同じ URL を読み、
+/// 成功して接続が届くことを確かめる。2 回で違うのは `allow_private_network_access` だけなので、
+/// 隔離まわりの別の不具合なら対照の側も落ちる。プロキシの拒否件数（`denied_address`）は、失敗した
+/// load がホストごとプロキシを破棄するため取り出せない（本番コードは変えない）。エラー種別は
+/// 実ホストで観測できるまで `Host | Timeout` に留める。隣の
+/// `render3_egress_required_loads_loopback_via_proxy` は成功側だけの単独確認。
 #[test]
 fn render3_egress_required_denies_internal_address_at_proxy() {
     if !egress_requested() {
@@ -854,6 +862,20 @@ fn render3_egress_required_denies_internal_address_at_proxy() {
     std::thread::sleep(Duration::from_millis(500));
     assert_eq!(srv.accepted(), 0, "request reached the server");
     p.shutdown();
+
+    // 対照: 許可だけを変えた同条件では、同じ URL が読めてサーバーに届く。
+    let backend = expected_backend();
+    let mut allowed = required_host(true);
+    let res = allowed
+        .load(&LoadParams::new(&url, Some(20_000)).expect("params"), 1)
+        .expect("control: allowed load must succeed");
+    assert_eq!(res.final_url(), url);
+    assert_eq!(
+        allowed.egress_isolation(),
+        Some(EgressIsolationStatus::Isolated(backend))
+    );
+    assert!(srv.accepted() >= 1, "control: server saw no connection");
+    allowed.shutdown();
     println!(
         "EGRESS-VERIFIED render3_egress_required_denies_internal_address_at_proxy mode=required"
     );
@@ -910,7 +932,9 @@ fn render3_egress_required_blocks_direct_websocket() {
             .any(|id| probe(id))
     });
     assert!(attempted, "page never reported a websocket failure");
-    assert!(!probe("#ws-open"), "websocket opened under isolation");
+    // `#ws-open` は見ない: `CountingListener` は accept してすぐ閉じ、ハンドシェイクしないため、
+    // 隔離がなくても open は立たず、検証にならない。判定は下の `ws.accepted() == 0`
+    // （隔離なしの対照では `>= 1` になる）が担う。
     std::thread::sleep(Duration::from_millis(500));
     assert_eq!(ws.accepted(), 0, "websocket reached the listener directly");
     p.shutdown();
