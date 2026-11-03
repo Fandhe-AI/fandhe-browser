@@ -268,6 +268,10 @@ pub(super) const EGRESS_SOCKET_NAME: &str = "egress-proxy.sock";
 
 /// bwrap 用に、WorkDir を正規化してソケット用ディレクトリとして返す。`--tmpfs /run` に隠れる、
 /// または UDS のパスが規則に反する場合は隔離できない理由を返す（fail-closed）。
+///
+/// 返すのは `HostProcess` がこの起動のために排他的に作った 0700 の WorkDir ルートで、
+/// `EgressEndpoint::UnixSocketIn` の呼び出し側の契約を満たす（#1444・#1450）。契約はテスト
+/// `render_3_sec_2_uds_dir_is_created_by_host_process_0700_and_owned`（`host_process.rs`）で固定する。
 pub(super) fn socket_dir_for(workdir: &Path) -> Result<PathBuf, EgressIsolationUnavailable> {
     let canonical = std::fs::canonicalize(workdir)
         .map_err(|_| EgressIsolationUnavailable::SocketPathInvalid)?;

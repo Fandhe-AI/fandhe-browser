@@ -20,7 +20,8 @@
 //! `HostProcess` への組み込み（WorkDir 配下へのソケット配置・netns 内の中継・servo-host の proxy
 //! pref 注入）、bwrap / Seatbelt、Windows の隔離は本モジュールの範囲外。macOS の TCP 待ち受けは
 //! 同一ユーザーの他プロセスからも届くため、Seatbelt 側で絞る前提。認証は置かない（loopback / UDS
-//! のみ。設計 §2）。
+//! のみ。設計 §2）。絞り込みが効かない場合の枠の占有（可用性のみ。SSRF ではない）は残余リスクで、
+//! 実測は #1437 が担当する（#1450。[`EgressEndpoint::LoopbackTcp`] の doc 参照）。
 
 use std::fmt;
 use std::io;
@@ -229,16 +230,24 @@ pub enum EgressEndpoint {
     /// 所有者がこのプロセスの uid であること。ソケット名は固定の `egress-proxy.sock`
     /// （外部文字列をパスに入れない）。ソケットは 0600。
     ///
-    /// 呼び出し側の契約（#1444）: 自プロセスが作った 0700 のディレクトリ（祖先も他ユーザーから
-    /// 書けない）を渡す。検査から bind までの間にディレクトリを差し替えて元に戻す競合は
-    /// `openat` 系なしでは閉じきれないため、この契約を前提に受け入れている。bind の前後で
-    /// (dev, ino, uid, mode) を照合して窓を縮めている。
+    /// 呼び出し側の契約（#1444・#1450）: 自プロセスが排他的に作った 0700 のディレクトリを渡す
+    /// （祖先は他ユーザーが書けない、または sticky ビット付き。既定の `temp_root` は `/tmp`）。
+    /// 検査から bind までの間にディレクトリを差し替えて元に戻す競合は `openat` 系なしでは
+    /// 閉じきれないため、この契約を前提に受け入れている。bind の前後で (dev, ino, uid, mode) を
+    /// 照合して窓を縮めている。契約は呼び出し側（`HostProcess`）の経路を通すテスト
+    /// `render_3_sec_2_uds_dir_is_created_by_host_process_0700_and_owned`（`host_process.rs`）と
+    /// `render_3_workdir_make_dir_is_exclusive`（`workdir.rs`）で固定している。
     UnixSocketIn(PathBuf),
     /// `127.0.0.1:0` の TCP（macOS 向け。loopback 以外へは bind しない）。
     ///
     /// 認証が無く、同一ホストの他プロセスからも届く。[`EgressProxyConfig::allow_private_network_access`]
     /// を true にするとローカル向けの開放プロキシになり得る（既定は false）。macOS では
     /// Seatbelt 側で届く先を絞る前提（#1444）。
+    ///
+    /// 残余リスク（#1450）: 絞り込みが効かない場合、同じホストの任意のプロセスが許可リスト内の
+    /// 宛先へ CONNECT してアイドルのまま保持し、`MAX_CONCURRENT_CONNECTIONS`（128）の枠を
+    /// `IDLE_TIMEOUT`（300 秒）ずつ占有できる。可用性の問題で SSRF ではない（宛先の検査は
+    /// このプロキシのまま）。絞り込みが効いていることの実測は #1437 が担当する（RENDER-3・SEC-2）。
     LoopbackTcp,
 }
 

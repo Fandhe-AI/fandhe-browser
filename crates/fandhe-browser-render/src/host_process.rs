@@ -1181,6 +1181,44 @@ mod tests {
     use super::*;
     use crate::protocol::VisibilityParams;
 
+    /// RENDER-3・SEC-2（#1444・#1450）: `HostProcess` の経路（`WorkDir::create` →
+    /// `isolation::socket_dir_for` → `EgressProxy::start(UnixSocketIn)`）で渡る UDS ディレクトリが、
+    /// 自プロセスが排他的に作った 0700・非 symlink・自 uid 所有で、ソケットは 0600 であること。
+    /// `EgressEndpoint::UnixSocketIn` の呼び出し側の契約を固定する。
+    #[cfg(unix)]
+    #[test]
+    fn render_3_sec_2_uds_dir_is_created_by_host_process_0700_and_owned() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let workdir = WorkDir::create(&std::env::temp_dir()).expect("workdir");
+        let dir = isolation::socket_dir_for(workdir.path()).expect("socket dir");
+        assert_eq!(
+            dir,
+            std::fs::canonicalize(workdir.path()).expect("canonicalize")
+        );
+        let dir_meta = std::fs::symlink_metadata(&dir).expect("dir meta");
+        assert!(dir_meta.file_type().is_dir() && !dir_meta.file_type().is_symlink());
+        assert_eq!(dir_meta.permissions().mode() & 0o777, 0o700);
+
+        let proxy = EgressProxy::start(
+            EgressEndpoint::UnixSocketIn(dir.clone()),
+            EgressProxyConfig::default(),
+        )
+        .expect("proxy");
+        let BoundEndpoint::Unix(sock) = proxy.endpoint().clone() else {
+            panic!("expected a unix endpoint");
+        };
+        assert_eq!(sock, dir.join(isolation::EGRESS_SOCKET_NAME));
+        let sock_meta = std::fs::symlink_metadata(&sock).expect("sock meta");
+        assert_eq!(sock_meta.permissions().mode() & 0o777, 0o600);
+        // std に geteuid が無いため、このプロセスが bind したソケットの uid を自 uid として使う。
+        assert_eq!(dir_meta.uid(), sock_meta.uid());
+        drop(proxy);
+        assert!(!sock.exists());
+        let root = workdir.path().to_path_buf();
+        drop(workdir);
+        assert!(!root.exists());
+    }
+
     /// RENDER-3: 未登録の起動失敗でも、ラッパーを kill・wait で回収する。
     #[cfg(unix)]
     #[test]
