@@ -297,12 +297,12 @@ host netns を記録し、bwrap 配下の Servo ホストに帰属する外向�
   `UDP` の痕跡の検出（解析できない行・proto=other の行）は大文字小文字を区別しない（過検出は観測不能側）。
   サンプラー側では、`/proc/net` の解析できない行、Servo と同定した pid の fd の EACCES（後述の読み直しでも読めなかったもの）、`/proc/net/if_inet6` があるのに tcp6・udp6 が無い状態を記録して観測不能にする
   （tcp6・udp6 の不在を許すのは `if_inet6` が無いときだけ）。
-  Servo と同定した pid の fd が EACCES のときは、診断を採ってから、pid ごとに最初の denied から 0.1 秒・最大 5 回で読み直す。1 回の走査の読み直しの累計は 0.15 秒まで（走査の時間は数えない。#1493・#1497）。結果は `recovered`（読めた。結果を使う）・
+  Servo と同定した pid の fd が EACCES のときは、診断を採ってから、pid ごとに最初の denied から 0.1 秒・最大 5 回で読み直す。回数と時間の関係は 5 回 × 0.02 秒 ≒ 0.1 秒で、sleep は締切までの残りに切り詰めるため待ちの累計は 0.1 秒（pid ごと）・0.15 秒（1 回の走査）を超えない（走査の時間は数えない。最後の読み取りの時間と OS の sleep 遅延の分だけ実時間は超えうる。#1493・#1497・#1503）。結果は `recovered`（読めた。結果を使う）・
   `vanished`（消えた、または starttime が変わった）・`persistent`（読めないまま、または starttime が読めず pid の再利用を判別できない。従来どおり記録して観測不能）の 3 つで、`samples.jsonl` の `fd-diag` 記録と
   `verdict.json` の `fd_read_retries`・Step Summary に件数を出す（合否には使わない診断。形式が不正な `fd-diag` は他の記録と同様に観測不能）。
-  `fd-diag` の `stop` は読み直しを止めた理由の固定カテゴリ（`read-ok`・`gone`・`reused`・`starttime-unknown`・`other-error`・`attempts`・`pid-budget`・`sample-budget`）で、persistent が予算切れ由来かの切り分けに使う。`verdict.json` の `fd_read_retries.records` は許可キー（`pid`・`outcome`・`attempts`・`elapsed`・`stop`・`first`・`last`）だけに絞る（生の記録は `samples.jsonl` に残る）。
+  `fd-diag` の `stop` は読み直しを止めた理由の固定カテゴリ（`read-ok`・`gone`・`reused`・`starttime-unknown`・`other-error`・`attempts`・`pid-budget`・`sample-budget`）で、persistent が予算切れ由来かの切り分けに使う。`verdict.json` の `fd_read_retries.records` は許可キー（`pid`・`outcome`・`attempts`・`elapsed`・`stop`・`first`・`last`）だけに絞る（`first`・`last` の下位キーは `fd_dir_owner`・`state`・`exe`・`stage`〔`listdir`・`readlink`、集合外は `unknown`〕・`errno`〔0〜4095 の整数、それ以外は null〕）（生の記録は `samples.jsonl` に残る）。
   診断値は整数・真偽値・固定カテゴリに限る（`fd_dir_owner`〔self / root / other〕・`state`・`exe` 等。生のパス・uid・名前は出さない）。
-- 読み直しの限界（#1493・#1497）: 予算（pid ごとに 0.1 秒）を超えて続く一時的な状態、および走査の累計（0.15 秒）を使い切った後の pid は従来どおり観測不能になる。EACCES の原因は未確認の仮説で、
+- 読み直しの限界（#1493・#1497）: 待ちの予算（pid ごとに 0.1 秒）を超えて続く一時的な状態、および走査の待ちの累計（0.15 秒）を使い切った後の pid は従来どおり観測不能になる。EACCES の原因は未確認の仮説で、
   dumpable でないタスクの `/proc/<pid>/` 配下の所有者が root になる（`fs/proc/base.c` の `task_dump_owner`）ことを疑っている。AppArmor の設定との相関は観測 2 回（fail 1・pass 1）だけで断定しない。
 - 限界: サンプル間隔より短命なソケット・root のプロセス（systemd-resolved 等）は帰属できない。隔離下のホストの ns 内の `lo` で閉じる問い合わせは host に届かないため観測対象外。
   `servo_unisolated` には、`render3_egress_required_blocks_direct_websocket` が意図して起動する隔離なしの対照ホストが現れうる。判定はこれを fail にしない（件数の記録のみ）。

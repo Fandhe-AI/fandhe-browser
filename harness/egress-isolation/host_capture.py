@@ -73,6 +73,10 @@ MAX_PACKET_LINE_CHARS = 1024
 # 1 回の走査で読み直しに使う時間の累計は FD_READ_RETRY_SAMPLE_BUDGET_SECONDS で抑える（走査の時間は数えない）。
 # 大小関係は pid ごと <= 累計 < サンプル間隔の既定（workflow の --interval-ms 200）で、denied の pid が多くても
 # 1 サンプルの延びを有界に保つ。累計を使い切った後の pid は読み直し 0 回で persistent（観測不能）になる。
+# 回数と時間の関係: FD_READ_RETRIES × FD_READ_RETRY_SECONDS（5 × 0.02）≒ FD_READ_RETRY_BUDGET_SECONDS（0.1）。
+# 回数上限は読み取りが速い環境の、時間上限は sleep の遅延・読み取りが遅い環境の歯止め。
+# 上界: sleep は締切までの残りに切り詰めるため、待ちの累計は pid ごと 0.1 秒・走査の累計 0.15 秒を超えない。
+# 締切直前の最後の読み取り（fd・starttime・スナップショット）の時間と OS の sleep 遅延の分だけ実時間は超えうる。
 FD_READ_RETRIES = 5
 FD_READ_RETRY_SECONDS = 0.02
 FD_READ_RETRY_BUDGET_SECONDS = 0.1
@@ -277,12 +281,19 @@ def _fd_diag_verdict_record(rec: dict) -> dict:
     """fd-diag 記録を verdict.json に載せる許可キーへ絞る（#1497）。生の記録は samples.jsonl に残る。
 
     値は整数・有限な数値・固定カテゴリに丸め、/proc 由来の生文字列を verdict と Step Summary に入れない。
+    first / last の許可キーは fd_dir_owner・state・exe・stage（FD_DIAG_STAGES か unknown）・errno（0..4095 の整数か None）。
     """
 
     def snap(v: object) -> dict | None:
         if not isinstance(v, dict):
             return None
-        return {k: _diag_cat(v.get(k)) for k in ("fd_dir_owner", "state", "exe")}
+        out: dict = {k: _diag_cat(v.get(k)) for k in ("fd_dir_owner", "state", "exe")}
+        st = v.get("stage")
+        out["stage"] = None if st is None else (st if isinstance(st, str) and st in FD_DIAG_STAGES else "unknown")
+        en = v.get("errno")
+        ok = isinstance(en, int) and not isinstance(en, bool) and 0 <= en <= FD_DIAG_MAX_ERRNO
+        out["errno"] = en if ok else None
+        return out
 
     attempts = rec.get("attempts")
     elapsed = rec.get("elapsed")
@@ -703,6 +714,10 @@ def _fd_diag_dropped(end: dict | None) -> int:
     return val if isinstance(val, int) and not isinstance(val, bool) else 0
 
 
+# `_read_fd_inodes` が denied で返す段階（listdir / readlink）。fd-diag の stage を固定カテゴリに丸める
+FD_DIAG_STAGES = ("listdir", "readlink")
+FD_DIAG_MAX_ERRNO = 4095  # Linux の MAX_ERRNO
+
 _DIAG_CATEGORIES = frozenset(
     {"self", "root", "other", "unknown", "servo", "unreadable", "gone"} | set("RSDZTtXxIKWP")
 )
@@ -1089,7 +1104,7 @@ def _socket_owners(
     dumpable でない（または mm が無い）タスクの /proc/<pid>/ 配下の所有者を root にし、fd ディレクトリは DAC だけで
     判定されるため、exec 中・終了処理中の瞬間に exe は読めても fd は読めない非対称が起きうる、というもの。
     そこで Servo pid の denied に限り、診断を採ってから FD_READ_RETRIES 回・pid ごとに最初の denied から
-    FD_READ_RETRY_BUDGET_SECONDS 以内（1 回の走査の累計は FD_READ_RETRY_SAMPLE_BUDGET_SECONDS まで）で読み直す
+    FD_READ_RETRY_BUDGET_SECONDS 以内（1 回の走査の待ちの累計は FD_READ_RETRY_SAMPLE_BUDGET_SECONDS まで。最後の読み取り時間は超えうる）で読み直す
     （#1497: 走査全体で 1 つの締切にすると後ろの pid が読み直されない）。結果は recovered（読めた。結果を使う）・vanished（消えた、または starttime が変わった）・
     persistent（読めないまま。従来どおり記録して観測不能）で、診断は diag に fd-diag 記録として足す。
     starttime が初回・再読みのどちらかで読めないときは pid の再利用を判別できないため recovered にせず persistent
@@ -1142,14 +1157,22 @@ def _socket_owners(
                 if attempts >= FD_READ_RETRIES:
                     stop = "attempts"
                     break
-                if clock.mono() >= pid_deadline:
+                remaining = pid_deadline - clock.mono()
+                if remaining <= 0:
                     stop = "sample-budget" if sample_bound else "pid-budget"
                     break
-                clock.sleep(FD_READ_RETRY_SECONDS)
+                # sleep は締切までの残りに切り詰め、待ちの累計が予算を超えないようにする
+                last_wait = remaining <= FD_READ_RETRY_SECONDS
+                clock.sleep(min(FD_READ_RETRY_SECONDS, remaining))
                 attempts += 1
                 kind, inodes, over, stage, errno_ = _read_fd_inodes(pid)
                 hit = hit or over
                 if kind == "denied":
+                    if last_wait and attempts < FD_READ_RETRIES:
+                        # 切り詰めた最後の待ちの後は予算切れ。浮動小数点の誤差で極小 sleep の余分な 1 回が
+                        # 起きるのを防ぐ（実時計の sleep 遅延でも判定が決定的になる）
+                        stop = "sample-budget" if sample_bound else "pid-budget"
+                        break
                     continue
                 now_start = _proc_starttime(pid)
                 if kind == "gone":

@@ -596,6 +596,29 @@ class FdReadRetryTests(unittest.TestCase):
             (c, "persistent", 0, "sample-budget"),
         ])
         self.assertEqual(sleeps, 8)
+        self.assertEqual(diag[1]["elapsed"], 0.05)  # 最後の sleep を残りに切り詰めるので締切を超えない
+        self.assertEqual(diag[2]["elapsed"], 0.0)
+
+    def test_sleeps_never_exceed_budgets(self):
+        # 待ちの累計は走査の累計予算を超えず、個々の sleep は FD_READ_RETRY_SECONDS 以下
+        clock = FakeClock()
+        pids = [4_000_501, 4_000_502, 4_000_503]
+        self._owners([self.DENIED], pids=pids, clock=clock)
+        self.assertTrue(all(0 < x <= hc.FD_READ_RETRY_SECONDS for x in clock.sleeps))
+        self.assertLessEqual(round(sum(clock.sleeps), 6), hc.FD_READ_RETRY_SAMPLE_BUDGET_SECONDS)
+        self.assertEqual(round(sum(clock.sleeps), 6), 0.15)
+
+    def test_non_multiple_budget_has_no_tiny_extra_sleep(self):
+        # 予算 0.05 は sleep 間隔 0.02 の非整数倍。0.02・0.02・0.01 の 3 回で止まり、極小 sleep の 4 回目は起きない
+        diag = []
+        clock = FakeClock()
+        _res, sleeps = self._owners([self.DENIED], budget=0.05, diag=diag, clock=clock)
+        self.assertEqual(sleeps, 3)
+        self.assertEqual((diag[0]["attempts"], diag[0]["stop"], diag[0]["elapsed"]), (3, "pid-budget", 0.05))
+        self.assertAlmostEqual(clock.sleeps[-1], 0.01)
+
+    def test_budget_constants_relation(self):
+        self.assertAlmostEqual(hc.FD_READ_RETRIES * hc.FD_READ_RETRY_SECONDS, hc.FD_READ_RETRY_BUDGET_SECONDS)
 
     def test_per_pid_budget_limits_attempts(self):
         diag = []
@@ -605,6 +628,8 @@ class FdReadRetryTests(unittest.TestCase):
         self.assertEqual(errors, [f"proc-read-error:fd-{self.X}"])
         self.assertEqual((diag[0]["attempts"], diag[0]["stop"]), (4, "pid-budget"))
         self.assertEqual(sleeps, 4)
+        self.assertEqual(diag[0]["elapsed"], 0.1)  # 従来は 0.12（最後の sleep が締切を超えていた）
+        self.assertAlmostEqual(clock.sleeps[-1], 0.01)
 
     def test_slow_scan_does_not_starve_trailing_servo_pid(self):
         # 非 Servo の走査に合計 0.5 秒かかっても（予算 0.1・累計 0.15 を超える）、末尾の Servo pid は読み直される
@@ -670,7 +695,7 @@ class FdReadRetryTests(unittest.TestCase):
                 (_o, hit, _e), _s = self._owners(results, starttimes=stimes)
                 self.assertIs(hit, True)
 
-    def test_budget_constants_relation(self):
+    def test_sample_budget_below_interval(self):
         # 0.2 は workflow の既定 --interval-ms 200。pid ごと <= 累計 < サンプル間隔
         self.assertLessEqual(hc.FD_READ_RETRY_BUDGET_SECONDS, hc.FD_READ_RETRY_SAMPLE_BUDGET_SECONDS)
         self.assertLess(hc.FD_READ_RETRY_SAMPLE_BUDGET_SECONDS, 0.2)
@@ -681,8 +706,9 @@ class FdReadRetryTests(unittest.TestCase):
             {
                 "type": "fd-diag", "t": 1.0, "pid": 200, "outcome": "persistent", "attempts": 5, "elapsed": 0.1,
                 "stop": "evil|x", "nspid": [1], "threads": 3,
-                "first": {"fd_dir_owner": "root", "state": "R", "exe": "servo", "nspid": [1], "uid_matches_self": True},
-                "last": {"fd_dir_owner": "bad value", "state": "S", "exe": "other"},
+                "first": {"fd_dir_owner": "root", "state": "R", "exe": "servo", "nspid": [1], "uid_matches_self": True,
+                          "stage": "readlink", "errno": 13},
+                "last": {"fd_dir_owner": "bad value", "state": "S", "exe": "other", "stage": "evil|x", "errno": "13"},
             }
         )
         rec = idx.fd_diags[0]
@@ -690,11 +716,21 @@ class FdReadRetryTests(unittest.TestCase):
             set(rec), {"pid", "outcome", "attempts", "elapsed", "stop", "first", "last"}
         )
         self.assertEqual(rec["stop"], "unknown")
-        self.assertEqual(set(rec["first"]), {"fd_dir_owner", "state", "exe"})
+        keys = {"fd_dir_owner", "state", "exe", "stage", "errno"}
+        self.assertEqual(set(rec["first"]), keys)
+        self.assertEqual(set(rec["last"]), keys)
+        self.assertEqual((rec["first"]["stage"], rec["first"]["errno"]), ("readlink", 13))
+        self.assertEqual((rec["last"]["stage"], rec["last"]["errno"]), ("unknown", None))
         self.assertEqual(rec["last"]["fd_dir_owner"], "unknown")
+        for bad in (True, -1, 100000, 4096):
+            idx.feed({"type": "fd-diag", "t": 1.0, "pid": 202, "outcome": "persistent",
+                      "first": {"stage": "listdir", "errno": bad}})
+            self.assertIsNone(idx.fd_diags[-1]["first"]["errno"], bad)
+        idx.feed({"type": "fd-diag", "t": 1.0, "pid": 203, "outcome": "persistent", "first": {"stage": None}})
+        self.assertIsNone(idx.fd_diags[-1]["first"]["stage"])
         self.assertEqual((rec["pid"], rec["attempts"], rec["elapsed"]), (200, 5, 0.1))
         idx.feed({"type": "fd-diag", "t": 1.0, "pid": 201, "outcome": "recovered", "attempts": True, "elapsed": "x"})
-        rec2 = idx.fd_diags[1]
+        rec2 = idx.fd_diags[-1]
         self.assertEqual((rec2["attempts"], rec2["elapsed"], rec2["first"], rec2["last"]), (None, None, None, None))
 
     def test_non_servo_pid_is_not_retried_or_recorded(self):
