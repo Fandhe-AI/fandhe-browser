@@ -190,7 +190,7 @@ Windows の補足（#1401）: `xos-measure.yml` の Windows ジョブに限り�
 
 - プロキシのポリシーは測定用のフィクスチャで、本番のものではない。本番は loopback を含む内部アドレスをすべて拒否するはずで、ここでは 127.0.0.4 を許可先の代役にしている。
 - `direct` は「netns 内の `127.x` は netns 自身の `lo` に向かう」性質に頼る陰性対照で、外へ出る経路の遮断そのものは §6.4 の実測が担う。
-- #1433 で bwrap の FS を `--ro-bind / /` に絞り（書き込めるのは `/run` の tmpfs・UDS ディレクトリ・出力ディレクトリだけ）、同じ構成で 5 項目がすべて pass することを再確認した。（測定は `--ro-bind / /` だが、本番（#1436・PR #1446）は `--dev-bind / /` のため、測定は FS 上の UDS の迂回を覆っていない。本番は #1485 で `/run`・`/tmp`・`$HOME` を tmpfs で隠すようにしたが、この測定の構成そのものは測り直していない。§9.3・§9.4 を参照。#1458）
+- #1433 で bwrap の FS を `--ro-bind / /` に絞り（書き込めるのは `/run` の tmpfs・UDS ディレクトリ・出力ディレクトリだけ）、同じ構成で 5 項目がすべて pass することを再確認した。（測定は `--ro-bind / /` だが、本番（#1436・PR #1446）は `--dev-bind / /` のため、測定は FS 上の UDS の迂回を覆っていない。本番は #1485 で `/run`・`/tmp`・`$HOME` を、#1492 で `/var/tmp`・`/dev/shm`・WorkDir の親も tmpfs で隠すようにしたが、この測定の構成そのものは測り直していない。§9.3・§9.4 を参照。#1458）
 - 結論: この環境では構成が成り立つ。本番のプロキシの実装・`servo-host` への注入・HostProcess への bwrap の組み込みは §7 の承認事項のまま。
 - 未測定: 名前解決後の再検査（DNS rebinding）、CONNECT 上の TLS、Servo 0.7.0 の `Tunnel` との実接続、AppArmor の制限が無い環境・6.7 未満のカーネル。
 
@@ -218,7 +218,7 @@ Windows の補足（#1401）: `xos-measure.yml` の Windows ジョブに限り�
 | 1. GA の成立範囲 | Linux を先行（B: bwrap `--unshare-net`） | Linux（B: bwrap `--unshare-net`）と macOS（B: Seatbelt）を含める。根拠: macOS 26 の run 41401095620・41402439545 で、TCP 5 経路（redirect・img・fetch・ws・internal）と udp_direct が pass し、拒否ログの自己検査も成立した（予熱 5 回入り。#1415・#1424・#1425）。`dns`・`internal_real` は netns が前提の構造検査のため、macOS では対象外（unobservable） | 本番への組み込みは論点 4 |
 | 2. 既知の制約の文言（D）の置き場所 | 設計 §2.5 か README のどちらか（未定） | README「実装方針（要点）」と設計 §2.5 に置く | 文言は両者で同じ内容 |
 | 3. Windows の扱い | macOS・Windows の実測まで GA の成立範囲から外し、D の扱い | 引き続き D（既知の制約）とし、GA の成立範囲から外す。根拠: AppContainer 内で Servo ホストの陽性対照は成立した（`positive_ok: true`。run 41386861681・41402439545。#1413・#1420）。一方、Servo を使わない preflight で、capability なしでも loopback の外側 listener に届いた（loopback 免除を付けているため）。そのため全経路が「loopback listener では egress の遮断を測れない」理由で unobservable。測り直すには loopback 以外の宛先が要る | 測り方の検討は #1427。AppContainer 内の ipc-channel の制約は #1421 |
-| 4. 本番への組み込み | （新規の論点） | #1436（PR #1446）で実装済み。HostProcess の起動を Linux は bwrap、macOS は sandbox-exec で包み、通信を本体の許可リスト付きプロキシに限る（`[rendering] egress_isolation`。既定 `best-effort`、`required` は隔離できなければ起動しない）。依存・`unsafe` を足さず外部コマンドで包む方式にしたため、§7 の承認事項のうち依存・`unsafe` を要する案は採っていない。隔離中は WebSocket が使えず（Servo の `websocket_loader` はプロキシを使わない）、ファイルシステム全体は隔離しない（`--dev-bind / /`。#1485 で `/run`・`/tmp`・`$HOME` だけ tmpfs で隠し、WorkDir と隠れる場所にあるホストの実行ファイルだけ戻す）。実ホストでの検証は #1437 で `real_host` の `render3_egress_*`（`FANDHE_BROWSER_RENDER_EGRESS_ISOLATION=required`）に足し、xos-measure の suite `egress-host` で実測した（run 41592034373・41650422295 で ubuntu・macOS とも `render3_egress_*` が 3 passed。記録は #1457。§9.5） | #1436・#1437 |
+| 4. 本番への組み込み | （新規の論点） | #1436（PR #1446）で実装済み。HostProcess の起動を Linux は bwrap、macOS は sandbox-exec で包み、通信を本体の許可リスト付きプロキシに限る（`[rendering] egress_isolation`。既定 `best-effort`、`required` は隔離できなければ起動しない）。依存・`unsafe` を足さず外部コマンドで包む方式にしたため、§7 の承認事項のうち依存・`unsafe` を要する案は採っていない。隔離中は WebSocket が使えず（Servo の `websocket_loader` はプロキシを使わない）、ファイルシステム全体は隔離しない（`--dev-bind / /`。#1485 で `/run`・`/tmp`・`$HOME` を、#1492 で `/var/tmp`・`/dev/shm`・WorkDir の親も tmpfs で隠し、WorkDir と隠れる場所にあるホストの実行ファイルだけ戻す）。実ホストでの検証は #1437 で `real_host` の `render3_egress_*`（`FANDHE_BROWSER_RENDER_EGRESS_ISOLATION=required`）に足し、xos-measure の suite `egress-host` で実測した（run 41592034373・41650422295 で ubuntu・macOS とも `render3_egress_*` が 3 passed。記録は #1457。§9.5） | #1436・#1437 |
 
 - 「8 経路すべて pass」（§6.4）のうち `internal_real`・`dns` は構造検査で、Servo 自身の DNS・UDP 送信の外部観測は #1461 の host-capture で追加し、run 41650422295・41703923217 で観測した（§9.5）
 - AppContainer 内の ipc-channel の制約（ボディ付きリクエストで panic し得る）は推定で、未実測（#1421）
@@ -265,7 +265,7 @@ options §7 を引き継ぐ。本書で新たに加わった未確認事項と�
 | Windows の測り直し（loopback 以外の宛先を使う測り方。loopback 免除の下では外側 listener に届くため、現行の測り方では egress を測れない） | #1427 |
 | AppContainer 内の ipc-channel の制約（ボディ付きリクエストで panic し得る。推定・未実測） | #1421 |
 | Landlock ルール適用下の動作・seccomp との併用（保留。§9.5。許可リスト付きプロキシは #1434・#1440・#1436 で本番に実装済み。netns 内の中継 → UDS → プロキシの成立性は §6.5 で確認済み） | #1457 |
-| bwrap のファイルシステム隔離の残り（`--ro-bind / /` 化・`/var/tmp`・`/dev/shm` など `/run`・`/tmp`・`$HOME` 以外の UDS・`temp_root` が `/tmp` と `$HOME` の外にあるときの兄弟 WorkDir。`/run`・`/tmp`・`$HOME` の tmpfs 化は #1485 で対応済み） | #1457 |
+| bwrap のファイルシステム隔離の残り（`--ro-bind / /` 化・`/dev/log`・`/var/lib/*`・`/var/snap/*` 配下の UDS など、隠している場所以外の既知のソケット。`/run`・`/tmp`・`$HOME` の tmpfs 化は #1485、`/var/tmp`・`/dev/shm`・WorkDir の親〔`temp_root` が `/tmp` と `$HOME` の外にあるときの兄弟 WorkDir〕の tmpfs 化は #1492 で対応済み） | #1457 |
 | 隔離中の WebSocket（現状は遮断のまま。WebSocket を必要とするサイトが実際に出たら見直す。§9.5） | #1457 |
 | AppArmor の制限が無い環境の実測と転記（`egress-host-ubuntu-noaa`。仕組みは #1487・PR #1491 で入れた）・6.7 未満のカーネル（ホステッドランナーでは測れない。自前の環境が要る） | #1457・#1487 |
 | net 層の直接接続の網羅 | options §7 の 1 |
@@ -277,7 +277,7 @@ options §7 を引き継ぐ。本書で新たに加わった未確認事項と�
 
 詳細は [servo-host-design.md](./servo-host-design.md) §2.5 の egress 隔離の残余リスク（(4)・(5)。#1451）と、`isolation.rs` のモジュール doc を正とする。ここでは要点だけを記す。
 
-- Linux: FS 全体は隔離しない（`--dev-bind / /`）。`/run`・`/tmp`・`$HOME` は tmpfs で隠す（#1485）ため ssh-agent・X11・gnupg・`temp_root` が `/tmp` 配下にある他インスタンスのプロキシ UDS には届かないが、それ以外の場所（`/var/tmp`・`/dev/shm` 等）の UDS を通る迂回は残る。`temp_root` が `/tmp` と `$HOME` の外にあると兄弟 WorkDir も見えたまま。`$HOME` が不正（未設定・`/` 等）だと隔離できない（`HomeNotHideable`）。
+- Linux: FS 全体は隔離しない（`--dev-bind / /`）。`/run`・`/tmp`・`/var/tmp`・`/dev/shm`・`$HOME`・WorkDir の親は tmpfs で隠す（#1485・#1492）ため ssh-agent・X11・gnupg・他インスタンスのプロキシ UDS には届かないが、それ以外の場所（`/dev/log`・`/var/lib/*`・`/var/snap/*` 等の既知のソケット）の UDS を通る迂回は残る（拒否リスト型の限界）。`$HOME` が不正（未設定・システムのディレクトリ・`/` 等）だと隔離できない（`HomeNotHideable`）。WorkDir の親が `/` やシステムのディレクトリだと覆えず `WorkDirParentNotHideable`（回避策は `/tmp`・`/var/tmp`・`$HOME` 配下などを `temp_root` / `TMPDIR` に指定）。
 - macOS: Seatbelt は IP の送信だけを絞る。mach/XPC 経由の通信は止めない。観測したのは `mDNSResponder` 経由の経路だけで、それ以外は観測していない。
 - 測定（#1433）は `--ro-bind / /` で行ったが、本番は `--dev-bind / /` である。そのため、測定は本番の FS 上の UDS の迂回を覆っていない。#1485 の隠蔽の実地確認は、`isolation.rs` と `tests/host_process.rs` の本物の bwrap を使うテストが担う。実 Servo ホストでの確認はマージ後の xos-measure `egress-host`（人間が実行）。
 - macOS のプローブは試走の終了コードだけで判定し、ns の比較のような偽物を排する手段が無い（Linux は #1459・#1466 で解決）。残余リスクとして受け入れる（2026-11-04・#1457）。
@@ -285,7 +285,8 @@ options §7 を引き継ぐ。本書で新たに加わった未確認事項と�
 
 ### 9.4 判断済みの事項（#1459）
 
-- FS 上の UDS の迂回の塞ぎ方（2026-11-04・#1485。オーナー判断 #1457）: bwrap で `--tmpfs /run`・`--tmpfs /tmp`・`--tmpfs <正規化した $HOME>` の後に、このインスタンスの WorkDir を `--bind`、隠れる場所にあるホストの実行ファイルを `--ro-bind` で戻す（順序が意味を持つ）。`--ro-bind / /`・Landlock・seccomp は使わない。`$HOME` が未設定・相対・`/`・存在しない・ディレクトリでないときは `HomeNotHideable` で隔離不能（`required` は拒否）。プローブも同じ tmpfs フラグで走る。本体の `HOME` も子へ強制で渡す `HOME` も変えない（SEC-2）。ユーザーのフォントと `$HOME` の設定は見えなくなる。
+- FS 上の UDS の迂回の塞ぎ方（2026-11-04・#1485。オーナー判断 #1457。#1492 で拡張）: bwrap で `--tmpfs /run`・`--tmpfs /tmp`・`--tmpfs /var/tmp`・`--tmpfs /dev/shm`・`--tmpfs <正規化した $HOME>`・`--tmpfs <WorkDir の親>` の後に、このインスタンスの WorkDir を `--bind`、隠れる場所にあるホストの実行ファイルを `--ro-bind` で戻す（順序が意味を持つ）。`--ro-bind / /`・Landlock・seccomp は使わない。`$HOME` が未設定・相対・システムのディレクトリ（`/` を含む）・存在しない・ディレクトリでないときは `HomeNotHideable` で隔離不能（`required` は拒否）。固定の対象（`/tmp` 等）は実体パスへ解決し、存在しないものは外し、祖先と子孫が重なるときは祖先だけを残す（`/tmp` が `/var/tmp` への symlink の環境でも 1 本になる）。WorkDir の親は起動ごとに決めて、既に隠れる場所の配下なら重複させず、そうでなければ tmpfs で覆う（兄弟 WorkDir の UDS を `temp_root` の置き場所によらず隠す。覆えない `/`・システムのディレクトリは `WorkDirParentNotHideable`）。親の tmpfs は起動ごとなのでプローブには含めず、覆えない場合は起動の失敗として表に出る（fail-open にはならない）。プローブは固定の対象と `$HOME` の tmpfs で走る。本体の `HOME` も子へ強制で渡す `HOME` も変えない（SEC-2）。ユーザーのフォントと `$HOME` の設定は見えなくなる。
+- tmpfs の `--size`（#1492）: 付けない。`--size` を持たない版の bwrap は未知のオプションで失敗してプローブが落ち（`required` で起動不能）、最低版を決めていない方針と合わず、版で分岐するとプローブと本番の引数が食い違うため（導入版は未確認で、新しい版で入ったオプションと推測）。残余リスクは、ホストが tmpfs を埋めると本体マシンのメモリを消費しうること（tmpfs の既定上限は RAM の 50%。egress とは別の DoS 面）と、tmpfs のページが RSS 監視に計上されない可能性（推測）。
 - プローブの判定方法（2026-11-03）: Linux のプローブは終了コードに加えて、サンドボックス内の `readlink /proc/self/ns/net` の出力（netns の inode）が本体の値と異なることまで確かめる。exit 0 だけの偽物や、ns を作らない偽物は失敗する。詳細は `isolation.rs` の doc を正とする。
 - 作業ディレクトリが `/run` 配下のときの扱い（2026-11-03）: `WorkDirHiddenBySandbox` で隔離不能とする fail-closed のまま変えない。回避策は `/run` の外を `temp_root` または `TMPDIR` に指定すること。2026-11-04 の判断でも変えない（#1457）。挙動は `isolation.rs` の doc を正とする。
 - プローブの前提（2026-11-03・#1466）:

@@ -8,9 +8,10 @@
 //! `pre_exec`・FFI は使わず外部コマンドの引数配列だけで隔離する（シェルを介さない）。
 //!
 //! - Linux: `bwrap --die-with-parent --unshare-net --unshare-pid --dev-bind / / --proc /proc
-//!   --tmpfs /run --tmpfs /tmp [--tmpfs <$HOME>] --bind <WorkDir> <WorkDir> [--ro-bind <ホスト>
-//!   <ホスト>] -- <ホスト> --stdio --egress-relay-uds <UDS>`（`--ro-bind` はホストが `/tmp` か
-//!   `$HOME` の配下にあるときだけ。`--tmpfs` の後に bind を置く順序が意味を持つ）。netns に出口が無くなり、ホストは
+//!   --tmpfs /run --tmpfs /tmp --tmpfs /var/tmp --tmpfs /dev/shm [--tmpfs <$HOME>]
+//!   [--tmpfs <WorkDir の親>] --bind <WorkDir> <WorkDir> [--ro-bind <ホスト> <ホスト>] -- <ホスト>
+//!   --stdio --egress-relay-uds <UDS>`（`--ro-bind` はホストが `/run` 以外の tmpfs の配下にあるときだけ。
+//!   `--tmpfs` の後に bind を置く順序が意味を持つ。`/tmp` 等は実体パスに解決し、存在しないものは外す）。netns に出口が無くなり、ホストは
 //!   netns 内の中継を経由して WorkDir 配下の UDS（本体側のプロキシ）にだけ届く。`--unshare-pid` と
 //!   新しい `/proc` により、ホストから本体の `/proc/<ppid>`（`mem`・`fd`・`environ`・ptrace）が見えず、
 //!   乗っ取られたホストが本体へ介入して隔離を破る経路を塞ぐ。`--proc` は `--dev-bind / /` が
@@ -23,8 +24,16 @@
 //! # 範囲・既知の制約
 //!
 //! - ファイルシステム全体の読み書きは隔離しない（`--dev-bind / /`）。隠すのは `/run`・`/tmp`・
-//!   本体の `$HOME`（tmpfs。#1485）で、戻すのはこのインスタンスの WorkDir（rw）と、隠れる場所に
-//!   あるホストの実行ファイル（ro）だけ。
+//!   `/var/tmp`・`/dev/shm`・本体の `$HOME`・WorkDir の親（tmpfs。#1485・#1492）で、戻すのはこの
+//!   インスタンスの WorkDir（rw）と、隠れる場所にあるホストの実行ファイル（ro）だけ。WorkDir の親
+//!   （`temp_root`）は兄弟 WorkDir（同じ uid の他インスタンスのプロキシ UDS）を見せないため常に隠す。
+//!   既に隠れる場所の配下なら重複させず、`/` やシステムのディレクトリ（`/usr`・`/etc`・`/var` など。
+//!   [`is_system_dir`]）なら覆えないので [`EgressIsolationUnavailable::WorkDirParentNotHideable`]。
+//!   `/tmp` が `/var/tmp` への symlink などの環境では、隠す対象を実体パスで判定して重複を除く。
+//! - tmpfs に `--size` は付けない。`--size` を持たない版の bwrap は未知のオプションで失敗し、
+//!   プローブが `SandboxProbeFailed` になって `required` で起動できなくなる（最低版を決めていない
+//!   方針と合わない）うえ、版で分岐するとプローブと本番の引数が食い違う。残余リスクは、ホストが
+//!   tmpfs を埋めると本体マシンのメモリを消費しうること（egress とは別の DoS 面。#1492）。
 //! - 隔離中は WebSocket が使えない（Servo の `websocket_loader` はプロキシを使わず直接接続する
 //!   ため、遮断されて失敗する）。
 //! - macOS の loopback プロキシは同一マシンの全ユーザー・全プロセスから届く（認証なし。Seatbelt
@@ -32,13 +41,12 @@
 //!   本体の送信元 IP を踏み台にされうる。UDS 化や接続トークンは、Servo のプロキシ設定が TCP
 //!   （`http://127.0.0.1:<port>`）しか扱えず、macOS には netns が無く中継を置いても loopback の
 //!   待ち受けが残るため、別途検討する（RENDER-3・#1451）。
-//! - Linux で残る FS 上の UDS の迂回路: `/run`・`/tmp`・`$HOME` 以外の場所（`/var/tmp`・`/dev/shm`・
-//!   独自の場所）の UDS。また `temp_root` が `/tmp` と `$HOME` の外にあると、兄弟 WorkDir（同じ uid の
-//!   他インスタンスのプロキシ UDS）は見えたままになる。抽象名前空間のソケットは netns ごとに分かれる
-//!   ので対象外（#1457・#1485）。
+//! - Linux で残る FS 上の UDS の迂回路: 隠している場所以外（`/dev/log`・`/var/lib/*`・`/var/snap/*` など
+//!   の既知のソケット）。拒否リスト型の限界で、長期策（`--ro-bind` / Landlock）は保留中。抽象名前空間の
+//!   ソケットは netns ごとに分かれるので対象外（#1457・#1485・#1492）。
 //! - `$HOME` と `/tmp` が隠れるため、ユーザーのフォント（`~/.local/share/fonts`・`~/.fonts`）や
 //!   `$HOME` の設定は見えない（`FONTCONFIG_FILE` 等が `$HOME` 配下を指していても同様）。
-//! - `$HOME` が未設定・相対・`/`・存在しない・ディレクトリでないときは隠せないため
+//! - `$HOME` が未設定・相対・システムのディレクトリ（`/` を含む）・存在しない・ディレクトリでないときは隠せないため
 //!   [`EgressIsolationUnavailable::HomeNotHideable`]（`required` は拒否、`best-effort` は警告つきで
 //!   隔離なし）。`$HOME` はプローブ時に 1 回だけ読みキャッシュする。本体の `HOME` も子へ強制で渡す
 //!   `HOME` も書き換えない（SEC-2）。`$HOME` がシステムのディレクトリを指すとプローブか起動が失敗する
@@ -179,6 +187,13 @@ pub enum EgressIsolationUnavailable {
     /// RENDER-3・#1485）。`required` は起動を拒否し、`best-effort` は警告つきで隔離なしで起動する。
     /// 回避策は有効な絶対パスのディレクトリを `HOME` に設定すること（最小構成のコンテナで起きやすい）。
     HomeNotHideable,
+    /// 作業ディレクトリの親（`temp_root` を正規化したもの）を tmpfs で隠せない。親が `/tmp`・
+    /// `/var/tmp`・`/dev/shm`・`$HOME` の配下なら既に隠れているが、それ以外（例: `/mnt/x`）は親を
+    /// tmpfs で覆って兄弟 WorkDir の UDS を塞ぐ。親が `/` やシステムのディレクトリ（`/usr`・`/etc`
+    /// など）だと覆えないため、`required` は起動を拒否し、`best-effort` は警告つきで隔離なしで
+    /// 起動する（RENDER-3・SEC-2・#1492）。回避策は `/tmp`・`/var/tmp`・`$HOME` の配下などを
+    /// `temp_root`（`with_temp_root`）または `TMPDIR` に指定すること。
+    WorkDirParentNotHideable,
 }
 
 impl EgressIsolationUnavailable {
@@ -194,6 +209,9 @@ impl EgressIsolationUnavailable {
             Self::WorkDirHiddenBySandbox => "work directory is hidden by the sandbox",
             Self::SocketPathInvalid => "relay socket path is not usable",
             Self::HomeNotHideable => "home directory cannot be hidden by the sandbox",
+            Self::WorkDirParentNotHideable => {
+                "work directory's parent cannot be hidden by the sandbox"
+            }
         }
     }
 }
@@ -293,53 +311,157 @@ pub fn isolation_warning_message(reason: EgressIsolationUnavailable) -> String {
     )
 }
 
-/// bwrap が隠す対象（`--tmpfs`）。`/run` と `/tmp` は固定で、`$HOME` はプローブ時に 1 回だけ
-/// 解決した正規化済みパス（RENDER-3・SEC-2・#1485）。FS 上の UDS（`/tmp/ssh-*/agent.*`・
-/// `/tmp/.X11-unix`・`~/.gnupg/S.*`・同じ uid の他インスタンスのプロキシ UDS）が netns の外への
-/// 迂回路になるのを塞ぐ。本体の `HOME` 環境変数は書き換えない（子へ強制で渡す `HOME` も `env.rs` のまま）。
+/// 固定で隠す場所の候補（`--tmpfs`。RENDER-3・#1492）。`/run` はリテラルのまま扱い
+/// （[`workdir_hidden_by_sandbox`] と対応）、残りは [`resolve_fixed_targets`] で実体パスに解決する。
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+const FIXED_CANDIDATES: [&str; 4] = ["/run", "/tmp", "/var/tmp", "/dev/shm"];
+
+/// 並べた `--tmpfs` の対象から、既に採用した対象の配下（成分単位）にあるものを捨て、後から来た
+/// 祖先が先の子孫を覆うときは子孫を取り除く（祖先を残す）。順序は保つ。tmpfs の重複と、祖先の
+/// tmpfs が子孫の tmpfs を消してしまう順序問題を避ける（RENDER-3・#1492）。
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn merge_tmpfs_targets(targets: &[PathBuf]) -> Vec<PathBuf> {
+    let mut kept: Vec<PathBuf> = Vec::new();
+    for t in targets {
+        if kept.iter().any(|k| t.starts_with(k)) {
+            continue;
+        }
+        kept.retain(|k| !k.starts_with(t));
+        kept.push(t.clone());
+    }
+    kept
+}
+
+/// 隠せないシステムのディレクトリか（正規化済みのパスで判定。RENDER-3・#1492）。
+///
+/// 配下も含めて真: `/proc`・`/sys`・`/usr`・`/etc`・`/bin`・`/sbin`・`/boot` と、先頭成分が `lib` で
+/// 始まるもの（`/lib`・`/lib64` など。安全側に倒して `/libertine` も真）。それ自身だけ真: `/`・
+/// `/dev`・`/var`（`/var/tmp` や `/var/lib/<service>` のサービスユーザーの HOME を壊さないため。
+/// `/dev/shm` は固定の tmpfs 対象）。
+fn is_system_dir(canonical: &Path) -> bool {
+    let mut normals = canonical.components().filter_map(|c| match c {
+        Component::Normal(n) => Some(n),
+        _ => None,
+    });
+    let mut first_opt = normals.next();
+    // macOS では `/etc`・`/var` が `/private/etc`・`/private/var` への symlink で、正規化すると
+    // 先頭に `private` が付く。判定では `/private` を外して Linux と同じ表で見る。
+    if first_opt.is_some_and(|f| f == "private") {
+        first_opt = normals.next();
+    }
+    let Some(first) = first_opt else {
+        return true; // `/`
+    };
+    let has_more = normals.next().is_some();
+    let first = first.to_string_lossy();
+    if matches!(
+        first.as_ref(),
+        "proc" | "sys" | "usr" | "etc" | "bin" | "sbin" | "boot"
+    ) || first.starts_with("lib")
+    {
+        return true;
+    }
+    !has_more && matches!(first.as_ref(), "dev" | "var")
+}
+
+/// [`FIXED_CANDIDATES`] を実体パスへ解決する（`canon` は canonicalize の注入点。RENDER-3・#1492）。
+///
+/// `/run` はリテラルのまま。存在しない候補（`NotFound`）は UDS が無いので外す（`--dev-bind / /` の下で
+/// 存在しない場所に `--tmpfs` を張ると bwrap が失敗するため）。それ以外のエラーと、システムの
+/// ディレクトリに解決されるものは [`EgressIsolationUnavailable::SandboxProbeFailed`]（fail-closed）。
+/// symlink 経由の重複（`/tmp -> /var/tmp` など）と `/run` 配下は [`merge_tmpfs_targets`] で除く。
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn resolve_fixed_targets(
+    canon: impl Fn(&Path) -> std::io::Result<PathBuf>,
+) -> Result<Vec<PathBuf>, EgressIsolationUnavailable> {
+    let mut out = Vec::new();
+    for c in FIXED_CANDIDATES {
+        let path = Path::new(c);
+        if c == "/run" {
+            out.push(path.to_path_buf());
+            continue;
+        }
+        match canon(path) {
+            Ok(real) if is_system_dir(&real) => {
+                return Err(EgressIsolationUnavailable::SandboxProbeFailed);
+            }
+            Ok(real) => out.push(real),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return Err(EgressIsolationUnavailable::SandboxProbeFailed),
+        }
+    }
+    Ok(merge_tmpfs_targets(&out))
+}
+
+/// 実ファイルシステムで [`resolve_fixed_targets`] を解くときの canonicalize（ディレクトリでなければ
+/// エラーにする）。
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn canonicalize_dir(path: &Path) -> std::io::Result<PathBuf> {
+    let real = std::fs::canonicalize(path)?;
+    if real.is_dir() {
+        Ok(real)
+    } else {
+        Err(std::io::Error::other("not a directory"))
+    }
+}
+
+/// bwrap が隠す対象（`--tmpfs`）。固定の `/run`・`/tmp`・`/var/tmp`・`/dev/shm`（正規化・重複除去済み）
+/// と、プローブ時に 1 回だけ解決した正規化済みの `$HOME`（RENDER-3・SEC-2・#1485・#1492）。FS 上の
+/// UDS（`/tmp/ssh-*/agent.*`・`/tmp/.X11-unix`・`~/.gnupg/S.*`・同じ uid の他インスタンスのプロキシ
+/// UDS）が netns の外への迂回路になるのを塞ぐ。本体の `HOME` 環境変数は書き換えない（子へ強制で渡す
+/// `HOME` も `env.rs` のまま）。WorkDir の親の tmpfs は起動ごとに決まるのでここには含めない
+/// （[`socket_dir_for`]）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct HiddenPaths {
-    /// 正規化済みの `$HOME`。`/run`・`/tmp` の配下なら既に隠れているので `None`（tmpfs の重複を省く）。
+    /// 解決済みの固定対象（先頭は `/run`）。
+    fixed: Vec<PathBuf>,
+    /// 正規化済みの `$HOME`。固定対象の配下なら既に隠れているので `None`（tmpfs の重複を省く）。
     home: Option<PathBuf>,
 }
 
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 impl HiddenPaths {
-    /// 固定で隠すパス（`--tmpfs` の先頭 2 つ）。
-    const FIXED: [&'static str; 2] = ["/run", "/tmp"];
-
-    /// 正規化済みの `$HOME`（[`resolve_home_to_hide`] の結果）から作る。
-    pub(super) fn new(home_canonical: PathBuf) -> Self {
-        let covered = Self::FIXED.iter().any(|f| home_canonical.starts_with(f));
+    /// 解決済みの固定対象（[`resolve_fixed_targets`]）と正規化済みの `$HOME`
+    /// （[`resolve_home_to_hide`]）から作る。
+    pub(super) fn from_resolved(fixed: Vec<PathBuf>, home_canonical: PathBuf) -> Self {
+        let covered = fixed.iter().any(|f| home_canonical.starts_with(f));
         Self {
+            fixed,
             home: if covered { None } else { Some(home_canonical) },
         }
     }
 
-    /// `--tmpfs` を並べる順の対象（`/run`・`/tmp`・必要なら `$HOME`）。
-    fn tmpfs_targets(&self) -> Vec<&Path> {
-        let mut v: Vec<&Path> = Self::FIXED.iter().map(Path::new).collect();
-        v.extend(self.home.as_deref());
-        v
+    /// テスト用: 固定対象を `/run`・`/tmp`・`/var/tmp`・`/dev/shm` として作る。
+    #[cfg(test)]
+    pub(super) fn new(home_canonical: PathBuf) -> Self {
+        let fixed = FIXED_CANDIDATES.iter().map(PathBuf::from).collect();
+        Self::from_resolved(fixed, home_canonical)
     }
 
-    /// 正規化済みの `canonical` が `/tmp` か `$HOME` の配下で隠れるか。ホストの実行ファイルを
+    /// `--tmpfs` を並べる順の対象（固定 -> `$HOME` -> WorkDir の親。祖先を残して重複除去）。
+    pub(super) fn tmpfs_targets(&self, parent: Option<&Path>) -> Vec<PathBuf> {
+        let mut v = self.fixed.clone();
+        v.extend(self.home.clone());
+        v.extend(parent.map(Path::to_path_buf));
+        merge_tmpfs_targets(&v)
+    }
+
+    /// 正規化済みの `canonical` が（`/run` 以外の）tmpfs 対象の配下で隠れるか。ホストの実行ファイルを
     /// `--ro-bind` で戻す要否の判定に使う。`/run` 配下は含めない（従来どおり。#1485 のスコープ外）。
-    pub(super) fn hides(&self, canonical: &Path) -> bool {
-        canonical.starts_with("/tmp")
-            || self
-                .home
-                .as_deref()
-                .is_some_and(|h| canonical.starts_with(h))
+    pub(super) fn hides(&self, canonical: &Path, parent: Option<&Path>) -> bool {
+        self.tmpfs_targets(parent)
+            .iter()
+            .filter(|t| t.as_path() != Path::new("/run"))
+            .any(|t| canonical.starts_with(t))
     }
 }
 
-/// `$HOME` の生の値を、tmpfs で隠せる正規化済みパスへ解決する（RENDER-3・#1485）。
+/// `$HOME` の生の値を、tmpfs で隠せる正規化済みパスへ解決する（RENDER-3・#1485・#1492）。
 ///
-/// 絶対パスで、正規化でき、`/` ではなく、ディレクトリのときだけ `Ok`。それ以外（未設定・相対・
-/// 存在しない・`/`〔`//`・`/.`・`/` を指す symlink を含む〕・ファイル）は
-/// [`EgressIsolationUnavailable::HomeNotHideable`]。環境変数を書き換えずにテストできるよう、
-/// 値は引数で受け取る（edition 2024 の `set_var` は `unsafe`）。
+/// 絶対パスで、正規化でき、システムのディレクトリ（[`is_system_dir`]。`/` を含む）ではなく、
+/// ディレクトリのときだけ `Ok`。それ以外（未設定・相対・存在しない・`/`〔`//`・`/.`・`/` を指す
+/// symlink を含む〕・`/usr` など・ファイル）は [`EgressIsolationUnavailable::HomeNotHideable`]。
+/// 環境変数を書き換えずにテストできるよう、値は引数で受け取る（edition 2024 の `set_var` は `unsafe`）。
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(super) fn resolve_home_to_hide(
     raw: Option<&std::ffi::OsStr>,
@@ -350,12 +472,13 @@ pub(super) fn resolve_home_to_hide(
         return Err(bad);
     }
     let canonical = std::fs::canonicalize(path).map_err(|_| bad)?;
-    if canonical == Path::new("/") || !canonical.is_dir() {
+    // 正規化の前後の両方で判定する（macOS の `/etc` -> `/private/etc` のように、symlink 越しで
+    // 拒否リストから外れるのを防ぐ）。
+    if is_system_dir(path) || is_system_dir(&canonical) || !canonical.is_dir() {
         return Err(bad);
     }
     Ok(canonical)
 }
-
 /// `--bind` / `--ro-bind` の種別（tmpfs で隠した後に戻すもの）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
@@ -365,11 +488,13 @@ pub(super) enum BindKind {
 }
 
 /// bwrap を包む引数（`--` まで）。プローブと本番で名前空間・`--dev-bind`・`--proc`・`--tmpfs` を
-/// 同じにする（RENDER-3）。`--proc /proc` は `--dev-bind / /` の後ろに、`binds`（隠した後に戻す
+/// 同じにする（RENDER-3）。ただし WorkDir の親の tmpfs（`tmpfs` に含める）は起動ごとに決まるため
+/// 本番だけが持つ。プローブに含めなくても、親を覆えない場合は起動の失敗として表に出る
+/// （fail-closed。隔離なしで起動する経路は増えない。#1492）。`--proc /proc` は `--dev-bind / /` の後ろに、`binds`（隠した後に戻す
 /// 自分の WorkDir とホストの実行ファイル）は `--tmpfs` の**後ろ**に置く（順序が意味を持つ）。
 /// bind は起動ごとのものなのでプローブには付けない。
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-fn linux_wrapper_args(hidden: &HiddenPaths, binds: &[(BindKind, &Path)]) -> Vec<OsString> {
+fn linux_wrapper_args(tmpfs: &[PathBuf], binds: &[(BindKind, &Path)]) -> Vec<OsString> {
     let mut args: Vec<OsString> = [
         "--die-with-parent",
         "--unshare-net",
@@ -383,7 +508,7 @@ fn linux_wrapper_args(hidden: &HiddenPaths, binds: &[(BindKind, &Path)]) -> Vec<
     .iter()
     .map(OsString::from)
     .collect();
-    for t in hidden.tmpfs_targets() {
+    for t in tmpfs {
         args.push(OsString::from("--tmpfs"));
         args.push(t.as_os_str().to_owned());
     }
@@ -401,14 +526,16 @@ fn linux_wrapper_args(hidden: &HiddenPaths, binds: &[(BindKind, &Path)]) -> Vec<
 
 /// Linux の起動コマンド（プログラムと引数）を組み立てる（FS には触れない純関数）。
 ///
-/// `workdir` は正規化済みの WorkDir（rw で戻す）、`host` は正規化済みのホスト実行ファイル（隠れる
-/// 場所にあるときだけ ro で戻す）。`relay_uds` が `workdir` の外だと隠れて届かないため `None`
+/// `workdir` は正規化済みの WorkDir（rw で戻す）、`parent_to_hide` は tmpfs で覆う WorkDir の親
+/// （[`SocketDir::parent_to_hide`]。既に隠れているなら `None`。#1492）、`host` は正規化済みの
+/// ホスト実行ファイル（隠れる場所にあるときだけ ro で戻す）。`relay_uds` が `workdir` の外だと隠れて届かないため `None`
 /// （呼び出し側が起動失敗にする）。
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(super) fn linux_argv(
     bwrap: &Path,
     hidden: &HiddenPaths,
     workdir: &Path,
+    parent_to_hide: Option<&Path>,
     host: &Path,
     relay_uds: &Path,
 ) -> Option<(PathBuf, Vec<OsString>)> {
@@ -416,10 +543,10 @@ pub(super) fn linux_argv(
         return None;
     }
     let mut binds = vec![(BindKind::ReadWrite, workdir)];
-    if hidden.hides(host) {
+    if hidden.hides(host, parent_to_hide) {
         binds.push((BindKind::ReadOnly, host));
     }
-    let mut args = linux_wrapper_args(hidden, &binds);
+    let mut args = linux_wrapper_args(&hidden.tmpfs_targets(parent_to_hide), &binds);
     args.push(host.as_os_str().to_owned());
     args.extend(HOST_ARGS.iter().map(OsString::from));
     args.push(OsString::from("--egress-relay-uds"));
@@ -439,7 +566,7 @@ fn linux_probe_argv(
     link: &str,
 ) -> (PathBuf, Vec<OsString>) {
     // readlink は root 所有の `/usr/bin`・`/bin` にあり隠れないため、bind は要らない。
-    let mut args = linux_wrapper_args(hidden, &[]);
+    let mut args = linux_wrapper_args(&hidden.tmpfs_targets(None), &[]);
     args.push(readlink_exec.as_os_str().to_owned());
     args.push(OsString::from(link));
     (bwrap.to_path_buf(), args)
@@ -542,23 +669,66 @@ pub(super) fn workdir_hidden_by_sandbox(canonical: &Path) -> bool {
 /// 結合テストが bind 済みの実パスと突き合わせる）。
 pub(super) const EGRESS_SOCKET_NAME: &str = "egress-proxy.sock";
 
-/// bwrap 用に、WorkDir を正規化してソケット用ディレクトリとして返す。`--tmpfs /run` に隠れる、
-/// または UDS のパスが規則に反する場合は隔離できない理由を返す（fail-closed）。
+/// [`socket_dir_for`] の結果。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct SocketDir {
+    /// 正規化済みの WorkDir（UDS を置くディレクトリ）。
+    pub(super) dir: PathBuf,
+    /// 起動時に tmpfs で覆う WorkDir の親。既に隠れる場所（`/tmp`・`/var/tmp`・`/dev/shm`・`$HOME` 配下）
+    /// なら `None`。
+    pub(super) parent_to_hide: Option<PathBuf>,
+}
+
+/// WorkDir の（正規化済みの）親について、tmpfs で覆う要否を決める（RENDER-3・SEC-2・#1492）。
 ///
-/// 返すのは `HostProcess` がこの起動のために排他的に作った 0700 の WorkDir ルートで、
+/// 兄弟 WorkDir（同じ uid の他インスタンスのプロキシ UDS）を見えなくするため、親は常に隠れていなければ
+/// ならない。親が既存の tmpfs 対象の配下なら `Ok(None)`。そうでなく、親が無い・`/`・システムの
+/// ディレクトリなら覆えないので [`EgressIsolationUnavailable::WorkDirParentNotHideable`]。
+/// それ以外は `Ok(Some(親))`。覆われているかの判定をシステムディレクトリの判定より先に行う
+/// （`/var/tmp` などの正当な置き場所を拒否しないため）。
+fn parent_to_hide(
+    parent: Option<&Path>,
+    hidden: &HiddenPaths,
+) -> Result<Option<PathBuf>, EgressIsolationUnavailable> {
+    let bad = EgressIsolationUnavailable::WorkDirParentNotHideable;
+    let parent = parent.ok_or(bad)?;
+    if hidden
+        .tmpfs_targets(None)
+        .iter()
+        .any(|t| parent.starts_with(t))
+    {
+        return Ok(None);
+    }
+    if is_system_dir(parent) {
+        return Err(bad);
+    }
+    Ok(Some(parent.to_path_buf()))
+}
+
+/// bwrap 用に、WorkDir を正規化してソケット用ディレクトリとして返す。`--tmpfs /run` に隠れる、
+/// UDS のパスが規則に反する、または親を隠せない場合は隔離できない理由を返す（fail-closed）。
+///
+/// 返す `dir` は `HostProcess` がこの起動のために排他的に作った 0700 の WorkDir ルートで、
 /// `EgressEndpoint::UnixSocketIn` の呼び出し側の契約を満たす（#1444・#1450）。契約はテスト
 /// `render_3_sec_2_uds_dir_is_created_by_host_process_0700_and_owned`（`host_process.rs`）が、
 /// `spawn` と同じ部品を直接呼んで固定する（`spawn` 自体は通さない範囲は同テストの doc を参照）。
-pub(super) fn socket_dir_for(workdir: &Path) -> Result<PathBuf, EgressIsolationUnavailable> {
+/// `parent_to_hide` は `host_process.rs` の `build_command` が [`linux_argv`] へ渡す。
+pub(super) fn socket_dir_for(
+    workdir: &Path,
+    hidden: &HiddenPaths,
+) -> Result<SocketDir, EgressIsolationUnavailable> {
     let canonical = std::fs::canonicalize(workdir)
         .map_err(|_| EgressIsolationUnavailable::SocketPathInvalid)?;
     if workdir_hidden_by_sandbox(&canonical) {
         return Err(EgressIsolationUnavailable::WorkDirHiddenBySandbox);
     }
     relay_socket_path_ok(&canonical.join(EGRESS_SOCKET_NAME))?;
-    Ok(canonical)
+    let parent_to_hide = parent_to_hide(canonical.parent(), hidden)?;
+    Ok(SocketDir {
+        dir: canonical,
+        parent_to_hide,
+    })
 }
-
 /// メタデータが外部コマンドとして信頼できるか（RENDER-3・#1451）。通常ファイル・実行ビットあり・
 /// 所有者が root・group / other に書き込み権限なし。root 所有のファイルはテストで作れないため
 /// 純関数に分けている。
@@ -850,8 +1020,11 @@ fn probe_uncached() -> Result<Sandbox, EgressIsolationUnavailable> {
     let bwrap = select_trusted(&BWRAP_CANDIDATES)?;
     let readlink_exec = select_trusted_exec(&READLINK_CANDIDATES)?;
     // `$HOME` はプローブ時に 1 回だけ読み、結果と一緒にキャッシュする（プロセスの生存中は変わらない前提。
-    // 本体の環境変数は書き換えない。SEC-2）。エラーの優先順位は ツールの有無・信頼 → HOME → 試走。
-    let hidden = HiddenPaths::new(resolve_home_to_hide(std::env::var_os("HOME").as_deref())?);
+    // 本体の環境変数は書き換えない。SEC-2）。エラーの優先順位は ツールの有無・信頼 → HOME →
+    // 固定対象（`/tmp` 等の解決）→ 試走。WorkDir の親の tmpfs は起動ごとなのでここには含めない（#1492）。
+    let home = resolve_home_to_hide(std::env::var_os("HOME").as_deref())?;
+    let fixed = resolve_fixed_targets(canonicalize_dir)?;
+    let hidden = HiddenPaths::from_resolved(fixed, home);
     // 実起動（`build_command`）は、ここでキャッシュした実体パスを `select_trusted` を通し直さず使う。
     // 実体は root 所有で祖先まで書き込み不可のまま、プロセスの生存中は変わらない前提に立つ
     // （差し替えには root が要り、脅威モデルの外。設計 §9.3）。
@@ -1198,6 +1371,10 @@ mod tests {
                     "--tmpfs",
                     "/tmp",
                     "--tmpfs",
+                    "/var/tmp",
+                    "--tmpfs",
+                    "/dev/shm",
+                    "--tmpfs",
                     "/home/u",
                     "--",
                     "/usr/bin/readlink",
@@ -1401,6 +1578,7 @@ mod tests {
             Path::new("/usr/bin/bwrap"),
             &hidden,
             Path::new("/tmp/w"),
+            None,
             Path::new("/home/u/t/servo-host"),
             Path::new("/tmp/w/egress-proxy.sock"),
         )
@@ -1422,6 +1600,10 @@ mod tests {
                 "/run",
                 "--tmpfs",
                 "/tmp",
+                "--tmpfs",
+                "/var/tmp",
+                "--tmpfs",
+                "/dev/shm",
                 "--tmpfs",
                 "/home/u",
                 "--bind",
@@ -1459,6 +1641,7 @@ mod tests {
             Path::new("/usr/bin/bwrap"),
             &hidden,
             Path::new("/tmp/w"),
+            None,
             Path::new("/opt/host/servo-host"),
             Path::new("/tmp/w/egress-proxy.sock"),
         )
@@ -1471,6 +1654,10 @@ mod tests {
                 "/run",
                 "--tmpfs",
                 "/tmp",
+                "--tmpfs",
+                "/var/tmp",
+                "--tmpfs",
+                "/dev/shm",
                 "--tmpfs",
                 "/home/u",
                 "--bind",
@@ -1495,6 +1682,7 @@ mod tests {
             Path::new("/usr/bin/bwrap"),
             &hidden,
             Path::new("/tmp/w"),
+            None,
             Path::new("/tmp/h/servo-host"),
             Path::new("/tmp/w/egress-proxy.sock"),
         )
@@ -1507,6 +1695,10 @@ mod tests {
                 "/run",
                 "--tmpfs",
                 "/tmp",
+                "--tmpfs",
+                "/var/tmp",
+                "--tmpfs",
+                "/dev/shm",
                 "--bind",
                 "/tmp/w",
                 "/tmp/w",
@@ -1533,6 +1725,7 @@ mod tests {
                 Path::new("/usr/bin/bwrap"),
                 &hidden,
                 Path::new("/tmp/w"),
+                None,
                 Path::new("/opt/host"),
                 Path::new("/tmp/other/egress-proxy.sock"),
             )
@@ -1575,7 +1768,7 @@ mod tests {
         if sub.starts_with("/tmp") {
             let h = HiddenPaths::new(sub.clone());
             assert_eq!(h.home, None);
-            assert!(h.hides(&sub.join("child")));
+            assert!(h.hides(&sub.join("child"), None));
         }
         let _ = std::fs::remove_dir_all(&dir);
 
@@ -1594,26 +1787,326 @@ mod tests {
     #[test]
     fn render3_hidden_paths_hides() {
         let h = HiddenPaths::new(PathBuf::from("/home/u"));
-        assert!(h.hides(Path::new("/tmp/x")));
-        assert!(!h.hides(Path::new("/tmpx")));
-        assert!(h.hides(Path::new("/home/u/a")));
-        assert!(!h.hides(Path::new("/home/ux")));
-        assert!(!h.hides(Path::new("/opt/x")));
-        assert!(!h.hides(Path::new("/run/x")));
+        assert!(h.hides(Path::new("/tmp/x"), None));
+        assert!(!h.hides(Path::new("/tmpx"), None));
+        assert!(h.hides(Path::new("/var/tmp/x"), None));
+        assert!(h.hides(Path::new("/dev/shm/x"), None));
+        assert!(!h.hides(Path::new("/var/tmpx"), None));
+        assert!(h.hides(Path::new("/home/u/a"), None));
+        assert!(!h.hides(Path::new("/home/ux"), None));
+        assert!(!h.hides(Path::new("/opt/x"), None));
+        assert!(!h.hides(Path::new("/run/x"), None));
+        // WorkDir の親の配下も隠れる（#1492）。
+        let parent = Path::new("/mnt/x");
+        assert!(h.hides(Path::new("/mnt/x/host"), Some(parent)));
+        assert!(!h.hides(Path::new("/mnt/x/host"), None));
+        assert!(!h.hides(Path::new("/mnt/xy/host"), Some(parent)));
+    }
+
+    fn pb(v: &[&str]) -> Vec<PathBuf> {
+        v.iter().map(PathBuf::from).collect()
+    }
+
+    /// RENDER-3（#1492）: 親を隠すと `--tmpfs` が固定 -> `$HOME` -> 親の順に出て、bind はその後ろ。
+    /// WorkDir の親が `/mnt/x`（どの tmpfs にも覆われない）の場合。
+    #[test]
+    fn render3_linux_argv_hides_uncovered_workdir_parent() {
+        let hidden = HiddenPaths::new(PathBuf::from("/home/u"));
+        let (_, args) = linux_argv(
+            Path::new("/usr/bin/bwrap"),
+            &hidden,
+            Path::new("/mnt/x/w"),
+            Some(Path::new("/mnt/x")),
+            Path::new("/mnt/x/host"),
+            Path::new("/mnt/x/w/egress-proxy.sock"),
+        )
+        .unwrap();
+        let got = argv_strs(&args);
+        assert_eq!(
+            &got[8..],
+            [
+                "--tmpfs",
+                "/run",
+                "--tmpfs",
+                "/tmp",
+                "--tmpfs",
+                "/var/tmp",
+                "--tmpfs",
+                "/dev/shm",
+                "--tmpfs",
+                "/home/u",
+                "--tmpfs",
+                "/mnt/x",
+                "--bind",
+                "/mnt/x/w",
+                "/mnt/x/w",
+                // ホストも親の配下なので ro で戻す。
+                "--ro-bind",
+                "/mnt/x/host",
+                "/mnt/x/host",
+                "--",
+                "/mnt/x/host",
+                "--stdio",
+                "--egress-relay-uds",
+                "/mnt/x/w/egress-proxy.sock",
+            ]
+        );
+        assert_bind_order(&got);
+    }
+
+    /// RENDER-3（#1492）: `/var/tmp`・`/dev/shm` 配下のホストは `--ro-bind` で戻し、`/opt` は戻さない。
+    /// 親が既に隠れているなら（`parent_to_hide` が `None`）親の `--tmpfs` は出ない。
+    #[test]
+    fn render3_linux_argv_ro_binds_host_under_var_tmp_and_dev_shm() {
+        let hidden = HiddenPaths::new(PathBuf::from("/home/u"));
+        for host in ["/var/tmp/h/servo-host", "/dev/shm/h/servo-host"] {
+            let (_, args) = linux_argv(
+                Path::new("/usr/bin/bwrap"),
+                &hidden,
+                Path::new("/var/tmp/w"),
+                None,
+                Path::new(host),
+                Path::new("/var/tmp/w/egress-proxy.sock"),
+            )
+            .unwrap();
+            let got = argv_strs(&args);
+            assert!(got.contains(&"--ro-bind"), "{host}");
+            assert_eq!(got.iter().filter(|a| **a == "/var/tmp").count(), 1);
+            assert_eq!(got.iter().filter(|a| **a == "--tmpfs").count(), 5);
+            assert_bind_order(&got);
+        }
+    }
+
+    /// RENDER-3（#1492）: `temp_root=/home`・`HOME=/home/u` のように祖先が来るときは祖先だけを残す。
+    #[test]
+    fn render3_linux_argv_keeps_only_ancestor_tmpfs() {
+        let hidden = HiddenPaths::new(PathBuf::from("/home/u"));
+        let (_, args) = linux_argv(
+            Path::new("/usr/bin/bwrap"),
+            &hidden,
+            Path::new("/home/w"),
+            Some(Path::new("/home")),
+            Path::new("/opt/host"),
+            Path::new("/home/w/egress-proxy.sock"),
+        )
+        .unwrap();
+        let got = argv_strs(&args);
+        assert_eq!(
+            &got[8..16],
+            [
+                "--tmpfs", "/run", "--tmpfs", "/tmp", "--tmpfs", "/var/tmp", "--tmpfs", "/dev/shm",
+            ]
+        );
+        assert_eq!(&got[16..18], ["--tmpfs", "/home"]);
+        assert_eq!(&got[18..20], ["--bind", "/home/w"]);
+        assert!(!got.contains(&"/home/u"));
+    }
+
+    /// RENDER-3（#1492）: tmpfs 対象の併合は、重複・子孫を捨て、後から来た祖先が先の子孫を消す。
+    /// 判定は成分単位（`/tmpx` は `/tmp` の配下ではない）。
+    #[test]
+    fn render3_merge_tmpfs_targets_cases() {
+        assert_eq!(
+            merge_tmpfs_targets(&pb(&["/run", "/tmp", "/tmp", "/tmp/a", "/tmpx"])),
+            pb(&["/run", "/tmp", "/tmpx"])
+        );
+        assert_eq!(
+            merge_tmpfs_targets(&pb(&["/home/u", "/tmp", "/home"])),
+            pb(&["/tmp", "/home"])
+        );
+        assert_eq!(merge_tmpfs_targets(&[]), Vec::<PathBuf>::new());
+    }
+
+    /// RENDER-3（#1492）: 固定対象の解決。`/tmp -> /var/tmp` は 1 本になり、`/dev/shm -> /run/shm` は
+    /// `/run` に含まれて消え、存在しない候補は外す。それ以外のエラーとシステムのディレクトリへの
+    /// 解決は `SandboxProbeFailed`。
+    #[test]
+    fn render3_resolve_fixed_targets_cases() {
+        use std::io::{Error, ErrorKind};
+        let ok = |m: &'static [(&'static str, &'static str)]| {
+            move |p: &Path| {
+                m.iter()
+                    .find(|(k, _)| Path::new(k) == p)
+                    .map(|(_, v)| PathBuf::from(v))
+                    .ok_or_else(|| Error::from(ErrorKind::NotFound))
+            }
+        };
+        assert_eq!(
+            resolve_fixed_targets(ok(&[
+                ("/tmp", "/tmp"),
+                ("/var/tmp", "/var/tmp"),
+                ("/dev/shm", "/dev/shm")
+            ])),
+            Ok(pb(&["/run", "/tmp", "/var/tmp", "/dev/shm"]))
+        );
+        assert_eq!(
+            resolve_fixed_targets(ok(&[
+                ("/tmp", "/var/tmp"),
+                ("/var/tmp", "/var/tmp"),
+                ("/dev/shm", "/run/shm")
+            ])),
+            Ok(pb(&["/run", "/var/tmp"]))
+        );
+        // 存在しない候補は外す。
+        assert_eq!(
+            resolve_fixed_targets(ok(&[("/tmp", "/tmp")])),
+            Ok(pb(&["/run", "/tmp"]))
+        );
+        // NotFound 以外のエラー。
+        let denied = |_: &Path| Err(Error::from(ErrorKind::PermissionDenied));
+        assert_eq!(
+            resolve_fixed_targets(denied),
+            Err(EgressIsolationUnavailable::SandboxProbeFailed)
+        );
+        // システムのディレクトリへ解決される場合。
+        assert_eq!(
+            resolve_fixed_targets(ok(&[("/tmp", "/usr/tmp")])),
+            Err(EgressIsolationUnavailable::SandboxProbeFailed)
+        );
+    }
+
+    /// RENDER-3（#1492）: システムのディレクトリの判定。`/var`・`/dev` はそれ自身だけ真。
+    #[test]
+    fn render3_is_system_dir_cases() {
+        for t in [
+            "/",
+            "/usr",
+            "/usr/local/x",
+            "/etc/x",
+            "/bin",
+            "/sbin/x",
+            "/boot",
+            "/lib",
+            "/lib64",
+            "/libx32/a",
+            "/libertine",
+            "/proc/1",
+            "/sys",
+            "/dev",
+            "/var",
+        ] {
+            assert!(is_system_dir(Path::new(t)), "{t}");
+        }
+        for f in [
+            "/var/tmp",
+            "/var/lib/svc",
+            "/dev/shm",
+            "/home/u",
+            "/usr2",
+            "/mnt/x",
+            "/opt",
+            "/tmp",
+        ] {
+            assert!(!is_system_dir(Path::new(f)), "{f}");
+        }
+    }
+
+    /// RENDER-3（#1492）: 親の判定。覆われていれば `None`、覆われていない通常の場所は `Some`、
+    /// 親なし・`/`・システムのディレクトリは `WorkDirParentNotHideable`。覆われているかを先に見る。
+    #[test]
+    fn render3_parent_to_hide_cases() {
+        let hidden = HiddenPaths::new(PathBuf::from("/home/u"));
+        for covered in ["/tmp", "/var/tmp", "/dev/shm", "/home/u", "/home/u/x/y"] {
+            assert_eq!(
+                parent_to_hide(Some(Path::new(covered)), &hidden),
+                Ok(None),
+                "{covered}"
+            );
+        }
+        assert_eq!(
+            parent_to_hide(Some(Path::new("/mnt/x")), &hidden),
+            Ok(Some(PathBuf::from("/mnt/x")))
+        );
+        // `/home/ux` は `$HOME`（/home/u）の配下ではない。
+        assert_eq!(
+            parent_to_hide(Some(Path::new("/home/ux")), &hidden),
+            Ok(Some(PathBuf::from("/home/ux")))
+        );
+        let bad = Err(EgressIsolationUnavailable::WorkDirParentNotHideable);
+        assert_eq!(parent_to_hide(None, &hidden), bad);
+        for sys in ["/", "/usr", "/usr/local", "/etc", "/dev", "/var", "/proc"] {
+            assert_eq!(parent_to_hide(Some(Path::new(sys)), &hidden), bad, "{sys}");
+        }
+    }
+
+    /// RENDER-3（#1492）: 実 FS の WorkDir で `socket_dir_for` が親の要否を返す。`temp_dir` 配下は
+    /// 既に隠れている（`None`）。`$HOME` にも固定対象にも覆われない場所では `Some(親)`。
+    #[cfg(unix)]
+    #[test]
+    fn render3_socket_dir_for_reports_parent_to_hide() {
+        let base = std::fs::canonicalize(std::env::temp_dir()).unwrap();
+        let dir = base.join(format!("fb-sd-{}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        let work = dir.join("w");
+        std::fs::create_dir(&work).unwrap();
+        // 固定対象に `temp_dir` を含めない。`$HOME` も別の場所にして、覆われない状況を作る。
+        let uncovered =
+            HiddenPaths::from_resolved(pb(&["/run"]), PathBuf::from("/nonexistent-home"));
+        let got = socket_dir_for(&work, &uncovered);
+        // 覆われる場合: 親 `dir` 自体が固定対象。
+        let covered = HiddenPaths::from_resolved(
+            vec![PathBuf::from("/run"), dir.clone()],
+            PathBuf::from("/nonexistent-home"),
+        );
+        let got_covered = socket_dir_for(&work, &covered);
+        let _ = std::fs::remove_dir_all(&dir);
+        // パス長の制限で SocketPathInvalid になる環境（macOS の長い temp_dir）は対象外。
+        if let Ok(sd) = got {
+            assert_eq!(sd.dir, work);
+            assert_eq!(sd.parent_to_hide, Some(dir.clone()));
+            let sd2 = got_covered.unwrap();
+            assert_eq!(sd2.parent_to_hide, None);
+        } else {
+            assert_eq!(got, Err(EgressIsolationUnavailable::SocketPathInvalid));
+        }
+    }
+
+    /// RENDER-3（#1492）: `$HOME` がシステムのディレクトリなら `HomeNotHideable`。
+    #[cfg(unix)]
+    #[test]
+    fn render3_resolve_home_rejects_system_dirs() {
+        use std::ffi::OsStr;
+        let bad = Err(EgressIsolationUnavailable::HomeNotHideable);
+        for d in ["/usr", "/etc", "/proc", "/sys", "/dev", "/var"] {
+            if Path::new(d).is_dir() {
+                assert_eq!(resolve_home_to_hide(Some(OsStr::new(d))), bad, "{d}");
+            }
+        }
+        // `/var/tmp` はシステムのディレクトリではなく、固定対象の配下として覆われる。
+        if let Ok(canon) = std::fs::canonicalize("/var/tmp") {
+            assert_eq!(
+                resolve_home_to_hide(Some(OsStr::new("/var/tmp"))),
+                Ok(canon.clone())
+            );
+            // macOS では `/var/tmp` が `/private/var/tmp` になるため、固定対象も実体パスで作る。
+            let hidden = HiddenPaths::from_resolved(vec![canon.clone()], canon);
+            assert_eq!(hidden.home, None);
+        }
+    }
+    /// RENDER-3（#1492）: macOS の実体パス（`/private/etc`・`/private/var`）もシステムのディレクトリ。
+    /// `/private/var/folders/..`（macOS の一時領域）は配下なので対象外。
+    #[test]
+    fn render3_is_system_dir_handles_macos_private_prefix() {
+        assert!(is_system_dir(Path::new("/private/etc")));
+        assert!(is_system_dir(Path::new("/private/etc/ssh")));
+        assert!(is_system_dir(Path::new("/private/var")));
+        assert!(!is_system_dir(Path::new("/private/var/folders/ab/cd")));
+        assert!(!is_system_dir(Path::new("/private/tmp")));
+        assert!(!is_system_dir(Path::new("/Users/alice")));
     }
 
     /// 試走用に `bwrap <wrapper> test <flag> <path>` を走らせ、終了コードを返す（失敗は `None`）。
     #[cfg(target_os = "linux")]
     fn run_bwrap_test(
         bwrap: &Path,
-        hidden: &HiddenPaths,
+        tmpfs: &[PathBuf],
         binds: &[(BindKind, &Path)],
         test_exec: &Path,
         flag: &str,
         target: &Path,
     ) -> Option<i32> {
         for _ in 0..20 {
-            let mut args = linux_wrapper_args(hidden, binds);
+            let mut args = linux_wrapper_args(tmpfs, binds);
             args.push(test_exec.as_os_str().to_owned());
             args.push(OsString::from(flag));
             args.push(target.as_os_str().to_owned());
@@ -1668,7 +2161,10 @@ mod tests {
             );
             return;
         };
-        let hidden = HiddenPaths::new(home.clone());
+        // 本番（probe_uncached）と同じく、実環境の `/tmp`・`/var/tmp`・`/dev/shm` を解決して使う。
+        let fixed = resolve_fixed_targets(canonicalize_dir).unwrap();
+        let hidden = HiddenPaths::from_resolved(fixed, home.clone());
+        let tmpfs = hidden.tmpfs_targets(None);
 
         // 兄弟ディレクトリ（`/tmp`）と WorkDir（`temp_dir` 配下。通常は `/tmp`）。
         let base = std::fs::canonicalize(std::env::temp_dir()).unwrap();
@@ -1690,14 +2186,41 @@ mod tests {
 
         let rw = [(BindKind::ReadWrite, work.as_path())];
         let run = |binds: &[(BindKind, &Path)], flag: &str, t: &Path| {
-            run_bwrap_test(&bwrap, &hidden, binds, &test_exec, flag, t)
+            run_bwrap_test(&bwrap, &tmpfs, binds, &test_exec, flag, t)
         };
         let mut checks = Vec::new();
-        // `/tmp` が隠れる環境（既定）でだけ、兄弟が消えることを確かめる。
-        let tmp_hidden = sibling.starts_with("/tmp") || hidden.hides(&sibling);
+        // `temp_dir` 配下の兄弟が消えること。CI では隠れることを必須にし、空振りさせない。
+        let tmp_hidden = hidden.hides(&sibling, None);
+        if ci_requires_ok() {
+            assert!(tmp_hidden, "CI temp_dir must be under a hidden path");
+        }
         if tmp_hidden {
             checks.push(("sibling file", run(&rw, "-e", &sib_file), Some(1)));
             checks.push(("sibling uds", run(&rw, "-S", &sib_sock), Some(1)));
+        }
+        // `/var/tmp`・`/dev/shm` の兄弟（ファイルと UDS）も消えること（#1492）。作れない環境は CI 以外のみ許す。
+        let mut extra_dirs = Vec::new();
+        let mut extra_listeners = Vec::new();
+        for root in ["/var/tmp", "/dev/shm"] {
+            let made = canonicalize_dir(Path::new(root)).ok().and_then(|b| {
+                let d = b.join(format!("fb-hide-extra-{pid}"));
+                let _ = std::fs::remove_dir_all(&d);
+                std::fs::create_dir(&d).ok()?;
+                let file = d.join("f");
+                let sock = d.join("s.sock");
+                std::fs::write(&file, b"x").ok()?;
+                let l = UnixListener::bind(&sock).ok()?;
+                Some((d, file, sock, l))
+            });
+            let Some((d, file, sock, l)) = made else {
+                assert!(!ci_requires_ok(), "CI must have writable {root}");
+                continue;
+            };
+            assert!(hidden.hides(&d, None), "{root} must be hidden");
+            checks.push(("extra sibling file", run(&rw, "-e", &file), Some(1)));
+            checks.push(("extra sibling uds", run(&rw, "-S", &sock), Some(1)));
+            extra_dirs.push(d);
+            extra_listeners.push(l);
         }
         checks.push(("workdir file", run(&rw, "-e", &work_file), Some(0)));
         checks.push(("workdir uds", run(&rw, "-S", &work_sock), Some(0)));
@@ -1707,8 +2230,9 @@ mod tests {
             .unwrap()
             .filter_map(Result::ok)
             .map(|e| e.path())
-            .find(|p| !exe.starts_with(p) && !work.starts_with(p));
-        if let (Some(entry), true) = (entry.as_ref(), !home.starts_with("/tmp")) {
+            .find(|p| !exe.starts_with(p) && !work.starts_with(p) && (p.is_file() || p.is_dir()));
+        let home_checked = entry.is_some() && !home.starts_with("/tmp");
+        if let (Some(entry), true) = (entry.as_ref(), home_checked) {
             checks.push(("home entry", run(&rw, "-e", entry), Some(1)));
         }
         // ホスト実行ファイル: 隠れる場所なら ro で戻り、書き込めない。
@@ -1716,17 +2240,18 @@ mod tests {
             (BindKind::ReadWrite, work.as_path()),
             (BindKind::ReadOnly, exe.as_path()),
         ];
-        let exe_hidden = hidden.hides(&exe);
+        let ro_tmpfs = &tmpfs;
+        let exe_hidden = hidden.hides(&exe, None);
         if exe_hidden {
             checks.push(("exe visible", run(&ro, "-e", &exe), Some(0)));
             // uutils の `test -w` は権限ビットしか見ず ro マウントを検出できないため、`touch -c`
             // （既存ファイルの時刻更新。ro マウントでは EROFS で失敗する）で読み取り専用を確かめる。
-            let touch = run_bwrap_test(&bwrap, &hidden, &ro, &touch_exec, "-c", &exe);
+            let touch = run_bwrap_test(&bwrap, ro_tmpfs, &ro, &touch_exec, "-c", &exe);
             checks.push(("exe read-only", touch, Some(1)));
             checks.push(("exe hidden without bind", run(&rw, "-e", &exe), Some(1)));
         }
 
-        for d in [&sibling, &work] {
+        for d in [&sibling, &work].into_iter().chain(extra_dirs.iter()) {
             let _ = std::fs::remove_dir_all(d);
         }
         for (name, got, want) in checks {
@@ -1734,6 +2259,65 @@ mod tests {
         }
         if ci_requires_ok() {
             assert!(exe_hidden, "CI runs tests from under $HOME");
+            assert!(
+                home_checked,
+                "CI must have a visible-on-host entry in $HOME"
+            );
+        }
+    }
+
+    /// RENDER-3・SEC-2（#1492）: 本物の bwrap で、WorkDir の親を `--tmpfs` で覆うと親の下の兄弟
+    /// （ファイルと UDS）が見えず、`--bind` で戻した WorkDir だけが見える。固定対象を `/run` だけにして
+    /// `/tmp` 配下の専用ディレクトリを「どの tmpfs にも覆われない親」として使う。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn render3_bwrap_hides_workdir_parent_siblings() {
+        use std::os::unix::net::UnixListener;
+        const TEST_CANDIDATES: [&str; 2] = ["/usr/bin/test", "/bin/test"];
+        let (Ok(bwrap), Ok(test_exec)) = (
+            select_trusted(&BWRAP_CANDIDATES),
+            select_trusted_exec(&TEST_CANDIDATES),
+        ) else {
+            assert!(!ci_requires_ok(), "CI must have bwrap and test");
+            return;
+        };
+        let base = std::fs::canonicalize(std::env::temp_dir()).unwrap();
+        let parent = base.join(format!("fb-hide-parent-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&parent);
+        std::fs::create_dir(&parent).unwrap();
+        let sibling = parent.join("sib");
+        let work = parent.join("work");
+        std::fs::create_dir(&sibling).unwrap();
+        std::fs::create_dir(&work).unwrap();
+        let sib_sock = sibling.join("s.sock");
+        let work_sock = work.join("s.sock");
+        let _l1 = UnixListener::bind(&sib_sock).unwrap();
+        let _l2 = UnixListener::bind(&work_sock).unwrap();
+        // `$HOME` は `/run` の配下（既に覆われる）として tmpfs を増やさない。
+        let hidden = HiddenPaths::from_resolved(pb(&["/run"]), PathBuf::from("/run/home"));
+        let tmpfs = hidden.tmpfs_targets(Some(&parent));
+        assert_eq!(tmpfs, [PathBuf::from("/run"), parent.clone()]);
+        let rw = [(BindKind::ReadWrite, work.as_path())];
+        let checks = [
+            (
+                "sibling dir",
+                run_bwrap_test(&bwrap, &tmpfs, &rw, &test_exec, "-e", &sibling),
+                Some(1),
+            ),
+            (
+                "sibling uds",
+                run_bwrap_test(&bwrap, &tmpfs, &rw, &test_exec, "-S", &sib_sock),
+                Some(1),
+            ),
+            (
+                "workdir uds",
+                run_bwrap_test(&bwrap, &tmpfs, &rw, &test_exec, "-S", &work_sock),
+                Some(0),
+            ),
+        ];
+        let _ = std::fs::remove_dir_all(&parent);
+        for (name, got, want) in checks {
+            assert_eq!(got, want, "{name}");
         }
     }
 
@@ -1820,6 +2404,7 @@ mod tests {
             EgressIsolationUnavailable::WorkDirHiddenBySandbox,
             EgressIsolationUnavailable::SocketPathInvalid,
             EgressIsolationUnavailable::HomeNotHideable,
+            EgressIsolationUnavailable::WorkDirParentNotHideable,
         ] {
             assert_eq!(
                 decide(BestEffort, Err(reason)).unwrap(),
@@ -1849,6 +2434,13 @@ mod tests {
              the sandbox); starting render host without egress isolation"
         );
         assert!(!h.contains('/'));
+        let w = isolation_warning_message(EgressIsolationUnavailable::WorkDirParentNotHideable);
+        assert_eq!(
+            w,
+            "render host egress isolation is unavailable (work directory's parent cannot be \
+             hidden by the sandbox); starting render host without egress isolation"
+        );
+        assert!(!w.contains('/'));
         let u = isolation_warning_message(EgressIsolationUnavailable::SandboxToolUntrusted);
         assert_eq!(
             u,

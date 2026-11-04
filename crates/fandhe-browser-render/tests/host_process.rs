@@ -389,6 +389,30 @@ fn t_required_unavailable_does_not_spawn() {
     assert!(h.pid().is_none());
 }
 
+/// `$HOME`・WorkDir の親を隠せない理由（#1485・#1492）も `required` では起動せず、理由つきで拒否する。
+fn t_required_hide_failures_do_not_spawn() {
+    for reason in [
+        EgressIsolationUnavailable::HomeNotHideable,
+        EgressIsolationUnavailable::WorkDirParentNotHideable,
+    ] {
+        let root = Root::new("iso-required-hide", "ok");
+        let cfg = root
+            .config(base_timeouts())
+            .with_egress_isolation(EgressIsolationMode::Required)
+            .with_isolation_probe(IsolationProbe::Unavailable(reason));
+        let mut h = HostProcess::new(cfg);
+        for _ in 0..5 {
+            let e = h.load(&page(), 1).expect_err("required must refuse");
+            assert!(
+                matches!(&e, HostProcessError::EgressIsolationUnavailable(r) if *r == reason),
+                "{e:?}"
+            );
+        }
+        assert_eq!(count(&root.0, "spawns"), 0, "host must never be started");
+        assert!(h.pid().is_none());
+    }
+}
+
 // 使うテストが unix 限定のため、Windows では dead_code にならないよう cfg を揃える。
 #[cfg(unix)]
 type Warnings = std::sync::Arc<std::sync::Mutex<Vec<EgressIsolationUnavailable>>>;
@@ -484,15 +508,32 @@ fn t_system_probe_branch() {
     match system_probe_for("egress_system_probe_branch") {
         Ok(()) => {
             let root = Root::new_visible("ok", "dump");
-            // FS の可視性の観測用（RENDER-3・#1485）。`/tmp` の番兵（兄弟 WorkDir 相当）と
-            // `$HOME` の既存ファイル（このクレートの Cargo.toml）が内側から見えないこと。
-            let sentinel =
-                std::env::temp_dir().join(format!("fb-hp-sentinel-{}", std::process::id()));
-            std::fs::write(&sentinel, b"x").unwrap();
-            let sentinel_sock =
-                std::env::temp_dir().join(format!("fb-hp-sentinel-{}.sock", std::process::id()));
-            let _ = std::fs::remove_file(&sentinel_sock);
-            let _listener = std::os::unix::net::UnixListener::bind(&sentinel_sock).unwrap();
+            // FS の可視性の観測用（RENDER-3・#1485・#1492）。`/tmp`・`/var/tmp`・`/dev/shm` の番兵
+            // （ファイルと UDS。兄弟 WorkDir 相当）と `$HOME` の既存ファイル（このクレートの
+            // Cargo.toml）が内側から見えないこと。偽ホストは名前から同じパスを組み立てて確かめる。
+            let pid = std::process::id();
+            let mut sentinels: Vec<std::path::PathBuf> = Vec::new();
+            let mut listeners = Vec::new();
+            for dir in ["/tmp", "/var/tmp", "/dev/shm"] {
+                let file = std::path::PathBuf::from(dir).join(format!("fb-hp-sentinel-{pid}"));
+                let sock = std::path::PathBuf::from(dir).join(format!("fb-hp-sentinel-{pid}.sock"));
+                let _ = std::fs::remove_file(&sock);
+                let made = std::fs::write(&file, b"x").is_ok()
+                    && std::os::unix::net::UnixListener::bind(&sock)
+                        .map(|l| listeners.push(l))
+                        .is_ok();
+                if made {
+                    sentinels.push(file);
+                    sentinels.push(sock);
+                } else {
+                    // CI では 3 か所とも作れることを必須にする（空振りさせない）。
+                    assert!(
+                        !ci_requires_sandbox(std::env::var("GITHUB_ACTIONS").ok().as_deref()),
+                        "CI must be able to create sentinels under {dir}"
+                    );
+                    let _ = std::fs::remove_file(&file);
+                }
+            }
             let manifest = concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml");
             let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
             let manifest_under_home = home
@@ -503,15 +544,6 @@ fn t_system_probe_branch() {
             if ci_requires_sandbox(std::env::var("GITHUB_ACTIONS").ok().as_deref()) {
                 assert!(manifest_under_home, "CI checks out the repo under $HOME");
             }
-            std::fs::write(
-                root.0.join("visibility-paths"),
-                format!(
-                    "{}\n{}\n{manifest}\n",
-                    sentinel.display(),
-                    sentinel_sock.display()
-                ),
-            )
-            .unwrap();
             let cfg = root
                 .config_system(base_timeouts())
                 .with_egress_isolation(EgressIsolationMode::Required)
@@ -524,7 +556,7 @@ fn t_system_probe_branch() {
             );
             let workdir = std::fs::canonicalize(h.workdir_path().unwrap()).unwrap();
             let obs: Value = serde_json::from_str(
-                &std::fs::read_to_string(root.0.join("obs-dump.json")).unwrap(),
+                &std::fs::read_to_string(workdir.join("obs-dump.json")).unwrap(),
             )
             .unwrap();
             let args: Vec<&str> = obs["args"]
@@ -557,20 +589,21 @@ fn t_system_probe_branch() {
                 "wrapper pid must be hidden: {seen:?}"
             );
             assert_eq!(obs["ppid"], 1);
-            assert_eq!(child_pid(&root, 1), 2);
+            assert_eq!(support::child_pid_in(&workdir, 1), 2);
             // FS の隠蔽（RENDER-3・#1485）: `/tmp` の番兵（ファイルと UDS）は見えない。`$HOME` 配下の
             // 既存ファイルも見えない。偽ホストが起動して応答できたこと自体が、`$HOME` 配下の実行
             // ファイルが `--ro-bind` で戻った証拠になる。
             let visible = &obs["visible"];
-            if sentinel.starts_with("/tmp") {
+            for sentinel in &sentinels {
                 assert_eq!(visible[sentinel.to_str().unwrap()], false, "{visible}");
-                assert_eq!(visible[sentinel_sock.to_str().unwrap()], false, "{visible}");
             }
             if manifest_under_home {
                 assert_eq!(visible[manifest], false, "{visible}");
             }
-            let _ = std::fs::remove_file(&sentinel);
-            let _ = std::fs::remove_file(&sentinel_sock);
+            for sentinel in &sentinels {
+                let _ = std::fs::remove_file(sentinel);
+            }
+            drop(listeners);
             // RSS 監視は bwrap ではなく 2 段下（外側の pid でのホスト）を辿る。
             let deadline = Instant::now() + Duration::from_secs(5);
             while h.monitored_pid().is_none() && Instant::now() < deadline {
@@ -742,6 +775,10 @@ fn main() {
     tests.push((
         "egress_required_unavailable",
         t_required_unavailable_does_not_spawn,
+    ));
+    tests.push((
+        "egress_required_hide_failures",
+        t_required_hide_failures_do_not_spawn,
     ));
     #[cfg(unix)]
     tests.push((
