@@ -24,7 +24,7 @@ use fandhe_browser_core::EgressIsolationMode;
 use fandhe_browser_core::render::{DisabledRenderer, Renderer};
 use fandhe_browser_render::host_process::{
     EgressIsolationUnavailable, HostBinary, HostProcessConfig, HostProcessError,
-    isolation_warning_message, probe_system, resolve_host_binary_from_process,
+    egress_isolation_warning_message, probe_system, resolve_host_binary_from_process,
 };
 use fandhe_browser_render::host_renderer::{HostRenderer, HostRendererConfig};
 
@@ -70,8 +70,8 @@ pub(crate) fn renderer_from_process_with_load_timeout(
 fn production_config(binary: HostBinary, egress: EgressIsolationMode) -> HostProcessConfig {
     HostProcessConfig::new(binary)
         .with_egress_isolation(egress)
-        .with_isolation_warning(Arc::new(|reason| {
-            eprintln!("warning: {}", isolation_warning_message(reason));
+        .with_isolation_warning(Arc::new(|warning| {
+            eprintln!("warning: {}", egress_isolation_warning_message(warning));
         }))
 }
 

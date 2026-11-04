@@ -35,9 +35,12 @@
 //! - tmpfs には容量の上限を付ける（#1498。[`TMPFS_SIZE_BYTES`] 1 本 64 MiB・最大 6 本で 384 MiB。
 //!   根拠は定数の doc）。既定は 1 本あたり RAM の 50% で上限は mount ごとのため、侵害されたホストが
 //!   本体マシンのメモリを消費しうるのを抑える。`--size`（upstream bubblewrap v0.7.0 で導入）が
-//!   使えるかは版の文字列ではなく `bwrap --help` の機能検出で、プローブ時に 1 回だけ決め
-//!   （[`TmpfsLimit`]）、試走と本番が同じ引数になるよう [`HiddenPaths`] に持たせる。非対応の版では
-//!   隔離をやめず上限なしで続け（黙って緩めない）、`HostProcess` が警告を 1 回出す。残余リスク:
+//!   使えるかは版の文字列ではなく `bwrap --help` の機能検出で、プローブ時に決め
+//!   （[`TmpfsLimit`]）、試走と本番が同じ引数になるよう [`HiddenPaths`] に持たせる。非対応の版（確定）は
+//!   固定するが、検出の失敗のうち一過性のもの（起動の失敗・時間切れ）は固定せず、上限つき
+//!   （[`TMPFS_REPROBE_MAX`]）で次のプローブ時に検出し直す（#1502）。非対応・検出失敗のどちらでも
+//!   隔離をやめず上限なしで続け（黙って緩めない）、`HostProcess` が警告を理由ごとの文言で 1 回出す
+//!   （`with_isolation_warning` のコールバック経由。未設定なら stderr）。残余リスク:
 //!   `--size` は容量しか抑えず inode の数（`nr_inodes`。bwrap に指定手段が無い）は抑えないため、
 //!   空ファイルを大量に作るとカーネルのメモリを使いうる。
 //! - 隔離中は WebSocket が使えない（Servo の `websocket_loader` はプロキシを使わず直接接続する
@@ -82,7 +85,7 @@ use std::num::NonZeroU16;
 use std::path::{Component, Path, PathBuf};
 #[cfg(unix)]
 use std::process::{Command, Stdio};
-use std::sync::OnceLock;
+use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 #[cfg(unix)]
 use std::time::Instant;
@@ -163,6 +166,7 @@ impl Namespace {
         }
     }
 }
+
 /// プローブの stdout を読む上限（`net:[<u64>]` は 30 バイト未満。超過は fail-closed）。
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 const PROBE_STDOUT_MAX: u64 = 256;
@@ -183,18 +187,49 @@ const HELP_STDOUT_MAX: u64 = 64 * 1024;
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 const TMPFS_SIZE_BYTES: u64 = 64 * 1024 * 1024;
 
-/// tmpfs の容量上限の扱い（プローブで 1 回だけ決め、[`HiddenPaths`] に持たせる）。
+/// tmpfs の容量上限の扱い（プローブで決め、[`HiddenPaths`] に持たせる）。
 ///
 /// 判定をプローブに集約し結果を `Sandbox::Bwrap` の中に持つので、プローブと本番の引数は構造上
 /// 一致する（版の文字列は解析せず、`bwrap --help` に `--size` があるかという機能で検出する）。
+/// 「版が非対応」は確定として固定し、「検出の失敗」は一過性なら後で検出し直す（#1502。
+/// [`cached_probe`]）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(super) enum TmpfsLimit {
     /// 各 `--tmpfs` の直前に `--size <バイト数>` を付ける。
     Capped(u64),
-    /// bwrap が `--size`（upstream v0.7.0 で導入）を持たない。上限なし（既定の RAM の 50%）で隔離を
-    /// 続ける。隔離そのものを外す理由にはしない（メモリ上限が無いことより悪くなるため）。
+    /// `--help` を読めて、そこに `--size`（upstream v0.7.0 で導入）が無い（版が非対応）。上限なし
+    /// （既定の RAM の 50%）で隔離を続ける。隔離そのものを外す理由にはしない（メモリ上限が無い
+    /// ことより悪くなるため）。確定した結果なので固定する。
     Unsupported,
+    /// 検出に失敗した（`--help` を読めていない）。`--size` を付けない上限なしで隔離を続ける
+    /// （付けると `--size` を知らない bwrap で試走が失敗し、隔離なしに落ちるため。#1502）。
+    /// 一過性の失敗（[`TmpfsDetectFailure::is_transient`]）は上限つきで検出し直す。
+    Undetected(TmpfsDetectFailure),
+}
+
+/// `bwrap --help` による `--size` 検出の失敗の種類（#1502）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(super) enum TmpfsDetectFailure {
+    /// 起動できなかった（負荷・ETXTBSY など。一過性）。
+    SpawnFailed(std::io::ErrorKind),
+    /// 時間切れ（一過性）。
+    TimedOut,
+    /// 非 0 で終了した（繰り返しても変わらない）。
+    ExitFailure,
+    /// 出力が [`HELP_STDOUT_MAX`] を超えた（繰り返しても変わらない）。
+    OutputTooLarge,
+    /// stdout を取れない・読み取りに失敗した。
+    OutputUnreadable,
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+impl TmpfsDetectFailure {
+    /// 検出し直す価値のある一過性の失敗か（起動の失敗・時間切れ）。
+    pub(super) fn is_transient(self) -> bool {
+        matches!(self, Self::SpawnFailed(_) | Self::TimedOut)
+    }
 }
 
 /// 隔離できない理由。`Display` は固定の英語文言で、パスを含めない（診断・警告用）。
@@ -518,11 +553,45 @@ impl HiddenPaths {
     }
 }
 
-/// tmpfs に容量上限を付けられない（bwrap が `--size` 非対応）ときの警告文言（固定の英語。パスを
-/// 含めない。RENDER-3・#1498）。`HostProcess` が隔離起動時に 1 回だけ stderr へ出す。
-pub(super) fn tmpfs_limit_warning_message() -> String {
-    "render host sandbox (bwrap) does not support --size; tmpfs mounts are not size-limited"
-        .to_string()
+/// tmpfs に容量上限を付けられない理由（#1502）。隔離は続いている。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum TmpfsUnlimitedReason {
+    /// bwrap が `--size` に対応していない版。
+    SizeUnsupported,
+    /// `--size` への対応を検出できなかった（一過性の失敗など）。
+    DetectionFailed,
+}
+
+/// 隔離まわりの警告（`with_isolation_warning` のコールバックに届く。RENDER-3・#1502）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum EgressIsolationWarning {
+    /// `best-effort` で隔離なしに落ちた（従来の通知）。
+    Unisolated(EgressIsolationUnavailable),
+    /// 隔離は続くが tmpfs に容量上限を付けられない。
+    TmpfsUnlimited(TmpfsUnlimitedReason),
+}
+
+/// 警告の文言（固定の英語。パスを含めない。RENDER-3・SEC-2・#1498・#1502）。
+pub fn egress_isolation_warning_message(warning: EgressIsolationWarning) -> String {
+    match warning {
+        EgressIsolationWarning::Unisolated(reason) => isolation_warning_message(reason),
+        EgressIsolationWarning::TmpfsUnlimited(reason) => tmpfs_limit_warning_message(reason),
+    }
+}
+
+/// tmpfs に容量上限を付けられないときの警告文言（固定の英語。パスを含めない）。
+pub(super) fn tmpfs_limit_warning_message(reason: TmpfsUnlimitedReason) -> String {
+    match reason {
+        TmpfsUnlimitedReason::SizeUnsupported => {
+            "render host sandbox (bwrap) does not support --size; tmpfs mounts are not size-limited"
+        }
+        TmpfsUnlimitedReason::DetectionFailed => {
+            "render host sandbox (bwrap) --size support could not be detected; tmpfs mounts are not size-limited"
+        }
+    }
+    .to_string()
 }
 
 /// `$HOME` の生の値を、tmpfs で隠せる正規化済みパスへ解決する（RENDER-3・#1485・#1492）。
@@ -1089,35 +1158,59 @@ fn help_supports_tmpfs_size(stdout: &[u8]) -> bool {
 }
 
 /// 信頼判定済みの `bwrap` が `--size` を持つかを `--help` で調べ、tmpfs の上限の扱いを決める。
-/// 起動できない・非 0 終了・時間切れ・出力が [`HELP_STDOUT_MAX`] 超は `Unsupported`（上限なしで
-/// 隔離を続ける。隔離自体の可否はこの後の試走が判定する）。
+/// `--help` を読めて `--size` が無ければ `Unsupported`（確定）。起動できない・非 0 終了・時間切れ・
+/// 出力が [`HELP_STDOUT_MAX`] 超は `Undetected`（上限なしで隔離を続ける。隔離自体の可否はこの後の
+/// 試走が判定する）。出力が上限を超えた時点で時間切れを待たずに kill する（#1502）。
 #[cfg(target_os = "linux")]
 fn detect_tmpfs_limit(bwrap: &Path, timeout: Duration) -> TmpfsLimit {
     use std::io::Read;
+    let undetected = TmpfsLimit::Undetected;
     let mut cmd = Command::new(bwrap);
     cmd.arg("--help")
         .env_clear()
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
-    let Ok(mut child) = cmd.spawn() else {
-        return TmpfsLimit::Unsupported;
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => return undetected(TmpfsDetectFailure::SpawnFailed(e.kind())),
     };
     // 出力がパイプ容量を超えても bwrap が書き込みで止まらないよう、終了待ちと並行して別スレッドで
-    // 上限付きに読む。上限超で読むのをやめると bwrap は書き込みで止まり、時間切れで Unsupported になる。
+    // 上限付きに読む。読み取りスレッドが終わったら（上限超 or EOF）毎周回で結果を見て、上限超なら
+    // 時間切れを待たずに kill する。
     let Some(out) = child.stdout.take() else {
         let _ = child.kill();
         let _ = child.wait();
-        return TmpfsLimit::Unsupported;
+        return undetected(TmpfsDetectFailure::OutputUnreadable);
     };
-    let reader = std::thread::spawn(move || {
+    let mut reader = Some(std::thread::spawn(move || {
         let mut buf = Vec::new();
         out.take(HELP_STDOUT_MAX.saturating_add(1))
             .read_to_end(&mut buf)
             .map(|_| buf)
-    });
+    }));
+    let mut buf: Option<Vec<u8>> = None;
     let deadline = Instant::now().checked_add(timeout);
     let status = loop {
+        if reader.as_ref().is_some_and(|r| r.is_finished())
+            && let Some(r) = reader.take()
+        {
+            match r.join() {
+                Ok(Ok(b)) if u64::try_from(b.len()).is_ok_and(|n| n <= HELP_STDOUT_MAX) => {
+                    buf = Some(b);
+                }
+                Ok(Ok(_)) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return undetected(TmpfsDetectFailure::OutputTooLarge);
+                }
+                _ => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return undetected(TmpfsDetectFailure::OutputUnreadable);
+                }
+            }
+        }
         match child.try_wait() {
             Ok(Some(status)) => break status,
             Ok(None) if deadline.is_some_and(|d| Instant::now() < d) => {
@@ -1127,16 +1220,26 @@ fn detect_tmpfs_limit(bwrap: &Path, timeout: Duration) -> TmpfsLimit {
                 let _ = child.kill();
                 let _ = child.wait();
                 // kill でパイプが閉じ、読み取りスレッドは EOF で終わる。
-                let _ = reader.join();
-                return TmpfsLimit::Unsupported;
+                if let Some(r) = reader.take() {
+                    let _ = r.join();
+                }
+                return undetected(TmpfsDetectFailure::TimedOut);
             }
         }
     };
-    let Ok(Ok(buf)) = reader.join() else {
-        return TmpfsLimit::Unsupported;
+    let buf = match (buf, reader.take()) {
+        (Some(b), _) => b,
+        (None, Some(r)) => match r.join() {
+            Ok(Ok(b)) => b,
+            _ => return undetected(TmpfsDetectFailure::OutputUnreadable),
+        },
+        (None, None) => return undetected(TmpfsDetectFailure::OutputUnreadable),
     };
-    if !status.success() || u64::try_from(buf.len()).map_or(true, |n| n > HELP_STDOUT_MAX) {
-        return TmpfsLimit::Unsupported;
+    if !status.success() {
+        return undetected(TmpfsDetectFailure::ExitFailure);
+    }
+    if u64::try_from(buf.len()).map_or(true, |n| n > HELP_STDOUT_MAX) {
+        return undetected(TmpfsDetectFailure::OutputTooLarge);
     }
     if help_supports_tmpfs_size(&buf) {
         TmpfsLimit::Capped(TMPFS_SIZE_BYTES)
@@ -1176,8 +1279,16 @@ fn probe_uncached() -> Result<Sandbox, EgressIsolationUnavailable> {
     // 固定対象（`/tmp` 等の解決）→ 試走。WorkDir の親の tmpfs は起動ごとなのでここには含めない（#1492）。
     let home = resolve_home_to_hide(std::env::var_os("HOME").as_deref())?;
     let fixed = resolve_fixed_targets(canonicalize_dir)?;
-    // `--size` の対応はここで 1 回だけ検出し、試走と本番が同じ引数になるよう `hidden` に持たせる。
-    let limit = detect_tmpfs_limit(&bwrap, PROBE_TIMEOUT);
+    // `--size` の対応はここで検出し、試走と本番が同じ引数になるよう `hidden` に持たせる。
+    // 起動の失敗（負荷など。すぐ終わる）だけはその場で 1 回やり直す。時間切れは起動の遅延を増やさない
+    // よう次の呼び出しでの再プローブ（[`cached_probe`]）に回す（#1502）。
+    let mut limit = detect_tmpfs_limit(&bwrap, PROBE_TIMEOUT);
+    if matches!(
+        limit,
+        TmpfsLimit::Undetected(TmpfsDetectFailure::SpawnFailed(_))
+    ) {
+        limit = detect_tmpfs_limit(&bwrap, PROBE_TIMEOUT);
+    }
     let hidden = HiddenPaths::from_resolved(fixed, home, limit);
     // 実起動（`build_command`）は、ここでキャッシュした実体パスを `select_trusted` を通し直さず使う。
     // 実体は root 所有で祖先まで書き込み不可のまま、プロセスの生存中は変わらない前提に立つ
@@ -1218,9 +1329,62 @@ pub fn probe_system() -> Result<(), EgressIsolationUnavailable> {
     probe_sandbox().map(|_| ())
 }
 
+/// 検出の失敗（一過性）の後に `--size` の検出をやり直す回数の上限（初回を除く。#1502）。
+const TMPFS_REPROBE_MAX: u32 = 3;
+
+/// プローブ結果のキャッシュ（再プローブの回数つき）。
+#[derive(Default)]
+struct ProbeCache {
+    result: Option<Result<Sandbox, EgressIsolationUnavailable>>,
+    reprobes: u32,
+}
+
+/// tmpfs の上限の検出が一過性の失敗で終わった `Ok` か。
+fn has_transient_tmpfs_failure(r: &Result<Sandbox, EgressIsolationUnavailable>) -> bool {
+    matches!(
+        r,
+        Ok(Sandbox::Bwrap { hidden, .. })
+            if matches!(hidden.tmpfs_limit(), TmpfsLimit::Undetected(f) if f.is_transient())
+    )
+}
+
+/// キャッシュの判断（注入した `probe` で試験できるよう切り出す）。未取得なら `probe` の結果を保存
+/// して返す。保存済みが一過性の検出失敗なら、上限（[`TMPFS_REPROBE_MAX`]）まで `probe`（試走を含む
+/// 全体なので、`Capped` は `--size` つきの引数で試走を通したときだけ採用される）をやり直す。再プローブが
+/// `Err` でも前の `Ok` を残し、隔離できていた状態を隔離なしへ落とさない。`$HOME` は再プローブのたびに
+/// 読み直すが、試走と本番の `hidden` は同じ結果から作られるので整合は崩れない。
+fn cached_probe(
+    cache: &mut ProbeCache,
+    mut probe: impl FnMut() -> Result<Sandbox, EgressIsolationUnavailable>,
+) -> Result<Sandbox, EgressIsolationUnavailable> {
+    match &cache.result {
+        None => {
+            let r = probe();
+            cache.result = Some(r.clone());
+            r
+        }
+        Some(prev) if has_transient_tmpfs_failure(prev) && cache.reprobes < TMPFS_REPROBE_MAX => {
+            let prev = prev.clone();
+            cache.reprobes += 1;
+            let r = probe();
+            if r.is_ok() {
+                cache.result = Some(r.clone());
+                r
+            } else {
+                prev
+            }
+        }
+        Some(prev) => prev.clone(),
+    }
+}
+
 pub(super) fn probe_sandbox() -> Result<Sandbox, EgressIsolationUnavailable> {
-    static CACHE: OnceLock<Result<Sandbox, EgressIsolationUnavailable>> = OnceLock::new();
-    CACHE.get_or_init(probe_uncached).clone()
+    static CACHE: Mutex<ProbeCache> = Mutex::new(ProbeCache {
+        result: None,
+        reprobes: 0,
+    });
+    let mut guard = CACHE.lock().unwrap_or_else(PoisonError::into_inner);
+    cached_probe(&mut guard, probe_uncached)
 }
 
 #[cfg(test)]
@@ -1620,6 +1784,25 @@ mod tests {
         probe_retrying_with(bwrap, readlink, &HiddenPaths::new(PathBuf::from("/home/u")))
     }
 
+    /// `detect_tmpfs_limit` を、fake の書き込み直後の ETXTBSY（`ExecutableFileBusy`）に限って
+    /// やり直して呼ぶ。他の失敗は即返す（`Capped` を隠さない。#1502）。
+    #[cfg(target_os = "linux")]
+    fn detect_retrying(bwrap: &Path, timeout: Duration) -> TmpfsLimit {
+        let mut limit = detect_tmpfs_limit(bwrap, timeout);
+        for _ in 0..20 {
+            if limit
+                != TmpfsLimit::Undetected(TmpfsDetectFailure::SpawnFailed(
+                    std::io::ErrorKind::ExecutableFileBusy,
+                ))
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+            limit = detect_tmpfs_limit(bwrap, timeout);
+        }
+        limit
+    }
+
     #[cfg(target_os = "linux")]
     fn probe_retrying_with(
         bwrap: &Path,
@@ -1692,8 +1875,8 @@ mod tests {
                 let Ok(home) = home else {
                     return assert!(!ci_requires_ok(), "CI must have a hideable HOME: {home:?}");
                 };
-                let hidden = HiddenPaths::new(home)
-                    .with_tmpfs_limit(detect_tmpfs_limit(&bwrap, PROBE_TIMEOUT));
+                let hidden =
+                    HiddenPaths::new(home).with_tmpfs_limit(detect_retrying(&bwrap, PROBE_TIMEOUT));
                 let mut r = Err((Namespace::Net, NsProbe::SpawnFailed));
                 for _ in 0..20 {
                     r = probe_bwrap_with(&bwrap, &hidden, &readlink, Duration::from_secs(5));
@@ -2305,8 +2488,7 @@ mod tests {
     ) -> Option<i32> {
         for _ in 0..20 {
             // 実物の bwrap が対応していれば `--size` 付きで、非対応なら無しで走らせる（本番と同じ判定）。
-            let mut args =
-                linux_wrapper_args(tmpfs, detect_tmpfs_limit(bwrap, PROBE_TIMEOUT), binds);
+            let mut args = linux_wrapper_args(tmpfs, detect_retrying(bwrap, PROBE_TIMEOUT), binds);
             args.push(test_exec.as_os_str().to_owned());
             args.push(OsString::from(flag));
             args.push(target.as_os_str().to_owned());
@@ -2554,7 +2736,7 @@ mod tests {
         std::fs::write(&sib_file, b"x").unwrap();
         let _l = UnixListener::bind(&sib_sock).unwrap();
         // `/tmp` を覆わない固定対象。`$HOME` は `/run` の配下として tmpfs を増やさない。
-        let limit = detect_tmpfs_limit(&bwrap, PROBE_TIMEOUT);
+        let limit = detect_retrying(&bwrap, PROBE_TIMEOUT);
         let hidden = HiddenPaths::from_resolved(pb(&["/run"]), PathBuf::from("/run/home"), limit);
         let sd = socket_dir_for(workdir.path(), &hidden).unwrap();
         assert_eq!(sd.parent_to_hide, Some(parent.clone()));
@@ -2613,6 +2795,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&parent);
         assert_eq!(code, Some(0));
     }
+
     /// RENDER-3（#1436）: Seatbelt の profile は整数ポートだけを埋め込んだ固定形。
     #[test]
     fn render3_seatbelt_profile_is_exact() {
@@ -2861,18 +3044,169 @@ mod tests {
         assert!(!help_supports_tmpfs_size(&[0xff, 0xfe, 0x00, 0x80]));
     }
 
-    /// RENDER-3（#1498）: 警告文言は固定の英語で、パスを含まない。
+    /// RENDER-3・SEC-2（#1498・#1502）: 警告文言は理由ごとに固定の英語で、互いに違い、パスを含まない。
     #[test]
-    fn render3_tmpfs_limit_warning_message_has_no_paths() {
-        let m = tmpfs_limit_warning_message();
+    fn render3_tmpfs_warning_messages_differ_and_have_no_paths() {
+        let unsupported = tmpfs_limit_warning_message(TmpfsUnlimitedReason::SizeUnsupported);
+        let failed = tmpfs_limit_warning_message(TmpfsUnlimitedReason::DetectionFailed);
         assert_eq!(
-            m,
+            unsupported,
             "render host sandbox (bwrap) does not support --size; tmpfs mounts are not size-limited"
         );
-        assert!(!m.contains('/'));
+        assert_eq!(
+            failed,
+            "render host sandbox (bwrap) --size support could not be detected; tmpfs mounts are not size-limited"
+        );
+        assert_ne!(unsupported, failed);
+        assert!(!unsupported.contains('/') && !failed.contains('/'));
+        // 公開の message 関数は、隔離なしの警告には従来の文言をそのまま返す。
+        assert_eq!(
+            egress_isolation_warning_message(EgressIsolationWarning::Unisolated(
+                EgressIsolationUnavailable::SandboxToolNotFound
+            )),
+            isolation_warning_message(EgressIsolationUnavailable::SandboxToolNotFound)
+        );
+        assert_eq!(
+            egress_isolation_warning_message(EgressIsolationWarning::TmpfsUnlimited(
+                TmpfsUnlimitedReason::DetectionFailed
+            )),
+            failed
+        );
     }
 
-    /// RENDER-3（#1498）: `--size` 非対応の bwrap（偽物。`--help` に `--size` が無く、`--size` 付きの
+    /// RENDER-3・SEC-2（#1502）: 検出に失敗した（`Undetected`）ときも `--size` は付けない
+    /// （`--size` を知らない bwrap で試走が失敗し、隔離なしに落ちるのを避ける）。
+    #[test]
+    fn render3_undetected_limit_adds_no_size_flag() {
+        let args = linux_wrapper_args(
+            &[PathBuf::from("/tmp")],
+            TmpfsLimit::Undetected(TmpfsDetectFailure::TimedOut),
+            &[],
+        );
+        assert!(!args.iter().any(|a| a == "--size"), "{args:?}");
+        assert!(args.iter().any(|a| a == "--tmpfs"), "{args:?}");
+    }
+
+    /// RENDER-3（#1502）: 一過性なのは起動の失敗と時間切れだけ。
+    #[test]
+    fn render3_tmpfs_detect_failure_transience() {
+        use std::io::ErrorKind;
+        assert!(TmpfsDetectFailure::SpawnFailed(ErrorKind::ExecutableFileBusy).is_transient());
+        assert!(TmpfsDetectFailure::TimedOut.is_transient());
+        assert!(!TmpfsDetectFailure::ExitFailure.is_transient());
+        assert!(!TmpfsDetectFailure::OutputTooLarge.is_transient());
+        assert!(!TmpfsDetectFailure::OutputUnreadable.is_transient());
+    }
+
+    fn bwrap_with(limit: TmpfsLimit) -> Result<Sandbox, EgressIsolationUnavailable> {
+        Ok(Sandbox::Bwrap {
+            bwrap: PathBuf::from("/usr/bin/bwrap"),
+            hidden: HiddenPaths::new(PathBuf::from("/home/u")).with_tmpfs_limit(limit),
+        })
+    }
+
+    fn limit_of(r: &Result<Sandbox, EgressIsolationUnavailable>) -> Option<TmpfsLimit> {
+        match r {
+            Ok(Sandbox::Bwrap { hidden, .. }) => Some(hidden.tmpfs_limit()),
+            _ => None,
+        }
+    }
+
+    /// RENDER-3・SEC-2（#1502）: 一過性の検出失敗の後は再プローブし、`Capped` になったら固定する
+    /// （3 回目は probe を呼ばない）。実時間に依存しない（probe を注入する）。
+    #[test]
+    fn render3_cached_probe_reprobes_after_transient_until_capped() {
+        let mut seq = vec![
+            TmpfsLimit::Undetected(TmpfsDetectFailure::TimedOut),
+            TmpfsLimit::Capped(TMPFS_SIZE_BYTES),
+        ]
+        .into_iter();
+        let mut calls = 0;
+        let mut cache = ProbeCache::default();
+        let mut results = Vec::new();
+        for _ in 0..3 {
+            results.push(cached_probe(&mut cache, || {
+                calls += 1;
+                bwrap_with(seq.next().expect("probe called too often"))
+            }));
+        }
+        assert_eq!(
+            limit_of(&results[0]),
+            Some(TmpfsLimit::Undetected(TmpfsDetectFailure::TimedOut))
+        );
+        assert_eq!(
+            limit_of(&results[1]),
+            Some(TmpfsLimit::Capped(TMPFS_SIZE_BYTES))
+        );
+        assert_eq!(
+            limit_of(&results[2]),
+            Some(TmpfsLimit::Capped(TMPFS_SIZE_BYTES))
+        );
+        assert_eq!(calls, 2);
+    }
+
+    /// RENDER-3（#1502）: 確定した結果（`Unsupported`・一過性でない `Undetected`・`Err`・
+    /// `SandboxExec`）は再プローブしない。
+    #[test]
+    fn render3_cached_probe_keeps_unsupported_and_non_transient() {
+        let cases: Vec<Result<Sandbox, EgressIsolationUnavailable>> = vec![
+            bwrap_with(TmpfsLimit::Unsupported),
+            bwrap_with(TmpfsLimit::Undetected(TmpfsDetectFailure::ExitFailure)),
+            bwrap_with(TmpfsLimit::Undetected(TmpfsDetectFailure::OutputTooLarge)),
+            bwrap_with(TmpfsLimit::Capped(TMPFS_SIZE_BYTES)),
+            Err(EgressIsolationUnavailable::SandboxProbeFailed),
+            Ok(Sandbox::SandboxExec),
+        ];
+        for case in cases {
+            let mut calls = 0;
+            let mut cache = ProbeCache::default();
+            let first = cached_probe(&mut cache, || {
+                calls += 1;
+                case.clone()
+            });
+            let second = cached_probe(&mut cache, || {
+                calls += 1;
+                case.clone()
+            });
+            assert_eq!(first, case);
+            assert_eq!(second, case);
+            assert_eq!(calls, 1, "{case:?}");
+        }
+    }
+
+    /// RENDER-3・SEC-2（#1502）: 再プローブが `Err` でも、前の `Ok`（隔離できていた状態）を残す
+    /// （`best-effort` を隔離なしへ降格させない）。
+    #[test]
+    fn render3_cached_probe_reprobe_error_keeps_previous_ok() {
+        let transient = TmpfsLimit::Undetected(TmpfsDetectFailure::TimedOut);
+        let mut cache = ProbeCache::default();
+        let first = cached_probe(&mut cache, || bwrap_with(transient));
+        let second = cached_probe(&mut cache, || {
+            Err(EgressIsolationUnavailable::SandboxProbeFailed)
+        });
+        assert_eq!(limit_of(&first), Some(transient));
+        assert_eq!(limit_of(&second), Some(transient));
+    }
+
+    /// RENDER-3（#1502）: 検出し直す回数には上限がある（初回 + [`TMPFS_REPROBE_MAX`] 回で止まる）。
+    #[test]
+    fn render3_cached_probe_reprobe_is_bounded() {
+        let transient = TmpfsLimit::Undetected(TmpfsDetectFailure::SpawnFailed(
+            std::io::ErrorKind::ExecutableFileBusy,
+        ));
+        let mut calls = 0;
+        let mut cache = ProbeCache::default();
+        for _ in 0..(TMPFS_REPROBE_MAX + 5) {
+            let r = cached_probe(&mut cache, || {
+                calls += 1;
+                bwrap_with(transient)
+            });
+            assert_eq!(limit_of(&r), Some(transient));
+        }
+        assert_eq!(calls, 1 + TMPFS_REPROBE_MAX);
+    }
+
+    /// RENDER-3（#1498・#1502）: `--size` 非対応の bwrap（偽物。`--help` に `--size` が無く、`--size` 付きの
     /// 起動は失敗する）では `Unsupported` と判定し、その上限で本番と同じ試走が通る
     /// （隔離は外さず、上限だけ外す）。実物の bwrap と readlink が要る。CI では必須。
     #[cfg(target_os = "linux")]
@@ -2896,39 +3230,97 @@ mod tests {
             real.display()
         );
         let (dir, fake) = fake_script("oldbwrap", &body);
-        let mut limit = TmpfsLimit::Capped(0);
-        for _ in 0..20 {
-            limit = detect_tmpfs_limit(&fake, Duration::from_secs(5));
-            if limit == TmpfsLimit::Unsupported {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
+        // ETXTBSY（書き込み直後の起動失敗）以外はやり直さない。`Capped` になったらここで失敗する。
+        let limit = detect_retrying(&fake, Duration::from_secs(5));
+        assert_eq!(limit, TmpfsLimit::Unsupported);
         let home = resolve_home_to_hide(std::env::var_os("HOME").as_deref());
         let result = home.map(|home| {
             let hidden = HiddenPaths::new(home).with_tmpfs_limit(limit);
             probe_retrying_with(&fake, &readlink, &hidden)
         });
         let _ = std::fs::remove_dir_all(&dir);
-        assert_eq!(limit, TmpfsLimit::Unsupported);
         match result {
             Ok(r) => assert_eq!(r, Ok(())),
             Err(e) => assert!(!ci_requires_ok(), "CI must have a hideable HOME: {e:?}"),
         }
     }
 
-    /// RENDER-3（#1498）: `--help` の出力が [`HELP_STDOUT_MAX`] を超える偽物は、`--size` を含んでいても
-    /// `Unsupported`（上限超は信頼しない）。読み取りは終了待ちと並行のため、固まらず時間内に返る。
+    /// RENDER-3・SEC-2（#1502）: 一過性の起動失敗（実行できない fake）は `Undetected(SpawnFailed)` で
+    /// 固定されず、同じパスが実行可能になって `--size` を持てば次の検出で `Capped` になる。
     #[cfg(target_os = "linux")]
     #[test]
-    fn render3_detect_tmpfs_limit_oversized_help_is_unsupported_without_hanging() {
-        let body = "#!/bin/sh\nif [ \"$1\" = \"--help\" ]; then echo '    --size BYTES  tmpfs size'; i=0; while [ $i -lt 4000 ]; do echo 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'; i=$((i+1)); done; exit 0; fi\nexit 1\n";
+    fn render3_detect_tmpfs_limit_transient_spawn_failure_then_capped() {
+        use std::os::unix::fs::PermissionsExt;
+        let (dir, fake) = fake_script("flaky", "#!/bin/sh\nexit 0\n");
+        // 実行権限を外して起動を決定的に失敗させる。
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let first = detect_tmpfs_limit(&fake, Duration::from_secs(5));
+        let TmpfsLimit::Undetected(failure) = first else {
+            panic!("expected Undetected, got {first:?}");
+        };
+        assert!(
+            matches!(
+                failure,
+                TmpfsDetectFailure::SpawnFailed(
+                    std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::NotFound
+                )
+            ),
+            "{failure:?}"
+        );
+        assert!(failure.is_transient());
+        // 回復: `--size` を持つ実行可能な bwrap になる。
+        std::fs::write(
+            &fake,
+            "#!/bin/sh\necho '    --size BYTES  tmpfs size'\nexit 0\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let second = detect_retrying(&fake, Duration::from_secs(5));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(second, TmpfsLimit::Capped(TMPFS_SIZE_BYTES));
+    }
+
+    /// RENDER-3（#1502）: 時間切れは `TimedOut`、非 0 終了は `ExitFailure`、`--size` の無い help は
+    /// `Unsupported` に分類する。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn render3_detect_tmpfs_limit_classifies_timeout_and_exit_failure() {
+        let (d1, slow) = fake_script("slow", "#!/bin/sh\nsleep 30\n");
+        let (d2, failing) = fake_script("fail", "#!/bin/sh\nexit 3\n");
+        let (d3, nosize) = fake_script("nosize", "#!/bin/sh\necho '    --tmpfs DEST'\nexit 0\n");
+        let timed_out = detect_retrying(&slow, Duration::from_millis(300));
+        let exit_failure = detect_retrying(&failing, Duration::from_secs(5));
+        let unsupported = detect_retrying(&nosize, Duration::from_secs(5));
+        for d in [d1, d2, d3] {
+            let _ = std::fs::remove_dir_all(&d);
+        }
+        assert_eq!(
+            timed_out,
+            TmpfsLimit::Undetected(TmpfsDetectFailure::TimedOut)
+        );
+        assert_eq!(
+            exit_failure,
+            TmpfsLimit::Undetected(TmpfsDetectFailure::ExitFailure)
+        );
+        assert_eq!(unsupported, TmpfsLimit::Unsupported);
+    }
+
+    /// RENDER-3（#1498・#1502）: `--help` の出力が [`HELP_STDOUT_MAX`] を超える偽物は、`--size` を含んでいても
+    /// `Undetected(OutputTooLarge)`（上限超は信頼しない）。出力後に居座っても時間切れ（`TimedOut`）を待たず、
+    /// 超過した時点で kill する。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn render3_detect_tmpfs_limit_oversized_help_kills_early() {
+        let body = "#!/bin/sh\nif [ \"$1\" = \"--help\" ]; then echo '    --size BYTES  tmpfs size'; i=0; while [ $i -lt 4000 ]; do echo 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'; i=$((i+1)); done; sleep 600; exit 0; fi\nexit 1\n";
         let (dir, fake) = fake_script("bigbwrap", body);
         let started = Instant::now();
-        let limit = detect_tmpfs_limit(&fake, Duration::from_secs(3));
+        let limit = detect_retrying(&fake, Duration::from_secs(60));
         let _ = std::fs::remove_dir_all(&dir);
-        assert_eq!(limit, TmpfsLimit::Unsupported);
-        assert!(started.elapsed() < Duration::from_secs(10));
+        assert_eq!(
+            limit,
+            TmpfsLimit::Undetected(TmpfsDetectFailure::OutputTooLarge)
+        );
+        assert!(started.elapsed() < Duration::from_secs(30));
     }
 
     /// RENDER-3（#1498）: 実物の bwrap の `--help` 検出が、`--size` ありの版で `Capped`、無い版で
@@ -2950,7 +3342,7 @@ mod tests {
         } else {
             TmpfsLimit::Unsupported
         };
-        assert_eq!(detect_tmpfs_limit(&bwrap, PROBE_TIMEOUT), expected);
+        assert_eq!(detect_retrying(&bwrap, PROBE_TIMEOUT), expected);
     }
 
     /// RENDER-3（#1436）: Windows ほかは隔離できない（既知の制約）。

@@ -18,11 +18,11 @@ use std::time::{Duration, Instant};
 
 use fandhe_browser_core::EgressIsolationMode;
 #[cfg(unix)]
-use fandhe_browser_render::host_process::EgressIsolationStatus;
-#[cfg(unix)]
 use fandhe_browser_render::host_process::HOST_ARGS;
 #[cfg(unix)]
 use fandhe_browser_render::host_process::HostProcessConfig;
+#[cfg(unix)]
+use fandhe_browser_render::host_process::{EgressIsolationStatus, EgressIsolationWarning};
 use fandhe_browser_render::host_process::{
     EgressIsolationUnavailable, HostProcess, HostProcessError, HostTimeouts, IsolationProbe,
     TimeoutPhase,
@@ -415,7 +415,7 @@ fn t_required_hide_failures_do_not_spawn() {
 
 // 使うテストが unix 限定のため、Windows では dead_code にならないよう cfg を揃える。
 #[cfg(unix)]
-type Warnings = std::sync::Arc<std::sync::Mutex<Vec<EgressIsolationUnavailable>>>;
+type Warnings = std::sync::Arc<std::sync::Mutex<Vec<EgressIsolationWarning>>>;
 
 #[cfg(unix)]
 fn with_warning_sink(cfg: HostProcessConfig) -> (HostProcessConfig, Warnings) {
@@ -447,12 +447,18 @@ fn t_best_effort_warns_once_and_starts_unwrapped() {
         serde_json::from_str(&std::fs::read_to_string(root.0.join("obs-dump.json")).unwrap())
             .unwrap();
     assert_eq!(obs["args"], serde_json::json!(["--stdio"]));
-    assert_eq!(*sink.lock().unwrap(), vec![reason]);
+    assert_eq!(
+        *sink.lock().unwrap(),
+        vec![EgressIsolationWarning::Unisolated(reason)]
+    );
     // 再起動しても警告は HostProcess ごとに 1 回。
     h.shutdown();
     h.load(&page(), 1).expect("restart");
     assert_eq!(count(&root.0, "spawns"), 2);
-    assert_eq!(*sink.lock().unwrap(), vec![reason]);
+    assert_eq!(
+        *sink.lock().unwrap(),
+        vec![EgressIsolationWarning::Unisolated(reason)]
+    );
 }
 
 #[cfg(target_os = "linux")]
@@ -597,7 +603,7 @@ fn t_system_probe_branch() {
                 .arg("--help")
                 .env_clear()
                 .output();
-            if let Ok(help) = help {
+            if let Ok(help) = &help {
                 let supports_size = help
                     .stdout
                     .split(|b| b.is_ascii_whitespace())
@@ -619,6 +625,13 @@ fn t_system_probe_branch() {
                         obs["mounts"]
                     );
                 }
+            } else if let Err(err) = &help {
+                // 結合テストからは `select_trusted` に届かないため `/usr/bin/bwrap` 固定。CI では
+                // 実行できなければ黙ってスキップせず失敗にする（#1502）。
+                assert!(
+                    !ci_requires_sandbox(std::env::var("GITHUB_ACTIONS").ok().as_deref()),
+                    "CI must be able to run /usr/bin/bwrap --help: {err}"
+                );
             }
             // FS の隠蔽（RENDER-3・#1485）: `/tmp` の番兵（ファイルと UDS）は見えない。`$HOME` 配下の
             // 既存ファイルも見えない。偽ホストが起動して応答できたこと自体が、`$HOME` 配下の実行

@@ -68,8 +68,9 @@ use std::time::{Duration, Instant};
 pub use breaker::{BREAKER_COOLDOWN, BREAKER_THRESHOLD, BREAKER_WINDOW};
 pub use env::{FORCED_ENV_NAMES, PASSTHROUGH_ENV_NAMES};
 pub use isolation::{
-    EgressIsolationStatus, EgressIsolationUnavailable, IsolationBackend, IsolationProbe,
-    RELAY_UDS_PATH_MAX_BYTES, isolation_warning_message, probe_system,
+    EgressIsolationStatus, EgressIsolationUnavailable, EgressIsolationWarning, IsolationBackend,
+    IsolationProbe, RELAY_UDS_PATH_MAX_BYTES, TmpfsUnlimitedReason,
+    egress_isolation_warning_message, isolation_warning_message, probe_system,
 };
 pub use resolve::{
     HOST_BINARY_ENV, HOST_BINARY_STEM, HostBinary, resolve_host_binary,
@@ -344,33 +345,27 @@ pub struct HostProcessConfig {
     injected_sandbox: Option<Sandbox>,
 }
 
-/// 隔離なしに落ちたことを通知する。コールバックがあればそれだけを呼び、無ければ `out`
-/// （本番は stderr）に `warning: <文言>` を 1 行書く（RENDER-3・#1451）。書き込みの失敗は無視する。
-/// render は `tracing` に依存しないため stderr を既定にしている。
-fn report_unisolated(
+/// 隔離まわりの警告（隔離なしに落ちた・tmpfs に上限を付けられない）を通知する。コールバックがあれば
+/// それだけを呼び、無ければ `out`（本番は stderr）に `warning: <文言>` を 1 行書く（RENDER-3・#1451・
+/// #1502）。書き込みの失敗は無視する。render は `tracing` に依存しないため stderr を既定にしている。
+fn report_isolation_warning(
     warning: &IsolationWarning,
-    reason: EgressIsolationUnavailable,
+    event: EgressIsolationWarning,
     out: &mut dyn std::io::Write,
 ) {
     match warning.0.as_ref() {
-        Some(f) => f(reason),
+        Some(f) => f(event),
         None => {
-            let _ = writeln!(out, "warning: {}", isolation_warning_message(reason));
+            let _ = writeln!(out, "warning: {}", egress_isolation_warning_message(event));
         }
     }
 }
 
-/// bwrap が tmpfs の容量上限（`--size`）に対応していないときの警告を `out`（本番は stderr）へ 1 行
-/// 書く（RENDER-3・#1498。隔離は続くが上限が無いことを黙らせない）。書き込みの失敗は無視する。
-fn report_tmpfs_unlimited(out: &mut dyn std::io::Write) {
-    let _ = writeln!(out, "warning: {}", isolation::tmpfs_limit_warning_message());
-}
-
-/// `best-effort` で隔離なしに落ちたときの警告の通知先。コールバックがあればそれだけを呼び、
-/// 無ければ stderr に 1 行出す（RENDER-3・#1451。黙って隔離なしで動く方が危険なため）。
-/// 抑止したい利用側は何もしないコールバックを渡す。cli は `eprintln!` するコールバックを渡す。
+/// 隔離まわりの警告の通知先。コールバックがあればそれだけを呼び、無ければ stderr に 1 行出す
+/// （RENDER-3・#1451・#1502。黙って隔離なしや上限なしで動く方が危険なため）。抑止したい利用側は
+/// 何もしないコールバックを渡す。cli は `eprintln!` するコールバックを渡す。
 #[derive(Clone, Default)]
-struct IsolationWarning(Option<Arc<dyn Fn(EgressIsolationUnavailable) + Send + Sync>>);
+struct IsolationWarning(Option<Arc<dyn Fn(EgressIsolationWarning) + Send + Sync>>);
 
 impl fmt::Debug for IsolationWarning {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -434,11 +429,12 @@ impl HostProcessConfig {
         self.isolation_probe = probe;
         self
     }
-    /// `best-effort` で隔離なしに落ちたときに 1 度だけ呼ぶ通知先を設定する
-    /// （[`isolation_warning_message`] で文言を作れる）。未設定なら stderr に 1 行出す。
+    /// 隔離まわりの警告（[`EgressIsolationWarning`]。`best-effort` で隔離なしに落ちた・tmpfs に上限を
+    /// 付けられない）の通知先を設定する。種類ごとに 1 度ずつ呼ぶ（1 つのプロセスで両方が出ることが
+    /// ある。[`egress_isolation_warning_message`] で文言を作れる）。未設定なら stderr に 1 行出す。
     pub fn with_isolation_warning(
         mut self,
-        f: Arc<dyn Fn(EgressIsolationUnavailable) + Send + Sync>,
+        f: Arc<dyn Fn(EgressIsolationWarning) + Send + Sync>,
     ) -> Self {
         self.isolation_warning = IsolationWarning(Some(f));
         self
@@ -972,9 +968,9 @@ impl HostProcess {
             Plan::Unisolated(reason) => {
                 if !self.isolation_warned {
                     self.isolation_warned = true;
-                    report_unisolated(
+                    report_isolation_warning(
                         &self.config.isolation_warning,
-                        reason,
+                        EgressIsolationWarning::Unisolated(reason),
                         &mut std::io::stderr().lock(),
                     );
                 }
@@ -989,11 +985,19 @@ impl HostProcess {
             Plan::Isolated(s) => s,
         };
         if let Sandbox::Bwrap { hidden, .. } = &sandbox
-            && hidden.tmpfs_limit() == isolation::TmpfsLimit::Unsupported
             && !self.tmpfs_limit_warned
+            && let Some(reason) = match hidden.tmpfs_limit() {
+                isolation::TmpfsLimit::Capped(_) => None,
+                isolation::TmpfsLimit::Unsupported => Some(TmpfsUnlimitedReason::SizeUnsupported),
+                isolation::TmpfsLimit::Undetected(_) => Some(TmpfsUnlimitedReason::DetectionFailed),
+            }
         {
             self.tmpfs_limit_warned = true;
-            report_tmpfs_unlimited(&mut std::io::stderr().lock());
+            report_isolation_warning(
+                &self.config.isolation_warning,
+                EgressIsolationWarning::TmpfsUnlimited(reason),
+                &mut std::io::stderr().lock(),
+            );
         }
         let endpoint = match (&sandbox, &socket_dir) {
             (Sandbox::Bwrap { .. }, Some(sd)) => EgressEndpoint::UnixSocketIn(sd.dir.clone()),
@@ -1297,9 +1301,9 @@ mod tests {
     #[test]
     fn render3_unisolated_warning_defaults_to_stderr_line() {
         let mut out: Vec<u8> = Vec::new();
-        report_unisolated(
+        report_isolation_warning(
             &IsolationWarning::default(),
-            EgressIsolationUnavailable::SandboxToolNotFound,
+            EgressIsolationWarning::Unisolated(EgressIsolationUnavailable::SandboxToolNotFound),
             &mut out,
         );
         assert_eq!(
@@ -1315,14 +1319,16 @@ mod tests {
         let sink = Arc::clone(&seen);
         let warning = IsolationWarning(Some(Arc::new(move |r| sink.lock().unwrap().push(r))));
         let mut out: Vec<u8> = Vec::new();
-        report_unisolated(
+        report_isolation_warning(
             &warning,
-            EgressIsolationUnavailable::SandboxToolNotFound,
+            EgressIsolationWarning::Unisolated(EgressIsolationUnavailable::SandboxToolNotFound),
             &mut out,
         );
         assert_eq!(
             *seen.lock().unwrap(),
-            vec![EgressIsolationUnavailable::SandboxToolNotFound]
+            vec![EgressIsolationWarning::Unisolated(
+                EgressIsolationUnavailable::SandboxToolNotFound
+            )]
         );
         assert!(out.is_empty());
     }
@@ -1527,15 +1533,49 @@ mod tests {
         assert!(request_within_limits(None, &Request::Shutdown, 11));
     }
 
-    /// RENDER-3・#1498: `report_tmpfs_unlimited` は固定文言の 1 行を `warning: ` つきで書く。
+    /// RENDER-3・#1498・#1502: コールバックが無いとき、tmpfs の上限なしの警告は理由ごとの固定文言を
+    /// 1 行（`warning: ` つき）で書く。
     #[test]
     fn render3_tmpfs_unlimited_warning_is_one_fixed_line() {
+        for (reason, text) in [
+            (
+                TmpfsUnlimitedReason::SizeUnsupported,
+                "warning: render host sandbox (bwrap) does not support --size; tmpfs mounts are not size-limited\n",
+            ),
+            (
+                TmpfsUnlimitedReason::DetectionFailed,
+                "warning: render host sandbox (bwrap) --size support could not be detected; tmpfs mounts are not size-limited\n",
+            ),
+        ] {
+            let mut out: Vec<u8> = Vec::new();
+            report_isolation_warning(
+                &IsolationWarning::default(),
+                EgressIsolationWarning::TmpfsUnlimited(reason),
+                &mut out,
+            );
+            assert_eq!(String::from_utf8(out).unwrap(), text);
+        }
+    }
+
+    /// RENDER-3・#1502: 上限なしの警告もコールバックだけを通り、出力先には書かれない。
+    #[test]
+    fn render3_tmpfs_unlimited_warning_goes_through_callback() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        let warning = IsolationWarning(Some(Arc::new(move |w| sink.lock().unwrap().push(w))));
         let mut out: Vec<u8> = Vec::new();
-        report_tmpfs_unlimited(&mut out);
-        assert_eq!(
-            String::from_utf8(out).unwrap(),
-            "warning: render host sandbox (bwrap) does not support --size; tmpfs mounts are not size-limited\n"
+        report_isolation_warning(
+            &warning,
+            EgressIsolationWarning::TmpfsUnlimited(TmpfsUnlimitedReason::DetectionFailed),
+            &mut out,
         );
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![EgressIsolationWarning::TmpfsUnlimited(
+                TmpfsUnlimitedReason::DetectionFailed
+            )]
+        );
+        assert!(out.is_empty());
     }
 
     /// 偽 bwrap・偽ホストの置き場（`/tmp` 直下の短い専用ディレクトリ。UDS のパス上限に収める）。
@@ -1565,14 +1605,17 @@ mod tests {
     /// 起動後に bwrap が失敗する構成で `load` を回し、降格しないことを固定する。
     ///
     /// 戻り値は (`load` の失敗の Debug 表記の列, 偽 bwrap の呼び出し回数, 偽ホストが直接実行されたか,
-    /// 警告の件数, `egress_isolation()` が `Unisolated` を返したか, 偽 bwrap が親の tmpfs を
-    /// 受け取らなかったか)。
+    /// 隔離なしの警告の件数, `egress_isolation()` が `Unisolated` を返したか, 偽 bwrap が親の tmpfs を
+    /// 受け取らなかったか, tmpfs の上限なしの警告の件数)。
+    #[cfg(target_os = "linux")]
+    type RunGot = (Vec<String>, usize, bool, usize, bool, bool, usize);
+
     #[cfg(target_os = "linux")]
     fn run_failing_bwrap(
         mode: EgressIsolationMode,
         bwrap_body: Option<&str>,
         uncovered_parent: bool,
-    ) -> (Vec<String>, usize, bool, usize, bool, bool) {
+    ) -> RunGot {
         let dir = fresh_dir("bw");
         let temp_root = dir.join("root");
         std::fs::create_dir(&temp_root).unwrap();
@@ -1623,29 +1666,35 @@ mod tests {
         );
         let calls = std::fs::read_to_string(&count).map_or(0, |t| t.lines().count());
         let direct_ran = direct.exists();
-        let n_warn = warnings.lock().unwrap().len();
+        let (n_warn, n_tmpfs) = {
+            let w = warnings.lock().unwrap();
+            let unisolated_n = w
+                .iter()
+                .filter(|e| matches!(e, EgressIsolationWarning::Unisolated(_)))
+                .count();
+            (unisolated_n, w.len() - unisolated_n)
+        };
         let no_parent = noparent.exists();
         drop(h);
         let _ = std::fs::remove_dir_all(&dir);
-        (errs, calls, direct_ran, n_warn, unisolated, no_parent)
+        (
+            errs, calls, direct_ran, n_warn, unisolated, no_parent, n_tmpfs,
+        )
     }
 
     /// 起動前の降格（`WorkDirHiddenBySandbox`・`SocketPathInvalid`・`WorkDirParentNotHideable` が
     /// `best-effort` で警告つきの隔離なしになること）は設計どおりで、ここの対象外。ここで固定するのは
     /// **起動後**の bwrap の失敗が `decide` を通らず、隔離なしの直接起動に落ちないこと。
     #[cfg(target_os = "linux")]
-    fn assert_no_downgrade(
-        got: (Vec<String>, usize, bool, usize, bool, bool),
-        first: &str,
-        calls: usize,
-    ) {
-        let (errs, n_calls, direct, n_warn, unisolated, no_parent) = got;
+    fn assert_no_downgrade(got: RunGot, tmpfs_warnings: usize, first: &str, calls: usize) {
+        let (errs, n_calls, direct, n_warn, unisolated, no_parent, n_tmpfs) = got;
         let mut want: Vec<String> = vec![first.to_string(); BREAKER_THRESHOLD];
         want.push("CircuitOpen".to_string());
         assert_eq!(errs, want);
         assert_eq!(n_calls, calls);
         assert!(!direct, "host must never be spawned directly");
         assert_eq!(n_warn, 0, "no unisolated warning");
+        assert_eq!(n_tmpfs, tmpfs_warnings, "tmpfs-unlimited warnings");
         assert!(!unisolated);
         // 親の tmpfs を要する構成では、偽 bwrap が親の tmpfs を受け取っている（印が無い）。
         assert!(!no_parent, "fake bwrap must receive the parent tmpfs");
@@ -1664,7 +1713,7 @@ mod tests {
             let got = run_failing_bwrap(mode, Some(body), false);
             // 失敗の種類は具体値で固定する（ホストがハンドシェイク前に EOF）。
             assert_eq!(got.0.first().map(String::as_str), Some("Crashed"));
-            assert_no_downgrade(got, "Crashed", BREAKER_THRESHOLD);
+            assert_no_downgrade(got, 0, "Crashed", BREAKER_THRESHOLD);
         }
     }
 
@@ -1679,7 +1728,7 @@ mod tests {
         ] {
             let got = run_failing_bwrap(mode, None, false);
             assert_eq!(got.0.first().map(String::as_str), Some("SpawnFailed"));
-            assert_no_downgrade(got, "SpawnFailed", 0);
+            assert_no_downgrade(got, 0, "SpawnFailed", 0);
         }
     }
 
@@ -1696,7 +1745,7 @@ mod tests {
         ] {
             let got = run_failing_bwrap(mode, Some(body), true);
             assert_eq!(got.0.first().map(String::as_str), Some("Crashed"));
-            assert_no_downgrade(got, "Crashed", BREAKER_THRESHOLD);
+            assert_no_downgrade(got, 1, "Crashed", BREAKER_THRESHOLD);
         }
     }
 }
