@@ -928,7 +928,7 @@ impl HostProcess {
             IsolationProbe::Unavailable(r) => Err(r),
         };
         let plan = isolation::decide(mode, availability)?;
-        if !matches!(plan, Plan::Isolated(Sandbox::Bwrap(_))) {
+        if !matches!(plan, Plan::Isolated(Sandbox::Bwrap { .. })) {
             return Ok((plan, None));
         }
         match isolation::socket_dir_for(workdir.path()) {
@@ -964,11 +964,11 @@ impl HostProcess {
             }
             Plan::Isolated(s) => s,
         };
-        let endpoint = match (&sandbox, socket_dir) {
-            (Sandbox::Bwrap(_), Some(dir)) => EgressEndpoint::UnixSocketIn(dir),
+        let endpoint = match (&sandbox, &socket_dir) {
+            (Sandbox::Bwrap { .. }, Some(dir)) => EgressEndpoint::UnixSocketIn(dir.clone()),
             (Sandbox::SandboxExec, _) => EgressEndpoint::LoopbackTcp,
             // plan_isolation が Bwrap に必ず dir を付ける。到達しない防御。
-            (Sandbox::Bwrap(_), None) => return Err(self.fail_spawn()),
+            (Sandbox::Bwrap { .. }, None) => return Err(self.fail_spawn()),
         };
         let proxy_config = EgressProxyConfig::default()
             .with_allow_private_network_access(self.config.allow_private_network_access);
@@ -977,14 +977,19 @@ impl HostProcess {
             Ok(p) => p,
             Err(_) => return Err(self.fail_spawn()),
         };
-        let (program, args) = match (&sandbox, proxy.endpoint()) {
-            (Sandbox::Bwrap(bwrap), BoundEndpoint::Unix(path)) => {
+        let (program, args) = match (&sandbox, proxy.endpoint(), &socket_dir) {
+            (Sandbox::Bwrap { bwrap, hidden }, BoundEndpoint::Unix(path), Some(dir)) => {
                 if isolation::relay_socket_path_ok(path).is_err() {
                     return Err(self.fail_spawn());
                 }
-                isolation::linux_argv(bwrap, &host, path)
+                // WorkDir（rw）と、隠れる場所にあるホストの実行ファイル（ro）だけを tmpfs の後に戻す。
+                // UDS が WorkDir の外なら隠れて届かないので起動失敗にする（#1485）。
+                match isolation::linux_argv(bwrap, hidden, dir, &host, path) {
+                    Some(v) => v,
+                    None => return Err(self.fail_spawn()),
+                }
             }
-            (Sandbox::SandboxExec, BoundEndpoint::Tcp(addr)) => {
+            (Sandbox::SandboxExec, BoundEndpoint::Tcp(addr), _) => {
                 let Some(port) = NonZeroU16::new(addr.port()) else {
                     return Err(self.fail_spawn());
                 };
@@ -1109,7 +1114,7 @@ impl HostProcess {
         let exceeded = Arc::new(AtomicBool::new(false));
         // bwrap に包むと pid は bwrap になり、ホストはその子になる。
         let pid_source = match launch.sandbox {
-            Some(Sandbox::Bwrap(_)) => PidSource::WrappedChildOf(pid),
+            Some(Sandbox::Bwrap { .. }) => PidSource::WrappedChildOf(pid),
             _ => PidSource::Direct(pid),
         };
         let monitor = match RssMonitor::start(
@@ -1283,11 +1288,15 @@ mod tests {
         // std に geteuid が無いため、このプロセスが bind したソケットの uid を自 uid として使う。
         assert_eq!(dir_meta.uid(), sock_meta.uid());
         // ホストへ渡す引数の末尾も同じソケットに繋がる。
+        let hidden = isolation::HiddenPaths::new(std::path::PathBuf::from("/home/u"));
         let (_, args) = isolation::linux_argv(
             std::path::Path::new("/usr/bin/bwrap"),
+            &hidden,
+            &dir,
             std::path::Path::new("/host"),
             &sock,
-        );
+        )
+        .expect("argv");
         let tail: Vec<&std::ffi::OsStr> = args
             .iter()
             .rev()

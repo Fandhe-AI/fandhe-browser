@@ -88,7 +88,19 @@ pub fn fake_host() -> ! {
                 t.lines()
                     .find_map(|l| l.strip_prefix("PPid:")?.trim().parse().ok())
             });
+        // FS の可視性の観測（RENDER-3・#1485）: テスト側が `visibility-paths` に 1 行 1 パスで書いた
+        // パスが、サンドボックスの内側から見えるか（`/tmp` の兄弟・`$HOME` の既存ファイルが隠れること）。
+        let visible: serde_json::Map<String, Value> =
+            std::fs::read_to_string(root.join("visibility-paths"))
+                .map(|t| {
+                    t.lines()
+                        .filter(|l| !l.is_empty())
+                        .map(|l| (l.to_string(), json!(std::fs::symlink_metadata(l).is_ok())))
+                        .collect()
+                })
+                .unwrap_or_default();
         let obs = json!({
+            "visible": visible,
             "proc_pids": proc_pids,
             "ppid": ppid,
             "args": std::env::args().skip(1).collect::<Vec<_>>(),
@@ -282,6 +294,27 @@ impl Root {
         let p = std::env::temp_dir().join(format!("fandhe-hp-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&p);
         std::fs::create_dir_all(&p).expect("mkdir");
+        std::fs::write(p.join("scenario"), scenario).expect("scenario");
+        Self(p)
+    }
+    /// bwrap が `/tmp` と `$HOME` を tmpfs で隠しても Root（偽ホストが `cwd.parent()` として読み書きする
+    /// `scenario`・`spawns`・`pid-N`・`obs-dump.json` の置き場）が見えるよう、隠れない `/var/tmp` に作る
+    /// （RENDER-3・#1485）。UDS のパス上限（`RELAY_UDS_PATH_MAX_BYTES`）を超えないよう短い名前にする。
+    #[cfg(target_os = "linux")]
+    pub fn new_visible(tag: &str, scenario: &str) -> Self {
+        let p = PathBuf::from("/var/tmp").join(format!("fhp-{}-{tag}", std::process::id()));
+        // WorkDir 名（`fandhe-render-<pid>-<19 桁>-<連番>`）の最大長 + ソケット名で上限を確かめる。
+        let worst = p.to_string_lossy().len()
+            + "/fandhe-render-4194304-".len()
+            + 19
+            + "-9999".len()
+            + "/egress-proxy.sock".len();
+        assert!(
+            worst <= fandhe_browser_render::host_process::RELAY_UDS_PATH_MAX_BYTES,
+            "root {p:?} is too long for a relay UDS ({worst} bytes)"
+        );
+        let _ = std::fs::remove_dir_all(&p);
+        std::fs::create_dir_all(&p).expect("mkdir /var/tmp root (must be writable)");
         std::fs::write(p.join("scenario"), scenario).expect("scenario");
         Self(p)
     }
