@@ -695,7 +695,7 @@ class FdReadRetryTests(unittest.TestCase):
                 (_o, hit, _e), _s = self._owners(results, starttimes=stimes)
                 self.assertIs(hit, True)
 
-    def test_budget_constants_relation(self):
+    def test_sample_budget_below_interval(self):
         # 0.2 は workflow の既定 --interval-ms 200。pid ごと <= 累計 < サンプル間隔
         self.assertLessEqual(hc.FD_READ_RETRY_BUDGET_SECONDS, hc.FD_READ_RETRY_SAMPLE_BUDGET_SECONDS)
         self.assertLess(hc.FD_READ_RETRY_SAMPLE_BUDGET_SECONDS, 0.2)
