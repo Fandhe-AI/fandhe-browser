@@ -1,7 +1,7 @@
 # Servo ホストの egress 隔離方式: 3 OS の比較設計と実測計画
 
 - **状態**: 設計（比較と実測計画）。**方式の最終決定は実測の後にオーナーが行う**（#1003）。2026-11-02 の見直し（GA の成立範囲は Linux と macOS の B・Windows は D）を §8.1 に、2026-10-31 の暫定判断（履歴）を §8.2 に、Linux の実測結果を §6.4 に記録した
-- **対応**: TASK-38・MS-4・`RENDER-3`・`SEC-2`・`PLUG-1`・`XOS-1`・Issue #1368（親判断 #1003）。関連は `RENDER-1`・#1458（テストの検出力と残余リスク欄）。docker 経路は #1386 で再実測した（§6.4）。後続は #1387（macOS・Windows の実測ハーネス）
+- **対応**: TASK-38・MS-4・`RENDER-3`・`SEC-2`・`PLUG-1`・`XOS-1`・Issue #1368（親判断 #1003）。関連は `RENDER-1`・#1458（テストの検出力と残余リスク欄）。docker 経路は #1386 で再実測した（§6.4）。後続は #1387（macOS・Windows の実測ハーネス）。macOS のプロキシの UNIX ソケット化の調査は §10（#1486）
 - **入力資料**: [servo-host-egress-options.md](./servo-host-egress-options.md)（#1317。手段ごとの詳細表・Servo 0.7 の net 層の事実・承認事項の洗い出し。以下「options §n」と書く）。設計の親は [servo-host-design.md](./servo-host-design.md) §2.5・§13 項目 6
 - **確度の表記**: 「確認済み」は原文またはコードを確認した事項、「推測」は読んだ範囲からの推論、「未確認」は調べていない事項。一次情報は options の出典（参照日 2026-10-29、Servo は `v0.7.0` タグ）に従い、判断の前に原文で再確認する。本書では新たな外部ページの再取得はしていない
 - **spec 側の課題**（本リポからは編集しない。要報告）: egress 方針に専用のビヘイビア ID が無い。`RENDER-3` の本文はホストのサイズ・ビルド時間とオプトイン配布の設計材料で egress を扱わない。対応づけの確認は spec 側で行う
@@ -269,6 +269,7 @@ options §7 を引き継ぐ。本書で新たに加わる未確認事項は §9.
 | 隔離中の WebSocket（現状は遮断。必要なら proxy 経由の対応を別途検討） | #1457 |
 | AppArmor の制限が無い環境・6.7 未満のカーネル | #1457 |
 | net 層の直接接続の網羅 | options §7 の 1 |
+| macOS の Seatbelt の UNIX ソケット宛の構文・他ユーザーの環境変数の可視性（§10.6） | #1486 |
 
 ### 9.3 残余リスク（RENDER-3・SEC-2・TASK-38・#1458）
 
@@ -287,3 +288,58 @@ options §7 を引き継ぐ。本書で新たに加わる未確認事項は §9.
   - プローブは `env_clear` で走り、本番の起動は許可リストの環境変数で走る。差が出るのは起動できない側だけで、隔離なしに起動できてしまう fail-open にはならない。
   - プローブが確かめるのは、別の netns にいることまで。外部への出口が無いことは、その netns が本物の bwrap の `--unshare-net` で作られ `lo` しか持たないという前提に依存する。本物であることは root 所有の信頼判定で担保する。
   - netns に加えて pid ns（`/proc/self/ns/pid`）の分離も確かめる。rss 監視の pid 解決とラッパーの kill で ns 内のホストも落ちる挙動が、`--unshare-pid` に依存するため。busybox の `readlink` はオペランドを 1 つしか取らないので、名前空間ごとに別の bwrap 起動にする（結果はプロセスごとに 1 回キャッシュ）。
+
+## 10. macOS のプロキシの UNIX ソケット化の調査（#1486・TASK-38・RENDER-3・SEC-2・XOS-1）
+
+調査と文書化だけを行う節で、コードは変えない。実装の要否と方式はオーナーが決める（#1457 の判断で調査が指示された）。確度は冒頭の表記に従う。一次情報は `servo-net 0.7.0`・`hyper-util 0.1.21`（`servo-host/Cargo.lock` が固定する版。crates.io から展開したソースを読んだ。上流の対応ファイルは Servo の `v0.7.0` タグの `components/net/connector.rs` と hyper-util の `v0.1.21` タグ）。
+
+### 10.1 結論
+
+- Servo 0.7.0 の proxy は TCP の宛先しか取れず、Servo を改変しない限り UNIX ソケットを指せない（確認済みの事実から導いた結論）。
+- macOS にはネットワーク名前空間が無く、ホスト内の中継を置いても Servo から中継までは loopback の TCP になる。中継の listener が他ユーザー・他プロセスから届く点は今と変わらず、穴は中継に移るだけで閉じない（導いた結論。Seatbelt の個別構文は未確認だが採否に影響しない）。
+- 現実的な対策は接続トークン（`Proxy-Authorization`）で、Servo を改変せずに付けられる。論点は秘密の渡し方で、argv は macOS で他ユーザーにも見えるため使えない。推奨候補は stdio の初回メッセージか、WorkDir 配下の 0600 ファイル。決定はオーナーが行う。
+
+### 10.2 Servo 0.7.0 の proxy が UNIX ソケットを扱えない根拠
+
+| 事項 | 根拠 | 確度 |
+| ---- | ---- | ---- |
+| proxy は pref の文字列（`network_http_proxy_uri`）から `Matcher::builder()` で組む | `servo-net-0.7.0/connector.rs` 604–605 | 確認済み |
+| 文字列は `http::Uri` として解釈する。対応する scheme は http・https・socks 系で、authority が必須。`unix:` のような宛先を表す形は無い | `hyper-util-0.1.21/src/client/proxy/matcher.rs` の `build`（304 付近）・`parse_env_uri`（333 以降） | 確認済み |
+| proxy へは `Tunnel::new(intercept.uri().clone(), self.client.clone())` で接続し、内側の `self.client` で `proxy_dst` に dial する。`ProxyConnector` の戻り値は TCP 固定 | `connector.rs` 631、`tunnel.rs` 133–134 | 確認済み |
+| hyper-util の `HttpConnector` に UNIX ソケットへ dial する経路は無い。`unix` が出るのは `Connection` の trait 実装（601–602 行）だけ | `legacy/connect/http.rs` を grep（`unix` は 601–602 のみ） | 確認済み |
+| userinfo は http 系で Basic 認証になり、`tunnel.with_auth` で CONNECT の `Proxy-Authorization` になる（`set_sensitive(true)`） | `matcher.rs` 355–375、`connector.rs` 632–636、`tunnel.rs` 78–87 | 確認済み |
+| `TunnelError` の `Display` は固定文言で、proxy の URI（トークンを含みうる）を出さない。Servo はこれを `ProxyError(format!("{e}"))` に包む | `tunnel.rs` 235–247、`connector.rs` 625・638 | 確認済み |
+
+### 10.3 代替案の比較
+
+| 案 | 実現性 | 残る穴 | 依存・`unsafe` | 測定 |
+| -- | ------ | ------ | -------------- | ---- |
+| UNIX ソケットを Servo の proxy に直接指定 | 不可（10.2）。Servo を改変すると MPL のソース開示義務が生じ、licensing の方針にも反するため採らない | — | — | — |
+| (a) Linux と同じホスト内中継（`--egress-relay-uds`）を macOS でも使う | 成立しない。Servo から中継へは loopback の TCP で、Seatbelt で `remote ip` を全面拒否すると Servo 自身が中継に届かない。許可すれば中継の listener が今の穴を引き継ぐ。`isolation.rs`・`relay.rs` の doc も、隔離なしだとホストの 127.0.0.1 に中継が開くと指摘している（確認済み） | 他ユーザー・他プロセスから中継経由で本体の送信元 IP が使える（今と同じ） | std で足りる見込み（推測）。`unsafe` 不要 | Seatbelt の UNIX ソケット宛の許可は `(remote unix-socket (path-literal ...))` の形が Apple 同梱・公開 profile にあるとされるが、実機では未確認。採否には影響しない |
+| (b) 接続トークン（`Proxy-Authorization`）を Servo に付けさせる | 実現可能。`LoopbackProxy::uri()`（`servo-host/src/engine.rs`）を `http://<user>:<token>@127.0.0.1:<port>` にすれば Servo が付ける（10.2）。本体プロキシ側は検証して不一致を 407 で閉じる | 同じ uid のプロセスは WorkDir・環境変数・プロセス情報を読めて防げない。検証が欠けると今の状態に戻る | トークン生成に CSPRNG が要る。std だけで足りるかは未確認で、依存が要るなら承認事項。`unsafe` は不要の見込み（推測） | xos-measure の macOS（`egress-isolation`・`egress-host`）で、陽性対照（トークン付きで通る）と陰性対照（なし・別トークンで 407）を測れる見込み（推測） |
+| (c) 本体側で接続元プロセスを確かめる | TCP の接続元 pid を得るには `proc_pidfdinfo` 等の FFI が要る（推測）。`LOCAL_PEERPID` は UNIX ソケット専用 | pid の再利用の競合 | `unsafe` が要るため承認事項。推奨しない | 未確認 |
+
+Seatbelt の profile は隔離したプロセスの送信だけを絞り、他のプロセスから listener への受信は絞れない。そのため、Seatbelt は listener を他から守る手段にならない（導いた結論）。
+
+### 10.4 トークン案の SEC-2 上の扱い
+
+`Proxy-Authorization` は CONNECT のときだけ送られ、本体プロキシが読んで終わる。本体プロキシは CONNECT のヘッダ行を検証するだけ（`egress_proxy/request.rs` の `parse_connect`・`validate_header_line`）で、トンネル確立後のバイト列は改変しない。そのため origin から見える識別面（UA・ヘッダ・`navigator`・TLS）は変わらない見込み（確認済みの動作からの推論）。宛先の許可判定と接続時の IP 再検査は本体プロキシのままで、トークンは送信元 IP の踏み台化を減らす対策であり、SSRF 対策の代わりではない。
+
+### 10.5 トークンの渡し方の候補（決定はオーナー）
+
+| 渡し方 | 評価 |
+| ------ | ---- |
+| argv（現状の `--egress-proxy-port` と同じ） | 不可。macOS の `ps` で他ユーザーにも見える |
+| 環境変数 | 他ユーザーの環境変数の可視性は macOS で未確認。`HostProcess` は許可リストの環境変数で起動するため拡張も要る |
+| stdio プロトコルの初回メッセージ | 有力。ホスト起動後の握手で渡す。プロトコルとスキーマの変更が要る。設計 §2.6 の「クライアントから任意引数を渡さない」とは、本体が決めた値を渡す形なので整合する |
+| WorkDir 配下の 0600 ファイル | 有力。同じ uid 以外は読めない（Linux の UNIX ソケット配置と同じ考え方）。パス検証が要る |
+
+実装時の条件（後続 issue）: 起動ごとに新規に作る。比較は定数時間で行う。407 応答とログにトークンと `Proxy-Authorization` の値を出さない。トークン検証が使えないときは起動を拒否する（`required` の既存方針と同じく fail-closed）。
+
+### 10.6 未確認事項と後続
+
+- macOS 実機での Seatbelt の構文（UNIX ソケット宛の許可・拒否）と、`seatbelt.py` の拒否行の帰属。現在の `_DENY_RE` は `ip:port` と `*:port` の形だけを受け付けるため、UNIX ソケット宛の拒否行は帰属できず、測るには拡張が要る。
+- 他ユーザーのプロセスの環境変数の macOS での可視性。
+- トークン生成に std だけで足りるか。
+- 実装（`servo-host` の `engine.rs`・`args.rs`、`egress_proxy` の 407、`host_process` の受け渡し、`real_host` と xos-measure のテスト追加）は、オーナー判断の後の別 issue。設計 §2.5 の (3) と `isolation.rs` の「別途検討」の更新もそのときに行う。
+- 依存の追加・`unsafe`・`ci.yml` の変更は本 issue では行っていない。
