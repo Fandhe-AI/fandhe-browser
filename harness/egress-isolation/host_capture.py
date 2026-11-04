@@ -41,6 +41,7 @@ import signal
 import socket
 import subprocess
 import sys
+import threading
 import time
 from collections import Counter
 from pathlib import Path
@@ -74,6 +75,14 @@ WINDOW_SLACK_SECONDS = ATTRIBUTION_WINDOW_SECONDS
 WAIT_CANARY_DEFAULT_TIMEOUT = 15.0
 WAIT_CANARY_MAX_TIMEOUT = 60.0
 WAIT_CANARY_DEFAULT_INTERVAL = 0.5
+# ポーリング 1 回（tcpdump -r の起動から読み切りまで）の待ちの上限・下限と、kill 後の wait の猶予（秒。#1476）。
+# 上限は従来の timeout=10。下限は残り時間が 0 以下でも最低 1 回は読みに行くための小さな正の値。
+WAIT_CANARY_POLL_MAX_SECONDS = 10.0
+WAIT_CANARY_POLL_MIN_SECONDS = 0.1
+WAIT_CANARY_KILL_GRACE_SECONDS = 1.0
+# tcpdump の起動コマンド。テストが偽の遅い tcpdump に差し替えるためのモジュール定数の注入点で、
+# 環境変数・CLI 引数からは変えられない（実行ファイルを外部入力で差し替えさせない）。
+TCPDUMP_ARGV: tuple[str, ...] = ("tcpdump",)
 # final_canary_t と pcap 上の時刻（マイクロ秒切り捨て）の比較に許す下駄（秒）。
 FINAL_CANARY_EPSILON_SECONDS = 0.001
 UNPARSED_RATIO_LIMIT = 0.01
@@ -358,21 +367,23 @@ def _final_canary_threshold(final_canary_t: float, window: tuple[float, float] |
     return threshold
 
 
+def _is_final_canary(pkt: dict, canary_port: int, threshold: float) -> bool:
+    """1 パケットが最終カナリア（lo 上の canary_port 発 UDP で閾値以降）か。逐次読みと一括判定で共用する。"""
+    return (
+        pkt.get("iface") == "lo"
+        and pkt.get("dir") in ("Out", "In")
+        and pkt.get("proto") == "udp"
+        and pkt.get("sport") == canary_port
+        and pkt.get("ts", 0.0) >= threshold
+    )
+
+
 def final_canary_observed(
     packets: Iterable[dict], canary_port: int, final_canary_t: float, window: tuple[float, float] | None = None
 ) -> bool:
     """パケット列に最終カナリア（lo 上の canary_port 発 UDP で閾値以降）があるか。stop ステップのポーリング用。"""
     threshold = _final_canary_threshold(final_canary_t, window)
-    for pkt in packets:
-        if (
-            pkt.get("iface") == "lo"
-            and pkt.get("dir") in ("Out", "In")
-            and pkt.get("proto") == "udp"
-            and pkt.get("sport") == canary_port
-            and pkt.get("ts", 0.0) >= threshold
-        ):
-            return True
-    return False
+    return any(_is_final_canary(pkt, canary_port, threshold) for pkt in packets)
 
 
 def _empty_counts() -> dict:
@@ -1104,35 +1115,80 @@ def run_sampler(
     return 0
 
 
-def _poll_pcap_once(pcap: Path, canary_port: int, final_canary_t: float, window: tuple[float, float] | None) -> bool:
-    """pcap を tcpdump -r で 1 回読み、最終カナリアがあるかを返す。
+def _read_bounded_line(stream) -> str:
+    """1 行を MAX_PACKET_LINE_CHARS までだけ保持して返す。超過分は改行か EOF まで読み捨てる（無制限バッファを避ける）。"""
+    raw = stream.readline(MAX_PACKET_LINE_CHARS + 1)
+    if len(raw) > MAX_PACKET_LINE_CHARS and not raw.endswith("\n"):
+        while True:
+            rest = stream.readline(MAX_PACKET_LINE_CHARS + 1)
+            if not rest or rest.endswith("\n"):
+                break
+    return raw[:MAX_PACKET_LINE_CHARS]
 
-    書きかけの pcap は truncation で tcpdump が非 0 を返すことがあるが手前のパケットは出るため、終了コードは無視して
-    stdout だけを見る。引数はリスト（shell=False）。port は呼び出し側が int・範囲を検証済み。
+
+def _poll_pcap_once(
+    pcap: Path,
+    canary_port: int,
+    final_canary_t: float,
+    window: tuple[float, float] | None,
+    budget: float = WAIT_CANARY_POLL_MAX_SECONDS,
+    max_packets: int = DEFAULT_MAX_PACKETS,
+) -> bool:
+    """pcap を tcpdump -r で 1 回読み、最終カナリアがあるかを返す（#1476）。
+
+    stdout を 1 行ずつ有界に読み、最終カナリアを見つけた時点か件数上限（max_packets）で打ち切る。
+    `budget` 秒を過ぎたら Timer が tcpdump を kill して EOF にする（select は Windows のパイプで使えないため）。
+    書きかけの pcap は truncation で tcpdump が非 0 を返すことがあるが手前のパケットは出るため、終了コードは無視する。
+    起動失敗・時間切れ・件数上限・読みの例外はすべて False（未観測。fail-closed）。引数はリスト（shell=False）。
+    port は呼び出し側が int・範囲を検証済み。stderr は読まないので DEVNULL（PIPE だと詰まる）。
     """
+    threshold = _final_canary_threshold(final_canary_t, window)
     try:
-        proc = subprocess.run(
-            ["tcpdump", "-r", str(pcap), "-nn", "-tt", f"udp and src port {canary_port}"],
-            capture_output=True,
-            timeout=10,
-            check=False,
+        proc = subprocess.Popen(
+            [*TCPDUMP_ARGV, "-r", str(pcap), "-nn", "-tt", f"udp and src port {canary_port}"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
         )
-    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+    except (OSError, subprocess.SubprocessError, ValueError):
         return False
-    packets = []
-    for n, raw in enumerate(proc.stdout.decode("utf-8", errors="replace").splitlines()):
-        if n >= DEFAULT_MAX_PACKETS:
-            break
-        pkt = parse_tcpdump_line(raw[:MAX_PACKET_LINE_CHARS])
-        if pkt is not None:
-            packets.append(pkt)
-    return final_canary_observed(packets, canary_port, final_canary_t, window)
+    timer = threading.Timer(max(0.0, budget), proc.kill)
+    timer.daemon = True
+    timer.start()
+    try:
+        for _ in range(max_packets):
+            raw = _read_bounded_line(proc.stdout)
+            if not raw:
+                return False
+            pkt = parse_tcpdump_line(raw)
+            if pkt is not None and _is_final_canary(pkt, canary_port, threshold):
+                return True
+        return False
+    except (OSError, ValueError):
+        return False
+    finally:
+        timer.cancel()
+        if proc.poll() is None:
+            proc.kill()
+        try:
+            proc.wait(timeout=WAIT_CANARY_KILL_GRACE_SECONDS)
+        except subprocess.TimeoutExpired:
+            pass
+        try:
+            proc.stdout.close()
+        except (OSError, ValueError):
+            pass
 
 
 def cmd_wait_final_canary(args: argparse.Namespace) -> int:
     """workflow の stop ステップから SIGINT の前に呼ばれる。最終カナリアが pcap に入るまで待つ（#1473 P2）。
 
     0: 観測した / 1: 時間切れ / 2: samples から port・final_canary_t を得られない。いずれも合否は judge が決める。
+    ポーリング 1 回の待ちは min(WAIT_CANARY_POLL_MAX_SECONDS, 締切までの残り)（下限 WAIT_CANARY_POLL_MIN_SECONDS）で、
+    実時間の上限は概ね timeout + POLL_MIN + KILL_GRACE（#1476）。
     """
     out_dir = Path(args.out_dir)
     timeout = max(0.0, min(float(args.timeout), WAIT_CANARY_MAX_TIMEOUT))
@@ -1151,12 +1207,15 @@ def cmd_wait_final_canary(args: argparse.Namespace) -> int:
     pcap = out_dir / "capture.pcap"
     deadline = time.monotonic() + timeout
     while True:
-        if _poll_pcap_once(pcap, port, final_t, window):
+        remaining = deadline - time.monotonic()
+        budget = max(WAIT_CANARY_POLL_MIN_SECONDS, min(WAIT_CANARY_POLL_MAX_SECONDS, remaining))
+        if _poll_pcap_once(pcap, port, final_t, window, budget):
             return 0
-        if time.monotonic() >= deadline:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
             sys.stdout.write(f"note: final canary not seen in pcap within {timeout:g}s\n")
             return 1
-        time.sleep(interval)
+        time.sleep(min(interval, remaining))
 
 
 def cmd_sample(args: argparse.Namespace) -> int:
