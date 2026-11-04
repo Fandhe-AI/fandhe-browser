@@ -8,8 +8,9 @@
 //! `pre_exec`・FFI は使わず外部コマンドの引数配列だけで隔離する（シェルを介さない）。
 //!
 //! - Linux: `bwrap --die-with-parent --unshare-net --unshare-pid --dev-bind / / --proc /proc
-//!   --tmpfs /run --tmpfs /tmp --tmpfs /var/tmp --tmpfs /dev/shm [--tmpfs <$HOME>]
-//!   [--tmpfs <WorkDir の親>] --bind <WorkDir> <WorkDir> [--ro-bind <ホスト> <ホスト>] -- <ホスト>
+//!   [--size <N>] --tmpfs /run [--size <N>] --tmpfs /tmp [--size <N>] --tmpfs /var/tmp
+//!   [--size <N>] --tmpfs /dev/shm [--size <N> --tmpfs <$HOME>]
+//!   [--size <N> --tmpfs <WorkDir の親>] --bind <WorkDir> <WorkDir> [--ro-bind <ホスト> <ホスト>] -- <ホスト>
 //!   --stdio --egress-relay-uds <UDS>`（`--ro-bind` はホストが `/run` 以外の tmpfs の配下にあるときだけ。
 //!   `--tmpfs` の後に bind を置く順序が意味を持つ。`/tmp` 等は実体パスに解決し、存在しないものは外す）。
 //!   netns に出口が無くなり、ホストは netns 内の中継を経由して WorkDir 配下の UDS（本体側の
@@ -31,10 +32,14 @@
 //!   既に隠れる場所の配下なら重複させず、`/` やシステムのディレクトリ（`/usr`・`/etc`・`/var` など。
 //!   [`is_system_dir`]）なら覆えないので [`EgressIsolationUnavailable::WorkDirParentNotHideable`]。
 //!   `/tmp` が `/var/tmp` への symlink などの環境では、隠す対象を実体パスで判定して重複を除く。
-//! - tmpfs に `--size` は付けない。`--size` を持たない版の bwrap は未知のオプションで失敗し、
-//!   プローブが `SandboxProbeFailed` になって `required` で起動できなくなる（最低版を決めていない
-//!   方針と合わない）うえ、版で分岐するとプローブと本番の引数が食い違う。残余リスクは、ホストが
-//!   tmpfs を埋めると本体マシンのメモリを消費しうること（egress とは別の DoS 面。#1492）。
+//! - tmpfs には容量の上限を付ける（#1498。[`TMPFS_SIZE_BYTES`] 1 本 64 MiB・最大 6 本で 384 MiB。
+//!   根拠は定数の doc）。既定は 1 本あたり RAM の 50% で上限は mount ごとのため、侵害されたホストが
+//!   本体マシンのメモリを消費しうるのを抑える。`--size`（upstream bubblewrap v0.7.0 で導入）が
+//!   使えるかは版の文字列ではなく `bwrap --help` の機能検出で、プローブ時に 1 回だけ決め
+//!   （[`TmpfsLimit`]）、試走と本番が同じ引数になるよう [`HiddenPaths`] に持たせる。非対応の版では
+//!   隔離をやめず上限なしで続け（黙って緩めない）、`HostProcess` が警告を 1 回出す。残余リスク:
+//!   `--size` は容量しか抑えず inode の数（`nr_inodes`。bwrap に指定手段が無い）は抑えないため、
+//!   空ファイルを大量に作るとカーネルのメモリを使いうる。
 //! - 隔離中は WebSocket が使えない（Servo の `websocket_loader` はプロキシを使わず直接接続する
 //!   ため、遮断されて失敗する）。
 //! - macOS の loopback プロキシは同一マシンの全ユーザー・全プロセスから届く（認証なし。Seatbelt
@@ -164,6 +169,33 @@ const PROBE_STDOUT_MAX: u64 = 256;
 /// プローブ 1 回の上限時間。
 #[cfg_attr(not(unix), allow(dead_code))]
 const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+/// `bwrap --help` の stdout を読む上限（実物は約 5.4KB。超過は `--size` 非対応とみなす）。
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+const HELP_STDOUT_MAX: u64 = 64 * 1024;
+/// tmpfs 1 本あたりの容量上限（バイト。bwrap の `--size`。RENDER-3・SEC-2・#1498）。
+///
+/// 根拠: 子の `TMPDIR`・`HOME`・`XDG_*` は WorkDir（実ディスクを `--bind` で戻したもの）を指すため、
+/// 正当な書き込みは tmpfs に入らない。入りうるのは `/dev/shm` の POSIX shm 程度と迷い込んだ
+/// ファイルだけなので 64 MiB で足りる。最悪の合計は「tmpfs の本数（最大 6: `/run`・`/tmp`・
+/// `/var/tmp`・`/dev/shm`・`$HOME`・WorkDir の親）x 64 MiB = 384 MiB」で、RSS の上限
+/// （`DEFAULT_RSS_LIMIT_BYTES` 2 GiB）の約 19%。既定の上限（1 本あたり RAM の 50%）と違い RAM の量に
+/// よらない。tmpfs のページは RSS の監視に計上されない（推測）ため、本数 x 上限で別に抑える。
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+const TMPFS_SIZE_BYTES: u64 = 64 * 1024 * 1024;
+
+/// tmpfs の容量上限の扱い（プローブで 1 回だけ決め、[`HiddenPaths`] に持たせる）。
+///
+/// 判定をプローブに集約し結果を `Sandbox::Bwrap` の中に持つので、プローブと本番の引数は構造上
+/// 一致する（版の文字列は解析せず、`bwrap --help` に `--size` があるかという機能で検出する）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(super) enum TmpfsLimit {
+    /// 各 `--tmpfs` の直前に `--size <バイト数>` を付ける。
+    Capped(u64),
+    /// bwrap が `--size`（upstream v0.7.0 で導入）を持たない。上限なし（既定の RAM の 50%）で隔離を
+    /// 続ける。隔離そのものを外す理由にはしない（メモリ上限が無いことより悪くなるため）。
+    Unsupported,
+}
 
 /// 隔離できない理由。`Display` は固定の英語文言で、パスを含めない（診断・警告用）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -418,25 +450,44 @@ pub(super) struct HiddenPaths {
     fixed: Vec<PathBuf>,
     /// 正規化済みの `$HOME`。固定対象の配下なら既に隠れているので `None`（tmpfs の重複を省く）。
     home: Option<PathBuf>,
+    /// 各 tmpfs の容量上限（プローブで検出。#1498）。
+    tmpfs_limit: TmpfsLimit,
 }
 
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 impl HiddenPaths {
     /// 解決済みの固定対象（[`resolve_fixed_targets`]）と正規化済みの `$HOME`
     /// （[`resolve_home_to_hide`]）から作る。
-    pub(super) fn from_resolved(fixed: Vec<PathBuf>, home_canonical: PathBuf) -> Self {
+    pub(super) fn from_resolved(
+        fixed: Vec<PathBuf>,
+        home_canonical: PathBuf,
+        tmpfs_limit: TmpfsLimit,
+    ) -> Self {
         let covered = fixed.iter().any(|f| home_canonical.starts_with(f));
         Self {
             fixed,
             home: if covered { None } else { Some(home_canonical) },
+            tmpfs_limit,
         }
+    }
+
+    /// 各 tmpfs の容量上限。
+    pub(super) fn tmpfs_limit(&self) -> TmpfsLimit {
+        self.tmpfs_limit
+    }
+
+    /// テスト用: 容量上限を差し替える。
+    #[cfg(test)]
+    pub(super) fn with_tmpfs_limit(mut self, limit: TmpfsLimit) -> Self {
+        self.tmpfs_limit = limit;
+        self
     }
 
     /// テスト用: 固定対象を `/run`・`/tmp`・`/var/tmp`・`/dev/shm` として作る。
     #[cfg(test)]
     pub(super) fn new(home_canonical: PathBuf) -> Self {
         let fixed = FIXED_CANDIDATES.iter().map(PathBuf::from).collect();
-        Self::from_resolved(fixed, home_canonical)
+        Self::from_resolved(fixed, home_canonical, TmpfsLimit::Capped(TMPFS_SIZE_BYTES))
     }
 
     /// `--tmpfs` を並べる順の対象（固定 -> `$HOME` -> WorkDir の親。祖先を残して重複除去）。
@@ -455,6 +506,13 @@ impl HiddenPaths {
             .filter(|t| t.as_path() != Path::new("/run"))
             .any(|t| canonical.starts_with(t))
     }
+}
+
+/// tmpfs に容量上限を付けられない（bwrap が `--size` 非対応）ときの警告文言（固定の英語。パスを
+/// 含めない。RENDER-3・#1498）。`HostProcess` が隔離起動時に 1 回だけ stderr へ出す。
+pub(super) fn tmpfs_limit_warning_message() -> String {
+    "render host sandbox (bwrap) does not support --size; tmpfs mounts are not size-limited"
+        .to_string()
 }
 
 /// `$HOME` の生の値を、tmpfs で隠せる正規化済みパスへ解決する（RENDER-3・#1485・#1492）。
@@ -496,9 +554,13 @@ pub(super) enum BindKind {
 ///
 /// `--proc /proc` は `--dev-bind / /` の後ろに、`binds`（隠した後に戻す自分の WorkDir と
 /// ホストの実行ファイル）は `--tmpfs` の**後ろ**に置く（順序が意味を持つ）。bind は起動ごとの
-/// ものなのでプローブには付けない。
+/// ものなのでプローブには付けない。`limit` が `Capped` なら各 `--tmpfs` の直前に `--size` を付ける。
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-fn linux_wrapper_args(tmpfs: &[PathBuf], binds: &[(BindKind, &Path)]) -> Vec<OsString> {
+fn linux_wrapper_args(
+    tmpfs: &[PathBuf],
+    limit: TmpfsLimit,
+    binds: &[(BindKind, &Path)],
+) -> Vec<OsString> {
     let mut args: Vec<OsString> = [
         "--die-with-parent",
         "--unshare-net",
@@ -513,6 +575,11 @@ fn linux_wrapper_args(tmpfs: &[PathBuf], binds: &[(BindKind, &Path)]) -> Vec<OsS
     .map(OsString::from)
     .collect();
     for t in tmpfs {
+        // `--size` は直後の 1 本の `--tmpfs` にだけ効くため、対象ごとに並べる（#1498）。
+        if let TmpfsLimit::Capped(n) = limit {
+            args.push(OsString::from("--size"));
+            args.push(OsString::from(n.to_string()));
+        }
         args.push(OsString::from("--tmpfs"));
         args.push(t.as_os_str().to_owned());
     }
@@ -550,7 +617,11 @@ pub(super) fn linux_argv(
     if hidden.hides(host, parent_to_hide) {
         binds.push((BindKind::ReadOnly, host));
     }
-    let mut args = linux_wrapper_args(&hidden.tmpfs_targets(parent_to_hide), &binds);
+    let mut args = linux_wrapper_args(
+        &hidden.tmpfs_targets(parent_to_hide),
+        hidden.tmpfs_limit(),
+        &binds,
+    );
     args.push(host.as_os_str().to_owned());
     args.extend(HOST_ARGS.iter().map(OsString::from));
     args.push(OsString::from("--egress-relay-uds"));
@@ -570,7 +641,7 @@ fn linux_probe_argv(
     link: &str,
 ) -> (PathBuf, Vec<OsString>) {
     // readlink は root 所有の `/usr/bin`・`/bin` にあり隠れないため、bind は要らない。
-    let mut args = linux_wrapper_args(&hidden.tmpfs_targets(None), &[]);
+    let mut args = linux_wrapper_args(&hidden.tmpfs_targets(None), hidden.tmpfs_limit(), &[]);
     args.push(readlink_exec.as_os_str().to_owned());
     args.push(OsString::from(link));
     (bwrap.to_path_buf(), args)
@@ -998,6 +1069,66 @@ fn probe_ns_with(
     }
 }
 
+/// `bwrap --help` の出力に `--size` オプションがあるか（空白区切りのトークンの完全一致。
+/// `--sizes` などは不一致。RENDER-3・#1498）。
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn help_supports_tmpfs_size(stdout: &[u8]) -> bool {
+    stdout
+        .split(|b| b.is_ascii_whitespace())
+        .any(|tok| tok == b"--size")
+}
+
+/// 信頼判定済みの `bwrap` が `--size` を持つかを `--help` で調べ、tmpfs の上限の扱いを決める。
+/// 起動できない・非 0 終了・時間切れ・出力が [`HELP_STDOUT_MAX`] 超は `Unsupported`（上限なしで
+/// 隔離を続ける。隔離自体の可否はこの後の試走が判定する）。
+#[cfg(target_os = "linux")]
+fn detect_tmpfs_limit(bwrap: &Path, timeout: Duration) -> TmpfsLimit {
+    use std::io::Read;
+    let mut cmd = Command::new(bwrap);
+    cmd.arg("--help")
+        .env_clear()
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let Ok(mut child) = cmd.spawn() else {
+        return TmpfsLimit::Unsupported;
+    };
+    let deadline = Instant::now().checked_add(timeout);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if deadline.is_some_and(|d| Instant::now() < d) => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return TmpfsLimit::Unsupported;
+            }
+        }
+    };
+    if !status.success() {
+        return TmpfsLimit::Unsupported;
+    }
+    let mut buf = Vec::new();
+    let Some(out) = child.stdout.take() else {
+        return TmpfsLimit::Unsupported;
+    };
+    if out
+        .take(HELP_STDOUT_MAX.saturating_add(1))
+        .read_to_end(&mut buf)
+        .is_err()
+        || u64::try_from(buf.len()).map_or(true, |n| n > HELP_STDOUT_MAX)
+    {
+        return TmpfsLimit::Unsupported;
+    }
+    if help_supports_tmpfs_size(&buf) {
+        TmpfsLimit::Capped(TMPFS_SIZE_BYTES)
+    } else {
+        TmpfsLimit::Unsupported
+    }
+}
+
 /// 本番と同じフラグで、netns -> pid ns の順に**別々の bwrap 起動**で分離を確かめる（RENDER-3・#1466）。
 /// 最初に分離できなかった名前空間とその結果を `Err` で返す。
 ///
@@ -1029,7 +1160,9 @@ fn probe_uncached() -> Result<Sandbox, EgressIsolationUnavailable> {
     // 固定対象（`/tmp` 等の解決）→ 試走。WorkDir の親の tmpfs は起動ごとなのでここには含めない（#1492）。
     let home = resolve_home_to_hide(std::env::var_os("HOME").as_deref())?;
     let fixed = resolve_fixed_targets(canonicalize_dir)?;
-    let hidden = HiddenPaths::from_resolved(fixed, home);
+    // `--size` の対応はここで 1 回だけ検出し、試走と本番が同じ引数になるよう `hidden` に持たせる。
+    let limit = detect_tmpfs_limit(&bwrap, PROBE_TIMEOUT);
+    let hidden = HiddenPaths::from_resolved(fixed, home, limit);
     // 実起動（`build_command`）は、ここでキャッシュした実体パスを `select_trusted` を通し直さず使う。
     // 実体は root 所有で祖先まで書き込み不可のまま、プロセスの生存中は変わらない前提に立つ
     // （差し替えには root が要り、脅威モデルの外。設計 §9.3）。
@@ -1350,7 +1483,8 @@ mod tests {
     #[test]
     fn render3_linux_probe_argv_uses_candidate_path_as_argv0() {
         for ns in [Namespace::Net, Namespace::Pid] {
-            let hidden = HiddenPaths::new(PathBuf::from("/home/u"));
+            let hidden = HiddenPaths::new(PathBuf::from("/home/u"))
+                .with_tmpfs_limit(TmpfsLimit::Unsupported);
             let (prog, args) = linux_probe_argv(
                 Path::new("/usr/bin/bwrap"),
                 &hidden,
@@ -1467,10 +1601,18 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     fn probe_retrying(bwrap: &Path, readlink: &Path) -> Result<(), (Namespace, NsProbe)> {
-        let hidden = HiddenPaths::new(PathBuf::from("/home/u"));
+        probe_retrying_with(bwrap, readlink, &HiddenPaths::new(PathBuf::from("/home/u")))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn probe_retrying_with(
+        bwrap: &Path,
+        readlink: &Path,
+        hidden: &HiddenPaths,
+    ) -> Result<(), (Namespace, NsProbe)> {
         let mut r = Err((Namespace::Net, NsProbe::SpawnFailed));
         for _ in 0..20 {
-            r = probe_bwrap_with(bwrap, &hidden, readlink, Duration::from_secs(5));
+            r = probe_bwrap_with(bwrap, hidden, readlink, Duration::from_secs(5));
             if !matches!(r, Err((_, NsProbe::SpawnFailed))) {
                 break;
             }
@@ -1534,7 +1676,8 @@ mod tests {
                 let Ok(home) = home else {
                     return assert!(!ci_requires_ok(), "CI must have a hideable HOME: {home:?}");
                 };
-                let hidden = HiddenPaths::new(home);
+                let hidden = HiddenPaths::new(home)
+                    .with_tmpfs_limit(detect_tmpfs_limit(&bwrap, PROBE_TIMEOUT));
                 let mut r = Err((Namespace::Net, NsProbe::SpawnFailed));
                 for _ in 0..20 {
                     r = probe_bwrap_with(&bwrap, &hidden, &readlink, Duration::from_secs(5));
@@ -1578,7 +1721,8 @@ mod tests {
     /// (a) ホストが `$HOME` 配下: tmpfs 3 つ -> `--bind` -> `--ro-bind`。
     #[test]
     fn render3_linux_argv_is_exact_with_exe_under_home() {
-        let hidden = HiddenPaths::new(PathBuf::from("/home/u"));
+        let hidden =
+            HiddenPaths::new(PathBuf::from("/home/u")).with_tmpfs_limit(TmpfsLimit::Unsupported);
         let (prog, args) = linux_argv(
             Path::new("/usr/bin/bwrap"),
             &hidden,
@@ -1641,7 +1785,8 @@ mod tests {
     /// (b) ホストが隠れない場所（`/opt`）なら `--ro-bind` は付けない。
     #[test]
     fn render3_linux_argv_has_no_ro_bind_for_visible_exe() {
-        let hidden = HiddenPaths::new(PathBuf::from("/home/u"));
+        let hidden =
+            HiddenPaths::new(PathBuf::from("/home/u")).with_tmpfs_limit(TmpfsLimit::Unsupported);
         let (_, args) = linux_argv(
             Path::new("/usr/bin/bwrap"),
             &hidden,
@@ -1682,7 +1827,8 @@ mod tests {
     /// (c) `$HOME` が `/tmp` 配下なら `--tmpfs <home>` を省き、`--tmpfs /tmp` は 1 回だけ。
     #[test]
     fn render3_linux_argv_omits_home_tmpfs_when_home_under_tmp() {
-        let hidden = HiddenPaths::new(PathBuf::from("/tmp/h"));
+        let hidden =
+            HiddenPaths::new(PathBuf::from("/tmp/h")).with_tmpfs_limit(TmpfsLimit::Unsupported);
         let (_, args) = linux_argv(
             Path::new("/usr/bin/bwrap"),
             &hidden,
@@ -1816,7 +1962,8 @@ mod tests {
     /// WorkDir の親が `/mnt/x`（どの tmpfs にも覆われない）の場合。
     #[test]
     fn render3_linux_argv_hides_uncovered_workdir_parent() {
-        let hidden = HiddenPaths::new(PathBuf::from("/home/u"));
+        let hidden =
+            HiddenPaths::new(PathBuf::from("/home/u")).with_tmpfs_limit(TmpfsLimit::Unsupported);
         let (_, args) = linux_argv(
             Path::new("/usr/bin/bwrap"),
             &hidden,
@@ -1878,6 +2025,8 @@ mod tests {
             assert!(got.contains(&"--ro-bind"), "{host}");
             assert_eq!(got.iter().filter(|a| **a == "/var/tmp").count(), 1);
             assert_eq!(got.iter().filter(|a| **a == "--tmpfs").count(), 5);
+            // 既定（Capped）では --tmpfs ごとに --size が付く（#1498）。
+            assert_eq!(got.iter().filter(|a| **a == "--size").count(), 5);
             assert_bind_order(&got);
         }
     }
@@ -1885,7 +2034,8 @@ mod tests {
     /// RENDER-3（#1492）: `temp_root=/home`・`HOME=/home/u` のように祖先が来るときは祖先だけを残す。
     #[test]
     fn render3_linux_argv_keeps_only_ancestor_tmpfs() {
-        let hidden = HiddenPaths::new(PathBuf::from("/home/u"));
+        let hidden =
+            HiddenPaths::new(PathBuf::from("/home/u")).with_tmpfs_limit(TmpfsLimit::Unsupported);
         let (_, args) = linux_argv(
             Path::new("/usr/bin/bwrap"),
             &hidden,
@@ -2045,13 +2195,17 @@ mod tests {
         let work = dir.join("w");
         std::fs::create_dir(&work).unwrap();
         // 固定対象に `temp_dir` を含めない。`$HOME` も別の場所にして、覆われない状況を作る。
-        let uncovered =
-            HiddenPaths::from_resolved(pb(&["/run"]), PathBuf::from("/nonexistent-home"));
+        let uncovered = HiddenPaths::from_resolved(
+            pb(&["/run"]),
+            PathBuf::from("/nonexistent-home"),
+            TmpfsLimit::Capped(TMPFS_SIZE_BYTES),
+        );
         let got = socket_dir_for(&work, &uncovered);
         // 覆われる場合: 親 `dir` 自体が固定対象。
         let covered = HiddenPaths::from_resolved(
             vec![PathBuf::from("/run"), dir.clone()],
             PathBuf::from("/nonexistent-home"),
+            TmpfsLimit::Capped(TMPFS_SIZE_BYTES),
         );
         let got_covered = socket_dir_for(&work, &covered);
         let _ = std::fs::remove_dir_all(&dir);
@@ -2084,7 +2238,11 @@ mod tests {
                 Ok(canon.clone())
             );
             // macOS では `/var/tmp` が `/private/var/tmp` になるため、固定対象も実体パスで作る。
-            let hidden = HiddenPaths::from_resolved(vec![canon.clone()], canon);
+            let hidden = HiddenPaths::from_resolved(
+                vec![canon.clone()],
+                canon,
+                TmpfsLimit::Capped(TMPFS_SIZE_BYTES),
+            );
             assert_eq!(hidden.home, None);
         }
     }
@@ -2112,7 +2270,9 @@ mod tests {
         target: &Path,
     ) -> Option<i32> {
         for _ in 0..20 {
-            let mut args = linux_wrapper_args(tmpfs, binds);
+            // 実物の bwrap が対応していれば `--size` 付きで、非対応なら無しで走らせる（本番と同じ判定）。
+            let mut args =
+                linux_wrapper_args(tmpfs, detect_tmpfs_limit(bwrap, PROBE_TIMEOUT), binds);
             args.push(test_exec.as_os_str().to_owned());
             args.push(OsString::from(flag));
             args.push(target.as_os_str().to_owned());
@@ -2169,7 +2329,8 @@ mod tests {
         };
         // 本番（probe_uncached）と同じく、実環境の `/tmp`・`/var/tmp`・`/dev/shm` を解決して使う。
         let fixed = resolve_fixed_targets(canonicalize_dir).unwrap();
-        let hidden = HiddenPaths::from_resolved(fixed, home.clone());
+        let hidden =
+            HiddenPaths::from_resolved(fixed, home.clone(), TmpfsLimit::Capped(TMPFS_SIZE_BYTES));
         let tmpfs = hidden.tmpfs_targets(None);
 
         // 兄弟ディレクトリ（`/tmp`）と WorkDir（`temp_dir` 配下。通常は `/tmp`）。
@@ -2300,7 +2461,11 @@ mod tests {
         let _l1 = UnixListener::bind(&sib_sock).unwrap();
         let _l2 = UnixListener::bind(&work_sock).unwrap();
         // `$HOME` は `/run` の配下（既に覆われる）として tmpfs を増やさない。
-        let hidden = HiddenPaths::from_resolved(pb(&["/run"]), PathBuf::from("/run/home"));
+        let hidden = HiddenPaths::from_resolved(
+            pb(&["/run"]),
+            PathBuf::from("/run/home"),
+            TmpfsLimit::Capped(TMPFS_SIZE_BYTES),
+        );
         let tmpfs = hidden.tmpfs_targets(Some(&parent));
         assert_eq!(tmpfs, [PathBuf::from("/run"), parent.clone()]);
         let rw = [(BindKind::ReadWrite, work.as_path())];
@@ -2454,6 +2619,203 @@ mod tests {
              (must be root-owned and not group/other writable)); starting render host without \
              egress isolation"
         );
+    }
+
+    /// RENDER-3・SEC-2（#1498）: 上限ありのとき、各 `--tmpfs` の直前に `--size 67108864` が付く
+    /// argv の完全一致（`--size` は直後の 1 本にだけ効くため対象ごとに並べる）。
+    #[test]
+    fn render3_linux_argv_is_exact_with_tmpfs_size() {
+        let hidden = HiddenPaths::new(PathBuf::from("/home/u"));
+        assert_eq!(hidden.tmpfs_limit(), TmpfsLimit::Capped(64 * 1024 * 1024));
+        let (_, args) = linux_argv(
+            Path::new("/usr/bin/bwrap"),
+            &hidden,
+            Path::new("/tmp/w"),
+            None,
+            Path::new("/opt/host/servo-host"),
+            Path::new("/tmp/w/egress-proxy.sock"),
+        )
+        .unwrap();
+        assert_eq!(
+            argv_strs(&args),
+            vec![
+                "--die-with-parent",
+                "--unshare-net",
+                "--unshare-pid",
+                "--dev-bind",
+                "/",
+                "/",
+                "--proc",
+                "/proc",
+                "--size",
+                "67108864",
+                "--tmpfs",
+                "/run",
+                "--size",
+                "67108864",
+                "--tmpfs",
+                "/tmp",
+                "--size",
+                "67108864",
+                "--tmpfs",
+                "/var/tmp",
+                "--size",
+                "67108864",
+                "--tmpfs",
+                "/dev/shm",
+                "--size",
+                "67108864",
+                "--tmpfs",
+                "/home/u",
+                "--bind",
+                "/tmp/w",
+                "/tmp/w",
+                "--",
+                "/opt/host/servo-host",
+                "--stdio",
+                "--egress-relay-uds",
+                "/tmp/w/egress-proxy.sock",
+            ]
+        );
+    }
+
+    /// RENDER-3・SEC-2（#1498）: bwrap が `--size` 非対応（`Unsupported`）なら従来どおり `--size` を
+    /// 付けない argv の完全一致（隔離は続け、上限だけ無い）。
+    #[test]
+    fn render3_linux_argv_is_exact_without_tmpfs_size() {
+        let hidden =
+            HiddenPaths::new(PathBuf::from("/home/u")).with_tmpfs_limit(TmpfsLimit::Unsupported);
+        let (_, args) = linux_argv(
+            Path::new("/usr/bin/bwrap"),
+            &hidden,
+            Path::new("/tmp/w"),
+            None,
+            Path::new("/opt/host/servo-host"),
+            Path::new("/tmp/w/egress-proxy.sock"),
+        )
+        .unwrap();
+        assert_eq!(
+            argv_strs(&args),
+            vec![
+                "--die-with-parent",
+                "--unshare-net",
+                "--unshare-pid",
+                "--dev-bind",
+                "/",
+                "/",
+                "--proc",
+                "/proc",
+                "--tmpfs",
+                "/run",
+                "--tmpfs",
+                "/tmp",
+                "--tmpfs",
+                "/var/tmp",
+                "--tmpfs",
+                "/dev/shm",
+                "--tmpfs",
+                "/home/u",
+                "--bind",
+                "/tmp/w",
+                "/tmp/w",
+                "--",
+                "/opt/host/servo-host",
+                "--stdio",
+                "--egress-relay-uds",
+                "/tmp/w/egress-proxy.sock",
+            ]
+        );
+    }
+
+    /// RENDER-3（#1498）: `--help` からの `--size` 検出はトークンの完全一致。
+    #[test]
+    fn render3_help_supports_tmpfs_size_cases() {
+        let real = b"Usage: bwrap [OPTION...] [--] COMMAND [ARGS...]\n\n    --tmpfs DEST                 Mount new tmpfs on DEST\n    --size BYTES                 Set size in bytes of next tmpfs\n";
+        assert!(help_supports_tmpfs_size(real));
+        assert!(!help_supports_tmpfs_size(
+            b"    --tmpfs DEST   Mount new tmpfs on DEST\n    --sizes N\n"
+        ));
+        assert!(!help_supports_tmpfs_size(b"--size-limit\n"));
+        assert!(!help_supports_tmpfs_size(b""));
+        assert!(!help_supports_tmpfs_size(&[0xff, 0xfe, 0x00, 0x80]));
+    }
+
+    /// RENDER-3（#1498）: 警告文言は固定の英語で、パスを含まない。
+    #[test]
+    fn render3_tmpfs_limit_warning_message_has_no_paths() {
+        let m = tmpfs_limit_warning_message();
+        assert_eq!(
+            m,
+            "render host sandbox (bwrap) does not support --size; tmpfs mounts are not size-limited"
+        );
+        assert!(!m.contains('/'));
+    }
+
+    /// RENDER-3（#1498）: `--size` 非対応の bwrap（偽物。`--help` に `--size` が無く、`--size` 付きの
+    /// 起動は失敗する）では `Unsupported` と判定し、その上限で本番と同じ試走が通る
+    /// （隔離は外さず、上限だけ外す）。実物の bwrap と readlink が要る。CI では必須。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn render3_unsupported_size_keeps_isolation_with_fake_old_bwrap() {
+        let (real, readlink) = match (
+            select_trusted(&BWRAP_CANDIDATES),
+            select_trusted_exec(&READLINK_CANDIDATES),
+        ) {
+            (Ok(b), Ok(r)) => (b, r),
+            (b, r) => {
+                assert!(
+                    !ci_requires_ok(),
+                    "CI must have bwrap and readlink: {b:?} {r:?}"
+                );
+                return;
+            }
+        };
+        let body = format!(
+            "#!/bin/sh\nif [ \"$1\" = \"--help\" ]; then echo 'Usage: bwrap [OPTION...] COMMAND'; echo '    --tmpfs DEST  Mount new tmpfs'; exit 0; fi\nfor a in \"$@\"; do if [ \"$a\" = \"--size\" ]; then exit 1; fi; done\nexec {} \"$@\"\n",
+            real.display()
+        );
+        let (dir, fake) = fake_script("oldbwrap", &body);
+        let mut limit = TmpfsLimit::Capped(0);
+        for _ in 0..20 {
+            limit = detect_tmpfs_limit(&fake, Duration::from_secs(5));
+            if limit == TmpfsLimit::Unsupported {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let home = resolve_home_to_hide(std::env::var_os("HOME").as_deref());
+        let result = home.map(|home| {
+            let hidden = HiddenPaths::new(home).with_tmpfs_limit(limit);
+            probe_retrying_with(&fake, &readlink, &hidden)
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(limit, TmpfsLimit::Unsupported);
+        match result {
+            Ok(r) => assert_eq!(r, Ok(())),
+            Err(e) => assert!(!ci_requires_ok(), "CI must have a hideable HOME: {e:?}"),
+        }
+    }
+
+    /// RENDER-3（#1498）: 実物の bwrap の `--help` 検出が、`--size` ありの版で `Capped`、無い版で
+    /// `Unsupported` を返す。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn render3_detect_tmpfs_limit_matches_real_bwrap_help() {
+        let Ok(bwrap) = select_trusted(&BWRAP_CANDIDATES) else {
+            assert!(!ci_requires_ok(), "CI must have bwrap");
+            return;
+        };
+        let help = Command::new(&bwrap)
+            .arg("--help")
+            .env_clear()
+            .output()
+            .unwrap();
+        let expected = if help_supports_tmpfs_size(&help.stdout) {
+            TmpfsLimit::Capped(TMPFS_SIZE_BYTES)
+        } else {
+            TmpfsLimit::Unsupported
+        };
+        assert_eq!(detect_tmpfs_limit(&bwrap, PROBE_TIMEOUT), expected);
     }
 
     /// RENDER-3（#1436）: Windows ほかは隔離できない（既知の制約）。

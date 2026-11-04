@@ -590,6 +590,36 @@ fn t_system_probe_branch() {
             );
             assert_eq!(obs["ppid"], 1);
             assert_eq!(support::child_pid_in(&workdir, 1), 2);
+            // tmpfs の容量上限（RENDER-3・#1498）: bwrap が `--size` に対応していれば、内側の `/tmp` は
+            // 64 MiB（mountinfo では `size=65536k`）の tmpfs。非対応の版では上限なし（`size=65536k` を
+            // 含まない）。対応の有無は同じ bwrap の `--help` で判定する（本番の機能検出と同じ根拠）。
+            let help = std::process::Command::new("/usr/bin/bwrap")
+                .arg("--help")
+                .env_clear()
+                .output();
+            if let Ok(help) = help {
+                let supports_size = help
+                    .stdout
+                    .split(|b| b.is_ascii_whitespace())
+                    .any(|t| t == b"--size");
+                let tmp_mount = &obs["mounts"]["/tmp"];
+                if tmp_mount.is_object() {
+                    assert_eq!(tmp_mount["fstype"], "tmpfs", "{tmp_mount}");
+                    let opts = tmp_mount["super_opts"].as_str().unwrap();
+                    assert_eq!(
+                        opts.split(',').any(|o| o == "size=65536k"),
+                        supports_size,
+                        "{tmp_mount}"
+                    );
+                } else {
+                    // /tmp が別の場所への symlink などでマウント点として現れない環境。CI では必須にする。
+                    assert!(
+                        !ci_requires_sandbox(std::env::var("GITHUB_ACTIONS").ok().as_deref()),
+                        "CI must show /tmp as a mount point: {}",
+                        obs["mounts"]
+                    );
+                }
+            }
             // FS の隠蔽（RENDER-3・#1485）: `/tmp` の番兵（ファイルと UDS）は見えない。`$HOME` 配下の
             // 既存ファイルも見えない。偽ホストが起動して応答できたこと自体が、`$HOME` 配下の実行
             // ファイルが `--ro-bind` で戻った証拠になる。

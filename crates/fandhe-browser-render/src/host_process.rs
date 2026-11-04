@@ -339,6 +339,9 @@ pub struct HostProcessConfig {
     /// 隔離可否の判定元（既定 [`IsolationProbe::System`]。差し替えはテスト用）。
     pub isolation_probe: IsolationProbe,
     isolation_warning: IsolationWarning,
+    /// テスト用: `isolation_probe` の代わりに使うサンドボックス（本番ビルドには現れない。#1498）。
+    #[cfg(test)]
+    injected_sandbox: Option<Sandbox>,
 }
 
 /// 隔離なしに落ちたことを通知する。コールバックがあればそれだけを呼び、無ければ `out`
@@ -355,6 +358,12 @@ fn report_unisolated(
             let _ = writeln!(out, "warning: {}", isolation_warning_message(reason));
         }
     }
+}
+
+/// bwrap が tmpfs の容量上限（`--size`）に対応していないときの警告を `out`（本番は stderr）へ 1 行
+/// 書く（RENDER-3・#1498。隔離は続くが上限が無いことを黙らせない）。書き込みの失敗は無視する。
+fn report_tmpfs_unlimited(out: &mut dyn std::io::Write) {
+    let _ = writeln!(out, "warning: {}", isolation::tmpfs_limit_warning_message());
 }
 
 /// `best-effort` で隔離なしに落ちたときの警告の通知先。コールバックがあればそれだけを呼び、
@@ -386,6 +395,8 @@ impl HostProcessConfig {
             allow_private_network_access: false,
             isolation_probe: IsolationProbe::default(),
             isolation_warning: IsolationWarning::default(),
+            #[cfg(test)]
+            injected_sandbox: None,
         }
     }
     /// タイムアウトを差し替える。
@@ -510,6 +521,8 @@ pub struct HostProcess {
     stderr_tail: Arc<Mutex<StderrTail>>,
     /// 隔離なしの警告を出したか（HostProcess ごとに 1 回）。
     isolation_warned: bool,
+    /// tmpfs の容量上限が無いことの警告を出したか（HostProcess ごとに 1 回。#1498）。
+    tmpfs_limit_warned: bool,
 }
 
 impl fmt::Debug for HostProcess {
@@ -610,6 +623,7 @@ impl HostProcess {
             next_id: 1,
             stderr_tail: Arc::new(Mutex::new(StderrTail::new())),
             isolation_warned: false,
+            tmpfs_limit_warned: false,
         }
     }
 
@@ -927,6 +941,11 @@ impl HostProcess {
             IsolationProbe::System => isolation::probe_sandbox(),
             IsolationProbe::Unavailable(r) => Err(r),
         };
+        #[cfg(test)]
+        let availability = match &self.config.injected_sandbox {
+            Some(s) => Ok(s.clone()),
+            None => availability,
+        };
         let plan = isolation::decide(mode, availability)?;
         if !matches!(plan, Plan::Isolated(Sandbox::Bwrap { .. })) {
             return Ok((plan, None));
@@ -969,6 +988,13 @@ impl HostProcess {
             }
             Plan::Isolated(s) => s,
         };
+        if let Sandbox::Bwrap { hidden, .. } = &sandbox
+            && hidden.tmpfs_limit() == isolation::TmpfsLimit::Unsupported
+            && !self.tmpfs_limit_warned
+        {
+            self.tmpfs_limit_warned = true;
+            report_tmpfs_unlimited(&mut std::io::stderr().lock());
+        }
         let endpoint = match (&sandbox, &socket_dir) {
             (Sandbox::Bwrap { .. }, Some(sd)) => EgressEndpoint::UnixSocketIn(sd.dir.clone()),
             (Sandbox::SandboxExec, _) => EgressEndpoint::LoopbackTcp,
@@ -1499,5 +1525,178 @@ mod tests {
             11
         ));
         assert!(request_within_limits(None, &Request::Shutdown, 11));
+    }
+
+    /// RENDER-3・#1498: `report_tmpfs_unlimited` は固定文言の 1 行を `warning: ` つきで書く。
+    #[test]
+    fn render3_tmpfs_unlimited_warning_is_one_fixed_line() {
+        let mut out: Vec<u8> = Vec::new();
+        report_tmpfs_unlimited(&mut out);
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "warning: render host sandbox (bwrap) does not support --size; tmpfs mounts are not size-limited\n"
+        );
+    }
+
+    /// 偽 bwrap・偽ホストの置き場（`/tmp` 直下の短い専用ディレクトリ。UDS のパス上限に収める）。
+    #[cfg(target_os = "linux")]
+    fn fresh_dir(tag: &str) -> PathBuf {
+        use std::sync::atomic::AtomicU32;
+        static SEQ: AtomicU32 = AtomicU32::new(0);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.subsec_nanos());
+        let dir = std::fs::canonicalize("/tmp").unwrap().join(format!(
+            "fbq-{tag}-{}-{}-{nanos}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        dir
+    }
+
+    #[cfg(target_os = "linux")]
+    fn write_exec(path: &Path, body: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::write(path, body).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// 起動後に bwrap が失敗する構成で `load` を回し、降格しないことを固定する。
+    ///
+    /// 戻り値は (`load` の失敗の Debug 表記の列, 偽 bwrap の呼び出し回数, 偽ホストが直接実行されたか,
+    /// 警告の件数, `egress_isolation()` が `Unisolated` を返したか, 偽 bwrap が親の tmpfs を
+    /// 受け取らなかったか)。
+    #[cfg(target_os = "linux")]
+    fn run_failing_bwrap(
+        mode: EgressIsolationMode,
+        bwrap_body: Option<&str>,
+        uncovered_parent: bool,
+    ) -> (Vec<String>, usize, bool, usize, bool, bool) {
+        let dir = fresh_dir("bw");
+        let temp_root = dir.join("root");
+        std::fs::create_dir(&temp_root).unwrap();
+        let count = dir.join("count");
+        let direct = dir.join("direct");
+        let noparent = dir.join("noparent");
+        let host = dir.join("host");
+        write_exec(
+            &host,
+            &format!("#!/bin/sh\ntouch {}\nexit 0\n", direct.display()),
+        );
+        let bwrap = dir.join("bwrap");
+        if let Some(body) = bwrap_body {
+            let body = body
+                .replace("@COUNT@", &count.display().to_string())
+                .replace("@NOPARENT@", &noparent.display().to_string())
+                .replace("@PARENT@", &temp_root.display().to_string());
+            write_exec(&bwrap, &body);
+        }
+        let hidden = if uncovered_parent {
+            // `/tmp` を覆わない固定対象にして、WorkDir の親（temp_root）を覆う必要がある状況を作る。
+            isolation::HiddenPaths::from_resolved(
+                vec![PathBuf::from("/run")],
+                PathBuf::from("/run/home"),
+                isolation::TmpfsLimit::Unsupported,
+            )
+        } else {
+            isolation::HiddenPaths::new(PathBuf::from("/home/u"))
+        };
+        let warnings = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&warnings);
+        let mut config = HostProcessConfig::new(
+            resolve::resolve_host_binary(Some(&host), None, None).expect("host binary"),
+        )
+        .with_temp_root(temp_root)
+        .with_egress_isolation(mode)
+        .with_isolation_warning(Arc::new(move |r| sink.lock().unwrap().push(r)));
+        config.injected_sandbox = Some(Sandbox::Bwrap { bwrap, hidden });
+        let mut h = HostProcess::new(config);
+        let page = LoadParams::new("https://example.com/", None).expect("page");
+        let mut errs = Vec::new();
+        for _ in 0..=BREAKER_THRESHOLD {
+            errs.push(format!("{:?}", h.load(&page, 1).expect_err("must fail")));
+        }
+        let unisolated = matches!(
+            h.egress_isolation(),
+            Some(EgressIsolationStatus::Unisolated(_))
+        );
+        let calls = std::fs::read_to_string(&count).map_or(0, |t| t.lines().count());
+        let direct_ran = direct.exists();
+        let n_warn = warnings.lock().unwrap().len();
+        let no_parent = noparent.exists();
+        drop(h);
+        let _ = std::fs::remove_dir_all(&dir);
+        (errs, calls, direct_ran, n_warn, unisolated, no_parent)
+    }
+
+    /// 起動前の降格（`WorkDirHiddenBySandbox`・`SocketPathInvalid`・`WorkDirParentNotHideable` が
+    /// `best-effort` で警告つきの隔離なしになること）は設計どおりで、ここの対象外。ここで固定するのは
+    /// **起動後**の bwrap の失敗が `decide` を通らず、隔離なしの直接起動に落ちないこと。
+    #[cfg(target_os = "linux")]
+    fn assert_no_downgrade(
+        got: (Vec<String>, usize, bool, usize, bool, bool),
+        first: &str,
+        calls: usize,
+    ) {
+        let (errs, n_calls, direct, n_warn, unisolated, no_parent) = got;
+        let mut want: Vec<String> = vec![first.to_string(); BREAKER_THRESHOLD];
+        want.push("CircuitOpen".to_string());
+        assert_eq!(errs, want);
+        assert_eq!(n_calls, calls);
+        assert!(!direct, "host must never be spawned directly");
+        assert_eq!(n_warn, 0, "no unisolated warning");
+        assert!(!unisolated);
+        // 親の tmpfs を要する構成では、偽 bwrap が親の tmpfs を受け取っている（印が無い）。
+        assert!(!no_parent, "fake bwrap must receive the parent tmpfs");
+    }
+
+    /// RENDER-3・SEC-2（#1498・P2-2）: bwrap が起動後に失敗（mount 失敗の想定）しても、`best-effort`
+    /// でも `required` でも隔離なしの直接起動に降格せず、失敗として数えて遮断器が開く。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn render3_bwrap_runtime_failure_never_downgrades_to_unisolated() {
+        let body = "#!/bin/sh\necho x >> @COUNT@\necho \"bwrap: Can't mount tmpfs on /newroot/x\" >&2\nsleep 0.1\nexit 1\n";
+        for mode in [
+            EgressIsolationMode::BestEffort,
+            EgressIsolationMode::Required,
+        ] {
+            let got = run_failing_bwrap(mode, Some(body), false);
+            // 失敗の種類は具体値で固定する（ホストがハンドシェイク前に EOF）。
+            assert_eq!(got.0.first().map(String::as_str), Some("Crashed"));
+            assert_no_downgrade(got, "Crashed", BREAKER_THRESHOLD);
+        }
+    }
+
+    /// RENDER-3・SEC-2（#1498・P2-2）: bwrap のパスが無い（起動できない）場合は `SpawnFailed` で、
+    /// 隔離なしには落ちない。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn render3_bwrap_missing_at_spawn_never_downgrades_to_unisolated() {
+        for mode in [
+            EgressIsolationMode::BestEffort,
+            EgressIsolationMode::Required,
+        ] {
+            let got = run_failing_bwrap(mode, None, false);
+            assert_eq!(got.0.first().map(String::as_str), Some("SpawnFailed"));
+            assert_no_downgrade(got, "SpawnFailed", 0);
+        }
+    }
+
+    /// RENDER-3・SEC-2（#1498・P2-2）: WorkDir の親の tmpfs（`--tmpfs <親>`）だけが実行時に失敗しても、
+    /// 降格せず失敗として数える（親はプローブに含まれないため実起動で初めて失敗しうる）。偽 bwrap は
+    /// 親の tmpfs が引数にあるときだけ失敗し、無ければ印（`noparent`）を残して区別する。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn render3_parent_tmpfs_failure_never_downgrades_to_unisolated() {
+        let body = "#!/bin/sh\necho x >> @COUNT@\nprev=\nfor a in \"$@\"; do\n  if [ \"$prev\" = \"--tmpfs\" ] && [ \"$a\" = \"@PARENT@\" ]; then\n    echo \"bwrap: Can't mount tmpfs on /newroot@PARENT@\" >&2\n    sleep 0.1\n    exit 1\n  fi\n  prev=\"$a\"\ndone\ntouch @NOPARENT@\nexit 0\n";
+        for mode in [
+            EgressIsolationMode::BestEffort,
+            EgressIsolationMode::Required,
+        ] {
+            let got = run_failing_bwrap(mode, Some(body), true);
+            assert_eq!(got.0.first().map(String::as_str), Some("Crashed"));
+            assert_no_downgrade(got, "Crashed", BREAKER_THRESHOLD);
+        }
     }
 }
