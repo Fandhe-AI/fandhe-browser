@@ -283,6 +283,12 @@ host netns を記録し、bwrap 配下の Servo ホストに帰属する外向�
   〔tick の延長を含む〕以降）に観測されたことを要求する。観測されない・`end` 記録が無い・`final_canary_t` が無いときは観測不能。
   最後のパケットの時刻とは比べない（runner の通常通信で満たせてしまい、Servo 終了後の静かな区間では落ちるため）。
   workflow の stop ステップは `end` 記録の確認後、tcpdump に SIGINT を送る前に `host_capture.py wait-final-canary`（`tcpdump -r` で pcap を読み、最終カナリアが現れるまで上限 15 秒でポーリング）を呼ぶ（固定の待ちは廃止。#1473 P2）。ポーリング 1 回の待ちは `min(10 秒, 締切までの残り)`（下限 0.1 秒）で、全体は概ね `--timeout` 以内に終わる。`tcpdump -r` の出力は 1 行ずつ読み、最終カナリアの検出か件数上限（`DEFAULT_MAX_PACKETS`。行長の上限は judge と同じ）で打ち切る（#1476）。
+  各ポーリングは `tcpdump -r` を起動し直して pcap を先頭から読み、毎回同じ件数上限（`DEFAULT_MAX_PACKETS`）で打ち切る（#1481）。
+  上限より後に最終カナリアが書かれると、待ちは毎回未観測（False）になり、judge 側でも観測不能になる（fail-closed。pass にはならない）。
+  改行のない出力の読み捨ては 1 回のポーリングで `WAIT_CANARY_MAX_DISCARD_CHARS` まで。kill 後に猶予内で tcpdump が終了しないときは stderr に警告を出す。
+  時間切れのメッセージは従来の `note: final canary not seen in pcap within ...` の後ろに `(last poll: <理由>)` を付ける。理由は
+  `spawn-failed`（起動失敗）・`budget-killed`（kill による打ち切り）・`packet-limit`（件数上限）・`discard-limit`（読み捨て上限）・`eof`（tcpdump が先に終了。終了コードと stderr の末尾の抜粋）・`read-error`。
+  どの理由でも合否は judge が決める。
   時間切れ・読めないときも SIGINT へ進み、合否は judge が決める（fail-closed）。`final_canary_t` は有限値で `>=` Servo の最後のサンプルでなければならず、違反は観測不能（`-inf` 等で閾値が落ちるのを防ぐ）。
   `UDP` の痕跡の検出（解析できない行・proto=other の行）は大文字小文字を区別しない（過検出は観測不能側）。
   サンプラー側では、`/proc/net` の解析できない行、Servo と同定した pid の fd の EACCES、`/proc/net/if_inet6` があるのに tcp6・udp6 が無い状態を記録して観測不能にする
@@ -296,7 +302,7 @@ host netns を記録し、bwrap 配下の Servo ホストに帰属する外向�
   帰属できない DNS・UDP（lo の In/Out で宛先 53 番のスタブ resolver 経由を含む。`count_category()` と同じ対象）の件数と宛先（dst・dport）の上位 10 件、pass の根拠の注記を Summary と `verdict.json`（`unattributed_in_servo_window`・`pass_basis_note`）に出す。
   pass は netns の構造検査と観測範囲だけに基づき、帰属できない通信が Servo のものでないとは言えない。ペイロードは出さず、pcap と変換テキストは削除する（アーティファクトは許可リスト）。
 - 初回実測での確認事項（#1473 D。人間）: マージ後の最初の `egress-host` 実測で、`proc-read-error:fd-<pid>` による unobservable が出ないかを確かめる。
-  出たら bwrap の子 userns の dumpable 属性を疑い、記録する範囲を見直す（Servo の pid に限る等）。あわせて stop ステップの `wait-final-canary` が実機で効くこと（`note: final canary not seen` が出ないこと）も確かめる。
+  出たら bwrap の子 userns の dumpable 属性を疑い、記録する範囲を見直す（Servo の pid に限る等）。あわせて stop ステップの `wait-final-canary` が実機で効くこと（`note: final canary not seen` が出ないこと。出た場合は `last poll:` の理由を記録する）も確かめる。
 - 自己テスト: `test_host_capture.py`（合成 tcpdump テキスト・合成サンプル。`make check-egress-isolation`）。行形式は tcpdump 4.99.6（SLL2）の実出力に合わせてある。
 
 ## 承認事項（この issue では実装しない）
