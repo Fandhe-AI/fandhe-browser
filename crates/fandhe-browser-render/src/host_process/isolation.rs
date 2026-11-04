@@ -343,7 +343,13 @@ fn is_system_dir(canonical: &Path) -> bool {
         Component::Normal(n) => Some(n),
         _ => None,
     });
-    let Some(first) = normals.next() else {
+    let mut first_opt = normals.next();
+    // macOS では `/etc`・`/var` が `/private/etc`・`/private/var` への symlink で、正規化すると
+    // 先頭に `private` が付く。判定では `/private` を外して Linux と同じ表で見る。
+    if first_opt.is_some_and(|f| f == "private") {
+        first_opt = normals.next();
+    }
+    let Some(first) = first_opt else {
         return true; // `/`
     };
     let has_more = normals.next().is_some();
@@ -466,7 +472,9 @@ pub(super) fn resolve_home_to_hide(
         return Err(bad);
     }
     let canonical = std::fs::canonicalize(path).map_err(|_| bad)?;
-    if is_system_dir(&canonical) || !canonical.is_dir() {
+    // 正規化の前後の両方で判定する（macOS の `/etc` -> `/private/etc` のように、symlink 越しで
+    // 拒否リストから外れるのを防ぐ）。
+    if is_system_dir(path) || is_system_dir(&canonical) || !canonical.is_dir() {
         return Err(bad);
     }
     Ok(canonical)
@@ -2074,6 +2082,18 @@ mod tests {
             assert_eq!(hidden.home, None);
         }
     }
+    /// RENDER-3（#1492）: macOS の実体パス（`/private/etc`・`/private/var`）もシステムのディレクトリ。
+    /// `/private/var/folders/..`（macOS の一時領域）は配下なので対象外。
+    #[test]
+    fn render3_is_system_dir_handles_macos_private_prefix() {
+        assert!(is_system_dir(Path::new("/private/etc")));
+        assert!(is_system_dir(Path::new("/private/etc/ssh")));
+        assert!(is_system_dir(Path::new("/private/var")));
+        assert!(!is_system_dir(Path::new("/private/var/folders/ab/cd")));
+        assert!(!is_system_dir(Path::new("/private/tmp")));
+        assert!(!is_system_dir(Path::new("/Users/alice")));
+    }
+
     /// 試走用に `bwrap <wrapper> test <flag> <path>` を走らせ、終了コードを返す（失敗は `None`）。
     #[cfg(target_os = "linux")]
     fn run_bwrap_test(
