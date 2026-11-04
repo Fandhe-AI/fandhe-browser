@@ -805,8 +805,10 @@ jobs:
             if grep -q '"type":"end"' "$cap/samples.jsonl" 2>/dev/null; then break; fi
             sleep 0.5
           done
-          # 最終カナリアが tcpdump に読み切られるまでの有界の待ち（#1470 の回帰。SIGINT が早いと最終カナリアが pcap に入らない）。
-          sleep 2
+          # 固定の待ちをやめ、pcap に最終カナリアが現れるまで上限つきでポーリングする（#1473 P2。#1470 の回帰対策）。
+          # tcpdump の -U により書きかけの pcap も読める。結果に関係なく SIGINT へ進み、合否は judge が決める（fail-closed）。
+          python3 -I -B harness/egress-isolation/host_capture.py wait-final-canary --out-dir "$cap" --timeout 15 \
+            || echo "note: final canary wait did not confirm (judge decides)"
           sudo pkill -INT -x tcpdump || echo "note: no tcpdump process to stop"
           for _ in $(seq 1 60); do
             if [ -f "$cap/tcpdump.exit" ]; then break; fi
@@ -845,6 +847,9 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: egress-host-ubuntu
+          # if-no-files-found: error はパターン全体が 0 件のときしか効かない。個々のファイルの欠落は judge が unobservable にする
+          # （tcpdump.exit・convert.exit・tcpdump.stderr・capture.txt・samples.jsonl）。
+          # verdict.json・summary.md が無いのは judge の失敗（#1473）。
           # 許可リスト（pcap・変換テキストはランナー自身の通信ヘッダを含むため、削除漏れがあっても載せない。#1467）
           path: |
             ${{ runner.temp }}/egress-host/platform.txt
