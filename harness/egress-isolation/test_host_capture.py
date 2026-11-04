@@ -813,48 +813,133 @@ class SlackAndTerminationTests(unittest.TestCase):
         return type("A", (), {"out_dir": str(out), "timeout": 15.0, "interval": 0.1})()
 
     @staticmethod
-    def _proc(stdout):
-        return type("P", (), {"stdout": stdout.encode(), "returncode": 1})()
+    def _popen(stdout):
+        """Popen の偽物。stdout は StringIO で、kill / wait / poll は no-op。"""
+        import io
+
+        p = mock.MagicMock()
+        p.stdout = io.StringIO(stdout)
+        p.poll.return_value = 0
+        p.wait.return_value = 0
+        return p
+
+    @staticmethod
+    def _fake_clock():
+        """sleep で進む偽時計（monotonic の呼び出し回数に依存しない）。"""
+        now = [0.0]
+        return now, (lambda: now[0]), (lambda s: now.__setitem__(0, now[0] + s))
 
     def test_wait_final_canary_succeeds_on_second_poll(self):
         final = FINAL_CANARY_LINE + "\n"
         with tempfile.TemporaryDirectory() as d:
             ns = self._wait_dir(d)
-            with mock.patch.object(hc.subprocess, "run", side_effect=[self._proc(""), self._proc(final)]) as run_, \
+            with mock.patch.object(hc.subprocess, "Popen", side_effect=[self._popen(""), self._popen(final)]) as popen, \
                  mock.patch.object(hc.time, "sleep"):
                 self.assertEqual(hc.cmd_wait_final_canary(ns), 0)
-            self.assertEqual(run_.call_count, 2)
-            args = run_.call_args.args[0]
+            self.assertEqual(popen.call_count, 2)
+            args = popen.call_args.args[0]
             self.assertEqual(args, ["tcpdump", "-r", str(Path(d) / "capture.pcap"), "-nn", "-tt", f"udp and src port {CANARY}"])
-            self.assertNotIn("shell", run_.call_args.kwargs)
+            self.assertNotIn("shell", popen.call_args.kwargs)
 
-    def test_wait_final_canary_times_out(self):
+    def test_wait_final_canary_times_out_with_shrinking_budget(self):
         with tempfile.TemporaryDirectory() as d:
             ns = self._wait_dir(d)
-            clock = iter([0.0, 5.0, 10.0, 16.0, 20.0, 30.0])
-            with mock.patch.object(hc.subprocess, "run", return_value=self._proc("")), \
-                 mock.patch.object(hc.time, "sleep"), mock.patch.object(hc.time, "monotonic", side_effect=lambda: next(clock)), \
+            ns.timeout = 3.0
+            ns.interval = 1.0
+            now, mono, sleep = self._fake_clock()
+            budgets = []
+
+            def poll(pcap, port, final_t, window, budget, *a, **k):
+                budgets.append(budget)
+                return False
+
+            with mock.patch.object(hc, "_poll_pcap_once", side_effect=poll), \
+                 mock.patch.object(hc.time, "sleep", side_effect=sleep), mock.patch.object(hc.time, "monotonic", side_effect=mono), \
                  mock.patch("sys.stdout"):
                 self.assertEqual(hc.cmd_wait_final_canary(ns), 1)
+            self.assertEqual(budgets, [3.0, 2.0, 1.0, hc.WAIT_CANARY_POLL_MIN_SECONDS])  # 締切到達後の最終 1 回は下限
+            self.assertTrue(all(b <= hc.WAIT_CANARY_POLL_MAX_SECONDS for b in budgets))
 
     def test_wait_final_canary_tcpdump_missing_is_not_success(self):
         with tempfile.TemporaryDirectory() as d:
             ns = self._wait_dir(d)
-            clock = iter([0.0, 20.0, 40.0])
-            with mock.patch.object(hc.subprocess, "run", side_effect=FileNotFoundError), \
-                 mock.patch.object(hc.time, "sleep"), mock.patch.object(hc.time, "monotonic", side_effect=lambda: next(clock)), \
+            now, mono, sleep = self._fake_clock()
+            with mock.patch.object(hc.subprocess, "Popen", side_effect=FileNotFoundError), \
+                 mock.patch.object(hc.time, "sleep", side_effect=sleep), mock.patch.object(hc.time, "monotonic", side_effect=mono), \
                  mock.patch("sys.stdout"):
                 self.assertEqual(hc.cmd_wait_final_canary(ns), 1)
+            with mock.patch.object(hc.subprocess, "Popen", side_effect=OSError):
+                self.assertFalse(hc._poll_pcap_once(Path(d) / "capture.pcap", CANARY, 100.65, (100.0, 100.6), 1.0))
 
     def test_wait_final_canary_invalid_inputs_do_not_run_tcpdump(self):
         for kw in ({"end": False}, {"final": float("nan")}, {"final": 100.0}):
             with self.subTest(kw=kw), tempfile.TemporaryDirectory() as d:
                 ns = self._wait_dir(d, **kw)
-                with mock.patch.object(hc.subprocess, "run") as run_, mock.patch("sys.stdout"):
+                with mock.patch.object(hc.subprocess, "Popen") as popen, mock.patch("sys.stdout"):
                     self.assertEqual(hc.cmd_wait_final_canary(ns), 2)
-                run_.assert_not_called()
+                popen.assert_not_called()
         with tempfile.TemporaryDirectory() as d, mock.patch("sys.stdout"):
             self.assertEqual(hc.cmd_wait_final_canary(type("A", (), {"out_dir": d, "timeout": 1.0, "interval": 0.1})()), 2)
+
+    # --- 偽の tcpdump（Python スクリプト）による実プロセステスト（#1476）。OS を問わず動く ---
+
+    def _fake_tcpdump(self, d, body):
+        fake = Path(d) / "fake_tcpdump.py"
+        fake.write_text("import sys, time\n" + body)
+        return mock.patch.object(hc, "TCPDUMP_ARGV", (sys.executable, "-I", "-B", str(fake)))
+
+    def _poll(self, d, **kw):
+        return hc._poll_pcap_once(Path(d) / "capture.pcap", CANARY, 100.65, (100.0, 100.6), **kw)
+
+    def test_wait_final_canary_slow_tcpdump_stays_within_deadline(self):
+        with tempfile.TemporaryDirectory() as d:
+            ns = self._wait_dir(d)
+            ns.timeout = 1.0
+            ns.interval = 0.1
+            with self._fake_tcpdump(d, "time.sleep(30)\n"), mock.patch("sys.stdout"):
+                t0 = time.monotonic()
+                self.assertEqual(hc.cmd_wait_final_canary(ns), 1)
+                elapsed = time.monotonic() - t0
+            self.assertLess(elapsed, 3.5)
+
+    def test_poll_stops_early_on_final_canary(self):
+        body = f"print({CANARY_LINE!r}); print({FINAL_CANARY_LINE!r}); sys.stdout.flush(); time.sleep(30)\n"
+        with tempfile.TemporaryDirectory() as d, self._fake_tcpdump(d, body):
+            t0 = time.monotonic()
+            self.assertTrue(self._poll(d, budget=20.0))
+            self.assertLess(time.monotonic() - t0, 10.0)
+
+    def test_poll_uses_shared_threshold_and_boundaries(self):
+        def lo(ts):
+            return line(ts, "lo", "Out", f"127.0.0.1.{CANARY} > 127.0.0.1.50000: UDP, length 26")
+
+        with tempfile.TemporaryDirectory() as d:
+            with self._fake_tcpdump(d, f"print({lo(100.648999)!r})\n"):
+                self.assertFalse(self._poll(d, budget=5.0))
+            with self._fake_tcpdump(d, f"print({lo(100.649)!r})\n"), \
+                 mock.patch.object(hc, "_final_canary_threshold", wraps=hc._final_canary_threshold) as thr:
+                self.assertTrue(self._poll(d, budget=5.0))
+                thr.assert_called()
+
+    def test_poll_max_packets_cap_is_not_observation(self):
+        body = f"for _ in range(10): print({CANARY_LINE!r})\nprint({FINAL_CANARY_LINE!r})\n"
+        with tempfile.TemporaryDirectory() as d, self._fake_tcpdump(d, body):
+            self.assertFalse(self._poll(d, budget=5.0, max_packets=5))
+            self.assertTrue(self._poll(d, budget=5.0, max_packets=50))
+
+    def test_poll_long_line_is_bounded_and_following_lines_are_read(self):
+        long_ = hc.MAX_PACKET_LINE_CHARS * 5
+        with tempfile.TemporaryDirectory() as d:
+            with self._fake_tcpdump(d, f"sys.stdout.write('x' * {long_}); sys.stdout.flush(); time.sleep(30)\n"):
+                t0 = time.monotonic()
+                self.assertFalse(self._poll(d, budget=0.5))
+                self.assertLess(time.monotonic() - t0, 5.0)
+            with self._fake_tcpdump(d, f"print('x' * {long_}); print({FINAL_CANARY_LINE!r})\n"):
+                self.assertTrue(self._poll(d, budget=5.0))
+
+    def test_poll_missing_executable_is_not_observation(self):
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(hc, "TCPDUMP_ARGV", (str(Path(d) / "nope"),)):
+            self.assertFalse(self._poll(d, budget=1.0))
 
     def test_missing_individual_files_are_unobservable(self):
         # upload-artifact の if-no-files-found は個々の欠落を検出しない。欠落は judge が unobservable にする前提（#1473 C）

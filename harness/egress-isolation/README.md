@@ -282,7 +282,7 @@ host netns を記録し、bwrap 配下の Servo ホストに帰属する外向�
   送信直前の時刻を `end` 記録の `final_canary_t` に残す。judge は、サンプラーに帰属するカナリアのパケットが `final_canary_t` 以降（かつ Servo の最後のサンプル
   〔tick の延長を含む〕以降）に観測されたことを要求する。観測されない・`end` 記録が無い・`final_canary_t` が無いときは観測不能。
   最後のパケットの時刻とは比べない（runner の通常通信で満たせてしまい、Servo 終了後の静かな区間では落ちるため）。
-  workflow の stop ステップは `end` 記録の確認後、tcpdump に SIGINT を送る前に `host_capture.py wait-final-canary`（`tcpdump -r` で pcap を読み、最終カナリアが現れるまで上限 15 秒でポーリング）を呼ぶ（固定の待ちは廃止。#1473 P2）。
+  workflow の stop ステップは `end` 記録の確認後、tcpdump に SIGINT を送る前に `host_capture.py wait-final-canary`（`tcpdump -r` で pcap を読み、最終カナリアが現れるまで上限 15 秒でポーリング）を呼ぶ（固定の待ちは廃止。#1473 P2）。ポーリング 1 回の待ちは `min(10 秒, 締切までの残り)`（下限 0.1 秒）で、全体は概ね `--timeout` 以内に終わる。`tcpdump -r` の出力は 1 行ずつ読み、最終カナリアの検出か件数上限（`DEFAULT_MAX_PACKETS`。行長の上限は judge と同じ）で打ち切る（#1476）。
   時間切れ・読めないときも SIGINT へ進み、合否は judge が決める（fail-closed）。`final_canary_t` は有限値で `>=` Servo の最後のサンプルでなければならず、違反は観測不能（`-inf` 等で閾値が落ちるのを防ぐ）。
   `UDP` の痕跡の検出（解析できない行・proto=other の行）は大文字小文字を区別しない（過検出は観測不能側）。
   サンプラー側では、`/proc/net` の解析できない行、Servo と同定した pid の fd の EACCES、`/proc/net/if_inet6` があるのに tcp6・udp6 が無い状態を記録して観測不能にする
