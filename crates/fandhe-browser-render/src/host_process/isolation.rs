@@ -365,36 +365,46 @@ fn merge_tmpfs_targets(targets: &[PathBuf]) -> Vec<PathBuf> {
     kept
 }
 
-/// 隠せないシステムのディレクトリか（正規化済みのパスで判定。RENDER-3・#1492）。
+/// 隠せないシステムのディレクトリか（正規化済みのパスで判定。RENDER-3・#1492・#1498）。
 ///
 /// 配下も含めて真: `/proc`・`/sys`・`/usr`・`/etc`・`/bin`・`/sbin`・`/boot` と、先頭成分が `lib` で
-/// 始まるもの（`/lib`・`/lib64` など。安全側に倒して `/libertine` も真）。それ自身だけ真: `/`・
-/// `/dev`・`/var`（`/var/tmp` や `/var/lib/<service>` のサービスユーザーの HOME を壊さないため。
-/// `/dev/shm` は固定の tmpfs 対象）。
+/// 始まるもの（`/lib`・`/lib64` など。安全側に倒して `/libertine` も真）、`/dev` 配下（`/dev/pts`・
+/// `/dev/mqueue` など。例外は固定の tmpfs 対象 `/dev/shm` とその配下で偽。`/devx` は成分が違うので
+/// 対象外）。それ自身だけ真: `/`・`/var`（`/var/tmp` や `/var/lib/<service>` のサービスユーザーの
+/// HOME を壊さないため。`/var/lib` 自体も `/var/lib/<service>` も偽のまま。`/var/lib` そのものを
+/// 覆って壊れる場合は起動の失敗として表に出て、隔離なしには落ちない）。
+///
+/// `/private` の先頭成分は OS によらず外して判定する（macOS の `/etc` -> `/private/etc` 対応）。
+/// 本番で効くのは Linux の bwrap の経路だけで、Linux で外しても `/private/usr` を真にする方向
+/// （過剰に拒否する安全側）にしか働かないため、`cfg` では分けない。
 fn is_system_dir(canonical: &Path) -> bool {
     let mut normals = canonical.components().filter_map(|c| match c {
-        Component::Normal(n) => Some(n),
+        Component::Normal(n) => Some(n.to_string_lossy().into_owned()),
         _ => None,
     });
     let mut first_opt = normals.next();
     // macOS では `/etc`・`/var` が `/private/etc`・`/private/var` への symlink で、正規化すると
     // 先頭に `private` が付く。判定では `/private` を外して Linux と同じ表で見る。
-    if first_opt.is_some_and(|f| f == "private") {
+    if first_opt.as_deref() == Some("private") {
         first_opt = normals.next();
     }
     let Some(first) = first_opt else {
         return true; // `/`
     };
-    let has_more = normals.next().is_some();
-    let first = first.to_string_lossy();
+    let second = normals.next();
     if matches!(
-        first.as_ref(),
+        first.as_str(),
         "proc" | "sys" | "usr" | "etc" | "bin" | "sbin" | "boot"
     ) || first.starts_with("lib")
     {
         return true;
     }
-    !has_more && matches!(first.as_ref(), "dev" | "var")
+    match first.as_str() {
+        // `/dev/shm` は固定の tmpfs 対象なので、それ以外の `/dev` 配下だけを真にする。
+        "dev" => second.as_deref() != Some("shm"),
+        "var" => second.is_none(),
+        _ => false,
+    }
 }
 
 /// [`FIXED_CANDIDATES`] を実体パスへ解決する（`canon` は canonicalize の注入点。RENDER-3・#1492）。
@@ -2120,7 +2130,8 @@ mod tests {
         );
     }
 
-    /// RENDER-3（#1492）: システムのディレクトリの判定。`/var`・`/dev` はそれ自身だけ真。
+    /// RENDER-3（#1492・#1498）: システムのディレクトリの判定。`/var` はそれ自身だけ真、`/dev` は
+    /// `/dev/shm`（固定の tmpfs 対象）とその配下を除いて配下も真、`/private` の先頭成分は外す。
     #[test]
     fn render3_is_system_dir_cases() {
         for t in [
@@ -2138,14 +2149,22 @@ mod tests {
             "/proc/1",
             "/sys",
             "/dev",
+            "/dev/pts",
+            "/dev/mqueue",
+            "/dev/x/y",
             "/var",
+            "/private/usr",
         ] {
             assert!(is_system_dir(Path::new(t)), "{t}");
         }
         for f in [
             "/var/tmp",
+            "/var/lib",
             "/var/lib/svc",
             "/dev/shm",
+            "/dev/shm/a",
+            "/devx",
+            "/private/x",
             "/home/u",
             "/usr2",
             "/mnt/x",
@@ -2179,7 +2198,16 @@ mod tests {
         );
         let bad = Err(EgressIsolationUnavailable::WorkDirParentNotHideable);
         assert_eq!(parent_to_hide(None, &hidden), bad);
-        for sys in ["/", "/usr", "/usr/local", "/etc", "/dev", "/var", "/proc"] {
+        for sys in [
+            "/",
+            "/usr",
+            "/usr/local",
+            "/etc",
+            "/dev",
+            "/dev/pts",
+            "/var",
+            "/proc",
+        ] {
             assert_eq!(parent_to_hide(Some(Path::new(sys)), &hidden), bad, "{sys}");
         }
     }
@@ -2226,7 +2254,7 @@ mod tests {
     fn render3_resolve_home_rejects_system_dirs() {
         use std::ffi::OsStr;
         let bad = Err(EgressIsolationUnavailable::HomeNotHideable);
-        for d in ["/usr", "/etc", "/proc", "/sys", "/dev", "/var"] {
+        for d in ["/usr", "/etc", "/proc", "/sys", "/dev", "/dev/pts", "/var"] {
             if Path::new(d).is_dir() {
                 assert_eq!(resolve_home_to_hide(Some(OsStr::new(d))), bad, "{d}");
             }
