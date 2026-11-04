@@ -2520,6 +2520,93 @@ mod tests {
         }
     }
 
+    /// RENDER-3・SEC-2（#1492・#1498・P3-b）: 親が既存の tmpfs に覆われない場合（`Some(親)`）を、
+    /// 本物の WorkDir から `socket_dir_for` -> `linux_argv` -> 実 bwrap まで通す。内側の偽ホスト
+    /// （親の下に置いた sh スクリプト。`--ro-bind` で戻る）が、UDS が見え・兄弟のファイルと UDS が見えず・
+    /// WorkDir に書け・親が tmpfs（上限ありなら `size=65536k`）であることを自分で確かめ、終了コード 0 を返す。
+    /// 実 FS の書き込み先はどれも `/tmp` か `$HOME` の配下で既に覆われるため、覆わない `HiddenPaths`
+    /// を注入して `Some(親)` を作る。CI の Linux では bwrap が使えることを必須にする。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn render3_socket_dir_for_to_real_bwrap_hides_uncovered_parent() {
+        use super::super::workdir::WorkDir;
+        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::net::UnixListener;
+        let Ok(bwrap) = select_trusted(&BWRAP_CANDIDATES) else {
+            assert!(!ci_requires_ok(), "CI must have bwrap");
+            return;
+        };
+        let base = std::fs::canonicalize(std::env::temp_dir()).unwrap();
+        let parent = base.join(format!("fb-p3b-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&parent);
+        std::fs::create_dir(&parent).unwrap();
+        let workdir = WorkDir::create(&parent).unwrap();
+        let sibling = parent.join("sib");
+        std::fs::create_dir(&sibling).unwrap();
+        let sib_file = sibling.join("f");
+        let sib_sock = sibling.join("s.sock");
+        std::fs::write(&sib_file, b"x").unwrap();
+        let _l = UnixListener::bind(&sib_sock).unwrap();
+        // `/tmp` を覆わない固定対象。`$HOME` は `/run` の配下として tmpfs を増やさない。
+        let limit = detect_tmpfs_limit(&bwrap, PROBE_TIMEOUT);
+        let hidden = HiddenPaths::from_resolved(pb(&["/run"]), PathBuf::from("/run/home"), limit);
+        let sd = socket_dir_for(workdir.path(), &hidden).unwrap();
+        assert_eq!(sd.parent_to_hide, Some(parent.clone()));
+        let uds = sd.dir.join(EGRESS_SOCKET_NAME);
+        let _proxy = UnixListener::bind(&uds).unwrap();
+        let size_check = if matches!(limit, TmpfsLimit::Capped(_)) {
+            "case \"$rest\" in *\" - tmpfs \"*size=65536k*) found=1;; esac"
+        } else {
+            "found=1"
+        };
+        let script = format!(
+            "#!/bin/sh\nfor a in \"$@\"; do last=\"$a\"; done\n\
+             [ -S \"$last\" ] || exit 11\n\
+             [ -e '{sf}' ] && exit 12\n\
+             [ -e '{ss}' ] && exit 13\n\
+             : > '{wd}/probe' || exit 14\n\
+             found=0\n\
+             while read -r id pid dev root mp rest; do\n\
+               if [ \"$mp\" = '{pa}' ]; then {size_check}; fi\n\
+             done < /proc/self/mountinfo\n\
+             [ \"$found\" = 1 ] || exit 15\nexit 0\n",
+            sf = sib_file.display(),
+            ss = sib_sock.display(),
+            wd = sd.dir.display(),
+            pa = parent.display(),
+        );
+        let host = parent.join("host.sh");
+        std::fs::write(&host, script).unwrap();
+        std::fs::set_permissions(&host, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let (prog, args) = linux_argv(
+            &bwrap,
+            &hidden,
+            &sd.dir,
+            sd.parent_to_hide.as_deref(),
+            &host,
+            &uds,
+        )
+        .unwrap();
+        let mut code = None;
+        for _ in 0..20 {
+            let mut cmd = Command::new(&prog);
+            cmd.args(&args)
+                .env_clear()
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            let Ok(mut child) = cmd.spawn() else {
+                // ETXTBSY 等の一過性の起動失敗はやり直す。
+                std::thread::sleep(Duration::from_millis(50));
+                continue;
+            };
+            code = child.wait().ok().and_then(|st| st.code());
+            break;
+        }
+        drop(workdir);
+        let _ = std::fs::remove_dir_all(&parent);
+        assert_eq!(code, Some(0));
+    }
     /// RENDER-3（#1436）: Seatbelt の profile は整数ポートだけを埋め込んだ固定形。
     #[test]
     fn render3_seatbelt_profile_is_exact() {
