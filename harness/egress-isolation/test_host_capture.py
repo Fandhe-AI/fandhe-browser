@@ -449,8 +449,9 @@ class SamplerTests(unittest.TestCase):
             servo, _k, limits = self._take_sample_for_servo_pid(exc)
             self.assertEqual([s["pid"] for s in servo], [4_000_123])
             self.assertEqual(limits, [])
-        # 対照: 権限で読めないときは記録する
-        _s, _k, limits = self._take_sample_for_servo_pid(PermissionError(13, "denied"))
+        # 対照: 権限で読めないときは（読み直しても読めなければ）記録する
+        with mock.patch.object(hc.time, "sleep", lambda s: None):
+            _s, _k, limits = self._take_sample_for_servo_pid(PermissionError(13, "denied"))
         self.assertEqual(limits, ["proc-read-error:fd-4000123"])
 
     def test_eacces_on_non_servo_pid_is_not_recorded(self):
@@ -473,6 +474,212 @@ class SamplerTests(unittest.TestCase):
             v = hc.judge([], idx)
             self.assertEqual(v["verdict"], "unobservable")
             self.assertTrue(any("proc-read-error:net-tcp" in r for r in v["unobservable_reasons"]))
+
+
+class FdReadRetryTests(unittest.TestCase):
+    """Servo pid の fd が一時的に読めない競合の読み直しと診断（#1493・`RENDER-3`）。"""
+
+    X = 4_000_123
+    DENIED = ("denied", [], False, "listdir", 13)
+    GONE = ("gone", [], False, None, None)
+
+    def _owners(self, results, starttimes=None, budget=None, pids=None, diag=None):
+        """_read_fd_inodes が results を順に返す状況で _socket_owners を呼ぶ。戻り値は (結果, sleep 回数)。"""
+        seq = list(results)
+        stimes = list(starttimes) if starttimes is not None else None
+        sleeps = []
+
+        def fake_read(pid):
+            return seq.pop(0) if len(seq) > 1 else seq[0]
+
+        def fake_start(pid):
+            if stimes is None:
+                return None
+            return stimes.pop(0) if len(stimes) > 1 else stimes[0]
+
+        patches = [
+            mock.patch.object(hc, "_read_fd_inodes", fake_read),
+            mock.patch.object(hc, "_proc_starttime", fake_start),
+            mock.patch.object(hc.time, "sleep", lambda s: sleeps.append(s)),
+        ]
+        if budget is not None:
+            patches.append(mock.patch.object(hc, "FD_READ_RETRY_BUDGET_SECONDS", budget))
+        for p in patches:
+            p.start()
+        try:
+            targets = pids or [self.X]
+            res = hc._socket_owners(targets, frozenset(targets), "/servo", diag)
+        finally:
+            for p in patches:
+                p.stop()
+        return res, len(sleeps)
+
+    def test_transient_denied_recovers(self):
+        diag = []
+        (owners, hit, errors), sleeps = self._owners([self.DENIED, ("ok", [777], False, None, None)], diag=diag)
+        self.assertEqual((owners, hit, errors), ({777: self.X}, False, []))
+        self.assertEqual(sleeps, 1)
+        self.assertEqual(
+            [(d["type"], d["pid"], d["outcome"], d["attempts"]) for d in diag],
+            [("fd-diag", self.X, "recovered", 1)],
+        )
+        self.assertIsNone(diag[0]["last"])
+        self.assertIsInstance(diag[0]["t"], float)
+
+    def test_vanished_during_retry(self):
+        diag = []
+        (owners, _hit, errors), _s = self._owners([self.DENIED, self.GONE], diag=diag)
+        self.assertEqual((owners, errors), ({}, []))
+        self.assertEqual(diag[0]["outcome"], "vanished")
+
+    def test_pid_reuse_is_treated_as_vanished(self):
+        diag = []
+        (owners, _hit, errors), _s = self._owners(
+            [self.DENIED, ("ok", [888], False, None, None)], starttimes=[100, 200], diag=diag
+        )
+        self.assertEqual((owners, errors), ({}, []))
+        self.assertEqual(diag[0]["outcome"], "vanished")
+
+    def test_persistent_denied_is_recorded(self):
+        diag = []
+        (owners, _hit, errors), sleeps = self._owners([self.DENIED], diag=diag)
+        self.assertEqual((owners, errors), ({}, [f"proc-read-error:fd-{self.X}"]))
+        self.assertEqual(sleeps, hc.FD_READ_RETRIES)
+        self.assertEqual((diag[0]["outcome"], diag[0]["attempts"]), ("persistent", hc.FD_READ_RETRIES))
+        self.assertIsNotNone(diag[0]["last"])
+
+    def test_budget_exhausted_pids_are_recorded_without_retry(self):
+        diag = []
+        a, b = 4_000_201, 4_000_202
+        # 締め切り計算で 0.0、以降は常に予算超過の時刻
+        clock = iter([0.0] + [1.0] * 100)
+        with mock.patch.object(hc.time, "monotonic", lambda: next(clock)):
+            (_owners, _hit, errors), sleeps = self._owners([self.DENIED], budget=0.05, pids=[a, b], diag=diag)
+        self.assertEqual(errors, [f"proc-read-error:fd-{a}", f"proc-read-error:fd-{b}"])
+        self.assertEqual(sleeps, 0)
+        self.assertEqual([d["outcome"] for d in diag], ["persistent", "persistent"])
+
+    def test_non_servo_pid_is_not_retried_or_recorded(self):
+        diag = []
+        with mock.patch.object(hc, "_read_fd_inodes", lambda pid: self.DENIED), mock.patch.object(
+            hc.time, "sleep", side_effect=AssertionError("must not sleep")
+        ):
+            res = hc._socket_owners([4_000_999], frozenset({self.X}), "/servo", diag)
+        self.assertEqual((res, diag), (({}, False, []), []))
+
+    def test_snapshot_uses_categories_only(self):
+        status = (
+            b"Name:\tevil::error::x\nState:\tZ (zombie)\nThreads:\t7\nNSpid:\t4000123\t55\n"
+            b"Uid:\t1000\t1000\t1000\t1000\n"
+        )
+        with mock.patch("builtins.open", mock.mock_open(read_data=status)), mock.patch.object(
+            hc.os, "geteuid", lambda: 1000
+        ):
+            snap = hc._fd_denied_snapshot(self.X, "/servo", "listdir", 13)
+        self.assertEqual(
+            set(snap),
+            {"fd_dir_owner", "state", "threads", "nspid", "uid_matches_self", "exe", "userns_differs", "stage", "errno"},
+        )
+        self.assertEqual(
+            (snap["state"], snap["threads"], snap["nspid"], snap["uid_matches_self"], snap["stage"], snap["errno"]),
+            ("Z", 7, [4000123, 55], True, "listdir", 13),
+        )
+        self.assertIn(snap["fd_dir_owner"], ("self", "root", "other", "unknown"))
+        self.assertNotIn("evil", json.dumps(snap))
+
+    def test_snapshot_unreadable_status_is_unknown(self):
+        with mock.patch("builtins.open", side_effect=PermissionError(13, "x")):
+            snap = hc._fd_denied_snapshot(self.X, None, "readlink", 1)
+        self.assertEqual(
+            (snap["state"], snap["threads"], snap["nspid"], snap["uid_matches_self"]), ("unknown", None, None, None)
+        )
+
+    def _run_sampler(self, kind):
+        x = self.X
+        with tempfile.TemporaryDirectory() as d:
+            out = Path(d) / "samples.jsonl"
+            calls = {"n": 0}
+
+            def fake_read(pid):
+                if pid != x:
+                    return self.GONE
+                calls["n"] += 1
+                if kind == "persistent" or calls["n"] == 1:
+                    return self.DENIED
+                return ("ok", [], False, None, None)
+
+            with mock.patch.object(hc, "_list_pids", lambda: ([x], False, False)), mock.patch.object(
+                hc, "_exe", lambda pid: "/servo"
+            ), mock.patch.object(hc, "_ppid", lambda pid: None), mock.patch.object(
+                hc, "_read_ns_net", lambda pid: None
+            ), mock.patch.object(hc, "_read_table", lambda n, optional=False: ([], False, False, 0)), mock.patch.object(
+                hc, "_ipv6_absent", lambda: True
+            ), mock.patch.object(hc, "_read_fd_inodes", fake_read), mock.patch.object(
+                hc, "_fd_denied_snapshot", lambda *a: {"fd_dir_owner": "root"}
+            ), mock.patch.object(hc, "FD_READ_RETRY_SECONDS", 0.0):
+                hc.run_sampler("/servo", out, 0.02, None, max_seconds=0.3)
+            recs = [json.loads(ln) for ln in out.read_text().splitlines()]
+        idx = hc.SampleIndex()
+        for r in recs:
+            idx.feed(r)
+        return recs, idx
+
+    def test_persistent_denied_makes_judge_unobservable(self):
+        recs, idx = self._run_sampler("persistent")
+        end = recs[-1]
+        self.assertTrue(end["truncated"])
+        self.assertEqual(end["reason"], f"proc-read-error:fd-{self.X}")
+        diags = [r for r in recs if r["type"] == "fd-diag"]
+        self.assertGreater(len(diags), 0)
+        self.assertEqual({r["outcome"] for r in diags}, {"persistent"})
+        self.assertEqual(idx.bad_lines, 0)
+        v = hc.judge([], idx)
+        self.assertEqual(v["verdict"], "unobservable")
+        self.assertTrue(any(f"proc-read-error:fd-{self.X}" in r for r in v["unobservable_reasons"]))
+        self.assertEqual(v["fd_read_retries"]["persistent"], len(diags))
+        summary = hc.render_summary(v)
+        self.assertIn(f"persistent pid {self.X}: fd_dir_owner=root", summary)
+
+    def test_transient_denied_is_not_truncated(self):
+        recs, idx = self._run_sampler("transient")
+        self.assertFalse(recs[-1]["truncated"])
+        self.assertEqual(recs[-1]["fd_diag_dropped"], 0)
+        diags = [r for r in recs if r["type"] == "fd-diag"]
+        self.assertEqual([r["outcome"] for r in diags], ["recovered"])
+        self.assertEqual(idx.bad_lines, 0)
+
+    def test_diag_records_are_capped_and_dropped_count_does_not_truncate(self):
+        with mock.patch.object(hc, "MAX_FD_DIAG_RECORDS", 1):
+            recs, idx = self._run_sampler("persistent")
+        diags = [r for r in recs if r["type"] == "fd-diag"]
+        self.assertEqual(len(diags), 1)
+        self.assertGreater(recs[-1]["fd_diag_dropped"], 0)
+        self.assertEqual(hc.judge([], idx)["fd_read_retries"]["dropped"], recs[-1]["fd_diag_dropped"])
+
+    def test_valid_fd_diag_alone_keeps_verdict_pass(self):
+        idx = make_index()
+        idx.feed(
+            {"type": "fd-diag", "t": 100.1, "pid": 200, "outcome": "recovered", "attempts": 1, "elapsed": 0.02, "first": {}, "last": None}
+        )
+        v = run([CANARY_LINE, FINAL_CANARY_LINE, OUT_TCP], idx)
+        self.assertEqual(v["verdict"], "pass")
+        self.assertEqual(
+            {k: v["fd_read_retries"][k] for k in ("recovered", "vanished", "persistent", "dropped")},
+            {"recovered": 1, "vanished": 0, "persistent": 0, "dropped": 0},
+        )
+
+    def test_malformed_fd_diag_is_unobservable(self):
+        for bad in (
+            {"outcome": "weird", "pid": 200},
+            {"outcome": "recovered", "pid": "200"},
+            {"outcome": "recovered", "pid": 200, "t": "x"},
+        ):
+            idx = make_index()
+            rec = {"type": "fd-diag", "t": 100.1}
+            rec.update(bad)
+            idx.feed(rec)
+            self.assertEqual(idx.bad_lines, 1)
+            self.assertEqual(run([CANARY_LINE, FINAL_CANARY_LINE, OUT_TCP], idx)["verdict"], "unobservable")
 
 
 class SelfNetnsTests(unittest.TestCase):
