@@ -483,7 +483,35 @@ fn t_system_probe_branch() {
     use fandhe_browser_render::host_process::IsolationBackend;
     match system_probe_for("egress_system_probe_branch") {
         Ok(()) => {
-            let root = Root::new("iso-system-ok", "dump");
+            let root = Root::new_visible("ok", "dump");
+            // FS の可視性の観測用（RENDER-3・#1485）。`/tmp` の番兵（兄弟 WorkDir 相当）と
+            // `$HOME` の既存ファイル（このクレートの Cargo.toml）が内側から見えないこと。
+            let sentinel =
+                std::env::temp_dir().join(format!("fb-hp-sentinel-{}", std::process::id()));
+            std::fs::write(&sentinel, b"x").unwrap();
+            let sentinel_sock =
+                std::env::temp_dir().join(format!("fb-hp-sentinel-{}.sock", std::process::id()));
+            let _ = std::fs::remove_file(&sentinel_sock);
+            let _listener = std::os::unix::net::UnixListener::bind(&sentinel_sock).unwrap();
+            let manifest = concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml");
+            let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+            let manifest_under_home = home
+                .as_deref()
+                .and_then(|h| std::fs::canonicalize(h).ok())
+                .zip(std::fs::canonicalize(manifest).ok())
+                .is_some_and(|(h, m)| m.starts_with(h));
+            if ci_requires_sandbox(std::env::var("GITHUB_ACTIONS").ok().as_deref()) {
+                assert!(manifest_under_home, "CI checks out the repo under $HOME");
+            }
+            std::fs::write(
+                root.0.join("visibility-paths"),
+                format!(
+                    "{}\n{}\n{manifest}\n",
+                    sentinel.display(),
+                    sentinel_sock.display()
+                ),
+            )
+            .unwrap();
             let cfg = root
                 .config_system(base_timeouts())
                 .with_egress_isolation(EgressIsolationMode::Required)
@@ -530,6 +558,19 @@ fn t_system_probe_branch() {
             );
             assert_eq!(obs["ppid"], 1);
             assert_eq!(child_pid(&root, 1), 2);
+            // FS の隠蔽（RENDER-3・#1485）: `/tmp` の番兵（ファイルと UDS）は見えない。`$HOME` 配下の
+            // 既存ファイルも見えない。偽ホストが起動して応答できたこと自体が、`$HOME` 配下の実行
+            // ファイルが `--ro-bind` で戻った証拠になる。
+            let visible = &obs["visible"];
+            if sentinel.starts_with("/tmp") {
+                assert_eq!(visible[sentinel.to_str().unwrap()], false, "{visible}");
+                assert_eq!(visible[sentinel_sock.to_str().unwrap()], false, "{visible}");
+            }
+            if manifest_under_home {
+                assert_eq!(visible[manifest], false, "{visible}");
+            }
+            let _ = std::fs::remove_file(&sentinel);
+            let _ = std::fs::remove_file(&sentinel_sock);
             // RSS 監視は bwrap ではなく 2 段下（外側の pid でのホスト）を辿る。
             let deadline = Instant::now() + Duration::from_secs(5);
             while h.monitored_pid().is_none() && Instant::now() < deadline {
@@ -635,7 +676,7 @@ fn t_system_probe_timeout_kills_wrapped_host() {
     if system_probe_for("egress_system_timeout_kills_wrapped_host").is_err() {
         return; // 隔離できない環境では上のテストが required の拒否を確かめる。
     }
-    let root = Root::new("iso-timeout", "hang-load");
+    let root = Root::new_visible("to", "hang-load");
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let collector = spawn_pid_collector(&root.0, stop.clone());
     let mut h = HostProcess::new(root.config_system(short_timeouts()));
@@ -656,7 +697,7 @@ fn t_system_probe_rss_limit_kills_wrapped_host() {
     if system_probe_for("egress_system_rss_limit_kills_wrapped_host").is_err() {
         return;
     }
-    let root = Root::new("iso-rss", "rss");
+    let root = Root::new_visible("rss", "rss");
     let cfg = root
         .config_system(base_timeouts())
         .with_rss_limit_bytes(48 * 1024 * 1024)

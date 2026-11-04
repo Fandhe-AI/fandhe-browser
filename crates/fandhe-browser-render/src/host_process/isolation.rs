@@ -8,7 +8,9 @@
 //! `pre_exec`・FFI は使わず外部コマンドの引数配列だけで隔離する（シェルを介さない）。
 //!
 //! - Linux: `bwrap --die-with-parent --unshare-net --unshare-pid --dev-bind / / --proc /proc
-//!   --tmpfs /run -- <ホスト> --stdio --egress-relay-uds <UDS>`。netns に出口が無くなり、ホストは
+//!   --tmpfs /run --tmpfs /tmp [--tmpfs <$HOME>] --bind <WorkDir> <WorkDir> [--ro-bind <ホスト>
+//!   <ホスト>] -- <ホスト> --stdio --egress-relay-uds <UDS>`（`--ro-bind` はホストが `/tmp` か
+//!   `$HOME` の配下にあるときだけ。`--tmpfs` の後に bind を置く順序が意味を持つ）。netns に出口が無くなり、ホストは
 //!   netns 内の中継を経由して WorkDir 配下の UDS（本体側のプロキシ）にだけ届く。`--unshare-pid` と
 //!   新しい `/proc` により、ホストから本体の `/proc/<ppid>`（`mem`・`fd`・`environ`・ptrace）が見えず、
 //!   乗っ取られたホストが本体へ介入して隔離を破る経路を塞ぐ。`--proc` は `--dev-bind / /` が
@@ -20,7 +22,9 @@
 //!
 //! # 範囲・既知の制約
 //!
-//! - ファイルシステムは隔離しない（v1。`--dev-bind / /`）。隔離するのはネットワーク送信だけ。
+//! - ファイルシステム全体の読み書きは隔離しない（`--dev-bind / /`）。隠すのは `/run`・`/tmp`・
+//!   本体の `$HOME`（tmpfs。#1485）で、戻すのはこのインスタンスの WorkDir（rw）と、隠れる場所に
+//!   あるホストの実行ファイル（ro）だけ。
 //! - 隔離中は WebSocket が使えない（Servo の `websocket_loader` はプロキシを使わず直接接続する
 //!   ため、遮断されて失敗する）。
 //! - macOS の loopback プロキシは同一マシンの全ユーザー・全プロセスから届く（認証なし。Seatbelt
@@ -28,9 +32,18 @@
 //!   本体の送信元 IP を踏み台にされうる。UDS 化や接続トークンは、Servo のプロキシ設定が TCP
 //!   （`http://127.0.0.1:<port>`）しか扱えず、macOS には netns が無く中継を置いても loopback の
 //!   待ち受けが残るため、別途検討する（RENDER-3・#1451）。
-//! - Linux でも FS は隔離しない（`--dev-bind / /`）ため、FS 上の UDS が迂回路として残る。`/run` は
-//!   tmpfs で隠すが、`/tmp/ssh-*/agent.*`・`/tmp/.X11-unix`・`~/.gnupg/S.*`・同じ uid の他
-//!   インスタンスのプロキシ UDS には届く。`/tmp`・`$HOME` を分けるかは別途判断する（残余リスク）。
+//! - Linux で残る FS 上の UDS の迂回路: `/run`・`/tmp`・`$HOME` 以外の場所（`/var/tmp`・`/dev/shm`・
+//!   独自の場所）の UDS。また `temp_root` が `/tmp` と `$HOME` の外にあると、兄弟 WorkDir（同じ uid の
+//!   他インスタンスのプロキシ UDS）は見えたままになる。抽象名前空間のソケットは netns ごとに分かれる
+//!   ので対象外（#1457・#1485）。
+//! - `$HOME` と `/tmp` が隠れるため、ユーザーのフォント（`~/.local/share/fonts`・`~/.fonts`）や
+//!   `$HOME` の設定は見えない（`FONTCONFIG_FILE` 等が `$HOME` 配下を指していても同様）。
+//! - `$HOME` が未設定・相対・`/`・存在しない・ディレクトリでないときは隠せないため
+//!   [`EgressIsolationUnavailable::HomeNotHideable`]（`required` は拒否、`best-effort` は警告つきで
+//!   隔離なし）。`$HOME` はプローブ時に 1 回だけ読みキャッシュする。本体の `HOME` も子へ強制で渡す
+//!   `HOME` も書き換えない（SEC-2）。`$HOME` がシステムのディレクトリを指すとプローブか起動が失敗する
+//!   が fail-closed で、fail-open にはならない。
+//! - 隔離時の子の cwd と `HOME`・`TMPDIR`・`XDG_*` は正規化済みの WorkDir から作る（symlink 経由の `temp_root` でも戻したパスを指す）。`/run` 配下にある実行ファイルは戻さない。
 //! - macOS の Seatbelt は `(allow default)` で、絞るのは IP の送信だけ。mach/XPC 経由の通信
 //!   （他のデーモンを介した通信）は止めない。DNS 経路（mDNSResponder 経由の名前解決・DNS
 //!   トンネリング）も同じ理由で観測・遮断していない。
@@ -162,6 +175,10 @@ pub enum EgressIsolationUnavailable {
     WorkDirHiddenBySandbox,
     /// 中継用 UDS のパスが servo-host の規則（絶対・正規化済み・100 バイト以下）に反する。
     SocketPathInvalid,
+    /// 本体の `$HOME` を tmpfs で隠せない（未設定・相対パス・`/`・存在しない・ディレクトリでない。
+    /// RENDER-3・#1485）。`required` は起動を拒否し、`best-effort` は警告つきで隔離なしで起動する。
+    /// 回避策は有効な絶対パスのディレクトリを `HOME` に設定すること（最小構成のコンテナで起きやすい）。
+    HomeNotHideable,
 }
 
 impl EgressIsolationUnavailable {
@@ -176,6 +193,7 @@ impl EgressIsolationUnavailable {
             Self::SandboxProbeFailed => "sandbox tool could not start an isolated process",
             Self::WorkDirHiddenBySandbox => "work directory is hidden by the sandbox",
             Self::SocketPathInvalid => "relay socket path is not usable",
+            Self::HomeNotHideable => "home directory cannot be hidden by the sandbox",
         }
     }
 }
@@ -226,7 +244,12 @@ pub enum IsolationProbe {
 pub(super) enum Sandbox {
     // 構築は Linux の probe のみ（macOS・Windows では未使用で、-D warnings の dead_code になるため許可する）。
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-    Bwrap(PathBuf),
+    Bwrap {
+        /// 信頼判定済みの bwrap の実体パス。
+        bwrap: PathBuf,
+        /// プローブで使ったのと同じ隠し対象（起動時にもそのまま使い、両者の一致を構造で保証する）。
+        hidden: HiddenPaths,
+    },
     // 構築は macOS の probe のみ（他 OS では未使用）。
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     SandboxExec,
@@ -235,7 +258,7 @@ pub(super) enum Sandbox {
 impl Sandbox {
     pub(super) fn backend(&self) -> IsolationBackend {
         match self {
-            Self::Bwrap(_) => IsolationBackend::Bwrap,
+            Self::Bwrap { .. } => IsolationBackend::Bwrap,
             Self::SandboxExec => IsolationBackend::SandboxExec,
         }
     }
@@ -270,10 +293,84 @@ pub fn isolation_warning_message(reason: EgressIsolationUnavailable) -> String {
     )
 }
 
-/// bwrap を包む引数（`--` まで）。プローブと本番で同じフラグを使う（RENDER-3）。
-/// `--proc /proc` は `--dev-bind / /` の後ろに置く（順序が意味を持つ）。
-fn linux_wrapper_args() -> Vec<OsString> {
-    [
+/// bwrap が隠す対象（`--tmpfs`）。`/run` と `/tmp` は固定で、`$HOME` はプローブ時に 1 回だけ
+/// 解決した正規化済みパス（RENDER-3・SEC-2・#1485）。FS 上の UDS（`/tmp/ssh-*/agent.*`・
+/// `/tmp/.X11-unix`・`~/.gnupg/S.*`・同じ uid の他インスタンスのプロキシ UDS）が netns の外への
+/// 迂回路になるのを塞ぐ。本体の `HOME` 環境変数は書き換えない（子へ強制で渡す `HOME` も `env.rs` のまま）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct HiddenPaths {
+    /// 正規化済みの `$HOME`。`/run`・`/tmp` の配下なら既に隠れているので `None`（tmpfs の重複を省く）。
+    home: Option<PathBuf>,
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+impl HiddenPaths {
+    /// 固定で隠すパス（`--tmpfs` の先頭 2 つ）。
+    const FIXED: [&'static str; 2] = ["/run", "/tmp"];
+
+    /// 正規化済みの `$HOME`（[`resolve_home_to_hide`] の結果）から作る。
+    pub(super) fn new(home_canonical: PathBuf) -> Self {
+        let covered = Self::FIXED.iter().any(|f| home_canonical.starts_with(f));
+        Self {
+            home: if covered { None } else { Some(home_canonical) },
+        }
+    }
+
+    /// `--tmpfs` を並べる順の対象（`/run`・`/tmp`・必要なら `$HOME`）。
+    fn tmpfs_targets(&self) -> Vec<&Path> {
+        let mut v: Vec<&Path> = Self::FIXED.iter().map(Path::new).collect();
+        v.extend(self.home.as_deref());
+        v
+    }
+
+    /// 正規化済みの `canonical` が `/tmp` か `$HOME` の配下で隠れるか。ホストの実行ファイルを
+    /// `--ro-bind` で戻す要否の判定に使う。`/run` 配下は含めない（従来どおり。#1485 のスコープ外）。
+    pub(super) fn hides(&self, canonical: &Path) -> bool {
+        canonical.starts_with("/tmp")
+            || self
+                .home
+                .as_deref()
+                .is_some_and(|h| canonical.starts_with(h))
+    }
+}
+
+/// `$HOME` の生の値を、tmpfs で隠せる正規化済みパスへ解決する（RENDER-3・#1485）。
+///
+/// 絶対パスで、正規化でき、`/` ではなく、ディレクトリのときだけ `Ok`。それ以外（未設定・相対・
+/// 存在しない・`/`〔`//`・`/.`・`/` を指す symlink を含む〕・ファイル）は
+/// [`EgressIsolationUnavailable::HomeNotHideable`]。環境変数を書き換えずにテストできるよう、
+/// 値は引数で受け取る（edition 2024 の `set_var` は `unsafe`）。
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(super) fn resolve_home_to_hide(
+    raw: Option<&std::ffi::OsStr>,
+) -> Result<PathBuf, EgressIsolationUnavailable> {
+    let bad = EgressIsolationUnavailable::HomeNotHideable;
+    let path = Path::new(raw.ok_or(bad)?);
+    if !path.is_absolute() {
+        return Err(bad);
+    }
+    let canonical = std::fs::canonicalize(path).map_err(|_| bad)?;
+    if canonical == Path::new("/") || !canonical.is_dir() {
+        return Err(bad);
+    }
+    Ok(canonical)
+}
+
+/// `--bind` / `--ro-bind` の種別（tmpfs で隠した後に戻すもの）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(super) enum BindKind {
+    ReadWrite,
+    ReadOnly,
+}
+
+/// bwrap を包む引数（`--` まで）。プローブと本番で名前空間・`--dev-bind`・`--proc`・`--tmpfs` を
+/// 同じにする（RENDER-3）。`--proc /proc` は `--dev-bind / /` の後ろに、`binds`（隠した後に戻す
+/// 自分の WorkDir とホストの実行ファイル）は `--tmpfs` の**後ろ**に置く（順序が意味を持つ）。
+/// bind は起動ごとのものなのでプローブには付けない。
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn linux_wrapper_args(hidden: &HiddenPaths, binds: &[(BindKind, &Path)]) -> Vec<OsString> {
+    let mut args: Vec<OsString> = [
         "--die-with-parent",
         "--unshare-net",
         "--unshare-pid",
@@ -282,32 +379,67 @@ fn linux_wrapper_args() -> Vec<OsString> {
         "/",
         "--proc",
         "/proc",
-        "--tmpfs",
-        "/run",
-        "--",
     ]
     .iter()
     .map(OsString::from)
-    .collect()
+    .collect();
+    for t in hidden.tmpfs_targets() {
+        args.push(OsString::from("--tmpfs"));
+        args.push(t.as_os_str().to_owned());
+    }
+    for (kind, p) in binds {
+        args.push(OsString::from(match kind {
+            BindKind::ReadWrite => "--bind",
+            BindKind::ReadOnly => "--ro-bind",
+        }));
+        args.push(p.as_os_str().to_owned());
+        args.push(p.as_os_str().to_owned());
+    }
+    args.push(OsString::from("--"));
+    args
 }
 
-/// Linux の起動コマンド（プログラムと引数）を組み立てる。
-pub(super) fn linux_argv(bwrap: &Path, host: &Path, relay_uds: &Path) -> (PathBuf, Vec<OsString>) {
-    let mut args = linux_wrapper_args();
+/// Linux の起動コマンド（プログラムと引数）を組み立てる（FS には触れない純関数）。
+///
+/// `workdir` は正規化済みの WorkDir（rw で戻す）、`host` は正規化済みのホスト実行ファイル（隠れる
+/// 場所にあるときだけ ro で戻す）。`relay_uds` が `workdir` の外だと隠れて届かないため `None`
+/// （呼び出し側が起動失敗にする）。
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(super) fn linux_argv(
+    bwrap: &Path,
+    hidden: &HiddenPaths,
+    workdir: &Path,
+    host: &Path,
+    relay_uds: &Path,
+) -> Option<(PathBuf, Vec<OsString>)> {
+    if !relay_uds.starts_with(workdir) {
+        return None;
+    }
+    let mut binds = vec![(BindKind::ReadWrite, workdir)];
+    if hidden.hides(host) {
+        binds.push((BindKind::ReadOnly, host));
+    }
+    let mut args = linux_wrapper_args(hidden, &binds);
     args.push(host.as_os_str().to_owned());
     args.extend(HOST_ARGS.iter().map(OsString::from));
     args.push(OsString::from("--egress-relay-uds"));
     args.push(relay_uds.as_os_str().to_owned());
-    (bwrap.to_path_buf(), args)
+    Some((bwrap.to_path_buf(), args))
 }
 
-/// プローブ用の bwrap 起動コマンド。本番と同じフラグ（[`linux_wrapper_args`]）の後ろに、
+/// プローブ用の bwrap 起動コマンド。本番と同じフラグ（[`linux_wrapper_args`]。tmpfs も同じ）の後ろに、
 /// `readlink_exec`（候補パスのまま。multicall の argv[0] 対策。#1458）と `link`（[`Namespace::link`]）
 /// を置く（内側の名前空間を標準出力へ出させる。RENDER-3・#1459・#1466）。busybox の `readlink` は
 /// オペランドを 1 つしか取らないため、名前空間ごとに別の起動にする。
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-fn linux_probe_argv(bwrap: &Path, readlink_exec: &Path, link: &str) -> (PathBuf, Vec<OsString>) {
-    let mut args = linux_wrapper_args();
+fn linux_probe_argv(
+    bwrap: &Path,
+    hidden: &HiddenPaths,
+    readlink_exec: &Path,
+    link: &str,
+) -> (PathBuf, Vec<OsString>) {
+    // readlink は root 所有の `/usr/bin`・`/bin` にあり隠れないため、bind は要らない。
+    let mut args = linux_wrapper_args(hidden, &[]);
     args.push(readlink_exec.as_os_str().to_owned());
     args.push(OsString::from(link));
     (bwrap.to_path_buf(), args)
@@ -633,13 +765,19 @@ fn run_probe(mut cmd: Command, timeout: Duration) -> bool {
 /// [`PROBE_STDOUT_MAX`] バイトまで、終了後に読む（出力が小さくパイプの容量に収まるため
 /// デッドロックしない。大量出力で詰まる場合は timeout で kill して失敗にする）。
 #[cfg(target_os = "linux")]
-fn probe_ns_with(bwrap: &Path, readlink_exec: &Path, ns: Namespace, timeout: Duration) -> NsProbe {
+fn probe_ns_with(
+    bwrap: &Path,
+    hidden: &HiddenPaths,
+    readlink_exec: &Path,
+    ns: Namespace,
+    timeout: Duration,
+) -> NsProbe {
     use std::io::Read;
     let Ok(outside) = std::fs::read_link(ns.link()) else {
         return NsProbe::OutputUnreadable;
     };
     let outside = outside.into_os_string().into_encoded_bytes();
-    let (prog, args) = linux_probe_argv(bwrap, readlink_exec, ns.link());
+    let (prog, args) = linux_probe_argv(bwrap, hidden, readlink_exec, ns.link());
     let mut cmd = Command::new(prog);
     cmd.args(args)
         .env_clear()
@@ -694,11 +832,12 @@ fn probe_ns_with(bwrap: &Path, readlink_exec: &Path, ns: Namespace, timeout: Dur
 #[cfg(target_os = "linux")]
 fn probe_bwrap_with(
     bwrap: &Path,
+    hidden: &HiddenPaths,
     readlink_exec: &Path,
     timeout: Duration,
 ) -> Result<(), (Namespace, NsProbe)> {
     for ns in [Namespace::Net, Namespace::Pid] {
-        match probe_ns_with(bwrap, readlink_exec, ns, timeout) {
+        match probe_ns_with(bwrap, hidden, readlink_exec, ns, timeout) {
             NsProbe::Separated => {}
             other => return Err((ns, other)),
         }
@@ -710,11 +849,14 @@ fn probe_bwrap_with(
 fn probe_uncached() -> Result<Sandbox, EgressIsolationUnavailable> {
     let bwrap = select_trusted(&BWRAP_CANDIDATES)?;
     let readlink_exec = select_trusted_exec(&READLINK_CANDIDATES)?;
+    // `$HOME` はプローブ時に 1 回だけ読み、結果と一緒にキャッシュする（プロセスの生存中は変わらない前提。
+    // 本体の環境変数は書き換えない。SEC-2）。エラーの優先順位は ツールの有無・信頼 → HOME → 試走。
+    let hidden = HiddenPaths::new(resolve_home_to_hide(std::env::var_os("HOME").as_deref())?);
     // 実起動（`build_command`）は、ここでキャッシュした実体パスを `select_trusted` を通し直さず使う。
     // 実体は root 所有で祖先まで書き込み不可のまま、プロセスの生存中は変わらない前提に立つ
     // （差し替えには root が要り、脅威モデルの外。設計 §9.3）。
-    match probe_bwrap_with(&bwrap, &readlink_exec, PROBE_TIMEOUT) {
-        Ok(()) => Ok(Sandbox::Bwrap(bwrap)),
+    match probe_bwrap_with(&bwrap, &hidden, &readlink_exec, PROBE_TIMEOUT) {
+        Ok(()) => Ok(Sandbox::Bwrap { bwrap, hidden }),
         Err(_) => Err(EgressIsolationUnavailable::SandboxProbeFailed),
     }
 }
@@ -1030,16 +1172,38 @@ mod tests {
     #[test]
     fn render3_linux_probe_argv_uses_candidate_path_as_argv0() {
         for ns in [Namespace::Net, Namespace::Pid] {
+            let hidden = HiddenPaths::new(PathBuf::from("/home/u"));
             let (prog, args) = linux_probe_argv(
                 Path::new("/usr/bin/bwrap"),
+                &hidden,
                 Path::new("/usr/bin/readlink"),
                 ns.link(),
             );
             assert_eq!(prog, PathBuf::from("/usr/bin/bwrap"));
-            let mut want = linux_wrapper_args();
-            want.push(OsString::from("/usr/bin/readlink"));
-            want.push(OsString::from(ns.link()));
-            assert_eq!(args, want);
+            let got: Vec<&str> = args.iter().map(|a| a.to_str().unwrap()).collect();
+            // 本番と同じ tmpfs を含み、bind は無い。
+            assert_eq!(
+                got,
+                [
+                    "--die-with-parent",
+                    "--unshare-net",
+                    "--unshare-pid",
+                    "--dev-bind",
+                    "/",
+                    "/",
+                    "--proc",
+                    "/proc",
+                    "--tmpfs",
+                    "/run",
+                    "--tmpfs",
+                    "/tmp",
+                    "--tmpfs",
+                    "/home/u",
+                    "--",
+                    "/usr/bin/readlink",
+                    ns.link(),
+                ]
+            );
         }
         assert_eq!(Namespace::Net.link(), "/proc/self/ns/net");
         assert_eq!(Namespace::Pid.link(), "/proc/self/ns/pid");
@@ -1121,9 +1285,10 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     fn probe_retrying(bwrap: &Path, readlink: &Path) -> Result<(), (Namespace, NsProbe)> {
+        let hidden = HiddenPaths::new(PathBuf::from("/home/u"));
         let mut r = Err((Namespace::Net, NsProbe::SpawnFailed));
         for _ in 0..20 {
-            r = probe_bwrap_with(bwrap, readlink, Duration::from_secs(5));
+            r = probe_bwrap_with(bwrap, &hidden, readlink, Duration::from_secs(5));
             if !matches!(r, Err((_, NsProbe::SpawnFailed))) {
                 break;
             }
@@ -1182,7 +1347,21 @@ mod tests {
             select_trusted_exec(&READLINK_CANDIDATES),
         ) {
             (Ok(bwrap), Ok(readlink)) => {
-                assert_eq!(probe_retrying(&bwrap, &readlink), Ok(()));
+                // 本番（probe_uncached）と同じく、実際の `$HOME` を隠した状態で分離を確かめる。
+                let home = resolve_home_to_hide(std::env::var_os("HOME").as_deref());
+                let Ok(home) = home else {
+                    return assert!(!ci_requires_ok(), "CI must have a hideable HOME: {home:?}");
+                };
+                let hidden = HiddenPaths::new(home);
+                let mut r = Err((Namespace::Net, NsProbe::SpawnFailed));
+                for _ in 0..20 {
+                    r = probe_bwrap_with(&bwrap, &hidden, &readlink, Duration::from_secs(5));
+                    if !matches!(r, Err((_, NsProbe::SpawnFailed))) {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                assert_eq!(r, Ok(()));
             }
             (b, r) => {
                 assert!(
@@ -1209,16 +1388,25 @@ mod tests {
         assert_eq!(got, ["-p", "(version 1)(allow default)", "/bin/true"]);
     }
 
-    /// RENDER-3（#1436）: Linux の argv は bwrap の固定フラグ + ホスト + 中継 UDS と完全一致する。
+    fn argv_strs(args: &[OsString]) -> Vec<&str> {
+        args.iter().map(|a| a.to_str().unwrap()).collect()
+    }
+
+    /// RENDER-3・SEC-2（#1436・#1485）: Linux の argv は具体値と順序まで完全一致する。
+    /// (a) ホストが `$HOME` 配下: tmpfs 3 つ -> `--bind` -> `--ro-bind`。
     #[test]
-    fn render3_linux_argv_is_exact() {
+    fn render3_linux_argv_is_exact_with_exe_under_home() {
+        let hidden = HiddenPaths::new(PathBuf::from("/home/u"));
         let (prog, args) = linux_argv(
             Path::new("/usr/bin/bwrap"),
-            Path::new("/opt/host/servo-host"),
+            &hidden,
+            Path::new("/tmp/w"),
+            Path::new("/home/u/t/servo-host"),
             Path::new("/tmp/w/egress-proxy.sock"),
-        );
+        )
+        .unwrap();
         assert_eq!(prog, PathBuf::from("/usr/bin/bwrap"));
-        let got: Vec<&str> = args.iter().map(|a| a.to_str().unwrap()).collect();
+        let got = argv_strs(&args);
         assert_eq!(
             got,
             [
@@ -1232,6 +1420,62 @@ mod tests {
                 "/proc",
                 "--tmpfs",
                 "/run",
+                "--tmpfs",
+                "/tmp",
+                "--tmpfs",
+                "/home/u",
+                "--bind",
+                "/tmp/w",
+                "/tmp/w",
+                "--ro-bind",
+                "/home/u/t/servo-host",
+                "/home/u/t/servo-host",
+                "--",
+                "/home/u/t/servo-host",
+                "--stdio",
+                "--egress-relay-uds",
+                "/tmp/w/egress-proxy.sock",
+            ]
+        );
+        assert_bind_order(&got);
+    }
+
+    /// bind は最後の `--tmpfs` より後ろ、`--` より前に置く（順序が意味を持つ）。
+    fn assert_bind_order(got: &[&str]) {
+        let last_tmpfs = got.iter().rposition(|a| *a == "--tmpfs").unwrap();
+        let sep = got.iter().position(|a| *a == "--").unwrap();
+        for (i, a) in got.iter().enumerate() {
+            if *a == "--bind" || *a == "--ro-bind" {
+                assert!(i > last_tmpfs && i < sep, "{a} at {i}");
+            }
+        }
+    }
+
+    /// (b) ホストが隠れない場所（`/opt`）なら `--ro-bind` は付けない。
+    #[test]
+    fn render3_linux_argv_has_no_ro_bind_for_visible_exe() {
+        let hidden = HiddenPaths::new(PathBuf::from("/home/u"));
+        let (_, args) = linux_argv(
+            Path::new("/usr/bin/bwrap"),
+            &hidden,
+            Path::new("/tmp/w"),
+            Path::new("/opt/host/servo-host"),
+            Path::new("/tmp/w/egress-proxy.sock"),
+        )
+        .unwrap();
+        let got = argv_strs(&args);
+        assert_eq!(
+            &got[8..],
+            [
+                "--tmpfs",
+                "/run",
+                "--tmpfs",
+                "/tmp",
+                "--tmpfs",
+                "/home/u",
+                "--bind",
+                "/tmp/w",
+                "/tmp/w",
                 "--",
                 "/opt/host/servo-host",
                 "--stdio",
@@ -1239,6 +1483,258 @@ mod tests {
                 "/tmp/w/egress-proxy.sock",
             ]
         );
+        assert!(!got.contains(&"--ro-bind"));
+        assert_bind_order(&got);
+    }
+
+    /// (c) `$HOME` が `/tmp` 配下なら `--tmpfs <home>` を省き、`--tmpfs /tmp` は 1 回だけ。
+    #[test]
+    fn render3_linux_argv_omits_home_tmpfs_when_home_under_tmp() {
+        let hidden = HiddenPaths::new(PathBuf::from("/tmp/h"));
+        let (_, args) = linux_argv(
+            Path::new("/usr/bin/bwrap"),
+            &hidden,
+            Path::new("/tmp/w"),
+            Path::new("/tmp/h/servo-host"),
+            Path::new("/tmp/w/egress-proxy.sock"),
+        )
+        .unwrap();
+        let got = argv_strs(&args);
+        assert_eq!(
+            &got[8..],
+            [
+                "--tmpfs",
+                "/run",
+                "--tmpfs",
+                "/tmp",
+                "--bind",
+                "/tmp/w",
+                "/tmp/w",
+                "--ro-bind",
+                "/tmp/h/servo-host",
+                "/tmp/h/servo-host",
+                "--",
+                "/tmp/h/servo-host",
+                "--stdio",
+                "--egress-relay-uds",
+                "/tmp/w/egress-proxy.sock",
+            ]
+        );
+        assert_eq!(got.iter().filter(|a| **a == "/tmp").count(), 1);
+        assert_bind_order(&got);
+    }
+
+    /// UDS が WorkDir の外だと隠れて届かないので argv を作らない（呼び出し側が起動失敗にする）。
+    #[test]
+    fn render3_linux_argv_rejects_uds_outside_workdir() {
+        let hidden = HiddenPaths::new(PathBuf::from("/home/u"));
+        assert!(
+            linux_argv(
+                Path::new("/usr/bin/bwrap"),
+                &hidden,
+                Path::new("/tmp/w"),
+                Path::new("/opt/host"),
+                Path::new("/tmp/other/egress-proxy.sock"),
+            )
+            .is_none()
+        );
+    }
+
+    /// RENDER-3（#1485）: `$HOME` の解決。未設定・相対・`/`・存在しない・ファイルは拒否する。
+    #[cfg(unix)]
+    #[test]
+    fn render3_resolve_home_cases() {
+        use std::ffi::OsStr;
+        let bad = Err(EgressIsolationUnavailable::HomeNotHideable);
+        assert_eq!(resolve_home_to_hide(None), bad);
+        assert_eq!(resolve_home_to_hide(Some(OsStr::new("rel/x"))), bad);
+        assert_eq!(resolve_home_to_hide(Some(OsStr::new(""))), bad);
+        for root in ["/", "//", "/."] {
+            assert_eq!(resolve_home_to_hide(Some(OsStr::new(root))), bad, "{root}");
+        }
+
+        let base = std::fs::canonicalize(std::env::temp_dir()).unwrap();
+        let dir = base.join(format!("fb-home-{}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        let file = dir.join("file");
+        std::fs::write(&file, b"x").unwrap();
+        let link = dir.join("rootlink");
+        std::os::unix::fs::symlink("/", &link).unwrap();
+        let sub = dir.join("sub");
+        std::fs::create_dir(&sub).unwrap();
+
+        assert_eq!(
+            resolve_home_to_hide(Some(dir.join("absent").as_os_str())),
+            bad
+        );
+        assert_eq!(resolve_home_to_hide(Some(file.as_os_str())), bad);
+        assert_eq!(resolve_home_to_hide(Some(link.as_os_str())), bad);
+        // `/tmp` 配下（macOS では /private/var 配下）でも Ok。正規化後の値が返る。
+        assert_eq!(resolve_home_to_hide(Some(sub.as_os_str())), Ok(sub.clone()));
+        // `/tmp` 配下の HOME は tmpfs が重複しない。
+        if sub.starts_with("/tmp") {
+            let h = HiddenPaths::new(sub.clone());
+            assert_eq!(h.home, None);
+            assert!(h.hides(&sub.join("child")));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // 通常のディレクトリ（`/tmp` の外）は正規化されて Ok。
+        let manifest = std::fs::canonicalize(env!("CARGO_MANIFEST_DIR")).unwrap();
+        assert!(!manifest.starts_with("/tmp"), "fixture assumption");
+        assert_eq!(
+            resolve_home_to_hide(Some(manifest.as_os_str())),
+            Ok(manifest.clone())
+        );
+        let h = HiddenPaths::new(manifest.clone());
+        assert_eq!(h.home, Some(manifest));
+    }
+
+    /// RENDER-3（#1485）: 隠れる場所の判定は成分単位（`/tmpx` や `/home/ux` は隠れない）。
+    #[test]
+    fn render3_hidden_paths_hides() {
+        let h = HiddenPaths::new(PathBuf::from("/home/u"));
+        assert!(h.hides(Path::new("/tmp/x")));
+        assert!(!h.hides(Path::new("/tmpx")));
+        assert!(h.hides(Path::new("/home/u/a")));
+        assert!(!h.hides(Path::new("/home/ux")));
+        assert!(!h.hides(Path::new("/opt/x")));
+        assert!(!h.hides(Path::new("/run/x")));
+    }
+
+    /// 試走用に `bwrap <wrapper> test <flag> <path>` を走らせ、終了コードを返す（失敗は `None`）。
+    #[cfg(target_os = "linux")]
+    fn run_bwrap_test(
+        bwrap: &Path,
+        hidden: &HiddenPaths,
+        binds: &[(BindKind, &Path)],
+        test_exec: &Path,
+        flag: &str,
+        target: &Path,
+    ) -> Option<i32> {
+        for _ in 0..20 {
+            let mut args = linux_wrapper_args(hidden, binds);
+            args.push(test_exec.as_os_str().to_owned());
+            args.push(OsString::from(flag));
+            args.push(target.as_os_str().to_owned());
+            let mut cmd = Command::new(bwrap);
+            cmd.args(args)
+                .env_clear()
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            let Ok(mut child) = cmd.spawn() else {
+                // ETXTBSY 等の一過性の起動失敗はやり直す。
+                std::thread::sleep(Duration::from_millis(50));
+                continue;
+            };
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                match child.try_wait() {
+                    Ok(Some(st)) => return st.code(),
+                    Ok(None) if Instant::now() < deadline => {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    _ => {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        return None;
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// RENDER-3・SEC-2（#1485）: 本物の bwrap で、`/tmp` の兄弟と `$HOME` の既存エントリが見えず、
+    /// 戻した WorkDir（rw）とホスト実行ファイル（ro）だけが見える。CI の Linux では bwrap・readlink・
+    /// test・`$HOME` が揃うこと自体を必須にする。揃わない環境では Err の種別を確かめて終える。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn render3_bwrap_hides_tmp_and_home_and_restores_workdir_and_exe() {
+        use std::os::unix::net::UnixListener;
+        const TEST_CANDIDATES: [&str; 2] = ["/usr/bin/test", "/bin/test"];
+        const TOUCH_CANDIDATES: [&str; 2] = ["/usr/bin/touch", "/bin/touch"];
+        let tools = (
+            select_trusted(&BWRAP_CANDIDATES),
+            select_trusted_exec(&TEST_CANDIDATES),
+            select_trusted_exec(&TOUCH_CANDIDATES),
+            resolve_home_to_hide(std::env::var_os("HOME").as_deref()),
+        );
+        let (Ok(bwrap), Ok(test_exec), Ok(touch_exec), Ok(home)) = tools.clone() else {
+            assert!(
+                !ci_requires_ok(),
+                "CI must have bwrap, test, touch and HOME: {tools:?}"
+            );
+            return;
+        };
+        let hidden = HiddenPaths::new(home.clone());
+
+        // 兄弟ディレクトリ（`/tmp`）と WorkDir（`temp_dir` 配下。通常は `/tmp`）。
+        let base = std::fs::canonicalize(std::env::temp_dir()).unwrap();
+        let pid = std::process::id();
+        let sibling = base.join(format!("fb-hide-sib-{pid}"));
+        let work = base.join(format!("fb-hide-work-{pid}"));
+        for d in [&sibling, &work] {
+            let _ = std::fs::remove_dir_all(d);
+            std::fs::create_dir(d).unwrap();
+        }
+        let sib_file = sibling.join("f");
+        let work_file = work.join("f");
+        std::fs::write(&sib_file, b"x").unwrap();
+        std::fs::write(&work_file, b"x").unwrap();
+        let sib_sock = sibling.join("s.sock");
+        let work_sock = work.join("s.sock");
+        let _l1 = UnixListener::bind(&sib_sock).unwrap();
+        let _l2 = UnixListener::bind(&work_sock).unwrap();
+
+        let rw = [(BindKind::ReadWrite, work.as_path())];
+        let run = |binds: &[(BindKind, &Path)], flag: &str, t: &Path| {
+            run_bwrap_test(&bwrap, &hidden, binds, &test_exec, flag, t)
+        };
+        let mut checks = Vec::new();
+        // `/tmp` が隠れる環境（既定）でだけ、兄弟が消えることを確かめる。
+        let tmp_hidden = sibling.starts_with("/tmp") || hidden.hides(&sibling);
+        if tmp_hidden {
+            checks.push(("sibling file", run(&rw, "-e", &sib_file), Some(1)));
+            checks.push(("sibling uds", run(&rw, "-S", &sib_sock), Some(1)));
+        }
+        checks.push(("workdir file", run(&rw, "-e", &work_file), Some(0)));
+        checks.push(("workdir uds", run(&rw, "-S", &work_sock), Some(0)));
+        // `$HOME` の既存エントリ（WorkDir と実行ファイルの祖先でないもの）は見えない。
+        let exe = std::fs::canonicalize(std::env::current_exe().unwrap()).unwrap();
+        let entry = std::fs::read_dir(&home)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.path())
+            .find(|p| !exe.starts_with(p) && !work.starts_with(p));
+        if let (Some(entry), true) = (entry.as_ref(), !home.starts_with("/tmp")) {
+            checks.push(("home entry", run(&rw, "-e", entry), Some(1)));
+        }
+        // ホスト実行ファイル: 隠れる場所なら ro で戻り、書き込めない。
+        let ro = [
+            (BindKind::ReadWrite, work.as_path()),
+            (BindKind::ReadOnly, exe.as_path()),
+        ];
+        let exe_hidden = hidden.hides(&exe);
+        if exe_hidden {
+            checks.push(("exe visible", run(&ro, "-e", &exe), Some(0)));
+            // uutils の `test -w` は権限ビットしか見ず ro マウントを検出できないため、`touch -c`
+            // （既存ファイルの時刻更新。ro マウントでは EROFS で失敗する）で読み取り専用を確かめる。
+            let touch = run_bwrap_test(&bwrap, &hidden, &ro, &touch_exec, "-c", &exe);
+            checks.push(("exe read-only", touch, Some(1)));
+            checks.push(("exe hidden without bind", run(&rw, "-e", &exe), Some(1)));
+        }
+
+        for d in [&sibling, &work] {
+            let _ = std::fs::remove_dir_all(d);
+        }
+        for (name, got, want) in checks {
+            assert_eq!(got, want, "{name}");
+        }
+        if ci_requires_ok() {
+            assert!(exe_hidden, "CI runs tests from under $HOME");
+        }
     }
 
     /// RENDER-3（#1436）: Seatbelt の profile は整数ポートだけを埋め込んだ固定形。
@@ -1323,6 +1819,7 @@ mod tests {
             EgressIsolationUnavailable::SandboxProbeFailed,
             EgressIsolationUnavailable::WorkDirHiddenBySandbox,
             EgressIsolationUnavailable::SocketPathInvalid,
+            EgressIsolationUnavailable::HomeNotHideable,
         ] {
             assert_eq!(
                 decide(BestEffort, Err(reason)).unwrap(),
@@ -1345,6 +1842,13 @@ mod tests {
              was not found); starting render host without egress isolation"
         );
         assert!(!m.contains('/'));
+        let h = isolation_warning_message(EgressIsolationUnavailable::HomeNotHideable);
+        assert_eq!(
+            h,
+            "render host egress isolation is unavailable (home directory cannot be hidden by \
+             the sandbox); starting render host without egress isolation"
+        );
+        assert!(!h.contains('/'));
         let u = isolation_warning_message(EgressIsolationUnavailable::SandboxToolUntrusted);
         assert_eq!(
             u,

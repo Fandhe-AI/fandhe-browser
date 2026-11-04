@@ -218,7 +218,16 @@ mod tests {
 
         let resolved = resolve_host_binary(Some(&script), None, None);
         let renderer = select_renderer(resolved, |b| {
-            HostProcessConfig::new(b).with_temp_root(temp_root.clone())
+            // 偽ホストは WorkDir の親（隔離すると `/tmp` ごと隠れる）へ到達印を書くため、実環境の
+            // bwrap の有無で挙動が変わらないよう隔離なしに固定する（#1485。本テストは遅延起動の確認）。
+            HostProcessConfig::new(b)
+                .with_temp_root(temp_root.clone())
+                .with_isolation_probe(
+                    fandhe_browser_render::host_process::IsolationProbe::Unavailable(
+                        EgressIsolationUnavailable::SandboxToolNotFound,
+                    ),
+                )
+                .with_isolation_warning(Arc::new(|_| {}))
         })
         .expect("host resolves");
         let app = open_app_state_with(
