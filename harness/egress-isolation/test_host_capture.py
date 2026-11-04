@@ -821,6 +821,7 @@ class SlackAndTerminationTests(unittest.TestCase):
         p.stdout = io.StringIO(stdout)
         p.poll.return_value = 0
         p.wait.return_value = 0
+        p.returncode = 0
         return p
 
     @staticmethod
@@ -851,7 +852,7 @@ class SlackAndTerminationTests(unittest.TestCase):
 
             def poll(pcap, port, final_t, window, budget, *a, **k):
                 budgets.append(budget)
-                return False
+                return hc.PollResult(False, hc.POLL_BUDGET_KILLED, "x")
 
             with mock.patch.object(hc, "_poll_pcap_once", side_effect=poll), \
                  mock.patch.object(hc.time, "sleep", side_effect=sleep), mock.patch.object(hc.time, "monotonic", side_effect=mono), \
@@ -869,7 +870,9 @@ class SlackAndTerminationTests(unittest.TestCase):
                  mock.patch("sys.stdout"):
                 self.assertEqual(hc.cmd_wait_final_canary(ns), 1)
             with mock.patch.object(hc.subprocess, "Popen", side_effect=OSError):
-                self.assertFalse(hc._poll_pcap_once(Path(d) / "capture.pcap", CANARY, 100.65, (100.0, 100.6), 1.0))
+                r = hc._poll_pcap_once(Path(d) / "capture.pcap", CANARY, 100.65, (100.0, 100.6), 1.0)
+                self.assertFalse(r.observed)
+                self.assertEqual(r.reason, hc.POLL_SPAWN_FAILED)
 
     def test_wait_final_canary_invalid_inputs_do_not_run_tcpdump(self):
         for kw in ({"end": False}, {"final": float("nan")}, {"final": 100.0}):
@@ -896,17 +899,33 @@ class SlackAndTerminationTests(unittest.TestCase):
             ns = self._wait_dir(d)
             ns.timeout = 1.0
             ns.interval = 0.1
-            with self._fake_tcpdump(d, "time.sleep(30)\n"), mock.patch("sys.stdout"):
+            calls = []
+            real = hc._poll_pcap_once
+
+            def rec(*a, **k):
+                r = real(*a, **k)
+                calls.append((a[4], r))
+                return r
+
+            with self._fake_tcpdump(d, "time.sleep(30)\n"), mock.patch.object(hc, "_poll_pcap_once", side_effect=rec), \
+                 mock.patch("sys.stdout") as out:
                 t0 = time.monotonic()
                 self.assertEqual(hc.cmd_wait_final_canary(ns), 1)
                 elapsed = time.monotonic() - t0
-            self.assertLess(elapsed, 3.5)
+            self.assertTrue(1 <= len(calls) <= 2, len(calls))
+            for budget, r in calls:
+                self.assertEqual(r.reason, hc.POLL_BUDGET_KILLED)
+                self.assertLessEqual(budget, 1.0)
+            written = "".join(c.args[0] for c in out.write.call_args_list)
+            self.assertIn("last poll: budget-killed", written)
+            # 実時間は 30 秒の sleep を待ってしまう桁の退行だけを捕まえる。締切の正しさは下の決定的なテストと理由・budget で見る
+            self.assertLess(elapsed, 10.0)
 
     def test_poll_stops_early_on_final_canary(self):
         body = f"print({CANARY_LINE!r}); print({FINAL_CANARY_LINE!r}); sys.stdout.flush(); time.sleep(30)\n"
         with tempfile.TemporaryDirectory() as d, self._fake_tcpdump(d, body):
             t0 = time.monotonic()
-            self.assertTrue(self._poll(d, budget=20.0))
+            self.assertTrue(self._poll(d, budget=20.0).observed)
             self.assertLess(time.monotonic() - t0, 10.0)
 
     def test_poll_uses_shared_threshold_and_boundaries(self):
@@ -915,31 +934,143 @@ class SlackAndTerminationTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as d:
             with self._fake_tcpdump(d, f"print({lo(100.648999)!r})\n"):
-                self.assertFalse(self._poll(d, budget=5.0))
+                r = self._poll(d, budget=5.0)
+                self.assertFalse(r.observed)
+                self.assertEqual(r.reason, hc.POLL_EOF)
             with self._fake_tcpdump(d, f"print({lo(100.649)!r})\n"), \
                  mock.patch.object(hc, "_final_canary_threshold", wraps=hc._final_canary_threshold) as thr:
-                self.assertTrue(self._poll(d, budget=5.0))
+                self.assertTrue(self._poll(d, budget=5.0).observed)
                 thr.assert_called()
 
     def test_poll_max_packets_cap_is_not_observation(self):
         body = f"for _ in range(10): print({CANARY_LINE!r})\nprint({FINAL_CANARY_LINE!r})\n"
         with tempfile.TemporaryDirectory() as d, self._fake_tcpdump(d, body):
-            self.assertFalse(self._poll(d, budget=5.0, max_packets=5))
-            self.assertTrue(self._poll(d, budget=5.0, max_packets=50))
+            r = self._poll(d, budget=5.0, max_packets=5)
+            self.assertFalse(r.observed)
+            self.assertEqual(r.reason, hc.POLL_PACKET_LIMIT)
+            self.assertTrue(self._poll(d, budget=5.0, max_packets=50).observed)
 
     def test_poll_long_line_is_bounded_and_following_lines_are_read(self):
         long_ = hc.MAX_PACKET_LINE_CHARS * 5
         with tempfile.TemporaryDirectory() as d:
             with self._fake_tcpdump(d, f"sys.stdout.write('x' * {long_}); sys.stdout.flush(); time.sleep(30)\n"):
                 t0 = time.monotonic()
-                self.assertFalse(self._poll(d, budget=0.5))
+                r = self._poll(d, budget=0.5)
+                self.assertFalse(r.observed)
+                self.assertEqual(r.reason, hc.POLL_BUDGET_KILLED)
                 self.assertLess(time.monotonic() - t0, 5.0)
             with self._fake_tcpdump(d, f"print('x' * {long_}); print({FINAL_CANARY_LINE!r})\n"):
-                self.assertTrue(self._poll(d, budget=5.0))
+                self.assertTrue(self._poll(d, budget=5.0).observed)
 
     def test_poll_missing_executable_is_not_observation(self):
         with tempfile.TemporaryDirectory() as d, mock.patch.object(hc, "TCPDUMP_ARGV", (str(Path(d) / "nope"),)):
-            self.assertFalse(self._poll(d, budget=1.0))
+            r = self._poll(d, budget=1.0)
+            self.assertFalse(r.observed)
+            self.assertEqual(r.reason, hc.POLL_SPAWN_FAILED)
+
+    # --- 未観測の理由・読み捨ての上限・警告・決定的な締切（#1481） ---
+
+    def test_poll_result_is_not_evaluable_as_bool(self):
+        # `if result:` が常に成功扱いになる fail-open を型で防ぐ
+        with self.assertRaises(TypeError):
+            bool(hc.PollResult(False, hc.POLL_EOF))
+
+    def test_poll_eof_reports_exit_code_and_sanitized_stderr(self):
+        body = ("sys.stderr.write('tcpdump: bad\\n\\x1b[31m::error::boom\\r\\n' + 'z' * 5000)\n"
+                "sys.stderr.flush()\nsys.exit(3)\n")
+        with tempfile.TemporaryDirectory() as d, self._fake_tcpdump(d, body):
+            r = self._poll(d, budget=10.0)
+        self.assertFalse(r.observed)
+        self.assertEqual(r.reason, hc.POLL_EOF)
+        self.assertIn("exited with 3", r.detail)
+        self.assertIn("stderr: ", r.detail)
+        self.assertNotIn("\n", r.detail)
+        self.assertNotIn("\x1b", r.detail)
+        self.assertLessEqual(len(r.detail), 128 + hc.WAIT_CANARY_STDERR_NOTE_CHARS)
+
+    def test_poll_kill_reports_budget_killed(self):
+        with tempfile.TemporaryDirectory() as d, self._fake_tcpdump(d, "time.sleep(30)\n"):
+            r = self._poll(d, budget=0.5)
+        self.assertEqual(r.reason, hc.POLL_BUDGET_KILLED)
+        self.assertIn("0.5s", r.detail)
+
+    def test_read_bounded_line_discard_is_capped(self):
+        import io
+
+        n = hc.MAX_PACKET_LINE_CHARS
+        line, discarded = hc._read_bounded_line(io.StringIO("a" * (n * 10)), n * 2)
+        self.assertEqual(line, "a" * n)
+        self.assertGreater(discarded, n * 2)
+        self.assertLess(discarded, n * 4)
+        s = io.StringIO("b" * (n * 3) + "\nnext\n")
+        line, discarded = hc._read_bounded_line(s, n * 100)
+        self.assertEqual(line, "b" * n)
+        self.assertEqual(discarded, n * 2 + 1)
+        self.assertEqual(hc._read_bounded_line(s, n * 100), ("next\n", 0))
+
+    def test_poll_discard_limit_stops_endless_unterminated_output(self):
+        body = "while True:\n    sys.stdout.write('x' * 4096); sys.stdout.flush()\n"
+        with tempfile.TemporaryDirectory() as d, self._fake_tcpdump(d, body), \
+             mock.patch.object(hc, "WAIT_CANARY_MAX_DISCARD_CHARS", 10_000):
+            r = self._poll(d, budget=30.0)
+        self.assertFalse(r.observed)
+        self.assertEqual(r.reason, hc.POLL_DISCARD_LIMIT)
+
+    def test_poll_warns_when_tcpdump_does_not_exit_after_kill(self):
+        import io
+        import subprocess
+
+        p = self._popen("")
+        p.poll.return_value = None
+        p.wait.side_effect = subprocess.TimeoutExpired("tcpdump", 1.0)
+        err = io.StringIO()
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(hc.subprocess, "Popen", return_value=p), \
+             mock.patch.object(hc.sys, "stderr", err):
+            r = self._poll(d, budget=5.0)
+        self.assertFalse(r.observed)
+        self.assertIn("warning: tcpdump did not exit", err.getvalue())
+        p.kill.assert_called()
+
+    def test_wait_final_canary_timeout_message_carries_last_reason(self):
+        with tempfile.TemporaryDirectory() as d:
+            ns = self._wait_dir(d)
+            ns.timeout = 3.0
+            now, mono, sleep = self._fake_clock()
+            res = hc.PollResult(False, hc.POLL_PACKET_LIMIT, "no final canary in the first 5 lines")
+            with mock.patch.object(hc, "_poll_pcap_once", return_value=res), \
+                 mock.patch.object(hc.time, "sleep", side_effect=sleep), mock.patch.object(hc.time, "monotonic", side_effect=mono), \
+                 mock.patch("sys.stdout") as out:
+                self.assertEqual(hc.cmd_wait_final_canary(ns), 1)
+            written = "".join(c.args[0] for c in out.write.call_args_list)
+            self.assertTrue(written.startswith("note: final canary not seen in pcap within 3s"), written)
+            self.assertIn("last poll: packet-limit", written)
+
+    def test_wait_final_canary_deadline_is_deterministic(self):
+        # tcpdump が kill まで終わらない最悪の場合（各ポーリングが budget いっぱい使う）を偽時計で再現する
+        # interval=0.1 の sleep が挟まるため 25 秒の最後の budget は 25 - (10 + 0.1 + 10 + 0.1) = 4.8
+        expected = {1.0: [1.0], 25.0: [10.0, 10.0, 4.8]}
+        for timeout, want in expected.items():
+            with self.subTest(timeout=timeout), tempfile.TemporaryDirectory() as d:
+                ns = self._wait_dir(d)
+                ns.timeout = timeout
+                ns.interval = 0.1
+                now, mono, sleep = self._fake_clock()
+                budgets = []
+
+                def poll(pcap, port, final_t, window, budget, *a, **k):
+                    budgets.append(budget)
+                    now[0] += budget
+                    return hc.PollResult(False, hc.POLL_BUDGET_KILLED, "x")
+
+                with mock.patch.object(hc, "_poll_pcap_once", side_effect=poll), \
+                     mock.patch.object(hc.time, "sleep", side_effect=sleep), mock.patch.object(hc.time, "monotonic", side_effect=mono), \
+                     mock.patch("sys.stdout"):
+                    self.assertEqual(hc.cmd_wait_final_canary(ns), 1)
+                self.assertEqual(len(budgets), len(want))
+                for got, exp in zip(budgets, want):
+                    self.assertAlmostEqual(got, exp, places=6)
+                self.assertLessEqual(max(budgets), hc.WAIT_CANARY_POLL_MAX_SECONDS)
+                self.assertLessEqual(now[0], timeout + hc.WAIT_CANARY_POLL_MIN_SECONDS + 0.1)
 
     def test_missing_individual_files_are_unobservable(self):
         # upload-artifact の if-no-files-found は個々の欠落を検出しない。欠落は judge が unobservable にする前提（#1473 C）

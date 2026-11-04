@@ -41,9 +41,11 @@ import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from collections import Counter
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
@@ -1115,15 +1117,73 @@ def run_sampler(
     return 0
 
 
-def _read_bounded_line(stream) -> str:
-    """1 行を MAX_PACKET_LINE_CHARS までだけ保持して返す。超過分は改行か EOF まで読み捨てる（無制限バッファを避ける）。"""
+# 1 回のポーリングで、MAX_PACKET_LINE_CHARS を超えた行の読み捨てに使ってよい総量（文字数。#1481）。
+# text モードの readline(n) は文字数で数える。tcpdump の出力は ASCII のためほぼバイト数と同じ。
+# 改行のない出力が続いても kill されるまで CPU を使い続けないための上限で、通常の pcap の出力量には届かない。
+WAIT_CANARY_MAX_DISCARD_CHARS = 1 << 20
+# 時間切れの診断に載せる tcpdump の stderr の読み取り量（末尾のバイト数）と、載せる文字数の上限（#1481）
+WAIT_CANARY_STDERR_TAIL_BYTES = 4096
+WAIT_CANARY_STDERR_NOTE_CHARS = 256
+
+# _poll_pcap_once の未観測の理由（出力文字列なので英語）。POLL_OBSERVED だけが observed=True になる。
+POLL_OBSERVED = "observed"
+POLL_SPAWN_FAILED = "spawn-failed"
+POLL_BUDGET_KILLED = "budget-killed"
+POLL_PACKET_LIMIT = "packet-limit"
+POLL_DISCARD_LIMIT = "discard-limit"
+POLL_EOF = "eof"
+POLL_READ_ERROR = "read-error"
+
+
+@dataclass(frozen=True)
+class PollResult:
+    """_poll_pcap_once の結果（REPAIR-4: 真偽値だけを返さない。#1481）。
+
+    cmd_wait_final_canary が分岐に使い、時間切れの診断メッセージに reason・detail を載せる。
+    dataclass は常に truthy なので `if result:` が常に成功扱い（fail-open）になる。
+    それを防ぐため真偽値としての評価は TypeError にし、呼び出し側に `.observed` の明示参照を強制する。
+    """
+
+    observed: bool
+    reason: str
+    detail: str = ""
+
+    def __bool__(self) -> bool:
+        raise TypeError("PollResult must not be evaluated as bool; use .observed")
+
+    def describe(self) -> str:
+        return f"{self.reason} ({self.detail})" if self.detail else self.reason
+
+
+def _read_bounded_line(stream, discard_remaining: int = WAIT_CANARY_MAX_DISCARD_CHARS) -> tuple[str, int]:
+    """1 行を MAX_PACKET_LINE_CHARS までだけ保持して返す。超過分は改行・EOF・discard_remaining まで読み捨てる。
+
+    戻り値は (保持した行, 今回読み捨てた文字数)。読み捨てた量が discard_remaining を超えたら打ち切るので、
+    呼び出し側（_poll_pcap_once）は累計が上限を超えたかで POLL_DISCARD_LIMIT を判定できる（#1481）。
+    """
     raw = stream.readline(MAX_PACKET_LINE_CHARS + 1)
+    discarded = max(0, len(raw) - MAX_PACKET_LINE_CHARS)
     if len(raw) > MAX_PACKET_LINE_CHARS and not raw.endswith("\n"):
-        while True:
+        while discarded <= discard_remaining:
             rest = stream.readline(MAX_PACKET_LINE_CHARS + 1)
+            discarded += len(rest)
             if not rest or rest.endswith("\n"):
                 break
-    return raw[:MAX_PACKET_LINE_CHARS]
+    return raw[:MAX_PACKET_LINE_CHARS], discarded
+
+
+def _summarize_stderr(f) -> str:
+    """tcpdump の stderr（一時ファイル）の末尾を 1 行・短い文字列にする（外部由来なので制御文字を除く。#1481）。"""
+    try:
+        f.flush()
+        size = f.seek(0, os.SEEK_END)
+        f.seek(max(0, size - WAIT_CANARY_STDERR_TAIL_BYTES))
+        text = f.read(WAIT_CANARY_STDERR_TAIL_BYTES).decode("utf-8", errors="replace")
+    except (OSError, ValueError):
+        return ""
+    text = re.sub(r"[^\x20-\x7e]+", " ", text)
+    text = re.sub(r" {2,}", " ", text).strip()
+    return text[-WAIT_CANARY_STDERR_NOTE_CHARS:]
 
 
 def _poll_pcap_once(
@@ -1133,42 +1193,66 @@ def _poll_pcap_once(
     window: tuple[float, float] | None,
     budget: float = WAIT_CANARY_POLL_MAX_SECONDS,
     max_packets: int = DEFAULT_MAX_PACKETS,
-) -> bool:
-    """pcap を tcpdump -r で 1 回読み、最終カナリアがあるかを返す（#1476）。
+) -> PollResult:
+    """pcap を tcpdump -r で 1 回読み、最終カナリアがあるかを理由つきで返す（#1476・#1481）。
 
     stdout を 1 行ずつ有界に読み、最終カナリアを見つけた時点か件数上限（max_packets）で打ち切る。
     `budget` 秒を過ぎたら Timer が tcpdump を kill して EOF にする（select は Windows のパイプで使えないため）。
-    書きかけの pcap は truncation で tcpdump が非 0 を返すことがあるが手前のパケットは出るため、終了コードは無視する。
-    起動失敗・時間切れ・件数上限・読みの例外はすべて False（未観測。fail-closed）。引数はリスト（shell=False）。
-    port は呼び出し側が int・範囲を検証済み。stderr は読まないので DEVNULL（PIPE だと詰まる）。
+    書きかけの pcap は truncation で tcpdump が非 0 を返すことがあるが手前のパケットは出るため、終了コードは判定に使わない。
+    observed=True は最終カナリアを検出した経路だけ。起動失敗・kill・件数上限・読み捨て上限・EOF・読みの例外は
+    すべて observed=False（fail-closed）で、reason が原因を区別する。引数はリスト（shell=False）。port は呼び出し側が int・範囲を検証済み。
+    stderr は PIPE だと読まないと詰まるため一時ファイルへ回収し、終了後に末尾だけを診断（detail）に使う。
     """
     threshold = _final_canary_threshold(final_canary_t, window)
+    errf = tempfile.TemporaryFile()
     try:
         proc = subprocess.Popen(
             [*TCPDUMP_ARGV, "-r", str(pcap), "-nn", "-tt", f"udp and src port {canary_port}"],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
+            stderr=errf,
             text=True,
             encoding="utf-8",
             errors="replace",
         )
-    except (OSError, subprocess.SubprocessError, ValueError):
-        return False
-    timer = threading.Timer(max(0.0, budget), proc.kill)
+    except (OSError, subprocess.SubprocessError, ValueError) as e:
+        errf.close()
+        msg = getattr(e, "strerror", None) or ""
+        return PollResult(False, POLL_SPAWN_FAILED, f"{type(e).__name__}{': ' + msg if msg else ''}")
+    killed = threading.Event()
+
+    def _kill_on_budget() -> None:
+        killed.set()
+        proc.kill()
+
+    timer = threading.Timer(max(0.0, budget), _kill_on_budget)
     timer.daemon = True
     timer.start()
+    reason = POLL_PACKET_LIMIT
+    detail = f"no final canary in the first {max_packets} lines"
+    observed = False
+    err_note = ""
+    exited = True
     try:
+        discarded_total = 0
         for _ in range(max_packets):
-            raw = _read_bounded_line(proc.stdout)
+            raw, discarded = _read_bounded_line(proc.stdout, WAIT_CANARY_MAX_DISCARD_CHARS - discarded_total)
+            discarded_total += discarded
+            if discarded_total > WAIT_CANARY_MAX_DISCARD_CHARS:
+                reason, detail = POLL_DISCARD_LIMIT, f"discarded more than {WAIT_CANARY_MAX_DISCARD_CHARS} chars of overlong lines"
+                break
             if not raw:
-                return False
+                if killed.is_set():
+                    reason, detail = POLL_BUDGET_KILLED, f"tcpdump did not finish within {budget:g}s"
+                else:
+                    reason, detail = POLL_EOF, ""
+                break
             pkt = parse_tcpdump_line(raw)
             if pkt is not None and _is_final_canary(pkt, canary_port, threshold):
-                return True
-        return False
-    except (OSError, ValueError):
-        return False
+                observed, reason, detail = True, POLL_OBSERVED, ""
+                break
+    except (OSError, ValueError) as e:
+        reason, detail = POLL_READ_ERROR, type(e).__name__
     finally:
         timer.cancel()
         if proc.poll() is None:
@@ -1176,17 +1260,27 @@ def _poll_pcap_once(
         try:
             proc.wait(timeout=WAIT_CANARY_KILL_GRACE_SECONDS)
         except subprocess.TimeoutExpired:
-            pass
+            exited = False
+            sys.stderr.write(f"warning: tcpdump did not exit within {WAIT_CANARY_KILL_GRACE_SECONDS:g}s after kill\n")
         try:
             proc.stdout.close()
         except (OSError, ValueError):
             pass
+        if not observed:
+            err_note = _summarize_stderr(errf)
+        errf.close()
+    if reason == POLL_EOF:
+        code = proc.returncode if exited and isinstance(proc.returncode, int) else "unknown"
+        detail = f"tcpdump exited with {code} before the final canary"
+    if err_note:
+        detail = f"{detail}; stderr: {err_note}" if detail else f"stderr: {err_note}"
+    return PollResult(observed, reason, detail)
 
 
 def cmd_wait_final_canary(args: argparse.Namespace) -> int:
     """workflow の stop ステップから SIGINT の前に呼ばれる。最終カナリアが pcap に入るまで待つ（#1473 P2）。
 
-    0: 観測した / 1: 時間切れ / 2: samples から port・final_canary_t を得られない。いずれも合否は judge が決める。
+    0: 観測した / 1: 時間切れ（メッセージに最後のポーリングの理由を付ける。#1481） / 2: samples から port・final_canary_t を得られない。いずれも合否は judge が決める。
     ポーリング 1 回の待ちは min(WAIT_CANARY_POLL_MAX_SECONDS, 締切までの残り)（下限 WAIT_CANARY_POLL_MIN_SECONDS）で、
     実時間の上限は概ね timeout + POLL_MIN + KILL_GRACE（#1476）。
     """
@@ -1209,11 +1303,12 @@ def cmd_wait_final_canary(args: argparse.Namespace) -> int:
     while True:
         remaining = deadline - time.monotonic()
         budget = max(WAIT_CANARY_POLL_MIN_SECONDS, min(WAIT_CANARY_POLL_MAX_SECONDS, remaining))
-        if _poll_pcap_once(pcap, port, final_t, window, budget):
+        result = _poll_pcap_once(pcap, port, final_t, window, budget)
+        if result.observed:
             return 0
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            sys.stdout.write(f"note: final canary not seen in pcap within {timeout:g}s\n")
+            sys.stdout.write(f"note: final canary not seen in pcap within {timeout:g}s (last poll: {result.describe()})\n")
             return 1
         time.sleep(min(interval, remaining))
 
