@@ -11,8 +11,9 @@
 //!   --tmpfs /run --tmpfs /tmp --tmpfs /var/tmp --tmpfs /dev/shm [--tmpfs <$HOME>]
 //!   [--tmpfs <WorkDir の親>] --bind <WorkDir> <WorkDir> [--ro-bind <ホスト> <ホスト>] -- <ホスト>
 //!   --stdio --egress-relay-uds <UDS>`（`--ro-bind` はホストが `/run` 以外の tmpfs の配下にあるときだけ。
-//!   `--tmpfs` の後に bind を置く順序が意味を持つ。`/tmp` 等は実体パスに解決し、存在しないものは外す）。netns に出口が無くなり、ホストは
-//!   netns 内の中継を経由して WorkDir 配下の UDS（本体側のプロキシ）にだけ届く。`--unshare-pid` と
+//!   `--tmpfs` の後に bind を置く順序が意味を持つ。`/tmp` 等は実体パスに解決し、存在しないものは外す）。
+//!   netns に出口が無くなり、ホストは netns 内の中継を経由して WorkDir 配下の UDS（本体側の
+//!   プロキシ）にだけ届く。`--unshare-pid` と
 //!   新しい `/proc` により、ホストから本体の `/proc/<ppid>`（`mem`・`fd`・`environ`・ptrace）が見えず、
 //!   乗っ取られたホストが本体へ介入して隔離を破る経路を塞ぐ。`--proc` は `--dev-bind / /` が
 //!   ホストの `/proc` を持ち込んだ後に置く（先に置くと上書きされ、本体の pid が見えてしまう）。
@@ -479,6 +480,7 @@ pub(super) fn resolve_home_to_hide(
     }
     Ok(canonical)
 }
+
 /// `--bind` / `--ro-bind` の種別（tmpfs で隠した後に戻すもの）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
@@ -490,9 +492,11 @@ pub(super) enum BindKind {
 /// bwrap を包む引数（`--` まで）。プローブと本番で名前空間・`--dev-bind`・`--proc`・`--tmpfs` を
 /// 同じにする（RENDER-3）。ただし WorkDir の親の tmpfs（`tmpfs` に含める）は起動ごとに決まるため
 /// 本番だけが持つ。プローブに含めなくても、親を覆えない場合は起動の失敗として表に出る
-/// （fail-closed。隔離なしで起動する経路は増えない。#1492）。`--proc /proc` は `--dev-bind / /` の後ろに、`binds`（隠した後に戻す
-/// 自分の WorkDir とホストの実行ファイル）は `--tmpfs` の**後ろ**に置く（順序が意味を持つ）。
-/// bind は起動ごとのものなのでプローブには付けない。
+/// （fail-closed。隔離なしで起動する経路は増えない。#1492）。
+///
+/// `--proc /proc` は `--dev-bind / /` の後ろに、`binds`（隠した後に戻す自分の WorkDir と
+/// ホストの実行ファイル）は `--tmpfs` の**後ろ**に置く（順序が意味を持つ）。bind は起動ごとの
+/// ものなのでプローブには付けない。
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn linux_wrapper_args(tmpfs: &[PathBuf], binds: &[(BindKind, &Path)]) -> Vec<OsString> {
     let mut args: Vec<OsString> = [
@@ -637,9 +641,9 @@ pub(super) fn macos_argv(host: &Path, port: NonZeroU16) -> (PathBuf, Vec<OsStrin
     (PathBuf::from(SANDBOX_EXEC_PATH), args)
 }
 
-/// なし・100 バイト以下）。ホストに拒否されて起動後に失敗するのを避けるため、起動前に検査する。
-/// 絶対判定は `/` 始まりの文字列で行う（UDS は unix 専用で、Windows の `is_absolute` はドライブ指定を要するため）。
-/// なし・100 バイト以下）。ホストに拒否されて起動後に失敗するのを避けるため、起動前に検査する。
+/// 中継用 UDS のパスが servo-host の規則（絶対・正規化済み・NUL なし・100 バイト以下）を満たすか。
+/// ホストに拒否されて起動後に失敗するのを避けるため、起動前に検査する。絶対判定は `/` 始まりの
+/// 文字列で行う（UDS は unix 専用で、Windows の `is_absolute` はドライブ指定を要するため）。
 pub(super) fn relay_socket_path_ok(path: &Path) -> Result<(), EgressIsolationUnavailable> {
     let bad = EgressIsolationUnavailable::SocketPathInvalid;
     let value = path.to_str().ok_or(bad)?;
@@ -729,6 +733,7 @@ pub(super) fn socket_dir_for(
         parent_to_hide,
     })
 }
+
 /// メタデータが外部コマンドとして信頼できるか（RENDER-3・#1451）。通常ファイル・実行ビットあり・
 /// 所有者が root・group / other に書き込み権限なし。root 所有のファイルはテストで作れないため
 /// 純関数に分けている。
@@ -2083,6 +2088,7 @@ mod tests {
             assert_eq!(hidden.home, None);
         }
     }
+
     /// RENDER-3（#1492）: macOS の実体パス（`/private/etc`・`/private/var`）もシステムのディレクトリ。
     /// `/private/var/folders/..`（macOS の一時領域）は配下なので対象外。
     #[test]
