@@ -311,7 +311,7 @@ host netns を記録し、bwrap 配下の Servo ホストに帰属する外向�
 
 ## ubuntu-22.04（AppArmor の userns 制限なし。#1487）
 
-#1457 の残課題「AppArmor の制限が無い環境・6.7 未満のカーネル」を埋めるため、xos-measure の suite `egress-host` の
+Issue #1457 の残課題「AppArmor の制限が無い環境・6.7 未満のカーネル」を埋めるため、xos-measure の suite `egress-host` の
 `egress-host-ubuntu` を ubuntu-latest と ubuntu-22.04 の matrix にした（ジョブ名 `egress-host-ubuntu` / `egress-host-ubuntu-2204`、
 artifact 名も同じ）。手順（bubblewrap の apt 導入、Servo ホストの release ビルド、`render3_egress_*`、host-capture、`EGRESS-PROCTREE` の集計）と
 判定基準（passed 3・VERIFIED 3・Bwrap 2 以上・PROCTREE 3・FAIL 0・host-capture の judge）は両方で同じで、緩めない。
