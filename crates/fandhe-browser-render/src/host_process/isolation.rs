@@ -1159,13 +1159,36 @@ fn help_supports_tmpfs_size(stdout: &[u8]) -> bool {
         .any(|tok| tok == b"--size")
 }
 
-/// 時間切れで kill した後に読み取りスレッドの終了を待つ上限。孫が stdout を保持してパイプが閉じない
-/// 場合に `join` で止まらないための値で、超えたらスレッドを detach する（#1508）。
+/// 時間切れで kill した後、または子の正常終了の後に、読み取りスレッドの終了を待つ上限。孫が stdout を
+/// 保持してパイプが閉じない場合に `join` で止まらないための値で、超えたらスレッドを detach する
+/// （#1508・#1510）。本物の bwrap は終了時にパイプを閉じ、残りは 64KiB 以下なので 200ms で足りる。
 #[cfg(target_os = "linux")]
 const READER_GRACE: Duration = Duration::from_millis(200);
 
+/// 読み取りスレッドの終了を [`READER_GRACE`] まで待つ。終われば `join` の結果を返し、終わらなければ
+/// ハンドルを drop して detach し `None` を返す。`detect_tmpfs_limit` の時間切れの分岐と正常終了の
+/// 分岐が共有する（#1508・#1510）。detach したスレッドが持つのは読み端と上限付きバッファ
+/// （`HELP_STDOUT_MAX + 1`）だけで、孫の終了で終わる。数は検出の回数（初回＋`TMPFS_REPROBE_MAX`）で
+/// 抑えられる。本物の bwrap の `--help` に孫はいない。
+#[cfg(target_os = "linux")]
+fn wait_reader_or_detach(
+    r: std::thread::JoinHandle<std::io::Result<Vec<u8>>>,
+) -> Option<std::thread::Result<std::io::Result<Vec<u8>>>> {
+    // 加算が溢れる場合は待たずに detach する（fail-closed）。
+    let grace_end = Instant::now().checked_add(READER_GRACE)?;
+    while !r.is_finished() && Instant::now() < grace_end {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    if r.is_finished() {
+        Some(r.join())
+    } else {
+        None
+    }
+}
+
 /// 信頼判定済みの `bwrap` が `--size` を持つかを `--help` で調べ、tmpfs の上限の扱いを決める。
-/// 時間切れの後の読み取りスレッドは上限付きで待ち、孫がパイプを保持していれば detach する（#1508）。
+/// 時間切れの後も正常終了の後も、読み取りスレッドは上限付きで待ち、孫がパイプを保持していれば
+/// detach して `Undetected(TimedOut)`（一過性）にする（#1508・#1510）。
 /// `--help` を読めて `--size` が無ければ `Unsupported`（確定）。起動できない・非 0 終了・時間切れ・
 /// 出力が [`HELP_STDOUT_MAX`] 超は `Undetected`（上限なしで隔離を続ける。隔離自体の可否はこの後の
 /// 試走が判定する）。出力が上限を超えた時点で時間切れを待たずに kill する（#1502）。
@@ -1227,20 +1250,11 @@ fn detect_tmpfs_limit(bwrap: &Path, timeout: Duration) -> TmpfsLimit {
             _ => {
                 let _ = child.kill();
                 let _ = child.wait();
-                // 通常は kill でパイプが閉じ、読み取りスレッドは EOF で終わる。ただし子が stdout を
-                // 孫へ受け継がせているとパイプが閉じず join が戻らないため、上限付きで終了を待ち、
-                // 過ぎたら detach する（#1508）。detach したスレッドが持つのは読み端と上限付き
-                // バッファ（`HELP_STDOUT_MAX + 1`）だけで、孫の終了で終わる。数は検出の回数
-                // （初回＋`TMPFS_REPROBE_MAX`）で抑えられる。本物の bwrap の `--help` に孫はいない。
+                // 通常は kill でパイプが閉じ、読み取りスレッドは EOF で終わる。子が stdout を孫へ
+                // 受け継がせているとパイプが閉じないため、上限付きで待って過ぎたら detach する
+                // （#1508・#1510）。
                 if let Some(r) = reader.take() {
-                    let grace_end = Instant::now() + READER_GRACE;
-                    while !r.is_finished() && Instant::now() < grace_end {
-                        std::thread::sleep(Duration::from_millis(10));
-                    }
-                    if r.is_finished() {
-                        let _ = r.join();
-                    }
-                    // 未終了なら `r` を drop して detach する。
+                    let _ = wait_reader_or_detach(r);
                 }
                 return undetected(TmpfsDetectFailure::TimedOut);
             }
@@ -1248,9 +1262,12 @@ fn detect_tmpfs_limit(bwrap: &Path, timeout: Duration) -> TmpfsLimit {
     };
     let buf = match (buf, reader.take()) {
         (Some(b), _) => b,
-        (None, Some(r)) => match r.join() {
-            Ok(Ok(b)) => b,
-            _ => return undetected(TmpfsDetectFailure::OutputUnreadable),
+        // 子は終了済みだが孫がパイプを保持していると EOF が来ない。無期限に待たず、grace を過ぎたら
+        // 一過性の `TimedOut` にする（#1510）。
+        (None, Some(r)) => match wait_reader_or_detach(r) {
+            Some(Ok(Ok(b))) => b,
+            Some(_) => return undetected(TmpfsDetectFailure::OutputUnreadable),
+            None => return undetected(TmpfsDetectFailure::TimedOut),
         },
         (None, None) => return undetected(TmpfsDetectFailure::OutputUnreadable),
     };
@@ -3326,7 +3343,7 @@ mod tests {
         false
     }
 
-    /// RENDER-3（#1502・#1508）: 時間切れは `TimedOut`、非 0 終了は `ExitFailure`、`--size` の無い help は
+    /// RENDER-3（#1502・#1508・#1510）: 時間切れは `TimedOut`、非 0 終了は `ExitFailure`、`--size` の無い help は
     /// `Unsupported` に分類する。時間切れの偽物は `exec` で pid を保ち、kill 後に残らない。stdout を
     /// 孫へ受け継がせる偽物でも読み取りスレッドの `join` で止まらない。
     #[cfg(target_os = "linux")]
@@ -3337,7 +3354,7 @@ mod tests {
         let (d3, nosize) = fake_script("nosize", "#!/bin/sh\necho '    --tmpfs DEST'\nexit 0\n");
         let (d4, gc) = fake_script(
             "gc",
-            "#!/bin/sh\nsleep 5 &\necho $! > \"$0.gc\"\necho $$ > \"$0.pid\"\nexec sleep 30\n",
+            "#!/bin/sh\nsleep 30 &\necho $! > \"$0.gc\"\necho $$ > \"$0.pid\"\nexec sleep 30\n",
         );
         let started = Instant::now();
         let timed_out = detect_retrying(&slow, Duration::from_millis(300));
@@ -3347,9 +3364,11 @@ mod tests {
         let started = Instant::now();
         let gc_limit = detect_retrying(&gc, Duration::from_millis(300));
         let gc_elapsed = started.elapsed();
+        let grandchild = read_pid(&gc, "gc");
+        // 戻った時点で孫が生きている＝detach の経路を通った（#1510）。
+        let gc_alive_at_return = PathBuf::from(format!("/proc/{grandchild}")).exists();
         let slow_pid = read_pid(&slow, "pid");
         let gc_pid = read_pid(&gc, "pid");
-        let grandchild = read_pid(&gc, "gc");
         // 孫を残さない（テスト自身が kill する。数値は自分で書いたファイル由来）。
         let _ = Command::new("kill").arg(grandchild.to_string()).status();
         let slow_gone = process_gone(slow_pid);
@@ -3368,6 +3387,7 @@ mod tests {
         );
         assert!(slow_elapsed < Duration::from_secs(2), "{slow_elapsed:?}");
         assert!(gc_elapsed < Duration::from_secs(2), "{gc_elapsed:?}");
+        assert!(gc_alive_at_return, "grandchild exited before return");
         assert!(slow_gone, "sleep 30 remained (pid {slow_pid})");
         assert!(gc_gone, "gc parent remained (pid {gc_pid})");
         assert!(grandchild_gone, "grandchild remained (pid {grandchild})");
@@ -3376,6 +3396,30 @@ mod tests {
             TmpfsLimit::Undetected(TmpfsDetectFailure::ExitFailure)
         );
         assert_eq!(unsupported, TmpfsLimit::Unsupported);
+    }
+
+    /// RENDER-3（#1510）: 子が stdout を孫へ受け継がせたまま `--size` を出して正常終了しても、読み取りを
+    /// 上限つきで待って detach し、`Undetected(TimedOut)`（一過性）で戻る。読み切れない出力は `Capped`
+    /// と判定しない。孫はテストが後始末し残さない。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn render3_detect_tmpfs_limit_normal_exit_with_inherited_stdout_is_bounded() {
+        let (dir, fake) = fake_script(
+            "gcexit",
+            "#!/bin/sh\nsleep 30 &\necho $! > \"$0.gc\"\necho '    --size BYTES'\nexit 0\n",
+        );
+        let started = Instant::now();
+        let limit = detect_retrying(&fake, Duration::from_secs(5));
+        let elapsed = started.elapsed();
+        let grandchild = read_pid(&fake, "gc");
+        let alive_at_return = PathBuf::from(format!("/proc/{grandchild}")).exists();
+        let _ = Command::new("kill").arg(grandchild.to_string()).status();
+        let gone = process_gone(grandchild);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(limit, TmpfsLimit::Undetected(TmpfsDetectFailure::TimedOut));
+        assert!(elapsed < Duration::from_secs(2), "{elapsed:?}");
+        assert!(alive_at_return, "grandchild exited before return");
+        assert!(gone, "grandchild remained (pid {grandchild})");
     }
 
     /// RENDER-3（#1498・#1502・#1508）: `--help` の出力が [`HELP_STDOUT_MAX`] を超える偽物は、`--size` を含んでいても
