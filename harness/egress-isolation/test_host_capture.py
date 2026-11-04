@@ -819,6 +819,7 @@ class SlackAndTerminationTests(unittest.TestCase):
 
         p = mock.MagicMock()
         p.stdout = io.StringIO(stdout)
+        p.stderr = io.StringIO("")
         p.poll.return_value = 0
         p.wait.return_value = 0
         p.returncode = 0
@@ -976,7 +977,8 @@ class SlackAndTerminationTests(unittest.TestCase):
             bool(hc.PollResult(False, hc.POLL_EOF))
 
     def test_poll_eof_reports_exit_code_and_sanitized_stderr(self):
-        body = ("sys.stderr.write('tcpdump: bad\\n\\x1b[31m::error::boom\\r\\n' + 'z' * 5000)\n"
+        # ESC を含む行を最後に置き、末尾の抜粋に残ることを見る（#1483。先頭に置くと切り捨てられて assert が自明になる）
+        body = ("sys.stderr.write('z' * 5000 + 'tcpdump: bad\\n\\x1b[31m::error::boom\\r\\n')\n"
                 "sys.stderr.flush()\nsys.exit(3)\n")
         with tempfile.TemporaryDirectory() as d, self._fake_tcpdump(d, body):
             r = self._poll(d, budget=10.0)
@@ -985,8 +987,134 @@ class SlackAndTerminationTests(unittest.TestCase):
         self.assertIn("exited with 3", r.detail)
         self.assertIn("stderr: ", r.detail)
         self.assertNotIn("\n", r.detail)
+        self.assertNotIn("\r", r.detail)
         self.assertNotIn("\x1b", r.detail)
+        self.assertIn("[31m::error::boom", r.detail)
+        self.assertTrue(r.detail.endswith("tcpdump: bad [31m::error::boom"), r.detail)
         self.assertLessEqual(len(r.detail), 128 + hc.WAIT_CANARY_STDERR_NOTE_CHARS)
+
+    def test_poll_eof_detail_exact_for_short_stderr(self):
+        body = "sys.stderr.write('tcpdump: bad\\n\\x1b[31m::error::boom\\r\\n')\nsys.stderr.flush()\nsys.exit(3)\n"
+        with tempfile.TemporaryDirectory() as d, self._fake_tcpdump(d, body):
+            r = self._poll(d, budget=10.0)
+        self.assertEqual(r.detail, "tcpdump exited with 3 before the final canary; stderr: tcpdump: bad [31m::error::boom")
+
+    def test_poll_large_stderr_is_bounded_and_does_not_block_or_use_tempfile(self):
+        # #1483: 数 MB の stderr でも pipe が詰まらず（kill に至らず）、一時ファイルも作らない
+        body = ("sys.stderr.write('e' * 3_000_000 + 'END-MARKER')\nsys.stderr.flush()\nsys.exit(3)\n")
+        with tempfile.TemporaryDirectory() as d, self._fake_tcpdump(d, body), \
+             mock.patch("tempfile.TemporaryFile") as tf:
+            t0 = time.monotonic()
+            r = self._poll(d, budget=20.0)
+            elapsed = time.monotonic() - t0
+        tf.assert_not_called()
+        self.assertEqual(r.reason, hc.POLL_EOF)
+        self.assertIn("END-MARKER", r.detail)
+        self.assertLess(elapsed, 15.0)
+
+    def test_stderr_tail_keeps_only_the_tail(self):
+        import io
+
+        with mock.patch.object(hc, "WAIT_CANARY_STDERR_TAIL_BYTES", 10):
+            t = hc._StderrTail(io.BytesIO(b"0123456789abcdefghij" * 1000 + b"TAIL-END!"))
+            t.start()
+            self.assertTrue(t.join(5.0))
+            snap = t.snapshot()
+        self.assertEqual(snap, (b"0123456789abcdefghij" * 1000 + b"TAIL-END!")[-10:])
+
+    def test_stderr_tail_handles_str_eof_and_oserror_streams(self):
+        import io
+
+        class Boom:
+            def read(self, n):
+                raise OSError("boom")
+
+            def close(self):
+                pass
+
+        t = hc._StderrTail(io.StringIO("hello"))
+        t.start()
+        self.assertTrue(t.join(5.0))
+        self.assertEqual(t.snapshot(), b"hello")
+        t = hc._StderrTail(io.BytesIO(b""))
+        t.start()
+        self.assertTrue(t.join(5.0))
+        self.assertEqual(t.snapshot(), b"")
+        t = hc._StderrTail(Boom())
+        t.start()
+        self.assertTrue(t.join(5.0))
+        self.assertEqual(t.snapshot(), b"")
+
+    def test_kill_if_running_only_kills_live_process(self):
+        import threading
+
+        done = mock.MagicMock()
+        done.poll.return_value = 0
+        ev = threading.Event()
+        hc._kill_if_running(done, ev)
+        self.assertFalse(ev.is_set())
+        done.kill.assert_not_called()
+        live = mock.MagicMock()
+        live.poll.return_value = None
+        hc._kill_if_running(live, ev)
+        self.assertTrue(ev.is_set())
+        live.kill.assert_called_once()
+
+    def test_poll_timer_firing_after_natural_exit_is_eof_not_budget_killed(self):
+        # #1483: 自然終了の直後に Timer が発火しても budget-killed にしない
+        import io
+
+        p = self._popen("")
+        p.poll.return_value = 0
+        captured = {}
+
+        class FakeTimer:
+            def __init__(self, interval, fn, args=()):
+                captured["fn"], captured["args"] = fn, args
+                self.daemon = False
+
+            def start(self):
+                pass
+
+            def cancel(self):
+                pass
+
+        class Stdout(io.StringIO):
+            def readline(self, n=-1):
+                captured["fn"](*captured["args"])
+                return ""
+
+        p.stdout = Stdout("")
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(hc.subprocess, "Popen", return_value=p), \
+             mock.patch.object(hc.threading, "Timer", FakeTimer):
+            r = self._poll(d, budget=5.0)
+        self.assertEqual(r.reason, hc.POLL_EOF)
+        self.assertFalse(r.observed)
+        p.kill.assert_not_called()
+
+    def test_poll_cleans_up_when_timer_start_fails(self):
+        # #1483: Timer の起動失敗でも kill・wait・close を行い、例外は伝播して成功扱いにしない
+        p = self._popen(FINAL_CANARY_LINE + "\n")
+        p.poll.return_value = None
+        stdout = p.stdout
+
+        class BadTimer:
+            def __init__(self, *a, **k):
+                self.daemon = False
+
+            def start(self):
+                raise RuntimeError("cannot start")
+
+            def cancel(self):
+                raise AssertionError("cancel must not be called")
+
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(hc.subprocess, "Popen", return_value=p), \
+             mock.patch.object(hc.threading, "Timer", BadTimer):
+            with self.assertRaises(RuntimeError):
+                self._poll(d, budget=5.0)
+        p.kill.assert_called()
+        p.wait.assert_called()
+        self.assertTrue(stdout.closed)
 
     def test_poll_kill_reports_budget_killed(self):
         with tempfile.TemporaryDirectory() as d, self._fake_tcpdump(d, "time.sleep(30)\n"):

@@ -41,7 +41,6 @@ import signal
 import socket
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 from collections import Counter
@@ -1172,18 +1171,94 @@ def _read_bounded_line(stream, discard_remaining: int = WAIT_CANARY_MAX_DISCARD_
     return raw[:MAX_PACKET_LINE_CHARS], discarded
 
 
-def _summarize_stderr(f) -> str:
-    """tcpdump の stderr（一時ファイル）の末尾を 1 行・短い文字列にする（外部由来なので制御文字を除く。#1481）。"""
-    try:
-        f.flush()
-        size = f.seek(0, os.SEEK_END)
-        f.seek(max(0, size - WAIT_CANARY_STDERR_TAIL_BYTES))
-        text = f.read(WAIT_CANARY_STDERR_TAIL_BYTES).decode("utf-8", errors="replace")
-    except (OSError, ValueError):
-        return ""
+class _StderrTail:
+    """tcpdump の stderr を読み続け、末尾 WAIT_CANARY_STDERR_TAIL_BYTES バイトだけをメモリに保持する（#1483）。
+
+    _poll_pcap_once から使う。PIPE は読まないと詰まって tcpdump の stdout も止まるため専用スレッドで読む。
+    ディスクには書かず、メモリは「末尾の上限 + 1 チャンク」で頭打ちになる。select を使わないので 3 OS で動く。
+    ストリームの close は読みスレッド自身が行う（読み取り中の別スレッドからの close は内部ロックで待たされうるため）。
+    """
+
+    _CHUNK = 4096
+
+    def __init__(self, stream) -> None:
+        self._stream = stream
+        self._buf = bytearray()
+        self._lock = threading.Lock()
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        t = threading.Thread(target=self._run, daemon=True)
+        t.start()
+        self._thread = t
+
+    def _run(self) -> None:
+        stream = self._stream
+        # text=True の TextIOWrapper はバイト数で数えるため下の binary ストリームを使う
+        raw = getattr(stream, "buffer", stream)
+        read = getattr(raw, "read1", None) or raw.read
+        try:
+            while True:
+                chunk = read(self._CHUNK)
+                if not chunk:
+                    break
+                if isinstance(chunk, str):
+                    chunk = chunk.encode("utf-8", errors="replace")
+                with self._lock:
+                    self._buf += chunk
+                    if len(self._buf) > WAIT_CANARY_STDERR_TAIL_BYTES:
+                        del self._buf[:-WAIT_CANARY_STDERR_TAIL_BYTES]
+        except (OSError, ValueError):
+            pass
+        finally:
+            try:
+                stream.close()
+            except (OSError, ValueError):
+                pass
+
+    def join(self, timeout: float) -> bool:
+        """読みスレッドの終了を timeout 秒まで待つ。終了した（または未起動）なら True。未起動ならストリームをここで閉じる。"""
+        t = self._thread
+        if t is None:
+            try:
+                self._stream.close()
+            except (OSError, ValueError, AttributeError):
+                pass
+            return True
+        t.join(timeout)
+        return not t.is_alive()
+
+    def snapshot(self) -> bytes:
+        with self._lock:
+            return bytes(self._buf)
+
+
+def _summarize_stderr(data: bytes) -> str:
+    """tcpdump の stderr の末尾を 1 行・短い文字列にする（外部由来なので印字可能 ASCII 以外を除く。#1481・#1483）。
+
+    戻り値はサニタイズ後も信頼できない参考情報（`[31m` や `::error::` は残る）。判定・コマンド・パスに使わない。
+    """
+    text = data[-WAIT_CANARY_STDERR_TAIL_BYTES:].decode("utf-8", errors="replace")
     text = re.sub(r"[^\x20-\x7e]+", " ", text)
     text = re.sub(r" {2,}", " ", text).strip()
     return text[-WAIT_CANARY_STDERR_NOTE_CHARS:]
+
+
+def _kill_if_running(proc, killed: threading.Event) -> None:
+    """予算切れの Timer から呼ぶ。まだ動いている tcpdump だけを kill して killed を立てる（#1483）。
+
+    自然 EOF（プロセス終了済み）の直後に発火しても budget-killed と誤分類しないよう、poll() で生死を見てから立てる。
+    残る競合（stdout は閉じたがプロセスは未終了の一瞬、poll と kill の間の終了）は診断の分類だけの話で、
+    observed=False は変わらず合否は judge が決めるため許容する。Popen.poll() は内部ロックでスレッド間安全。
+    kill の失敗は握る（finally でもう一度 kill する）。
+    """
+    try:
+        if proc.poll() is not None:
+            return
+        killed.set()
+        proc.kill()
+    except (OSError, ValueError):
+        pass
 
 
 def _poll_pcap_once(
@@ -1194,46 +1269,44 @@ def _poll_pcap_once(
     budget: float = WAIT_CANARY_POLL_MAX_SECONDS,
     max_packets: int = DEFAULT_MAX_PACKETS,
 ) -> PollResult:
-    """pcap を tcpdump -r で 1 回読み、最終カナリアがあるかを理由つきで返す（#1476・#1481）。
+    """pcap を tcpdump -r で 1 回読み、最終カナリアがあるかを理由つきで返す（#1476・#1481・#1483）。
 
     stdout を 1 行ずつ有界に読み、最終カナリアを見つけた時点か件数上限（max_packets）で打ち切る。
     `budget` 秒を過ぎたら Timer が tcpdump を kill して EOF にする（select は Windows のパイプで使えないため）。
     書きかけの pcap は truncation で tcpdump が非 0 を返すことがあるが手前のパケットは出るため、終了コードは判定に使わない。
     observed=True は最終カナリアを検出した経路だけ。起動失敗・kill・件数上限・読み捨て上限・EOF・読みの例外は
     すべて observed=False（fail-closed）で、reason が原因を区別する。引数はリスト（shell=False）。port は呼び出し側が int・範囲を検証済み。
-    stderr は PIPE だと読まないと詰まるため一時ファイルへ回収し、終了後に末尾だけを診断（detail）に使う。
+    stderr は PIPE で受け、専用スレッド（_StderrTail）が末尾だけをメモリに保持する（ディスクを使わない）。終了後にその末尾を診断（detail）に使う。
+    Popen 成功後の想定外の例外（スレッド・Timer の起動失敗を含む）は後始末の後に伝播し、成功扱いにはならない。
     """
     threshold = _final_canary_threshold(final_canary_t, window)
-    errf = tempfile.TemporaryFile()
     try:
         proc = subprocess.Popen(
             [*TCPDUMP_ARGV, "-r", str(pcap), "-nn", "-tt", f"udp and src port {canary_port}"],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
-            stderr=errf,
+            stderr=subprocess.PIPE,
             text=True,
             encoding="utf-8",
             errors="replace",
         )
     except (OSError, subprocess.SubprocessError, ValueError) as e:
-        errf.close()
         msg = getattr(e, "strerror", None) or ""
         return PollResult(False, POLL_SPAWN_FAILED, f"{type(e).__name__}{': ' + msg if msg else ''}")
     killed = threading.Event()
-
-    def _kill_on_budget() -> None:
-        killed.set()
-        proc.kill()
-
-    timer = threading.Timer(max(0.0, budget), _kill_on_budget)
-    timer.daemon = True
-    timer.start()
+    tail = _StderrTail(proc.stderr)
+    timer: threading.Timer | None = None
     reason = POLL_PACKET_LIMIT
     detail = f"no final canary in the first {max_packets} lines"
     observed = False
     err_note = ""
     exited = True
     try:
+        tail.start()
+        t = threading.Timer(max(0.0, budget), _kill_if_running, args=(proc, killed))
+        t.daemon = True
+        t.start()
+        timer = t  # 起動に成功してから束縛する（未起動の cancel を避ける）
         discarded_total = 0
         for _ in range(max_packets):
             raw, discarded = _read_bounded_line(proc.stdout, WAIT_CANARY_MAX_DISCARD_CHARS - discarded_total)
@@ -1254,7 +1327,8 @@ def _poll_pcap_once(
     except (OSError, ValueError) as e:
         reason, detail = POLL_READ_ERROR, type(e).__name__
     finally:
-        timer.cancel()
+        if timer is not None:
+            timer.cancel()
         if proc.poll() is None:
             proc.kill()
         try:
@@ -1266,9 +1340,10 @@ def _poll_pcap_once(
             proc.stdout.close()
         except (OSError, ValueError):
             pass
+        if not tail.join(WAIT_CANARY_KILL_GRACE_SECONDS):
+            sys.stderr.write("warning: tcpdump stderr reader did not finish after kill\n")
         if not observed:
-            err_note = _summarize_stderr(errf)
-        errf.close()
+            err_note = _summarize_stderr(tail.snapshot())
     if reason == POLL_EOF:
         code = proc.returncode if exited and isinstance(proc.returncode, int) else "unknown"
         detail = f"tcpdump exited with {code} before the final canary"

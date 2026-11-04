@@ -288,6 +288,10 @@ host netns を記録し、bwrap 配下の Servo ホストに帰属する外向�
   改行のない出力の読み捨ては 1 回のポーリングで `WAIT_CANARY_MAX_DISCARD_CHARS` まで。kill 後に猶予内で tcpdump が終了しないときは stderr に警告を出す。
   時間切れのメッセージは従来の `note: final canary not seen in pcap within ...` の後ろに `(last poll: <理由>)` を付ける。理由は
   `spawn-failed`（起動失敗）・`budget-killed`（kill による打ち切り）・`packet-limit`（件数上限）・`discard-limit`（読み捨て上限）・`eof`（tcpdump が先に終了。終了コードと stderr の末尾の抜粋）・`read-error`。
+  tcpdump の stderr はパイプで回収し、メモリ上に末尾 `WAIT_CANARY_STDERR_TAIL_BYTES` バイトだけを保持する（ディスクには書かない。#1483）。
+  `detail` に載せる抜粋は、印字可能な ASCII 以外を空白にした末尾 `WAIT_CANARY_STDERR_NOTE_CHARS` 文字だけ。この抜粋は外部（tcpdump・pcap の内容）由来で、
+  サニタイズ後も信頼できない（`[31m` や `::error::` のような印字可能な文字列は残る）。判定・コマンド・パスに使わず、表示用の参考情報としてだけ扱う。
+  `budget-killed` と `eof` の分類は、Timer 発火時にプロセスが終了済みなら kill せず `eof` とする。stdout を閉じた直後で未終了の一瞬などの競合は診断の分類だけに効き、合否は変わらない。
   どの理由でも合否は judge が決める。
   時間切れ・読めないときも SIGINT へ進み、合否は judge が決める（fail-closed）。`final_canary_t` は有限値で `>=` Servo の最後のサンプルでなければならず、違反は観測不能（`-inf` 等で閾値が落ちるのを防ぐ）。
   `UDP` の痕跡の検出（解析できない行・proto=other の行）は大文字小文字を区別しない（過検出は観測不能側）。
