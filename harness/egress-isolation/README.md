@@ -295,8 +295,14 @@ host netns を記録し、bwrap 配下の Servo ホストに帰属する外向�
   どの理由でも合否は judge が決める。
   時間切れ・読めないときも SIGINT へ進み、合否は judge が決める（fail-closed）。`final_canary_t` は有限値で `>=` Servo の最後のサンプルでなければならず、違反は観測不能（`-inf` 等で閾値が落ちるのを防ぐ）。
   `UDP` の痕跡の検出（解析できない行・proto=other の行）は大文字小文字を区別しない（過検出は観測不能側）。
-  サンプラー側では、`/proc/net` の解析できない行、Servo と同定した pid の fd の EACCES、`/proc/net/if_inet6` があるのに tcp6・udp6 が無い状態を記録して観測不能にする
+  サンプラー側では、`/proc/net` の解析できない行、Servo と同定した pid の fd の EACCES（後述の読み直しでも読めなかったもの）、`/proc/net/if_inet6` があるのに tcp6・udp6 が無い状態を記録して観測不能にする
   （tcp6・udp6 の不在を許すのは `if_inet6` が無いときだけ）。
+  Servo と同定した pid の fd が EACCES のときは、診断を採ってから最大 5 回・総時間 0.1 秒以内で読み直す（#1493）。結果は `recovered`（読めた。結果を使う）・
+  `vanished`（消えた、または starttime が変わった）・`persistent`（読めないまま。従来どおり記録して観測不能）の 3 つで、`samples.jsonl` の `fd-diag` 記録と
+  `verdict.json` の `fd_read_retries`・Step Summary に件数を出す（合否には使わない診断。形式が不正な `fd-diag` は他の記録と同様に観測不能）。
+  診断値は整数・真偽値・固定カテゴリに限る（`fd_dir_owner`〔self / root / other〕・`state`・`exe` 等。生のパス・uid・名前は出さない）。
+- 読み直しの限界（#1493）: 予算（0.1 秒）を超えて続く一時的な状態は従来どおり観測不能になる。EACCES の原因は未確認の仮説で、
+  dumpable でないタスクの `/proc/<pid>/` 配下の所有者が root になる（`fs/proc/base.c` の `task_dump_owner`）ことを疑っている。AppArmor の設定との相関は観測 2 回（fail 1・pass 1）だけで断定しない。
 - 限界: サンプル間隔より短命なソケット・root のプロセス（systemd-resolved 等）は帰属できない。隔離下のホストの ns 内の `lo` で閉じる問い合わせは host に届かないため観測対象外。
   `servo_unisolated` には、`render3_egress_required_blocks_direct_websocket` が意図して起動する隔離なしの対照ホストが現れうる。判定はこれを fail にしない（件数の記録のみ）。
   テストのページは IP リテラルで、宛先の DNS を誘発しない（Servo が自発的に出す送信だけを見る）。fd 受け渡しによる netns 越えのソケットは想定外。ubuntu のみ。
@@ -307,6 +313,9 @@ host netns を記録し、bwrap 配下の Servo ホストに帰属する外向�
   pass は netns の構造検査と観測範囲だけに基づき、帰属できない通信が Servo のものでないとは言えない。ペイロードは出さず、pcap と変換テキストは削除する（アーティファクトは許可リスト）。
 - 初回実測での確認事項（#1473 D。人間）: マージ後の最初の `egress-host` 実測で、`proc-read-error:fd-<pid>` による unobservable が出ないかを確かめる。
   出たら bwrap の子 userns の dumpable 属性を疑い、記録する範囲を見直す（Servo の pid に限る等）。あわせて stop ステップの `wait-final-canary` が実機で効くこと（`note: final canary not seen` が出ないこと。出た場合は `last poll:` の理由を記録する）も確かめる。
+  追記（#1493）: 予測していた失敗が run 41819946868（`ubuntu-noaa`）で 1 回観測された（同定済み pid の fd が一時的に読めず unobservable）。切り分けのため `fd-diag` 記録を足した。
+  次の実測では、`fd_read_retries` の outcome の内訳と、`first.fd_dir_owner` が `root`（その瞬間 dumpable でない・仮説を支持）か `self`（DAC は通っており ptrace・LSM 側。読み直しでは対処にならない）かを見る。
+  間欠的なので 1 回で再現しなければ未確認として残す。
 - 自己テスト: `test_host_capture.py`（合成 tcpdump テキスト・合成サンプル。`make check-egress-isolation`）。行形式は tcpdump 4.99.6（SLL2）の実出力に合わせてある。
 
 ## AppArmor の制限なしの測定（#1487）
