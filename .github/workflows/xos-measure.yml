@@ -15,8 +15,9 @@ name: XOS Measure
 #                          egress-host-ubuntu はさらに host-capture（#1461）で、隔離下の Servo ホストの DNS・UDP・直接 TCP 送信を
 #                          host netns の外から tcpdump で観測する。sudo は tcpdump の導入・起動・停止だけに使う
 #                          （使い捨てランナー限定。オーナー承認 2026-11-03〔#1457 のコメント〕）
-#                          egress-host-ubuntu は ubuntu-latest の 2 エントリ matrix（ubuntu: 既定のまま / ubuntu-noaa: AppArmor の userns 制限を
-#                          sysctl で 0 にして測る。#1487・#1457。ubuntu-22.04 は Servo 0.7.0 の freetype 要件を満たせず使わない）
+#                          egress-host-ubuntu は ubuntu-latest の 2 エントリ matrix（ubuntu: 既定のまま /
+#                          ubuntu-noaa: AppArmor の userns 制限を sysctl で 0 にして測る。#1487・#1457）
+#                          ubuntu-22.04 は Servo の freetype 要件を満たせず不使用
 # Windows の egress-isolation は #1401 で opt-in のループバック免除（CheckNetIsolation LoopbackExempt。ハーネスが作った
 # AppContainer の SID だけ・計測後に解除）を付ける（オーナー承認 2026-11-01。使い捨て runner に限る）。
 # macOS の egress-isolation は sudo なしの `log show` で拒否行を取る（#1402。実測で sudo・`log config` が不要と分かり、
