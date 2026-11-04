@@ -23,6 +23,8 @@
       そのため判定の柱は (a) netns 構造検査 (b) host 側パケットに隔離下 Servo の帰属が 0 件、の併用。
     - サンプル間隔より短命なソケットは帰属できない（unattributed）。root のプロセス（systemd-resolved 等）の
       ソケットも `/proc/<pid>/fd` が読めず帰属できない。これらは件数を記録するだけで合否に使わない。
+    - 同定済み Servo pid の fd が一時的に読めない競合（#1493）は、診断（fd-diag 記録）を残しつつ上限つきで読み直す。
+      読み直しでも読めなければ従来どおり観測不能（`_socket_owners` の docstring）。
     - 隔離下のホストのスタブ問い合わせは ns 内の `lo` で閉じ、host には届かない（観測対象外）。
     - 陽性対照（カナリア）: サンプラーが 127.0.0.1 の UDP で自分宛てに送り、`lo` の記録に現れて自分の pid に
       帰属することを要求する。観測できなければ unobservable（合格にしない）。
@@ -63,6 +65,19 @@ MAX_SAMPLE_BYTES = 64 * 1024 * 1024
 MAX_SOCKETS_PER_SAMPLE = 512
 MAX_JSONL_LINE_CHARS = 262_144
 MAX_PACKET_LINE_CHARS = 1024
+# Servo と同定した pid の `/proc/<pid>/fd` が PermissionError になったときの読み直し（#1493）。run 41819946868 で
+# 同定済み pid の fd が一時的に読めず unobservable になった。読み直しは「一時的な状態」を吸収するための上限つきの
+# 措置で、予算内に読めなければ従来どおり記録して観測不能にする（fail-closed）。1 回の走査での総時間はサンプル間隔
+# （200ms）より十分短くする。
+FD_READ_RETRIES = 5
+FD_READ_RETRY_SECONDS = 0.02
+FD_READ_RETRY_BUDGET_SECONDS = 0.1
+# サンプラー 1 回の実行で samples.jsonl に出す fd-diag 記録の上限。超えた分は end 記録の fd_diag_dropped に数える
+# （診断の取りこぼしは観測の欠落ではないので truncated にはしない）。
+MAX_FD_DIAG_RECORDS = 64
+# verdict.json に載せる fd-diag 記録の件数の上限
+MAX_FD_DIAG_VERDICT_RECORDS = 8
+FD_DIAG_OUTCOMES = ("recovered", "vanished", "persistent")
 # judge() の kwarg 既定値（純関数のテスト・関数呼び出し用）。CLI は既定値を持たず、workflow が job env の
 # HOST_CAPTURE_MAX_PACKETS を tcpdump の -c と judge の --max-packets の両方へ明示で渡す（二重管理のずれを防ぐ。#1473）。
 DEFAULT_MAX_PACKETS = 300_000
@@ -244,6 +259,9 @@ class SampleIndex:
         self._open: dict[tuple[str, int, str], list] = {}
         self._starts: dict[tuple[str, int], list[float]] = {}
         self.last_t: float | None = None
+        # fd-diag 記録（#1493）。合否には使わない診断で、件数は outcome 別に数え、記録本体は先頭の数件だけ保持する。
+        self.fd_diag_counts: Counter = Counter()
+        self.fd_diags: list[dict] = []
 
     def feed(self, rec: dict) -> None:
         kind = rec.get("type")
@@ -252,6 +270,21 @@ class SampleIndex:
             return
         if kind == "end":
             self.end = rec
+            return
+        if kind == "fd-diag":
+            # 診断記録。形式が不正なら他の記録と同様に bad_lines（fail-closed）。サンプル数・区間には影響させない。
+            pid = rec.get("pid")
+            if (
+                not isinstance(rec.get("t"), (int, float))
+                or not isinstance(pid, int)
+                or isinstance(pid, bool)
+                or rec.get("outcome") not in FD_DIAG_OUTCOMES
+            ):
+                self.bad_lines += 1
+                return
+            self.fd_diag_counts[rec["outcome"]] += 1
+            if len(self.fd_diags) < MAX_FD_DIAG_VERDICT_RECORDS:
+                self.fd_diags.append(rec)
             return
         if kind not in ("sample", "tick"):
             self.bad_lines += 1
@@ -592,7 +625,30 @@ def judge(
         "tcpdump_exit": tcpdump_exit,
         "convert_exit": convert_exit,
         "kernel_dropped": kernel_dropped,
+        "fd_read_retries": {
+            "recovered": index.fd_diag_counts.get("recovered", 0),
+            "vanished": index.fd_diag_counts.get("vanished", 0),
+            "persistent": index.fd_diag_counts.get("persistent", 0),
+            "records": list(index.fd_diags),
+            "dropped": _fd_diag_dropped(index.end),
+        },
     }
+
+
+def _fd_diag_dropped(end: dict | None) -> int:
+    """end 記録の fd_diag_dropped（上限超過で捨てた fd-diag の件数）。無い・不正なら 0。"""
+    val = (end or {}).get("fd_diag_dropped", 0)
+    return val if isinstance(val, int) and not isinstance(val, bool) else 0
+
+
+_DIAG_CATEGORIES = frozenset(
+    {"self", "root", "other", "unknown", "servo", "unreadable", "gone"} | set("RSDZTtXxIKWP")
+)
+
+
+def _diag_cat(value: object) -> str:
+    """Summary（Markdown）へ出す診断値を既知のカテゴリに限る。未知の値は unknown にして注入を防ぐ。"""
+    return value if isinstance(value, str) and value in _DIAG_CATEGORIES else "unknown"
 
 
 def render_summary(v: dict) -> str:
@@ -626,6 +682,21 @@ def render_summary(v: dict) -> str:
     counted = (
         f" (counted over [{cwin[0]:.3f}..{cwin[1]:.3f}], +/-{u.get('slack_seconds', 0)} s slack)" if cwin else ""
     )
+    r = v.get("fd_read_retries") or {}
+    lines += [
+        "",
+        f"- fd read retries (Servo pids): recovered={r.get('recovered', 0)} vanished={r.get('vanished', 0)}"
+        f" persistent={r.get('persistent', 0)} (dropped {r.get('dropped', 0)})",
+    ]
+    for rec in r.get("records", []):
+        if rec.get("outcome") != "persistent":
+            continue
+        # カテゴリ値だけを出す（/proc の生の文字列は入れない）
+        first = rec.get("first") if isinstance(rec.get("first"), dict) else {}
+        lines.append(
+            f"  - persistent pid {int(rec.get('pid', 0))}: fd_dir_owner={_diag_cat(first.get('fd_dir_owner'))}"
+            f" state={_diag_cat(first.get('state'))} exe={_diag_cat(first.get('exe'))}"
+        )
     lines += [
         "",
         f"- unattributed DNS/UDP within the isolated Servo window {span}{counted}: dns={u['dns']} udp_other={u['udp_other']}",
@@ -829,50 +900,194 @@ def _list_pids() -> tuple[list[int], bool, bool]:
     return pids, False, False
 
 
+def _proc_starttime(pid: int) -> int | None:
+    """`/proc/<pid>/stat` の starttime（22 番目）。pid 再利用の検出に使う。読めなければ None。"""
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as fh:
+            data = fh.read(4096).decode("utf-8", "replace")
+    except OSError:
+        return None
+    tail = data.rsplit(")", 1)[-1].split()
+    try:
+        return int(tail[19])
+    except (IndexError, ValueError):
+        return None
+
+
+def _read_fd_inodes(pid: int) -> tuple[str, list[int], bool, str | None, int | None]:
+    """1 pid の socket inode を読む。戻り値は (種別, inode 列, fd 数上限到達, 失敗の段階, errno)。
+
+    種別は ok / denied（PermissionError。部分結果は捨てる）/ gone（FileNotFoundError・ProcessLookupError）/
+    other（その他の OSError）。fd 個別の readlink が FileNotFoundError（fd が閉じられた）なら読み飛ばす。
+    """
+    try:
+        names = os.listdir(f"/proc/{pid}/fd")
+    except PermissionError as exc:
+        return "denied", [], False, "listdir", exc.errno
+    except (FileNotFoundError, ProcessLookupError):
+        return "gone", [], False, None, None
+    except OSError as exc:
+        return "other", [], False, "listdir", exc.errno
+    hit = len(names) > MAX_FDS_PER_PROCESS
+    inodes: list[int] = []
+    for name in names[:MAX_FDS_PER_PROCESS]:
+        try:
+            target = os.readlink(f"/proc/{pid}/fd/{name}")
+        except PermissionError as exc:
+            return "denied", [], hit, "readlink", exc.errno
+        except OSError:
+            continue
+        if target.startswith("socket:["):
+            try:
+                inodes.append(int(target[8:-1]))
+            except ValueError:
+                continue
+    return "ok", inodes, hit, None, None
+
+
+def _fd_denied_snapshot(pid: int, servo_exe: str | None, stage: str | None, errno_: int | None) -> dict:
+    """fd が読めなかった瞬間の対象 pid の状態（#1493）。値は整数・真偽値・固定カテゴリに限る。
+
+    uid・パス・コマンド名などの生の文字列は出さない（samples.jsonl・Step Summary への注入と機微値の露出を防ぐ）。
+    `fd_dir_owner=root` は、その瞬間タスクが dumpable でなかった（または mm が無かった）ことを示す。
+    `self` なら DAC は通っており、EACCES は ptrace・LSM 側から来ている（読み直しでは対処にならない）。
+    採取の各項目は個別に OSError を吸収する（採取中に pid が消えることがある）。
+    """
+    snap: dict = {
+        "fd_dir_owner": "unknown",
+        "state": "unknown",
+        "threads": None,
+        "nspid": None,
+        "uid_matches_self": None,
+        "exe": "unreadable",
+        "userns_differs": None,
+        "stage": stage,
+        "errno": errno_,
+    }
+    try:
+        uid = os.stat(f"/proc/{pid}/fd").st_uid
+        snap["fd_dir_owner"] = "self" if uid == os.geteuid() else ("root" if uid == 0 else "other")
+    except OSError:
+        pass
+    try:
+        with open(f"/proc/{pid}/status", "rb") as fh:
+            text = fh.read(4096).decode("utf-8", "replace")
+        for ln in text.splitlines():
+            key, _, val = ln.partition(":")
+            val = val.strip()
+            if key == "State":
+                m = re.match(r"([RSDZTtXxIKWP])\b", val)
+                snap["state"] = m.group(1) if m else "unknown"
+            elif key == "Threads":
+                if val.isdigit():
+                    snap["threads"] = min(int(val), 100_000)
+            elif key == "NSpid":
+                parts = val.split()[:8]
+                if parts and all(x.isdigit() for x in parts):
+                    snap["nspid"] = [int(x) for x in parts]
+            elif key == "Uid":
+                parts = val.split()
+                if len(parts) >= 2 and parts[1].isdigit():
+                    snap["uid_matches_self"] = int(parts[1]) == os.geteuid()
+    except OSError:
+        pass
+    if servo_exe is not None:
+        try:
+            exe = os.path.realpath(os.readlink(f"/proc/{pid}/exe"))
+            snap["exe"] = "servo" if exe == servo_exe else "other"
+        except FileNotFoundError:
+            snap["exe"] = "gone"
+        except OSError:
+            snap["exe"] = "unreadable"
+    try:
+        snap["userns_differs"] = os.readlink(f"/proc/{pid}/ns/user") != os.readlink("/proc/self/ns/user")
+    except OSError:
+        pass
+    return snap
+
+
 def _socket_owners(
-    pids: list[int], servo_pids: frozenset[int] | set[int] = frozenset()
+    pids: list[int],
+    servo_pids: frozenset[int] | set[int] = frozenset(),
+    servo_exe: str | None = None,
+    diag: list | None = None,
 ) -> tuple[dict[int, int], bool, list[str]]:
     """読める範囲の fd から inode -> pid を作る（同一ユーザーのプロセスだけ。root は読めず帰属不能）。
 
     戻り値は (owners, fd 数の上限で打ち切ったか, 読み取り失敗の記録)。記録するのは Servo ホストと同定済みの pid の
-    fd が PermissionError で読めなかったときだけ（`proc-read-error:fd-<pid>`）。消えたプロセス
-    （FileNotFoundError・ProcessLookupError）は通常の競合で記録しない。他ユーザーの pid は帰属不能が前提で記録しない。
-    本番で誤って unobservable にならない根拠: `/proc/<pid>/exe` の readlink と `/proc/<pid>/fd` の listdir は同じ
-    ptrace-read のアクセス検査を通るため、`_exe` で同定できた pid の fd が正当な理由で EACCES になることは通常ない
-    （参考実測 run 41650422295 でも、隔離下の pid を検出したうえで fd が読めていた）。
+    fd が PermissionError で読めず、上限つきの読み直しでも読めなかったときだけ（`proc-read-error:fd-<pid>`）。
+    消えたプロセス（FileNotFoundError・ProcessLookupError）は通常の競合で記録しない。他ユーザーの pid は帰属不能が
+    前提で記録せず、読み直しもしない。
+
+    #1493: 従来は「`/proc/<pid>/exe` の readlink と fd の listdir は同じ ptrace-read 検査を通るため、`_exe` で同定
+    できた pid の fd が EACCES になることは通常ない」と見ていたが、run 41819946868（ubuntu-noaa）で同定済み pid の
+    fd が一時的に読めず unobservable になった。原因は未確認の仮説で、`fs/proc/base.c` の task_dump_owner は
+    dumpable でない（または mm が無い）タスクの /proc/<pid>/ 配下の所有者を root にし、fd ディレクトリは DAC だけで
+    判定されるため、exec 中・終了処理中の瞬間に exe は読めても fd は読めない非対称が起きうる、というもの。
+    そこで Servo pid の denied に限り、診断を採ってから FD_READ_RETRIES 回・総時間 FD_READ_RETRY_BUDGET_SECONDS
+    以内で読み直す。結果は recovered（読めた。結果を使う）・vanished（消えた、または starttime が変わった）・
+    persistent（読めないまま。従来どおり記録して観測不能）で、診断は diag に fd-diag 記録として足す。
+    persistent を合格に変えることはない（持続する失敗の経路は変えない）。
     """
     owners: dict[int, int] = {}
     errors: list[str] = []
     hit = False
+    deadline = time.monotonic() + FD_READ_RETRY_BUDGET_SECONDS
 
     def _note(pid: int) -> None:
         tag = f"proc-read-error:fd-{pid}"
         if pid in servo_pids and tag not in errors:
             errors.append(tag)
 
+    def _emit_diag(pid: int, outcome: str, attempts: int, started: float, first: dict, last: dict | None) -> None:
+        if diag is not None:
+            diag.append(
+                {
+                    "type": "fd-diag",
+                    "t": time.time(),
+                    "pid": pid,
+                    "outcome": outcome,
+                    "attempts": attempts,
+                    "elapsed": round(time.monotonic() - started, 4),
+                    "first": first,
+                    "last": last,
+                }
+            )
+
     for pid in pids:
-        try:
-            names = os.listdir(f"/proc/{pid}/fd")
-        except PermissionError:
-            _note(pid)
-            continue
-        except OSError:
-            continue
-        if len(names) > MAX_FDS_PER_PROCESS:
-            hit = True
-        for name in names[:MAX_FDS_PER_PROCESS]:
-            try:
-                target = os.readlink(f"/proc/{pid}/fd/{name}")
-            except PermissionError:
+        kind, inodes, over, stage, errno_ = _read_fd_inodes(pid)
+        # 上限到達は denied・読み直しの結果によらず先に累積する（未走査 fd が残る観測欠落を落とさない）
+        hit = hit or over
+        if kind == "denied" and pid in servo_pids:
+            started = time.monotonic()
+            start_time = _proc_starttime(pid)
+            first = _fd_denied_snapshot(pid, servo_exe, stage, errno_)
+            attempts = 0
+            outcome = "persistent"
+            while attempts < FD_READ_RETRIES and time.monotonic() < deadline:
+                time.sleep(FD_READ_RETRY_SECONDS)
+                attempts += 1
+                kind, inodes, over, stage, errno_ = _read_fd_inodes(pid)
+                hit = hit or over
+                if kind != "denied":
+                    now_start = _proc_starttime(pid)
+                    reused = start_time is not None and now_start is not None and now_start != start_time
+                    if kind == "gone" or reused:
+                        outcome, kind, inodes, over = "vanished", "gone", [], False
+                    elif kind == "ok":
+                        outcome = "recovered"
+                    break
+            last = _fd_denied_snapshot(pid, servo_exe, stage, errno_) if outcome == "persistent" else None
+            _emit_diag(pid, outcome, attempts, started, first, last)
+            if outcome == "persistent":
                 _note(pid)
                 continue
-            except OSError:
-                continue
-            if target.startswith("socket:["):
-                try:
-                    owners.setdefault(int(target[8:-1]), pid)
-                except ValueError:
-                    continue
+        elif kind == "denied":
+            continue
+        if kind != "ok":
+            continue
+        for inode in inodes:
+            owners.setdefault(inode, pid)
     return owners, hit, errors
 
 
@@ -923,12 +1138,13 @@ def _read_table(name: str, optional: bool = False) -> tuple[list[tuple[int, int]
 
 
 def take_sample(
-    servo_exe: str, self_pid: int, self_netns: int | None
+    servo_exe: str, self_pid: int, self_netns: int | None, diag: list | None = None
 ) -> tuple[list[dict], list[dict], list[str]]:
     """1 回分の走査。戻り値は (servo, sockets, limits)。servo は pid・bwrap 祖先の有無・netns。
 
     limits は走査上限に到達した理由（空なら完全な走査）。呼び出し側のサンプラーが
     end.truncated へ累積し、judge が unobservable にする（観測の欠落を合格にしない）。
+    diag を渡すと Servo pid の fd 読み直しの診断（fd-diag 記録。#1493）がそこへ足される。
     """
     limits: list[str] = []
     pids, hit, failed = _list_pids()
@@ -946,7 +1162,7 @@ def take_sample(
         servo.append({"pid": pid, "bwrap": bwrap, "netns": netns})
         isolated = bwrap or (netns is not None and self_netns is not None and netns != self_netns)
         servo_roles[pid] = ROLE_ISOLATED if isolated else ROLE_UNISOLATED
-    owners, hit, fd_errors = _socket_owners(pids, frozenset(servo_roles))
+    owners, hit, fd_errors = _socket_owners(pids, frozenset(servo_roles), servo_exe, diag)
     if hit:
         limits.append("fds-per-process-limit")
     limits.extend(fd_errors)
@@ -1012,6 +1228,8 @@ def run_sampler(
     truncated = False
     reason = "stop"
     reasons: list[str] = []
+    diag_emitted = 0
+    diag_dropped = 0
 
     def _mark(r: str) -> None:
         nonlocal truncated, reason
@@ -1033,13 +1251,20 @@ def run_sampler(
             fh.flush()
 
         def do_sample() -> None:
-            nonlocal prev
+            nonlocal prev, diag_emitted, diag_dropped
             try:
                 while True:
                     recv.recvfrom(256)
             except (BlockingIOError, OSError):
                 pass
-            servo, sockets, limits = take_sample(servo_exe, self_pid, self_netns)
+            diag: list[dict] = []
+            servo, sockets, limits = take_sample(servo_exe, self_pid, self_netns, diag)
+            for rec in diag:
+                if diag_emitted < MAX_FD_DIAG_RECORDS:
+                    emit(rec)
+                    diag_emitted += 1
+                else:
+                    diag_dropped += 1
             for lim in limits:
                 _mark(lim)
             if len(sockets) > MAX_SOCKETS_PER_SAMPLE:
@@ -1109,6 +1334,7 @@ def run_sampler(
                 "reason": reason,
                 "samples": n,
                 "final_canary_t": final_canary_t,
+                "fd_diag_dropped": diag_dropped,
             }
         )
     recv.close()

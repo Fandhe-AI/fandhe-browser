@@ -1,7 +1,7 @@
 # Servo ホストの egress 隔離方式: 3 OS の比較設計と実測計画
 
 - **状態**: 設計（比較と実測計画）。**方式の最終決定は実測の後にオーナーが行う**（#1003）。2026-11-02 の見直し（GA の成立範囲は Linux と macOS の B・Windows は D）を §8.1 に、2026-10-31 の暫定判断（履歴）を §8.2 に、Linux の実測結果を §6.4 に記録した
-- **対応**: TASK-38・MS-4・`RENDER-3`・`SEC-2`・`PLUG-1`・`XOS-1`・Issue #1368（親判断 #1003）。関連は `RENDER-1`・#1458（テストの検出力と残余リスク欄）。docker 経路は #1386 で再実測した（§6.4）。後続は #1387（macOS・Windows の実測ハーネス）。macOS のプロキシの UNIX ソケット化の調査は §10（#1486）
+- **対応**: TASK-38・MS-4・`RENDER-3`・`SEC-2`・`PLUG-1`・`XOS-1`・Issue #1368（親判断 #1003）。関連は `RENDER-1`・#1458（テストの検出力と残余リスク欄）。docker 経路は #1386 で再実測した（§6.4）。後続は #1387（macOS・Windows の実測ハーネス）。macOS のプロキシの UNIX ソケット化の調査は §10（#1486）。残課題の扱いは 2026-11-04 のオーナー判断（#1457）で決まり、§9.5 に記録した（#1488）
 - **入力資料**: [servo-host-egress-options.md](./servo-host-egress-options.md)（#1317。手段ごとの詳細表・Servo 0.7 の net 層の事実・承認事項の洗い出し。以下「options §n」と書く）。設計の親は [servo-host-design.md](./servo-host-design.md) §2.5・§13 項目 6
 - **確度の表記**: 「確認済み」は原文またはコードを確認した事項、「推測」は読んだ範囲からの推論、「未確認」は調べていない事項。一次情報は options の出典（参照日 2026-10-29、Servo は `v0.7.0` タグ）に従い、判断の前に原文で再確認する。本書では新たな外部ページの再取得はしていない
 - **spec 側の課題**（本リポからは編集しない。要報告）: egress 方針に専用のビヘイビア ID が無い。`RENDER-3` の本文はホストのサイズ・ビルド時間とオプトイン配布の設計材料で egress を扱わない。対応づけの確認は spec 側で行う
@@ -54,7 +54,7 @@ B の具体形は次の 2 つ。外部 http/https に出る要件があるため
 
 | 手段 | ① 宛先の粒度 | ② 被覆 | ③ 権限 | ④ 配布 | ⑤ PNA | ⑥ PLUG-1 |
 | ---- | ------------ | ------ | ------ | ------ | ----- | -------- |
-| netns（user ns + net ns。`unshare` / `bwrap`） | 全遮断。プロキシへは中継プロセスが要る（options §3.1。推測） | 全経路（WebSocket・UDP・DNS 含む） | カーネル上は非特権。Ubuntu 24.04 の AppArmor 制限で ns 内 capability が拒否される（options の記述）。カーネル 7.0.0-34 の Ubuntu では `unshare -n` が EPERM、`bwrap --unshare-net` は成功（確認済み。§6.4） | Docker 既定 seccomp 下で `unshare -n` は EPERM（確認済み。§6.4）。イメージに bwrap が無く、Docker 内での bwrap の可否は未確認 | 変えない | `pre_exec` + `unshare` は `unsafe`。`bwrap` は外部バイナリ |
+| netns（user ns + net ns。`unshare` / `bwrap`） | 全遮断。プロキシへは中継プロセスが要る（options §3.1。推測） | 全経路（WebSocket・UDP・DNS 含む） | カーネル上は非特権。Ubuntu 24.04 の AppArmor 制限で ns 内 capability が拒否される（options の記述）。カーネル 7.0.0-34 の Ubuntu では `unshare -n` が EPERM、`bwrap --unshare-net` は成功（確認済み。§6.4） | Docker 既定 seccomp 下で `unshare -n` は EPERM（確認済み。§6.4）。イメージに bwrap が無い。配布用コンテナには bwrap を入れない（§9.5・#1457） | 変えない | `pre_exec` + `unshare` は `unsafe`。`bwrap` は外部バイナリ |
 | コンテナ外部の netns（`docker run --network none` 等） | 全遮断。プロキシへは別途経路が要る（未設計） | 全経路 | docker 権限（ホスト側の運用） | 前例あり（`isolation_check.py`。#55 の判断。保存済みページ撮影のみ） | 変えない | 本体の外側の隔離で、ホスト本体のコードは増えない |
 | Landlock net（ABI 4、6.7 以降） | TCP のポート単位。宛先 IP は不可（options §3.1。確認済みとして記載） | TCP は被覆。ABI 4 は UDP・DNS を制限しない | 非特権（`no_new_privs`）。userns 不要 | Docker 既定 seccomp は `landlock_*` を許可（options の記述） | プロキシと同ポートの別 IP への直接接続は塞げない | 依存（`landlock` 等）と syscall の `unsafe` が候補（承認事項） |
 | seccomp-bpf（socket 種別） | `socket()` の domain・type のみ。`connect()` の宛先は見えない | UDP・RAW を禁止して補完する役 | 非特権 | 同上 | 宛先 IP は絞れない | BPF 組み立ての依存か自前（承認事項） |
@@ -165,9 +165,10 @@ Windows の補足（#1401）: `xos-measure.yml` の Windows ジョブに限り�
 
 未測定（残りの追跡は §9.2）:
 
-- Servo 自身の DNS・UDP 送信の外部観測（root か `CAP_NET_ADMIN` が要る）。#1461 で xos-measure の `egress-host-ubuntu` に host-capture（tcpdump とサンプラーによる帰属判定）を追加した。実測はマージ後で、結果は未記録。帰属できない DNS・UDP は記録だけで合否に使わず（案 A・#1457）、Servo の観測区間内の件数と宛先の上位 10 件を Summary と `verdict.json` に出す（#1467）。キャプチャの終端はサンプラーの最終カナリア（`end` 記録の `final_canary_t` 以降に観測されたサンプラー帰属のカナリア）で確かめ、観測されなければ観測不能とする（#1470 の回帰。最後のパケットの時刻との比較は廃止）。件数を数える区間には両端 0.5 秒の余裕を足し（陽性対照と終端の閾値には足さない）、stop ステップの固定の待ちは pcap に最終カナリアが現れるまで上限つきでポーリングする方式に置き換えた（#1473）。`servo_unisolated` には `render3_egress_required_blocks_direct_websocket` が意図して起動する隔離なしの対照ホストが現れうるが、判定は fail にしない
-- Landlock ルールの適用・seccomp・許可リスト付きプロキシとの併用（§7 の承認事項）
-- macOS・Windows（#1387）、AppArmor の制限が無い環境・古いカーネル
+- Servo 自身の DNS・UDP 送信の外部観測（root か `CAP_NET_ADMIN` が要る）。#1461 で xos-measure の `egress-host-ubuntu` に host-capture（tcpdump とサンプラーによる帰属判定）を追加した。実測は run 41650422295・41703923217 で verdict pass（記録は #1457。§9.5）。帰属できない DNS・UDP は記録だけで合否に使わず（案 A・#1457）、Servo の観測区間内の件数と宛先の上位 10 件を Summary と `verdict.json` に出す（#1467）。キャプチャの終端はサンプラーの最終カナリア（`end` 記録の `final_canary_t` 以降に観測されたサンプラー帰属のカナリア）で確かめ、観測されなければ観測不能とする（#1470 の回帰。最後のパケットの時刻との比較は廃止）。件数を数える区間には両端 0.5 秒の余裕を足し（陽性対照と終端の閾値には足さない）、stop ステップの固定の待ちは pcap に最終カナリアが現れるまで上限つきでポーリングする方式に置き換えた（#1473）。`servo_unisolated` には `render3_egress_required_blocks_direct_websocket` が意図して起動する隔離なしの対照ホストが現れうるが、判定は fail にしない
+- Landlock ルールの適用・seccomp・許可リスト付きプロキシとの併用（§7 の承認事項。保留と決めた。§9.5）
+- macOS・Windows（#1387）
+- AppArmor の制限が無い環境・古いカーネル: 測る仕組みは入れた（xos-measure の `egress-host-ubuntu-noaa`。#1487・PR #1491）が、実測と転記はまだ。6.7 未満のカーネルはホステッドランナーでは測れず未検証（§9.5）
 
 ### 6.5 Linux の proxy-relay 実測結果（#1431・2026-11-02）
 
@@ -217,9 +218,9 @@ Windows の補足（#1401）: `xos-measure.yml` の Windows ジョブに限り�
 | 1. GA の成立範囲 | Linux を先行（B: bwrap `--unshare-net`） | Linux（B: bwrap `--unshare-net`）と macOS（B: Seatbelt）を含める。根拠: macOS 26 の run 41401095620・41402439545 で、TCP 5 経路（redirect・img・fetch・ws・internal）と udp_direct が pass し、拒否ログの自己検査も成立した（予熱 5 回入り。#1415・#1424・#1425）。`dns`・`internal_real` は netns が前提の構造検査のため、macOS では対象外（unobservable） | 本番への組み込みは論点 4 |
 | 2. 既知の制約の文言（D）の置き場所 | 設計 §2.5 か README のどちらか（未定） | README「実装方針（要点）」と設計 §2.5 に置く | 文言は両者で同じ内容 |
 | 3. Windows の扱い | macOS・Windows の実測まで GA の成立範囲から外し、D の扱い | 引き続き D（既知の制約）とし、GA の成立範囲から外す。根拠: AppContainer 内で Servo ホストの陽性対照は成立した（`positive_ok: true`。run 41386861681・41402439545。#1413・#1420）。一方、Servo を使わない preflight で、capability なしでも loopback の外側 listener に届いた（loopback 免除を付けているため）。そのため全経路が「loopback listener では egress の遮断を測れない」理由で unobservable。測り直すには loopback 以外の宛先が要る | 測り方の検討は #1427。AppContainer 内の ipc-channel の制約は #1421 |
-| 4. 本番への組み込み | （新規の論点） | #1436（PR #1446）で実装済み。HostProcess の起動を Linux は bwrap、macOS は sandbox-exec で包み、通信を本体の許可リスト付きプロキシに限る（`[rendering] egress_isolation`。既定 `best-effort`、`required` は隔離できなければ起動しない）。依存・`unsafe` を足さず外部コマンドで包む方式にしたため、§7 の承認事項のうち依存・`unsafe` を要する案は採っていない。隔離中は WebSocket が使えず（Servo の `websocket_loader` はプロキシを使わない）、ファイルシステム全体は隔離しない（`--dev-bind / /`。#1485 で `/run`・`/tmp`・`$HOME` を、#1492 で `/var/tmp`・`/dev/shm`・WorkDir の親も tmpfs で隠し、WorkDir と隠れる場所にあるホストの実行ファイルだけ戻す）。実ホストでの検証は #1437 で `real_host` の `render3_egress_*`（`FANDHE_BROWSER_RENDER_EGRESS_ISOLATION=required`）に足し、xos-measure の suite `egress-host` で実測する（実行と記録はマージ後） | #1436・#1437 |
+| 4. 本番への組み込み | （新規の論点） | #1436（PR #1446）で実装済み。HostProcess の起動を Linux は bwrap、macOS は sandbox-exec で包み、通信を本体の許可リスト付きプロキシに限る（`[rendering] egress_isolation`。既定 `best-effort`、`required` は隔離できなければ起動しない）。依存・`unsafe` を足さず外部コマンドで包む方式にしたため、§7 の承認事項のうち依存・`unsafe` を要する案は採っていない。隔離中は WebSocket が使えず（Servo の `websocket_loader` はプロキシを使わない）、ファイルシステム全体は隔離しない（`--dev-bind / /`。#1485 で `/run`・`/tmp`・`$HOME` を、#1492 で `/var/tmp`・`/dev/shm`・WorkDir の親も tmpfs で隠し、WorkDir と隠れる場所にあるホストの実行ファイルだけ戻す）。実ホストでの検証は #1437 で `real_host` の `render3_egress_*`（`FANDHE_BROWSER_RENDER_EGRESS_ISOLATION=required`）に足し、xos-measure の suite `egress-host` で実測した（run 41592034373・41650422295 で ubuntu・macOS とも `render3_egress_*` が 3 passed。記録は #1457。§9.5） | #1436・#1437 |
 
-- 「8 経路すべて pass」（§6.4）のうち `internal_real`・`dns` は構造検査で、Servo 自身の DNS・UDP 送信の外部観測は #1461 の host-capture で追加した（実測はマージ後）
+- 「8 経路すべて pass」（§6.4）のうち `internal_real`・`dns` は構造検査で、Servo 自身の DNS・UDP 送信の外部観測は #1461 の host-capture で追加し、run 41650422295・41703923217 で観測した（§9.5）
 - AppContainer 内の ipc-channel の制約（ボディ付きリクエストで panic し得る）は推定で、未実測（#1421）
 
 ### 8.2 暫定判断（2026-10-31・履歴。§8.1 で見直し済み）
@@ -234,13 +235,13 @@ Windows の補足（#1401）: `xos-measure.yml` の Windows ジョブに限り�
 | 2. B が成立しない OS・環境での既知の制約の文言（D） | OS 隔離が使えない環境では A（アプリ側の検知）だけで動作し、「egress を完全には遮断できない」と明記する。既定ではそのことを警告する | 文言の置き場所は §4 の候補（設計 §2.5・README）から選ぶ（未定。§8.1 の論点 2 で決定） |
 | 3. Windows の扱い（弱い保証にとどめるか、対象外とするか） | macOS・Windows の実測が済むまで GA の成立範囲から外し、D の扱いとする | #1387（§8.1 の論点 1・3 で更新） |
 
-- 「8 経路すべて pass」のうち `internal_real`・`dns` は構造検査で、Servo 自身の DNS・UDP 送信の外部観測は #1461 の host-capture で追加した（実測はマージ後）（§6.4）
+- 「8 経路すべて pass」のうち `internal_real`・`dns` は構造検査で、Servo 自身の DNS・UDP 送信の外部観測は #1461 の host-capture で追加した。実測は §8.1・§9.1 を参照（§6.4）
 
 ## 9. 未確認事項
 
-options §7 を引き継ぐ。本書で新たに加わる未確認事項は §9.2 の 2 行（2026-11-02 の見直しで追加）。§6.2 で確かめるとしていた Docker 既定 seccomp 下での `unshare` の挙動と Landlock の実機の対応は、Linux（カーネル 7.0.0-34）について §6.4 で確かめた。
+options §7 を引き継ぐ。本書で新たに加わった未確認事項と、2026-11-04 のオーナー判断（#1457）による残課題の扱いは §9.5 にまとめた。§6.2 で確かめるとしていた Docker 既定 seccomp 下での `unshare` の挙動と Landlock の実機の対応は、Linux（カーネル 7.0.0-34）について §6.4 で確かめた。
 
-### 9.1 2026-10-31 の Linux 実測で解消した事項
+### 9.1 解消した事項（2026-10-31 の Linux 実測と以後の実測）
 
 詳細は §6.4（TASK-38・`RENDER-1`）。
 
@@ -252,6 +253,9 @@ options §7 を引き継ぐ。本書で新たに加わる未確認事項は §9.
 - 現在のコミットのホストでの再測定: c56f11c2 の dev ビルドで測り、bwrap `--unshare-net` は 8 経路すべて pass
 - GitHub の ubuntu runner の AppArmor 下で bwrap が使えるか: Ubuntu 26.04 image の runner では使える（根拠は PR #1456 の同 image の CI ログだけで、他の image・AppArmor の設定は未確認）。同ログ（`rust-test-ubuntu`）に `egress isolation probe: bwrap available` が出た（#1458）
 - docker `--network none` の判定（配布コンテナとホストの glibc をそろえた同一バイナリ。#1386）: 8 経路すべて pass（§6.4）
+- Servo 自身の DNS・UDP 送信の外部観測（2026-11-04）: xos-measure `egress-host` の host-capture で観測した。run 41650422295 と #1474 のブランチの run 41703923217 で verdict pass。帰属できないもの（run 41650422295 では DNS 12・tcp_syn 54）は記録だけで合否に使わない（案 A）。関連は #1437・#1461・#1467・#1470・#1474・#1479・#1482・#1484（§9.5）
+- 実ホストの子プロセス数（2026-11-04）: run 41650422295 の `EGRESS-PROCTREE` は 3 行で、`wrapper_children=1 init_children=1 init_children_main_thread=1`（#1460・#1466）
+- 実ホストでの隔離下の動作（2026-11-04）: run 41592034373（main 169126a4）と 41650422295 で、ubuntu・macOS とも `render3_egress_*` が 3 passed。記録は #1457（#1003 は CLOSED）
 
 ### 9.2 残る未確認事項と追跡先
 
@@ -260,16 +264,14 @@ options §7 を引き継ぐ。本書で新たに加わる未確認事項は §9.
 | Windows の成立性（§3.3・§6.2）。§8.1 で D（既知の制約）とした。測り直しは次行の #1427 で追跡する | #1387 |
 | Windows の測り直し（loopback 以外の宛先を使う測り方。loopback 免除の下では外側 listener に届くため、現行の測り方では egress を測れない） | #1427 |
 | AppContainer 内の ipc-channel の制約（ボディ付きリクエストで panic し得る。推定・未実測） | #1421 |
-| Docker 内での bwrap の可否（イメージに bwrap が無い） | #1457 |
-| 実ホストの子プロセス数（rss の pid 解決の前提。ns 内 pid 1 の子が 1 件）。記録は `real_host` の `EGRESS-PROCTREE` 行（#1460。走査の失敗・pid 未解決のときは別接頭辞の `EGRESS-PROCTREE-FAIL` 行で、件数の期待値は 0。#1466）、実測は xos-measure の `egress-host`（マージ後） | #1457 |
-| Servo 自身の DNS・UDP 送信の外部観測（root か `CAP_NET_ADMIN` が要る） | #1461 |
-| Landlock ルール適用下の動作・seccomp との併用（許可リスト付きプロキシは #1434・#1440・#1436 で本番に実装済み。netns 内の中継 → UDS → プロキシの成立性は §6.5 で確認済み） | #1457 |
-| 実ホスト（GitHub の ubuntu・macOS runner）での隔離下の動作（xos-measure の `egress-host`。マージ後に実施し、結果は #1003 へ） | #1003 |
-| bwrap のファイルシステム隔離の残り（`--ro-bind / /` 化・Landlock。`/dev/log`・`/var/lib/*`・`/var/snap/*` 配下の UDS など、隠している場所以外の既知のソケット。`/run`・`/tmp`・`$HOME` の tmpfs 化は #1485、`/var/tmp`・`/dev/shm`・WorkDir の親の tmpfs 化は #1492 で対応済み） | #1457 |
-| 隔離中の WebSocket（現状は遮断。必要なら proxy 経由の対応を別途検討） | #1457 |
-| AppArmor の制限が無い環境・6.7 未満のカーネル | #1457 |
+| Landlock ルール適用下の動作・seccomp との併用（保留。§9.5。許可リスト付きプロキシは #1434・#1440・#1436 で本番に実装済み。netns 内の中継 → UDS → プロキシの成立性は §6.5 で確認済み） | #1457 |
+| bwrap のファイルシステム隔離の残り（`--ro-bind / /` 化・`/dev/log`・`/var/lib/*`・`/var/snap/*` 配下の UDS など、隠している場所以外の既知のソケット。`/run`・`/tmp`・`$HOME` の tmpfs 化は #1485、`/var/tmp`・`/dev/shm`・WorkDir の親〔`temp_root` が `/tmp` と `$HOME` の外にあるときの兄弟 WorkDir〕の tmpfs 化は #1492 で対応済み） | #1457 |
+| 隔離中の WebSocket（現状は遮断のまま。WebSocket を必要とするサイトが実際に出たら見直す。§9.5） | #1457 |
+| AppArmor の制限が無い環境の実測と転記（`egress-host-ubuntu-noaa`。仕組みは #1487・PR #1491 で入れた）・6.7 未満のカーネル（ホステッドランナーでは測れない。自前の環境が要る） | #1457・#1487 |
 | net 層の直接接続の網羅 | options §7 の 1 |
-| macOS の Seatbelt の UNIX ソケット宛の構文・他ユーザーの環境変数の可視性（§10.6） | #1486 |
+| macOS の Seatbelt の UNIX ソケット宛の構文・他ユーザーの環境変数の可視性・トークン入り URI のログ経路（§10.6）。#1486 は調査済みで CLOSED。実装の要否はオーナー判断の後の別 issue | #1457 |
+
+残課題 10 項目の扱い（2026-11-04 のオーナー判断）は §9.5 を正とする。
 
 ### 9.3 残余リスク（RENDER-3・SEC-2・TASK-38・#1458）
 
@@ -278,6 +280,7 @@ options §7 を引き継ぐ。本書で新たに加わる未確認事項は §9.
 - Linux: FS 全体は隔離しない（`--dev-bind / /`）。`/run`・`/tmp`・`/var/tmp`・`/dev/shm`・`$HOME`・WorkDir の親は tmpfs で隠す（#1485・#1492）ため ssh-agent・X11・gnupg・他インスタンスのプロキシ UDS には届かないが、それ以外の場所（`/dev/log`・`/var/lib/*`・`/var/snap/*` 等の既知のソケット）の UDS を通る迂回は残る（拒否リスト型の限界）。`$HOME` が不正（未設定・システムのディレクトリ・`/` 等）だと隔離できない（`HomeNotHideable`）。WorkDir の親が `/` やシステムのディレクトリだと覆えず `WorkDirParentNotHideable`（回避策は `/tmp`・`/var/tmp`・`$HOME` 配下などを `temp_root` / `TMPDIR` に指定）。
 - macOS: Seatbelt は IP の送信だけを絞る。mach/XPC 経由の通信は止めない。観測したのは `mDNSResponder` 経由の経路だけで、それ以外は観測していない。
 - 測定（#1433）は `--ro-bind / /` で行ったが、本番は `--dev-bind / /` である。そのため、測定は本番の FS 上の UDS の迂回を覆っていない。#1485 の隠蔽の実地確認は、`isolation.rs` と `tests/host_process.rs` の本物の bwrap を使うテストが担う。実 Servo ホストでの確認はマージ後の xos-measure `egress-host`（人間が実行）。
+- macOS のプローブは試走の終了コードだけで判定し、ns の比較のような偽物を排する手段が無い（Linux は #1459・#1466 で解決）。残余リスクとして受け入れる（2026-11-04・#1457）。
 - 信頼判定の TOCTOU（#1466）: 実起動は、プローブ時にキャッシュした bwrap の実体パスを `select_trusted` で通し直さずに使う。実体は root 所有で祖先まで書き込み不可のまま、プロセスの生存中は変わらない前提に立つ。差し替えには root が要るため脅威モデルの外とする。
 
 ### 9.4 判断済みの事項（#1459）
@@ -285,11 +288,31 @@ options §7 を引き継ぐ。本書で新たに加わる未確認事項は §9.
 - FS 上の UDS の迂回の塞ぎ方（2026-11-04・#1485。オーナー判断 #1457。#1492 で拡張）: bwrap で `--tmpfs /run`・`--tmpfs /tmp`・`--tmpfs /var/tmp`・`--tmpfs /dev/shm`・`--tmpfs <正規化した $HOME>`・`--tmpfs <WorkDir の親>` の後に、このインスタンスの WorkDir を `--bind`、隠れる場所にあるホストの実行ファイルを `--ro-bind` で戻す（順序が意味を持つ）。`--ro-bind / /`・Landlock・seccomp は使わない。`$HOME` が未設定・相対・システムのディレクトリ（`/` を含む）・存在しない・ディレクトリでないときは `HomeNotHideable` で隔離不能（`required` は拒否）。固定の対象（`/tmp` 等）は実体パスへ解決し、存在しないものは外し、祖先と子孫が重なるときは祖先だけを残す（`/tmp` が `/var/tmp` への symlink の環境でも 1 本になる）。WorkDir の親は起動ごとに決めて、既に隠れる場所の配下なら重複させず、そうでなければ tmpfs で覆う（兄弟 WorkDir の UDS を `temp_root` の置き場所によらず隠す。覆えない `/`・システムのディレクトリは `WorkDirParentNotHideable`）。親の tmpfs は起動ごとなのでプローブには含めず、覆えない場合は起動の失敗として表に出る（fail-open にはならない）。プローブは固定の対象と `$HOME` の tmpfs で走る。本体の `HOME` も子へ強制で渡す `HOME` も変えない（SEC-2）。ユーザーのフォントと `$HOME` の設定は見えなくなる。
 - tmpfs の `--size`（#1492）: 付けない。`--size` を持たない版の bwrap は未知のオプションで失敗してプローブが落ち（`required` で起動不能）、最低版を決めていない方針と合わず、版で分岐するとプローブと本番の引数が食い違うため（導入版は未確認で、新しい版で入ったオプションと推測）。残余リスクは、ホストが tmpfs を埋めると本体マシンのメモリを消費しうること（tmpfs の既定上限は RAM の 50%。egress とは別の DoS 面）と、tmpfs のページが RSS 監視に計上されない可能性（推測）。
 - プローブの判定方法（2026-11-03）: Linux のプローブは終了コードに加えて、サンドボックス内の `readlink /proc/self/ns/net` の出力（netns の inode）が本体の値と異なることまで確かめる。exit 0 だけの偽物や、ns を作らない偽物は失敗する。詳細は `isolation.rs` の doc を正とする。
-- 作業ディレクトリが `/run` 配下のときの扱い（2026-11-03）: `WorkDirHiddenBySandbox` で隔離不能とする fail-closed のまま変えない。回避策は `/run` の外を `temp_root` または `TMPDIR` に指定すること。挙動は `isolation.rs` の doc を正とする。
+- 作業ディレクトリが `/run` 配下のときの扱い（2026-11-03）: `WorkDirHiddenBySandbox` で隔離不能とする fail-closed のまま変えない。回避策は `/run` の外を `temp_root` または `TMPDIR` に指定すること。2026-11-04 の判断でも変えない（#1457）。挙動は `isolation.rs` の doc を正とする。
 - プローブの前提（2026-11-03・#1466）:
   - プローブは `env_clear` で走り、本番の起動は許可リストの環境変数で走る。差が出るのは起動できない側だけで、隔離なしに起動できてしまう fail-open にはならない。
   - プローブが確かめるのは、別の netns にいることまで。外部への出口が無いことは、その netns が本物の bwrap の `--unshare-net` で作られ `lo` しか持たないという前提に依存する。本物であることは root 所有の信頼判定で担保する。
   - netns に加えて pid ns（`/proc/self/ns/pid`）の分離も確かめる。rss 監視の pid 解決とラッパーの kill で ns 内のホストも落ちる挙動が、`--unshare-pid` に依存するため。busybox の `readlink` はオペランドを 1 つしか取らないので、名前空間ごとに別の bwrap 起動にする（結果はプロセスごとに 1 回キャッシュ）。
+
+### 9.5 残課題の扱い（オーナー判断 2026-11-04・#1457・#1488）
+
+TASK-38・`RENDER-3`・`SEC-2`・`XOS-1`。#1457 に集めた未起票の残課題について、2026-11-04 のオーナー判断と、その後の実測（xos-measure `egress-host`）・後続 PR の結果を合わせて記録する。
+
+| 項目 | 扱い（2026-11-04） | 根拠・issue / run |
+| ---- | ------------------ | ----------------- |
+| bwrap の FS 隔離 | `/run`・`/tmp`・`$HOME` を tmpfs で隠し、WorkDir と実行ファイルだけを戻した。FS 全体の読み取り専用化（`--ro-bind / /`）はしない（ソケットへの connect は読み取り専用のマウントでも通るため）。残る迂回路は §9.3 | #1485（PR #1490）・§9.4 |
+| 隔離中の WebSocket | 遮断のまま（fail-closed）。Servo の `websocket_loader` はプロキシを通らない。WebSocket を必要とするサイトが実際に出たら見直す | #1457 |
+| Landlock・seccomp との併用 | 保留。依存か `unsafe` が要るうえ、#1485 の FS 隠蔽の後では得られるものが小さい。進めるときは dependency-policy の 5 項目を添えて別途承認を得る | #1457・§7 |
+| macOS の UDS 化 | 調査済み（§10）。Servo 0.7.0 の proxy は TCP しか扱えず、現実的な案は接続トークン。実装するか・どう実装するかはオーナー判断待ち | #1486（PR #1489）・#1457 |
+| Docker 内での bwrap | 配布用コンテナには入れない。bwrap を動かすには特権か userns の許可が要り、コンテナ自体が弱くなるため。現行の `docker/Dockerfile.release` の既定・軽量コンテナは Servo ホストを含まず、Servo ホスト用の glibc 系の別イメージ（設計 §13 項目 8）も同じ方針。コンテナ内ではコンテナ側のネットワーク隔離（`docker run --network` 等）を使う。コンテナ内では `/usr/bin/bwrap` が無いか（`SandboxToolNotFound`）、Docker の既定 seccomp でプローブが失敗する（§6.4）ため隔離不能と判定され、`required` は起動を拒否し、`best-effort` は警告つきで隔離なしで起動する（現状の挙動。コンテナを検出する仕組みは無い） | #1457・§6.4 |
+| Servo 自身の DNS・UDP 送信の外部観測 | 解決済み。host-capture で観測した（run 41650422295・41703923217 で verdict pass。帰属できないものは記録だけ〔案 A〕） | #1437・#1461・#1467・#1470・#1474・#1479・#1482・#1484 |
+| 作業ディレクトリが `/run` 配下 | 現状の fail-closed（`WorkDirHiddenBySandbox`）のまま | #1459・§9.4 |
+| AppArmor の制限が無い環境・カーネル 6.7 未満 | 制限なしは `egress-host-ubuntu-noaa`（ubuntu-latest で `kernel.apparmor_restrict_unprivileged_userns=0`）で測る仕組みを入れた。実測と転記はまだ。ubuntu-22.04 は Servo 0.7.0 の freetype-sys が freetype 2.12 以上を要求しビルドできないため使わない（run 41813316652）。6.7 未満はホステッドランナーでは測れず（ubuntu-latest は 7.0.0 系。run 41813316652・41813309725）、自前の環境が要るので未検証 | #1487（PR #1491）・`harness/egress-isolation/README.md` |
+| プローブで外へ出られないことまで確かめる | Linux は解決済み（netns・pid ns の inode を本体と比べ、ns を作らない偽物は通らない）。macOS は終了コードの判定のままで、残余リスクとして受け入れる（§9.3） | #1459・#1466 |
+| 実ホストの子プロセス数 | 解決済み。`EGRESS-PROCTREE` の実測（run 41650422295）で `wrapper_children=1 init_children=1 init_children_main_thread=1` | #1460・#1466 |
+
+- 実ホストでの隔離下の動作は run 41592034373・41650422295 で確認済み（ubuntu・macOS とも `render3_egress_*` が 3 passed。記録先は #1457）。
+- GitHub の ubuntu ランナーの AppArmor 下で bwrap が使えるかは解決済みで、§9.1 に記録している（PR #1456 の CI ログ・Ubuntu 26.04 image・#1458）。
 
 ## 10. macOS のプロキシの UNIX ソケット化の調査（#1486・TASK-38・RENDER-3・SEC-2・XOS-1）
 
@@ -318,7 +341,7 @@ options §7 を引き継ぐ。本書で新たに加わる未確認事項は §9.
 | -- | ------ | ------ | -------------- | ---- |
 | UNIX ソケットを Servo の proxy に直接指定 | 不可（10.2）。Servo を改変すると MPL のソース開示義務が生じ、licensing の方針にも反するため採らない | — | — | — |
 | (a) Linux と同じホスト内中継（`--egress-relay-uds`）を macOS でも使う | 成立しない。Servo から中継へは loopback の TCP で、Seatbelt で `remote ip` を全面拒否すると Servo 自身が中継に届かない。許可すれば中継の listener が今の穴を引き継ぐ。`isolation.rs`・`relay.rs` の doc も、隔離なしだとホストの 127.0.0.1 に中継が開くと指摘している（確認済み） | 他ユーザー・他プロセスから中継経由で本体の送信元 IP が使える（今と同じ） | std で足りる見込み（推測）。`unsafe` 不要 | Seatbelt の UNIX ソケット宛の許可は `(remote unix-socket (path-literal ...))` の形が Apple 同梱・公開 profile にあるとされるが、実機では未確認。採否には影響しない |
-| (b) 接続トークン（`Proxy-Authorization`）を Servo に付けさせる | 実現可能。`LoopbackProxy::uri()`（`servo-host/src/engine.rs`）を `http://<user>:<token>@127.0.0.1:<port>` にすれば Servo が付ける（10.2）。本体プロキシ側は検証して不一致を 407 で閉じる | 同じ uid のプロセスは WorkDir・環境変数・プロセス情報を読めて防げない。検証が欠けると今の状態に戻る | トークン生成に CSPRNG が要る。std だけで足りるかは未確認で、依存が要るなら承認事項。`unsafe` は不要の見込み（推測） | xos-measure の macOS（`egress-isolation`・`egress-host`）で、陽性対照（トークン付きで通る）と陰性対照（なし・別トークンで 407）を測れる見込み（推測） |
+| (b) 接続トークン（`Proxy-Authorization`）を Servo に付けさせる | 実現可能。`LoopbackProxy::uri()`（`servo-host/src/engine.rs`）を `http://<user>:<token>@127.0.0.1:<port>` にすれば Servo が付ける（10.2）。本体プロキシ側で検証し、不一致を 407 で閉じる実装を足す（将来の実装であり、現状の `egress_proxy/request.rs` は `Proxy-Authorization` を検証せず 407 も返さない。確認済み。未検証） | 同じ uid のプロセスは WorkDir・環境変数・プロセス情報を読めて防げない。検証が欠けると今の状態に戻る | トークン生成に CSPRNG が要る。std だけで足りるかは未確認で、依存が要るなら承認事項。`unsafe` は不要の見込み（推測） | xos-measure の macOS（`egress-isolation`・`egress-host`）で、陽性対照（トークン付きで通る）と陰性対照（なし・別トークンで 407）を測れる見込み（推測） |
 | (c) 本体側で接続元プロセスを確かめる | TCP の接続元 pid を得るには `proc_pidfdinfo` 等の FFI が要る（推測）。`LOCAL_PEERPID` は UNIX ソケット専用 | pid の再利用の競合 | `unsafe` が要るため承認事項。推奨しない | 未確認 |
 
 Seatbelt の profile は隔離したプロセスの送信だけを絞り、他のプロセスから listener への受信は絞れない。そのため、Seatbelt は listener を他から守る手段にならない（導いた結論）。
@@ -336,12 +359,13 @@ Seatbelt の profile は隔離したプロセスの送信だけを絞り、他�
 | stdio プロトコルの初回メッセージ | 有力。ホスト起動後の握手で渡す。プロトコルとスキーマの変更が要る。設計 §2.6 の「クライアントから任意引数を渡さない」とは、本体が決めた値を渡す形なので整合する |
 | WorkDir 配下の 0600 ファイル | 有力。同じ uid 以外は読めない（Linux の UNIX ソケット配置と同じ考え方）。パス検証が要る |
 
-実装時の条件（後続 issue）: 起動ごとに新規に作る。比較は定数時間で行う。407 応答とログにトークンと `Proxy-Authorization` の値を出さない。トークン検証が使えないときは起動を拒否する（`required` の既存方針と同じく fail-closed）。
+実装時の条件（後続 issue）: 起動ごとに新規に作る。比較は定数時間で行う。407 応答とログにトークンと `Proxy-Authorization` の値を出さない。トークン入りの proxy URI が Servo の他のログ経路（pref のダンプ・デバッグ出力・`ProxyError` 以外のエラー）に出ないことを確かめる（受け入れ条件。§10.6）。トークン検証が使えないときは起動を拒否する（`required` の既存方針と同じく fail-closed）。
 
 ### 10.6 未確認事項と後続
 
 - macOS 実機での Seatbelt の構文（UNIX ソケット宛の許可・拒否）と、`seatbelt.py` の拒否行の帰属。現在の `_DENY_RE` は `ip:port` と `*:port` の形だけを受け付けるため、UNIX ソケット宛の拒否行は帰属できず、測るには拡張が要る。
 - 他ユーザーのプロセスの環境変数の macOS での可視性。
 - トークン生成に std だけで足りるか。
+- トークン入りの proxy URI（`http://user:token@127.0.0.1:port`）は Servo の pref として渡る。§10.2 で確かめたのは `TunnelError` の Display だけで、pref のダンプ・デバッグ出力・`ProxyError` 以外のエラーに URI が出ないことは未確認（#1489 の監査 P2）。
 - 実装（`servo-host` の `engine.rs`・`args.rs`、`egress_proxy` の 407、`host_process` の受け渡し、`real_host` と xos-measure のテスト追加）は、オーナー判断の後の別 issue。設計 §2.5 の (3) と `isolation.rs` の「別途検討」の更新もそのときに行う。
 - 依存の追加・`unsafe`・`ci.yml` の変更は本 issue では行っていない。
