@@ -125,7 +125,7 @@ python3 -I -B harness/egress-isolation/relay_probe.py --out "$(mktemp -d)"   # �
 | `direct` | pass | netns の直接 connect は `ECONNREFUSED`（ベースラインでは届いた）。プロキシ経由でない受信 0 件 |
 | `ip_recheck` | pass | 127.0.0.2 は 403（`ip_denied` 1 件）。内部 listener の受信 0 件（ベースラインでは 1 件） |
 
-結論: この環境では構成が成り立つ。他の環境（AppArmor の制限が無い環境・6.7 未満のカーネル）は未測定。
+結論: この環境では構成が成り立つ。他の環境（AppArmor の制限が無い環境・6.7 未満のカーネル）は未測定（AppArmor の制限なしの測定の仕組みは「AppArmor の制限なしの測定」の節。#1487）。
 
 ## macOS・Windows（#1387）
 
@@ -308,6 +308,27 @@ host netns を記録し、bwrap 配下の Servo ホストに帰属する外向�
 - 初回実測での確認事項（#1473 D。人間）: マージ後の最初の `egress-host` 実測で、`proc-read-error:fd-<pid>` による unobservable が出ないかを確かめる。
   出たら bwrap の子 userns の dumpable 属性を疑い、記録する範囲を見直す（Servo の pid に限る等）。あわせて stop ステップの `wait-final-canary` が実機で効くこと（`note: final canary not seen` が出ないこと。出た場合は `last poll:` の理由を記録する）も確かめる。
 - 自己テスト: `test_host_capture.py`（合成 tcpdump テキスト・合成サンプル。`make check-egress-isolation`）。行形式は tcpdump 4.99.6（SLL2）の実出力に合わせてある。
+
+## AppArmor の制限なしの測定（#1487）
+
+Issue #1457 の残課題「AppArmor の制限が無い環境・6.7 未満のカーネル」のため、xos-measure の suite `egress-host` の
+`egress-host-ubuntu` を ubuntu-latest 上の 2 エントリ matrix にした（ジョブ名 `egress-host-ubuntu` / `egress-host-ubuntu-noaa`、artifact 名も同じ）。
+
+- `ubuntu`: 既定のまま（`kernel.apparmor_restrict_unprivileged_userns=1`）。従来の挙動。
+- `ubuntu-noaa`: テストの前に `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0` を実行し、読み直して 0 でなければ fail する
+  （ファイルが無い場合も fail。fail-closed）。管理者操作は使い捨てランナー内に限る。
+
+手順（bubblewrap の apt 導入、Servo ホストの release ビルド、`render3_egress_*`、host-capture、`EGRESS-PROCTREE` の集計）と
+判定基準（passed 3・VERIFIED 3・Bwrap 2 以上・PROCTREE 3・FAIL 0・host-capture の judge）は両方で同じで、緩めない。
+起動: `gh workflow run xos-measure.yml -f suite=egress-host`。Step Summary の `egress-host environment` に、カーネル版（`uname -r`）・
+`kernel >= 6.7`・bwrap の版・sysctl の値（ファイルが無ければ `absent`）を出す。
+
+- ubuntu-22.04 は使わない: Servo 0.7.0（servo-host の依存）の freetype-sys 0.23.0 の build.rs が `pkg-config freetype2 >= 24.3.18`
+  （freetype 2.12 以上）を要求するが、22.04 の libfreetype-dev は 2.11.1（pkg-config 版 24.1.18）でビルドできない（run 41813316652）。
+  依存の変更・Servo の feature 変更・freetype のソースビルドはしない。
+- カーネル 6.7 未満は GitHub ホステッドランナーでは測れない: ubuntu-latest のカーネルは 7.0.0-10xx-azure 系
+  （run 41813316652・41813309725）。6.7 未満の測定は自前の環境が要り、下の「承認事項」の古いカーネルでの再測定に残る。
+- 実測値（ubuntu-noaa の結果）は Step Summary で確かめ、#1457 とここへ転記する（未転記。実測前）。
 
 ## 承認事項（この issue では実装しない）
 

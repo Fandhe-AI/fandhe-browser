@@ -15,6 +15,9 @@ name: XOS Measure
 #                          egress-host-ubuntu はさらに host-capture（#1461）で、隔離下の Servo ホストの DNS・UDP・直接 TCP 送信を
 #                          host netns の外から tcpdump で観測する。sudo は tcpdump の導入・起動・停止だけに使う
 #                          （使い捨てランナー限定。オーナー承認 2026-11-03〔#1457 のコメント〕）
+#                          egress-host-ubuntu は ubuntu-latest の 2 エントリ matrix（ubuntu: 既定のまま /
+#                          ubuntu-noaa: AppArmor の userns 制限を sysctl で 0 にして測る。#1487・#1457）
+#                          ubuntu-22.04 は Servo の freetype 要件を満たせず不使用
 # Windows の egress-isolation は #1401 で opt-in のループバック免除（CheckNetIsolation LoopbackExempt。ハーネスが作った
 # AppContainer の SID だけ・計測後に解除）を付ける（オーナー承認 2026-11-01。使い捨て runner に限る）。
 # macOS の egress-isolation は sudo なしの `log show` で拒否行を取る（#1402。実測で sudo・`log config` が不要と分かり、
@@ -26,7 +29,8 @@ name: XOS Measure
 #   ここで出る check-run は required に登録しない（登録すると PR で pending のままになりマージできなくなる）。
 # - ci.yml とは別 workflow にする理由: ci.yml が出す check-run はすべて required にする規約のため、非 required の
 #   補助ジョブを足せない（.claude/rules/ci.md「ジョブ構成と required checks」）。bench-competitor.yml と同じ事情。
-# - ジョブは OS × suite の明示ジョブ 10 本（egress-isolation は macOS・Windows、egress-host は ubuntu・macOS のみ）。
+# - ジョブは OS × suite の明示ジョブ 10 本（egress-isolation は macOS・Windows、egress-host は ubuntu・macOS のみ。
+#   egress-host-ubuntu だけは同じ Ubuntu 系の 2 エントリ〔ubuntu・ubuntu-noaa〕で前提ステップが同じため matrix。#1487）。
 #   required にしないので matrix でもよいが、OS ごとに前提ステップの形が
 #   大きく違う（Windows は Servo の MSVC v143・ATL・MozTools・ANGLE、macOS は LLVM_OBJDUMP）ため、
 #   matrix にすると `if: runner.os` だらけになる。timeout も suite × OS で違う。
@@ -649,15 +653,34 @@ jobs:
   # --------------------------------------------------
   # egress-host（#1437・TASK-38・RENDER-3）。render の real_host で隔離下の実ホストを検証する（ubuntu・macOS。Windows は対象外）
   # --------------------------------------------------
+  # ubuntu-latest 上の 2 エントリ matrix（#1487・#1457）。ubuntu は既定のまま（AppArmor の unprivileged userns 制限あり）、
+  # ubuntu-noaa は同制限を sysctl で 0 にして測る（制限が無い環境の確認用）。ubuntu-22.04 は Servo 0.7.0（freetype-sys 0.23.0）が
+  # freetype 2.12 以上を要求し、22.04 の libfreetype-dev は 2.11.1 のためビルドできない（run 41813316652）ので使わない。
+  # 6.7 未満のカーネルは GitHub ホステッドでは得られない（ubuntu-latest は 7.0 系。run 41813316652・41813309725）。
+  # fail-fast: false は片方の失敗でもう片方の計測を止めないため（失敗を握りつぶすものではない）。
   egress-host-ubuntu:
     if: ${{ inputs.suite == 'egress-host' }}
-    runs-on: ubuntu-latest
-    # cli-conformance-ubuntu と同じ根拠（Servo ホストの release ビルド約 15 分）+ 本体 workspace の debug ビルドと実行
+    name: egress-host-${{ matrix.label }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            label: ubuntu # 既存の artifact 名 egress-host-ubuntu を保つ
+          - os: ubuntu-latest
+            label: ubuntu-noaa # AppArmor の userns 制限を sysctl で 0 にして測る（#1487・#1457）
+            apparmor_userns: "0"
+    runs-on: ${{ matrix.os }}
+    # cli-conformance-ubuntu と同じ根拠（Servo ホストの release ビルド約 15 分）+ 本体 workspace の debug ビルドと実行。
     timeout-minutes: 75
     permissions:
       contents: read
     env:
       CARGO_INCREMENTAL: "0"
+      # matrix の値は run: へ直接展開せず env 経由で渡す
+      EGRESS_HOST_LABEL: ${{ matrix.label }}
+      # 空文字は sysctl を変えない。"0" のエントリだけ apparmor_restrict_unprivileged_userns を 0 にする
+      APPARMOR_USERNS: ${{ matrix.apparmor_userns }}
       # tcpdump の -c（打ち切り件数）と host_capture.py judge の --max-packets で共用する（二重管理のずれを防ぐ。#1467）
       HOST_CAPTURE_MAX_PACKETS: "300000"
     defaults:
@@ -702,26 +725,85 @@ jobs:
             exit 1
           fi
           echo "LIBCLANG_PATH=$libdir" >> "$GITHUB_ENV"
+      # 環境情報（#1487）。読み取りのみ（このステップは sysctl を書き換えない。書き換えは後段の専用ステップ）。apt やビルドが失敗しても必ず出す。
+      # 6.7 は Landlock の TCP 制限（ABI 4）が入った版で、README の「6.7 未満は未測定」の軸に当たる。
+      - name: "[egress-host] 環境情報（読み取りのみ。Step Summary へ）"
+        if: ${{ !cancelled() }}
+        run: |
+          mkdir -p "$OUT_DIR"
+          f=/proc/sys/kernel/apparmor_restrict_unprivileged_userns
+          if [ -e "$f" ]; then
+            aa="$(cat "$f" 2>/dev/null || echo unreadable)"
+          else
+            aa="absent ($f not found)"
+          fi
+          kr="$(uname -r)"
+          kver="${kr%%-*}"
+          if printf '%s' "$kver" | grep -Eq '^[0-9]+\.[0-9]+'; then
+            if [ "$(printf '%s\n%s\n' 6.7 "$kver" | sort -V | head -n 1)" = "6.7" ]; then k67=yes; else k67=no; fi
+          else
+            k67=unknown
+          fi
+          os_name="$(. /etc/os-release 2>/dev/null && echo "${PRETTY_NAME:-unknown}")"
+          {
+            echo "## egress-host environment (${EGRESS_HOST_LABEL})"
+            echo "- os: ${os_name} (ImageOS=${ImageOS:-unknown} ImageVersion=${ImageVersion:-unknown})"
+            echo "- kernel: ${kr}"
+            echo "- kernel >= 6.7: ${k67}"
+            echo "- bwrap: $(/usr/bin/bwrap --version 2>/dev/null || echo 'not installed')"
+            echo "- apparmor_restrict_unprivileged_userns: ${aa}"
+          } | tee "$OUT_DIR/environment.md" >> "$GITHUB_STEP_SUMMARY"
       - name: "[servo-host] cargo build --release"
-        run: cargo build --manifest-path servo-host/Cargo.toml --locked --release --target-dir "$SERVO_HOST_TARGET_DIR"
+        run: |
+          mkdir -p "$OUT_DIR"
+          cargo build --manifest-path servo-host/Cargo.toml --locked --release --target-dir "$SERVO_HOST_TARGET_DIR" \
+            2>&1 | tee "$OUT_DIR/servo-host-build.log"
       - name: "[servo-host] --selftest"
         run: |
           out="$("$SERVO_HOST_TARGET_DIR/release/fandhe-browser-servo-host" --selftest)"
           echo "$out"
           case "$out" in "selftest ok:"*) ;; *) echo "error: unexpected --selftest output" >&2; exit 1 ;; esac
-      - name: "[egress-host] プラットフォームの記録（読み取りのみ。sysctl は書き換えない）"
+      # ubuntu-noaa のみ: AppArmor の unprivileged userns 制限を外す（#1487・#1457）。管理者操作は使い捨てランナー内に限る。
+      # 書き換え後に読み直して 0 でなければ fail（fail-closed）。ファイルが無い場合も、このエントリの目的が成立しないため fail。
+      # 条件は label の文字列比較にする。apparmor_userns を持たないエントリでは値が null になり、
+      # `null == '0'` は両辺が数値 0 に変換されて true になるため（run 41816947001 で ubuntu でも実行された）。
+      - name: "[egress-host] AppArmor の userns 制限を sysctl で 0 にする（ubuntu-noaa のみ。書き換える）"
+        if: ${{ matrix.label == 'ubuntu-noaa' }}
+        run: |
+          set -euo pipefail
+          f=/proc/sys/kernel/apparmor_restrict_unprivileged_userns
+          if [ ! -e "$f" ]; then
+            echo "error: $f not found; the purpose of this entry cannot be met" >&2
+            exit 1
+          fi
+          before="$(cat "$f")"
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          after="$(cat "$f")"
+          {
+            echo "## egress-host sysctl (${EGRESS_HOST_LABEL})"
+            echo "- apparmor_restrict_unprivileged_userns: ${before} -> ${after}"
+          } | tee -a "$OUT_DIR/environment.md" >> "$GITHUB_STEP_SUMMARY"
+          if [ "$after" != "$APPARMOR_USERNS" ]; then
+            echo "error: apparmor_restrict_unprivileged_userns is ${after}, expected ${APPARMOR_USERNS}" >&2
+            exit 1
+          fi
+      - name: "[egress-host] プラットフォームの記録（読み取りのみ。sysctl 変更後の値を含む）"
         run: |
           mkdir -p "$OUT_DIR"
           {
             uname -a
             /usr/bin/bwrap --version || true
             key=kernel.apparmor_restrict_unprivileged_userns
-            echo "$key=$(sysctl -n "$key" 2>/dev/null || echo unknown)"
+            if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+              echo "$key=$(sysctl -n "$key" 2>/dev/null || echo unreadable)"
+            else
+              echo "$key=absent"
+            fi
             python3 -I -B harness/egress-isolation/platform_probe.py || true
           } 2>&1 | tee "$OUT_DIR/platform.txt"
       # host-capture（#1461・RENDER-3・SEC-2）。隔離下の Servo ホストの DNS・UDP・直接 TCP 送信を host netns の外から観測する。
       # sudo は tcpdump の起動・停止（と apt の導入）だけに使い、-Z で直ちに実行ユーザーへ権限を落とす。サンプラーと判定は非特権。
-      # sysctl・ルーティング・nftables・ruleset は変えない。pcap は書き込みを runner のシェルのリダイレクトで行う（-w -）。
+      # ルーティング・nftables・ruleset は変えない（sysctl は ubuntu-noaa の専用ステップだけが変える）。pcap は書き込みを runner のシェルのリダイレクトで行う（-w -）。
       # 帰属の方法と限界は harness/egress-isolation/README.md「host-capture」。
       - name: "[egress-host] host-capture start（tcpdump は Ubuntu 公式 apt。sudo は起動のみ）"
         run: |
@@ -779,7 +861,7 @@ jobs:
           proctree="$(grep -c 'EGRESS-PROCTREE ' "$log" || true)"
           proctree_fail="$(grep -c 'EGRESS-PROCTREE-FAIL ' "$log" || true)"
           {
-            echo "## egress-host (ubuntu)"
+            echo "## egress-host (${EGRESS_HOST_LABEL})"
             echo "- passed: ${passed:-none} (expected 3)"
             echo "- EGRESS-VERIFIED lines: $verified (expected 3)"
             echo "- backend=Bwrap lines: $backend (expected >= 2)"
@@ -846,12 +928,14 @@ jobs:
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: egress-host-ubuntu
+          name: egress-host-${{ matrix.label }}
           # if-no-files-found: error はパターン全体が 0 件のときしか効かない。個々のファイルの欠落は judge が unobservable にする
           # （tcpdump.exit・convert.exit・tcpdump.stderr・capture.txt・samples.jsonl）。
           # verdict.json・summary.md が無いのは judge の失敗（#1473）。
           # 許可リスト（pcap・変換テキストはランナー自身の通信ヘッダを含むため、削除漏れがあっても載せない。#1467）
           path: |
+            ${{ runner.temp }}/egress-host/environment.md
+            ${{ runner.temp }}/egress-host/servo-host-build.log
             ${{ runner.temp }}/egress-host/platform.txt
             ${{ runner.temp }}/egress-host/real_host_egress.log
             ${{ runner.temp }}/egress-host/summary.md
