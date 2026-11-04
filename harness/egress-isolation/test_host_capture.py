@@ -722,10 +722,15 @@ class FdReadRetryTests(unittest.TestCase):
         self.assertEqual((rec["first"]["stage"], rec["first"]["errno"]), ("readlink", 13))
         self.assertEqual((rec["last"]["stage"], rec["last"]["errno"]), ("unknown", None))
         self.assertEqual(rec["last"]["fd_dir_owner"], "unknown")
-        for bad in (True, -1, 100000, 4096):
+        for bad in (True, 0, -1, 100000, 4096):
             idx.feed({"type": "fd-diag", "t": 1.0, "pid": 202, "outcome": "persistent",
                       "first": {"stage": "listdir", "errno": bad}})
             self.assertIsNone(idx.fd_diags[-1]["first"]["errno"], bad)
+        idx = hc.SampleIndex()  # 件数上限（MAX_FD_DIAG_VERDICT_RECORDS）を避けて作り直す
+        for good in (1, 4095):
+            idx.feed({"type": "fd-diag", "t": 1.0, "pid": 204, "outcome": "persistent",
+                      "first": {"stage": "listdir", "errno": good}})
+            self.assertEqual(idx.fd_diags[-1]["first"]["errno"], good)
         idx.feed({"type": "fd-diag", "t": 1.0, "pid": 203, "outcome": "persistent", "first": {"stage": None}})
         self.assertIsNone(idx.fd_diags[-1]["first"]["stage"])
         self.assertEqual((rec["pid"], rec["attempts"], rec["elapsed"]), (200, 5, 0.1))
