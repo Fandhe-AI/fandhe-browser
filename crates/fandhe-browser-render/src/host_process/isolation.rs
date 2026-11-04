@@ -43,7 +43,7 @@
 //!   隔離なし）。`$HOME` はプローブ時に 1 回だけ読みキャッシュする。本体の `HOME` も子へ強制で渡す
 //!   `HOME` も書き換えない（SEC-2）。`$HOME` がシステムのディレクトリを指すとプローブか起動が失敗する
 //!   が fail-closed で、fail-open にはならない。
-//! - 子の cwd は正規化前の WorkDir パス。`/run` 配下にある実行ファイルは戻さない。
+//! - 隔離時の子の cwd と `HOME`・`TMPDIR`・`XDG_*` は正規化済みの WorkDir から作る（symlink 経由の `temp_root` でも戻したパスを指す）。`/run` 配下にある実行ファイルは戻さない。
 //! - macOS の Seatbelt は `(allow default)` で、絞るのは IP の送信だけ。mach/XPC 経由の通信
 //!   （他のデーモンを介した通信）は止めない。DNS 経路（mDNSResponder 経由の名前解決・DNS
 //!   トンネリング）も同じ理由で観測・遮断していない。

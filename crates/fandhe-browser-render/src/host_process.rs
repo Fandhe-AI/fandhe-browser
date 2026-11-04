@@ -57,7 +57,7 @@ use std::ffi::OsString;
 use std::fmt;
 use std::io::Read;
 use std::num::NonZeroU16;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
@@ -1009,15 +1009,19 @@ impl HostProcess {
     fn spawn(&mut self) -> Result<(), HostProcessError> {
         let workdir = WorkDir::create(&self.config.temp_root)?;
         let (plan, socket_dir) = self.plan_isolation(&workdir)?;
+        // 隔離（bwrap）時は tmpfs で隠れた後に戻るのは正規化済みの WorkDir だけなので、cwd と
+        // 子の環境変数（HOME・TMPDIR・XDG_*）もそのパスから作る。temp_root が symlink 経由でも
+        // 子の指し先が消えない（#1485）。
+        let (child_root, child_home, child_tmp) = child_paths(socket_dir.as_deref(), &workdir);
         let mut launch = self.build_command(plan, socket_dir)?;
         let mut cmd = Command::new(&launch.program);
         cmd.args(&launch.args)
             .env_clear()
-            .current_dir(workdir.path())
+            .current_dir(&child_root)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        env::apply(&mut cmd, workdir.path(), &workdir.home(), &workdir.tmp());
+        env::apply(&mut cmd, &child_root, &child_home, &child_tmp);
         // bwrap の `--die-with-parent` は PR_SET_PDEATHSIG を使い、親**スレッド**の終了で発火する。
         // 呼び出し元のスレッド（tokio の blocking スレッド等）が先に終わると、HostProcess が生きて
         // いるのにホストが殺されるため、専用の親スレッドで起動し、`teardown` まで生かし続ける。
@@ -1206,10 +1210,39 @@ fn reap_unregistered(child: &mut Child) {
     let _ = child.wait();
 }
 
+/// 子の cwd・`HOME`・`TMPDIR` の元になるパスを返す。`canonical_root`（隔離時の正規化済み
+/// WorkDir）があればそれを、なければ WorkDir のパスをそのまま使う（RENDER-3・#1485）。
+fn child_paths(canonical_root: Option<&Path>, workdir: &WorkDir) -> (PathBuf, PathBuf, PathBuf) {
+    match canonical_root {
+        Some(root) => (root.to_path_buf(), root.join("home"), root.join("tmp")),
+        None => (workdir.path().to_path_buf(), workdir.home(), workdir.tmp()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::protocol::VisibilityParams;
+
+    /// RENDER-3（#1485）: temp_root が symlink 経由でも、隔離時の子の cwd・HOME・TMPDIR は
+    /// tmpfs の後に戻す正規化済み WorkDir の中を指す。
+    #[cfg(unix)]
+    #[test]
+    fn render3_child_paths_use_canonical_workdir_via_symlinked_temp_root() {
+        let real = WorkDir::create(&std::env::temp_dir()).expect("real base");
+        let link = real.path().join("link");
+        std::os::unix::fs::symlink(std::env::temp_dir(), &link).expect("symlink");
+        let workdir = WorkDir::create(&link).expect("workdir");
+        let canonical = isolation::socket_dir_for(workdir.path()).expect("socket dir");
+        assert_ne!(canonical, workdir.path());
+        let (cwd, home, tmp) = child_paths(Some(&canonical), &workdir);
+        assert_eq!(cwd, canonical);
+        assert_eq!(home, canonical.join("home"));
+        assert_eq!(tmp, canonical.join("tmp"));
+        assert!(home.is_dir() && tmp.is_dir());
+        let (cwd2, _, _) = child_paths(None, &workdir);
+        assert_eq!(cwd2, workdir.path());
+    }
 
     /// RENDER-3（#1451）: コールバックが無いときは stderr に `warning: ` つきの 1 行を出す。
     #[test]
