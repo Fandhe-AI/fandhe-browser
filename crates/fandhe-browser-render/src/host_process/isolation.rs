@@ -2078,7 +2078,8 @@ mod tests {
                 resolve_home_to_hide(Some(OsStr::new("/var/tmp"))),
                 Ok(canon.clone())
             );
-            let hidden = HiddenPaths::new(canon);
+            // macOS では `/var/tmp` が `/private/var/tmp` になるため、固定対象も実体パスで作る。
+            let hidden = HiddenPaths::from_resolved(vec![canon.clone()], canon);
             assert_eq!(hidden.home, None);
         }
     }
