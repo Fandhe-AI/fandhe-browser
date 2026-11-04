@@ -3786,7 +3786,7 @@ mod tests {
 
     // --- TASK-11.4.3（#546）: 子孫テキスト・文書ルート・優先順位の統合 ---
 
-    use super::{MAX_CONTENT_STEPS, NORMALIZED_LABEL_TEXT_CHAR_LIMIT};
+    use super::{MAX_CONTENT_STEPS, MAX_TOTAL_CONTENT_STEPS, NORMALIZED_LABEL_TEXT_CHAR_LIMIT};
 
     /// AISNAP-1（TASK-11.4.3・#546）: 子孫テキストだけで決まる要素。
     #[test]
@@ -4043,9 +4043,12 @@ mod tests {
         );
     }
 
-    /// AISNAP-1（TASK-11.4.3・#546）: 文書全体の予算。content role の深い
-    /// 入れ子を共有索引で全要素算出しても有限時間で終わり、予算超過分は
-    /// truncated になる。
+    /// AISNAP-1（TASK-11.4.3・#546・#1478）: content role の深い入れ子を
+    /// 共有索引で全要素算出したときの仕事量の上限。(1) 1 要素あたりの走査は
+    /// `MAX_CONTENT_STEPS` で頭打ちになり、総消費ステップ数は閉形式の値と
+    /// 一致する。(2) `with_content_budget(MAX_TOTAL_CONTENT_STEPS)` では
+    /// 文書全体の消費が予算で止まり、超過後の要素は truncated の空の名前になる。
+    /// 有限性は壁時計ではなく消費ステップ数で検証する（CPU 競合でのフレーク対策）。
     #[test]
     fn aisnap_1_content_document_budget_bounds_total_work() {
         const DEPTH: usize = 3_000;
@@ -4062,19 +4065,49 @@ mod tests {
         let doc = parsed.document;
         let targets = fandhe_browser_core::query::query_selector_all_str(&doc, doc.root(), "div")
             .expect("セレクタは解釈できる");
+        assert_eq!(targets.len(), DEPTH);
+        // 外側から i 番目の子孫は DEPTH - i ノード。要素ごとの上限で頭打ちになる。
+        let expected_total: usize = (0..DEPTH).map(|i| MAX_CONTENT_STEPS.min(DEPTH - i)).sum();
+        assert!(
+            expected_total > MAX_TOTAL_CONTENT_STEPS,
+            "文書全体の予算を超える入力でなければ 2 本目の検証が空振りする"
+        );
+
+        // (1) 無制限の索引: 消費ステップ数は初期値 usize::MAX からの減少分。
         let index = NameIndex::build(&doc);
-        let start = std::time::Instant::now();
-        let results: Vec<AccessibleName> = targets
-            .iter()
-            .map(|&id| compute_name_with_index(&doc, &index, id))
-            .collect();
-        assert!(start.elapsed() < std::time::Duration::from_secs(10));
+        let mut results: Vec<AccessibleName> = Vec::with_capacity(DEPTH);
+        for (i, &id) in targets.iter().enumerate() {
+            let before = index.content_steps_left.get();
+            results.push(compute_name_with_index(&doc, &index, id));
+            let used = before - index.content_steps_left.get();
+            assert!(used <= MAX_CONTENT_STEPS, "i={i} used={used}");
+            if i == 0 {
+                assert_eq!(used, MAX_CONTENT_STEPS);
+            }
+        }
+        assert_eq!(usize::MAX - index.content_steps_left.get(), expected_total);
         // 最も外側はステップ上限で本文に届かず、truncated の空の名前。
         let first = results.first().expect("要素がある");
         assert_eq!(first, &named("", NameSource::None, true));
         // 最も内側は本文に届く（先に算出した要素に予算を奪われない）。
         let last = results.last().expect("要素がある");
         assert_eq!(last, &named("x", NameSource::Content, false));
+
+        // (2) 文書全体の予算を有効にした索引: 予算を使い切り、後続は打ち切られる。
+        let budgeted = NameIndex::build(&doc).with_content_budget(MAX_TOTAL_CONTENT_STEPS);
+        let budgeted_results: Vec<AccessibleName> = targets
+            .iter()
+            .map(|&id| compute_name_with_index(&doc, &budgeted, id))
+            .collect();
+        assert_eq!(budgeted.content_steps_left.get(), 0);
+        assert_eq!(
+            budgeted_results.first().expect("要素がある"),
+            &named("", NameSource::None, true)
+        );
+        assert_eq!(
+            budgeted_results.last().expect("要素がある"),
+            &named("", NameSource::None, true)
+        );
     }
 
     /// AISNAP-1（TASK-11.4.3・#546・PR #574 レビュー指摘）: 共有索引での
