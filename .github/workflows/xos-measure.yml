@@ -15,7 +15,8 @@ name: XOS Measure
 #                          egress-host-ubuntu はさらに host-capture（#1461）で、隔離下の Servo ホストの DNS・UDP・直接 TCP 送信を
 #                          host netns の外から tcpdump で観測する。sudo は tcpdump の導入・起動・停止だけに使う
 #                          （使い捨てランナー限定。オーナー承認 2026-11-03〔#1457 のコメント〕）
-#                          egress-host-ubuntu は ubuntu-latest と ubuntu-22.04（AppArmor の userns 制限なし。#1487・#1457）の matrix
+#                          egress-host-ubuntu は ubuntu-latest の 2 エントリ matrix（ubuntu: 既定のまま / ubuntu-noaa: AppArmor の userns 制限を
+#                          sysctl で 0 にして測る。#1487・#1457。ubuntu-22.04 は Servo 0.7.0 の freetype 要件を満たせず使わない）
 # Windows の egress-isolation は #1401 で opt-in のループバック免除（CheckNetIsolation LoopbackExempt。ハーネスが作った
 # AppContainer の SID だけ・計測後に解除）を付ける（オーナー承認 2026-11-01。使い捨て runner に限る）。
 # macOS の egress-isolation は sudo なしの `log show` で拒否行を取る（#1402。実測で sudo・`log config` が不要と分かり、
@@ -28,7 +29,7 @@ name: XOS Measure
 # - ci.yml とは別 workflow にする理由: ci.yml が出す check-run はすべて required にする規約のため、非 required の
 #   補助ジョブを足せない（.claude/rules/ci.md「ジョブ構成と required checks」）。bench-competitor.yml と同じ事情。
 # - ジョブは OS × suite の明示ジョブ 10 本（egress-isolation は macOS・Windows、egress-host は ubuntu・macOS のみ。
-#   egress-host-ubuntu だけは同じ Ubuntu 系の 2 版〔latest・22.04〕で前提ステップが同じため matrix。#1487）。
+#   egress-host-ubuntu だけは同じ Ubuntu 系の 2 エントリ〔ubuntu・ubuntu-noaa〕で前提ステップが同じため matrix。#1487）。
 #   required にしないので matrix でもよいが、OS ごとに前提ステップの形が
 #   大きく違う（Windows は Servo の MSVC v143・ATL・MozTools・ANGLE、macOS は LLVM_OBJDUMP）ため、
 #   matrix にすると `if: runner.os` だらけになる。timeout も suite × OS で違う。
@@ -651,8 +652,10 @@ jobs:
   # --------------------------------------------------
   # egress-host（#1437・TASK-38・RENDER-3）。render の real_host で隔離下の実ホストを検証する（ubuntu・macOS。Windows は対象外）
   # --------------------------------------------------
-  # ubuntu-latest と ubuntu-22.04 の 2 版 matrix（#1487・#1457）。22.04 は 24.04 以降の AppArmor による unprivileged userns
-  # 制限が無い環境の確認用。同じ Ubuntu 系で前提ステップが同じため、このジョブだけ matrix にする（冒頭コメント参照）。
+  # ubuntu-latest 上の 2 エントリ matrix（#1487・#1457）。ubuntu は既定のまま（AppArmor の unprivileged userns 制限あり）、
+  # ubuntu-noaa は同制限を sysctl で 0 にして測る（制限が無い環境の確認用）。ubuntu-22.04 は Servo 0.7.0（freetype-sys 0.23.0）が
+  # freetype 2.12 以上を要求し、22.04 の libfreetype-dev は 2.11.1 のためビルドできない（run 41813316652）ので使わない。
+  # 6.7 未満のカーネルは GitHub ホステッドでは得られない（ubuntu-latest は 7.0 系。run 41813316652・41813309725）。
   # fail-fast: false は片方の失敗でもう片方の計測を止めないため（失敗を握りつぶすものではない）。
   egress-host-ubuntu:
     if: ${{ inputs.suite == 'egress-host' }}
@@ -663,11 +666,11 @@ jobs:
         include:
           - os: ubuntu-latest
             label: ubuntu # 既存の artifact 名 egress-host-ubuntu を保つ
-          - os: ubuntu-22.04
-            label: ubuntu-2204 # AppArmor の userns 制限なし（#1487・#1457）
+          - os: ubuntu-latest
+            label: ubuntu-noaa # AppArmor の userns 制限を sysctl で 0 にして測る（#1487・#1457）
+            apparmor_userns: "0"
     runs-on: ${{ matrix.os }}
     # cli-conformance-ubuntu と同じ根拠（Servo ホストの release ビルド約 15 分）+ 本体 workspace の debug ビルドと実行。
-    # 22.04 も同じ値（clang 14 等でビルドが遅い場合は実測で見直す）
     timeout-minutes: 75
     permissions:
       contents: read
@@ -675,6 +678,8 @@ jobs:
       CARGO_INCREMENTAL: "0"
       # matrix の値は run: へ直接展開せず env 経由で渡す
       EGRESS_HOST_LABEL: ${{ matrix.label }}
+      # 空文字は sysctl を変えない。"0" のエントリだけ apparmor_restrict_unprivileged_userns を 0 にする
+      APPARMOR_USERNS: ${{ matrix.apparmor_userns }}
       # tcpdump の -c（打ち切り件数）と host_capture.py judge の --max-packets で共用する（二重管理のずれを防ぐ。#1467）
       HOST_CAPTURE_MAX_PACKETS: "300000"
     defaults:
@@ -692,7 +697,6 @@ jobs:
         with:
           toolchain: stable
       - name: "Servo ホストの system 依存と bubblewrap の導入"
-        id: deps
         run: |
           df -h /
           sudo apt-get update -qq
@@ -720,7 +724,7 @@ jobs:
             exit 1
           fi
           echo "LIBCLANG_PATH=$libdir" >> "$GITHUB_ENV"
-      # 環境情報（#1487）。読み取りのみ（sysctl は書き換えない）。apt やビルドが失敗しても必ず出す。
+      # 環境情報（#1487）。読み取りのみ（このステップは sysctl を書き換えない。書き換えは後段の専用ステップ）。apt やビルドが失敗しても必ず出す。
       # 6.7 は Landlock の TCP 制限（ABI 4）が入った版で、README の「6.7 未満は未測定」の軸に当たる。
       - name: "[egress-host] 環境情報（読み取りのみ。Step Summary へ）"
         if: ${{ !cancelled() }}
@@ -749,39 +753,38 @@ jobs:
             echo "- apparmor_restrict_unprivileged_userns: ${aa}"
           } | tee "$OUT_DIR/environment.md" >> "$GITHUB_STEP_SUMMARY"
       - name: "[servo-host] cargo build --release"
-        id: servo_build
         run: |
           mkdir -p "$OUT_DIR"
           cargo build --manifest-path servo-host/Cargo.toml --locked --release --target-dir "$SERVO_HOST_TARGET_DIR" \
             2>&1 | tee "$OUT_DIR/servo-host-build.log"
       - name: "[servo-host] --selftest"
-        id: servo_selftest
         run: |
           out="$("$SERVO_HOST_TARGET_DIR/release/fandhe-browser-servo-host" --selftest)"
           echo "$out"
           case "$out" in "selftest ok:"*) ;; *) echo "error: unexpected --selftest output" >&2; exit 1 ;; esac
-      # ビルド等が不成立のとき、どの段階で失敗したかを記録する（#1487）。記録のみで fail-closed は変えない。
-      - name: "[servo-host] 不成立の要因を Step Summary へ"
-        if: ${{ failure() }}
-        env:
-          DEPS_OUTCOME: ${{ steps.deps.outcome }}
-          BUILD_OUTCOME: ${{ steps.servo_build.outcome }}
-          SELFTEST_OUTCOME: ${{ steps.servo_selftest.outcome }}
+      # ubuntu-noaa のみ: AppArmor の unprivileged userns 制限を外す（#1487・#1457）。管理者操作は使い捨てランナー内に限る。
+      # 書き換え後に読み直して 0 でなければ fail（fail-closed）。ファイルが無い場合も、このエントリの目的が成立しないため fail。
+      - name: "[egress-host] AppArmor の userns 制限を sysctl で 0 にする（ubuntu-noaa のみ。書き換える）"
+        if: ${{ matrix.apparmor_userns == '0' }}
         run: |
-          log="$OUT_DIR/servo-host-build.log"
+          set -euo pipefail
+          f=/proc/sys/kernel/apparmor_restrict_unprivileged_userns
+          if [ ! -e "$f" ]; then
+            echo "error: $f not found; the purpose of this entry cannot be met" >&2
+            exit 1
+          fi
+          before="$(cat "$f")"
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          after="$(cat "$f")"
           {
-            echo "## servo-host failure (${EGRESS_HOST_LABEL})"
-            echo "判定基準は緩めていない（#1487）。"
-            echo "- deps: ${DEPS_OUTCOME}"
-            echo "- build: ${BUILD_OUTCOME}"
-            echo "- selftest: ${SELFTEST_OUTCOME}"
-            if [ -f "$log" ]; then
-              echo '```'
-              grep -E '^error|error\[|error:' "$log" | head -n 40 | cut -c 1-300 || true
-              echo '```'
-            fi
-          } >> "$GITHUB_STEP_SUMMARY"
-      - name: "[egress-host] プラットフォームの記録（読み取りのみ。sysctl は書き換えない）"
+            echo "## egress-host sysctl (${EGRESS_HOST_LABEL})"
+            echo "- apparmor_restrict_unprivileged_userns: ${before} -> ${after}"
+          } | tee -a "$OUT_DIR/environment.md" >> "$GITHUB_STEP_SUMMARY"
+          if [ "$after" != "$APPARMOR_USERNS" ]; then
+            echo "error: apparmor_restrict_unprivileged_userns is ${after}, expected ${APPARMOR_USERNS}" >&2
+            exit 1
+          fi
+      - name: "[egress-host] プラットフォームの記録（読み取りのみ。sysctl 変更後の値を含む）"
         run: |
           mkdir -p "$OUT_DIR"
           {
@@ -797,7 +800,7 @@ jobs:
           } 2>&1 | tee "$OUT_DIR/platform.txt"
       # host-capture（#1461・RENDER-3・SEC-2）。隔離下の Servo ホストの DNS・UDP・直接 TCP 送信を host netns の外から観測する。
       # sudo は tcpdump の起動・停止（と apt の導入）だけに使い、-Z で直ちに実行ユーザーへ権限を落とす。サンプラーと判定は非特権。
-      # sysctl・ルーティング・nftables・ruleset は変えない。pcap は書き込みを runner のシェルのリダイレクトで行う（-w -）。
+      # ルーティング・nftables・ruleset は変えない（sysctl は ubuntu-noaa の専用ステップだけが変える）。pcap は書き込みを runner のシェルのリダイレクトで行う（-w -）。
       # 帰属の方法と限界は harness/egress-isolation/README.md「host-capture」。
       - name: "[egress-host] host-capture start（tcpdump は Ubuntu 公式 apt。sudo は起動のみ）"
         run: |
