@@ -125,7 +125,7 @@ python3 -I -B harness/egress-isolation/relay_probe.py --out "$(mktemp -d)"   # �
 | `direct` | pass | netns の直接 connect は `ECONNREFUSED`（ベースラインでは届いた）。プロキシ経由でない受信 0 件 |
 | `ip_recheck` | pass | 127.0.0.2 は 403（`ip_denied` 1 件）。内部 listener の受信 0 件（ベースラインでは 1 件） |
 
-結論: この環境では構成が成り立つ。他の環境（AppArmor の制限が無い環境・6.7 未満のカーネル）は未測定。
+結論: この環境では構成が成り立つ。他の環境（AppArmor の制限が無い環境・6.7 未満のカーネル）は未測定（測定の仕組みは「ubuntu-22.04」の節。#1487）。
 
 ## macOS・Windows（#1387）
 
@@ -308,6 +308,24 @@ host netns を記録し、bwrap 配下の Servo ホストに帰属する外向�
 - 初回実測での確認事項（#1473 D。人間）: マージ後の最初の `egress-host` 実測で、`proc-read-error:fd-<pid>` による unobservable が出ないかを確かめる。
   出たら bwrap の子 userns の dumpable 属性を疑い、記録する範囲を見直す（Servo の pid に限る等）。あわせて stop ステップの `wait-final-canary` が実機で効くこと（`note: final canary not seen` が出ないこと。出た場合は `last poll:` の理由を記録する）も確かめる。
 - 自己テスト: `test_host_capture.py`（合成 tcpdump テキスト・合成サンプル。`make check-egress-isolation`）。行形式は tcpdump 4.99.6（SLL2）の実出力に合わせてある。
+
+## ubuntu-22.04（AppArmor の userns 制限なし。#1487）
+
+#1457 の残課題「AppArmor の制限が無い環境・6.7 未満のカーネル」を埋めるため、xos-measure の suite `egress-host` の
+`egress-host-ubuntu` を ubuntu-latest と ubuntu-22.04 の matrix にした（ジョブ名 `egress-host-ubuntu` / `egress-host-ubuntu-2204`、
+artifact 名も同じ）。手順（bubblewrap の apt 導入、Servo ホストの release ビルド、`render3_egress_*`、host-capture、`EGRESS-PROCTREE` の集計）と
+判定基準（passed 3・VERIFIED 3・Bwrap 2 以上・PROCTREE 3・FAIL 0・host-capture の judge）は両方で同じで、緩めない。
+起動: `gh workflow run xos-measure.yml -f suite=egress-host`。
+
+- Step Summary の `egress-host environment` に、カーネル版（`uname -r`）・`kernel >= 6.7`・bwrap の版・
+  `apparmor_restrict_unprivileged_userns` の値（ファイルが無ければ `absent`）を出す。ビルドや apt が失敗しても出る。
+- 6.7 未満: ホステッドの ubuntu-22.04 のカーネルが 6.7 以上なら、6.7 未満はホステッドランナーでは測れない。
+  実測値は Step Summary で確かめ、#1457 とここへ転記する（未転記。実測前）。測れない場合の 6.7 未満の測定は自前の環境が要り、下の「承認事項」の古いカーネルでの再測定に残る。
+- ビルドが成り立たない場合: 失敗した段階（deps・build・selftest）とビルドログの `error` 行（先頭 40 行）が Step Summary の
+  `servo-host failure` に出る（ログは artifact の `servo-host-build.log`）。実測後に原因をここへ転記する。判定基準は緩めない。
+- 既知の差: 22.04 の bubblewrap は 0.6 系（隔離で使うフラグは `--die-with-parent`・`--unshare-net`・`--unshare-pid`・`--dev-bind`・`--bind`・`--ro-bind`・`--proc`・`--tmpfs` で、0.6 系にある）。
+  tcpdump は 4.99.1 系で、host-capture の行形式は 4.99.6（SLL2）に合わせてあるため、judge が unobservable になりうる。pass に寄せる変更はしない。
+- ubuntu-22.04 のイメージは上流でいずれ廃止される。その時点でこのジョブを見直す。
 
 ## 承認事項（この issue では実装しない）
 
