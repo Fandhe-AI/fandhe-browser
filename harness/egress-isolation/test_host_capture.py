@@ -476,6 +476,27 @@ class SamplerTests(unittest.TestCase):
             self.assertTrue(any("proc-read-error:net-tcp" in r for r in v["unobservable_reasons"]))
 
 
+class FakeClock:
+    """決定的な時計。sleep は時刻を進めるだけで実時間を使わない（#1497）。"""
+
+    def __init__(self, start: float = 1000.0) -> None:
+        self.now = start
+        self.sleeps: list[float] = []
+
+    def wall(self) -> float:
+        return self.now
+
+    def mono(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.sleeps.append(seconds)
+        self.now += seconds
+
+    def advance(self, dt: float) -> None:
+        self.now += dt
+
+
 class FdReadRetryTests(unittest.TestCase):
     """Servo pid の fd が一時的に読めない競合の読み直しと診断（#1493・`RENDER-3`）。"""
 
@@ -483,24 +504,26 @@ class FdReadRetryTests(unittest.TestCase):
     DENIED = ("denied", [], False, "listdir", 13)
     GONE = ("gone", [], False, None, None)
 
-    def _owners(self, results, starttimes=None, budget=None, pids=None, diag=None):
-        """_read_fd_inodes が results を順に返す状況で _socket_owners を呼ぶ。戻り値は (結果, sleep 回数)。"""
-        seq = list(results)
-        stimes = list(starttimes) if starttimes is not None else None
-        sleeps = []
+    def _owners(self, results, starttimes=(100,), budget=None, pids=None, diag=None, servo=None, clock=None):
+        """_read_fd_inodes が results を順に返す状況で _socket_owners を呼ぶ。戻り値は (結果, sleep 回数)。
+
+        results は列、または pid を受ける関数。時計は FakeClock（実 sleep なし）。servo は Servo と同定する pid の集合。
+        """
+        clock = clock or FakeClock()
+        seq = list(results) if not callable(results) else None
+        stimes = list(starttimes)
 
         def fake_read(pid):
+            if seq is None:
+                return results(pid)
             return seq.pop(0) if len(seq) > 1 else seq[0]
 
         def fake_start(pid):
-            if stimes is None:
-                return None
             return stimes.pop(0) if len(stimes) > 1 else stimes[0]
 
         patches = [
             mock.patch.object(hc, "_read_fd_inodes", fake_read),
             mock.patch.object(hc, "_proc_starttime", fake_start),
-            mock.patch.object(hc.time, "sleep", lambda s: sleeps.append(s)),
         ]
         if budget is not None:
             patches.append(mock.patch.object(hc, "FD_READ_RETRY_BUDGET_SECONDS", budget))
@@ -508,11 +531,13 @@ class FdReadRetryTests(unittest.TestCase):
             p.start()
         try:
             targets = pids or [self.X]
-            res = hc._socket_owners(targets, frozenset(targets), "/servo", diag)
+            res = hc._socket_owners(
+                targets, frozenset(servo if servo is not None else targets), "/servo", diag, clock=clock
+            )
         finally:
             for p in patches:
                 p.stop()
-        return res, len(sleeps)
+        return res, len(clock.sleeps)
 
     def test_non_servo_denied_with_fd_limit_keeps_hit(self):
         # fd 数が上限超かつ readlink が PermissionError の非 Servo pid でも fds-per-process-limit を保持する
@@ -532,7 +557,8 @@ class FdReadRetryTests(unittest.TestCase):
             [("fd-diag", self.X, "recovered", 1)],
         )
         self.assertIsNone(diag[0]["last"])
-        self.assertIsInstance(diag[0]["t"], float)
+        self.assertEqual(diag[0]["t"], 1000.02)
+        self.assertEqual(diag[0]["stop"], "read-ok")
 
     def test_vanished_during_retry(self):
         diag = []
@@ -555,17 +581,121 @@ class FdReadRetryTests(unittest.TestCase):
         self.assertEqual(sleeps, hc.FD_READ_RETRIES)
         self.assertEqual((diag[0]["outcome"], diag[0]["attempts"]), ("persistent", hc.FD_READ_RETRIES))
         self.assertIsNotNone(diag[0]["last"])
+        self.assertEqual(diag[0]["stop"], "attempts")
 
-    def test_budget_exhausted_pids_are_recorded_without_retry(self):
+    def test_sample_budget_exhausted_pids_are_recorded_without_retry(self):
+        # a は 5 回（0.1 秒）、b は累計の残り 0.05 秒で 3 回、c は残りなしで 0 回。すべて記録して観測不能（fail-closed）
         diag = []
-        a, b = 4_000_201, 4_000_202
-        # 締め切り計算で 0.0、以降は常に予算超過の時刻
-        clock = iter([0.0] + [1.0] * 100)
-        with mock.patch.object(hc.time, "monotonic", lambda: next(clock)):
-            (_owners, _hit, errors), sleeps = self._owners([self.DENIED], budget=0.05, pids=[a, b], diag=diag)
-        self.assertEqual(errors, [f"proc-read-error:fd-{a}", f"proc-read-error:fd-{b}"])
-        self.assertEqual(sleeps, 0)
-        self.assertEqual([d["outcome"] for d in diag], ["persistent", "persistent"])
+        a, b, c = 4_000_201, 4_000_202, 4_000_203
+        (owners, hit, errors), sleeps = self._owners([self.DENIED], pids=[a, b, c], diag=diag)
+        self.assertEqual((owners, hit), ({}, False))
+        self.assertEqual(errors, [f"proc-read-error:fd-{p}" for p in (a, b, c)])
+        self.assertEqual([(d["pid"], d["outcome"], d["attempts"], d["stop"]) for d in diag], [
+            (a, "persistent", 5, "attempts"),
+            (b, "persistent", 3, "sample-budget"),
+            (c, "persistent", 0, "sample-budget"),
+        ])
+        self.assertEqual(sleeps, 8)
+
+    def test_per_pid_budget_limits_attempts(self):
+        diag = []
+        clock = FakeClock()
+        with mock.patch.object(hc, "FD_READ_RETRIES", 100), mock.patch.object(hc, "FD_READ_RETRY_SECONDS", 0.03):
+            (_o, _h, errors), sleeps = self._owners([self.DENIED], diag=diag, clock=clock)
+        self.assertEqual(errors, [f"proc-read-error:fd-{self.X}"])
+        self.assertEqual((diag[0]["attempts"], diag[0]["stop"]), (4, "pid-budget"))
+        self.assertEqual(sleeps, 4)
+
+    def test_slow_scan_does_not_starve_trailing_servo_pid(self):
+        # 非 Servo の走査に合計 0.5 秒かかっても（予算 0.1・累計 0.15 を超える）、末尾の Servo pid は読み直される
+        diag = []
+        clock = FakeClock()
+        others = [4_000_300 + i for i in range(10)]
+        calls = {"n": 0}
+
+        def read(pid):
+            if pid != self.X:
+                clock.advance(0.05)
+                return self.GONE
+            calls["n"] += 1
+            return self.DENIED if calls["n"] == 1 else ("ok", [777], False, None, None)
+
+        (owners, hit, errors), sleeps = self._owners(read, pids=others + [self.X], servo={self.X}, diag=diag, clock=clock)
+        self.assertEqual((owners, hit, errors), ({777: self.X}, False, []))
+        self.assertEqual((diag[0]["outcome"], diag[0]["attempts"], diag[0]["stop"]), ("recovered", 1, "read-ok"))
+        self.assertEqual(sleeps, 1)
+
+    def test_second_denied_pid_gets_own_budget(self):
+        diag = []
+        clock = FakeClock()
+        a, b = 4_000_401, 4_000_402
+        state = {a: 0, b: 0}
+
+        def read(pid):
+            state[pid] += 1
+            if pid == a and state[pid] == 1:
+                clock.advance(0.2)  # 走査の遅延（読み直しの時間には数えない）
+            if state[pid] == 1:
+                return self.DENIED
+            return ("ok", [pid + 1], False, None, None)
+
+        (owners, _h, errors), _s = self._owners(read, pids=[a, b], diag=diag, clock=clock)
+        self.assertEqual((owners, errors), ({a + 1: a, b + 1: b}, []))
+        self.assertEqual([d["outcome"] for d in diag], ["recovered", "recovered"])
+
+    def test_unknown_starttime_is_persistent_not_recovered(self):
+        ok = ("ok", [777], False, None, None)
+        for stimes in ([None, 100], [100, None], [None, None]):
+            with self.subTest(starttimes=stimes):
+                diag = []
+                (owners, _h, errors), _s = self._owners([self.DENIED, ok], starttimes=stimes, diag=diag)
+                self.assertEqual((owners, errors), ({}, [f"proc-read-error:fd-{self.X}"]))
+                self.assertEqual((diag[0]["outcome"], diag[0]["stop"]), ("persistent", "starttime-unknown"))
+                self.assertIsNotNone(diag[0]["last"])
+        # 消えたなら starttime が不明でも vanished
+        diag = []
+        (_o, _h, errors), _s = self._owners([self.DENIED, self.GONE], starttimes=[None], diag=diag)
+        self.assertEqual((errors, diag[0]["outcome"], diag[0]["stop"]), ([], "vanished", "gone"))
+
+    def test_fd_limit_hit_survives_every_outcome(self):
+        first = ("denied", [], True, "readlink", 13)
+        cases = {
+            "persistent": ([first, self.DENIED], [100]),
+            "vanished": ([first, self.GONE], [100]),
+            "recovered": ([first, ("ok", [5], False, None, None)], [100]),
+            "recovered-over": ([self.DENIED, ("ok", [5], True, None, None)], [100]),
+        }
+        for name, (results, stimes) in cases.items():
+            with self.subTest(name=name):
+                (_o, hit, _e), _s = self._owners(results, starttimes=stimes)
+                self.assertIs(hit, True)
+
+    def test_budget_constants_relation(self):
+        # 0.2 は workflow の既定 --interval-ms 200。pid ごと <= 累計 < サンプル間隔
+        self.assertLessEqual(hc.FD_READ_RETRY_BUDGET_SECONDS, hc.FD_READ_RETRY_SAMPLE_BUDGET_SECONDS)
+        self.assertLess(hc.FD_READ_RETRY_SAMPLE_BUDGET_SECONDS, 0.2)
+
+    def test_verdict_records_keep_allowed_keys_only(self):
+        idx = hc.SampleIndex()
+        idx.feed(
+            {
+                "type": "fd-diag", "t": 1.0, "pid": 200, "outcome": "persistent", "attempts": 5, "elapsed": 0.1,
+                "stop": "evil|x", "nspid": [1], "threads": 3,
+                "first": {"fd_dir_owner": "root", "state": "R", "exe": "servo", "nspid": [1], "uid_matches_self": True},
+                "last": {"fd_dir_owner": "bad value", "state": "S", "exe": "other"},
+            }
+        )
+        rec = idx.fd_diags[0]
+        self.assertEqual(
+            set(rec), {"pid", "outcome", "attempts", "elapsed", "stop", "first", "last"}
+        )
+        self.assertEqual(rec["stop"], "unknown")
+        self.assertEqual(set(rec["first"]), {"fd_dir_owner", "state", "exe"})
+        self.assertEqual(rec["last"]["fd_dir_owner"], "unknown")
+        self.assertEqual((rec["pid"], rec["attempts"], rec["elapsed"]), (200, 5, 0.1))
+        idx.feed({"type": "fd-diag", "t": 1.0, "pid": 201, "outcome": "recovered", "attempts": True, "elapsed": "x"})
+        rec2 = idx.fd_diags[1]
+        self.assertEqual((rec2["attempts"], rec2["elapsed"], rec2["first"], rec2["last"]), (None, None, None, None))
 
     def test_non_servo_pid_is_not_retried_or_recorded(self):
         diag = []
@@ -624,8 +754,8 @@ class FdReadRetryTests(unittest.TestCase):
                 hc, "_ipv6_absent", lambda: True
             ), mock.patch.object(hc, "_read_fd_inodes", fake_read), mock.patch.object(
                 hc, "_fd_denied_snapshot", lambda *a: {"fd_dir_owner": "root"}
-            ), mock.patch.object(hc, "FD_READ_RETRY_SECONDS", 0.0):
-                hc.run_sampler("/servo", out, 0.02, None, max_seconds=0.3)
+            ), mock.patch.object(hc, "_proc_starttime", lambda pid: 100):
+                hc.run_sampler("/servo", out, 0.02, None, max_seconds=0.3, clock=FakeClock())
             recs = [json.loads(ln) for ln in out.read_text().splitlines()]
         idx = hc.SampleIndex()
         for r in recs:
