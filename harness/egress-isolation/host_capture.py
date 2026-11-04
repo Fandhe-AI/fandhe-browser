@@ -65,13 +65,48 @@ MAX_SAMPLE_BYTES = 64 * 1024 * 1024
 MAX_SOCKETS_PER_SAMPLE = 512
 MAX_JSONL_LINE_CHARS = 262_144
 MAX_PACKET_LINE_CHARS = 1024
-# Servo と同定した pid の `/proc/<pid>/fd` が PermissionError になったときの読み直し（#1493）。run 41819946868 で
+# Servo と同定した pid の `/proc/<pid>/fd` が PermissionError になったときの読み直し（#1493・#1497）。run 41819946868 で
 # 同定済み pid の fd が一時的に読めず unobservable になった。読み直しは「一時的な状態」を吸収するための上限つきの
-# 措置で、予算内に読めなければ従来どおり記録して観測不能にする（fail-closed）。1 回の走査での総時間はサンプル間隔
-# （200ms）より十分短くする。
+# 措置で、予算内に読めなければ従来どおり記録して観測不能にする（fail-closed）。
+# 時間予算は pid ごと（最初の denied から FD_READ_RETRY_BUDGET_SECONDS）。走査全体の締切を 1 回だけ計算すると、
+# 走査が遅いとき・先頭の pid が使い切ったときに後ろの Servo pid が読み直し 0 回になるため（#1497）。
+# 1 回の走査で読み直しに使う時間の累計は FD_READ_RETRY_SAMPLE_BUDGET_SECONDS で抑える（走査の時間は数えない）。
+# 大小関係は pid ごと <= 累計 < サンプル間隔の既定（workflow の --interval-ms 200）で、denied の pid が多くても
+# 1 サンプルの延びを有界に保つ。累計を使い切った後の pid は読み直し 0 回で persistent（観測不能）になる。
 FD_READ_RETRIES = 5
 FD_READ_RETRY_SECONDS = 0.02
 FD_READ_RETRY_BUDGET_SECONDS = 0.1
+FD_READ_RETRY_SAMPLE_BUDGET_SECONDS = 0.15
+# fd-diag の `stop`（読み直しを止めた理由）の固定集合。persistent が予算切れ由来か持続的な失敗かの切り分けに使う。
+FD_DIAG_STOPS = (
+    "read-ok",
+    "gone",
+    "reused",
+    "starttime-unknown",
+    "other-error",
+    "attempts",
+    "pid-budget",
+    "sample-budget",
+)
+
+
+class _Clock:
+    """時刻・待ちの注入点。既定は呼び出し時点の `time` を引く（テストが偽の時計を渡して実 sleep を避ける。#1497）。
+
+    モジュール内のキーワード引数でだけ差し替えられ、CLI・環境変数からは変えられない。
+    """
+
+    def wall(self) -> float:
+        return time.time()
+
+    def mono(self) -> float:
+        return time.monotonic()
+
+    def sleep(self, seconds: float) -> None:
+        time.sleep(seconds)
+
+
+SYSTEM_CLOCK = _Clock()
 # サンプラー 1 回の実行で samples.jsonl に出す fd-diag 記録の上限。超えた分は end 記録の fd_diag_dropped に数える
 # （診断の取りこぼしは観測の欠落ではないので truncated にはしない）。
 MAX_FD_DIAG_RECORDS = 64
@@ -238,6 +273,33 @@ def count_category(pkt: dict) -> str | None:
 # --------------------------------------------------------------------------------------
 
 
+def _fd_diag_verdict_record(rec: dict) -> dict:
+    """fd-diag 記録を verdict.json に載せる許可キーへ絞る（#1497）。生の記録は samples.jsonl に残る。
+
+    値は整数・有限な数値・固定カテゴリに丸め、/proc 由来の生文字列を verdict と Step Summary に入れない。
+    """
+
+    def snap(v: object) -> dict | None:
+        if not isinstance(v, dict):
+            return None
+        return {k: _diag_cat(v.get(k)) for k in ("fd_dir_owner", "state", "exe")}
+
+    attempts = rec.get("attempts")
+    elapsed = rec.get("elapsed")
+    stop = rec.get("stop")
+    return {
+        "pid": rec["pid"],
+        "outcome": rec["outcome"],
+        "attempts": attempts if isinstance(attempts, int) and not isinstance(attempts, bool) else None,
+        "elapsed": elapsed
+        if isinstance(elapsed, (int, float)) and not isinstance(elapsed, bool) and math.isfinite(elapsed)
+        else None,
+        "stop": stop if stop in FD_DIAG_STOPS else "unknown",
+        "first": snap(rec.get("first")),
+        "last": snap(rec.get("last")),
+    }
+
+
 class SampleIndex:
     """サンプラーの jsonl から、帰属に必要な情報を組み立てる。
 
@@ -284,7 +346,7 @@ class SampleIndex:
                 return
             self.fd_diag_counts[rec["outcome"]] += 1
             if len(self.fd_diags) < MAX_FD_DIAG_VERDICT_RECORDS:
-                self.fd_diags.append(rec)
+                self.fd_diags.append(_fd_diag_verdict_record(rec))
             return
         if kind not in ("sample", "tick"):
             self.bad_lines += 1
@@ -1011,6 +1073,8 @@ def _socket_owners(
     servo_pids: frozenset[int] | set[int] = frozenset(),
     servo_exe: str | None = None,
     diag: list | None = None,
+    *,
+    clock: _Clock = SYSTEM_CLOCK,
 ) -> tuple[dict[int, int], bool, list[str]]:
     """読める範囲の fd から inode -> pid を作る（同一ユーザーのプロセスだけ。root は読めず帰属不能）。
 
@@ -1024,31 +1088,37 @@ def _socket_owners(
     fd が一時的に読めず unobservable になった。原因は未確認の仮説で、`fs/proc/base.c` の task_dump_owner は
     dumpable でない（または mm が無い）タスクの /proc/<pid>/ 配下の所有者を root にし、fd ディレクトリは DAC だけで
     判定されるため、exec 中・終了処理中の瞬間に exe は読めても fd は読めない非対称が起きうる、というもの。
-    そこで Servo pid の denied に限り、診断を採ってから FD_READ_RETRIES 回・総時間 FD_READ_RETRY_BUDGET_SECONDS
-    以内で読み直す。結果は recovered（読めた。結果を使う）・vanished（消えた、または starttime が変わった）・
+    そこで Servo pid の denied に限り、診断を採ってから FD_READ_RETRIES 回・pid ごとに最初の denied から
+    FD_READ_RETRY_BUDGET_SECONDS 以内（1 回の走査の累計は FD_READ_RETRY_SAMPLE_BUDGET_SECONDS まで）で読み直す
+    （#1497: 走査全体で 1 つの締切にすると後ろの pid が読み直されない）。結果は recovered（読めた。結果を使う）・vanished（消えた、または starttime が変わった）・
     persistent（読めないまま。従来どおり記録して観測不能）で、診断は diag に fd-diag 記録として足す。
+    starttime が初回・再読みのどちらかで読めないときは pid の再利用を判別できないため recovered にせず persistent
+    にする。fd-diag の stop は読み直しを止めた理由（FD_DIAG_STOPS）。
     persistent を合格に変えることはない（持続する失敗の経路は変えない）。
     """
     owners: dict[int, int] = {}
     errors: list[str] = []
     hit = False
-    deadline = time.monotonic() + FD_READ_RETRY_BUDGET_SECONDS
+    spent = 0.0  # この走査で読み直しに使った時間の累計
 
     def _note(pid: int) -> None:
         tag = f"proc-read-error:fd-{pid}"
         if pid in servo_pids and tag not in errors:
             errors.append(tag)
 
-    def _emit_diag(pid: int, outcome: str, attempts: int, started: float, first: dict, last: dict | None) -> None:
+    def _emit_diag(
+        pid: int, outcome: str, stop: str, attempts: int, started: float, first: dict, last: dict | None
+    ) -> None:
         if diag is not None:
             diag.append(
                 {
                     "type": "fd-diag",
-                    "t": time.time(),
+                    "t": clock.wall(),
                     "pid": pid,
                     "outcome": outcome,
+                    "stop": stop,
                     "attempts": attempts,
-                    "elapsed": round(time.monotonic() - started, 4),
+                    "elapsed": round(clock.mono() - started, 4),
                     "first": first,
                     "last": last,
                 }
@@ -1059,26 +1129,45 @@ def _socket_owners(
         # 上限到達は denied・読み直しの結果によらず先に累積する（未走査 fd が残る観測欠落を落とさない）
         hit = hit or over
         if kind == "denied" and pid in servo_pids:
-            started = time.monotonic()
+            started = clock.mono()
             start_time = _proc_starttime(pid)
             first = _fd_denied_snapshot(pid, servo_exe, stage, errno_)
+            sample_left = max(0.0, FD_READ_RETRY_SAMPLE_BUDGET_SECONDS - spent)
+            sample_bound = sample_left < FD_READ_RETRY_BUDGET_SECONDS  # 締切が累計の残りで決まったか
+            pid_deadline = started + min(FD_READ_RETRY_BUDGET_SECONDS, sample_left)
             attempts = 0
             outcome = "persistent"
-            while attempts < FD_READ_RETRIES and time.monotonic() < deadline:
-                time.sleep(FD_READ_RETRY_SECONDS)
+            stop = "attempts"
+            while True:
+                if attempts >= FD_READ_RETRIES:
+                    stop = "attempts"
+                    break
+                if clock.mono() >= pid_deadline:
+                    stop = "sample-budget" if sample_bound else "pid-budget"
+                    break
+                clock.sleep(FD_READ_RETRY_SECONDS)
                 attempts += 1
                 kind, inodes, over, stage, errno_ = _read_fd_inodes(pid)
                 hit = hit or over
-                if kind != "denied":
-                    now_start = _proc_starttime(pid)
-                    reused = start_time is not None and now_start is not None and now_start != start_time
-                    if kind == "gone" or reused:
-                        outcome, kind, inodes, over = "vanished", "gone", [], False
-                    elif kind == "ok":
-                        outcome = "recovered"
-                    break
+                if kind == "denied":
+                    continue
+                now_start = _proc_starttime(pid)
+                if kind == "gone":
+                    outcome, stop, kind, inodes, over = "vanished", "gone", "gone", [], False
+                elif kind == "ok":
+                    if start_time is None or now_start is None:
+                        # pid の再利用を判別できない。recovered にせず fail-closed（#1497）
+                        stop = "starttime-unknown"
+                    elif now_start != start_time:
+                        outcome, stop, kind, inodes, over = "vanished", "reused", "gone", [], False
+                    else:
+                        outcome, stop = "recovered", "read-ok"
+                else:
+                    stop = "other-error"
+                break
+            spent += max(0.0, clock.mono() - started)
             last = _fd_denied_snapshot(pid, servo_exe, stage, errno_) if outcome == "persistent" else None
-            _emit_diag(pid, outcome, attempts, started, first, last)
+            _emit_diag(pid, outcome, stop, attempts, started, first, last)
             if outcome == "persistent":
                 _note(pid)
                 continue
@@ -1138,7 +1227,12 @@ def _read_table(name: str, optional: bool = False) -> tuple[list[tuple[int, int]
 
 
 def take_sample(
-    servo_exe: str, self_pid: int, self_netns: int | None, diag: list | None = None
+    servo_exe: str,
+    self_pid: int,
+    self_netns: int | None,
+    diag: list | None = None,
+    *,
+    clock: _Clock = SYSTEM_CLOCK,
 ) -> tuple[list[dict], list[dict], list[str]]:
     """1 回分の走査。戻り値は (servo, sockets, limits)。servo は pid・bwrap 祖先の有無・netns。
 
@@ -1162,7 +1256,7 @@ def take_sample(
         servo.append({"pid": pid, "bwrap": bwrap, "netns": netns})
         isolated = bwrap or (netns is not None and self_netns is not None and netns != self_netns)
         servo_roles[pid] = ROLE_ISOLATED if isolated else ROLE_UNISOLATED
-    owners, hit, fd_errors = _socket_owners(pids, frozenset(servo_roles), servo_exe, diag)
+    owners, hit, fd_errors = _socket_owners(pids, frozenset(servo_roles), servo_exe, diag, clock=clock)
     if hit:
         limits.append("fds-per-process-limit")
     limits.extend(fd_errors)
@@ -1204,6 +1298,8 @@ def run_sampler(
     interval: float,
     stop_file: Path | None,
     max_seconds: float | None = None,
+    *,
+    clock: _Clock = SYSTEM_CLOCK,
 ) -> int:
     """サンプラー本体。カナリアを張りつつ、変化があったときだけ sample、無変化は tick を書く。"""
     stop = {"flag": False}
@@ -1238,9 +1334,9 @@ def run_sampler(
         truncated, reason = True, ",".join(reasons)
 
     prev: tuple | None = None
-    next_canary = time.time() + 1.0
+    next_canary = clock.wall() + 1.0
     canary_sent = 0
-    started = time.time()
+    started = clock.wall()
     with out.open("w", encoding="utf-8") as fh:
 
         def emit(rec: dict) -> None:
@@ -1258,7 +1354,7 @@ def run_sampler(
             except (BlockingIOError, OSError):
                 pass
             diag: list[dict] = []
-            servo, sockets, limits = take_sample(servo_exe, self_pid, self_netns, diag)
+            servo, sockets, limits = take_sample(servo_exe, self_pid, self_netns, diag, clock=clock)
             for rec in diag:
                 if diag_emitted < MAX_FD_DIAG_RECORDS:
                     emit(rec)
@@ -1275,10 +1371,10 @@ def run_sampler(
                 tuple((s["proto"], s["port"], s["pid"], s["role"]) for s in sockets),
             )
             if state != prev:
-                emit({"type": "sample", "t": time.time(), "servo": servo, "sockets": sockets})
+                emit({"type": "sample", "t": clock.wall(), "servo": servo, "sockets": sockets})
                 prev = state
             else:
-                emit({"type": "tick", "t": time.time()})
+                emit({"type": "tick", "t": clock.wall()})
 
         emit(
             {
@@ -1293,7 +1389,7 @@ def run_sampler(
         )
         n = 0
         while not stop["flag"]:
-            now = time.time()
+            now = clock.wall()
             if stop_file is not None and stop_file.exists():
                 break
             if max_seconds is not None and now - started > max_seconds:
@@ -1310,7 +1406,7 @@ def run_sampler(
                 next_canary = now + 2.0
             do_sample()
             n += 1
-            time.sleep(interval)
+            clock.sleep(interval)
         # 停止要求の後、最後に 1 回だけ実サンプルを取ってから最終カナリアを送る。カナリアのソケットの存在区間が
         # 最終カナリアまで続くため、judge が自己帰属として数えられる。送信直前の時刻を final_canary_t として
         # end 記録に残す（pcap 上の時刻は送信後なので、これ以上になる）。judge は Servo の最後のサンプル以降に
@@ -1320,7 +1416,7 @@ def run_sampler(
         do_sample()
         n += 1
         final_canary_t: float | None = None
-        t_before = time.time()
+        t_before = clock.wall()
         try:
             send.sendto(_CANARY_PAYLOAD, recv_addr)
             final_canary_t = t_before
@@ -1329,7 +1425,7 @@ def run_sampler(
         emit(
             {
                 "type": "end",
-                "t": time.time(),
+                "t": clock.wall(),
                 "truncated": truncated,
                 "reason": reason,
                 "samples": n,
