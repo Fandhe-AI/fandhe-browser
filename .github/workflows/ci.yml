@@ -1325,7 +1325,9 @@ jobs:
     runs-on: macos-latest
     # cache なしのコールドビルド。dev は workflow_dispatch の実測（最大 12.5 分。run 38842938258・38847207875）。
     # release を足したジョブ全体の workflow_dispatch 実測 35.3 分（dev ビルド 10.8 分・release 23.9 分。run 40396545036）× 約 1.5（#1279）
-    timeout-minutes: 55
+    # 2026-11-03 の main push 実測（attempt 1）: 37・26・29・48・41・40・41・41 分。
+    # run 41711653563 は 55 分で timeout（release ビルドの遅延。再実行は 36 分で成功）。成功の最大 48 分 × 約 1.5 ≒ 72 → 75 分（オーナー承認 2026-11-04）
+    timeout-minutes: 75
     permissions:
       contents: read
     env:
