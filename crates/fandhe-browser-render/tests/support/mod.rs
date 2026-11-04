@@ -140,7 +140,28 @@ pub fn fake_host() -> ! {
             .iter()
             .map(|l| (l.clone(), json!(std::fs::symlink_metadata(l).is_ok())))
             .collect();
+        // tmpfs の容量上限の観測（RENDER-3・#1498）: `/proc/self/mountinfo` の `/tmp`・`/var/tmp`・
+        // `/dev/shm` のマウントについて、ファイルシステムの種別と super options（`size=65536k` 等）。
+        let mut mounts = serde_json::Map::new();
+        if let Ok(t) = std::fs::read_to_string("/proc/self/mountinfo") {
+            for line in t.lines() {
+                let Some((pre, post)) = line.split_once(" - ") else {
+                    continue;
+                };
+                let mount_point = pre.split_whitespace().nth(4).unwrap_or("");
+                let mut post = post.split_whitespace();
+                let fstype = post.next().unwrap_or("");
+                let super_opts = post.nth(1).unwrap_or("");
+                if ["/tmp", "/var/tmp", "/dev/shm"].contains(&mount_point) {
+                    mounts.insert(
+                        mount_point.to_string(),
+                        json!({"fstype": fstype, "super_opts": super_opts}),
+                    );
+                }
+            }
+        }
         let obs = json!({
+            "mounts": mounts,
             "visible": visible,
             "proc_pids": proc_pids,
             "ppid": ppid,
