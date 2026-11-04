@@ -1103,6 +1103,19 @@ fn detect_tmpfs_limit(bwrap: &Path, timeout: Duration) -> TmpfsLimit {
     let Ok(mut child) = cmd.spawn() else {
         return TmpfsLimit::Unsupported;
     };
+    // 出力がパイプ容量を超えても bwrap が書き込みで止まらないよう、終了待ちと並行して別スレッドで
+    // 上限付きに読む。上限超で読むのをやめると bwrap は書き込みで止まり、時間切れで Unsupported になる。
+    let Some(out) = child.stdout.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return TmpfsLimit::Unsupported;
+    };
+    let reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        out.take(HELP_STDOUT_MAX.saturating_add(1))
+            .read_to_end(&mut buf)
+            .map(|_| buf)
+    });
     let deadline = Instant::now().checked_add(timeout);
     let status = loop {
         match child.try_wait() {
@@ -1113,23 +1126,16 @@ fn detect_tmpfs_limit(bwrap: &Path, timeout: Duration) -> TmpfsLimit {
             _ => {
                 let _ = child.kill();
                 let _ = child.wait();
+                // kill でパイプが閉じ、読み取りスレッドは EOF で終わる。
+                let _ = reader.join();
                 return TmpfsLimit::Unsupported;
             }
         }
     };
-    if !status.success() {
-        return TmpfsLimit::Unsupported;
-    }
-    let mut buf = Vec::new();
-    let Some(out) = child.stdout.take() else {
+    let Ok(Ok(buf)) = reader.join() else {
         return TmpfsLimit::Unsupported;
     };
-    if out
-        .take(HELP_STDOUT_MAX.saturating_add(1))
-        .read_to_end(&mut buf)
-        .is_err()
-        || u64::try_from(buf.len()).map_or(true, |n| n > HELP_STDOUT_MAX)
-    {
+    if !status.success() || u64::try_from(buf.len()).map_or(true, |n| n > HELP_STDOUT_MAX) {
         return TmpfsLimit::Unsupported;
     }
     if help_supports_tmpfs_size(&buf) {
@@ -2909,6 +2915,20 @@ mod tests {
             Ok(r) => assert_eq!(r, Ok(())),
             Err(e) => assert!(!ci_requires_ok(), "CI must have a hideable HOME: {e:?}"),
         }
+    }
+
+    /// RENDER-3（#1498）: `--help` の出力が [`HELP_STDOUT_MAX`] を超える偽物は、`--size` を含んでいても
+    /// `Unsupported`（上限超は信頼しない）。読み取りは終了待ちと並行のため、固まらず時間内に返る。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn render3_detect_tmpfs_limit_oversized_help_is_unsupported_without_hanging() {
+        let body = "#!/bin/sh\nif [ \"$1\" = \"--help\" ]; then echo '    --size BYTES  tmpfs size'; i=0; while [ $i -lt 4000 ]; do echo 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'; i=$((i+1)); done; exit 0; fi\nexit 1\n";
+        let (dir, fake) = fake_script("bigbwrap", body);
+        let started = Instant::now();
+        let limit = detect_tmpfs_limit(&fake, Duration::from_secs(3));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(limit, TmpfsLimit::Unsupported);
+        assert!(started.elapsed() < Duration::from_secs(10));
     }
 
     /// RENDER-3（#1498）: 実物の bwrap の `--help` 検出が、`--size` ありの版で `Capped`、無い版で
