@@ -38,7 +38,9 @@
 //!   使えるかは版の文字列ではなく `bwrap --help` の機能検出で、プローブ時に決め
 //!   （[`TmpfsLimit`]）、試走と本番が同じ引数になるよう [`HiddenPaths`] に持たせる。非対応の版（確定）は
 //!   固定するが、検出の失敗のうち一過性のもの（起動の失敗・時間切れ）は固定せず、上限つき
-//!   （[`TMPFS_REPROBE_MAX`]）で次のプローブ時に検出し直す（#1502）。非対応・検出失敗のどちらでも
+//!   （[`TMPFS_REPROBE_MAX`]）で次のプローブ時に検出し直す（#1502）。上限は時間でなく回数で数え、
+//!   `Err` に終わった再検出も 1 回に数える。使い切るとそのプロセスの間は上限なしに固定する（#1508）。
+//!   非対応・検出失敗のどちらでも
 //!   隔離をやめず上限なしで続け（黙って緩めない）、`HostProcess` が警告を理由ごとの文言で 1 回出す
 //!   （`with_isolation_warning` のコールバック経由。未設定なら stderr）。残余リスク:
 //!   `--size` は容量しか抑えず inode の数（`nr_inodes`。bwrap に指定手段が無い）は抑えないため、
@@ -1157,7 +1159,13 @@ fn help_supports_tmpfs_size(stdout: &[u8]) -> bool {
         .any(|tok| tok == b"--size")
 }
 
+/// 時間切れで kill した後に読み取りスレッドの終了を待つ上限。孫が stdout を保持してパイプが閉じない
+/// 場合に `join` で止まらないための値で、超えたらスレッドを detach する（#1508）。
+#[cfg(target_os = "linux")]
+const READER_GRACE: Duration = Duration::from_millis(200);
+
 /// 信頼判定済みの `bwrap` が `--size` を持つかを `--help` で調べ、tmpfs の上限の扱いを決める。
+/// 時間切れの後の読み取りスレッドは上限付きで待ち、孫がパイプを保持していれば detach する（#1508）。
 /// `--help` を読めて `--size` が無ければ `Unsupported`（確定）。起動できない・非 0 終了・時間切れ・
 /// 出力が [`HELP_STDOUT_MAX`] 超は `Undetected`（上限なしで隔離を続ける。隔離自体の可否はこの後の
 /// 試走が判定する）。出力が上限を超えた時点で時間切れを待たずに kill する（#1502）。
@@ -1219,9 +1227,20 @@ fn detect_tmpfs_limit(bwrap: &Path, timeout: Duration) -> TmpfsLimit {
             _ => {
                 let _ = child.kill();
                 let _ = child.wait();
-                // kill でパイプが閉じ、読み取りスレッドは EOF で終わる。
+                // 通常は kill でパイプが閉じ、読み取りスレッドは EOF で終わる。ただし子が stdout を
+                // 孫へ受け継がせているとパイプが閉じず join が戻らないため、上限付きで終了を待ち、
+                // 過ぎたら detach する（#1508）。detach したスレッドが持つのは読み端と上限付き
+                // バッファ（`HELP_STDOUT_MAX + 1`）だけで、孫の終了で終わる。数は検出の回数
+                // （初回＋`TMPFS_REPROBE_MAX`）で抑えられる。本物の bwrap の `--help` に孫はいない。
                 if let Some(r) = reader.take() {
-                    let _ = r.join();
+                    let grace_end = Instant::now() + READER_GRACE;
+                    while !r.is_finished() && Instant::now() < grace_end {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    if r.is_finished() {
+                        let _ = r.join();
+                    }
+                    // 未終了なら `r` を drop して detach する。
                 }
                 return undetected(TmpfsDetectFailure::TimedOut);
             }
@@ -1330,6 +1349,8 @@ pub fn probe_system() -> Result<(), EgressIsolationUnavailable> {
 }
 
 /// 検出の失敗（一過性）の後に `--size` の検出をやり直す回数の上限（初回を除く。#1502）。
+/// 時間では区切らず回数で数える（`Err` に終わった再検出も消費する）。使い切った後は
+/// `Undetected` のまま、そのプロセスの間は上限なしに固定する（警告は出す。#1508）。
 const TMPFS_REPROBE_MAX: u32 = 3;
 
 /// プローブ結果のキャッシュ（再プローブの回数つき）。
@@ -3280,18 +3301,61 @@ mod tests {
         assert_eq!(second, TmpfsLimit::Capped(TMPFS_SIZE_BYTES));
     }
 
-    /// RENDER-3（#1502）: 時間切れは `TimedOut`、非 0 終了は `ExitFailure`、`--size` の無い help は
-    /// `Unsupported` に分類する。
+    /// 偽 bwrap が書いた pid ファイル（`<script>.<ext>`）を読む。無い・数値でないなら panic。
+    #[cfg(target_os = "linux")]
+    fn read_pid(script: &Path, ext: &str) -> u32 {
+        let mut name = script.as_os_str().to_owned();
+        name.push(format!(".{ext}"));
+        std::fs::read_to_string(PathBuf::from(name))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap()
+    }
+
+    /// `/proc/<pid>` が消える（回収済み）まで最大 2 秒待つ。残っていれば false。
+    #[cfg(target_os = "linux")]
+    fn process_gone(pid: u32) -> bool {
+        let p = PathBuf::from(format!("/proc/{pid}"));
+        for _ in 0..200 {
+            if !p.exists() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        false
+    }
+
+    /// RENDER-3（#1502・#1508）: 時間切れは `TimedOut`、非 0 終了は `ExitFailure`、`--size` の無い help は
+    /// `Unsupported` に分類する。時間切れの偽物は `exec` で pid を保ち、kill 後に残らない。stdout を
+    /// 孫へ受け継がせる偽物でも読み取りスレッドの `join` で止まらない。
     #[cfg(target_os = "linux")]
     #[test]
     fn render3_detect_tmpfs_limit_classifies_timeout_and_exit_failure() {
-        let (d1, slow) = fake_script("slow", "#!/bin/sh\nsleep 30\n");
+        let (d1, slow) = fake_script("slow", "#!/bin/sh\necho $$ > \"$0.pid\"\nexec sleep 30\n");
         let (d2, failing) = fake_script("fail", "#!/bin/sh\nexit 3\n");
         let (d3, nosize) = fake_script("nosize", "#!/bin/sh\necho '    --tmpfs DEST'\nexit 0\n");
+        let (d4, gc) = fake_script(
+            "gc",
+            "#!/bin/sh\nsleep 5 &\necho $! > \"$0.gc\"\necho $$ > \"$0.pid\"\nexec sleep 30\n",
+        );
+        let started = Instant::now();
         let timed_out = detect_retrying(&slow, Duration::from_millis(300));
+        let slow_elapsed = started.elapsed();
         let exit_failure = detect_retrying(&failing, Duration::from_secs(5));
         let unsupported = detect_retrying(&nosize, Duration::from_secs(5));
-        for d in [d1, d2, d3] {
+        let started = Instant::now();
+        let gc_limit = detect_retrying(&gc, Duration::from_millis(300));
+        let gc_elapsed = started.elapsed();
+        let slow_pid = read_pid(&slow, "pid");
+        let gc_pid = read_pid(&gc, "pid");
+        let grandchild = read_pid(&gc, "gc");
+        // 孫を残さない（テスト自身が kill する。数値は自分で書いたファイル由来）。
+        let _ = Command::new("kill").arg(grandchild.to_string()).status();
+        let slow_gone = process_gone(slow_pid);
+        let gc_gone = process_gone(gc_pid);
+        let grandchild_gone = process_gone(grandchild);
+        for d in [d1, d2, d3, d4] {
             let _ = std::fs::remove_dir_all(&d);
         }
         assert_eq!(
@@ -3299,28 +3363,41 @@ mod tests {
             TmpfsLimit::Undetected(TmpfsDetectFailure::TimedOut)
         );
         assert_eq!(
+            gc_limit,
+            TmpfsLimit::Undetected(TmpfsDetectFailure::TimedOut)
+        );
+        assert!(slow_elapsed < Duration::from_secs(2), "{slow_elapsed:?}");
+        assert!(gc_elapsed < Duration::from_secs(2), "{gc_elapsed:?}");
+        assert!(slow_gone, "sleep 30 remained (pid {slow_pid})");
+        assert!(gc_gone, "gc parent remained (pid {gc_pid})");
+        assert!(grandchild_gone, "grandchild remained (pid {grandchild})");
+        assert_eq!(
             exit_failure,
             TmpfsLimit::Undetected(TmpfsDetectFailure::ExitFailure)
         );
         assert_eq!(unsupported, TmpfsLimit::Unsupported);
     }
 
-    /// RENDER-3（#1498・#1502）: `--help` の出力が [`HELP_STDOUT_MAX`] を超える偽物は、`--size` を含んでいても
+    /// RENDER-3（#1498・#1502・#1508）: `--help` の出力が [`HELP_STDOUT_MAX`] を超える偽物は、`--size` を含んでいても
     /// `Undetected(OutputTooLarge)`（上限超は信頼しない）。出力後に居座っても時間切れ（`TimedOut`）を待たず、
-    /// 超過した時点で kill する。
+    /// 超過した時点で kill し、偽物のプロセスを残さない。
     #[cfg(target_os = "linux")]
     #[test]
     fn render3_detect_tmpfs_limit_oversized_help_kills_early() {
-        let body = "#!/bin/sh\nif [ \"$1\" = \"--help\" ]; then echo '    --size BYTES  tmpfs size'; i=0; while [ $i -lt 4000 ]; do echo 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'; i=$((i+1)); done; sleep 600; exit 0; fi\nexit 1\n";
+        let body = "#!/bin/sh\nif [ \"$1\" = \"--help\" ]; then echo $$ > \"$0.pid\"; echo '    --size BYTES  tmpfs size'; i=0; while [ $i -lt 4000 ]; do echo 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'; i=$((i+1)); done; exec sleep 600; fi\nexit 1\n";
         let (dir, fake) = fake_script("bigbwrap", body);
         let started = Instant::now();
         let limit = detect_retrying(&fake, Duration::from_secs(60));
+        let elapsed = started.elapsed();
+        let pid = read_pid(&fake, "pid");
+        let gone = process_gone(pid);
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(
             limit,
             TmpfsLimit::Undetected(TmpfsDetectFailure::OutputTooLarge)
         );
-        assert!(started.elapsed() < Duration::from_secs(30));
+        assert!(elapsed < Duration::from_secs(2), "{elapsed:?}");
+        assert!(gone, "fake bwrap remained (pid {pid})");
     }
 
     /// RENDER-3（#1498）: 実物の bwrap の `--help` 検出が、`--size` ありの版で `Capped`、無い版で

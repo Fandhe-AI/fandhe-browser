@@ -117,6 +117,9 @@ MAX_FD_DIAG_RECORDS = 64
 # verdict.json に載せる fd-diag 記録の件数の上限
 MAX_FD_DIAG_VERDICT_RECORDS = 8
 FD_DIAG_OUTCOMES = ("recovered", "vanished", "persistent")
+# `_read_fd_inodes` が denied で返す段階（listdir / readlink）。fd-diag の stage を固定カテゴリに丸める
+FD_DIAG_STAGES = ("listdir", "readlink")
+FD_DIAG_MAX_ERRNO = 4095  # Linux の MAX_ERRNO
 # judge() の kwarg 既定値（純関数のテスト・関数呼び出し用）。CLI は既定値を持たず、workflow が job env の
 # HOST_CAPTURE_MAX_PACKETS を tcpdump の -c と judge の --max-packets の両方へ明示で渡す（二重管理のずれを防ぐ。#1473）。
 DEFAULT_MAX_PACKETS = 300_000
@@ -281,7 +284,7 @@ def _fd_diag_verdict_record(rec: dict) -> dict:
     """fd-diag 記録を verdict.json に載せる許可キーへ絞る（#1497）。生の記録は samples.jsonl に残る。
 
     値は整数・有限な数値・固定カテゴリに丸め、/proc 由来の生文字列を verdict と Step Summary に入れない。
-    first / last の許可キーは fd_dir_owner・state・exe・stage（FD_DIAG_STAGES か unknown）・errno（0..4095 の整数か None）。
+    first / last の許可キーは fd_dir_owner・state・exe・stage（FD_DIAG_STAGES か unknown）・errno（1..4095 の整数か None。0 は失敗の errno ではないので None）。
     """
 
     def snap(v: object) -> dict | None:
@@ -291,7 +294,7 @@ def _fd_diag_verdict_record(rec: dict) -> dict:
         st = v.get("stage")
         out["stage"] = None if st is None else (st if isinstance(st, str) and st in FD_DIAG_STAGES else "unknown")
         en = v.get("errno")
-        ok = isinstance(en, int) and not isinstance(en, bool) and 0 <= en <= FD_DIAG_MAX_ERRNO
+        ok = isinstance(en, int) and not isinstance(en, bool) and 1 <= en <= FD_DIAG_MAX_ERRNO
         out["errno"] = en if ok else None
         return out
 
@@ -713,10 +716,6 @@ def _fd_diag_dropped(end: dict | None) -> int:
     val = (end or {}).get("fd_diag_dropped", 0)
     return val if isinstance(val, int) and not isinstance(val, bool) else 0
 
-
-# `_read_fd_inodes` が denied で返す段階（listdir / readlink）。fd-diag の stage を固定カテゴリに丸める
-FD_DIAG_STAGES = ("listdir", "readlink")
-FD_DIAG_MAX_ERRNO = 4095  # Linux の MAX_ERRNO
 
 _DIAG_CATEGORIES = frozenset(
     {"self", "root", "other", "unknown", "servo", "unreadable", "gone"} | set("RSDZTtXxIKWP")
