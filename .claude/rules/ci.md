@@ -89,7 +89,7 @@ cargo test --workspace
 
 ## 手動計測 workflow（`xos-measure.yml`。required に含めない）
 
-- `on: workflow_dispatch` のみ。`ci.yml` とは別 workflow で、PR・push では動かない。人間担当の計測 TASK-49（#292。CLI コンフォーマンステスト `harness/cli-conformance/`）と TASK-59（#294。PoC-1 代表タスク `harness/compat-practical/repeat_core.sh`）を 3 OS の GitHub ホステッドランナーで実行する。suite `egress-isolation`（#1387・TASK-38。`harness/egress-isolation/` を macOS・Windows で実測。ubuntu は対象外）と suite `egress-host`（#1437・TASK-38。render の `real_host` の `render3_egress_*` を隔離下で実行。ubuntu〔bubblewrap を apt で導入〕・macOS。Windows は対象外）も同 workflow にある（オーナー承認 2026-10-29: 実機の代替）。結果は Step Summary とアーティファクトに出すだけで、合否・OS 間の差の判定は人間が行う
+- `on: workflow_dispatch` のみ。`ci.yml` とは別 workflow で、PR・push では動かない。人間担当の計測 TASK-49（#292。CLI コンフォーマンステスト `harness/cli-conformance/`）と TASK-59（#294。PoC-1 代表タスク `harness/compat-practical/repeat_core.sh`）を 3 OS の GitHub ホステッドランナーで実行する。suite `egress-isolation`（#1387・TASK-38。`harness/egress-isolation/` を macOS・Windows で実測。ubuntu は対象外）と suite `egress-host`（#1437・TASK-38。render の `real_host` の `render3_egress_*` を隔離下で実行。ubuntu〔bubblewrap を apt で導入。ubuntu-latest と ubuntu-22.04 の matrix。22.04 は AppArmor の userns 制限なし。#1487〕・macOS。Windows は対象外）も同 workflow にある（オーナー承認 2026-10-29: 実機の代替）。結果は Step Summary とアーティファクトに出すだけで、合否・OS 間の差の判定は人間が行う
 - ここの check-run は required に登録しない（PR で pending のままになりマージできなくなる）。ジョブ名・構成の変更で ruleset の更新は要らない。`ci.yml` には手を入れない（`ci.yml` のジョブ追加・改名は ruleset の更新を伴う）。起動例は `gh workflow run xos-measure.yml -f suite=cli-conformance`
 
 ## ワークフロー変更時の注意
