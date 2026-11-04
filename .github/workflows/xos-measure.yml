@@ -765,8 +765,10 @@ jobs:
           case "$out" in "selftest ok:"*) ;; *) echo "error: unexpected --selftest output" >&2; exit 1 ;; esac
       # ubuntu-noaa のみ: AppArmor の unprivileged userns 制限を外す（#1487・#1457）。管理者操作は使い捨てランナー内に限る。
       # 書き換え後に読み直して 0 でなければ fail（fail-closed）。ファイルが無い場合も、このエントリの目的が成立しないため fail。
+      # 条件は label の文字列比較にする。apparmor_userns を持たないエントリでは値が null になり、
+      # `null == '0'` は両辺が数値 0 に変換されて true になるため（run 41816947001 で ubuntu でも実行された）。
       - name: "[egress-host] AppArmor の userns 制限を sysctl で 0 にする（ubuntu-noaa のみ。書き換える）"
-        if: ${{ matrix.apparmor_userns == '0' }}
+        if: ${{ matrix.label == 'ubuntu-noaa' }}
         run: |
           set -euo pipefail
           f=/proc/sys/kernel/apparmor_restrict_unprivileged_userns
