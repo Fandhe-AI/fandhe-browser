@@ -1056,6 +1056,8 @@ def _socket_owners(
 
     for pid in pids:
         kind, inodes, over, stage, errno_ = _read_fd_inodes(pid)
+        # 上限到達は denied・読み直しの結果によらず先に累積する（未走査 fd が残る観測欠落を落とさない）
+        hit = hit or over
         if kind == "denied" and pid in servo_pids:
             started = time.monotonic()
             start_time = _proc_starttime(pid)
@@ -1066,6 +1068,7 @@ def _socket_owners(
                 time.sleep(FD_READ_RETRY_SECONDS)
                 attempts += 1
                 kind, inodes, over, stage, errno_ = _read_fd_inodes(pid)
+                hit = hit or over
                 if kind != "denied":
                     now_start = _proc_starttime(pid)
                     reused = start_time is not None and now_start is not None and now_start != start_time
@@ -1083,8 +1086,6 @@ def _socket_owners(
             continue
         if kind != "ok":
             continue
-        if over:
-            hit = True
         for inode in inodes:
             owners.setdefault(inode, pid)
     return owners, hit, errors

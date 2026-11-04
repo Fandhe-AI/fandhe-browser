@@ -514,6 +514,14 @@ class FdReadRetryTests(unittest.TestCase):
                 p.stop()
         return res, len(sleeps)
 
+    def test_non_servo_denied_with_fd_limit_keeps_hit(self):
+        # fd 数が上限超かつ readlink が PermissionError の非 Servo pid でも fds-per-process-limit を保持する
+        other = 4_000_999
+        denied_over = ("denied", [], True, "readlink", 13)
+        res, _ = self._owners([denied_over], pids=[other])
+        hit = res[1]
+        self.assertTrue(hit)
+
     def test_transient_denied_recovers(self):
         diag = []
         (owners, hit, errors), sleeps = self._owners([self.DENIED, ("ok", [777], False, None, None)], diag=diag)
