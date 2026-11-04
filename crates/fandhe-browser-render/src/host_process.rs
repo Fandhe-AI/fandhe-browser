@@ -1229,9 +1229,15 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn render3_child_paths_use_canonical_workdir_via_symlinked_temp_root() {
-        let real = WorkDir::create(&std::env::temp_dir()).expect("real base");
+        // macOS の temp_dir は /private/var/folders/... と長く UDS パス上限を超えるため、
+        // macOS だけ短い /tmp 直下を使う（契約は弱めない）。
+        #[cfg(target_os = "macos")]
+        let base = std::path::PathBuf::from("/tmp");
+        #[cfg(not(target_os = "macos"))]
+        let base = std::env::temp_dir();
+        let real = WorkDir::create(&base).expect("real base");
         let link = real.path().join("link");
-        std::os::unix::fs::symlink(std::env::temp_dir(), &link).expect("symlink");
+        std::os::unix::fs::symlink(&base, &link).expect("symlink");
         let workdir = WorkDir::create(&link).expect("workdir");
         let canonical = isolation::socket_dir_for(workdir.path()).expect("socket dir");
         assert_ne!(canonical, workdir.path());
