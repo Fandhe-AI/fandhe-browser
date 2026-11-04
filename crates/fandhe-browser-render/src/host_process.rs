@@ -921,7 +921,7 @@ impl HostProcess {
     fn plan_isolation(
         &self,
         workdir: &WorkDir,
-    ) -> Result<(Plan, Option<PathBuf>), HostProcessError> {
+    ) -> Result<(Plan, Option<isolation::SocketDir>), HostProcessError> {
         let mode = self.config.egress_isolation;
         let availability = match self.config.isolation_probe {
             IsolationProbe::System => isolation::probe_sandbox(),
@@ -931,7 +931,12 @@ impl HostProcess {
         if !matches!(plan, Plan::Isolated(Sandbox::Bwrap { .. })) {
             return Ok((plan, None));
         }
-        match isolation::socket_dir_for(workdir.path()) {
+        // 親を隠せない（WorkDirParentNotHideable）などもここで `decide` を通り、`required` は拒否、
+        // `best-effort` は警告つきで隔離なしになる（#1492）。
+        let Plan::Isolated(Sandbox::Bwrap { hidden, .. }) = &plan else {
+            return Ok((plan, None));
+        };
+        match isolation::socket_dir_for(workdir.path(), hidden) {
             Ok(dir) => Ok((plan, Some(dir))),
             Err(reason) => Ok((isolation::decide(mode, Err(reason))?, None)),
         }
@@ -941,7 +946,7 @@ impl HostProcess {
     fn build_command(
         &mut self,
         plan: Plan,
-        socket_dir: Option<PathBuf>,
+        socket_dir: Option<isolation::SocketDir>,
     ) -> Result<Launch, HostProcessError> {
         let host = self.config.binary.path().to_path_buf();
         let sandbox = match plan {
@@ -965,7 +970,7 @@ impl HostProcess {
             Plan::Isolated(s) => s,
         };
         let endpoint = match (&sandbox, &socket_dir) {
-            (Sandbox::Bwrap { .. }, Some(dir)) => EgressEndpoint::UnixSocketIn(dir.clone()),
+            (Sandbox::Bwrap { .. }, Some(sd)) => EgressEndpoint::UnixSocketIn(sd.dir.clone()),
             (Sandbox::SandboxExec, _) => EgressEndpoint::LoopbackTcp,
             // plan_isolation が Bwrap に必ず dir を付ける。到達しない防御。
             (Sandbox::Bwrap { .. }, None) => return Err(self.fail_spawn()),
@@ -978,13 +983,21 @@ impl HostProcess {
             Err(_) => return Err(self.fail_spawn()),
         };
         let (program, args) = match (&sandbox, proxy.endpoint(), &socket_dir) {
-            (Sandbox::Bwrap { bwrap, hidden }, BoundEndpoint::Unix(path), Some(dir)) => {
+            (Sandbox::Bwrap { bwrap, hidden }, BoundEndpoint::Unix(path), Some(sd)) => {
                 if isolation::relay_socket_path_ok(path).is_err() {
                     return Err(self.fail_spawn());
                 }
                 // WorkDir（rw）と、隠れる場所にあるホストの実行ファイル（ro）だけを tmpfs の後に戻す。
                 // UDS が WorkDir の外なら隠れて届かないので起動失敗にする（#1485）。
-                match isolation::linux_argv(bwrap, hidden, dir, &host, path) {
+                // 親の tmpfs（兄弟 WorkDir の UDS を隠す。#1492）も同じ引数列に含める。
+                match isolation::linux_argv(
+                    bwrap,
+                    hidden,
+                    &sd.dir,
+                    sd.parent_to_hide.as_deref(),
+                    &host,
+                    path,
+                ) {
                     Some(v) => v,
                     None => return Err(self.fail_spawn()),
                 }
@@ -1012,7 +1025,8 @@ impl HostProcess {
         // 隔離（bwrap）時は tmpfs で隠れた後に戻るのは正規化済みの WorkDir だけなので、cwd と
         // 子の環境変数（HOME・TMPDIR・XDG_*）もそのパスから作る。temp_root が symlink 経由でも
         // 子の指し先が消えない（#1485）。
-        let (child_root, child_home, child_tmp) = child_paths(socket_dir.as_deref(), &workdir);
+        let (child_root, child_home, child_tmp) =
+            child_paths(socket_dir.as_ref().map(|sd| sd.dir.as_path()), &workdir);
         let mut launch = self.build_command(plan, socket_dir)?;
         let mut cmd = Command::new(&launch.program);
         cmd.args(&launch.args)
@@ -1239,7 +1253,10 @@ mod tests {
         let link = real.path().join("link");
         std::os::unix::fs::symlink(&base, &link).expect("symlink");
         let workdir = WorkDir::create(&link).expect("workdir");
-        let canonical = isolation::socket_dir_for(workdir.path()).expect("socket dir");
+        let hidden = isolation::HiddenPaths::new(std::path::PathBuf::from("/home/u"));
+        let canonical = isolation::socket_dir_for(workdir.path(), &hidden)
+            .expect("socket dir")
+            .dir;
         assert_ne!(canonical, workdir.path());
         let (cwd, home, tmp) = child_paths(Some(&canonical), &workdir);
         assert_eq!(cwd, canonical);
@@ -1304,7 +1321,9 @@ mod tests {
         #[cfg(not(target_os = "macos"))]
         let base = std::env::temp_dir();
         let workdir = WorkDir::create(&base).expect("workdir");
-        let dir = isolation::socket_dir_for(workdir.path()).expect("socket dir");
+        let hidden = isolation::HiddenPaths::new(std::path::PathBuf::from("/home/u"));
+        let socket_dir = isolation::socket_dir_for(workdir.path(), &hidden).expect("socket dir");
+        let dir = socket_dir.dir.clone();
         assert_eq!(
             dir,
             std::fs::canonicalize(workdir.path()).expect("canonicalize")
@@ -1327,11 +1346,11 @@ mod tests {
         // std に geteuid が無いため、このプロセスが bind したソケットの uid を自 uid として使う。
         assert_eq!(dir_meta.uid(), sock_meta.uid());
         // ホストへ渡す引数の末尾も同じソケットに繋がる。
-        let hidden = isolation::HiddenPaths::new(std::path::PathBuf::from("/home/u"));
         let (_, args) = isolation::linux_argv(
             std::path::Path::new("/usr/bin/bwrap"),
             &hidden,
             &dir,
+            socket_dir.parent_to_hide.as_deref(),
             std::path::Path::new("/host"),
             &sock,
         )

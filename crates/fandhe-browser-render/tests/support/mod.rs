@@ -50,10 +50,30 @@ pub fn send_error(out: &mut impl Write, id: u64, kind: &str) {
 
 pub fn fake_host() -> ! {
     let cwd = std::env::current_dir().expect("cwd");
-    let root = cwd.parent().expect("parent").to_path_buf();
+    let parent = cwd.parent().expect("parent").to_path_buf();
+    // bwrap で隔離されると WorkDir の親は tmpfs で覆われ、`scenario` などが見えない（#1492）。そのとき
+    // は WorkDir 自身を作業場所にし、シナリオと本体のプロセス id は親ディレクトリ名
+    // （`fhp-<テストの pid>-<シナリオ>`。名前は見える）から読む。
+    let isolated = !parent.join("scenario").exists();
+    let (root, isolated_name) = if isolated {
+        let name = parent
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        (cwd.clone(), Some(name))
+    } else {
+        (parent, None)
+    };
     append(&root.join("spawns"), "x");
     let n = count(&root, "spawns");
-    let text = std::fs::read_to_string(root.join("scenario")).expect("scenario");
+    let text = match &isolated_name {
+        Some(name) => name
+            .strip_prefix("fhp-")
+            .and_then(|r| r.split_once('-'))
+            .map(|(_, scenario)| scenario.to_string())
+            .expect("isolated root name fhp-<pid>-<scenario>"),
+        None => std::fs::read_to_string(root.join("scenario")).expect("scenario"),
+    };
     let lines: Vec<&str> = text.lines().collect();
     let scenario = lines
         .get(n - 1)
@@ -90,15 +110,36 @@ pub fn fake_host() -> ! {
             });
         // FS の可視性の観測（RENDER-3・#1485）: テスト側が `visibility-paths` に 1 行 1 パスで書いた
         // パスが、サンドボックスの内側から見えるか（`/tmp` の兄弟・`$HOME` の既存ファイルが隠れること）。
-        let visible: serde_json::Map<String, Value> =
-            std::fs::read_to_string(root.join("visibility-paths"))
-                .map(|t| {
-                    t.lines()
-                        .filter(|l| !l.is_empty())
-                        .map(|l| (l.to_string(), json!(std::fs::symlink_metadata(l).is_ok())))
-                        .collect()
-                })
-                .unwrap_or_default();
+        let listed: Vec<String> = match (
+            &isolated_name,
+            std::fs::read_to_string(root.join("visibility-paths")),
+        ) {
+            (_, Ok(t)) => t
+                .lines()
+                .filter(|l| !l.is_empty())
+                .map(String::from)
+                .collect(),
+            // 隔離時は親が見えないので、テストが置く番兵（`/tmp`・`/var/tmp`・`/dev/shm`）と
+            // このクレートの Cargo.toml を名前から組み立てる。
+            (Some(name), Err(_)) => {
+                let pid = name
+                    .strip_prefix("fhp-")
+                    .and_then(|r| r.split_once('-'))
+                    .map_or("0", |(p, _)| p);
+                let mut v = Vec::new();
+                for dir in ["/tmp", "/var/tmp", "/dev/shm"] {
+                    v.push(format!("{dir}/fb-hp-sentinel-{pid}"));
+                    v.push(format!("{dir}/fb-hp-sentinel-{pid}.sock"));
+                }
+                v.push(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml").to_string());
+                v
+            }
+            (None, Err(_)) => Vec::new(),
+        };
+        let visible: serde_json::Map<String, Value> = listed
+            .iter()
+            .map(|l| (l.clone(), json!(std::fs::symlink_metadata(l).is_ok())))
+            .collect();
         let obs = json!({
             "visible": visible,
             "proc_pids": proc_pids,
@@ -297,12 +338,14 @@ impl Root {
         std::fs::write(p.join("scenario"), scenario).expect("scenario");
         Self(p)
     }
-    /// bwrap が `/tmp` と `$HOME` を tmpfs で隠しても Root（偽ホストが `cwd.parent()` として読み書きする
-    /// `scenario`・`spawns`・`pid-N`・`obs-dump.json` の置き場）が見えるよう、隠れない `/var/tmp` に作る
-    /// （RENDER-3・#1485）。UDS のパス上限（`RELAY_UDS_PATH_MAX_BYTES`）を超えないよう短い名前にする。
+    /// bwrap は WorkDir の親も tmpfs で隠すため、隔離時の偽ホストは親の `scenario` などを読めない
+    /// （RENDER-3・#1485・#1492）。そこで偽ホストは WorkDir を作業場所にし、シナリオとテストの pid を
+    /// 親ディレクトリ名 `fhp-<pid>-<scenario>`（名前だけは見える）から読む。結果の読み取りは
+    /// `HostProcess::workdir_path()` を使う。UDS のパス上限（`RELAY_UDS_PATH_MAX_BYTES`）を超えない
+    /// よう、短い名前の `/tmp` 直下に作る。`tag` は呼び出し側の識別用（名前には使わない）。
     #[cfg(target_os = "linux")]
-    pub fn new_visible(tag: &str, scenario: &str) -> Self {
-        let p = PathBuf::from("/var/tmp").join(format!("fhp-{}-{tag}", std::process::id()));
+    pub fn new_visible(_tag: &str, scenario: &str) -> Self {
+        let p = PathBuf::from("/tmp").join(format!("fhp-{}-{scenario}", std::process::id()));
         // WorkDir 名（`fandhe-render-<pid>-<19 桁>-<連番>`）の最大長 + ソケット名で上限を確かめる。
         let worst = p.to_string_lossy().len()
             + "/fandhe-render-4194304-".len()
@@ -314,7 +357,7 @@ impl Root {
             "root {p:?} is too long for a relay UDS ({worst} bytes)"
         );
         let _ = std::fs::remove_dir_all(&p);
-        std::fs::create_dir_all(&p).expect("mkdir /var/tmp root (must be writable)");
+        std::fs::create_dir_all(&p).expect("mkdir /tmp root");
         std::fs::write(p.join("scenario"), scenario).expect("scenario");
         Self(p)
     }
@@ -361,7 +404,12 @@ pub fn short_timeouts() -> HostTimeouts {
 }
 
 pub fn child_pid(root: &Root, n: usize) -> u32 {
-    std::fs::read_to_string(root.0.join(format!("pid-{n}")))
+    child_pid_in(&root.0, n)
+}
+
+/// `dir`（偽ホストの作業場所。隔離時は WorkDir）にある `pid-<n>` を読む。
+pub fn child_pid_in(dir: &Path, n: usize) -> u32 {
+    std::fs::read_to_string(dir.join(format!("pid-{n}")))
         .expect("pid file")
         .trim()
         .parse()
