@@ -171,7 +171,33 @@ pub enum ProcTreeError {
 /// `real_host` の隔離下結合テストが、`resolve_wrapped_pid` の前提（ns 内 pid 1 の子がホスト 1 件）
 /// を実ホストで確かめるために使う診断用の値。children は全スレッド（tid）の和集合で数える
 /// （`/proc/<pid>/task/<tid>/children` はその tid が作った子だけを返すため）。
+///
+/// `host_process` が `#[doc(hidden)]` で再公開する診断用の型で、安定 API ではない。フィールドの追加を
+/// 破壊的変更にしないため `non_exhaustive`（外部 crate からは構築できず、読み取りだけができる。#1473）。
+///
+/// ```
+/// use fandhe_browser_render::host_process::{ProcTreeError, WrappedProcTree, walk_wrapped_proc_tree_live};
+/// // 存在しない pid は Err（推測で埋めない）。型とパスの存在確認も兼ねる。
+/// let r: Result<WrappedProcTree, ProcTreeError> = walk_wrapped_proc_tree_live(u32::MAX);
+/// assert!(r.is_err());
+/// ```
+///
+/// 外部 crate からのフィールド指定による構築はコンパイルエラー（`non_exhaustive`）:
+///
+/// ```compile_fail,E0639
+/// use fandhe_browser_render::host_process::WrappedProcTree;
+/// let _ = WrappedProcTree {
+///     wrapper_children: vec![],
+///     init_children: vec![],
+///     init_children_main_thread: vec![],
+///     host: None,
+///     host_descendants: vec![],
+///     host_threads: 0,
+///     truncated: false,
+/// };
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct WrappedProcTree {
     /// ラッパーの子（全 tid）。期待値は ns 内 pid 1 の 1 件。
     pub wrapper_children: Vec<u32>,
@@ -248,6 +274,12 @@ fn list_proc_tasks(pid: u32) -> Option<Vec<u32>> {
 /// 主スレッドの children を読む。1 回目が `None` なら短く待って 1 回だけ読み直す。
 /// 走査中のプロセスがゾンビ化・終了する競合で一瞬読めない場合のフレーク抑制（#1466）。
 /// 存続中のプロセスが 2 回とも読めなければ `None` のままで、呼び出し側が Err にする（fail-closed）。
+///
+/// 待ち時間の上限: 1 回の呼び出しで読み取りは最大 2 回、[`PROC_TREE_RETRY_DELAY`]（20ms）の sleep は最大 1 回。
+/// 呼ばれるのは各ノードの主スレッド（tid == pid）の読み取りと init の主スレッドだけなので、1 回の走査の sleep の
+/// 合計は最大 `20ms * (PROC_TREE_MAX_NODES + 3)`。実際に読めないのは消えたプロセスとの競合のときだけ。
+/// 診断用の経路（`real_host` の `EGRESS-PROCTREE`）だけで使い、本番の rss 監視からは呼ばれない。
+/// 呼び出し側の期限には従わない（必要になったら別 issue。#1473）。
 fn read_children_retry(read: &dyn Fn(&str) -> Option<String>, path: &str) -> Option<String> {
     read(path).or_else(|| {
         std::thread::sleep(PROC_TREE_RETRY_DELAY);
@@ -795,6 +827,29 @@ mod tests {
                 path: "/proc/77/task/77/children".to_string()
             })
         );
+    }
+
+    /// RENDER-3（#1473）: 読み直しは最大 1 回（読み取り 2 回）。常に読めない path でも 3 回目は読まない。
+    #[test]
+    fn render3_read_children_retry_is_bounded_to_two_reads() {
+        let calls = std::cell::Cell::new(0u32);
+        let never = |_: &str| {
+            calls.set(calls.get() + 1);
+            None
+        };
+        assert_eq!(read_children_retry(&never, "/proc/1/task/1/children"), None);
+        assert_eq!(calls.get(), 2);
+        // 1 回目で読めれば読み直さない
+        calls.set(0);
+        let ok = |_: &str| {
+            calls.set(calls.get() + 1);
+            Some("5".to_string())
+        };
+        assert_eq!(
+            read_children_retry(&ok, "/proc/1/task/1/children"),
+            Some("5".to_string())
+        );
+        assert_eq!(calls.get(), 1);
     }
 
     /// RENDER-3（#1460）: 循環は二重に数えず、深すぎるツリーは truncated で打ち切る。

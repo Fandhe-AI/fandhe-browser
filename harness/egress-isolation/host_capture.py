@@ -34,10 +34,12 @@ from __future__ import annotations
 import argparse
 import bisect
 import json
+import math
 import os
 import re
 import signal
 import socket
+import subprocess
 import sys
 import time
 from collections import Counter
@@ -59,11 +61,19 @@ MAX_SAMPLE_BYTES = 64 * 1024 * 1024
 MAX_SOCKETS_PER_SAMPLE = 512
 MAX_JSONL_LINE_CHARS = 262_144
 MAX_PACKET_LINE_CHARS = 1024
-# ローカル実行の既定値。workflow は job env の HOST_CAPTURE_MAX_PACKETS を tcpdump の -c と judge の --max-packets の
-# 両方へ明示的に渡して一本化する（二重管理のずれを防ぐ）。
+# judge() の kwarg 既定値（純関数のテスト・関数呼び出し用）。CLI は既定値を持たず、workflow が job env の
+# HOST_CAPTURE_MAX_PACKETS を tcpdump の -c と judge の --max-packets の両方へ明示で渡す（二重管理のずれを防ぐ。#1473）。
 DEFAULT_MAX_PACKETS = 300_000
 UNATTRIBUTED_TOP_N = 10
 ATTRIBUTION_WINDOW_SECONDS = 0.5
+# 帰属できない DNS・UDP を数える Servo の観測区間の両端に足す余裕（秒）。サンプリング間隔（200ms）より広く、
+# 起動直後・終了直前の送信が [最初のサンプル, 最後のサンプル] から漏れるのを防ぐ。件数（参考値）にだけ効かせ、
+# 陽性対照（canary_in_window）と最終カナリアの閾値は生の区間のまま（広げると pass しやすくなる・閾値が最終カナリアを追い越す。#1473）。
+WINDOW_SLACK_SECONDS = ATTRIBUTION_WINDOW_SECONDS
+# wait-final-canary の待ち時間の既定と上限（秒）
+WAIT_CANARY_DEFAULT_TIMEOUT = 15.0
+WAIT_CANARY_MAX_TIMEOUT = 60.0
+WAIT_CANARY_DEFAULT_INTERVAL = 0.5
 # final_canary_t と pcap 上の時刻（マイクロ秒切り捨て）の比較に許す下駄（秒）。
 FINAL_CANARY_EPSILON_SECONDS = 0.001
 UNPARSED_RATIO_LIMIT = 0.01
@@ -89,7 +99,7 @@ _LINE_RE = re.compile(
 _HOSTPORT_RE = re.compile(r"^(?P<host>[0-9a-fA-F:.]+?)\.(?P<port>\d{1,5})$")
 _CANARY_PAYLOAD = b"fandhe-host-capture-canary"
 # 解析できない行・proto=other の行に UDP・DNS の痕跡があるかの判定（非先頭フラグメントは `ip-proto-17` と出る）
-_UDP_TEXT_RE = re.compile(r"ip-proto-17|\bUDP\b|\.53(?=[:\s,]|$)")
+_UDP_TEXT_RE = re.compile(r"ip-proto-17|\bUDP\b|\.53(?=[:\s,]|$)", re.IGNORECASE)
 _ICMP_RE = re.compile(r"\bICMP6?\b")
 
 
@@ -322,6 +332,49 @@ def attribute(index: SampleIndex, pkt: dict, window: float = ATTRIBUTION_WINDOW_
     return ROLE_NONE
 
 
+def _valid_final_canary_t(
+    end: dict | None, window: tuple[float, float] | None
+) -> tuple[float | None, str | None]:
+    """end 記録の final_canary_t を検証して (値, 不正理由) を返す。judge と wait-final-canary が共用する（#1473）。
+
+    キー無し・None は (None, None)。bool・非数値・NaN/inf・最後の Servo サンプルより前（window[1] 未満）は
+    (None, 理由) で、呼び出し側は観測不能にする（-inf で閾値が window[1] に落ち通常のカナリアが通るのを防ぐ）。
+    """
+    raw = end.get("final_canary_t") if end else None
+    if raw is None:
+        return None, None
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)) or not math.isfinite(raw):
+        return None, f"final_canary_t is invalid (not a finite number at or after the last Servo sample): {raw!r}"
+    if window is not None and raw < window[1]:
+        return None, f"final_canary_t is invalid (not a finite number at or after the last Servo sample): {raw!r}"
+    return float(raw), None
+
+
+def _final_canary_threshold(final_canary_t: float, window: tuple[float, float] | None) -> float:
+    """最終カナリアとみなす pcap 時刻の下限。judge と wait-final-canary で二重定義しない。"""
+    threshold = final_canary_t - FINAL_CANARY_EPSILON_SECONDS
+    if window is not None:
+        threshold = max(threshold, window[1])
+    return threshold
+
+
+def final_canary_observed(
+    packets: Iterable[dict], canary_port: int, final_canary_t: float, window: tuple[float, float] | None = None
+) -> bool:
+    """パケット列に最終カナリア（lo 上の canary_port 発 UDP で閾値以降）があるか。stop ステップのポーリング用。"""
+    threshold = _final_canary_threshold(final_canary_t, window)
+    for pkt in packets:
+        if (
+            pkt.get("iface") == "lo"
+            and pkt.get("dir") in ("Out", "In")
+            and pkt.get("proto") == "udp"
+            and pkt.get("sport") == canary_port
+            and pkt.get("ts", 0.0) >= threshold
+        ):
+            return True
+    return False
+
+
 def _empty_counts() -> dict:
     return {role: {c: 0 for c in CATEGORIES} for role in (ROLE_ISOLATED, ROLE_UNISOLATED, ROLE_SELF, ROLE_OTHER, ROLE_NONE)}
 
@@ -358,15 +411,14 @@ def judge(
     window = index.isolated_window()
     canary_in_window = 0
     canary_after_last = 0
-    final_canary_t = index.end.get("final_canary_t") if index.end else None
-    if isinstance(final_canary_t, bool) or not isinstance(final_canary_t, (int, float)):
-        final_canary_t = None
-    # pcap の時刻表記（マイクロ秒切り捨て）との差を吸収する下駄。通常カナリア（2 秒間隔）を最終扱いしない幅に留める。
+    count_window = (
+        (window[0] - WINDOW_SLACK_SECONDS, window[1] + WINDOW_SLACK_SECONDS) if window is not None else None
+    )
+    final_canary_t, final_canary_invalid = _valid_final_canary_t(index.end, window)
+    # pcap の時刻表記（マイクロ秒切り捨て）との差を吸収する下駄は閾値側に含む。通常カナリア（2 秒間隔）を最終扱いしない幅に留める。
     after_threshold: float | None = None
     if final_canary_t is not None:
-        after_threshold = float(final_canary_t) - FINAL_CANARY_EPSILON_SECONDS
-        if window is not None:
-            after_threshold = max(after_threshold, window[1])
+        after_threshold = _final_canary_threshold(final_canary_t, window)
     other_udp_like = 0
     win_counts = {"dns": 0, "udp_other": 0}
     win_dests: Counter = Counter()
@@ -400,8 +452,8 @@ def judge(
         if (
             role == ROLE_NONE
             and cat in win_counts
-            and window is not None
-            and window[0] <= pkt["ts"] <= window[1]
+            and count_window is not None
+            and count_window[0] <= pkt["ts"] <= count_window[1]
         ):
             win_counts[cat] += 1
             win_dests[(str(pkt.get("dst")), pkt.get("dport"))] += 1
@@ -473,7 +525,9 @@ def judge(
         unobs.append(f"{index.bad_lines} malformed sample line(s)")
     if index.lines_over_limit:
         unobs.append(f"samples file exceeded the line limit ({index.lines_over_limit} line(s) not read)")
-    if index.end is not None and final_canary_t is None:
+    if final_canary_invalid is not None:
+        unobs.append(final_canary_invalid)
+    elif index.end is not None and final_canary_t is None:
         unobs.append("sampler end record has no final_canary_t (the final canary was not sent)")
     elif final_canary_t is not None and canary_after_last == 0:
         unobs.append(
@@ -507,6 +561,8 @@ def judge(
         "other_udp_like": other_udp_like,
         "unattributed_in_servo_window": {
             "window": list(window) if window is not None else None,
+            "counted_window": list(count_window) if count_window is not None else None,
+            "slack_seconds": WINDOW_SLACK_SECONDS,
             "dns": win_counts["dns"],
             "udp_other": win_counts["udp_other"],
             "destinations": [
@@ -554,9 +610,13 @@ def render_summary(v: dict) -> str:
     u = v["unattributed_in_servo_window"]
     win = u["window"]
     span = f"[{win[0]:.3f}..{win[1]:.3f}]" if win else "n/a"
+    cwin = u.get("counted_window")
+    counted = (
+        f" (counted over [{cwin[0]:.3f}..{cwin[1]:.3f}], +/-{u.get('slack_seconds', 0)} s slack)" if cwin else ""
+    )
     lines += [
         "",
-        f"- unattributed DNS/UDP within the isolated Servo window {span}: dns={u['dns']} udp_other={u['udp_other']}",
+        f"- unattributed DNS/UDP within the isolated Servo window {span}{counted}: dns={u['dns']} udp_other={u['udp_other']}",
         "",
         "| dst | dport | count |",
         "| --- | ---: | ---: |",
@@ -1044,6 +1104,61 @@ def run_sampler(
     return 0
 
 
+def _poll_pcap_once(pcap: Path, canary_port: int, final_canary_t: float, window: tuple[float, float] | None) -> bool:
+    """pcap を tcpdump -r で 1 回読み、最終カナリアがあるかを返す。
+
+    書きかけの pcap は truncation で tcpdump が非 0 を返すことがあるが手前のパケットは出るため、終了コードは無視して
+    stdout だけを見る。引数はリスト（shell=False）。port は呼び出し側が int・範囲を検証済み。
+    """
+    try:
+        proc = subprocess.run(
+            ["tcpdump", "-r", str(pcap), "-nn", "-tt", f"udp and src port {canary_port}"],
+            capture_output=True,
+            timeout=10,
+            check=False,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return False
+    packets = []
+    for n, raw in enumerate(proc.stdout.decode("utf-8", errors="replace").splitlines()):
+        if n >= DEFAULT_MAX_PACKETS:
+            break
+        pkt = parse_tcpdump_line(raw[:MAX_PACKET_LINE_CHARS])
+        if pkt is not None:
+            packets.append(pkt)
+    return final_canary_observed(packets, canary_port, final_canary_t, window)
+
+
+def cmd_wait_final_canary(args: argparse.Namespace) -> int:
+    """workflow の stop ステップから SIGINT の前に呼ばれる。最終カナリアが pcap に入るまで待つ（#1473 P2）。
+
+    0: 観測した / 1: 時間切れ / 2: samples から port・final_canary_t を得られない。いずれも合否は judge が決める。
+    """
+    out_dir = Path(args.out_dir)
+    timeout = max(0.0, min(float(args.timeout), WAIT_CANARY_MAX_TIMEOUT))
+    interval = max(0.05, min(float(args.interval), 5.0))
+    samples = out_dir / "samples.jsonl"
+    if not samples.is_file():
+        sys.stdout.write("note: samples file is missing; cannot wait for the final canary\n")
+        return 2
+    index = load_samples(samples)
+    window = index.isolated_window()
+    port = index.meta.get("canary_port") if index.meta else None
+    final_t, invalid = _valid_final_canary_t(index.end, window)
+    if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535 or final_t is None:
+        sys.stdout.write(f"note: cannot wait for the final canary ({invalid or 'port or final_canary_t unavailable'})\n")
+        return 2
+    pcap = out_dir / "capture.pcap"
+    deadline = time.monotonic() + timeout
+    while True:
+        if _poll_pcap_once(pcap, port, final_t, window):
+            return 0
+        if time.monotonic() >= deadline:
+            sys.stdout.write(f"note: final canary not seen in pcap within {timeout:g}s\n")
+            return 1
+        time.sleep(interval)
+
+
 def cmd_sample(args: argparse.Namespace) -> int:
     servo_exe = os.path.realpath(args.servo_exe)
     interval = max(0.05, min(args.interval_ms / 1000.0, 5.0))
@@ -1071,8 +1186,13 @@ def main(argv: list[str] | None = None) -> int:
     s.set_defaults(func=cmd_sample)
     j = sub.add_parser("judge", help="capture.txt と samples.jsonl から verdict を出す")
     j.add_argument("--out-dir", required=True)
-    j.add_argument("--max-packets", type=_positive_int, default=DEFAULT_MAX_PACKETS)
+    j.add_argument("--max-packets", type=_positive_int, required=True)
     j.set_defaults(func=cmd_judge)
+    w = sub.add_parser("wait-final-canary", help="pcap に最終カナリアが現れるまで上限つきでポーリングする")
+    w.add_argument("--out-dir", required=True)
+    w.add_argument("--timeout", type=float, default=WAIT_CANARY_DEFAULT_TIMEOUT)
+    w.add_argument("--interval", type=float, default=WAIT_CANARY_DEFAULT_INTERVAL)
+    w.set_defaults(func=cmd_wait_final_canary)
     args = ap.parse_args(argv)
     return args.func(args)
 

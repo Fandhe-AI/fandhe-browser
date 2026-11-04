@@ -165,7 +165,7 @@ Windows の補足（#1401）: `xos-measure.yml` の Windows ジョブに限り�
 
 未測定（残りの追跡は §9.2）:
 
-- Servo 自身の DNS・UDP 送信の外部観測（root か `CAP_NET_ADMIN` が要る）。#1461 で xos-measure の `egress-host-ubuntu` に host-capture（tcpdump とサンプラーによる帰属判定）を追加した。実測はマージ後で、結果は未記録。帰属できない DNS・UDP は記録だけで合否に使わず（案 A・#1457）、Servo の観測区間内の件数と宛先の上位 10 件を Summary と `verdict.json` に出す（#1467）。キャプチャの終端はサンプラーの最終カナリア（`end` 記録の `final_canary_t` 以降に観測されたサンプラー帰属のカナリア）で確かめ、観測されなければ観測不能とする（#1470 の回帰。最後のパケットの時刻との比較は廃止）。`servo_unisolated` には `render3_egress_required_blocks_direct_websocket` が意図して起動する隔離なしの対照ホストが現れうるが、判定は fail にしない
+- Servo 自身の DNS・UDP 送信の外部観測（root か `CAP_NET_ADMIN` が要る）。#1461 で xos-measure の `egress-host-ubuntu` に host-capture（tcpdump とサンプラーによる帰属判定）を追加した。実測はマージ後で、結果は未記録。帰属できない DNS・UDP は記録だけで合否に使わず（案 A・#1457）、Servo の観測区間内の件数と宛先の上位 10 件を Summary と `verdict.json` に出す（#1467）。キャプチャの終端はサンプラーの最終カナリア（`end` 記録の `final_canary_t` 以降に観測されたサンプラー帰属のカナリア）で確かめ、観測されなければ観測不能とする（#1470 の回帰。最後のパケットの時刻との比較は廃止）。件数を数える区間には両端 0.5 秒の余裕を足し（陽性対照と終端の閾値には足さない）、stop ステップの固定の待ちは pcap に最終カナリアが現れるまで上限つきでポーリングする方式に置き換えた（#1473）。`servo_unisolated` には `render3_egress_required_blocks_direct_websocket` が意図して起動する隔離なしの対照ホストが現れうるが、判定は fail にしない
 - Landlock ルールの適用・seccomp・許可リスト付きプロキシとの併用（§7 の承認事項）
 - macOS・Windows（#1387）、AppArmor の制限が無い環境・古いカーネル
 

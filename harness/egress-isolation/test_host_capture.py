@@ -453,6 +453,12 @@ class SamplerTests(unittest.TestCase):
         _s, _k, limits = self._take_sample_for_servo_pid(PermissionError(13, "denied"))
         self.assertEqual(limits, ["proc-read-error:fd-4000123"])
 
+    def test_eacces_on_non_servo_pid_is_not_recorded(self):
+        # Servo 以外の pid の fd の EACCES は帰属不能が前提で記録しない（#1473 D）
+        with mock.patch.object(hc.os, "listdir", side_effect=PermissionError(13, "denied")):
+            owners, hit, errors = hc._socket_owners([4_000_999], frozenset({4_000_123}))
+        self.assertEqual((owners, hit, errors), ({}, False, []))
+
     def test_table_read_error_makes_judge_unobservable(self):
         with tempfile.TemporaryDirectory() as d:
             out = Path(d) / "samples.jsonl"
@@ -504,6 +510,8 @@ class UdpHintTests(unittest.TestCase):
         self.assertTrue(hc.suspicious_udp_text(line(1.0, "eth0", "Out", "10.0.0.5 > 8.8.8.8: ip-proto-17, length 40")))
         self.assertTrue(hc.suspicious_udp_text(line(1.0, "eth0", "Out", "10.0.0.5.5000 > 8.8.8.8.53: broken")))
         self.assertTrue(hc.suspicious_udp_text("garbage UDP, length 5"))
+        self.assertTrue(hc.suspicious_udp_text("garbage udp, length 5"))
+        self.assertTrue(hc.suspicious_udp_text("garbage Udp, length 5"))
         self.assertFalse(hc.suspicious_udp_text(line(1.0, "eth0", "Out", "10.0.0.5 > 8.8.8.8: ICMP 8.8.8.8 udp port 53 unreachable, length 36")))
         self.assertFalse(hc.suspicious_udp_text("1.000000 eth0  Out ARP, Request who-has 10.0.0.1 tell 10.0.0.5, length 28"))
 
@@ -634,6 +642,10 @@ class CoverageTests(unittest.TestCase):
     def test_max_packets_argument_rejects_zero(self):
         with self.assertRaises(SystemExit), mock.patch("sys.stderr"):
             hc.main(["judge", "--out-dir", "/nonexistent", "--max-packets", "0"])
+        # CLI は既定値を持たない（#1473）。省略は argparse エラー（exit code 2）
+        with self.assertRaises(SystemExit) as cm, mock.patch("sys.stderr"):
+            hc.main(["judge", "--out-dir", "/nonexistent"])
+        self.assertEqual(cm.exception.code, 2)
         with self.assertRaises(argparse.ArgumentTypeError):
             hc._positive_int("0")
         self.assertEqual(hc._positive_int("300000"), 300000)
@@ -671,6 +683,9 @@ class UnattributedWindowTests(unittest.TestCase):
         self.assertEqual((u["dns"], u["udp_other"], u["destinations"]), (0, 0, []))
         self.assertEqual(u["window"][0], 100.0)
         self.assertAlmostEqual(u["window"][1], 100.6)
+        self.assertAlmostEqual(u["counted_window"][0], 99.5)
+        self.assertAlmostEqual(u["counted_window"][1], 101.1)
+        self.assertEqual(u["slack_seconds"], 0.5)
 
     def test_destinations_are_cut_to_top_n(self):
         lines = [CANARY_LINE, FINAL_CANARY_LINE, OUT_TCP]
@@ -692,7 +707,7 @@ class UnattributedWindowTests(unittest.TestCase):
         self.assertEqual((u["dns"], u["udp_other"]), (1, 0))
         self.assertEqual(u["destinations"], [{"dst": "8.8.8.8", "dport": 53, "count": 1}])
         summary = hc.render_summary(v)
-        self.assertIn("unattributed DNS/UDP within the isolated Servo window [100.000..100.600]: dns=1 udp_other=0", summary)
+        self.assertIn("unattributed DNS/UDP within the isolated Servo window [100.000..100.600] (counted over [99.500..101.100], +/-0.5 s slack): dns=1 udp_other=0", summary)
         self.assertIn("| 8.8.8.8 | 53 | 1 |", summary)
         self.assertIn("unattributed DNS/UDP cannot be ruled out as Servo's", summary)
 
@@ -707,8 +722,191 @@ class UnattributedWindowTests(unittest.TestCase):
     def test_zero_count_line_is_still_in_summary(self):
         v = run([CANARY_LINE, FINAL_CANARY_LINE, OUT_TCP], make_index())
         summary = hc.render_summary(v)
-        self.assertIn("within the isolated Servo window [100.000..100.600]: dns=0 udp_other=0", summary)
+        self.assertIn("within the isolated Servo window [100.000..100.600] (counted over [99.500..101.100], +/-0.5 s slack): dns=0 udp_other=0", summary)
         self.assertIn("| none | | |", summary)
+
+
+def _end_idx(final):
+    idx = make_index(end=False)
+    idx.feed({"type": "end", "t": 101.0, "truncated": False, "reason": "stop", "final_canary_t": final})
+    return idx
+
+
+class SlackAndTerminationTests(unittest.TestCase):
+    """#1473: 観測区間の余裕・最終カナリアの検証・stop ステップのポーリング。"""
+
+    def test_unattributed_dns_just_before_first_sample_is_counted_with_slack(self):
+        base = [CANARY_LINE, FINAL_CANARY_LINE, OUT_TCP]
+        inside = line(99.7, "eth0", "Out", "10.0.0.5.5000 > 8.8.8.8.53: UDP, length 5")
+        v = run(base + [inside], make_index())
+        self.assertEqual(v["verdict"], "pass", v)
+        self.assertEqual(v["unattributed_in_servo_window"]["dns"], 1)
+        outside = line(99.4, "eth0", "Out", "10.0.0.5.5000 > 8.8.8.8.53: UDP, length 5")
+        v = run(base + [outside], make_index())
+        self.assertEqual(v["unattributed_in_servo_window"]["dns"], 0)
+        self.assertEqual(v["counts"][hc.ROLE_NONE]["dns"], 1)
+        end_in = line(101.05, "eth0", "Out", "10.0.0.5.5000 > 8.8.8.8.53: UDP, length 5")
+        end_out = line(101.2, "eth0", "Out", "10.0.0.5.5000 > 8.8.8.8.53: UDP, length 5")
+        self.assertEqual(run(base + [end_in], make_index())["unattributed_in_servo_window"]["dns"], 1)
+        self.assertEqual(run(base + [end_out], make_index())["unattributed_in_servo_window"]["dns"], 0)
+
+    def test_slack_does_not_widen_canary_window(self):
+        # 区間の外（余裕の内側）のカナリアしか無いなら陽性対照は成立しない
+        early = line(99.8, "lo", "Out", f"127.0.0.1.{CANARY} > 127.0.0.1.50000: UDP, length 26")
+        v = run([early, FINAL_CANARY_LINE, OUT_TCP], make_index())
+        self.assertEqual(v["verdict"], "unobservable")
+        self.assertEqual(v["canary"]["in_servo_window"], 0)
+
+    def test_missing_final_canary_packet_is_unobservable(self):
+        v = run([CANARY_LINE, OUT_TCP, LATE_ACK], make_index())
+        self.assertEqual(v["verdict"], "unobservable")
+        self.assertTrue(
+            any(r.startswith("final canary not observed after the last Servo sample") for r in v["unobservable_reasons"]),
+            v["unobservable_reasons"],
+        )
+
+    def test_epsilon_boundary(self):
+        def mk(ts):
+            return line(ts, "lo", "Out", f"127.0.0.1.{CANARY} > 127.0.0.1.50000: UDP, length 26")
+
+        ok = run([CANARY_LINE, mk(100.6495), OUT_TCP], make_index())
+        self.assertEqual(ok["verdict"], "pass", ok)
+        ng = run([CANARY_LINE, mk(100.648), OUT_TCP], make_index())
+        self.assertEqual(ng["verdict"], "unobservable")
+        self.assertTrue(any("final canary not observed" in r for r in ng["unobservable_reasons"]))
+
+    def test_invalid_final_canary_t_is_unobservable(self):
+        for bad in (float("nan"), float("inf"), float("-inf"), True, "100.65", 100.0):
+            with self.subTest(bad=bad):
+                v = run([CANARY_LINE, OUT_TCP], _end_idx(bad))
+                self.assertEqual(v["verdict"], "unobservable", v)
+                self.assertTrue(
+                    any(r.startswith("final_canary_t is invalid") for r in v["unobservable_reasons"]),
+                    v["unobservable_reasons"],
+                )
+
+    def test_valid_final_canary_t_helper(self):
+        self.assertEqual(hc._valid_final_canary_t({"final_canary_t": 100.65}, (100.0, 100.6)), (100.65, None))
+        self.assertEqual(hc._valid_final_canary_t({}, (100.0, 100.6)), (None, None))
+        self.assertEqual(hc._valid_final_canary_t(None, None), (None, None))
+
+    def test_final_canary_observed_boundaries(self):
+        def mk(ts, iface="lo", port=CANARY):
+            return pkts(line(ts, iface, "Out", f"127.0.0.1.{port} > 127.0.0.1.50000: UDP, length 26"))
+
+        w = (100.0, 100.6)
+        self.assertTrue(hc.final_canary_observed(mk(100.649), CANARY, 100.65, w))
+        self.assertFalse(hc.final_canary_observed(mk(100.648999), CANARY, 100.65, w))
+        self.assertFalse(hc.final_canary_observed(mk(100.7, port=CANARY + 1), CANARY, 100.65, w))
+        self.assertFalse(hc.final_canary_observed(mk(100.7, iface="eth0"), CANARY, 100.65, w))
+
+    def _wait_dir(self, d, end=True, final=100.65):
+        out = Path(d)
+        recs = [
+            {"type": "meta", "self_netns": SELF_NS, "canary_port": CANARY, "pid": 10},
+            {"type": "sample", "t": 100.0, "servo": [{"pid": 200, "bwrap": True, "netns": ISO_NS}], "sockets": []},
+            {"type": "tick", "t": 100.6},
+        ]
+        if end:
+            recs.append({"type": "end", "t": 101.0, "truncated": False, "reason": "stop", "final_canary_t": final})
+        (out / "samples.jsonl").write_text("\n".join(json.dumps(r) for r in recs) + "\n")
+        return type("A", (), {"out_dir": str(out), "timeout": 15.0, "interval": 0.1})()
+
+    @staticmethod
+    def _proc(stdout):
+        return type("P", (), {"stdout": stdout.encode(), "returncode": 1})()
+
+    def test_wait_final_canary_succeeds_on_second_poll(self):
+        final = FINAL_CANARY_LINE + "\n"
+        with tempfile.TemporaryDirectory() as d:
+            ns = self._wait_dir(d)
+            with mock.patch.object(hc.subprocess, "run", side_effect=[self._proc(""), self._proc(final)]) as run_, \
+                 mock.patch.object(hc.time, "sleep"):
+                self.assertEqual(hc.cmd_wait_final_canary(ns), 0)
+            self.assertEqual(run_.call_count, 2)
+            args = run_.call_args.args[0]
+            self.assertEqual(args, ["tcpdump", "-r", str(Path(d) / "capture.pcap"), "-nn", "-tt", f"udp and src port {CANARY}"])
+            self.assertNotIn("shell", run_.call_args.kwargs)
+
+    def test_wait_final_canary_times_out(self):
+        with tempfile.TemporaryDirectory() as d:
+            ns = self._wait_dir(d)
+            clock = iter([0.0, 5.0, 10.0, 16.0, 20.0, 30.0])
+            with mock.patch.object(hc.subprocess, "run", return_value=self._proc("")), \
+                 mock.patch.object(hc.time, "sleep"), mock.patch.object(hc.time, "monotonic", side_effect=lambda: next(clock)), \
+                 mock.patch("sys.stdout"):
+                self.assertEqual(hc.cmd_wait_final_canary(ns), 1)
+
+    def test_wait_final_canary_tcpdump_missing_is_not_success(self):
+        with tempfile.TemporaryDirectory() as d:
+            ns = self._wait_dir(d)
+            clock = iter([0.0, 20.0, 40.0])
+            with mock.patch.object(hc.subprocess, "run", side_effect=FileNotFoundError), \
+                 mock.patch.object(hc.time, "sleep"), mock.patch.object(hc.time, "monotonic", side_effect=lambda: next(clock)), \
+                 mock.patch("sys.stdout"):
+                self.assertEqual(hc.cmd_wait_final_canary(ns), 1)
+
+    def test_wait_final_canary_invalid_inputs_do_not_run_tcpdump(self):
+        for kw in ({"end": False}, {"final": float("nan")}, {"final": 100.0}):
+            with self.subTest(kw=kw), tempfile.TemporaryDirectory() as d:
+                ns = self._wait_dir(d, **kw)
+                with mock.patch.object(hc.subprocess, "run") as run_, mock.patch("sys.stdout"):
+                    self.assertEqual(hc.cmd_wait_final_canary(ns), 2)
+                run_.assert_not_called()
+        with tempfile.TemporaryDirectory() as d, mock.patch("sys.stdout"):
+            self.assertEqual(hc.cmd_wait_final_canary(type("A", (), {"out_dir": d, "timeout": 1.0, "interval": 0.1})()), 2)
+
+    def test_missing_individual_files_are_unobservable(self):
+        # upload-artifact の if-no-files-found は個々の欠落を検出しない。欠落は judge が unobservable にする前提（#1473 C）
+        cases = {
+            "tcpdump.exit": "tcpdump exit status is missing",
+            "tcpdump.stderr": "kernel drop statistics are missing",
+            "samples.jsonl": "capture text or samples file is missing",
+        }
+        for missing, reason in cases.items():
+            with self.subTest(missing=missing), tempfile.TemporaryDirectory() as d:
+                out = Path(d)
+                (out / "capture.txt").write_text(CANARY_LINE + "\n" + FINAL_CANARY_LINE + "\n" + OUT_TCP + "\n")
+                recs = [
+                    {"type": "meta", "self_netns": SELF_NS, "canary_port": CANARY, "pid": 10},
+                    {"type": "sample", "t": 100.0, "servo": [{"pid": 200, "bwrap": True, "netns": ISO_NS}],
+                     "sockets": [{"proto": "udp", "port": CANARY, "pid": 10, "role": "self"}]},
+                    {"type": "tick", "t": 100.5},
+                    {"type": "end", "t": 101.0, "truncated": False, "reason": "stop", "final_canary_t": 100.65},
+                ]
+                (out / "samples.jsonl").write_text("\n".join(json.dumps(r) for r in recs) + "\n")
+                (out / "tcpdump.exit").write_text("0\n")
+                (out / "convert.exit").write_text("0\n")
+                (out / "tcpdump.stderr").write_text("0 packets dropped by kernel\n")
+                (out / missing).unlink()
+                ns = type("A", (), {"out_dir": str(out), "max_packets": 1000})()
+                with mock.patch("sys.stdout"):
+                    self.assertEqual(hc.cmd_judge(ns), 1)
+                v = json.loads((out / "verdict.json").read_text())
+                self.assertEqual(v["verdict"], "unobservable")
+                self.assertTrue(any(reason in r for r in v["unobservable_reasons"]), v["unobservable_reasons"])
+
+
+@unittest.skipUnless(sys.platform == "linux", "/proc is Linux only")
+class FinalCanarySendFailureTests(unittest.TestCase):
+    def test_sendto_oserror_leaves_no_final_canary_t(self):
+        real = socket.socket
+
+        class Boom(real):
+            def sendto(self, *a, **k):
+                raise OSError("boom")
+
+        with tempfile.TemporaryDirectory() as d:
+            out = Path(d) / "samples.jsonl"
+            with mock.patch.object(hc.socket, "socket", Boom):
+                hc.run_sampler(os.path.join(d, "no-such-servo"), out, 0.05, None, max_seconds=0.3)
+            recs = [json.loads(x) for x in out.read_text().splitlines()]
+            idx = hc.load_samples(out)
+        self.assertEqual(recs[-1]["type"], "end")
+        self.assertIsNone(recs[-1].get("final_canary_t"))
+        v = run([CANARY_LINE, OUT_TCP], idx)
+        self.assertEqual(v["verdict"], "unobservable")
+        self.assertTrue(any("no final_canary_t" in r for r in v["unobservable_reasons"]), v["unobservable_reasons"])
 
 
 if __name__ == "__main__":
