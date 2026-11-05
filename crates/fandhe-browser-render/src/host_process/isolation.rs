@@ -1159,24 +1159,34 @@ fn help_supports_tmpfs_size(stdout: &[u8]) -> bool {
         .any(|tok| tok == b"--size")
 }
 
-/// 時間切れで kill した後、または子の正常終了の後に、読み取りスレッドの終了を待つ上限。孫が stdout を
-/// 保持してパイプが閉じない場合に `join` で止まらないための値で、超えたらスレッドを detach する
-/// （#1508・#1510）。本物の bwrap は終了時にパイプを閉じ、残りは 64KiB 以下なので 200ms で足りる。
+/// 読み取りスレッドの終了を待つ最低の猶予。時間切れで kill した後の待ちと、子の正常終了後に検出全体の
+/// 期限が既に近いときの最低保証を兼ねる。孫が stdout を保持してパイプが閉じない場合に `join` で
+/// 止まらないための値で、超えたらスレッドを detach する（#1508・#1510・#1512）。
 #[cfg(target_os = "linux")]
 const READER_GRACE: Duration = Duration::from_millis(200);
 
-/// 読み取りスレッドの終了を [`READER_GRACE`] まで待つ。終われば `join` の結果を返し、終わらなければ
-/// ハンドルを drop して detach し `None` を返す。`detect_tmpfs_limit` の時間切れの分岐と正常終了の
-/// 分岐が共有する（#1508・#1510）。detach したスレッドが持つのは読み端と上限付きバッファ
-/// （`HELP_STDOUT_MAX + 1`）だけで、孫の終了で終わる。数は検出の回数（初回＋`TMPFS_REPROBE_MAX`）で
-/// 抑えられる。本物の bwrap の `--help` に孫はいない。
+/// 子の正常終了後に読み取りスレッドを待つ終端を決める純関数（#1512）。検出全体の期限 `deadline` と
+/// `now + READER_GRACE` の遅いほうを返すので、高負荷でも正常な出力を取りこぼしにくい。待ちの上限は
+/// 検出全体で `timeout + READER_GRACE` 以下で、時間切れ経路（`timeout` + kill + `READER_GRACE`）と
+/// 同じ。`deadline` が無い・加算が溢れるときは `None`（待たずに detach。fail-closed）。
+#[cfg(target_os = "linux")]
+fn reader_wait_until(now: Instant, deadline: Option<Instant>) -> Option<Instant> {
+    let grace_end = now.checked_add(READER_GRACE)?;
+    Some(deadline?.max(grace_end))
+}
+
+/// 読み取りスレッドの終了を `until` まで待つ。終われば `join` の結果を返し、終わらなければ
+/// ハンドルを drop して detach し `None` を返す。`detect_tmpfs_limit` の時間切れの分岐（終端は
+/// `now + READER_GRACE`）と正常終了の分岐（終端は [`reader_wait_until`]）が共有する（#1508・#1510・
+/// #1512）。detach したスレッドが持つのは読み端と上限付きバッファ（`HELP_STDOUT_MAX + 1`）だけで、
+/// 孫の終了で終わる。数は検出の回数（初回＋`TMPFS_REPROBE_MAX`）で抑えられる。本物の bwrap の
+/// `--help` に孫はいない。
 #[cfg(target_os = "linux")]
 fn wait_reader_or_detach(
     r: std::thread::JoinHandle<std::io::Result<Vec<u8>>>,
+    until: Instant,
 ) -> Option<std::thread::Result<std::io::Result<Vec<u8>>>> {
-    // 加算が溢れる場合は待たずに detach する（fail-closed）。
-    let grace_end = Instant::now().checked_add(READER_GRACE)?;
-    while !r.is_finished() && Instant::now() < grace_end {
+    while !r.is_finished() && Instant::now() < until {
         std::thread::sleep(Duration::from_millis(10));
     }
     if r.is_finished() {
@@ -1187,8 +1197,10 @@ fn wait_reader_or_detach(
 }
 
 /// 信頼判定済みの `bwrap` が `--size` を持つかを `--help` で調べ、tmpfs の上限の扱いを決める。
-/// 時間切れの後も正常終了の後も、読み取りスレッドは上限付きで待ち、孫がパイプを保持していれば
-/// detach して `Undetected(TimedOut)`（一過性）にする（#1508・#1510）。
+/// 時間切れの後は kill してから [`READER_GRACE`] まで、正常終了の後は検出全体の期限（最低
+/// [`READER_GRACE`]）まで読み取りスレッドを待ち、孫がパイプを保持して読み切れなければ detach して
+/// `Undetected(TimedOut)`（一過性）にする。部分出力は `Capped` にしない。待ちの上限は
+/// `timeout + READER_GRACE`（#1508・#1510・#1512）。
 /// `--help` を読めて `--size` が無ければ `Unsupported`（確定）。起動できない・非 0 終了・時間切れ・
 /// 出力が [`HELP_STDOUT_MAX`] 超は `Undetected`（上限なしで隔離を続ける。隔離自体の可否はこの後の
 /// 試走が判定する）。出力が上限を超えた時点で時間切れを待たずに kill する（#1502）。
@@ -1253,8 +1265,10 @@ fn detect_tmpfs_limit(bwrap: &Path, timeout: Duration) -> TmpfsLimit {
                 // 通常は kill でパイプが閉じ、読み取りスレッドは EOF で終わる。子が stdout を孫へ
                 // 受け継がせているとパイプが閉じないため、上限付きで待って過ぎたら detach する
                 // （#1508・#1510）。
-                if let Some(r) = reader.take() {
-                    let _ = wait_reader_or_detach(r);
+                if let Some(r) = reader.take()
+                    && let Some(until) = Instant::now().checked_add(READER_GRACE)
+                {
+                    let _ = wait_reader_or_detach(r, until);
                 }
                 return undetected(TmpfsDetectFailure::TimedOut);
             }
@@ -1262,9 +1276,11 @@ fn detect_tmpfs_limit(bwrap: &Path, timeout: Duration) -> TmpfsLimit {
     };
     let buf = match (buf, reader.take()) {
         (Some(b), _) => b,
-        // 子は終了済みだが孫がパイプを保持していると EOF が来ない。無期限に待たず、grace を過ぎたら
-        // 一過性の `TimedOut` にする（#1510）。
-        (None, Some(r)) => match wait_reader_or_detach(r) {
+        // 子は終了済みだが孫がパイプを保持していると EOF が来ない。検出全体の期限（最低
+        // `READER_GRACE`）まで待ち、過ぎたら一過性の `TimedOut` にする（#1510・#1512）。
+        (None, Some(r)) => match reader_wait_until(Instant::now(), deadline)
+            .and_then(|until| wait_reader_or_detach(r, until))
+        {
             Some(Ok(Ok(b))) => b,
             Some(_) => return undetected(TmpfsDetectFailure::OutputUnreadable),
             None => return undetected(TmpfsDetectFailure::TimedOut),
@@ -3318,16 +3334,28 @@ mod tests {
         assert_eq!(second, TmpfsLimit::Capped(TMPFS_SIZE_BYTES));
     }
 
+    /// 偽 bwrap が書いた pid ファイルのパス（`<script>.<ext>`）。
+    #[cfg(target_os = "linux")]
+    fn pid_path(script: &Path, ext: &str) -> PathBuf {
+        let mut name = script.as_os_str().to_owned();
+        name.push(format!(".{ext}"));
+        PathBuf::from(name)
+    }
+
+    /// pid ファイルを読む。無い・数値でないなら `None`（`Drop` から使うため panic しない）。
+    #[cfg(target_os = "linux")]
+    fn try_read_pid(script: &Path, ext: &str) -> Option<u32> {
+        std::fs::read_to_string(pid_path(script, ext))
+            .ok()?
+            .trim()
+            .parse()
+            .ok()
+    }
+
     /// 偽 bwrap が書いた pid ファイル（`<script>.<ext>`）を読む。無い・数値でないなら panic。
     #[cfg(target_os = "linux")]
     fn read_pid(script: &Path, ext: &str) -> u32 {
-        let mut name = script.as_os_str().to_owned();
-        name.push(format!(".{ext}"));
-        std::fs::read_to_string(PathBuf::from(name))
-            .unwrap()
-            .trim()
-            .parse()
-            .unwrap()
+        try_read_pid(script, ext).expect("pid file missing or invalid")
     }
 
     /// `/proc/<pid>` が消える（回収済み）まで最大 2 秒待つ。残っていれば false。
@@ -3343,6 +3371,63 @@ mod tests {
         false
     }
 
+    /// pid が生きていて argv0 が `sleep` のときだけ kill する（pid 再利用で無関係なプロセスを
+    /// 巻き込まないため）。exec の途中や偽 bwrap が `exec sleep` する前は argv0 が空・別名のことがある
+    /// ので、最大 200ms 見直す。`Drop` から呼ぶので panic せず、失敗は無視する。
+    #[cfg(target_os = "linux")]
+    fn kill_if_sleep(pid: u32) {
+        for _ in 0..20 {
+            let Ok(cmdline) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
+                return;
+            };
+            let argv0 = cmdline.split(|b| *b == 0).next().unwrap_or(&[]);
+            let base = argv0.rsplit(|b| *b == b'/').next().unwrap_or(&[]);
+            if base == b"sleep" {
+                let _ = Command::new("kill").arg(pid.to_string()).status();
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// 偽 bwrap が pid ファイルへ書いた孫（`sleep`）をテストの panic 時も残さない RAII ガード（#1512）。
+    /// 正常経路は [`PidFileReaper::reap`] で pid ごとの結果を得て、未完了で drop されたら同じ処理を行う。
+    #[cfg(target_os = "linux")]
+    struct PidFileReaper {
+        files: Vec<PathBuf>,
+        done: bool,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl PidFileReaper {
+        fn new(files: Vec<PathBuf>) -> Self {
+            Self { files, done: false }
+        }
+
+        /// 各 pid ファイルの `sleep` を kill し、消滅を待つ。読めた pid ごとに `(pid, gone)` を返す。
+        fn reap(&mut self) -> Vec<(u32, bool)> {
+            self.done = true;
+            let pids: Vec<u32> = self
+                .files
+                .iter()
+                .filter_map(|f| std::fs::read_to_string(f).ok()?.trim().parse().ok())
+                .collect();
+            for pid in &pids {
+                kill_if_sleep(*pid);
+            }
+            pids.into_iter().map(|p| (p, process_gone(p))).collect()
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Drop for PidFileReaper {
+        fn drop(&mut self) {
+            if !self.done {
+                let _ = self.reap();
+            }
+        }
+    }
+
     /// RENDER-3（#1502・#1508・#1510）: 時間切れは `TimedOut`、非 0 終了は `ExitFailure`、`--size` の無い help は
     /// `Unsupported` に分類する。時間切れの偽物は `exec` で pid を保ち、kill 後に残らない。stdout を
     /// 孫へ受け継がせる偽物でも読み取りスレッドの `join` で止まらない。
@@ -3356,6 +3441,11 @@ mod tests {
             "gc",
             "#!/bin/sh\nsleep 30 &\necho $! > \"$0.gc\"\necho $$ > \"$0.pid\"\nexec sleep 30\n",
         );
+        let mut reaper = PidFileReaper::new(vec![
+            pid_path(&slow, "pid"),
+            pid_path(&gc, "gc"),
+            pid_path(&gc, "pid"),
+        ]);
         let started = Instant::now();
         let timed_out = detect_retrying(&slow, Duration::from_millis(300));
         let slow_elapsed = started.elapsed();
@@ -3369,11 +3459,11 @@ mod tests {
         let gc_alive_at_return = PathBuf::from(format!("/proc/{grandchild}")).exists();
         let slow_pid = read_pid(&slow, "pid");
         let gc_pid = read_pid(&gc, "pid");
-        // 孫を残さない（テスト自身が kill する。数値は自分で書いたファイル由来）。
-        let _ = Command::new("kill").arg(grandchild.to_string()).status();
-        let slow_gone = process_gone(slow_pid);
-        let gc_gone = process_gone(gc_pid);
-        let grandchild_gone = process_gone(grandchild);
+        // 孫を残さない（ガードが kill して消滅を待つ。panic 時は Drop が同じ後始末をする）。
+        let gone: std::collections::HashMap<u32, bool> = reaper.reap().into_iter().collect();
+        let slow_gone = gone.get(&slow_pid).copied().unwrap_or(false);
+        let gc_gone = gone.get(&gc_pid).copied().unwrap_or(false);
+        let grandchild_gone = gone.get(&grandchild).copied().unwrap_or(false);
         for d in [d1, d2, d3, d4] {
             let _ = std::fs::remove_dir_all(&d);
         }
@@ -3398,9 +3488,10 @@ mod tests {
         assert_eq!(unsupported, TmpfsLimit::Unsupported);
     }
 
-    /// RENDER-3（#1510）: 子が stdout を孫へ受け継がせたまま `--size` を出して正常終了しても、読み取りを
-    /// 上限つきで待って detach し、`Undetected(TimedOut)`（一過性）で戻る。読み切れない出力は `Capped`
-    /// と判定しない。孫はテストが後始末し残さない。
+    /// RENDER-3（#1510・#1512）: 子が stdout を孫へ受け継がせたまま `--size` を出して正常終了しても、
+    /// 読み取りを検出全体の期限まで待ってから detach し、`Undetected(TimedOut)`（一過性）で戻る。
+    /// 読み切れない出力は `Capped` と判定しない。期限まで待った（`elapsed >= timeout`）ことと待ちが
+    /// 有界なことを確かめる。孫はガードが後始末し、panic でも残さない。
     #[cfg(target_os = "linux")]
     #[test]
     fn render3_detect_tmpfs_limit_normal_exit_with_inherited_stdout_is_bounded() {
@@ -3408,18 +3499,97 @@ mod tests {
             "gcexit",
             "#!/bin/sh\nsleep 30 &\necho $! > \"$0.gc\"\necho '    --size BYTES'\nexit 0\n",
         );
+        let mut reaper = PidFileReaper::new(vec![pid_path(&fake, "gc")]);
+        let timeout = Duration::from_millis(500);
         let started = Instant::now();
-        let limit = detect_retrying(&fake, Duration::from_secs(5));
+        let limit = detect_retrying(&fake, timeout);
         let elapsed = started.elapsed();
         let grandchild = read_pid(&fake, "gc");
         let alive_at_return = PathBuf::from(format!("/proc/{grandchild}")).exists();
-        let _ = Command::new("kill").arg(grandchild.to_string()).status();
-        let gone = process_gone(grandchild);
+        let gone = reaper.reap().contains(&(grandchild, true));
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(limit, TmpfsLimit::Undetected(TmpfsDetectFailure::TimedOut));
-        assert!(elapsed < Duration::from_secs(2), "{elapsed:?}");
+        assert!(elapsed >= timeout, "{elapsed:?}");
+        assert!(
+            elapsed < timeout + READER_GRACE + Duration::from_millis(1500),
+            "{elapsed:?}"
+        );
         assert!(alive_at_return, "grandchild exited before return");
         assert!(gone, "grandchild remained (pid {grandchild})");
+    }
+
+    /// RENDER-3（#1512）: 正常終了後の読み取りの終端は、期限と `now + READER_GRACE` の遅いほう。
+    /// 期限が無い・加算が溢れるときは `None`。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn render3_reader_wait_until_cases() {
+        let now = Instant::now();
+        let far = now + Duration::from_secs(5);
+        assert_eq!(reader_wait_until(now, Some(far)), Some(far));
+        assert_eq!(reader_wait_until(now, Some(now)), Some(now + READER_GRACE));
+        assert_eq!(
+            reader_wait_until(now + Duration::from_secs(1), Some(now)),
+            Some(now + Duration::from_secs(1) + READER_GRACE)
+        );
+        assert_eq!(reader_wait_until(now, None), None);
+    }
+
+    /// RENDER-3（#1512）: `wait_reader_or_detach` は `until` まで待って結果を返し、過ぎたら detach する。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn render3_wait_reader_or_detach_honors_until() {
+        let slow = || {
+            std::thread::spawn(|| {
+                std::thread::sleep(Duration::from_millis(300));
+                Ok(b"abc".to_vec())
+            })
+        };
+        let got = wait_reader_or_detach(slow(), Instant::now() + Duration::from_secs(2));
+        assert_eq!(got.unwrap().unwrap().unwrap(), b"abc".to_vec());
+        let started = Instant::now();
+        let none = wait_reader_or_detach(slow(), Instant::now() + Duration::from_millis(50));
+        assert!(none.is_none());
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    /// RENDER-3（#1512）: 正常終了後に孫が stdout を期限より前に離せば、遅れて届いた `--size` を
+    /// 取りこぼさず `Capped` になる（猶予 200ms 固定だった旧実装では `TimedOut`）。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn render3_detect_tmpfs_limit_normal_exit_waits_for_reader_until_deadline() {
+        let (dir, fake) = fake_script(
+            "gcslow",
+            "#!/bin/sh\nsleep 1 &\necho $! > \"$0.gc\"\necho '    --size BYTES'\nexit 0\n",
+        );
+        let mut reaper = PidFileReaper::new(vec![pid_path(&fake, "gc")]);
+        let timeout = Duration::from_secs(5);
+        let started = Instant::now();
+        let limit = detect_retrying(&fake, timeout);
+        let elapsed = started.elapsed();
+        let _ = reaper.reap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(limit, TmpfsLimit::Capped(TMPFS_SIZE_BYTES));
+        assert!(
+            elapsed < timeout + READER_GRACE + Duration::from_millis(1500),
+            "{elapsed:?}"
+        );
+    }
+
+    /// RENDER-3（#1512）: ガードは `reap` を呼ばずに drop されても（panic 経路の模擬）`sleep` を回収する。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn render3_pid_file_reaper_kills_on_drop() {
+        let dir = std::env::temp_dir().join(format!("fb-reaper-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let file = dir.join("p.pid");
+        let mut child = Command::new("sleep").arg("30").spawn().unwrap();
+        let pid = child.id();
+        std::fs::write(&file, pid.to_string()).unwrap();
+        drop(PidFileReaper::new(vec![file]));
+        let status = child.wait().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(!status.success(), "sleep was not killed: {status:?}");
+        assert!(process_gone(pid));
     }
 
     /// RENDER-3（#1498・#1502・#1508）: `--help` の出力が [`HELP_STDOUT_MAX`] を超える偽物は、`--size` を含んでいても
