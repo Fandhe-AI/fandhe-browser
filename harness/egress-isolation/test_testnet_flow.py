@@ -432,10 +432,6 @@ class FinishAndSummaryTest(unittest.TestCase):
         self.assertIsNone(measure.appcontainer_cleanup_reason(data))
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class TestnetOriginOkTest(unittest.TestCase):
     def test_requires_ok_and_page_host(self) -> None:
         good = {"testnet_origin_load": {"ok": True, "final_host": "pages.test"}}
@@ -445,3 +441,7 @@ class TestnetOriginOkTest(unittest.TestCase):
                     {"testnet_origin_load": {"ok": True, "final_host": "127.0.0.1"}},
                     {"testnet_origin_load": {"ok": 1, "final_host": "pages.test"}}):
             self.assertFalse(measure.testnet_origin_ok(bad), bad)
+
+
+if __name__ == "__main__":
+    unittest.main()
