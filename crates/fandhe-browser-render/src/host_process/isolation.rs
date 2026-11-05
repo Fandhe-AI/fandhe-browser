@@ -3459,10 +3459,12 @@ mod tests {
         let gc_alive_at_return = PathBuf::from(format!("/proc/{grandchild}")).exists();
         let slow_pid = read_pid(&slow, "pid");
         let gc_pid = read_pid(&gc, "pid");
+        // 親（slow / gc）は検出処理自身が終了させたはずなので、後始末の kill より前に消滅を確認して記録する
+        // （reap() の kill 後の結果を使うと、親を残す回帰を覆い隠す）。
+        let slow_gone = process_gone(slow_pid);
+        let gc_gone = process_gone(gc_pid);
         // 孫を残さない（ガードが kill して消滅を待つ。panic 時は Drop が同じ後始末をする）。
         let gone: std::collections::HashMap<u32, bool> = reaper.reap().into_iter().collect();
-        let slow_gone = gone.get(&slow_pid).copied().unwrap_or(false);
-        let gc_gone = gone.get(&gc_pid).copied().unwrap_or(false);
         let grandchild_gone = gone.get(&grandchild).copied().unwrap_or(false);
         for d in [d1, d2, d3, d4] {
             let _ = std::fs::remove_dir_all(&d);
