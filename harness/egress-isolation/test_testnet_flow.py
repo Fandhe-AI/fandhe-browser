@@ -28,7 +28,7 @@ from test_testnet_observe import FakeWindows, observer, syn  # noqa: E402
 from test_testnet_parse import DROP, SID, netevent  # noqa: E402
 
 OK = dict(negative_packets=0, control_packets=1, wfp_drops_with_sid=1, observation_unavailable=None,
-          cleanup_incomplete=None, positive_ok=True, binary_match=True)
+          cleanup_incomplete=None, positive_ok=True, origin_ok=True, binary_match=True)
 GOOD_CLEANUP = {"pktmon_stopped": True, "pktmon_filters_removed": True, "netevents_restored": True, "raw_removed": True}
 
 
@@ -67,9 +67,31 @@ def _obs(neg: int = 0, ctl: int = 3, match: int = 2, drops: int | None = None) -
     return {"unavailable": None, "pktmon": {"routes": pk}, "wfp": {"routes": wf}}
 
 
+class JudgeTestnetOriginTest(unittest.TestCase):
+    """ホスト名オリジンが成立しないとき、img・fetch・ws だけが観測不能になる（Issue #1519）。"""
+
+    def test_origin_not_ok_is_unobservable_with_reason(self) -> None:
+        verdict, reason = judge.judge_testnet_route(**{**OK, "origin_ok": False})
+        self.assertEqual((verdict, reason), (judge.UNOBSERVABLE, judge.TESTNET_ORIGIN_REASON))
+
+    def test_negative_packets_still_fail_without_origin(self) -> None:
+        self.assertEqual(judge.judge_testnet_route(**{**OK, "origin_ok": False, "negative_packets": 1})[0], judge.FAIL)
+
+    def test_only_hostname_origin_routes_are_affected(self) -> None:
+        v = judge.judge_testnet("appcontainer", observation=_obs(), positive_ok=True, origin_ok=False, binary_match=True)
+        for r in ("testnet_img", "testnet_fetch", "testnet_ws"):
+            self.assertEqual(v[r]["verdict"], judge.UNOBSERVABLE, r)
+            self.assertEqual(v[r]["reason"], judge.TESTNET_ORIGIN_REASON, r)
+        for r in ("testnet_redirect", "testnet_udp"):
+            self.assertEqual(v[r]["verdict"], judge.PASS, r)
+
+    def test_hosts_file_maps_only_the_page_host(self) -> None:
+        self.assertEqual(judge.TESTNET_HOSTS_FILE, "127.0.0.1 pages.test\n")
+
+
 class JudgeTestnetTest(unittest.TestCase):
     def test_all_routes_pass_with_negative_zero_drop_and_control(self) -> None:
-        v = judge.judge_testnet("appcontainer", observation=_obs(), positive_ok=True, binary_match=True)
+        v = judge.judge_testnet("appcontainer", observation=_obs(), positive_ok=True, origin_ok=True, binary_match=True)
         self.assertEqual(list(v), list(judge.TESTNET_ROUTES))
         self.assertTrue(all(x["verdict"] == judge.PASS for x in v.values()))
         row = v["testnet_fetch"]
@@ -82,28 +104,28 @@ class JudgeTestnetTest(unittest.TestCase):
     def test_leak_is_fail_and_others_stay_pass(self) -> None:
         obs = _obs()
         obs["pktmon"]["routes"]["appcontainer/testnet_ws"] = {"packets": {"tcp_syn": 1}, "unique_flows": {"tcp_syn": 1}}
-        v = judge.judge_testnet("appcontainer", observation=obs, positive_ok=True, binary_match=True)
+        v = judge.judge_testnet("appcontainer", observation=obs, positive_ok=True, origin_ok=True, binary_match=True)
         self.assertEqual(v["testnet_ws"]["verdict"], judge.FAIL)
         self.assertEqual(v["testnet_img"]["verdict"], judge.PASS)
 
     def test_drop_without_matching_package_sid_is_not_evidence(self) -> None:
-        v = judge.judge_testnet("appcontainer", observation=_obs(match=0, drops=4), positive_ok=True, binary_match=True)
+        v = judge.judge_testnet("appcontainer", observation=_obs(match=0, drops=4), positive_ok=True, origin_ok=True, binary_match=True)
         self.assertTrue(all(x["verdict"] == judge.UNOBSERVABLE for x in v.values()))
         self.assertEqual(v["testnet_img"]["wfp_drops"], 4)
 
     def test_no_control_packets_is_unobservable(self) -> None:
-        v = judge.judge_testnet("appcontainer", observation=_obs(ctl=0), positive_ok=True, binary_match=True)
+        v = judge.judge_testnet("appcontainer", observation=_obs(ctl=0), positive_ok=True, origin_ok=True, binary_match=True)
         self.assertTrue(all(x["verdict"] == judge.UNOBSERVABLE for x in v.values()))
 
     def test_not_requested_and_malformed_observation(self) -> None:
-        v = judge.judge_testnet("appcontainer", observation=None, positive_ok=True, binary_match=True)
+        v = judge.judge_testnet("appcontainer", observation=None, positive_ok=True, origin_ok=True, binary_match=True)
         self.assertTrue(all(x["reason"].endswith(judge.TESTNET_NOT_REQUESTED_REASON) for x in v.values()))
         bad = {"unavailable": 5, "pktmon": {}, "wfp": {}}
-        v2 = judge.judge_testnet("appcontainer", observation=bad, positive_ok=True, binary_match=True)
+        v2 = judge.judge_testnet("appcontainer", observation=bad, positive_ok=True, origin_ok=True, binary_match=True)
         self.assertTrue(all(x["verdict"] == judge.UNOBSERVABLE for x in v2.values()))
 
     def test_cleanup_incomplete_blocks_pass(self) -> None:
-        v = judge.judge_testnet("appcontainer", observation=_obs(), positive_ok=True, binary_match=True,
+        v = judge.judge_testnet("appcontainer", observation=_obs(), positive_ok=True, origin_ok=True, binary_match=True,
                                 cleanup_incomplete="dirty")
         self.assertTrue(all(x["verdict"] == judge.UNOBSERVABLE for x in v.values()))
 
@@ -111,7 +133,7 @@ class JudgeTestnetTest(unittest.TestCase):
         # Issue #1515: 帰属できない TEST-NET 宛てパケット -> 全経路 unobservable。
         o = _obs()
         o["pktmon"]["routes"]["unattributed"] = {"packets": {"tcp_syn": 1}}
-        v = judge.judge_testnet("appcontainer", observation=o, positive_ok=True, binary_match=True)
+        v = judge.judge_testnet("appcontainer", observation=o, positive_ok=True, origin_ok=True, binary_match=True)
         for x in v.values():
             self.assertEqual(x["verdict"], judge.UNOBSERVABLE)
             self.assertIn(judge.TESTNET_UNATTRIBUTED_REASON, x["reason"])
@@ -120,7 +142,7 @@ class JudgeTestnetTest(unittest.TestCase):
         o = _obs()
         o["pktmon"]["routes"]["unattributed"] = {"packets": {"udp": 2}}
         o["pktmon"]["routes"]["appcontainer/testnet_udp"] = {"packets": {"udp": 1}, "unique_flows": {"udp": 1}}
-        v = judge.judge_testnet("appcontainer", observation=o, positive_ok=True, binary_match=True)
+        v = judge.judge_testnet("appcontainer", observation=o, positive_ok=True, origin_ok=True, binary_match=True)
         self.assertEqual(v["testnet_udp"]["verdict"], judge.FAIL)
         self.assertEqual(v["testnet_fetch"]["verdict"], judge.UNOBSERVABLE)
 
@@ -128,12 +150,12 @@ class JudgeTestnetTest(unittest.TestCase):
         o = _obs()
         o["unavailable"] = "pktmon start failed"
         o["pktmon"]["routes"]["unattributed"] = {"packets": {"tcp_syn": 1}}
-        v = judge.judge_testnet("appcontainer", observation=o, positive_ok=True, binary_match=True)
+        v = judge.judge_testnet("appcontainer", observation=o, positive_ok=True, origin_ok=True, binary_match=True)
         self.assertIn("pktmon start failed", v["testnet_fetch"]["reason"])
         o2 = _obs()
         o2["wfp"]["routes"]["unattributed"] = {"drops": 4, "package_sid_match": 4}
         o2["pktmon"]["routes"]["unattributed"] = {"packets": {}}
-        v2 = judge.judge_testnet("appcontainer", observation=o2, positive_ok=True, binary_match=True)
+        v2 = judge.judge_testnet("appcontainer", observation=o2, positive_ok=True, origin_ok=True, binary_match=True)
         self.assertTrue(all(x["verdict"] == judge.PASS for x in v2.values()))
 
     def test_loopback_confound_does_not_apply_to_testnet_routes(self) -> None:
@@ -143,7 +165,7 @@ class JudgeTestnetTest(unittest.TestCase):
         loop = judge.judge_all("appcontainer", inner, {k: 0 for k in CONTROL}, CONTROL,
                                loopback_confound=judge.LOOPBACK_EXEMPT_UNMEASURABLE_REASON)
         self.assertEqual(loop["udp_direct"]["verdict"], judge.UNOBSERVABLE)
-        v = judge.judge_testnet("appcontainer", observation=_obs(), positive_ok=True, binary_match=True)
+        v = judge.judge_testnet("appcontainer", observation=_obs(), positive_ok=True, origin_ok=True, binary_match=True)
         self.assertEqual(v["testnet_udp"]["verdict"], judge.PASS)
 
     def test_existing_route_lists_are_unchanged(self) -> None:
@@ -319,7 +341,7 @@ class FinishAndSummaryTest(unittest.TestCase):
         out = measure.finish_testnet_observe(obs, self._results())
         self.assertEqual(out["cleanup"], GOOD_CLEANUP)
         self.assertIsNone(out["unavailable"])
-        v = judge.judge_testnet("appcontainer", observation=out, positive_ok=True, binary_match=True)
+        v = judge.judge_testnet("appcontainer", observation=out, positive_ok=True, origin_ok=True, binary_match=True)
         self.assertEqual(v["testnet_redirect"]["verdict"], judge.PASS)
 
     def test_finish_cleans_up_even_when_collection_raises(self) -> None:
@@ -369,7 +391,7 @@ class FinishAndSummaryTest(unittest.TestCase):
         res = self._results()
         ac = res["modes"]["appcontainer"]
         ac["verdicts"] = {}
-        ac["testnet_verdicts"] = judge.judge_testnet("appcontainer", observation=_obs(), positive_ok=True, binary_match=True)
+        ac["testnet_verdicts"] = judge.judge_testnet("appcontainer", observation=_obs(), positive_ok=True, origin_ok=True, binary_match=True)
         res["testnet_observe"] = {"unavailable": None, "scaffold": {"services_running": True}, "cleanup": GOOD_CLEANUP,
                                   "pktmon": {"routes": {"unattributed": {"packets": {"tcp_syn": 1}}}, "diag": {"frames": 5}},
                                   "wfp": {"routes": {}, "diag": {}}, "diag": {"pktmon_start_rc": 0}}
@@ -408,6 +430,17 @@ class FinishAndSummaryTest(unittest.TestCase):
         self.assertIn("TEST-NET observation cleanup", measure.appcontainer_cleanup_reason(data) or "")
         data["appcontainer"]["testnet_cleanup"] = dict(GOOD_CLEANUP)
         self.assertIsNone(measure.appcontainer_cleanup_reason(data))
+
+
+class TestnetOriginOkTest(unittest.TestCase):
+    def test_requires_ok_and_page_host(self) -> None:
+        good = {"testnet_origin_load": {"ok": True, "final_host": "pages.test"}}
+        self.assertTrue(measure.testnet_origin_ok(good))
+        for bad in (None, {}, {"testnet_origin_load": None},
+                    {"testnet_origin_load": {"ok": False, "kind": "error"}},
+                    {"testnet_origin_load": {"ok": True, "final_host": "127.0.0.1"}},
+                    {"testnet_origin_load": {"ok": 1, "final_host": "pages.test"}}):
+            self.assertFalse(measure.testnet_origin_ok(bad), bad)
 
 
 if __name__ == "__main__":

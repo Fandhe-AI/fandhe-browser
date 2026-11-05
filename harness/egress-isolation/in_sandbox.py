@@ -586,6 +586,15 @@ def run(args: argparse.Namespace, ports: dict[str, int]) -> dict[str, Any]:
         for sub in ("home", "tmp", "xdg-config", "xdg-cache", "xdg-data"):
             (workdir / sub).mkdir()
         env = sbd.build_host_env(workdir)
+        host_env = env
+        if testnet_on:
+            # TEST-NET の img・fetch・ws を mixed content に遮られず測るため、`--stdio` のホストにだけ Servo の `HOST_FILE`
+            # （pages.test -> 127.0.0.1）を渡す（Issue #1519・`SEC-2`）。`--testnet`（Windows の計測専用）のときだけで、
+            # `build_host_env`（本番の許可リストの写し）と `--selftest` の env は変えない。本番では render crate の
+            # `env_clear` と許可リストにより届かない。
+            hosts_path = workdir / "testnet-hosts"
+            hosts_path.write_bytes(judge.TESTNET_HOSTS_FILE.encode("ascii"))
+            host_env = {**env, "HOST_FILE": str(hosts_path)}
         env_notes = sorted(k for k in os.environ if k.lower().endswith("_proxy"))
         result["proxy_env_present"] = bool(env_notes)  # 値は記録しない（有無のみ）
 
@@ -599,7 +608,7 @@ def run(args: argparse.Namespace, ports: dict[str, int]) -> dict[str, Any]:
             result["selftest_stderr_tail"] = quiet_io.tail_text(st.stderr)
 
         stage = "spawn_host"
-        proc = quiet_io.popen_stdio_host([*host_argv(args.host), "--stdio"], env=env)
+        proc = quiet_io.popen_stdio_host([*host_argv(args.host), "--stdio"], env=host_env)
         host_t0 = time.monotonic()  # 時系列の基準（ホスト起動）
         stage = "drive_host"
         # ハーネスが意図的に接続させるダミー宛先（127.0.0.2 / 127.0.0.3）は想定内の試行として除外し、監視を続ける。
@@ -613,6 +622,7 @@ def run(args: argparse.Namespace, ports: dict[str, int]) -> dict[str, Any]:
         chan.request_max = info.request_max
         next_id = [1]
         base = f"http://{judge.IP_ALLOWED if literal else judge.HOST_ALLOWED}:{page_port}"
+        testnet_base = f"http://{judge.HOST_ALLOWED}:{page_port}"  # ホスト名オリジン（Issue #1519）
 
         def record(route: str, role: str, t0: float, elapsed_ms: int, res: dict[str, Any]) -> None:
             """時系列へ 1 件足す。int と固定語彙だけを入れ、URL は入れない。"""
@@ -662,11 +672,14 @@ def run(args: argparse.Namespace, ports: dict[str, int]) -> dict[str, Any]:
         result["loads"] = loads
         result["guard_polls"] = guard_polls
         if testnet_on:
-            # TEST-NET-1 宛ての 4 経路（Issue #1515）。判定経路の後に読み、loads・attempts・guard_polls には混ぜない
+            # TEST-NET-1 宛ての 4 経路（Issue #1515）。img・fetch・ws は pages.test から配る（Issue #1519）。判定経路の後に読み、loads・attempts・guard_polls には混ぜない
             # （試行の根拠はランナー側の WFP drop。ここは読み込みの結果の記録だけ）。
+            # 先にホスト名オリジンのページが読めるか（HOST_FILE が効いたか）を記録する。失敗しても経路の読み込みは続ける。
+            result["testnet_origin_load"] = timed_load("testnet_origin", f"{testnet_base}/ok", "testnet_origin")
             testnet_loads: dict[str, Any] = {}
             for r in testnet.TESTNET_TCP_ROUTES:
-                testnet_loads[r] = timed_load(r, base + fixtures.TESTNET_ROUTE_PATH[r], "testnet")
+                origin = testnet_base if r in testnet.TESTNET_HOSTNAME_ORIGIN_ROUTES else base
+                testnet_loads[r] = timed_load(r, origin + fixtures.TESTNET_ROUTE_PATH[r], "testnet")
                 time.sleep(SETTLE_S)
                 host_pids |= descendant_pids(proc.pid)
                 result["host_pids"] = sorted(host_pids)

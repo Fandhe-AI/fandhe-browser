@@ -206,7 +206,7 @@ class HappyPathTest(unittest.TestCase):
         obs.start()
         result = obs.stop_and_collect(SID)
         cleanup = obs.cleanup()
-        verdicts = judge.judge_testnet("appcontainer", observation=result, positive_ok=True, binary_match=True,
+        verdicts = judge.judge_testnet("appcontainer", observation=result, positive_ok=True, origin_ok=True, binary_match=True,
                                        cleanup_incomplete=to.cleanup_reason(cleanup))
         for r in testnet.TESTNET_TCP_ROUTES:
             self.assertEqual(verdicts[r]["verdict"], judge.PASS, verdicts[r]["reason"])
@@ -219,7 +219,7 @@ class HappyPathTest(unittest.TestCase):
         o2.start()
         r2 = o2.stop_and_collect(SID)
         o2.cleanup()
-        v2 = judge.judge_testnet("appcontainer", observation=r2, positive_ok=True, binary_match=True)
+        v2 = judge.judge_testnet("appcontainer", observation=r2, positive_ok=True, origin_ok=True, binary_match=True)
         self.assertEqual(v2["testnet_img"]["verdict"], judge.FAIL)
         self.assertEqual(v2["testnet_redirect"]["verdict"], judge.PASS)
 
@@ -317,7 +317,7 @@ class DiagnosticFailureTest(unittest.TestCase):
         obs.cleanup()
         self.assertIsNone(result["unavailable"])
         # 同じ pcap の陰性パケット（appcontainer の NIC 出力）は従来どおり漏えいとして fail になる。
-        verdicts = judge.judge_testnet("appcontainer", observation=result, positive_ok=True, binary_match=True)
+        verdicts = judge.judge_testnet("appcontainer", observation=result, positive_ok=True, origin_ok=True, binary_match=True)
         self.assertEqual(verdicts["testnet_img"]["verdict"], judge.FAIL)
         self.assertEqual(result["pktmon"]["diag"]["short_frames"], 1)
         self.assertEqual(result["pktmon"]["routes"]["baseline/testnet_redirect"]["packets"], {"tcp_syn": 1})
@@ -398,7 +398,7 @@ class FailureHandlingTest(unittest.TestCase):
             result = obs.stop_and_collect(SID)
             self.assertIsNotNone(result["unavailable"])
             self.assertEqual(result["pktmon"]["routes"]["appcontainer/testnet_redirect"]["packets"], {"tcp_syn": 1})
-            verdicts = judge.judge_testnet("appcontainer", observation=result, positive_ok=True, binary_match=True,
+            verdicts = judge.judge_testnet("appcontainer", observation=result, positive_ok=True, origin_ok=True, binary_match=True,
                                            cleanup_incomplete=to.cleanup_reason(obs.cleanup()))
             self.assertEqual(verdicts["testnet_redirect"]["verdict"], judge.FAIL)
 
@@ -529,12 +529,12 @@ class FailureHandlingTest(unittest.TestCase):
 
     def test_unavailable_makes_every_route_unobservable_but_leak_still_fails(self) -> None:
         obs_dict = {"unavailable": "pktmon start failed", "pktmon": {"routes": {}}, "wfp": {"routes": {}}}
-        v = judge.judge_testnet("appcontainer", observation=obs_dict, positive_ok=True, binary_match=True)
+        v = judge.judge_testnet("appcontainer", observation=obs_dict, positive_ok=True, origin_ok=True, binary_match=True)
         self.assertTrue(all(x["verdict"] == judge.UNOBSERVABLE for x in v.values()))
         leak = {"unavailable": "netsh wfp show netevents failed",
                 "pktmon": {"routes": {"appcontainer/testnet_fetch": {"packets": {"tcp_syn": 1}, "unique_flows": {"tcp_syn": 1}}}},
                 "wfp": {"routes": {}}}
-        v2 = judge.judge_testnet("appcontainer", observation=leak, positive_ok=True, binary_match=True)
+        v2 = judge.judge_testnet("appcontainer", observation=leak, positive_ok=True, origin_ok=True, binary_match=True)
         self.assertEqual(v2["testnet_fetch"]["verdict"], judge.FAIL)
 
     def test_cleanup_is_idempotent(self) -> None:

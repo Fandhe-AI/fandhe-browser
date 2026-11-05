@@ -28,6 +28,10 @@ MIN_PORT = 1024
 
 # TCP はホストが読み込むページの 4 経路、UDP は内側ランナー自身の sendto（`udp_direct` と同じくハーネスのプローブ）。
 TESTNET_TCP_ROUTES = ("testnet_redirect", "testnet_img", "testnet_fetch", "testnet_ws")
+# 配信元をホスト名（`pages.test`。Servo の `HOST_FILE` で 127.0.0.1 に解決）にする経路（Issue #1519・`RENDER-3`・`SEC-2`）。
+# 127.0.0.1 のオリジンは potentially trustworthy で、そこから非 trustworthy な TEST-NET 宛ての subresource（img・fetch・ws）は
+# Servo の mixed content 検査でネットワークに出る前に遮られ、対照でも NIC にパケットが出ない。document（redirect）は対象外。
+TESTNET_HOSTNAME_ORIGIN_ROUTES = ("testnet_img", "testnet_fetch", "testnet_ws")
 TESTNET_UDP_ROUTE = "testnet_udp"
 TESTNET_ROUTES = (*TESTNET_TCP_ROUTES, TESTNET_UDP_ROUTE)
 
