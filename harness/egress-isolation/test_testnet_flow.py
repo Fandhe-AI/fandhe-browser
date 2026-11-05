@@ -351,6 +351,18 @@ class FinishAndSummaryTest(unittest.TestCase):
         self.assertIsNone(measure.appcontainer_confound_reason(data))
         self.assertIn("cleanup was incomplete", measure.appcontainer_caveat(data) or "")
 
+    def test_empty_appcontainer_cleanup_is_not_masked_by_testnet_cleanup(self) -> None:
+        # session 生成に失敗して cleanup が空でも、testnet の片付け結果（すべて True）で未記録が隠れない（Issue #1515）。
+        data = {"appcontainer": {"cleanup": {}, "testnet_cleanup": dict(GOOD_CLEANUP)}}
+        self.assertIn("not recorded", measure.appcontainer_cleanup_reason(data) or "")
+
+    def test_testnet_cleanup_failure_gives_a_reason(self) -> None:
+        bad = dict(GOOD_CLEANUP, netevents_restored=False)
+        data = {"appcontainer": {"cleanup": {"profile_deleted": True}, "testnet_cleanup": bad}}
+        self.assertIn("TEST-NET observation cleanup", measure.appcontainer_cleanup_reason(data) or "")
+        data["appcontainer"]["testnet_cleanup"] = dict(GOOD_CLEANUP)
+        self.assertIsNone(measure.appcontainer_cleanup_reason(data))
+
 
 if __name__ == "__main__":
     unittest.main()

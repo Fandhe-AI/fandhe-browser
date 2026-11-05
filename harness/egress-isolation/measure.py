@@ -614,6 +614,13 @@ def appcontainer_cleanup_reason(data: dict[str, Any]) -> str | None:
     cleanup = info.get("cleanup") or {}
     if not cleanup or any(v is False for v in cleanup.values()):
         return "AppContainer cleanup was incomplete or not recorded; result is not trusted"
+    # TEST-NET 観測の片付け結果は `cleanup` と別キー（`testnet_cleanup`）に置く。混ぜると session が作れず
+    # `cleanup` が空のケースでも空でなくなり、上の「未記録」検出が効かなくなる（Issue #1515）。
+    testnet_cleanup = info.get("testnet_cleanup")
+    if testnet_cleanup is not None and (
+            not isinstance(testnet_cleanup, dict) or not testnet_cleanup
+            or any(v is False for v in testnet_cleanup.values())):
+        return "TEST-NET observation cleanup was incomplete or not recorded; result is not trusted"
     return None
 
 
@@ -1170,9 +1177,9 @@ def main(argv: list[str] | None = None) -> int:
             # 陽性対照（baseline）と同一バイナリでなければ、対照が当該モードの根拠にならない。
             data["binary_match"] = bool(base_sha) and data.get("binary_sha256") == base_sha
             if testnet_obs is not None and mode == "appcontainer":
-                # 片付けの成否は AppContainer の cleanup にも写す（loopback 経路の pass も妨げる。fail-closed）。
-                data.setdefault("appcontainer", {}).setdefault("cleanup", {}).update(
-                    {f"testnet_{k}": v for k, v in testnet_obs["cleanup"].items()})
+                # 片付けの成否は `cleanup` と別キーに写す（loopback 経路の pass も妨げる。fail-closed）。
+                # `cleanup` へ混ぜると AppContainer 本来の「未記録」検出が無効になる（Issue #1515）。
+                data.setdefault("appcontainer", {})["testnet_cleanup"] = dict(testnet_obs["cleanup"])
             data["verdicts"] = judge.judge_all(mode, data["inner"], data["outer_counts"], control,
                                                binary_match=data["binary_match"],
                                                mode_unavailable=data.get("unavailable"),
