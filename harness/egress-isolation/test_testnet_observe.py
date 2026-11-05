@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import json
+import struct
 import sys
 import unittest
 from pathlib import Path
@@ -16,7 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import judge  # noqa: E402
 import testnet  # noqa: E402
 import testnet_observe as to  # noqa: E402
-from test_testnet_parse import DROP, NIC, SID, epb, eth, events_xml, idb, ipv4, netevent, shb  # noqa: E402
+from test_testnet_parse import DROP, NIC, SID, block, epb, eth, events_xml, idb, ipv4, netevent, shb  # noqa: E402
 
 FILTERS_XML = ("<wfpdiag><filters><item><filterId>100</filterId><displayData>"
                "<name>UWP Default Outbound Block Rule</name></displayData></item></filters></wfpdiag>")
@@ -37,6 +38,7 @@ class FakeWindows:
         self.pcap_frames: list[bytes] = over.get("pcap_frames", [])
         self.events: list[str] = over.get("events", [])
         self.bad_pcap = over.get("bad_pcap", False)
+        self.pcap_bytes: bytes | None = over.get("pcap_bytes")
         self.stop_fail_first = over.get("stop_fail_first", False)  # 最初の stop だけ失敗（再試行は成功）
 
     def _rc(self, name: str, out: str = "") -> dict[str, Any]:
@@ -89,7 +91,7 @@ class FakeWindows:
             return self._rc("stop")
         if sub == "etl2pcap":
             if "etl2pcap" not in self.fail:
-                data = b"\x01\x02" if self.bad_pcap else shb() + idb(1) + b"".join(epb(f) for f in self.pcap_frames)
+                data = self.pcap_bytes if self.pcap_bytes is not None else b"\x01\x02" if self.bad_pcap else shb() + idb(1) + b"".join(epb(f) for f in self.pcap_frames)
                 Path(rest[-1]).write_bytes(data)
             return self._rc("etl2pcap")
         raise AssertionError(f"unexpected pktmon args: {rest}")
@@ -353,6 +355,21 @@ class FailureHandlingTest(unittest.TestCase):
             result = obs.stop_and_collect(SID)
             obs.cleanup()
             self.assertIn(text, result["unavailable"] or "")
+
+    def test_undefined_ifid_and_caplen_mismatch_are_unavailable_and_keep_leak_evidence(self) -> None:
+        good = epb(syn(5000, 47300))
+        frame = syn(5001, 47301)
+        bad_ifid = block(6, struct.pack("<IIIII", 7, 0, 0, len(frame), len(frame)) + frame)
+        bad_caplen = block(6, struct.pack("<IIIII", 0, 0, 0, len(frame) + 64, len(frame) + 64) + frame)
+        for blk, text in ((bad_ifid, "undefined interface"), (bad_caplen, "caplen")):
+            fake = FakeWindows(pcap_bytes=shb() + idb(1) + good + blk)
+            obs = observer(fake)
+            obs.start()
+            result = obs.stop_and_collect(SID)
+            obs.cleanup()
+            self.assertIn(text, result["pktmon"]["diag"]["error"])
+            self.assertIn("could not be parsed", result["unavailable"] or "")
+            self.assertEqual(result["pktmon"]["routes"]["baseline/testnet_redirect"]["packets"], {"tcp_syn": 1})
 
     def test_show_netevents_failure_is_unavailable(self) -> None:
         fake = FakeWindows(fail={"show-netevents"})

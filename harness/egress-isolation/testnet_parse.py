@@ -153,7 +153,14 @@ def parse_pcapng(f: Any, index: dict[tuple[str, int], tuple[str, str]]) -> dict[
             elif btype == _PCAPNG_EPB and len(body) >= 20:
                 ifid, _hi, _lo, caplen, _orig = struct.unpack_from(endian + "IIIII", body, 0)
                 frame = body[20:20 + caplen]
-                link = links[ifid] if ifid < len(links) else -1
+                if caplen > len(body) - 20:
+                    # 宣言長が実データより長い。観測が欠けている可能性があるため壊れた入力として記録する（集計は続ける）。
+                    diag.setdefault("error", "EPB caplen exceeds block data")
+                if ifid < len(links):
+                    link = links[ifid]
+                else:
+                    # 未定義のインターフェース。デコードできずパケットが無言で落ちるため記録する（集計は続ける）。
+                    diag.setdefault("error", "EPB references undefined interface")
             elif btype == _PCAPNG_SPB and len(body) >= 4:
                 orig = struct.unpack_from(endian + "I", body, 0)[0]
                 frame = body[4:4 + min(orig, len(body) - 4)]
