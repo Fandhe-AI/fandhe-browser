@@ -1147,6 +1147,7 @@ jobs:
   # - 分離検証 A〜E は scripts/check-render-isolation.sh（C〜E がホスト側。harness-* の重複ステップは本ジョブへ集約）
   # - release ビルドは main・workflow_dispatch のみ。成果物は RUNNER_TEMP に出し cache しない
   #   （[static-link] と同じ方式）。cache は ubuntu のみ（設計 §6.3）で、key 種別は servohost
+  #   release の前に dev の servo-host/target を削除し、前後の df -h / を記録する（小さい runner のディスク枯渇対策。#1525）
   # - 出る check-run は required にする前提（ruleset の更新はオーナーが行う）
   servo-host-ubuntu:
     needs: changes
@@ -1275,6 +1276,15 @@ jobs:
             ~/.cargo/git/db
             servo-host/target
           key: ${{ steps.cache.outputs.cache-primary-key }}
+      # 小さい runner（72G・空き 19G。run 42005501697）で release ビルドがディスク枯渇するため（#1525）、
+      # dev の target を消して空きを戻す。cache の保存より後に置き、以降のステップはこの target を使わない。
+      # 条件は release と同じにする（prune・save の cache-hit 条件に揃えると exact hit 時に削除が走らない）
+      - name: "[servo-host-release] dev の servo-host/target の削除（main・workflow_dispatch のみ）"
+        if: ${{ !cancelled() && github.event_name != 'pull_request' }}
+        run: |
+          df -h /
+          rm -rf servo-host/target
+          df -h /
       - name: "[servo-host-release] release ビルド（main・workflow_dispatch のみ）"
         if: ${{ !cancelled() && github.event_name != 'pull_request' }}
         env:
@@ -1282,6 +1292,10 @@ jobs:
         run: |
           cargo build --manifest-path servo-host/Cargo.toml --locked --release \
             --target-dir "$SERVO_HOST_RELEASE_TARGET_DIR"
+      # ビルドが失敗しても記録する。削除直後の df との差が release の必要容量の実測値になる（#1525）
+      - name: "[servo-host-release] release ビルド後のディスク空きの記録（main・workflow_dispatch のみ）"
+        if: ${{ !cancelled() && github.event_name != 'pull_request' }}
+        run: df -h /
       # 記録のみ。閾値で fail させない: ホストのバイナリに SSOT 上の閾値は無い
       # （RENDER-2・BINARY_SIZE_LIMIT_BYTES は既定ビルドの cli 向け）。ゲート化はオーナー判断
       - name: "[servo-host-release] リリースバイナリのサイズ記録（main・workflow_dispatch のみ）"
