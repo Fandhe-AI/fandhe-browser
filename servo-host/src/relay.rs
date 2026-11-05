@@ -539,33 +539,50 @@ mod tests {
         assert!(wait_until(|| relay.active() == 0));
     }
 
-    /// UDS 側から一方向に流れ続ける接続はアイドル時間を超えても切られない。
+    /// UDS 側から一方向に流れ続ける接続はアイドル時間を超えても切られない（RENDER-3・SEC-2）。
+    /// 値の根拠（#1527）: macOS runner では 100ms の送信周期が実効 150〜190ms に延び、約 0.5 秒の
+    /// 停止も出るため、`idle_timeout` を周期の 20 倍にする。送信の総時間は sleep の下限だけで
+    /// 2.4 秒あり、`idle_timeout` を必ず超える（超えなければ切断の有無を確かめたことにならない）。
     #[test]
     fn one_way_traffic_is_not_cut() {
+        const SENDS: usize = 25;
+        const INTERVAL: Duration = Duration::from_millis(100);
+        const IDLE: Duration = Duration::from_secs(2);
         let dir = TmpDir::new();
         let sock = dir.sock();
         let listener = UnixListener::bind(&sock).unwrap();
         std::thread::spawn(move || {
             if let Ok((mut s, _)) = listener.accept() {
-                for _ in 0..12 {
+                for _ in 0..SENDS {
                     if s.write_all(b"x").is_err() {
                         return;
                     }
-                    std::thread::sleep(Duration::from_millis(100));
+                    std::thread::sleep(INTERVAL);
                 }
                 std::thread::sleep(Duration::from_secs(2));
             }
         });
         let limits = RelayLimits {
-            idle_timeout: Duration::from_millis(400),
+            idle_timeout: IDLE,
             tick: Duration::from_millis(50),
             ..RelayLimits::default()
         };
         let relay = start_with(sock, limits).unwrap();
+        // 送信側は accept の後に始まるため、ここからの経過は送信の総時間以上になる。
+        let started = Instant::now();
         let mut c = connect(&relay);
-        let mut got = [0u8; 12];
-        c.read_exact(&mut got).unwrap();
-        assert_eq!(&got, b"xxxxxxxxxxxx");
+        let mut got = [0u8; SENDS];
+        c.read_exact(&mut got).unwrap_or_else(|e| {
+            panic!(
+                "relay cut a flowing connection after {:?}: {e}",
+                started.elapsed()
+            )
+        });
+        assert_eq!(got, [b'x'; SENDS]);
+        assert!(
+            started.elapsed() > IDLE,
+            "traffic must outlast idle_timeout"
+        );
     }
 
     /// RENDER-3・SEC-2（#1450）: UDS が存在しなくても panic せず固定の 503 を返して閉じ、
