@@ -294,8 +294,20 @@ class DiagnosticFailureTest(unittest.TestCase):
         self.assertFalse(cleanup["pktmon_stopped"])
         self.assertIsNotNone(to.cleanup_reason(cleanup))
 
-    def test_short_frames_are_counted_without_making_the_observation_unavailable(self) -> None:
+    def test_short_frame_to_testnet_makes_the_observation_unavailable(self) -> None:
         short = eth(ipv4(NIC, 1, "192.0.2.1", 2, "udp"))[:14 + 20 + 4]
+        fake = FakeWindows(pcap_frames=[syn(5000, 47300), short],
+                           events=[netevent(DROP, "192.0.2.1", 47316, fid="100")])
+        obs = observer(fake)
+        obs.start()
+        result = obs.stop_and_collect(SID)
+        obs.cleanup()
+        self.assertEqual(result["unavailable"],
+                         "pktmon pcapng could not be parsed (short frame to testnet could not be decoded)")
+        self.assertEqual(result["pktmon"]["diag"]["short_frames"], 1)
+
+    def test_short_frame_outside_testnet_is_counted_without_making_the_observation_unavailable(self) -> None:
+        short = eth(ipv4(NIC, 1, "198.51.100.7", 2, "udp"))[:14 + 20 + 4]
         leak_port = testnet.testnet_ports("appcontainer")["testnet_img"]
         fake = FakeWindows(pcap_frames=[syn(5000, 47300), short, syn(6000, leak_port)],
                            events=[netevent(DROP, "192.0.2.1", 47316, fid="100")])

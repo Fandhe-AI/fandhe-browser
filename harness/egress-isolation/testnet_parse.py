@@ -112,11 +112,23 @@ def decode_ipv4_packet(frame: bytes, linktype: int) -> tuple[str, int, str, int,
     return None
 
 
+def _short_frame_dst(frame: bytes, linktype: int) -> str | None:
+    """短いフレームでも読める IPv4 の宛先 IP を返す。IPv4 で 20 バイト未満・IPv4 以外・未知の linktype は None。
+
+    `_is_short_frame` が真のフレームに使う。宛先が TEST-NET 内なら NIC へ出たパケットを見落とさないため観測不能にする。
+    """
+    ip, _short = _link_payload(frame, linktype)
+    if ip is None or len(ip) < 20 or ip[0] >> 4 != 4:
+        return None
+    return socket.inet_ntoa(ip[16:20])
+
+
 def _is_short_frame(frame: bytes, linktype: int) -> bool:
     """`decode_ipv4_packet` が None を返したフレームが「ヘッダの途中で終わった短いフレーム」かを返す。
 
-    採取は `--pkt-size 0` で全長を取るため、切り詰めのないフレームがヘッダの途中で終わるなら本当に短い不正なパケットで、
-    TCP・UDP の接続試行にはなれない。エラーにはせず件数（`diag.short_frames`）に残して、無言で捨てないようにする。
+    採取は `--pkt-size 0` で全長を取るため、切り詰めのないフレームがヘッダの途中で終わるなら短い不正なパケットである。
+    ただし NIC へ出た事実は変わらず、IP ヘッダが 20 バイト以上あれば宛先は読める。呼び出し側（`parse_pcapng`）は
+    宛先が TEST-NET 内なら観測不能にし、それ以外は件数（`diag.short_frames`）に残すだけにする（無言で捨てない）。
     IPv4 以外・先頭でない断片・TCP / UDP 以外・未知の linktype は短いフレームに数えない。
     """
     ip, link_short = _link_payload(frame, linktype)
@@ -236,8 +248,12 @@ def parse_pcapng(f: Any, index: dict[tuple[str, int], tuple[str, str]]) -> dict[
                     # ヘッダの途中で切れて宛先を読めないフレームは、集計から無言で消えて漏れを見落とす（観測不能にする）。
                     diag.setdefault("error", "truncated frame could not be decoded")
                 elif _is_short_frame(frame, link):
-                    # 切り詰めのない短いフレームは不正なパケットで接続試行になれない。観測不能にはせず件数だけ残す。
+                    # 切り詰めのない短いフレーム。宛先が読めて TEST-NET 内なら NIC への送出を見落とせないため観測不能にする。
+                    # 宛先を読めない・TEST-NET 外宛ては件数だけ残す。
                     diag["short_frames"] += 1
+                    short_dst = _short_frame_dst(frame, link)
+                    if short_dst is not None and testnet.in_testnet(short_dst):
+                        diag.setdefault("error", "short frame to testnet could not be decoded")
                 continue
             diag["ipv4_decoded"] += 1
             src, sport, dst, dport, kind = dec

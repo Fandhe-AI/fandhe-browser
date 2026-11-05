@@ -362,12 +362,29 @@ class ShortFrameTest(unittest.TestCase):
         res = self._parse(epb_raw(cut, len(cut), len(self.FULL)))
         self.assertEqual(res["diag"]["error"], "truncated frame could not be decoded")
 
-    def test_l4_cut_without_truncation_is_counted_not_an_error(self) -> None:
-        cut = self.FULL[:14 + 20 + 4]
-        res = self._parse(epb(cut))
-        self.assertNotIn("error", res["diag"])
-        self.assertEqual((res["diag"]["frames"], res["diag"]["short_frames"]), (1, 1))
-        self.assertEqual(res["routes"], {})
+    def test_short_frame_to_testnet_is_an_error(self) -> None:
+        for kind in ("tcp_syn", "udp"):
+            cut = eth(ipv4(NIC, 5000, "192.0.2.1", 47300, kind))[:14 + 20 + 4]
+            res = self._parse(epb(cut))
+            self.assertEqual(res["diag"]["error"], "short frame to testnet could not be decoded", kind)
+            self.assertEqual((res["diag"]["frames"], res["diag"]["short_frames"]), (1, 1), kind)
+            self.assertEqual(res["routes"], {}, kind)
+
+    def test_short_frame_outside_testnet_is_counted_not_an_error(self) -> None:
+        for kind in ("tcp_syn", "udp"):
+            cut = eth(ipv4(NIC, 5000, "198.51.100.7", 47300, kind))[:14 + 20 + 4]
+            res = self._parse(epb(cut))
+            self.assertNotIn("error", res["diag"], kind)
+            self.assertEqual((res["diag"]["frames"], res["diag"]["short_frames"]), (1, 1), kind)
+            self.assertEqual(res["routes"], {}, kind)
+
+    def test_short_frame_with_unreadable_dst_is_counted_not_an_error(self) -> None:
+        for kind in ("tcp_syn", "udp"):
+            cut = eth(ipv4(NIC, 5000, "192.0.2.1", 47300, kind))[:14 + 19]
+            res = self._parse(epb(cut))
+            self.assertNotIn("error", res["diag"], kind)
+            self.assertEqual((res["diag"]["frames"], res["diag"]["short_frames"]), (1, 1), kind)
+            self.assertEqual(res["routes"], {}, kind)
 
     def test_exactly_20_byte_epb(self) -> None:
         res = self._parse(epb_raw(b"", 0, 0))

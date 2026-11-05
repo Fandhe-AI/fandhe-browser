@@ -283,7 +283,7 @@ macOS・Windows の GitHub ホステッドランナー。結果は #1003 に記�
       不完全なら pass にせず、pktmon の未停止・filter の未削除・netevents の未復元は終了コード 3。
     - 生データ（etl・pcapng・net events と filters の xml）はアーティファクトの外（`--out` の外の一時ディレクトリ）に置き、集計後に削除する。
       結果に出すのは宛先で絞った件数・種類・filter 名・SID の一致件数と、診断だけ（数字は `#` に潰し、許可語〔実機の出力に現れた語〕以外の語は `?` に置き換える。パス・MAC・NIC 名・送信元 IP・SID の値・範囲外の宛先は出さない）。
-      切り詰めのない短いフレーム（ヘッダの途中で終わる不正なパケット。TCP・UDP の接続試行にはなれない）は `diag.short_frames` に数えるだけで観測不能にしない（取り込みで切れて宛先を読めないフレームは従来どおり観測不能）。
+      切り詰めのない短いフレーム（ヘッダの途中で終わる不正なパケット）は `diag.short_frames` に数える。IP ヘッダが 20 バイト以上あって宛先が TEST-NET 内なら NIC への送出を見落とせないため観測不能にする。宛先を読めない（IP ヘッダが 20 バイト未満）フレームと TEST-NET 外宛てのフレームは件数だけで観測不能にしない。取り込みで切れて宛先を読めないフレームは従来どおり観測不能。
     - 実測: `xos-measure.yml` の suite `egress-isolation`（`egress-isolation-windows`）で行う。run 42000257965（`workflow_dispatch`・#1516 のブランチ head 9cb4f790 の実測で、main の実測ではない。Windows Server 2025、2026-11-05）の結果: `testnet_redirect`・`testnet_udp` は pass（容器の NIC 0 件・対照の NIC に出た・SID 一致の WFP drop あり）、`testnet_img`・`testnet_fetch`・`testnet_ws` は対照でも NIC に出ず unobservable（#1519 で追跡）。片付けは 4 項目とも成功。
     - 後続の候補: `internetClient` を付けた容器を陽性の対照に足す（Servo のセッションが 3 つ目になり、ipc-channel の制約〔#1421〕も絡むため今回は採らない）。
 
