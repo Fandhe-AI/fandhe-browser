@@ -315,6 +315,21 @@ class FiltersAndOptionsTest(unittest.TestCase):
         self.assertIs(tp.parse_pktmon_running(real + "    Log file:  C:\\work\\stopped\\x.etl\n"), True)
         self.assertIs(tp.parse_pktmon_running("Packet Monitor is not running.\r\n"), False)
 
+    def test_pktmon_running_banner_and_stopped_path_are_not_false(self) -> None:
+        # Issue #1523・RENDER-3: False は危険側。バナー付き・stopped を含む行付きでも False にしない。
+        real = ("Collected Data:\n    Packet counters, packet capture\nCapture Type:\n    All packets\n")
+        self.assertIs(tp.parse_pktmon_running("WARNING: x\n" + real), True)
+        path = "WARNING: x\n" + real + "    Log file:  C:\\work\\stopped\\x.etl\n"
+        self.assertIs(tp.parse_pktmon_running(path), True)
+        self.assertIs(tp.parse_pktmon_running(path.replace("\n", "\r\n")), True)
+        for stopped in ("Packet Monitor is not running.", "Packet Monitor is not running.\r\n",
+                        "Packet Monitor is not running.\r\n\n"):
+            self.assertIs(tp.parse_pktmon_running(stopped), False)
+        for unknown in ("Packet Monitor is not running.\nExtra\n", "WARNING\nPacket Monitor is not running.\n",
+                        "Log: C:\\work\\stopped\\x.etl\n", "Collection status: Stopped", "???", ""):
+            self.assertIsNone(tp.parse_pktmon_running(unknown), unknown)
+        self.assertIs(tp.parse_pktmon_running("Collection status: Running"), True)
+
     def test_pktmon_filters_empty_is_full_match(self) -> None:
         for text in ("No filters set.", "no filter", "No filters set.\r\n", "  No filters  "):
             self.assertIs(tp.parse_pktmon_filters_empty(text), True, repr(text))
@@ -334,6 +349,14 @@ class FiltersAndOptionsTest(unittest.TestCase):
         for line in lines:
             self.assertEqual(tp.shape(line), line)
         self.assertEqual(tp.shape("1 testnet 192.0.2.0/24"), "# testnet #.#.#.#/#")
+
+    def test_shape_allows_whole_real_lines_only(self) -> None:
+        # Issue #1523: 語単位でなく行単位。許可語と同じ名前の語は残さない。
+        for word in ("none", "name", "network", "all"):
+            self.assertEqual(tp.shape(word), "?")
+        self.assertEqual(tp.shape("Adapter all"), "? ?")
+        self.assertEqual(tp.shape("Logger name:        network"), "? ?:        ?")
+        self.assertEqual(tp.shape("C:\\Users\\none\\x.etl"), "?:\\?\\?\\?.?")
 
     def test_shape_drops_environment_specific_words(self) -> None:
         for text, forbidden in (("C:\\Users\\runneradmin\\AppData\\x.etl", "runneradmin"),
