@@ -256,6 +256,28 @@ class FailureHandlingTest(unittest.TestCase):
         self.assertFalse(fake.pm_filters)
         self.assertFalse(fake.netevents)  # netevents=on は start の失敗で行っていない
 
+    def test_capture_is_limited_to_nics(self) -> None:
+        fake = FakeWindows()
+        obs = observer(fake)
+        obs.start()
+        starts = [a for a in fake.calls if a[1:2] == ["start"]]
+        self.assertEqual(len(starts), 1)
+        self.assertEqual(starts[0][starts[0].index("--comp") + 1], "nics")
+        obs.cleanup()
+
+    def test_wfp_failure_still_parses_pcap_and_leak_fails(self) -> None:
+        port = testnet.testnet_ports("appcontainer")["testnet_redirect"]
+        for failing in ({"set-options"}, {"show-netevents"}):
+            fake = FakeWindows(fail=failing, pcap_frames=[syn(5000, port)])
+            obs = observer(fake)
+            obs.start()
+            result = obs.stop_and_collect(SID)
+            self.assertIsNotNone(result["unavailable"])
+            self.assertEqual(result["pktmon"]["routes"]["appcontainer/testnet_redirect"]["packets"], {"tcp_syn": 1})
+            verdicts = judge.judge_testnet("appcontainer", observation=result, positive_ok=True, binary_match=True,
+                                           cleanup_incomplete=to.cleanup_reason(obs.cleanup()))
+            self.assertEqual(verdicts["testnet_redirect"]["verdict"], judge.FAIL)
+
     def test_filter_add_failure_is_unavailable(self) -> None:
         fake = FakeWindows(fail={"filter-add"})
         obs = observer(fake)

@@ -120,6 +120,7 @@ class TestnetObserver:
         self.filter_names: dict[str, str] = {}
         self._pm_start_attempted = False
         self._pm_filters_attempted = False
+        self._pm_capturing = False  # NIC 採取の開始に成功した（WFP 側の成否とは独立に pcap を解析する根拠）
         self._wfp_set_attempted = False
         self._wfp_orig_on: bool | None = None
         self._cleanup_done: dict[str, Any] | None = None
@@ -238,14 +239,14 @@ class TestnetObserver:
             self._fail("pktmon filter add failed")
             return
         self._pm_start_attempted = True
-        r = self._pm("start", "--capture", "--comp", "all", "--pkt-size", "0", "--file-name", str(self.etl))
-        if r["rc"] != 0:
-            d["pktmon_start_comp_all_rc"] = r["rc"]
-            r = self._pm("start", "--capture", "--file-name", str(self.etl))
+        # 採取は NIC に限る（`--comp nics`）。`--comp all` だと NIC より上で記録され遮断されたパケットも
+        # 「NIC から出た」と数えてしまうため、全コンポーネントへの fallback もしない（失敗は unavailable）。
+        r = self._pm("start", "--capture", "--comp", "nics", "--pkt-size", "0", "--file-name", str(self.etl))
         d["pktmon_start_rc"] = r["rc"]
         if r["rc"] != 0:
             self._fail("pktmon start failed")
             return
+        self._pm_capturing = True
         self._wfp_set_attempted = True  # 付与を試みたら、部分適用を除外できないため復元も必ず試す
         on = self._wfp("set", "options", "netevents=on")
         d["wfp_set_on_rc"] = on["rc"]
@@ -280,7 +281,8 @@ class TestnetObserver:
         if self._pm_start_attempted:
             stop = self._pm("stop")
             d["pktmon_stop_rc"] = stop["rc"]
-            if self.unavailable is None:
+            if self._pm_capturing:
+                # WFP 側が unavailable でも、採取済みの pcap は必ず解析する（漏えいの証拠があれば fail を優先するため）。
                 conv = self._pm("etl2pcap", str(self.etl), "--out", str(self.pcap))
                 if conv["rc"] != 0 or not self.pcap.exists():
                     d["pktmon_etl2pcap_long_rc"] = conv["rc"]
