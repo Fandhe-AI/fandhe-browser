@@ -51,6 +51,7 @@ import judge  # noqa: E402
 import listeners  # noqa: E402
 import quiet_io  # noqa: E402
 import seatbelt  # noqa: E402
+import testnet  # noqa: E402
 import servo_bbox_driver as sbd  # noqa: E402
 
 LOAD_TIMEOUT_MS = 8000
@@ -307,6 +308,12 @@ def probe_udp(ip: str, port: int) -> str:
         sock.close()
 
 
+def probe_testnet_udp(port: int) -> str:
+    """TEST-NET-1 への UDP sendto（Issue #1515）。宛先を検証してから 1 回送る。戻り値は根拠にしない（記録だけ）。"""
+    testnet.validate_egress_dest(testnet.TESTNET_IP, port)
+    return probe_udp(testnet.TESTNET_IP, port)
+
+
 def probe_dns() -> dict[str, Any]:
     """hosts に無い名前の解決を試み、所要時間と失敗種別を返す（隔離下専用。上流の DNS へ出うるため）。"""
     started = time.monotonic()
@@ -461,6 +468,17 @@ def validate_args(args: argparse.Namespace) -> dict[str, int]:
             if isinstance(value, bool) or not isinstance(value, int) or not (1024 <= value <= 65535):
                 raise ValueError(f"port for {key} must be an int in [1024, 65535]")
         needed = (*needed, *fixtures.DIAG_ROUTES)
+    if getattr(args, "testnet", False):
+        # TEST-NET-1 宛ての経路（Issue #1515。Windows の実測だけ）。指定したときだけ必須で、経路ごとの一意なポートを検証する。
+        if sys.platform != "win32":
+            raise ValueError("--testnet is for the Windows measurement only")
+        for key in testnet.TESTNET_ROUTES:
+            value = ports.get(key)
+            if isinstance(value, bool) or not isinstance(value, int) or not (1024 <= value <= 65535):
+                raise ValueError(f"port for {key} must be an int in [1024, 65535]")
+        if len({ports[k] for k in testnet.TESTNET_ROUTES}) != len(testnet.TESTNET_ROUTES):
+            raise ValueError("TEST-NET ports must be distinct per route")
+        needed = (*needed, *testnet.TESTNET_ROUTES)
     count = getattr(args, "warmup_count", 0)
     wait_ms = getattr(args, "warmup_wait_ms", 0)
     if isinstance(count, bool) or not isinstance(count, int) or not (0 <= count <= fixtures.MAX_WARMUP_COUNT):
@@ -538,6 +556,10 @@ def run(args: argparse.Namespace, ports: dict[str, int]) -> dict[str, Any]:
     page_port = server.server_address[1]
     _PageHandler.pages = fixtures.build_pages(ports, literal=literal)
     _PageHandler.redirects = {fixtures.REDIRECT_PATH: fixtures.redirect_location(ports, literal=literal)}
+    testnet_on = bool(getattr(args, "testnet", False)) and all(r in ports for r in testnet.TESTNET_ROUTES)
+    if testnet_on:
+        _PageHandler.pages = {**_PageHandler.pages, **fixtures.build_testnet_pages(ports)}
+        _PageHandler.redirects[fixtures.TESTNET_REDIRECT_PATH] = fixtures.testnet_redirect_location(ports)
     diag = bool(getattr(args, "diag_routes", False)) and all(r in ports for r in fixtures.DIAG_ROUTES)
     if diag:
         _PageHandler.redirects[fixtures.REDIRECT_LATE_PATH] = fixtures.diag_redirect_location(ports, literal=literal)
@@ -639,6 +661,16 @@ def run(args: argparse.Namespace, ports: dict[str, int]) -> dict[str, Any]:
             guard_polls[r] = (guard.snapshot_polls() - polls_before) if guard is not None else 0  # 経路ごとに完了した走査の回数
         result["loads"] = loads
         result["guard_polls"] = guard_polls
+        if testnet_on:
+            # TEST-NET-1 宛ての 4 経路（Issue #1515）。判定経路の後に読み、loads・attempts・guard_polls には混ぜない
+            # （試行の根拠はランナー側の WFP drop。ここは読み込みの結果の記録だけ）。
+            testnet_loads: dict[str, Any] = {}
+            for r in testnet.TESTNET_TCP_ROUTES:
+                testnet_loads[r] = timed_load(r, base + fixtures.TESTNET_ROUTE_PATH[r], "testnet")
+                time.sleep(SETTLE_S)
+                host_pids |= descendant_pids(proc.pid)
+                result["host_pids"] = sorted(host_pids)
+            result["testnet_loads"] = testnet_loads
         if diag:
             # 判定経路の後に診断経路を試す（Issue #1415。判定・attempts には混ぜない）。
             diag_loads: dict[str, Any] = {}
@@ -686,6 +718,9 @@ def run(args: argparse.Namespace, ports: dict[str, int]) -> dict[str, Any]:
             return f"unobservable:{type(exc).__name__}"
 
     probes["udp_direct"] = guarded("udp_direct", lambda: probe_udp(judge.IP_BLOCKED, ports["udp_direct"]))
+    if testnet_on:
+        probes[testnet.TESTNET_UDP_ROUTE] = guarded(
+            testnet.TESTNET_UDP_ROUTE, lambda: probe_testnet_udp(ports[testnet.TESTNET_UDP_ROUTE]))
     if netns:
         probes["internal_real"] = {
             **{ip: guarded("internal_real", lambda ip=ip: probe_connect(socket.AF_INET, (ip, 80)))
@@ -753,6 +788,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--warmup-wait-ms", type=int, default=0,
                         help="macOS only: wait (0-30000 ms) after the last warm-up, before the verdict routes "
                              "(Issue #1415). Not part of verdicts.")
+    parser.add_argument("--testnet", action="store_true",
+                        help="Windows only: also load/send to TEST-NET-1 (192.0.2.1) destinations on per-route ports "
+                             "(Issue #1515). Observed from the runner side; never part of the loopback verdicts.")
     parser.add_argument("--diag-routes", action="store_true",
                         help="macOS only: also run redirect diagnostics (Issue #1415). Not part of verdicts.")
     args = parser.parse_args(argv)
