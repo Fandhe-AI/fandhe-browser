@@ -25,6 +25,7 @@ import json
 import os
 import re
 import selectors
+import struct
 import shutil
 import socket
 import subprocess
@@ -156,6 +157,172 @@ def parse_pktmon_text(lines: Iterable[str], nic_ip: str | None, port_index: dict
             ent["drops"][dr.group(1).strip() or "drop"] += 1
     diag["component_ids"] = dict(diag["component_ids"])
     return {"by_variant": {k: {f: dict(v) for f, v in ent.items()} for k, ent in out.items()}, "diag": diag}
+
+
+_LINK_ETHERNET = 1
+_LINK_NULL = 0
+_LINK_RAW_TYPES = (12, 14, 101, 228)
+_PCAPNG_SHB, _PCAPNG_IDB, _PCAPNG_SPB, _PCAPNG_EPB = 0x0A0D0D0A, 1, 3, 6
+_MAX_BLOCK_BYTES = 16 * 1024 * 1024
+_COMPONENT_IN_COMMENT = re.compile(r"(?i)component\W*(\d+)")
+
+
+def decode_ipv4_packet(frame: bytes, linktype: int) -> tuple[str, int, str, int, str] | None:
+    """リンク層つきのフレームから IPv4 の (src, sport, dst, dport, kind) を取る。kind は tcp_syn / tcp_other / udp。
+
+    IPv4 の TCP・UDP 以外、先頭断片でない断片、途中で切れたパケットは None。
+    """
+    off = 0
+    if linktype == _LINK_ETHERNET:
+        if len(frame) < 14:
+            return None
+        et = struct.unpack_from("!H", frame, 12)[0]
+        off = 14
+        while et in (0x8100, 0x88A8) and len(frame) >= off + 4:
+            et = struct.unpack_from("!H", frame, off + 2)[0]
+            off += 4
+        if et != 0x0800:
+            return None
+    elif linktype == _LINK_NULL:
+        off = 4
+    elif linktype in _LINK_RAW_TYPES:
+        off = 0
+    else:
+        return None
+    ip = frame[off:]
+    if len(ip) < 20 or ip[0] >> 4 != 4:
+        return None
+    ihl = (ip[0] & 0x0F) * 4
+    if ihl < 20 or len(ip) < ihl + 8:
+        return None
+    if struct.unpack_from("!H", ip, 6)[0] & 0x1FFF:
+        return None
+    proto = ip[9]
+    src, dst = socket.inet_ntoa(ip[12:16]), socket.inet_ntoa(ip[16:20])
+    sport, dport = struct.unpack_from("!HH", ip, ihl)
+    if proto == 17:
+        return src, sport, dst, dport, "udp"
+    if proto == 6:
+        if len(ip) < ihl + 14:
+            return None
+        flags = ip[ihl + 13]
+        return src, sport, dst, dport, ("tcp_syn" if flags & 0x02 and not flags & 0x10 else "tcp_other")
+    return None
+
+
+def _epb_comment(options: bytes, endian: str) -> str | None:
+    """EPB のオプション列から opt_comment（code 1）を取る。"""
+    pos = 0
+    while pos + 4 <= len(options):
+        code, length = struct.unpack_from(endian + "HH", options, pos)
+        if code == 0:
+            return None
+        if code == 1:
+            return options[pos + 4:pos + 4 + length].decode("utf-8", errors="replace")
+        pos += 4 + ((length + 3) & ~3)
+    return None
+
+
+def parse_pcapng(f: Any, nic_ip: str | None, port_index: dict[tuple[str, int], str]) -> dict[str, Any]:
+    """pktmon の pcapng（SHB・IDB・EPB・SPB）を読み、宛先（loopback / testnet / nic）で絞って variant 単位に集計する。
+
+    pktmon は同じパケットを複数コンポーネントで記録するため、`packets`（生の件数）と `unique_flows`（送信元込みの
+    5 タプル + kind の重複除去後の件数）の両方を出す。範囲外の IP は件数だけ数え、値は出さない。壊れたファイルは
+    例外にせず `diag.error` に残して、そこまでの集計を返す。
+    """
+    diag: dict[str, Any] = {"block_types": collections.Counter(), "linktypes": collections.Counter(),
+                            "frames": 0, "ipv4_decoded": 0, "in_scope": 0, "out_of_scope": 0,
+                            "epb_with_comment": 0, "comment_shapes": collections.Counter(),
+                            "component_ids": collections.Counter()}
+    out: dict[str, dict[str, Any]] = {}
+    seen: dict[str, set[tuple[Any, ...]]] = {}
+    endian = "<"
+    links: list[int] = []
+    try:
+        while True:
+            head = f.read(8)
+            if len(head) < 8:
+                break
+            btype_le = struct.unpack("<I", head[:4])[0]
+            if btype_le == _PCAPNG_SHB:
+                # ブロック長の解釈にエンディアンが要るため、先に byte-order magic を見る。
+                body = f.read(8)
+                if len(body) < 8:
+                    diag["error"] = "truncated SHB"
+                    break
+                magic = struct.unpack("<I", body[:4])[0]
+                endian = "<" if magic == 0x1A2B3C4D else ">" if magic == 0x4D3C2B1A else "<"
+                total = struct.unpack(endian + "I", head[4:8])[0]
+                rest = f.read(max(0, total - 16))
+                if total < 16 or len(rest) < total - 16:
+                    diag["error"] = "truncated SHB"
+                    break
+                links = []
+                diag["block_types"]["SHB"] += 1
+                continue
+            btype, total = struct.unpack(endian + "II", head)
+            if total < 12 or total > _MAX_BLOCK_BYTES:
+                diag["error"] = f"bad block length (type {btype})"
+                break
+            body = f.read(total - 12)
+            tail = f.read(4)
+            if len(body) < total - 12 or len(tail) < 4:
+                diag["error"] = "truncated block"
+                break
+            name = {_PCAPNG_IDB: "IDB", _PCAPNG_EPB: "EPB", _PCAPNG_SPB: "SPB"}.get(btype, f"other-{btype}")
+            diag["block_types"][name] += 1
+            frame: bytes | None = None
+            link = -1
+            comment = None
+            if btype == _PCAPNG_IDB and len(body) >= 8:
+                links.append(struct.unpack_from(endian + "H", body, 0)[0])
+                diag["linktypes"][str(links[-1])] += 1
+            elif btype == _PCAPNG_EPB and len(body) >= 20:
+                ifid, _hi, _lo, caplen, _orig = struct.unpack_from(endian + "IIIII", body, 0)
+                frame = body[20:20 + caplen]
+                link = links[ifid] if ifid < len(links) else -1
+                comment = _epb_comment(body[20 + ((caplen + 3) & ~3):], endian)
+            elif btype == _PCAPNG_SPB and len(body) >= 4:
+                orig = struct.unpack_from(endian + "I", body, 0)[0]
+                frame = body[4:4 + min(orig, len(body) - 4)]
+                link = links[0] if links else -1
+            if frame is None:
+                continue
+            diag["frames"] += 1
+            if comment:
+                diag["epb_with_comment"] += 1
+                if len(diag["comment_shapes"]) < 8:
+                    diag["comment_shapes"][shape(comment, 80)] += 1
+            dec = decode_ipv4_packet(frame, link)
+            if dec is None:
+                continue
+            diag["ipv4_decoded"] += 1
+            src, sport, dst, dport, kind = dec
+            if classify_dest(dst, nic_ip) is None:
+                diag["out_of_scope"] += 1
+                continue
+            diag["in_scope"] += 1
+            proto = "udp" if kind == "udp" else "tcp"
+            key = port_index.get((proto, dport), "unattributed")
+            ent = out.setdefault(key, {"packets": collections.Counter(), "unique_flows": collections.Counter(),
+                                       "present": {}, "components": collections.Counter()})
+            ent["packets"][kind] += 1
+            flow = (src, sport, dst, dport, kind)
+            sset = seen.setdefault(key, set())
+            if flow not in sset and len(sset) < 100000:
+                sset.add(flow)
+                ent["unique_flows"][kind] += 1
+            ent["present"][kind] = 1
+            m = _COMPONENT_IN_COMMENT.search(comment or "")
+            if m:
+                ent["components"][m.group(1)] += 1
+                diag["component_ids"][m.group(1)] += 1
+    except (OSError, struct.error) as exc:
+        diag["error"] = f"{type(exc).__name__}"
+    for k in ("block_types", "linktypes", "comment_shapes", "component_ids"):
+        diag[k] = dict(diag[k])
+    by = {k: {f2: dict(v) for f2, v in ent.items()} for k, ent in out.items()}
+    return {"by_variant": by, "diag": diag}
 
 
 def _local(tag: str) -> str:
@@ -542,7 +709,7 @@ class Captures:
         self.workdir = workdir
         self.nic_ip = nic_ip
         self.etl = workdir / "pm.etl"
-        self.txt = workdir / "pm.txt"
+        self.pcap = workdir / "pktmon.pcapng"
         self.status: dict[str, Any] = {}
         self.pktmon_started = False
         self.pktmon_filters_added = False
@@ -613,18 +780,18 @@ class Captures:
             with stage("pktmon-stop-and-parse", timings):
                 st["pktmon_stop_rc"] = self._pm("stop")["rc"]
                 self.pktmon_started = False
-                r = self._pm("etl2txt", str(self.etl), "--out", str(self.txt))
-                if r["rc"] != 0 or not self.txt.exists():
-                    st["pktmon_etl2txt_long_rc"] = r["rc"]
-                    r = self._pm("etl2txt", str(self.etl), "-o", str(self.txt))
-                st["pktmon_etl2txt_rc"] = r["rc"]
+                r = self._pm("etl2pcap", str(self.etl), "--out", str(self.pcap))
+                if r["rc"] != 0 or not self.pcap.exists():
+                    st["pktmon_etl2pcap_long_rc"] = r["rc"]
+                    r = self._pm("etl2pcap", str(self.etl), "-o", str(self.pcap))
+                st["pktmon_etl2pcap_rc"] = r["rc"]
                 try:
-                    size = self.txt.stat().st_size
-                    st["pktmon_txt_bytes_bucket"] = f"<={1 << max(size, 1).bit_length()}"
+                    size = self.pcap.stat().st_size
+                    st["pktmon_pcap_bytes_bucket"] = f"<={1 << max(size, 1).bit_length()}"
                     if size > MAX_TEXT_BYTES:
-                        raise ValueError("pktmon text too large")
-                    with self.txt.open("r", encoding="utf-8", errors="replace") as f:
-                        result["pktmon"] = parse_pktmon_text(f, self.nic_ip, port_index)
+                        raise ValueError("pktmon pcapng too large")
+                    with self.pcap.open("rb") as f:
+                        result["pktmon"] = parse_pcapng(f, self.nic_ip, port_index)
                 except (OSError, ValueError) as exc:
                     st["pktmon_parse_error"] = type(exc).__name__
         # filter id → 名前（名前のみ）。event に現れた id だけを解決して出す。
@@ -792,15 +959,15 @@ def render_summary(doc: dict[str, Any]) -> str:
     lines.append(f"- services: `{json.dumps(rc.get('services'))[:200]}`")
     for tag, f in (doc.get("filters") or {}).items():
         lines.append(f"- WFP filters [{tag}]: total={f.get('total')} name matches={json.dumps(f.get('pattern_counts'))}")
-    lines += ["", "| variant | dest | proto | result | ms | listener | pktmon pkts (drops) | wfp events |",
+    lines += ["", "| variant | dest | proto | result | ms | listener | pktmon pkts raw (unique flows) | wfp events |",
               "| ------- | ---- | ----- | ------ | -- | -------- | ------------------- | ---------- |"]
     for r in doc.get("rows") or []:
         pm = r.get("pktmon") or {}
         pkts = sum((pm.get("packets") or {}).values())
-        drops = sum((pm.get("drops") or {}).values())
+        uniq = sum((pm.get("unique_flows") or {}).values())
         wf = r.get("wfp") or {}
         lines.append(f"| {r['variant']} | {r['dest']} | {r['proto']} | {_fmt_result(r)} | {r.get('elapsed_ms')} | "
-                     f"{r['listener_received']} | {pkts} ({drops}) | {json.dumps(wf.get('events') or {})} |")
+                     f"{r['listener_received']} | {pkts} (uniq {uniq}) | {json.dumps(wf.get('events') or {})} |")
     lines += ["", "### stage timings (ms)", ""]
     lines += [f"- {t['stage']}: {t['ms']} ({t['status']})" for t in doc.get("stage_timings") or []]
     lines += ["", "### cleanup", "", f"`{json.dumps(doc.get('cleanup'), sort_keys=True)}`", "",

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import io
+import socket
+import struct
 import sys
 import unittest
 from pathlib import Path
@@ -118,6 +120,87 @@ class Parsers(unittest.TestCase):
         self.assertEqual(res["total"], 2)
         self.assertEqual(res["pattern_counts"]["Block Outbound Default Rule"], 1)
         self.assertEqual(res["pattern_counts"]["AppContainerLoopback"], 1)
+
+
+def _eth_ipv4(src: str, dst: str, proto: int, l4: bytes) -> bytes:
+    ip = struct.pack("!BBHHHBBH4s4s", 0x45, 0, 20 + len(l4), 1, 0, 64, proto, 0,
+                     socket.inet_aton(src), socket.inet_aton(dst))
+    return b"\x00" * 12 + b"\x08\x00" + ip + l4
+
+
+def _tcp(sport: int, dport: int, flags: int) -> bytes:
+    return struct.pack("!HHIIBBHHH", sport, dport, 0, 0, 5 << 4, flags, 1024, 0, 0)
+
+
+def _udp(sport: int, dport: int) -> bytes:
+    return struct.pack("!HHHH", sport, dport, 9, 0) + b"x"
+
+
+def _block(btype: int, body: bytes) -> bytes:
+    pad = body + b"\x00" * (-len(body) % 4)
+    total = 12 + len(pad)
+    return struct.pack("<II", btype, total) + pad + struct.pack("<I", total)
+
+
+def make_pcapng(frames: list[bytes], comments: list[str | None] | None = None) -> bytes:
+    shb = _block(0x0A0D0D0A, struct.pack("<IHHq", 0x1A2B3C4D, 1, 0, -1))
+    idb = _block(1, struct.pack("<HHI", 1, 0, 0))
+    out = shb + idb
+    for i, fr in enumerate(frames):
+        body = struct.pack("<IIIII", 0, 0, 0, len(fr), len(fr)) + fr + b"\x00" * (-len(fr) % 4)
+        c = (comments or [None] * len(frames))[i]
+        if c:
+            cb = c.encode()
+            body += struct.pack("<HH", 1, len(cb)) + cb + b"\x00" * (-len(cb) % 4) + struct.pack("<HH", 0, 0)
+        out += _block(6, body)
+    return out
+
+
+class Pcapng(unittest.TestCase):
+    index = {("tcp", 47010): "v/c/tcp", ("udp", 47011): "v/c/udp", ("tcp", 47020): "v/b/tcp"}
+
+    def test_attribution_dedup_and_scope(self) -> None:
+        syn = _eth_ipv4(NIC, "192.0.2.1", 6, _tcp(50001, 47010, 0x02))
+        udp = _eth_ipv4(NIC, "192.0.2.1", 17, _udp(50002, 47011))
+        nic_syn = _eth_ipv4("127.0.0.1", NIC, 6, _tcp(50003, 47020, 0x02))
+        synack = _eth_ipv4(NIC, "192.0.2.1", 6, _tcp(50001, 47010, 0x12))
+        out_scope = _eth_ipv4(NIC, "93.184.216.34", 6, _tcp(50004, 47010, 0x02))
+        arp = b"\x00" * 12 + b"\x08\x06" + b"\x00" * 28
+        data = make_pcapng([syn, syn, udp, nic_syn, synack, out_scope, arp],
+                           ["Component 7", "Component 9", None, None, None, None, None])
+        res = run_probe.parse_pcapng(io.BytesIO(data), NIC, self.index)
+        by, diag = res["by_variant"], res["diag"]
+        self.assertEqual(by["v/c/tcp"]["packets"], {"tcp_syn": 2, "tcp_other": 1})
+        self.assertEqual(by["v/c/tcp"]["unique_flows"], {"tcp_syn": 1, "tcp_other": 1})
+        self.assertEqual(by["v/c/tcp"]["present"], {"tcp_syn": 1, "tcp_other": 1})
+        self.assertEqual(by["v/c/tcp"]["components"], {"7": 1, "9": 1})
+        self.assertEqual(by["v/c/udp"]["packets"], {"udp": 1})
+        self.assertEqual(by["v/b/tcp"]["packets"], {"tcp_syn": 1})
+        self.assertEqual(diag["block_types"], {"SHB": 1, "IDB": 1, "EPB": 7})
+        self.assertEqual(diag["linktypes"], {"1": 1})
+        self.assertEqual(diag["frames"], 7)
+        self.assertEqual(diag["ipv4_decoded"], 6)
+        self.assertEqual(diag["in_scope"], 5)
+        self.assertEqual(diag["out_of_scope"], 1)
+        self.assertEqual(diag["epb_with_comment"], 2)
+        self.assertNotIn("93.184", str(res))
+
+    def test_truncated_file_keeps_partial_result(self) -> None:
+        syn = _eth_ipv4(NIC, "192.0.2.1", 6, _tcp(50001, 47010, 0x02))
+        data = make_pcapng([syn, syn])
+        res = run_probe.parse_pcapng(io.BytesIO(data[:-10]), NIC, self.index)
+        self.assertEqual(res["by_variant"]["v/c/tcp"]["packets"], {"tcp_syn": 1})
+        self.assertIn("error", res["diag"])
+
+    def test_garbage_does_not_raise(self) -> None:
+        res = run_probe.parse_pcapng(io.BytesIO(b"\xff" * 64), NIC, self.index)
+        self.assertEqual(res["by_variant"], {})
+        self.assertIn("error", res["diag"])
+
+    def test_raw_ipv4_linktype(self) -> None:
+        raw = _eth_ipv4(NIC, "192.0.2.1", 17, _udp(50002, 47011))[14:]
+        self.assertEqual(run_probe.decode_ipv4_packet(raw, 101)[2:4], ("192.0.2.1", 47011))
+        self.assertIsNone(run_probe.decode_ipv4_packet(raw, 9999))
 
 
 class Commands(unittest.TestCase):
