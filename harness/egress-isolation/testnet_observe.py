@@ -281,6 +281,10 @@ class TestnetObserver:
         if self._pm_start_attempted:
             stop = self._pm("stop")
             d["pktmon_stop_rc"] = stop["rc"]
+            if stop["rc"] != 0:
+                # 停止に失敗すると未フラッシュの採取が欠ける。後の cleanup の再停止が成功しても観測は不完全のまま
+                # なので、最初の失敗をここで unavailable に固定する（取得済みパケットの解析は続け、漏えいは fail を優先）。
+                self._fail("pktmon stop failed")
             if self._pm_capturing:
                 # WFP 側が unavailable でも、採取済みの pcap は必ず解析する（漏えいの証拠があれば fail を優先するため）。
                 conv = self._pm("etl2pcap", str(self.etl), "--out", str(self.pcap))

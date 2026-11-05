@@ -37,6 +37,7 @@ class FakeWindows:
         self.pcap_frames: list[bytes] = over.get("pcap_frames", [])
         self.events: list[str] = over.get("events", [])
         self.bad_pcap = over.get("bad_pcap", False)
+        self.stop_fail_first = over.get("stop_fail_first", False)  # 最初の stop だけ失敗（再試行は成功）
 
     def _rc(self, name: str, out: str = "") -> dict[str, Any]:
         return {"rc": 1 if name in self.fail else 0, "out": out, "error": None}
@@ -80,6 +81,9 @@ class FakeWindows:
                 self.pm_running = True
             return self._rc("start")
         if sub == "stop":
+            if self.stop_fail_first:
+                self.stop_fail_first = False
+                return {"rc": 1, "out": "", "error": None}
             if "stop" not in self.fail:
                 self.pm_running = False
             return self._rc("stop")
@@ -314,6 +318,25 @@ class FailureHandlingTest(unittest.TestCase):
         cleanup = obs.cleanup()
         self.assertFalse(cleanup["pktmon_stopped"])
         self.assertIsNotNone(to.cleanup_reason(cleanup))
+
+    def test_stop_failure_is_unavailable_even_if_cleanup_stop_succeeds(self) -> None:
+        fake = FakeWindows(stop_fail_first=True, pcap_frames=[syn(5000, 47300)])
+        obs = observer(fake)
+        obs.start()
+        result = obs.stop_and_collect(SID)
+        cleanup = obs.cleanup()
+        self.assertTrue(cleanup["pktmon_stopped"])  # cleanup の再停止は成功する
+        self.assertIsNone(to.cleanup_reason(cleanup))
+        self.assertEqual(result["unavailable"], "pktmon stop failed")
+        self.assertEqual(result["diag"]["pktmon_stop_rc"], 1)
+
+    def test_stop_failure_keeps_captured_packets_for_leak_evidence(self) -> None:
+        fake = FakeWindows(stop_fail_first=True, pcap_frames=[syn(5000, 47300)])
+        obs = observer(fake)
+        obs.start()
+        result = obs.stop_and_collect(SID)
+        obs.cleanup()
+        self.assertEqual(result["pktmon"]["routes"]["baseline/testnet_redirect"]["packets"], {"tcp_syn": 1})
 
     def test_failed_filter_remove_is_not_reported_as_removed(self) -> None:
         fake = FakeWindows(fail={"filter-remove"})
