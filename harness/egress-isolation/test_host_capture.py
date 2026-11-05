@@ -752,7 +752,8 @@ class FdReadRetryTests(unittest.TestCase):
             b"Uid:\t1000\t1000\t1000\t1000\n"
         )
         with mock.patch("builtins.open", mock.mock_open(read_data=status)), mock.patch.object(
-            hc.os, "geteuid", lambda: 1000
+            # geteuid は Windows の os に無い。xos-measure の Windows ジョブでもこのテストを動かすため create を付ける（#1517）。
+            hc.os, "geteuid", lambda: 1000, create=True
         ):
             snap = hc._fd_denied_snapshot(self.X, "/servo", "listdir", 13)
         self.assertEqual(
