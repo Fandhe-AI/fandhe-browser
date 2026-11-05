@@ -102,7 +102,7 @@ def parse_pcapng(f: Any, index: dict[tuple[str, int], tuple[str, str]]) -> dict[
     壊れたファイルは例外にせず `diag.error` に残し、そこまでの集計を返す。
     """
     diag: dict[str, Any] = {"block_types": collections.Counter(), "linktypes": collections.Counter(),
-                            "frames": 0, "ipv4_decoded": 0, "in_scope": 0, "out_of_scope": 0}
+                            "frames": 0, "ipv4_decoded": 0, "in_scope": 0, "out_of_scope": 0, "truncated_frames": 0}
     out: dict[str, dict[str, Any]] = {}
     seen: dict[str, set[tuple[Any, ...]]] = {}
     endian = "<"
@@ -147,12 +147,14 @@ def parse_pcapng(f: Any, index: dict[tuple[str, int], tuple[str, str]]) -> dict[
             diag["block_types"][name] += 1
             frame: bytes | None = None
             link = -1
+            truncated = False  # 取り込み長が元の長さより短い（Issue #1515）
             if btype == _PCAPNG_IDB and len(body) >= 8:
                 links.append(struct.unpack_from(endian + "H", body, 0)[0])
                 diag["linktypes"][str(links[-1])] += 1
             elif btype == _PCAPNG_EPB and len(body) >= 20:
-                ifid, _hi, _lo, caplen, _orig = struct.unpack_from(endian + "IIIII", body, 0)
+                ifid, _hi, _lo, caplen, orig_len = struct.unpack_from(endian + "IIIII", body, 0)
                 frame = body[20:20 + caplen]
+                truncated = caplen < orig_len
                 if caplen > len(body) - 20:
                     # 宣言長が実データより長い。観測が欠けている可能性があるため壊れた入力として記録する（集計は続ける）。
                     diag.setdefault("error", "EPB caplen exceeds block data")
@@ -164,12 +166,18 @@ def parse_pcapng(f: Any, index: dict[tuple[str, int], tuple[str, str]]) -> dict[
             elif btype == _PCAPNG_SPB and len(body) >= 4:
                 orig = struct.unpack_from(endian + "I", body, 0)[0]
                 frame = body[4:4 + min(orig, len(body) - 4)]
+                truncated = orig > len(body) - 4
                 link = links[0] if links else -1
             if frame is None:
                 continue
             diag["frames"] += 1
+            if truncated:
+                diag["truncated_frames"] += 1
             dec = decode_ipv4_packet(frame, link)
             if dec is None:
+                if truncated:
+                    # ヘッダの途中で切れて宛先を読めないフレームは、集計から無言で消えて漏れを見落とす（観測不能にする）。
+                    diag.setdefault("error", "truncated frame could not be decoded")
                 continue
             diag["ipv4_decoded"] += 1
             src, sport, dst, dport, kind = dec

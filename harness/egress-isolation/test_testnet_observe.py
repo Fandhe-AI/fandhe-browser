@@ -385,6 +385,18 @@ class FailureHandlingTest(unittest.TestCase):
             self.assertIn("could not be parsed", result["unavailable"] or "")
             self.assertEqual(result["pktmon"]["routes"]["baseline/testnet_redirect"]["packets"], {"tcp_syn": 1})
 
+    def test_truncated_undecodable_frame_makes_the_observation_unavailable(self) -> None:
+        # Issue #1515: ヘッダの途中で切れたフレームは diag.error を経て unavailable に繋がる。
+        frame = syn(5001, 47301)
+        cut = block(6, struct.pack("<IIIII", 0, 0, 0, 24, len(frame)) + frame[:24])
+        fake = FakeWindows(pcap_bytes=shb() + idb(1) + epb(syn(5000, 47300)) + cut)
+        obs = observer(fake)
+        obs.start()
+        result = obs.stop_and_collect(SID)
+        obs.cleanup()
+        self.assertEqual(result["pktmon"]["diag"]["truncated_frames"], 1)
+        self.assertIn("truncated frame could not be decoded", result["unavailable"] or "")
+
     def test_show_netevents_failure_is_unavailable(self) -> None:
         fake = FakeWindows(fail={"show-netevents"})
         obs = observer(fake)

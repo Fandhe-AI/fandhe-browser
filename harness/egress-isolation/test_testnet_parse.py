@@ -150,6 +150,59 @@ def events_xml(*items: str) -> io.BytesIO:
 DROP = "FWPM_NET_EVENT_TYPE_CLASSIFY_DROP"
 
 
+def epb_trunc(frame: bytes, orig: int) -> bytes:
+    """取り込み長 len(frame)・元の長さ orig の EPB（orig > len(frame) で切り詰め）。"""
+    return block(6, struct.pack("<IIIII", 0, 0, 0, len(frame), orig) + frame)
+
+
+def spb(data: bytes, orig: int) -> bytes:
+    return block(3, struct.pack("<I", orig) + data)
+
+
+class TruncatedFrameTest(unittest.TestCase):
+    """切り詰められたフレームの扱い（Issue #1515。EPB・SPB）。ヘッダが読めなければ error、読めれば通常どおり集計する。"""
+
+    FULL = eth(ipv4(NIC, 5000, "192.0.2.1", 47300, "tcp_syn"))
+
+    def _parse(self, *blocks: bytes) -> dict:
+        return tp.parse_pcapng(io.BytesIO(shb() + idb(1) + b"".join(blocks)), testnet.port_index())
+
+    def test_epb_cut_inside_header_is_error(self) -> None:
+        r = self._parse(epb_trunc(self.FULL[:24], len(self.FULL)))
+        self.assertEqual(r["diag"]["truncated_frames"], 1)
+        self.assertEqual(r["diag"]["error"], "truncated frame could not be decoded")
+        self.assertEqual(r["routes"], {})
+
+    def test_epb_truncated_but_decodable_is_counted_without_error(self) -> None:
+        r = self._parse(epb_trunc(self.FULL, len(self.FULL) + 40))
+        self.assertEqual(r["diag"]["truncated_frames"], 1)
+        self.assertNotIn("error", r["diag"])
+        self.assertEqual(r["routes"]["baseline/testnet_redirect"]["packets"], {"tcp_syn": 1})
+
+    def test_epb_not_truncated_is_unchanged(self) -> None:
+        r = self._parse(epb(self.FULL))
+        self.assertEqual(r["diag"]["truncated_frames"], 0)
+        self.assertNotIn("error", r["diag"])
+        self.assertEqual(r["routes"]["baseline/testnet_redirect"]["packets"], {"tcp_syn": 1})
+
+    def test_spb_cut_inside_header_is_error(self) -> None:
+        r = self._parse(spb(self.FULL[:24], len(self.FULL)))
+        self.assertEqual(r["diag"]["truncated_frames"], 1)
+        self.assertEqual(r["diag"]["error"], "truncated frame could not be decoded")
+
+    def test_spb_truncated_but_decodable_is_counted_without_error(self) -> None:
+        r = self._parse(spb(self.FULL, len(self.FULL) + 40))
+        self.assertEqual(r["diag"]["truncated_frames"], 1)
+        self.assertNotIn("error", r["diag"])
+        self.assertEqual(r["routes"]["baseline/testnet_redirect"]["packets"], {"tcp_syn": 1})
+
+    def test_spb_not_truncated_is_unchanged(self) -> None:
+        r = self._parse(spb(self.FULL, len(self.FULL)))
+        self.assertEqual(r["diag"]["truncated_frames"], 0)
+        self.assertNotIn("error", r["diag"])
+        self.assertEqual(r["routes"]["baseline/testnet_redirect"]["packets"], {"tcp_syn": 1})
+
+
 class WfpEventsTest(unittest.TestCase):
     def test_drops_with_matching_sid_are_counted_per_route(self) -> None:
         res = tp.parse_wfp_events(events_xml(netevent(DROP, "192.0.2.1", 47316), netevent(DROP, "192.0.2.1", 47316),
