@@ -10,6 +10,7 @@ import json
 import struct
 import sys
 import unittest
+import unittest.mock
 from pathlib import Path
 from typing import Any
 
@@ -18,6 +19,16 @@ import judge  # noqa: E402
 import testnet  # noqa: E402
 import testnet_observe as to  # noqa: E402
 from test_testnet_parse import DROP, NIC, SID, block, epb, eth, events_xml, idb, ipv4, netevent, shb  # noqa: E402
+
+# run 42000257965（Windows Server 2025）の実機の出力の形。偽物もこの形で返し、パーサーの実機追従を回帰で守る。
+PM_RUNNING_OUT = ("Collected Data:\n    Packet counters, packet capture\nCapture Type:\n    All packets\n"
+                  "Monitored Components:\n    Network adapters\nPacket Filters:\n"
+                  "    # Name    IP Address\n    - ----    ----------\n    1 testnet 192.0.2.0/24\n"
+                  "Logger Parameters:\n    Logger name:        PktMon\n")
+PM_STOPPED_OUT = "Packet Monitor is not running."
+PM_FILTERS_OUT = ("Packet Filters:\n    # Name    IP Address\n    - ----    ----------\n"
+                  "    1 testnet 192.0.2.0/24\n")
+PM_NO_FILTERS_OUT = "Packet Filters:\n    None\n"
 
 FILTERS_XML = ("<wfpdiag><filters><item><filterId>100</filterId><displayData>"
                "<name>UWP Default Outbound Block Rule</name></displayData></item></filters></wfpdiag>")
@@ -40,6 +51,11 @@ class FakeWindows:
         self.bad_pcap = over.get("bad_pcap", False)
         self.pcap_bytes: bytes | None = over.get("pcap_bytes")
         self.stop_fail_first = over.get("stop_fail_first", False)  # 最初の stop だけ失敗（再試行は成功）
+        # 診断コマンドの失敗の注入。採取前の status / filter list は開始の条件なので、採取中（pm_running）だけに効かせる。
+        self.diag_raise = over.get("diag_raise", False)
+        self.diag_rc_fail = over.get("diag_rc_fail", False)
+        self.status_fail_after_stop = over.get("status_fail_after_stop", False)  # stop 後の status だけ rc=1
+        self._stopped = False
 
     def _rc(self, name: str, out: str = "") -> dict[str, Any]:
         return {"rc": 1 if name in self.fail else 0, "out": out, "error": None}
@@ -63,13 +79,19 @@ class FakeWindows:
 
     def _pktmon(self, rest: list[str]) -> dict[str, Any]:
         sub = rest[0]
+        if sub in ("status", "filter") and self.pm_running and (sub == "status" or rest[1] == "list"):
+            if self.diag_raise:
+                raise RuntimeError("injected diagnostic failure")
+            if self.diag_rc_fail:
+                return {"rc": 1, "out": "", "error": None}
         if sub == "status":
-            return self._rc("status", self.status_out or ("Collection status: Running" if self.pm_running
-                                                           else "Collection status: Not running"))
+            if self.status_fail_after_stop and self._stopped:
+                return {"rc": 1, "out": "", "error": None}
+            return self._rc("status", self.status_out or (PM_RUNNING_OUT if self.pm_running else PM_STOPPED_OUT))
         if sub == "filter":
             op = rest[1]
             if op == "list":
-                return self._rc("filter-list", "Filter Name  Protocol  IP Address" if self.pm_filters else "No filters set.")
+                return self._rc("filter-list", PM_FILTERS_OUT if self.pm_filters else PM_NO_FILTERS_OUT)
             if op == "add":
                 if "filter-add" not in self.fail:
                     self.pm_filters = True
@@ -83,6 +105,7 @@ class FakeWindows:
                 self.pm_running = True
             return self._rc("start")
         if sub == "stop":
+            self._stopped = True
             if self.stop_fail_first:
                 self.stop_fail_first = False
                 return {"rc": 1, "out": "", "error": None}
@@ -169,7 +192,8 @@ class HappyPathTest(unittest.TestCase):
         for key in ("pktmon_status_running_shape", "pktmon_filter_list_after_add_shape",
                     "pktmon_status_after_stop_shape", "pktmon_filter_list_after_remove_shape"):
             self.assertIsInstance(measure_obs["diag"].get(key), list, key)
-        self.assertEqual(measure_obs["diag"]["pktmon_filter_list_after_remove_shape"], ["No filters set."])
+        self.assertEqual(measure_obs["diag"]["pktmon_filter_list_after_remove_shape"],
+                         ["Packet Filters:", "None"])
         text = "\n".join(measure._testnet_observe_block(measure_obs))
         self.assertIn("pktmon_filter_list_after_remove_shape", text)
 
@@ -217,6 +241,86 @@ class HappyPathTest(unittest.TestCase):
                 self.assertNotIn("capture", a)
             else:
                 self.assertEqual(exe, "powershell.exe")
+
+
+class DiagnosticFailureTest(unittest.TestCase):
+    """診断（形の記録）の失敗が観測と片付けを止めないこと。判定に使う値の算出は fail-closed のまま。"""
+
+    SHAPE_KEYS = ("pktmon_status_running_shape", "pktmon_filter_list_after_add_shape")
+
+    def test_diag_command_exception_does_not_stop_the_observation(self) -> None:
+        fake = FakeWindows(diag_raise=True, pcap_frames=[syn(5000, 47300)])
+        obs = observer(fake)
+        obs.start()
+        self.assertIsNone(obs.unavailable)
+        for key in self.SHAPE_KEYS:
+            self.assertEqual(obs.diag[key], ["unavailable: RuntimeError"], key)
+        result = obs.stop_and_collect(SID)
+        cleanup = obs.cleanup()
+        self.assertIsNone(result["unavailable"])
+        self.assertEqual(result["pktmon"]["routes"]["baseline/testnet_redirect"]["packets"], {"tcp_syn": 1})
+        self.assertTrue(all(cleanup.values()))
+
+    def test_diag_command_rc_failure_does_not_stop_the_observation(self) -> None:
+        fake = FakeWindows(diag_rc_fail=True)
+        obs = observer(fake)
+        obs.start()
+        self.assertIsNone(obs.unavailable)
+        for key in self.SHAPE_KEYS:
+            self.assertIsInstance(obs.diag[key], list, key)
+        result = obs.stop_and_collect(SID)
+        cleanup = obs.cleanup()
+        self.assertIsNone(result["unavailable"])
+        self.assertTrue(all(cleanup.values()))
+
+    def test_shape_exception_in_cleanup_does_not_stop_the_cleanup(self) -> None:
+        fake = FakeWindows()
+        obs = observer(fake)
+        obs.start()
+        obs.stop_and_collect(SID)
+        with unittest.mock.patch.object(to, "_shapes", side_effect=ValueError("boom")):
+            cleanup = obs.cleanup()
+        self.assertEqual(cleanup, {"pktmon_stopped": True, "pktmon_filters_removed": True,
+                                   "netevents_restored": True, "raw_removed": True})
+        self.assertEqual(obs.diag["pktmon_status_after_stop_shape"], ["unavailable: ValueError"])
+        self.assertEqual(obs.diag["pktmon_filter_list_after_remove_shape"], ["unavailable: ValueError"])
+
+    def test_status_failure_after_stop_is_not_reported_as_stopped(self) -> None:
+        fake = FakeWindows(status_fail_after_stop=True)
+        obs = observer(fake)
+        obs.start()
+        obs.stop_and_collect(SID)
+        cleanup = obs.cleanup()
+        self.assertFalse(cleanup["pktmon_stopped"])
+        self.assertIsNotNone(to.cleanup_reason(cleanup))
+
+    def test_short_frame_to_testnet_makes_the_observation_unavailable(self) -> None:
+        short = eth(ipv4(NIC, 1, "192.0.2.1", 2, "udp"))[:14 + 20 + 4]
+        fake = FakeWindows(pcap_frames=[syn(5000, 47300), short],
+                           events=[netevent(DROP, "192.0.2.1", 47316, fid="100")])
+        obs = observer(fake)
+        obs.start()
+        result = obs.stop_and_collect(SID)
+        obs.cleanup()
+        self.assertEqual(result["unavailable"],
+                         "pktmon pcapng could not be parsed (short frame to testnet could not be decoded)")
+        self.assertEqual(result["pktmon"]["diag"]["short_frames"], 1)
+
+    def test_short_frame_outside_testnet_is_counted_without_making_the_observation_unavailable(self) -> None:
+        short = eth(ipv4(NIC, 1, "198.51.100.7", 2, "udp"))[:14 + 20 + 4]
+        leak_port = testnet.testnet_ports("appcontainer")["testnet_img"]
+        fake = FakeWindows(pcap_frames=[syn(5000, 47300), short, syn(6000, leak_port)],
+                           events=[netevent(DROP, "192.0.2.1", 47316, fid="100")])
+        obs = observer(fake)
+        obs.start()
+        result = obs.stop_and_collect(SID)
+        obs.cleanup()
+        self.assertIsNone(result["unavailable"])
+        # 同じ pcap の陰性パケット（appcontainer の NIC 出力）は従来どおり漏えいとして fail になる。
+        verdicts = judge.judge_testnet("appcontainer", observation=result, positive_ok=True, binary_match=True)
+        self.assertEqual(verdicts["testnet_img"]["verdict"], judge.FAIL)
+        self.assertEqual(result["pktmon"]["diag"]["short_frames"], 1)
+        self.assertEqual(result["pktmon"]["routes"]["baseline/testnet_redirect"]["packets"], {"tcp_syn": 1})
 
 
 class PreExistingStateTest(unittest.TestCase):
