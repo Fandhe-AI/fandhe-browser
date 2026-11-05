@@ -46,6 +46,7 @@ class FakeWindows:
         self.restore_fail = over.get("restore_fail", False)  # off への set が効かない（復元の失敗）
         self.firewall = over.get("firewall", "True")
         self.status_out = over.get("status_out")
+        self.status_after_stop_out = over.get("status_after_stop_out")  # stop 後の status の出力
         self.pcap_frames: list[bytes] = over.get("pcap_frames", [])
         self.events: list[str] = over.get("events", [])
         self.bad_pcap = over.get("bad_pcap", False)
@@ -87,6 +88,8 @@ class FakeWindows:
         if sub == "status":
             if self.status_fail_after_stop and self._stopped:
                 return {"rc": 1, "out": "", "error": None}
+            if self._stopped and self.status_after_stop_out is not None:
+                return self._rc("status", self.status_after_stop_out)
             return self._rc("status", self.status_out or (PM_RUNNING_OUT if self.pm_running else PM_STOPPED_OUT))
         if sub == "filter":
             op = rest[1]
@@ -357,6 +360,34 @@ class PreExistingStateTest(unittest.TestCase):
         self.assertIn("could not be determined", obs.unavailable or "")
         self.assertFalse(any(a[1] == "start" for a in fake.calls if a[0].endswith("pktmon.exe")))
         obs.cleanup()
+
+    def test_banner_and_stopped_path_status_is_treated_as_running(self) -> None:
+        # Issue #1523: バナー付き・stopped を含むパス付きの稼働中の出力を停止と誤認しない。
+        out = "WARNING: x\n" + PM_RUNNING_OUT + "    Log file: C:\\work\\stopped\\x.etl\n"
+        fake = FakeWindows(status_out=out)
+        obs = observer(fake)
+        obs.start()
+        self.assertIn("already running", obs.unavailable or "")
+        self.assertNotIn("pktmon.exe start", fake.names())
+        obs.cleanup()
+
+    def test_stopped_word_without_collected_data_is_undetermined(self) -> None:
+        fake = FakeWindows(status_out="Log: C:\\work\\stopped\\x.etl\n")
+        obs = observer(fake)
+        obs.start()
+        self.assertIn("could not be determined", obs.unavailable or "")
+        self.assertNotIn("pktmon.exe start", fake.names())
+        obs.cleanup()
+
+    def test_unconfirmed_status_after_stop_is_not_reported_as_stopped(self) -> None:
+        out = "WARNING: x\n" + PM_RUNNING_OUT + "    Log file: C:\\work\\stopped\\x.etl\n"
+        fake = FakeWindows(status_after_stop_out=out)
+        obs = observer(fake)
+        obs.start()
+        obs.stop_and_collect(SID)
+        cleanup = obs.cleanup()
+        self.assertFalse(cleanup["pktmon_stopped"])
+        self.assertIsNotNone(to.cleanup_reason(cleanup))
 
     def test_netevents_originally_on_is_restored_to_on(self) -> None:
         fake = FakeWindows(netevents=True)

@@ -96,7 +96,7 @@ def run_cmd(args: list[str], *, cwd: Path | None = None, timeout: int = CMD_TIME
 
 
 def _shapes(text: str, limit: int = MAX_DIAG_LINES) -> list[str]:
-    """出力の形（数字を潰し、許可語以外を ? にした先頭行。`parse.shape` の allow-list）。空行は除く。"""
+    """出力の形（数字を潰し、実測の行以外は語を ? にした先頭行。`parse.shape` の行単位 allow-list）。空行は除く。"""
     return [parse.shape(x, 100) for x in text.splitlines() if x.strip()][:limit]
 
 

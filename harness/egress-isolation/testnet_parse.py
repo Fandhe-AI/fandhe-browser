@@ -41,22 +41,30 @@ SCAFFOLD_FILTER_PATTERNS = ("UWP Default Outbound Block Rule", "Block Outbound D
                             "InternetClient Default Rule")
 
 
-# 診断に残してよい語（実機 run 42000257965 の pktmon / netsh の出力に現れた語だけ。小文字）。これ以外の語は `?` に落とす。
-SHAPE_WORDS = frozenset(
-    "collected data packet counters capture type all packets monitored components network adapters filters "
-    "name ip address testnet logger parameters pktmon monitor is not running none netevents on off".split())
+# 診断に残してよい行（実機 run 42031488652 の pktmon / netsh の出力に現れた行だけ。数字を # に潰し空白を 1 個に畳んだ形・大文字小文字を区別する）。
+# 語単位の許可にすると、ユーザー名・ホスト名・NIC 名が `name`・`network`・`none` 等と同じとき診断に残るため、行の形で照合する。
+# これ以外の行は語をすべて `?` に落とす。実測で新しい行の形が見えたら、語ではなく行を足す。
+# `netevents = off` は実測の値ではないが、`on` と同じ行の形で取りうる状態値のため含める。
+SHAPE_LINES = frozenset({
+    "Collected Data:", "Packet counters, packet capture", "Capture Type:", "All packets",
+    "Monitored Components:", "Network adapters", "Packet Filters:", "# Name IP Address",
+    "# testnet #.#.#.#/#", "Logger Parameters:", "Logger name: PktMon",
+    "Packet Monitor is not running.", "None", "netevents = on", "netevents = off",
+})
 _SHAPE_WORD_RE = re.compile(r"[^\W\d_]+")
 
 
 def shape(line: str, limit: int = 120) -> str:
-    """生出力の「形」だけを残す（数字を # に潰し、許可語（`SHAPE_WORDS`）以外の語を ? に置き換える）。
+    """生出力の「形」だけを残す（数字を # に潰し、実測の行（`SHAPE_LINES`）と一致しない行は語をすべて ? に置き換える）。
 
     パス・MAC アドレス・NIC 名・ユーザー名のような環境固有の語が診断（アーティファクトとログ）に残らないよう、
-    block list ではなく allow-list にしている。診断の情報量より漏れないことを優先する（未知の語は `?` に落ちる）。
-    語の集合は英語の出力を前提にする（他言語の出力は `?` だらけになるが、安全側に倒れるだけで判定には使わない）。
+    block list ではなく allow-list（行単位）にしている。診断の情報量より漏れないことを優先する。
+    残余: 行全体が許可行と完全に一致する場合（例: 名前が `None` だけの行）は実測の行と区別できない。
+    英語の出力を前提にする（他言語の出力は `?` だらけになるが、安全側に倒れるだけで判定には使わない）。
     """
     masked = re.sub(r"\d+", "#", line.strip())
-    masked = _SHAPE_WORD_RE.sub(lambda m: m.group(0) if m.group(0).lower() in SHAPE_WORDS else "?", masked)
+    if " ".join(masked.split()) not in SHAPE_LINES:
+        masked = _SHAPE_WORD_RE.sub("?", masked)
     return masked[:limit]
 
 
@@ -409,15 +417,21 @@ def parse_netevents_option(text: str) -> bool | None:
 
 
 def parse_pktmon_running(text: str) -> bool | None:
-    """`pktmon status` の出力から採取中かを推定する。判別できなければ None（呼び出し側は fail-closed にする）。"""
+    """`pktmon status` の出力から採取中かを推定する。判別できなければ None（呼び出し側は fail-closed にする）。
+
+    False は唯一の危険側（start() は他人の採取の上に開始し、cleanup() は未停止を停止済みと記録する）。
+    停止中でも rc=0 のため rc では判別できず、出力の形で判定する（根拠は run 42031488652 の実測・Issue #1523・RENDER-3）。
+    """
     low = text.lower()
-    # 実機の稼働中の出力は「Collected Data:」で始まる。13 行目以降（ログのパス等）は未確認で、そこに stopped などが
-    # 含まれると下の否定側に当たって False になる。False は start() では他人の採取の上に開始し、cleanup() では未停止を
-    # 停止済みと記録する危険側なので、True を先に判定する（停止中の出力はこの形で始まらない）。
-    if re.match(r"\s*collected\s+data\s*:", low):
-        return True
-    if re.search(r"not\s+(running|started|active)|\bstopped\b|\binactive\b", low):
+    # False は出力全体が実測の停止の 1 文のときだけ。警告・バナーや余分な行が付いたら推測しない。
+    if re.fullmatch(r"\s*packet\s+monitor\s+is\s+not\s+running\.?\s*", low):
         return False
+    # 実機の稼働中の出力は「Collected Data:」の行で始まる（13 行目以降のログのパス等は未確認）。バナーが前に付いても True。
+    if re.search(r"^\s*collected\s+data\s*:", low, re.MULTILINE):
+        return True
+    # 否定語はあるが実測の停止の形ではない: 判別不能（stopped を含むパスの行などを停止と誤認しない）。
+    if re.search(r"not\s+(running|started|active)|\bstopped\b|\binactive\b", low):
+        return None
     if re.search(r"\b(running|active|started|collecting)\b", low):
         return True
     return None
