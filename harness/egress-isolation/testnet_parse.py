@@ -237,6 +237,7 @@ def parse_wfp_events(source: Any, index: dict[tuple[str, int], tuple[str, str]],
                 continue
             header = next((c for c in el if _local(c.tag) == "header"), None)
             if header is None:
+                el.clear()  # 処理しない item も解放する（巨大 XML のメモリ蓄積を防ぐ。Issue #1515）
                 continue
             diag["items_with_header"] += 1
             flat, hflat = _flat(el), _flat(header)
@@ -295,6 +296,7 @@ def parse_filters_xml(source: Any) -> dict[str, Any]:
                 continue
             kids = {_local(c.tag): c for c in el}
             if "filterId" not in kids or "displayData" not in kids:
+                el.clear()  # 処理しない item も解放する（Issue #1515）
                 continue
             total += 1
             fid = (kids["filterId"].text or "").strip()
