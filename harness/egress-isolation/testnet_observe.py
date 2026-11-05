@@ -96,7 +96,7 @@ def run_cmd(args: list[str], *, cwd: Path | None = None, timeout: int = CMD_TIME
 
 
 def _shapes(text: str, limit: int = MAX_DIAG_LINES) -> list[str]:
-    """出力の形（数字・IP・GUID・SID の値を潰した先頭行）。空行は除く。"""
+    """出力の形（数字を潰し、許可語以外を ? にした先頭行。`parse.shape` の allow-list）。空行は除く。"""
     return [parse.shape(x, 100) for x in text.splitlines() if x.strip()][:limit]
 
 
@@ -262,6 +262,13 @@ class TestnetObserver:
             except Exception as exc:  # noqa: BLE001  (診断のみ。観測は続ける)
                 self.diag[key] = [f"unavailable: {type(exc).__name__}"]
 
+    def _record_shape(self, key: str, out: Any) -> None:
+        """診断の形だけを記録する。cleanup から呼ぶため、整形の例外で片付けの成否の算出を止めない（判定には使わない）。"""
+        try:
+            self.diag[key] = _shapes(str(out or ""))
+        except Exception as exc:  # noqa: BLE001  (診断のみ。片付けは続ける)
+            self.diag[key] = [f"unavailable: {type(exc).__name__}"]
+
     # --- 停止と集計 ------------------------------------------------------------------------------------------
     def stop_and_collect(self, profile_sid: str | None) -> dict[str, Any]:
         """net events を読み出し、pktmon を止めて pcapng を解析する。宛先で絞った集計だけを返す（生データは返さない）。"""
@@ -329,14 +336,14 @@ class TestnetObserver:
             self._pm("stop", timeout=SHORT_TIMEOUT_S)
             st = self._pm("status", timeout=SHORT_TIMEOUT_S)
             c["pktmon_stopped"] = st["rc"] == 0 and parse.parse_pktmon_running(st["out"]) is False
-            self.diag["pktmon_status_after_stop_shape"] = _shapes(str(st.get("out") or ""))
+            self._record_shape("pktmon_status_after_stop_shape", st.get("out"))
         else:
             c["pktmon_stopped"] = True
         if self._pm_filters_attempted:
             self._pm("filter", "remove", timeout=SHORT_TIMEOUT_S)
             fl = self._pm("filter", "list", timeout=SHORT_TIMEOUT_S)
             c["pktmon_filters_removed"] = fl["rc"] == 0 and parse.parse_pktmon_filters_empty(fl["out"]) is True
-            self.diag["pktmon_filter_list_after_remove_shape"] = _shapes(str(fl.get("out") or ""))
+            self._record_shape("pktmon_filter_list_after_remove_shape", fl.get("out"))
         else:
             c["pktmon_filters_removed"] = True
         if self._wfp_set_attempted and self._wfp_orig_on is not None:
