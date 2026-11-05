@@ -4,7 +4,7 @@
 役割・責務境界:
     Issue #1427（TASK-38・`RENDER-3`・`SEC-2`）。Servo を使わず、AppContainer（capability 3 通り × loopback 免除 2 通り）と
     通常プロセス（陽性対照）から、`127.0.0.2`・ランナー自身の NIC の IP・`192.0.2.1`（TEST-NET-1）へ TCP connect / UDP sendto
-    した結果を、ランナー側の listener・`pktmon`・`netsh wfp capture` で外部から観測し、集計だけを JSON と summary.md に出す。
+    した結果を、ランナー側の listener・`pktmon`・WFP net events（`netsh wfp set options netevents=on` / `show netevents`）で外部から観測し、集計だけを JSON と summary.md に出す。
     AppContainer の作成・起動・片付けは既存の `appcontainer.py` を再利用する（既存ファイルは変更しない）。
 
 承認範囲（オーナー承認 2026-11-05・#1427）:
@@ -43,7 +43,9 @@ sys.path.insert(0, str(_HERE.parent))
 import probe  # noqa: E402  (同ディレクトリの自己完結プローブ)
 
 BASE_PORT = 47000
-CMD_TIMEOUT_S = 120
+CMD_TIMEOUT_S = 60
+MAX_CMD_OUT_BYTES = 4 * 1024 * 1024
+OVERALL_DEADLINE_S = 15 * 60
 MAX_XML_BYTES = 400 * 1024 * 1024
 MAX_TEXT_BYTES = 800 * 1024 * 1024
 DEST_KEYS = ("a", "b", "c")
@@ -179,7 +181,7 @@ def _addr(text: str | None) -> str | None:
 
 
 def parse_wfp_events(source: Any, nic_ip: str | None, port_index: dict[tuple[str, int], str]) -> dict[str, Any]:
-    """wfpdiag.xml の net event を宛先で絞り、port 単位に種類・filter id・package SID / app id の有無へ集計する。
+    """`netsh wfp show netevents` の xml（wfpdiag.xml と同じ net event の形と仮定）の net event を宛先で絞り、port 単位に種類・filter id・package SID / app id の有無へ集計する。
 
     形式は仮定: `<item><header>…remoteAddrV4 / remotePort / ipProtocol / packageSid / appId…</header><type>…</type>…<filterId>` 。
     source は ET.iterparse が受け付けるファイルパスまたはファイルオブジェクト。
@@ -268,6 +270,21 @@ def parse_filters_xml(source: Any) -> dict[str, Any]:
     return {"names": names, "total": total, "pattern_counts": patterns, "diag": diag}
 
 
+def parse_netevents_option(text: str) -> bool | None:
+    """`netsh wfp show options optionsfor=netevents` の出力から net events が有効かを推定する。判別できなければ None。
+
+    形式は仮定（`netevents` / `net events` を含む行に on・enabled・off・disabled のいずれかがある）。外れたら None。
+    """
+    for line in text.splitlines():
+        low = line.lower()
+        if "netevent" in low or "net event" in low:
+            if re.search(r"\b(on|enabled|true)\b", low):
+                return True
+            if re.search(r"\b(off|disabled|false)\b", low):
+                return False
+    return None
+
+
 def merge_counts(dst: dict[str, Any], src: dict[str, Any]) -> None:
     """入れ子の件数 dict を足し込む（port 単位の集計を複数回の採取で統合する用）。"""
     for k, v in src.items():
@@ -321,20 +338,91 @@ def port_index_of(variants: list[dict[str, Any]]) -> dict[tuple[str, int], str]:
 
 
 # --- 実行系（Windows 専用の部分） ------------------------------------------------------------------------
+_T0 = time.monotonic()
+_DEADLINE = [_T0 + OVERALL_DEADLINE_S]
+
+
+def expired() -> bool:
+    return time.monotonic() >= _DEADLINE[0]
+
+
+def remaining_s(cap: int) -> int:
+    """全体期限までの残り秒（cap で頭打ち、最低 5 秒）。"""
+    return int(max(5, min(cap, _DEADLINE[0] - time.monotonic())))
+
+
+class stage:  # noqa: N801
+    """段の開始と終了を時刻と経過 ms つきで stderr に出す（IP・秘密情報は出さない）。例外は握りつぶさず通す。"""
+
+    def __init__(self, name: str, timings: list[dict[str, Any]] | None = None) -> None:
+        self.name, self.timings = name, timings
+
+    def __enter__(self) -> "stage":
+        self.t = time.monotonic()
+        print(f"[{time.strftime('%H:%M:%S')}] start {self.name}", file=sys.stderr, flush=True)
+        return self
+
+    def __exit__(self, et: Any, ev: Any, tb: Any) -> None:
+        ms = int((time.monotonic() - self.t) * 1000)
+        status = "ok" if et is None else f"raised {et.__name__}"
+        print(f"[{time.strftime('%H:%M:%S')}] end   {self.name} ({ms} ms, {status})", file=sys.stderr, flush=True)
+        if self.timings is not None:
+            self.timings.append({"stage": self.name, "ms": ms, "status": status})
+
+
 def sysroot() -> str:
     import appcontainer  # noqa: PLC0415
 
     return appcontainer.trusted_system_root()
 
 
-def run_cmd(args: list[str], *, cwd: Path | None = None, timeout: int = CMD_TIMEOUT_S) -> dict[str, Any]:
-    """外部コマンドを実行し {rc, out(先頭のみ内部用), error} を返す。例外は呼び出し側へ出さない。"""
+def _kill_tree(proc: "subprocess.Popen[bytes]") -> None:
+    """taskkill /T /F で子孫ごと止める（Windows では孫が継承ハンドルを握ったまま残ることがある）。待ちは短く打ち切る。"""
     try:
-        done = subprocess.run(args, stdin=subprocess.DEVNULL, capture_output=True, timeout=timeout,  # noqa: S603
-                              check=False, cwd=str(cwd) if cwd else None)
-        text = ((done.stdout or b"") + b"\n" + (done.stderr or b"")).decode("utf-8", errors="replace")
-        return {"rc": done.returncode, "out": text, "error": None}
-    except (OSError, subprocess.SubprocessError) as exc:
+        k = subprocess.Popen([sys32("taskkill.exe"), "/T", "/F", "/PID", str(proc.pid)],  # noqa: S603
+                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            k.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            k.kill()
+    except OSError:
+        pass
+    try:
+        proc.kill()
+    except OSError:
+        pass
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        pass
+
+
+def run_cmd(args: list[str], *, cwd: Path | None = None, timeout: int = CMD_TIMEOUT_S) -> dict[str, Any]:
+    """外部コマンドを実行し {rc, out, error} を返す。例外は呼び出し側へ出さない。
+
+    stdout / stderr はパイプではなく一時ファイルへ書く（パイプだと kill 後に孫が握るハンドルのせいで読み取りが戻らない。
+    初回実行 run 41961452377 の教訓）。timeout 超過は木ごと kill して短い待ちで必ず戻り、rc=None・error="TimeoutExpired"。
+    """
+    try:
+        with tempfile.TemporaryFile() as fo, tempfile.TemporaryFile() as fe:
+            try:
+                proc = subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=fo, stderr=fe,  # noqa: S603
+                                        cwd=str(cwd) if cwd else None)
+            except OSError as exc:
+                return {"rc": None, "out": "", "error": type(exc).__name__}
+            error = None
+            rc: int | None
+            try:
+                rc = proc.wait(timeout=max(1, timeout))
+            except subprocess.TimeoutExpired:
+                _kill_tree(proc)
+                rc, error = None, "TimeoutExpired"
+            parts = []
+            for f in (fo, fe):
+                f.seek(0)
+                parts.append(f.read(MAX_CMD_OUT_BYTES))
+            return {"rc": rc, "out": b"\n".join(parts).decode("utf-8", errors="replace"), "error": error}
+    except OSError as exc:
         return {"rc": None, "out": "", "error": type(exc).__name__}
 
 
@@ -444,7 +532,11 @@ class Hub:
 
 
 class Captures:
-    """pktmon と `netsh wfp capture` の採取。開始・停止・片付けの成否を記録し、失敗しても続行する。"""
+    """pktmon と WFP net events の採取。開始・停止・片付けの成否を記録し、失敗しても続行する。
+
+    WFP は `netsh wfp capture`（返ってこない）ではなく、`netsh wfp set options netevents=on` → 試行 →
+    `netsh wfp show netevents file=` → 元の設定へ戻す、の順で観測する。
+    """
 
     def __init__(self, workdir: Path, nic_ip: str | None) -> None:
         self.workdir = workdir
@@ -453,93 +545,111 @@ class Captures:
         self.txt = workdir / "pm.txt"
         self.status: dict[str, Any] = {}
         self.pktmon_started = False
-        self.wfp_started = False
+        self.pktmon_filters_added = False
+        self.wfp_set = False
+        self.wfp_orig_on: bool | None = None
 
-    def _pm(self, *args: str) -> dict[str, Any]:
-        return run_cmd([sys32("pktmon.exe"), *args], cwd=self.workdir)
+    def _pm(self, *args: str, timeout: int = CMD_TIMEOUT_S) -> dict[str, Any]:
+        return run_cmd([sys32("pktmon.exe"), *args], cwd=self.workdir, timeout=timeout)
 
-    def start(self) -> None:
+    def _wfp(self, *args: str) -> dict[str, Any]:
+        return run_cmd([sys32("netsh.exe"), "wfp", *args], cwd=self.workdir, timeout=remaining_s(CMD_TIMEOUT_S))
+
+    def start(self, timings: list[dict[str, Any]]) -> None:
         st = self.status
-        st["pktmon_prestop_rc"] = self._pm("stop")["rc"]
-        st["pktmon_filter_remove_rc"] = self._pm("filter", "remove")["rc"]
-        filters = [("testnet", "192.0.2.0/24"), ("loopback", "127.0.0.0/8")]
-        if self.nic_ip:
-            filters.append(("nic", self.nic_ip))
-        st["pktmon_filter_add_rc"] = {n: self._pm("filter", "add", n, "-i", ip)["rc"] for n, ip in filters}
-        r = self._pm("start", "--capture", "--comp", "all", "--pkt-size", "0", "--file-name", str(self.etl))
-        if r["rc"] != 0:
-            st["pktmon_start_comp_all_rc"] = r["rc"]
-            r = self._pm("start", "--capture", "--file-name", str(self.etl))
-        st["pktmon_start_rc"] = r["rc"]
-        st["pktmon_start_error"] = r["error"]
-        self.pktmon_started = r["rc"] == 0
-        lst = self._pm("list")
-        lines = [mask_text(x) for x in lst["out"].splitlines() if x.strip()][:30]
-        st["pktmon_list_lines"] = lines
-        w = run_cmd([sys32("netsh.exe"), "wfp", "capture", "start", f"file={self.workdir / 'wfpdiag.cab'}"], cwd=self.workdir)
-        if w["rc"] != 0:
-            st["wfp_start_with_file_rc"] = w["rc"]
-            w = run_cmd([sys32("netsh.exe"), "wfp", "capture", "start"], cwd=self.workdir)
-        st["wfp_start_rc"] = w["rc"]
-        self.wfp_started = w["rc"] == 0
+        with stage("pktmon-start", timings):
+            st["pktmon_prestop_rc"] = self._pm("stop", timeout=20)["rc"]
+            st["pktmon_filter_remove_rc"] = self._pm("filter", "remove", timeout=20)["rc"]
+            filters = [("testnet", "192.0.2.0/24"), ("loopback", "127.0.0.0/8")]
+            if self.nic_ip:
+                filters.append(("nic", self.nic_ip))
+            self.pktmon_filters_added = True
+            st["pktmon_filter_add_rc"] = {n: self._pm("filter", "add", n, "-i", ip, timeout=20)["rc"] for n, ip in filters}
+            r = self._pm("start", "--capture", "--comp", "all", "--pkt-size", "0", "--file-name", str(self.etl))
+            if r["rc"] != 0:
+                st["pktmon_start_comp_all_rc"] = r["rc"]
+                r = self._pm("start", "--capture", "--file-name", str(self.etl))
+            st["pktmon_start_rc"] = r["rc"]
+            st["pktmon_start_error"] = r["error"]
+            self.pktmon_started = r["rc"] == 0
+            lst = self._pm("list", timeout=20)
+            st["pktmon_list_lines"] = [mask_text(x) for x in lst["out"].splitlines() if x.strip()][:30]
+        with stage("wfp-netevents-on", timings):
+            before = self._wfp("show", "options", "optionsfor=netevents")
+            st["wfp_options_before_rc"] = before["rc"]
+            st["wfp_options_before_lines"] = [mask_text(x) for x in before["out"].splitlines() if x.strip()][:20]
+            self.wfp_orig_on = parse_netevents_option(before["out"])
+            st["wfp_netevents_originally_on"] = self.wfp_orig_on
+            r = self._wfp("set", "options", "netevents=on")
+            st["wfp_set_on_rc"] = r["rc"]
+            st["wfp_set_on_error"] = r["error"]
+            # 付与を試みたら、部分適用を除外できないため解除（復元）も必ず試す。
+            self.wfp_set = True
 
-    def stop_and_collect(self, port_index: dict[tuple[str, int], str], filter_names: dict[str, str]) -> dict[str, Any]:
+    def stop_and_collect(self, port_index: dict[tuple[str, int], str], filter_names: dict[str, str],
+                         timings: list[dict[str, Any]]) -> dict[str, Any]:
         """停止して、宛先で絞った集計だけを返す。各段の失敗は diagnostics に残して続ける。"""
         st = self.status
         result: dict[str, Any] = {"pktmon": {"by_variant": {}, "diag": {}}, "wfp": {"by_variant": {}, "diag": {}}}
-        if self.pktmon_started:
-            st["pktmon_stop_rc"] = self._pm("stop")["rc"]
-            self.pktmon_started = False
-            r = self._pm("etl2txt", str(self.etl), "--out", str(self.txt))
-            if r["rc"] != 0 or not self.txt.exists():
-                st["pktmon_etl2txt_long_rc"] = r["rc"]
-                r = self._pm("etl2txt", str(self.etl), "-o", str(self.txt))
-            st["pktmon_etl2txt_rc"] = r["rc"]
-            try:
-                size = self.txt.stat().st_size
-                st["pktmon_txt_bytes_bucket"] = f"<={1 << max(size, 1).bit_length()}"
-                if size > MAX_TEXT_BYTES:
-                    raise ValueError("pktmon text too large")
-                with self.txt.open("r", encoding="utf-8", errors="replace") as f:
-                    result["pktmon"] = parse_pktmon_text(f, self.nic_ip, port_index)
-            except (OSError, ValueError) as exc:
-                st["pktmon_parse_error"] = type(exc).__name__
-        if self.wfp_started:
-            w = run_cmd([sys32("netsh.exe"), "wfp", "capture", "stop"], cwd=self.workdir)
-            st["wfp_stop_rc"] = w["rc"]
-            self.wfp_started = False
-            cabs = sorted(self.workdir.glob("*.cab"))
-            st["wfp_cab_count"] = len(cabs)
-            if cabs:
-                ex = self.workdir / "wfp-x"
-                ex.mkdir(exist_ok=True)
-                e = run_cmd([sys32("expand.exe"), str(cabs[0]), "-F:*", str(ex)], cwd=self.workdir)
-                st["wfp_expand_rc"] = e["rc"]
-                xmls = sorted(ex.glob("*.xml"))
-                st["wfp_xml_count"] = len(xmls)
-                for x in xmls:
+        if self.wfp_set:
+            with stage("wfp-show-netevents", timings):
+                xml_path = self.workdir / "netevents.xml"
+                r = self._wfp("show", "netevents", f"file={xml_path}")
+                st["wfp_show_netevents_rc"] = r["rc"]
+                st["wfp_show_netevents_error"] = r["error"]
+                try:
+                    if xml_path.is_file() and xml_path.stat().st_size <= MAX_XML_BYTES:
+                        result["wfp"] = parse_wfp_events(str(xml_path), self.nic_ip, port_index)
+                    else:
+                        st["wfp_netevents_missing_or_large"] = True
+                except (OSError, ET.ParseError) as exc:
+                    st["wfp_parse_error"] = type(exc).__name__
+                finally:
                     try:
-                        if x.stat().st_size > MAX_XML_BYTES:
-                            st["wfp_xml_too_large"] = True
-                            continue
-                        res = parse_wfp_events(str(x), self.nic_ip, port_index)
-                        if res["diag"].get("items_with_header", 0) > 0 or not result["wfp"]["diag"]:
-                            result["wfp"] = res
-                    except (OSError, ET.ParseError) as exc:
-                        st["wfp_parse_error"] = type(exc).__name__
+                        xml_path.unlink()
+                    except OSError:
+                        pass
+        if self.pktmon_started:
+            with stage("pktmon-stop-and-parse", timings):
+                st["pktmon_stop_rc"] = self._pm("stop")["rc"]
+                self.pktmon_started = False
+                r = self._pm("etl2txt", str(self.etl), "--out", str(self.txt))
+                if r["rc"] != 0 or not self.txt.exists():
+                    st["pktmon_etl2txt_long_rc"] = r["rc"]
+                    r = self._pm("etl2txt", str(self.etl), "-o", str(self.txt))
+                st["pktmon_etl2txt_rc"] = r["rc"]
+                try:
+                    size = self.txt.stat().st_size
+                    st["pktmon_txt_bytes_bucket"] = f"<={1 << max(size, 1).bit_length()}"
+                    if size > MAX_TEXT_BYTES:
+                        raise ValueError("pktmon text too large")
+                    with self.txt.open("r", encoding="utf-8", errors="replace") as f:
+                        result["pktmon"] = parse_pktmon_text(f, self.nic_ip, port_index)
+                except (OSError, ValueError) as exc:
+                    st["pktmon_parse_error"] = type(exc).__name__
         # filter id → 名前（名前のみ）。event に現れた id だけを解決して出す。
         for ent in result["wfp"]["by_variant"].values():
             ent["filter_names"] = {fid: filter_names.get(fid, "?") for fid in ent.get("filters", {})}
         return result
 
     def cleanup(self) -> dict[str, Any]:
+        """pktmon の停止・フィルタ削除と WFP net events の復元。期限に関係なく必ず試し、成否を返す。"""
         c: dict[str, Any] = {}
-        c["pktmon_stop_rc"] = self._pm("stop")["rc"] if self.pktmon_started else "not-running"
-        c["pktmon_filter_remove_rc"] = self._pm("filter", "remove")["rc"]
-        if self.wfp_started:
-            c["wfp_stop_rc"] = run_cmd([sys32("netsh.exe"), "wfp", "capture", "stop"], cwd=self.workdir)["rc"]
+        c["pktmon_stop_rc"] = self._pm("stop", timeout=20)["rc"] if self.pktmon_started else "not-running"
+        c["pktmon_filter_remove_rc"] = self._pm("filter", "remove", timeout=20)["rc"] if self.pktmon_filters_added \
+            else "not-added"
+        if self.wfp_set:
+            want = "on" if self.wfp_orig_on else "off"
+            r = run_cmd([sys32("netsh.exe"), "wfp", "set", "options", f"netevents={want}"], cwd=self.workdir, timeout=30)
+            c["wfp_netevents_restore_to"] = want
+            c["wfp_netevents_restore_rc"] = r["rc"]
+            after = run_cmd([sys32("netsh.exe"), "wfp", "show", "options", "optionsfor=netevents"],
+                            cwd=self.workdir, timeout=30)
+            now = parse_netevents_option(after["out"])
+            c["wfp_netevents_after_on"] = now
+            c["wfp_netevents_after_lines"] = [mask_text(x) for x in after["out"].splitlines() if x.strip()][:10]
         else:
-            c["wfp_stop_rc"] = "not-running"
+            c["wfp_netevents_restore_rc"] = "not-set"
         return c
 
 
@@ -569,7 +679,7 @@ def run_control(variant: dict[str, Any], nic_ip: str | None, workdir: Path) -> d
     plan = workdir / "plan-control.json"
     res = workdir / "res-control.json"
     plan.write_text(json.dumps({"nic_ip": nic_ip, "attempts": attempt_plan(variant, nic_ip)}), encoding="utf-8")
-    r = run_cmd([sys.executable, "-I", "-B", str(_HERE / "probe.py"), "--plan", str(plan), "--out", str(res)], timeout=120)
+    r = run_cmd([sys.executable, "-I", "-B", str(_HERE / "probe.py"), "--plan", str(plan), "--out", str(res)], timeout=remaining_s(90))
     try:
         data = json.loads(res.read_text(encoding="utf-8"))
     except (OSError, ValueError):
@@ -594,7 +704,8 @@ def make_session_class() -> Any:
 
 
 def run_appcontainer_group(exempt: bool, variants: list[dict[str, Any]], nic_ip: str | None,
-                           record: dict[str, Any], filters: dict[str, Any]) -> dict[str, Any]:
+                           record: dict[str, Any], filters: dict[str, Any],
+                           timings: list[dict[str, Any]]) -> dict[str, Any]:
     """1 つのプロファイル（免除 あり / なし）で capability 3 通りを順に起動する。結果は variant 名をキーに返す。"""
     import appcontainer  # noqa: PLC0415
 
@@ -603,20 +714,26 @@ def run_appcontainer_group(exempt: bool, variants: list[dict[str, Any]], nic_ip:
     group: dict[str, Any] = {"variants": {}, "error": None, "cleanup": {}, "loopback_exempt": {"requested": exempt}}
     session = None
     try:
-        session = cls(host=host, harness_dir=_HERE.parents[1], loopback_exempt=exempt, timeout_s=120)
-        with session:
+        session = cls(host=host, harness_dir=_HERE.parents[1], loopback_exempt=exempt, timeout_s=90)
+        with stage(f"appcontainer-session-enter exempt={exempt}", timings), session:
             for i, v in enumerate(x for x in variants if x["actor"] == "appcontainer" and x["exempt"] is exempt):
-                plan_name, res_name = f"plan-{i}.json", f"res-{i}.json"
-                Path(session.out_path(plan_name)).write_text(
-                    json.dumps({"nic_ip": nic_ip, "attempts": attempt_plan(v, nic_ip)}), encoding="utf-8")
-                res = session.run("exp_1427/probe.py",
-                                  ["--plan", session.out_path(plan_name), "--out", session.out_path(res_name)],
-                                  capabilities=tuple(v["caps"]), result_name=res_name, timeout_s=120)
-                group["variants"][v["name"]] = {"exit_code": res.get("exit_code"), "timed_out": res.get("timed_out"),
-                                               "error": res.get("error"), "result_json": res.get("result_json"),
-                                               "stderr_tail": (res.get("stderr_tail") or "")[:200]}
+                if expired():
+                    group["variants"][v["name"]] = {"error": "overall deadline reached; not run"}
+                    continue
+                with stage(f"variant {v['name']}", timings):
+                    plan_name, res_name = f"plan-{i}.json", f"res-{i}.json"
+                    Path(session.out_path(plan_name)).write_text(
+                        json.dumps({"nic_ip": nic_ip, "attempts": attempt_plan(v, nic_ip)}), encoding="utf-8")
+                    res = session.run("exp_1427/probe.py",
+                                      ["--plan", session.out_path(plan_name), "--out", session.out_path(res_name)],
+                                      capabilities=tuple(v["caps"]), result_name=res_name, timeout_s=remaining_s(90))
+                    group["variants"][v["name"]] = {"exit_code": res.get("exit_code"), "timed_out": res.get("timed_out"),
+                                                   "error": res.get("error"), "result_json": res.get("result_json"),
+                                                   "stderr_tail": (res.get("stderr_tail") or "")[:200]}
                 time.sleep(0.5)
-            filters[f"exempt-{exempt}"] = snapshot_filters(Path(record["workdir"]), f"ac-{int(exempt)}")
+            if not expired():
+                with stage(f"wfp-filters-snapshot exempt={exempt}", timings):
+                    filters[f"exempt-{exempt}"] = snapshot_filters(Path(record["workdir"]), f"ac-{int(exempt)}")
     except (appcontainer.AppContainerError, OSError, ValueError) as exc:
         group["error"] = f"{type(exc).__name__}: {str(exc)[:160]}"
     finally:
@@ -684,6 +801,8 @@ def render_summary(doc: dict[str, Any]) -> str:
         wf = r.get("wfp") or {}
         lines.append(f"| {r['variant']} | {r['dest']} | {r['proto']} | {_fmt_result(r)} | {r.get('elapsed_ms')} | "
                      f"{r['listener_received']} | {pkts} ({drops}) | {json.dumps(wf.get('events') or {})} |")
+    lines += ["", "### stage timings (ms)", ""]
+    lines += [f"- {t['stage']}: {t['ms']} ({t['status']})" for t in doc.get("stage_timings") or []]
     lines += ["", "### cleanup", "", f"`{json.dumps(doc.get('cleanup'), sort_keys=True)}`", "",
               f"### errors: {json.dumps(doc.get('errors'))}"]
     return "\n".join(lines) + "\n"
@@ -699,6 +818,9 @@ def cleanup_ok(doc: dict[str, Any]) -> bool:
             return False
         if g.get("loopback_exempt", {}).get("requested") and c.get("loopback_exempt_absent_after_remove") is not True:
             return False
+    capc = cl.get("capture") or {}
+    if capc.get("wfp_netevents_restore_rc") not in (0, "not-set", None):
+        return False
     left = cl.get("exempt_leftover") or {}
     if left.get("checked") and left.get("appcontainer_sid_entries"):
         return False
@@ -706,9 +828,13 @@ def cleanup_ok(doc: dict[str, Any]) -> bool:
 
 
 def run(out_dir: Path) -> dict[str, Any]:
+    """全体を `OVERALL_DEADLINE_S` 以内に収める。期限切れ・例外でも finally で片付けと、取れた分の集計・JSON 出力を行う。"""
+    _DEADLINE[0] = time.monotonic() + OVERALL_DEADLINE_S
     out_dir.mkdir(parents=True, exist_ok=True)
     workdir = Path(tempfile.mkdtemp(prefix="exp1427-raw-", dir=os.environ.get("RUNNER_TEMP") or None))
-    doc: dict[str, Any] = {"errors": [], "diagnostics": {}, "cleanup": {"groups": {}}, "filters": {}}
+    timings: list[dict[str, Any]] = []
+    doc: dict[str, Any] = {"errors": [], "diagnostics": {}, "cleanup": {"groups": {}}, "filters": {},
+                           "stage_timings": timings, "overall_deadline_s": OVERALL_DEADLINE_S}
     variants = build_variants()
     port_index = port_index_of(variants)
     hub = None
@@ -717,43 +843,52 @@ def run(out_dir: Path) -> dict[str, Any]:
     cap_result: dict[str, Any] = {"pktmon": {"by_variant": {}, "diag": {}}, "wfp": {"by_variant": {}, "diag": {}}}
     filter_names: dict[str, str] = {}
     try:
-        nic_ip, nic_note = detect_nic_ip()
-        doc["nic_detect"] = nic_note
+        with stage("nic-detect", timings):
+            nic_ip, nic_note = detect_nic_ip()
+            doc["nic_detect"] = nic_note
         try:
-            doc["recon"] = recon(nic_ip)
+            with stage("recon", timings):
+                doc["recon"] = recon(nic_ip)
         except Exception as exc:  # noqa: BLE001  (観測ごとの失敗は記録して続行する)
             doc["errors"].append(f"recon: {type(exc).__name__}")
         try:
-            base = snapshot_filters(workdir, "base")
-            filter_names.update(base.pop("names", {}))
-            doc["filters"]["baseline"] = base
+            with stage("wfp-filters-baseline", timings):
+                base = snapshot_filters(workdir, "base")
+                filter_names.update(base.pop("names", {}))
+                doc["filters"]["baseline"] = base
         except Exception as exc:  # noqa: BLE001
             doc["errors"].append(f"filters-baseline: {type(exc).__name__}")
-        hub = Hub(nic_ip)
-        for v in variants:
-            for key, port in v["ports"].items():
-                d, p = key.split("/")
-                if d == "a":
-                    hub.add(p, "127.0.0.2", port)
-                elif d == "b" and nic_ip:
-                    hub.add(p, nic_ip, port)
-        hub.start()
-        doc["listener_bind_errors"] = list(hub.errors)
+        with stage("listeners-start", timings):
+            hub = Hub(nic_ip)
+            for v in variants:
+                for key, port in v["ports"].items():
+                    d, p = key.split("/")
+                    if d == "a":
+                        hub.add(p, "127.0.0.2", port)
+                    elif d == "b" and nic_ip:
+                        hub.add(p, nic_ip, port)
+            hub.start()
+            doc["listener_bind_errors"] = list(hub.errors)
         caps = Captures(workdir, nic_ip)
         try:
-            caps.start()
+            caps.start(timings)
         except Exception as exc:  # noqa: BLE001
             doc["errors"].append(f"capture-start: {type(exc).__name__}")
         time.sleep(1.0)
-        try:
-            launches["control"] = run_control(variants[0], nic_ip, workdir)
-        except Exception as exc:  # noqa: BLE001
-            doc["errors"].append(f"control: {type(exc).__name__}")
+        if not expired():
+            try:
+                with stage("variant control", timings):
+                    launches["control"] = run_control(variants[0], nic_ip, workdir)
+            except Exception as exc:  # noqa: BLE001
+                doc["errors"].append(f"control: {type(exc).__name__}")
         time.sleep(0.5)
         filt: dict[str, Any] = {}
         for exempt in (False, True):
+            if expired():
+                doc["errors"].append(f"group exempt={exempt}: overall deadline reached; not run")
+                continue
             try:
-                g = run_appcontainer_group(exempt, variants, nic_ip, {"workdir": str(workdir)}, filt)
+                g = run_appcontainer_group(exempt, variants, nic_ip, {"workdir": str(workdir)}, filt, timings)
             except Exception as exc:  # noqa: BLE001
                 g = {"error": f"{type(exc).__name__}", "variants": {}, "cleanup": {}}
             doc["cleanup"]["groups"][f"exempt-{exempt}"] = {k: g.get(k) for k in ("error", "cleanup", "loopback_exempt")}
@@ -764,35 +899,43 @@ def run(out_dir: Path) -> dict[str, Any]:
             filter_names.update(f.pop("names", {}))
             doc["filters"][tag] = f
         time.sleep(1.0)
+        # 集計は期限切れでも取れた分だけ行う（停止・読み出しは個別のコマンド timeout で必ず戻る）。
         try:
-            cap_result = caps.stop_and_collect(port_index, filter_names)
+            cap_result = caps.stop_and_collect(port_index, filter_names, timings)
         except Exception as exc:  # noqa: BLE001
             doc["errors"].append(f"capture-collect: {type(exc).__name__}")
         doc["capture_status"] = caps.status
     except Exception as exc:  # noqa: BLE001
         doc["errors"].append(f"fatal: {type(exc).__name__}: {str(exc)[:120]}")
     finally:
+        if expired():
+            doc["errors"].append("overall deadline reached")
         counts = dict(hub.counts) if hub else {}
         if hub:
             hub.stop()
         if caps:
             try:
-                doc["cleanup"]["capture"] = caps.cleanup()
+                with stage("capture-cleanup", timings):
+                    doc["cleanup"]["capture"] = caps.cleanup()
+                doc["capture_status"] = caps.status
             except Exception as exc:  # noqa: BLE001
                 doc["cleanup"]["capture"] = {"error": type(exc).__name__}
         try:
-            doc["cleanup"]["exempt_leftover"] = final_exempt_leftover()
+            with stage("exempt-leftover-check", timings):
+                doc["cleanup"]["exempt_leftover"] = final_exempt_leftover()
         except Exception as exc:  # noqa: BLE001
             doc["cleanup"]["exempt_leftover"] = {"checked": False, "error": type(exc).__name__}
         shutil.rmtree(workdir, ignore_errors=True)
         doc["cleanup"]["raw_workdir_removed"] = not workdir.exists()
-    doc["rows"] = assemble(variants, launches, counts, cap_result)
-    doc["diagnostics"] = {"pktmon": cap_result["pktmon"].get("diag"), "wfp": cap_result["wfp"].get("diag"),
-                          "unattributed": {"pktmon": cap_result["pktmon"]["by_variant"].get("unattributed"),
-                                           "wfp": cap_result["wfp"]["by_variant"].get("unattributed")}}
-    doc["launch_status"] = {k: {kk: vv for kk, vv in v.items() if kk != "result_json"} for k, v in launches.items()}
-    (out_dir / "exp1427.json").write_text(json.dumps(doc, indent=2, sort_keys=True, default=str) + "\n", encoding="utf-8")
-    (out_dir / "summary.md").write_text(render_summary(doc), encoding="utf-8")
+        doc["rows"] = assemble(variants, launches, counts, cap_result)
+        doc["diagnostics"] = {"pktmon": cap_result["pktmon"].get("diag"), "wfp": cap_result["wfp"].get("diag"),
+                              "unattributed": {"pktmon": cap_result["pktmon"]["by_variant"].get("unattributed"),
+                                               "wfp": cap_result["wfp"]["by_variant"].get("unattributed")}}
+        doc["launch_status"] = {k: {kk: vv for kk, vv in v.items() if kk != "result_json"} for k, v in launches.items()}
+        with stage("write-output", timings):
+            (out_dir / "exp1427.json").write_text(json.dumps(doc, indent=2, sort_keys=True, default=str) + "\n",
+                                                  encoding="utf-8")
+            (out_dir / "summary.md").write_text(render_summary(doc), encoding="utf-8")
     return doc
 
 

@@ -1367,7 +1367,7 @@ jobs:
   # --------------------------------------------------
   # exp-1427（#1427 の予備実験。実験用ブランチ専用・main にはマージしない）
   # Servo は使わない。AppContainer と通常プロセスから 127.0.0.2・NIC の IP・192.0.2.1（TEST-NET-1）へ
-  # connect / sendto し、listener・pktmon・netsh wfp capture で外部観測する。生データは出力しない。
+  # connect / sendto し、listener・pktmon・WFP net events で外部観測する。生データは出力しない。
   # --------------------------------------------------
   exp-1427-windows:
     if: ${{ inputs.suite == 'exp-1427' }}
@@ -1385,6 +1385,7 @@ jobs:
       - name: "[exp-1427] 自己テスト（純粋関数）"
         run: python -I -B -m unittest discover -s harness/egress-isolation/exp_1427 -p "test_*.py" -v
       - name: "[exp-1427] 実行"
+        timeout-minutes: 20
         run: |
           $out = Join-Path $env:RUNNER_TEMP 'exp-1427'
           New-Item -ItemType Directory -Force -Path $out | Out-Null
@@ -1392,6 +1393,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: "[exp-1427] 残骸の確認（読み取りのみ）"
         if: ${{ !cancelled() }}
+        timeout-minutes: 3
         run: |
           $pk = Join-Path $env:LOCALAPPDATA 'Packages'
           $left = Get-ChildItem $pk -Filter 'fandhe.egressiso.*' -ErrorAction SilentlyContinue
@@ -1401,7 +1403,8 @@ jobs:
           Write-Host "leftover loopback exemptions with an AppContainer SID: $n"
           & "$env:SystemRoot\System32\pktmon.exe" stop | Out-Null
           & "$env:SystemRoot\System32\pktmon.exe" filter remove | Out-Null
-          & "$env:SystemRoot\System32\netsh.exe" wfp capture stop | Out-Null
+          Write-Host "WFP netevents option now:"
+          & "$env:SystemRoot\System32\netsh.exe" wfp show options optionsfor=netevents
       - name: "[exp-1427] 結果表を Step Summary へ"
         if: ${{ !cancelled() }}
         run: |

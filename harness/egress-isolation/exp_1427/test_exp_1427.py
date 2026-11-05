@@ -120,6 +120,32 @@ class Parsers(unittest.TestCase):
         self.assertEqual(res["pattern_counts"]["AppContainerLoopback"], 1)
 
 
+class Commands(unittest.TestCase):
+    def test_netevents_option_parse(self) -> None:
+        self.assertIs(run_probe.parse_netevents_option("Net events: ON\nother: off"), True)
+        self.assertIs(run_probe.parse_netevents_option("netevents = disabled"), False)
+        self.assertIsNone(run_probe.parse_netevents_option("nothing relevant"))
+
+    def test_run_cmd_returns_on_timeout(self) -> None:
+        import time
+
+        t0 = time.monotonic()
+        r = run_probe.run_cmd([sys.executable, "-c", "import time; time.sleep(30)"], timeout=1)
+        self.assertEqual(r["error"], "TimeoutExpired")
+        self.assertIsNone(r["rc"])
+        self.assertLess(time.monotonic() - t0, 15)
+
+    def test_run_cmd_collects_output(self) -> None:
+        r = run_probe.run_cmd([sys.executable, "-c", "print('hello')"], timeout=20)
+        self.assertEqual(r["rc"], 0)
+        self.assertIn("hello", r["out"])
+
+    def test_run_cmd_missing_executable(self) -> None:
+        r = run_probe.run_cmd(["/nonexistent/definitely-not-here"], timeout=5)
+        self.assertIsNone(r["rc"])
+        self.assertEqual(r["error"], "FileNotFoundError")
+
+
 class Plan(unittest.TestCase):
     def test_variants_and_unique_ports(self) -> None:
         vs = run_probe.build_variants()
