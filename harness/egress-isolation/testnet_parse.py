@@ -41,9 +41,47 @@ SCAFFOLD_FILTER_PATTERNS = ("UWP Default Outbound Block Rule", "Block Outbound D
                             "InternetClient Default Rule")
 
 
+# 診断に残してよい語（実機 run 42000257965 の pktmon / netsh の出力に現れた語だけ。小文字）。これ以外の語は `?` に落とす。
+SHAPE_WORDS = frozenset(
+    "collected data packet counters capture type all packets monitored components network adapters filters "
+    "name ip address testnet logger parameters pktmon monitor is not running none netevents on off".split())
+_SHAPE_WORD_RE = re.compile(r"[^\W\d_]+")
+
+
 def shape(line: str, limit: int = 120) -> str:
-    """生出力の「形」だけを残す（数字を # に潰す。IP・GUID・SID の値も潰れる）。"""
-    return re.sub(r"\d+", "#", line.strip())[:limit]
+    """生出力の「形」だけを残す（数字を # に潰し、許可語（`SHAPE_WORDS`）以外の語を ? に置き換える）。
+
+    パス・MAC アドレス・NIC 名・ユーザー名のような環境固有の語が診断（アーティファクトとログ）に残らないよう、
+    block list ではなく allow-list にしている。診断の情報量より漏れないことを優先する（未知の語は `?` に落ちる）。
+    語の集合は英語の出力を前提にする（他言語の出力は `?` だらけになるが、安全側に倒れるだけで判定には使わない）。
+    """
+    masked = re.sub(r"\d+", "#", line.strip())
+    masked = _SHAPE_WORD_RE.sub(lambda m: m.group(0) if m.group(0).lower() in SHAPE_WORDS else "?", masked)
+    return masked[:limit]
+
+
+def _link_payload(frame: bytes, linktype: int) -> tuple[bytes | None, bool]:
+    """リンク層を外した IP 以降のバイト列と「リンク層の途中で終わったか」を返す。IPv4 以外・未知の linktype は (None, False)。"""
+    off = 0
+    if linktype == _LINK_ETHERNET:
+        if len(frame) < 14:
+            return None, True
+        et = struct.unpack_from("!H", frame, 12)[0]
+        off = 14
+        while et in (0x8100, 0x88A8):
+            if len(frame) < off + 4:
+                return None, True
+            et = struct.unpack_from("!H", frame, off + 2)[0]
+            off += 4
+        if et != 0x0800:
+            return None, False
+    elif linktype == _LINK_NULL:
+        off = 4
+    elif linktype in _LINK_RAW_TYPES:
+        off = 0
+    else:
+        return None, False
+    return frame[off:], False
 
 
 def decode_ipv4_packet(frame: bytes, linktype: int) -> tuple[str, int, str, int, str] | None:
@@ -51,24 +89,9 @@ def decode_ipv4_packet(frame: bytes, linktype: int) -> tuple[str, int, str, int,
 
     IPv4 の TCP・UDP 以外、先頭断片でない断片、途中で切れたパケットは None。
     """
-    off = 0
-    if linktype == _LINK_ETHERNET:
-        if len(frame) < 14:
-            return None
-        et = struct.unpack_from("!H", frame, 12)[0]
-        off = 14
-        while et in (0x8100, 0x88A8) and len(frame) >= off + 4:
-            et = struct.unpack_from("!H", frame, off + 2)[0]
-            off += 4
-        if et != 0x0800:
-            return None
-    elif linktype == _LINK_NULL:
-        off = 4
-    elif linktype in _LINK_RAW_TYPES:
-        off = 0
-    else:
+    ip, _short = _link_payload(frame, linktype)
+    if ip is None:
         return None
-    ip = frame[off:]
     if len(ip) < 20 or ip[0] >> 4 != 4:
         return None
     ihl = (ip[0] & 0x0F) * 4
@@ -89,6 +112,35 @@ def decode_ipv4_packet(frame: bytes, linktype: int) -> tuple[str, int, str, int,
     return None
 
 
+def _is_short_frame(frame: bytes, linktype: int) -> bool:
+    """`decode_ipv4_packet` が None を返したフレームが「ヘッダの途中で終わった短いフレーム」かを返す。
+
+    採取は `--pkt-size 0` で全長を取るため、切り詰めのないフレームがヘッダの途中で終わるなら本当に短い不正なパケットで、
+    TCP・UDP の接続試行にはなれない。エラーにはせず件数（`diag.short_frames`）に残して、無言で捨てないようにする。
+    IPv4 以外・先頭でない断片・TCP / UDP 以外・未知の linktype は短いフレームに数えない。
+    """
+    ip, link_short = _link_payload(frame, linktype)
+    if link_short:
+        return True
+    if ip is None:
+        return False
+    if len(ip) < 20:
+        return True
+    if ip[0] >> 4 != 4:
+        return False
+    ihl = (ip[0] & 0x0F) * 4
+    if ihl < 20 or len(ip) < ihl:
+        return True
+    if struct.unpack_from("!H", ip, 6)[0] & 0x1FFF:
+        return False
+    proto = ip[9]
+    if proto == 17:
+        return len(ip) < ihl + 8
+    if proto == 6:
+        return len(ip) < ihl + 14
+    return False
+
+
 def _attribute(index: dict[tuple[str, int], tuple[str, str]], proto: str, port: int) -> str:
     hit = index.get((proto, port))
     return testnet.route_key(*hit) if hit else UNATTRIBUTED
@@ -102,7 +154,8 @@ def parse_pcapng(f: Any, index: dict[tuple[str, int], tuple[str, str]]) -> dict[
     壊れたファイルは例外にせず `diag.error` に残し、そこまでの集計を返す。
     """
     diag: dict[str, Any] = {"block_types": collections.Counter(), "linktypes": collections.Counter(),
-                            "frames": 0, "ipv4_decoded": 0, "in_scope": 0, "out_of_scope": 0, "truncated_frames": 0}
+                            "frames": 0, "ipv4_decoded": 0, "in_scope": 0, "out_of_scope": 0, "truncated_frames": 0,
+                            "short_frames": 0}
     out: dict[str, dict[str, Any]] = {}
     seen: dict[str, set[tuple[Any, ...]]] = {}
     endian = "<"
@@ -182,6 +235,9 @@ def parse_pcapng(f: Any, index: dict[tuple[str, int], tuple[str, str]]) -> dict[
                 if truncated:
                     # ヘッダの途中で切れて宛先を読めないフレームは、集計から無言で消えて漏れを見落とす（観測不能にする）。
                     diag.setdefault("error", "truncated frame could not be decoded")
+                elif _is_short_frame(frame, link):
+                    # 切り詰めのない短いフレームは不正なパケットで接続試行になれない。観測不能にはせず件数だけ残す。
+                    diag["short_frames"] += 1
                 continue
             diag["ipv4_decoded"] += 1
             src, sport, dst, dport, kind = dec
@@ -339,6 +395,11 @@ def parse_netevents_option(text: str) -> bool | None:
 def parse_pktmon_running(text: str) -> bool | None:
     """`pktmon status` の出力から採取中かを推定する。判別できなければ None（呼び出し側は fail-closed にする）。"""
     low = text.lower()
+    # 実機の稼働中の出力は「Collected Data:」で始まる。13 行目以降（ログのパス等）は未確認で、そこに stopped などが
+    # 含まれると下の否定側に当たって False になる。False は start() では他人の採取の上に開始し、cleanup() では未停止を
+    # 停止済みと記録する危険側なので、True を先に判定する（停止中の出力はこの形で始まらない）。
+    if re.match(r"\s*collected\s+data\s*:", low):
+        return True
     if re.search(r"not\s+(running|started|active)|\bstopped\b|\binactive\b", low):
         return False
     if re.search(r"\b(running|active|started|collecting)\b", low):
@@ -349,7 +410,7 @@ def parse_pktmon_running(text: str) -> bool | None:
 def parse_pktmon_filters_empty(text: str) -> bool | None:
     """`pktmon filter list` の出力から filter が空かを推定する。判別できなければ None。"""
     low = text.lower()
-    if re.search(r"no\s+filters?\b", low):
+    if re.fullmatch(r"\s*no\s+filters?(?:\s+set)?\.?\s*", low):
         return True
     # 実機（windows-latest）の空の出力は「Packet Filters:」+「None」の 2 行（Issue #1515）。
     # 空白・CRLF の差は許すが、全体がこの 2 行のときだけ空とみなす（`None` を含むだけでは True にしない）。

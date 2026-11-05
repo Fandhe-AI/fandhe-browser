@@ -303,8 +303,93 @@ class FiltersAndOptionsTest(unittest.TestCase):
                      "Packet Filters:\n    None of the above\n", "Something\nPacket Filters:\n None\n"):
             self.assertIsNot(tp.parse_pktmon_filters_empty(text), True, repr(text))
 
+    def test_pktmon_running_real_output_shapes(self) -> None:
+        # run 42000257965 の稼働中の出力（先頭 12 行）。LF・CRLF のどちらでも True。13 行目以降は未確認。
+        real = ("Collected Data:\n    Packet counters, packet capture\nCapture Type:\n    All packets\n"
+                "Monitored Components:\n    Network adapters\nPacket Filters:\n"
+                "    # Name    IP Address\n    - ----    ----------\n    # testnet #.#.#.#/#\n"
+                "Logger Parameters:\n    Logger name:        PktMon\n")
+        self.assertIs(tp.parse_pktmon_running(real), True)
+        self.assertIs(tp.parse_pktmon_running(real.replace("\n", "\r\n")), True)
+        # 13 行目以降に stopped を含むパスの行が続いても True（False は危険側のため先に判定する）。
+        self.assertIs(tp.parse_pktmon_running(real + "    Log file:  C:\\work\\stopped\\x.etl\n"), True)
+        self.assertIs(tp.parse_pktmon_running("Packet Monitor is not running.\r\n"), False)
+
+    def test_pktmon_filters_empty_is_full_match(self) -> None:
+        for text in ("No filters set.", "no filter", "No filters set.\r\n", "  No filters  "):
+            self.assertIs(tp.parse_pktmon_filters_empty(text), True, repr(text))
+        # filter の行の中に no filter を含むだけの表は空と判定しない。
+        table = "Packet Filters:\n    # Name    IP Address\n    1 no filter-like  192.0.2.0/24\n"
+        self.assertIsNot(tp.parse_pktmon_filters_empty(table), True)
+        self.assertIsNot(tp.parse_pktmon_filters_empty("There is no filter named x\n"), True)
+
     def test_shape_masks_digits(self) -> None:
-        self.assertEqual(tp.shape("addr 192.0.2.1 port 47300"), "addr #.#.#.# port #")
+        self.assertEqual(tp.shape("# testnet 192.0.2.0/24"), "# testnet #.#.#.#/#")
+
+    def test_shape_keeps_real_output_lines(self) -> None:
+        lines = ["Collected Data:", "Packet counters, packet capture", "Capture Type:", "All packets",
+                 "Monitored Components:", "Network adapters", "Packet Filters:", "# Name    IP Address",
+                 "- ----    ----------", "# testnet #.#.#.#/#", "Logger Parameters:", "Logger name:        PktMon",
+                 "Packet Monitor is not running.", "None", "netevents = on"]
+        for line in lines:
+            self.assertEqual(tp.shape(line), line)
+        self.assertEqual(tp.shape("1 testnet 192.0.2.0/24"), "# testnet #.#.#.#/#")
+
+    def test_shape_drops_environment_specific_words(self) -> None:
+        for text, forbidden in (("C:\\Users\\runneradmin\\AppData\\x.etl", "runneradmin"),
+                                ("Adapter 00-15-5D-01-AB-CD up", "AB"),
+                                ("Ethernet-1 Hyper-V Virtual Adapter", "Hyper"),
+                                ("イーサネット 2", "イーサネット")):
+            out = tp.shape(text)
+            self.assertNotIn(forbidden, out, out)
+        self.assertEqual(tp.shape("Ethernet 3"), "? #")
+        self.assertEqual(tp.shape("C:\\Users\\runneradmin"), "?:\\?\\?")
+        self.assertEqual(tp.shape("a" * 300, 5), "?")
+
+
+def epb_raw(frame: bytes, caplen: int, orig: int) -> bytes:
+    return block(6, struct.pack("<IIIII", 0, 0, 0, caplen, orig) + frame)
+
+
+class ShortFrameTest(unittest.TestCase):
+    FULL = eth(ipv4(NIC, 5000, "192.0.2.1", 47300, "tcp_syn"))
+
+    def _parse(self, *epbs: bytes) -> dict:
+        return tp.parse_pcapng(io.BytesIO(shb() + idb(1) + b"".join(epbs)), INDEX)
+
+    def test_l4_cut_by_capture_is_an_error(self) -> None:
+        cut = self.FULL[:14 + 20 + 4]
+        res = self._parse(epb_raw(cut, len(cut), len(self.FULL)))
+        self.assertEqual(res["diag"]["error"], "truncated frame could not be decoded")
+
+    def test_l4_cut_without_truncation_is_counted_not_an_error(self) -> None:
+        cut = self.FULL[:14 + 20 + 4]
+        res = self._parse(epb(cut))
+        self.assertNotIn("error", res["diag"])
+        self.assertEqual((res["diag"]["frames"], res["diag"]["short_frames"]), (1, 1))
+        self.assertEqual(res["routes"], {})
+
+    def test_exactly_20_byte_epb(self) -> None:
+        res = self._parse(epb_raw(b"", 0, 0))
+        self.assertNotIn("error", res["diag"])
+        self.assertEqual(res["diag"]["frames"], 1)
+        res = self._parse(epb_raw(b"", 0, 60))
+        self.assertEqual(res["diag"]["error"], "truncated frame could not be decoded")
+        res = self._parse(epb_raw(b"", 10, 10))
+        self.assertEqual(res["diag"]["error"], "EPB caplen exceeds block data")
+
+    def test_out_of_scope_kinds_are_not_short_frames(self) -> None:
+        arp = b"\x00" * 12 + b"\x08\x06" + b"\x00" * 28
+        ipv6 = b"\x00" * 12 + b"\x86\xdd" + b"\x00" * 40
+        pkt = bytearray(ipv4(NIC, 1, "192.0.2.1", 2, "udp"))
+        pkt[6:8] = struct.pack("!H", 0x0001)  # 先頭でない断片
+        frag = eth(bytes(pkt))
+        icmp = bytearray(ipv4(NIC, 1, "192.0.2.1", 2, "udp"))
+        icmp[9] = 1
+        res = self._parse(epb(arp), epb(ipv6), epb(frag), epb(eth(bytes(icmp))))
+        self.assertEqual(res["diag"]["frames"], 4)
+        self.assertEqual(res["diag"]["short_frames"], 0)
+        self.assertNotIn("error", res["diag"])
 
 
 if __name__ == "__main__":
