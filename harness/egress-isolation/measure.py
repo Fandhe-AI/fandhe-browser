@@ -624,6 +624,11 @@ def appcontainer_cleanup_reason(data: dict[str, Any]) -> str | None:
     return None
 
 
+def record_testnet_cleanup(data: dict[str, Any], testnet_cleanup: dict[str, Any]) -> None:
+    """TEST-NET 観測の片付け結果を `appcontainer.testnet_cleanup` に写す。`appcontainer.cleanup` は書き換えない（Issue #1515）。"""
+    data.setdefault("appcontainer", {})["testnet_cleanup"] = dict(testnet_cleanup)
+
+
 def appcontainer_caveat(data: dict[str, Any]) -> str | None:
     """appcontainer の loopback 経路の pass を妨げる理由（loopback の交絡、または片付けの不完全）。なければ None。"""
     return appcontainer_confound_reason(data) or appcontainer_cleanup_reason(data)
@@ -1179,7 +1184,7 @@ def main(argv: list[str] | None = None) -> int:
             if testnet_obs is not None and mode == "appcontainer":
                 # 片付けの成否は `cleanup` と別キーに写す（loopback 経路の pass も妨げる。fail-closed）。
                 # `cleanup` へ混ぜると AppContainer 本来の「未記録」検出が無効になる（Issue #1515）。
-                data.setdefault("appcontainer", {})["testnet_cleanup"] = dict(testnet_obs["cleanup"])
+                record_testnet_cleanup(data, testnet_obs["cleanup"])
             data["verdicts"] = judge.judge_all(mode, data["inner"], data["outer_counts"], control,
                                                binary_match=data["binary_match"],
                                                mode_unavailable=data.get("unavailable"),
@@ -1241,7 +1246,7 @@ def admin_restore_failures(results: dict[str, Any]) -> list[str]:
     tn = results.get("testnet_observe")
     if isinstance(tn, dict):
         cleanup = tn.get("cleanup") or {}
-        for key in ("pktmon_stopped", "pktmon_filters_removed", "netevents_restored"):
+        for key in ("pktmon_stopped", "pktmon_filters_removed", "netevents_restored", "raw_removed"):
             if cleanup.get(key) is not True:
                 failures.append(f"testnet_observe: {key} is not true")
     return failures

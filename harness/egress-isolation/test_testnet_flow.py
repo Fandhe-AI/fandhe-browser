@@ -339,7 +339,24 @@ class FinishAndSummaryTest(unittest.TestCase):
         self.assertEqual(measure.admin_restore_failures({"modes": {}, "testnet_observe": out}),
                          ["testnet_observe: pktmon_stopped is not true",
                           "testnet_observe: pktmon_filters_removed is not true",
-                          "testnet_observe: netevents_restored is not true"])
+                          "testnet_observe: netevents_restored is not true",
+                          "testnet_observe: raw_removed is not true"])
+
+    def test_raw_removed_failure_is_reflected_in_admin_restore_failures(self) -> None:
+        out = {"cleanup": dict(GOOD_CLEANUP, raw_removed=False)}
+        self.assertEqual(measure.admin_restore_failures({"modes": {}, "testnet_observe": out}),
+                         ["testnet_observe: raw_removed is not true"])
+
+    def test_record_testnet_cleanup_does_not_touch_appcontainer_cleanup(self) -> None:
+        data = {"appcontainer": {"cleanup": {}}}
+        measure.record_testnet_cleanup(data, GOOD_CLEANUP)
+        self.assertEqual(data["appcontainer"]["cleanup"], {})
+        self.assertEqual(data["appcontainer"]["testnet_cleanup"], GOOD_CLEANUP)
+        self.assertIsNot(data["appcontainer"]["testnet_cleanup"], GOOD_CLEANUP)
+        self.assertIn("not recorded", measure.appcontainer_cleanup_reason(data) or "")
+        bare: dict[str, Any] = {}
+        measure.record_testnet_cleanup(bare, GOOD_CLEANUP)
+        self.assertEqual(bare, {"appcontainer": {"testnet_cleanup": GOOD_CLEANUP}})
 
     def test_admin_restore_failures_only_when_observed(self) -> None:
         self.assertEqual(measure.admin_restore_failures({"modes": {}}), [])
