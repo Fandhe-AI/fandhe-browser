@@ -265,7 +265,14 @@ macOS・Windows の GitHub ホステッドランナー。結果は #1003 に記�
     `--appcontainer-loopback-exempt` を併用するときだけ受け付ける。`xos-measure.yml` の `egress-isolation-windows` だけが付ける。既定・ローカル・`ci.yml` では送らない）:
     - 経路は `testnet_redirect`・`testnet_img`・`testnet_fetch`・`testnet_ws`（Servo ホストが読むページ）と `testnet_udp`（内側ランナー自身の `sendto`）。
       経路ごとに一意のポート（`testnet.py` のポート帯。baseline は 47300〜47304、appcontainer は 47316〜47320）を割り当て、ポートだけで経路とモードに帰属させる。
-      ページの配信は従来どおり容器内の 127.0.0.1（loopback 免除）。`internal` は TEST-NET では意味を持たないため対象外。
+      ページの配信は容器内の 127.0.0.1（loopback 免除）。ただし `testnet_img`・`testnet_fetch`・`testnet_ws` は `http://pages.test:<port>` から配る
+      （#1519。`testnet_redirect` は document で mixed content の対象外のため従来どおり 127.0.0.1）。127.0.0.1 のオリジンは potentially trustworthy で、
+      そこから非 trustworthy な TEST-NET 宛ての subresource は Servo の mixed content 検査でネットワークに出る前に遮られ、対照（baseline）でも
+      NIC にパケットが出ず `unobservable` になっていた（PR #1516 の run 42000257965。コードと実測からの見立てで、Servo の実行時ログでは未確認）。
+      `pages.test` は内側ランナーが `--testnet` のときだけ、`--stdio` のホストへ Servo の `HOST_FILE`（`pages.test` -> 127.0.0.1 の 1 行）を渡して解決する。
+      `build_host_env`（本番の許可リストの写し）と `--selftest` の env は変えず、本番は render crate の `env_clear` により `HOST_FILE` が届かない。
+      宛先（TEST-NET の IP リテラル）は名前解決せず、「宛先に名前を使わない」規則は変わらない（`pages.test` はページの配信元）。
+      `internal` は TEST-NET では意味を持たないため対象外。
     - 判定（`judge.judge_testnet_route`）: `pass` は、(1) 陰性（capability なしの容器）で NIC から 0 件、(2) 同じ経路に package SID つきの WFP drop
       （ハーネスが作った AppContainer の SID と一致するもの）がある、(3) 陽性の対照（baseline の通常プロセス）で同じ経路のパケットが出ている、
       の 3 つがすべてそろい、観測と片付けが完全なときだけ。`fail` は陰性でパケットが出たとき（観測が一部欠けていても優先）。
@@ -273,6 +280,9 @@ macOS・Windows の GitHub ホステッドランナー。結果は #1003 に記�
       pktmon は同じパケットを複数コンポーネントで記録し SYN も再送されるため、有無（1 件以上か）で判定し、生の件数と重複除去後の件数を両方残す。
       pktmon の 192.0.2.0/24 宛てで定義済みポートに帰属できないパケット（`unattributed`）が 1 件以上あれば、全経路を `unobservable` にする（陰性パケットの `fail` は優先。WFP 側の `unattributed` は判定に使わない）。
       loopback 経路の判定（`appcontainer_confound`）は変えず、TEST-NET の経路には当てない。
+      img・fetch・ws には条件を 1 つ足す（#1519）: baseline と陰性の両方で `pages.test` のページ（`testnet_origin_load`）が読めていること
+      （`HOST_FILE` が効いたことの確認。読めなければ `origin_ok` が偽で、専用の理由の `unobservable`。`fail` は従来どおり最優先）。条件が増えるだけで緩めない。
+    - 実測（#1519）: Windows の実測（`xos-measure.yml` の suite `egress-isolation`）の run ID と結果は未記録（実装後に記録する）。
     - 足場の確認（読み取りのみ）: 接続プロファイルのカテゴリに対応する firewall プロファイルが有効・`mpssvc` と `bfe` が Running・
       AppContainer 既定の遮断 filter（`UWP Default Outbound Block Rule` 等）が 1 件以上、のどれかが欠ければ `unobservable`。
     - 管理者操作（使い捨て runner。承認範囲はこれだけ）: `pktmon`（filter add / remove / list、start / stop / status、etl2pcap）と

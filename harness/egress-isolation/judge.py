@@ -38,6 +38,9 @@ HOSTS_FILE = (
     f"{IP_INTERNAL_STANDIN} {HOST_INTERNAL_STANDIN}\n"
     "::1 localhost\n"
 )
+# TEST-NET の img・fetch・ws を mixed content に遮られず測るための hosts（Servo の `HOST_FILE`。Issue #1519）。
+# `pages.test` を 127.0.0.1 へ解決するだけで、宛先（TEST-NET の IP リテラル）は名前解決しない。
+TESTNET_HOSTS_FILE = f"{IP_ALLOWED} {HOST_ALLOWED}\n"
 # 隔離下だけで試す「実在の内部アドレス」。接続先に何も届かないこと（経路なし）を前提検査した後にだけ使う。
 REAL_INTERNAL_V4 = ("10.255.255.1", "169.254.169.254")
 REAL_INTERNAL_V6 = "fd00::1"
@@ -315,6 +318,8 @@ TESTNET_NO_DROP_REASON = "no WFP drop with the container's package SID was recor
 TESTNET_POSITIVE_REASON = "positive check failed (selftest or loopback load)"
 TESTNET_BINARY_REASON = "binary inside the sandbox differs from the baseline control binary"
 TESTNET_UNATTRIBUTED_REASON = "packet(s) to the TEST-NET destination could not be attributed to any route; the observation is incomplete"
+TESTNET_ORIGIN_REASON = ("hostname page origin did not load (HOST_FILE mapping not effective); "
+                         "mixed content cannot be avoided for this route")
 TESTNET_NOT_REQUESTED_REASON = "TEST-NET observation was not requested"
 
 
@@ -326,6 +331,7 @@ def judge_testnet_route(
     observation_unavailable: str | None,
     cleanup_incomplete: str | None,
     positive_ok: bool,
+    origin_ok: bool,
     binary_match: bool,
 ) -> tuple[str, str]:
     """TEST-NET 宛て 1 経路の判定。(verdict, reason) を返す。
@@ -345,6 +351,8 @@ def judge_testnet_route(
         return UNOBSERVABLE, cleanup_incomplete
     if not positive_ok:
         return UNOBSERVABLE, TESTNET_POSITIVE_REASON
+    if not origin_ok:
+        return UNOBSERVABLE, TESTNET_ORIGIN_REASON
     if control_packets < 1:
         return UNOBSERVABLE, TESTNET_NO_CONTROL_REASON
     if wfp_drops_with_sid < 1:
@@ -366,7 +374,7 @@ def _total(counts: Any) -> int:
 
 
 def judge_testnet(
-    mode: str, *, observation: dict[str, Any] | None, positive_ok: bool, binary_match: bool,
+    mode: str, *, observation: dict[str, Any] | None, positive_ok: bool, origin_ok: bool, binary_match: bool,
     cleanup_incomplete: str | None = None,
 ) -> dict[str, dict[str, Any]]:
     """TEST-NET 宛ての全経路を判定する（`mode` は陰性側。陽性の対照は同じ観測の baseline の同じ経路）。
@@ -374,6 +382,8 @@ def judge_testnet(
     `observation` は `testnet_observe.TestnetObserver.stop_and_collect` の戻り値
     （`unavailable`・`pktmon.routes`・`wfp.routes`）。None は観測が要求されなかった。
     loopback の交絡（`appcontainer_confound`）は loopback の listener の話なので、ここには当てない。
+    `origin_ok` はホスト名オリジン（`pages.test`）のページが baseline・陰性の両方で読めたこと（Issue #1519）。
+    `testnet.TESTNET_HOSTNAME_ORIGIN_ROUTES` の経路にだけ効き、他の経路には条件を足さない。
     """
     out: dict[str, dict[str, Any]] = {}
     obs = observation if isinstance(observation, dict) else None
@@ -396,7 +406,9 @@ def judge_testnet(
         verdict, reason = judge_testnet_route(
             negative_packets=neg_raw, control_packets=ctl_raw, wfp_drops_with_sid=sid_drops,
             observation_unavailable=unavailable, cleanup_incomplete=cleanup_incomplete,
-            positive_ok=positive_ok, binary_match=binary_match)
+            positive_ok=positive_ok,
+            origin_ok=origin_ok if route in testnet.TESTNET_HOSTNAME_ORIGIN_ROUTES else True,
+            binary_match=binary_match)
         out[route] = {
             "verdict": verdict, "reason": reason, "method": TESTNET_METHOD,
             "negative_packets": neg_raw, "negative_unique": _total(neg.get("unique_flows")),

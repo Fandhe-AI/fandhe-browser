@@ -1026,6 +1026,8 @@ def _testnet_verdict_block(data: dict[str, Any]) -> list[str]:
             f"({v['wfp_drops_with_sid']} / {v['wfp_package_sid_match']}) | {', '.join(v['filter_names']) or '-'} | "
             f"{v['reason']} |")
     lines.append(f"- method: {judge.TESTNET_METHOD}")
+    # ホスト名オリジン（pages.test）が読めたかの記録（Issue #1519。img・fetch・ws の配信元。ホスト名と固定語彙のみ）
+    lines.append(f"- hostname origin load (img/fetch/ws): {(data.get('inner') or {}).get('testnet_origin_load')}")
     return lines
 
 
@@ -1196,10 +1198,19 @@ def main(argv: list[str] | None = None) -> int:
             if testnet_obs is not None and mode == "appcontainer":
                 data["testnet_verdicts"] = judge.judge_testnet(
                     mode, observation=testnet_obs, positive_ok=bool((data.get("inner") or {}).get("positive_ok")),
+                    # baseline と陰性の両方でホスト名オリジンが読めたときだけ成立（Issue #1519）
+                    origin_ok=(testnet_origin_ok((results["modes"]["baseline"]).get("inner"))
+                               and testnet_origin_ok(data.get("inner"))),
                     binary_match=data["binary_match"],
                     cleanup_incomplete=(appcontainer_cleanup_reason(data)
                                         or testnet_observe.cleanup_reason(testnet_obs.get("cleanup"))))
     return finalize(results, out_dir)
+
+
+def testnet_origin_ok(inner: Any) -> bool:
+    """内側の結果でホスト名オリジン（`pages.test`）のページが読めたか。欠落・不正な形は False（fail-closed。Issue #1519）。"""
+    load = inner.get("testnet_origin_load") if isinstance(inner, dict) else None
+    return (isinstance(load, dict) and load.get("ok") is True and load.get("final_host") == judge.HOST_ALLOWED)
 
 
 def finish_testnet_observe(observer: testnet_observe.TestnetObserver, results: dict[str, Any]) -> dict[str, Any]:

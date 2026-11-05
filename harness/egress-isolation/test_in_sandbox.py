@@ -68,6 +68,60 @@ class InnerRunnerTest(unittest.TestCase):
         self.assertTrue(all(n >= 1 for n in result["guard_polls"].values()), result["guard_polls"])
         self.assertEqual(set(result["guard_polls"]), {"redirect", "img", "fetch", "ws", "internal"})
 
+    def _run_spied(self, testnet_on: bool) -> tuple[dict[str, object], dict[str, str], str | None, list[str]]:
+        """ホスト起動時の env・HOST_FILE の中身・load した URL を記録して実行する（Issue #1519）。"""
+        import testnet
+
+        host = make_fake_host(self.tmp, [])
+        ports = {**self.ports(), **testnet.testnet_ports("baseline")}
+        args = self.args("baseline", host)
+        args.ports = json.dumps(ports)
+        args.testnet = testnet_on
+        seen: dict[str, str] = {}
+        hosts: list[str | None] = []
+        urls: list[str] = []
+        orig_popen, orig_load = in_sandbox.quiet_io.popen_stdio_host, in_sandbox.load_route
+
+        def popen(argv: list[str], env: dict[str, str] | None = None, **kw: object) -> object:
+            seen.update(env or {})
+            path = (env or {}).get("HOST_FILE")
+            hosts.append(Path(path).read_text(encoding="ascii") if path else None)
+            return orig_popen(argv, env=env, **kw)
+
+        def load(chan: object, next_id: object, info: object, url: str) -> dict[str, object]:
+            urls.append(url)
+            return orig_load(chan, next_id, info, url)
+
+        with mock.patch.object(in_sandbox.quiet_io, "popen_stdio_host", popen), \
+                mock.patch.object(in_sandbox, "load_route", load):
+            result = in_sandbox.run(args, ports)
+        return result, seen, (hosts[0] if hosts else None), urls
+
+    def test_testnet_serves_subresource_routes_from_hostname_origin(self) -> None:
+        """Issue #1519: HOST_FILE は --testnet のときだけ渡り、img・fetch・ws は pages.test から読む。"""
+        import page_templates
+        import testnet
+
+        result, env, hosts, urls = self._run_spied(True)
+        self.assertEqual(hosts, "127.0.0.1 pages.test\n")
+        self.assertTrue(env["HOST_FILE"].endswith("testnet-hosts"))
+        self.assertEqual(result["testnet_origin_load"]["final_host"], "pages.test")
+        self.assertEqual(set(result["testnet_loads"]), set(testnet.TESTNET_TCP_ROUTES))
+        # Linux の既定は hosts 名のページ配信（literal でない）ため、redirect も pages.test になる。
+        # Windows（literal）で redirect だけが 127.0.0.1 のままになる分岐は実機の実測で確かめる。
+        for r in testnet.TESTNET_HOSTNAME_ORIGIN_ROUTES:
+            path = page_templates.TESTNET_ROUTE_PATH[r]
+            self.assertEqual([u for u in urls if u.endswith(path)], [f"http://pages.test:{urls[0].rsplit(':', 1)[1].split('/')[0]}{path}"], r)
+
+    def test_without_testnet_no_host_file_and_no_hostname_loads(self) -> None:
+        """Issue #1519・SEC-2: --testnet でなければ HOST_FILE を渡さず、pages.test の読み込みも増えない。"""
+        result, env, hosts, urls = self._run_spied(False)
+        self.assertNotIn("HOST_FILE", env)
+        self.assertIsNone(hosts)
+        self.assertNotIn("testnet_origin_load", result)
+        import page_templates
+        self.assertEqual([u for u in urls if u.endswith(tuple(page_templates.TESTNET_ROUTE_PATH.values()))], [])
+
     def test_diag_routes_run_after_judged_routes_in_order(self) -> None:
         """Issue #1415: --diag-routes は判定経路の後に D1・D2 の順で load し、loads / attempts には混ぜない。"""
         host = make_fake_host(self.tmp, [])

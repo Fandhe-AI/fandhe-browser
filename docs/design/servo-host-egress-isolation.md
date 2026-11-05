@@ -262,7 +262,7 @@ options §7 を引き継ぐ。本書で新たに加わった未確認事項と�
 | 未確認事項 | 追跡先 |
 | ---------- | ------ |
 | Windows の成立性（§3.3・§6.2）。§8.1 で D（既知の制約）とした。測り直しは次行の #1427 で追跡する | #1387 |
-| Windows の測り直し（loopback 免除の下では外側 listener に届くため、loopback 宛てでは egress を測れない）。#1427 の予備実験で、TEST-NET-1 宛てとランナー側の観測（pktmon・WFP net events）で判定できる見込みを得て、#1515 でハーネスに実装した（`--appcontainer-testnet-observe`）。実測（xos-measure の suite `egress-isolation`）の run ID と結果は未記録。D の扱いは実測の結果を受けてオーナーが見直す | #1427・#1515 |
+| Windows の測り直し（loopback 免除の下では外側 listener に届くため、loopback 宛てでは egress を測れない）。#1427 の予備実験で、TEST-NET-1 宛てとランナー側の観測（pktmon・WFP net events）で判定できる見込みを得て、#1515 でハーネスに実装した（`--appcontainer-testnet-observe`）。#1516 の実測（run 42000257965）で `testnet_redirect`・`testnet_udp` は pass、img・fetch・ws は対照にパケットが出ず unobservable だった（127.0.0.1 オリジンからの mixed content の見立て）ため、#1519 でこの 3 経路を `pages.test` オリジンから配るようにした（Servo の `HOST_FILE`。ハーネスのみ）。#1519 の実測の run ID と結果は未記録。D の扱いは実測の結果を受けてオーナーが見直す | #1427・#1515 |
 | AppContainer 内の ipc-channel の制約（ボディ付きリクエストで panic し得る。推定・未実測） | #1421 |
 | Landlock ルール適用下の動作・seccomp との併用（保留。§9.5。許可リスト付きプロキシは #1434・#1440・#1436 で本番に実装済み。netns 内の中継 → UDS → プロキシの成立性は §6.5 で確認済み） | #1457 |
 | bwrap のファイルシステム隔離の残り（`--ro-bind / /` 化・`/dev/log`・`/var/lib/*`・`/var/snap/*` 配下の UDS など、隠している場所以外の既知のソケット。`/run`・`/tmp`・`$HOME` の tmpfs 化は #1485、`/var/tmp`・`/dev/shm`・WorkDir の親〔`temp_root` が `/tmp` と `$HOME` の外にあるときの兄弟 WorkDir〕の tmpfs 化は #1492 で対応済み） | #1457 |
