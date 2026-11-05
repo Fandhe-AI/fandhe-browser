@@ -9,6 +9,7 @@ name: XOS Measure
 #   suite=egress-isolation Servo ホストの egress 隔離を macOS・Windows で実測する（#1387・TASK-38・RENDER-3。
 #                          harness/egress-isolation/measure.py。macOS は Seatbelt、Windows は baseline と
 #                          AppContainer〔ctypes のランチャー。#1396・loopback の切り分けつき〕。ubuntu は対象外）
+#   suite=exp-1427         #1427 の予備実験（Windows の egress 遮断を loopback 以外の宛先で測る。実験用ブランチ専用・main にはマージしない）
 #   suite=egress-host      render の real_host で、隔離（Linux: bwrap・macOS: sandbox-exec）下の実 Servo ホストを検証する
 #                          （#1437・TASK-38・RENDER-3。`render3_egress_*` の 3 本。Windows は対象外〔既知の制約 D〕。
 #                          起動例: gh workflow run xos-measure.yml -f suite=egress-host）
@@ -63,6 +64,7 @@ on:
           - compat-practical
           - egress-isolation
           - egress-host
+          - exp-1427
       repeat:
         description: "compat-practical の繰り返し回数（1〜5。cli-conformance では使わない）"
         type: string
@@ -1360,6 +1362,58 @@ jobs:
           name: egress-isolation-windows
           path: ${{ runner.temp }}\egress-isolation
           retention-days: 30
+          if-no-files-found: error
+
+  # --------------------------------------------------
+  # exp-1427（#1427 の予備実験。実験用ブランチ専用・main にはマージしない）
+  # Servo は使わない。AppContainer と通常プロセスから 127.0.0.2・NIC の IP・192.0.2.1（TEST-NET-1）へ
+  # connect / sendto し、listener・pktmon・netsh wfp capture で外部観測する。生データは出力しない。
+  # --------------------------------------------------
+  exp-1427-windows:
+    if: ${{ inputs.suite == 'exp-1427' }}
+    runs-on: windows-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: false
+      - name: "[exp-1427] 自己テスト（純粋関数）"
+        run: python -I -B -m unittest discover -s harness/egress-isolation/exp_1427 -p "test_*.py" -v
+      - name: "[exp-1427] 実行"
+        run: |
+          $out = Join-Path $env:RUNNER_TEMP 'exp-1427'
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+          python -I -B harness/egress-isolation/exp_1427/run_probe.py --out $out
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: "[exp-1427] 残骸の確認（読み取りのみ）"
+        if: ${{ !cancelled() }}
+        run: |
+          $pk = Join-Path $env:LOCALAPPDATA 'Packages'
+          $left = Get-ChildItem $pk -Filter 'fandhe.egressiso.*' -ErrorAction SilentlyContinue
+          Write-Host "leftover AppContainer profile folders: $(@($left).Count)"
+          $lines = & "$env:SystemRoot\System32\CheckNetIsolation.exe" LoopbackExempt -s
+          $n = @($lines | Select-String -SimpleMatch 'S-1-15-2-').Count
+          Write-Host "leftover loopback exemptions with an AppContainer SID: $n"
+          & "$env:SystemRoot\System32\pktmon.exe" stop | Out-Null
+          & "$env:SystemRoot\System32\pktmon.exe" filter remove | Out-Null
+          & "$env:SystemRoot\System32\netsh.exe" wfp capture stop | Out-Null
+      - name: "[exp-1427] 結果表を Step Summary へ"
+        if: ${{ !cancelled() }}
+        run: |
+          $f = Join-Path $env:RUNNER_TEMP 'exp-1427\summary.md'
+          if (Test-Path $f) { Get-Content $f | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8 }
+      - name: "[exp-1427] 集計をアーティファクトへ（生データは含めない）"
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: exp-1427-windows
+          path: ${{ runner.temp }}\exp-1427
+          retention-days: 14
           if-no-files-found: error
 
   # --------------------------------------------------
