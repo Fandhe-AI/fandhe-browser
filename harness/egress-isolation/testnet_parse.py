@@ -148,6 +148,10 @@ def parse_pcapng(f: Any, index: dict[tuple[str, int], tuple[str, str]]) -> dict[
             frame: bytes | None = None
             link = -1
             truncated = False  # 取り込み長が元の長さより短い（Issue #1515）
+            # 既知のブロックの必須ヘッダが足りないと、フレームや link が無言で欠ける。観測不能にする（集計は続ける。Issue #1515）。
+            if (btype == _PCAPNG_IDB and len(body) < 8) or (btype == _PCAPNG_EPB and len(body) < 20) \
+                    or (btype == _PCAPNG_SPB and len(body) < 4):
+                diag.setdefault("error", f"{name} block shorter than its required header")
             if btype == _PCAPNG_IDB and len(body) >= 8:
                 links.append(struct.unpack_from(endian + "H", body, 0)[0])
                 diag["linktypes"][str(links[-1])] += 1

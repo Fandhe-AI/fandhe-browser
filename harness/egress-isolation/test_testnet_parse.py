@@ -203,6 +203,26 @@ class TruncatedFrameTest(unittest.TestCase):
         self.assertEqual(r["routes"]["baseline/testnet_redirect"]["packets"], {"tcp_syn": 1})
 
 
+class ShortBlockTest(unittest.TestCase):
+    """必須ヘッダに満たない IDB・EPB・SPB は diag.error にする（Issue #1515）。集計は続ける。"""
+
+    GOOD = epb(eth(ipv4(NIC, 5000, "192.0.2.1", 47300, "tcp_syn")))
+
+    def _parse(self, *blocks: bytes) -> dict:
+        return tp.parse_pcapng(io.BytesIO(shb() + b"".join(blocks)), testnet.port_index())
+
+    def test_short_blocks_are_errors_and_counting_continues(self) -> None:
+        for name, short in (("IDB", block(1, b"\x01\x00\x00")), ("EPB", block(6, b"\x00" * 16)),
+                            ("SPB", block(3, b""))):
+            r = self._parse(idb(1), short, self.GOOD)
+            self.assertEqual(r["diag"]["error"], f"{name} block shorter than its required header", name)
+            self.assertEqual(r["routes"]["baseline/testnet_redirect"]["packets"], {"tcp_syn": 1}, name)
+
+    def test_well_formed_blocks_and_unknown_types_are_not_errors(self) -> None:
+        r = self._parse(idb(1), self.GOOD, block(3, struct.pack("<I", 0)), block(0x99, b""))
+        self.assertNotIn("error", r["diag"])
+
+
 class WfpEventsTest(unittest.TestCase):
     def test_drops_with_matching_sid_are_counted_per_route(self) -> None:
         res = tp.parse_wfp_events(events_xml(netevent(DROP, "192.0.2.1", 47316), netevent(DROP, "192.0.2.1", 47316),

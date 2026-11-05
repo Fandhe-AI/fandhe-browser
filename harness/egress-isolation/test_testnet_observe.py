@@ -397,6 +397,16 @@ class FailureHandlingTest(unittest.TestCase):
         self.assertEqual(result["pktmon"]["diag"]["truncated_frames"], 1)
         self.assertIn("truncated frame could not be decoded", result["unavailable"] or "")
 
+    def test_short_blocks_make_the_observation_unavailable(self) -> None:
+        # Issue #1515: 必須ヘッダに満たない IDB・EPB・SPB は無言で捨てず unavailable にする。
+        for name, short in (("IDB", block(1, b"\x01\x00")), ("EPB", block(6, b"\x00" * 12)), ("SPB", block(3, b""))):
+            fake = FakeWindows(pcap_bytes=shb() + idb(1) + short + epb(syn(5000, 47300)))
+            obs = observer(fake)
+            obs.start()
+            result = obs.stop_and_collect(SID)
+            obs.cleanup()
+            self.assertIn(f"{name} block shorter", result["unavailable"] or "", name)
+
     def test_show_netevents_failure_is_unavailable(self) -> None:
         fake = FakeWindows(fail={"show-netevents"})
         obs = observer(fake)
