@@ -271,6 +271,7 @@ macOS・Windows の GitHub ホステッドランナー。結果は #1003 に記�
       の 3 つがすべてそろい、観測と片付けが完全なときだけ。`fail` は陰性でパケットが出たとき（観測が一部欠けていても優先）。
       それ以外（陽性が出ない・観測が取れない・足場が想定と違う・片付けが不完全）は `unobservable`。UDP の `sendto` の成功や TCP の `WSAEACCES` は根拠にしない。
       pktmon は同じパケットを複数コンポーネントで記録し SYN も再送されるため、有無（1 件以上か）で判定し、生の件数と重複除去後の件数を両方残す。
+      pktmon の 192.0.2.0/24 宛てで定義済みポートに帰属できないパケット（`unattributed`）が 1 件以上あれば、全経路を `unobservable` にする（陰性パケットの `fail` は優先。WFP 側の `unattributed` は判定に使わない）。
       loopback 経路の判定（`appcontainer_confound`）は変えず、TEST-NET の経路には当てない。
     - 足場の確認（読み取りのみ）: 接続プロファイルのカテゴリに対応する firewall プロファイルが有効・`mpssvc` と `bfe` が Running・
       AppContainer 既定の遮断 filter（`UWP Default Outbound Block Rule` 等）が 1 件以上、のどれかが欠ければ `unobservable`。

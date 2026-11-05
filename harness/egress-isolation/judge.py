@@ -18,6 +18,7 @@ from __future__ import annotations
 from typing import Any
 
 import testnet
+import testnet_parse
 
 PASS = "pass"
 FAIL = "fail"
@@ -313,6 +314,7 @@ TESTNET_NO_CONTROL_REASON = "baseline control did not reach the NIC (no packet t
 TESTNET_NO_DROP_REASON = "no WFP drop with the container's package SID was recorded for this route (no evidence of an attempt)"
 TESTNET_POSITIVE_REASON = "positive check failed (selftest or loopback load)"
 TESTNET_BINARY_REASON = "binary inside the sandbox differs from the baseline control binary"
+TESTNET_UNATTRIBUTED_REASON = "packet(s) to the TEST-NET destination could not be attributed to any route; the observation is incomplete"
 TESTNET_NOT_REQUESTED_REASON = "TEST-NET observation was not requested"
 
 
@@ -380,6 +382,11 @@ def judge_testnet(
         unavailable = "malformed observation"
     pk = _entry(obs, "pktmon").get("routes", {}) if obs else {}
     wf = _entry(obs, "wfp").get("routes", {}) if obs else {}
+    # 帰属できない TEST-NET 宛てのパケットがあると、陰性の経路の漏れを見落とし得るため全経路を観測不能にする（Issue #1515）。
+    # 既に unavailable があればそちらを優先し、陰性パケットの fail は judge_testnet_route 側で最優先のまま。
+    # WFP 側の unattributed は NIC からの漏れではない（drop）ので使わない。
+    if unavailable is None and _total(_entry(pk, testnet_parse.UNATTRIBUTED).get("packets")) >= 1:
+        unavailable = TESTNET_UNATTRIBUTED_REASON
     for route in TESTNET_ROUTES:
         neg_key, ctl_key = testnet.route_key(mode, route), testnet.route_key("baseline", route)
         neg, ctl = _entry(pk, neg_key), _entry(pk, ctl_key)

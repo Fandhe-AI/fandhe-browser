@@ -107,6 +107,35 @@ class JudgeTestnetTest(unittest.TestCase):
                                 cleanup_incomplete="dirty")
         self.assertTrue(all(x["verdict"] == judge.UNOBSERVABLE for x in v.values()))
 
+    def test_unattributed_packets_make_every_route_unobservable(self) -> None:
+        # Issue #1515: 帰属できない TEST-NET 宛てパケット -> 全経路 unobservable。
+        o = _obs()
+        o["pktmon"]["routes"]["unattributed"] = {"packets": {"tcp_syn": 1}}
+        v = judge.judge_testnet("appcontainer", observation=o, positive_ok=True, binary_match=True)
+        for x in v.values():
+            self.assertEqual(x["verdict"], judge.UNOBSERVABLE)
+            self.assertIn(judge.TESTNET_UNATTRIBUTED_REASON, x["reason"])
+
+    def test_unattributed_with_negative_packets_is_still_fail_on_that_route(self) -> None:
+        o = _obs()
+        o["pktmon"]["routes"]["unattributed"] = {"packets": {"udp": 2}}
+        o["pktmon"]["routes"]["appcontainer/testnet_udp"] = {"packets": {"udp": 1}, "unique_flows": {"udp": 1}}
+        v = judge.judge_testnet("appcontainer", observation=o, positive_ok=True, binary_match=True)
+        self.assertEqual(v["testnet_udp"]["verdict"], judge.FAIL)
+        self.assertEqual(v["testnet_fetch"]["verdict"], judge.UNOBSERVABLE)
+
+    def test_existing_unavailable_wins_over_unattributed_and_wfp_unattributed_is_ignored(self) -> None:
+        o = _obs()
+        o["unavailable"] = "pktmon start failed"
+        o["pktmon"]["routes"]["unattributed"] = {"packets": {"tcp_syn": 1}}
+        v = judge.judge_testnet("appcontainer", observation=o, positive_ok=True, binary_match=True)
+        self.assertIn("pktmon start failed", v["testnet_fetch"]["reason"])
+        o2 = _obs()
+        o2["wfp"]["routes"]["unattributed"] = {"drops": 4, "package_sid_match": 4}
+        o2["pktmon"]["routes"]["unattributed"] = {"packets": {}}
+        v2 = judge.judge_testnet("appcontainer", observation=o2, positive_ok=True, binary_match=True)
+        self.assertTrue(all(x["verdict"] == judge.PASS for x in v2.values()))
+
     def test_loopback_confound_does_not_apply_to_testnet_routes(self) -> None:
         # 既存の judge_all は loopback の交絡で pass を降格するが、TEST-NET の判定はその影響を受けない。
         inner = {"positive_ok": True, "guard": {"unavailable": "n/a"}, "attempts": {"udp_direct": True},
