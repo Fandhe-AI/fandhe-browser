@@ -221,6 +221,15 @@ class FiltersAndOptionsTest(unittest.TestCase):
         self.assertIs(tp.parse_pktmon_filters_empty("Filter Name  IP Address  Port"), False)
         self.assertIsNone(tp.parse_pktmon_filters_empty("???"))
 
+    def test_pktmon_filter_list_real_empty_output(self) -> None:
+        # windows-latest の実出力（Issue #1515）。CRLF・前後の空白は許容する。
+        for text in ("Packet Filters:\n    None\n", "Packet Filters:\r\n    None\r\n", "  Packet Filters:  \r\n\r\n None  "):
+            self.assertIs(tp.parse_pktmon_filters_empty(text), True, repr(text))
+        # None が無い・他の行が続く・None を含むだけ、は空と判定しない。
+        for text in ("Packet Filters:\r\n", "Packet Filters:\n    None\n    Extra line\n",
+                     "Packet Filters:\n    None of the above\n", "Something\nPacket Filters:\n None\n"):
+            self.assertIsNot(tp.parse_pktmon_filters_empty(text), True, repr(text))
+
     def test_shape_masks_digits(self) -> None:
         self.assertEqual(tp.shape("addr 192.0.2.1 port 47300"), "addr #.#.#.# port #")
 

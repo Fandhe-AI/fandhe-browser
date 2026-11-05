@@ -159,6 +159,20 @@ class HappyPathTest(unittest.TestCase):
         self.assertIsNone(to.cleanup_reason(cleanup))
         json.dumps(result)
 
+    def test_shape_diagnostics_are_recorded_and_reach_the_summary(self) -> None:
+        # Issue #1515: 次の実測で実機の出力形を確かめるための診断。判定には使わず、cleanup 後の diag も summary に届く。
+        import measure  # noqa: PLC0415
+        fake = FakeWindows(pcap_frames=[syn(5000, 47300)], events=[netevent(DROP, "192.0.2.1", 47316, fid="100")])
+        obs = observer(fake)
+        obs.start()
+        measure_obs = measure.finish_testnet_observe(obs, {"modes": {}})
+        for key in ("pktmon_status_running_shape", "pktmon_filter_list_after_add_shape",
+                    "pktmon_status_after_stop_shape", "pktmon_filter_list_after_remove_shape"):
+            self.assertIsInstance(measure_obs["diag"].get(key), list, key)
+        self.assertEqual(measure_obs["diag"]["pktmon_filter_list_after_remove_shape"], ["No filters set."])
+        text = "\n".join(measure._testnet_observe_block(measure_obs))
+        self.assertIn("pktmon_filter_list_after_remove_shape", text)
+
     def test_end_to_end_judgement_pass_and_fail(self) -> None:
         # 陰性（appcontainer）は NIC 0 件・SID つき drop あり、陽性（baseline）は NIC に出た -> 全 TCP 経路 pass。
         frames = [syn(5000 + i, testnet.testnet_ports("baseline")[r]) for i, r in enumerate(testnet.TESTNET_TCP_ROUTES)]

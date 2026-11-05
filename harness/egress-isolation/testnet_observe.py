@@ -247,11 +247,20 @@ class TestnetObserver:
             self._fail("pktmon start failed")
             return
         self._pm_capturing = True
+        self._record_pktmon_shapes("pktmon_status_running_shape", "pktmon_filter_list_after_add_shape")
         self._wfp_set_attempted = True  # 付与を試みたら、部分適用を除外できないため復元も必ず試す
         on = self._wfp("set", "options", "netevents=on")
         d["wfp_set_on_rc"] = on["rc"]
         if on["rc"] != 0:
             self._fail("netsh wfp set options netevents=on failed")
+
+    def _record_pktmon_shapes(self, status_key: str, filter_key: str) -> None:
+        """実機の出力形を次の実測で確かめるための診断（判定には使わない。失敗しても観測を止めない。Issue #1515）。"""
+        for key, args in ((status_key, ("status",)), (filter_key, ("filter", "list"))):
+            try:
+                self.diag[key] = _shapes(str(self._pm(*args, timeout=SHORT_TIMEOUT_S).get("out") or ""))
+            except Exception as exc:  # noqa: BLE001  (診断のみ。観測は続ける)
+                self.diag[key] = [f"unavailable: {type(exc).__name__}"]
 
     # --- 停止と集計 ------------------------------------------------------------------------------------------
     def stop_and_collect(self, profile_sid: str | None) -> dict[str, Any]:
@@ -320,12 +329,14 @@ class TestnetObserver:
             self._pm("stop", timeout=SHORT_TIMEOUT_S)
             st = self._pm("status", timeout=SHORT_TIMEOUT_S)
             c["pktmon_stopped"] = st["rc"] == 0 and parse.parse_pktmon_running(st["out"]) is False
+            self.diag["pktmon_status_after_stop_shape"] = _shapes(str(st.get("out") or ""))
         else:
             c["pktmon_stopped"] = True
         if self._pm_filters_attempted:
             self._pm("filter", "remove", timeout=SHORT_TIMEOUT_S)
             fl = self._pm("filter", "list", timeout=SHORT_TIMEOUT_S)
             c["pktmon_filters_removed"] = fl["rc"] == 0 and parse.parse_pktmon_filters_empty(fl["out"]) is True
+            self.diag["pktmon_filter_list_after_remove_shape"] = _shapes(str(fl.get("out") or ""))
         else:
             c["pktmon_filters_removed"] = True
         if self._wfp_set_attempted and self._wfp_orig_on is not None:

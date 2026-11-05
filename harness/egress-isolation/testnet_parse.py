@@ -339,6 +339,10 @@ def parse_pktmon_filters_empty(text: str) -> bool | None:
     low = text.lower()
     if re.search(r"no\s+filters?\b", low):
         return True
+    # 実機（windows-latest）の空の出力は「Packet Filters:」+「None」の 2 行（Issue #1515）。
+    # 空白・CRLF の差は許すが、全体がこの 2 行のときだけ空とみなす（`None` を含むだけでは True にしない）。
+    if re.fullmatch(r"\s*packet\s+filters:\s*none\s*", low):
+        return True
     if re.search(r"\b(ip address|protocol|port|mac address)\b", low):
         return False
     return None
