@@ -317,7 +317,7 @@ class DiagnosticFailureTest(unittest.TestCase):
         obs.cleanup()
         self.assertIsNone(result["unavailable"])
         # 同じ pcap の陰性パケット（appcontainer の NIC 出力）は従来どおり漏えいとして fail になる。
-        verdicts = judge.judge_testnet("appcontainer", observation=result, positive_ok=True, binary_match=True)
+        verdicts = judge.judge_testnet("appcontainer", observation=result, positive_ok=True, origin_ok=True, binary_match=True)
         self.assertEqual(verdicts["testnet_img"]["verdict"], judge.FAIL)
         self.assertEqual(result["pktmon"]["diag"]["short_frames"], 1)
         self.assertEqual(result["pktmon"]["routes"]["baseline/testnet_redirect"]["packets"], {"tcp_syn": 1})
