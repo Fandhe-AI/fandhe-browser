@@ -10,10 +10,12 @@
 
 from __future__ import annotations
 
+import re
 import string
 from typing import Any
 
 import judge
+import testnet
 
 _PAGES: dict[str, str] = {
     "/ok": "<!doctype html><html><body><p>ok</p></body></html>",
@@ -172,3 +174,51 @@ def warmup_redirect_location(ports: dict[str, Any], index: int, *, literal: bool
     """予熱用 302 の Location。index 回目の専用ポート（int）だけを置換する（Issue #1415）。"""
     template = f"http://{judge.HOST_BLOCKED}:$p_{WARMUP_ROUTE_PREFIX}_{_warmup_index(index)}/redirected"
     return _subst(_literal(template) if literal else template, ports)
+
+
+# --- TEST-NET-1 宛ての経路（Windows の AppContainer 実測だけ。Issue #1515） ---------------------------------------
+# 宛先は IP リテラルの TEST-NET-1（192.0.2.1）で、ポートは経路ごとに一意（`testnet.testnet_ports`）。失敗ビーコンは付けない
+# （試行の根拠はランナー側の WFP drop。ブラウザ内部の拒否でも発火するビーコンは根拠にならない）。
+# `build_pages` の既定の出力は変えず、このフラグのあるときだけ `in_sandbox.py` が `build_testnet_pages` を配信に足す。
+TESTNET_REDIRECT_PATH = "/testnet-redirect-out"
+TESTNET_ROUTE_PATH = {
+    "testnet_redirect": TESTNET_REDIRECT_PATH,
+    "testnet_img": "/testnet_img",
+    "testnet_fetch": "/testnet_fetch",
+    "testnet_ws": "/testnet_ws",
+}
+_TESTNET_PAGES: dict[str, str] = {
+    "/testnet_img": f'<!doctype html><html><body><img src="http://{testnet.TESTNET_IP}:$p_testnet_img/img"></body></html>',
+    "/testnet_fetch": (
+        "<!doctype html><html><body><script>"
+        f"fetch('http://{testnet.TESTNET_IP}:$p_testnet_fetch/fetch').catch(function(){{}});"
+        "</script></body></html>"
+    ),
+    "/testnet_ws": (
+        "<!doctype html><html><body><script>"
+        f"try{{var w=new WebSocket('ws://{testnet.TESTNET_IP}:$p_testnet_ws/ws');w.onerror=function(){{}};}}catch(e){{}}"
+        "</script></body></html>"
+    ),
+}
+_TESTNET_REDIRECT_LOCATION = f"http://{testnet.TESTNET_IP}:$p_testnet_redirect/redirected"
+_AUTHORITY = re.compile(r"(?:https?|wss?)://([^/:\s'\"<>]+):(\d+)")
+
+
+def _checked_testnet(text: str) -> str:
+    """置換後の本文に含まれる宛先がすべて `testnet.validate_egress_dest` を満たすことを確かめる（満たさなければ ValueError）。"""
+    found = _AUTHORITY.findall(text)
+    if not found:
+        raise ValueError("TEST-NET page has no destination")
+    for host, port in found:
+        testnet.validate_egress_dest(host, int(port))
+    return text
+
+
+def build_testnet_pages(ports: dict[str, Any]) -> dict[str, str]:
+    """TEST-NET 宛てのページ（パス -> HTML）。`ports` に `testnet_img` 等が不足なら KeyError、int 以外は ValueError。"""
+    return {path: _checked_testnet(_subst(body, ports)) for path, body in _TESTNET_PAGES.items()}
+
+
+def testnet_redirect_location(ports: dict[str, Any]) -> str:
+    """TEST-NET 宛て 302 の Location。`testnet_redirect` の int のポートだけを置換する。"""
+    return _checked_testnet(_subst(_TESTNET_REDIRECT_LOCATION, ports))

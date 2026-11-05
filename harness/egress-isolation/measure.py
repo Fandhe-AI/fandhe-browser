@@ -58,8 +58,12 @@ import judge  # noqa: E402
 import appcontainer  # noqa: E402
 import listeners  # noqa: E402
 import seatbelt  # noqa: E402
+import testnet  # noqa: E402
+import testnet_observe  # noqa: E402
 
 RUN_TIMEOUT_S = 240
+# TEST-NET 宛ての 4 経路の読み込み（各 約 10.5 秒）と余裕。`--appcontainer-testnet-observe` のときだけ内側ランナーの timeout に足す。
+TESTNET_EXTRA_S = 120
 DOCKER_IMAGE_RE = re.compile(r"^[a-z0-9][a-z0-9._/:@-]{0,127}$")
 DOCKER_HOST_PATH = "/opt/fandhe/bin/fandhe-browser-servo-host"
 
@@ -241,7 +245,8 @@ def free_port() -> int:
 
 def build_argv(mode: str, *, host: Path, ports: dict[str, int], out_dir: Path, hosts_file: Path,
                image: str | None, resolv_file: Path | None = None, name: str | None = None,
-               page_port: int = 0, platform_name: str | None = None, warmup_wait_ms: int = 0) -> list[str]:
+               page_port: int = 0, platform_name: str | None = None, warmup_wait_ms: int = 0,
+               testnet_observe_on: bool = False) -> list[str]:
     """内側ランナーを起動する固定 argv。ポートは int を文字列化したものだけが入る。"""
     inner_args = ["--mode", mode, "--ports", json.dumps(ports, sort_keys=True)]
     plat = platform_name or sys.platform
@@ -251,6 +256,8 @@ def build_argv(mode: str, *, host: Path, ports: dict[str, int], out_dir: Path, h
     if plat == "darwin" and (warmup_count > 0 or warmup_wait_ms > 0):
         # 予熱（Issue #1415）。baseline・seatbelt の両方に付けて読み込み順を揃える。Linux・Windows には付けない。
         inner_args += ["--warmup-count", str(warmup_count), "--warmup-wait-ms", str(int(warmup_wait_ms))]
+    if testnet_observe_on:
+        inner_args.append("--testnet")  # TEST-NET-1 宛ての経路（Issue #1515。Windows だけ。in_sandbox 側でも検証する）
     if not plat.startswith("linux"):
         # macOS・Windows: 内側ランナーを（Seatbelt があれば包んで）直接起動する。
         inner_args += ["--page-port", str(page_port)]
@@ -314,19 +321,20 @@ def remove_container(name: str) -> None:
         pass
 
 
-def run_argv(argv: list[str], container: str | None = None) -> tuple[int | None, str]:
+def run_argv(argv: list[str], container: str | None = None,
+             timeout_s: int = RUN_TIMEOUT_S) -> tuple[int | None, str]:
     """argv を実行する（シェル不使用・タイムアウトつき・プロセスグループごと終了）。
 
     `container` を渡すと、正常終了・タイムアウト・例外のいずれでも finally で `docker rm -f` する。
     """
     try:
-        return _run_argv(argv)
+        return _run_argv(argv, timeout_s)
     finally:
         if container:
             remove_container(container)
 
 
-def _run_argv(argv: list[str]) -> tuple[int | None, str]:
+def _run_argv(argv: list[str], timeout_s: int = RUN_TIMEOUT_S) -> tuple[int | None, str]:
     windows = sys.platform == "win32"
     kwargs: dict[str, Any] = (
         {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if windows else {"start_new_session": True})
@@ -334,7 +342,7 @@ def _run_argv(argv: list[str]) -> tuple[int | None, str]:
         argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, **kwargs,
     )
     try:
-        _, err = proc.communicate(timeout=RUN_TIMEOUT_S)
+        _, err = proc.communicate(timeout=timeout_s)
         return proc.returncode, err.decode("utf-8", errors="replace")[-400:]
     except subprocess.TimeoutExpired:
         if windows:
@@ -507,7 +515,8 @@ def collect_denies(start: str, pids: frozenset[int] | None = None, *,
 
 
 def run_appcontainer_mode(*, host: Path, ports: dict[str, int], recs: dict[str, Any], out_dir: Path,
-                          page_port: int, launcher: Any = None, loopback_exempt: bool = False) -> dict[str, Any]:
+                          page_port: int, launcher: Any = None, loopback_exempt: bool = False,
+                          testnet_observe_on: bool = False) -> dict[str, Any]:
     """AppContainer モード（Windows。Issue #1396）。preflight（capability の対照）→ 本体の順に同じ容器で実行する。
 
     `launcher` は `appcontainer.run_in_appcontainer_session` と同じ呼び出し規約のファクトリ（自己テストで偽物を渡す）。
@@ -544,11 +553,16 @@ def run_appcontainer_mode(*, host: Path, ports: dict[str, int], recs: dict[str, 
                     "outer_tcp": pre_tcp.count - t0, "outer_udp": pre_udp.count - u0}
             info["preflight"] = preflight
             before = {k: r.count for k, r in recs.items()}
-            res = session.run("egress-isolation/in_sandbox.py",
-                              ["--mode", "appcontainer", "--host", session.host_path,
-                               "--ports", json.dumps(ports, sort_keys=True),
-                               "--out", session.out_path("appcontainer.json"), "--page-port", str(page_port)],
-                              capabilities=(), result_name="appcontainer.json")
+            main_args = ["--mode", "appcontainer", "--host", session.host_path,
+                         "--ports", json.dumps(ports, sort_keys=True),
+                         "--out", session.out_path("appcontainer.json"), "--page-port", str(page_port)]
+            main_kwargs: dict[str, Any] = {}
+            if testnet_observe_on:
+                # TEST-NET-1 宛ての読み込み分だけ timeout を延ばす（Issue #1515）。付けないときの呼び出しは従来どおり。
+                main_args.append("--testnet")
+                main_kwargs["timeout_s"] = appcontainer.DEFAULT_TIMEOUT_S + TESTNET_EXTRA_S
+            res = session.run("egress-isolation/in_sandbox.py", main_args,
+                              capabilities=(), result_name="appcontainer.json", **main_kwargs)
             data["outer_counts"] = {k: r.count - before[k] for k, r in recs.items()}
             data["exit_code"] = res.get("exit_code")
             data["stderr_tail"] = res.get("stderr_tail") or ""
@@ -586,31 +600,42 @@ def run_appcontainer_mode(*, host: Path, ports: dict[str, int], recs: dict[str, 
     return data
 
 
-def appcontainer_caveat(data: dict[str, Any]) -> str | None:
-    """appcontainer の pass を妨げる理由（loopback の交絡、または片付けの不完全）。なければ None。"""
+def appcontainer_confound_reason(data: dict[str, Any]) -> str | None:
+    """loopback 遮断と egress 遮断を区別できない理由（`judge.appcontainer_confound`）。loopback の listener の判定だけに効く。"""
     info = data.get("appcontainer") or {}
     exempt = info.get("loopback_exempt")
     requested = isinstance(exempt, dict) and exempt.get("requested") is True
-    confound = judge.appcontainer_confound(info.get("preflight"), loopback_exempt=requested)
-    if confound is not None:
-        return confound
+    return judge.appcontainer_confound(info.get("preflight"), loopback_exempt=requested)
+
+
+def appcontainer_cleanup_reason(data: dict[str, Any]) -> str | None:
+    """AppContainer の片付けが不完全・未記録のときの理由。TEST-NET 宛ての判定にも効く（Issue #1515）。"""
+    info = data.get("appcontainer") or {}
     cleanup = info.get("cleanup") or {}
     if not cleanup or any(v is False for v in cleanup.values()):
         return "AppContainer cleanup was incomplete or not recorded; result is not trusted"
     return None
 
 
+def appcontainer_caveat(data: dict[str, Any]) -> str | None:
+    """appcontainer の loopback 経路の pass を妨げる理由（loopback の交絡、または片付けの不完全）。なければ None。"""
+    return appcontainer_confound_reason(data) or appcontainer_cleanup_reason(data)
+
+
 def run_mode(mode: str, *, host: Path, ports: dict[str, int], recs: dict[str, Any], out_dir: Path,
              hosts_file: Path, image: str | None, resolv_file: Path | None = None, page_port: int = 0,
-             launcher: Any = None, loopback_exempt: bool = False, warmup_wait_ms: int = 0) -> dict[str, Any]:
+             launcher: Any = None, loopback_exempt: bool = False, warmup_wait_ms: int = 0,
+             testnet_observe_on: bool = False) -> dict[str, Any]:
     if mode == "appcontainer":
         return run_appcontainer_mode(host=host, ports=ports, recs=recs, out_dir=out_dir, page_port=page_port,
-                                     launcher=launcher, loopback_exempt=loopback_exempt)
+                                     launcher=launcher, loopback_exempt=loopback_exempt,
+                                     testnet_observe_on=testnet_observe_on)
     before = {k: r.count for k, r in recs.items()}
     # docker はコンテナ名を付けて、タイムアウト・例外時にも確実に後始末する（名前は pid 由来の固定形式）。
     name = f"egress-iso-{os.getpid()}" if mode == "docker-none" else None
     argv = build_argv(mode, host=host, ports=ports, out_dir=out_dir, hosts_file=hosts_file, image=image,
-                      resolv_file=resolv_file, name=name, page_port=page_port, warmup_wait_ms=warmup_wait_ms)
+                      resolv_file=resolv_file, name=name, page_port=page_port, warmup_wait_ms=warmup_wait_ms,
+                      testnet_observe_on=testnet_observe_on)
     denies: dict[str, int] = {}
     status: dict[str, Any] = {}
     pids: frozenset[int] = frozenset()
@@ -619,7 +644,8 @@ def run_mode(mode: str, *, host: Path, ports: dict[str, int], recs: dict[str, An
     warmup_dests: dict[str, str] = {}
     info_debug: dict[str, Any] | None = None
     started = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time() - 2))
-    rc, err = run_argv(argv, container=name)
+    run_kwargs = {"timeout_s": RUN_TIMEOUT_S + TESTNET_EXTRA_S} if testnet_observe_on else {}
+    rc, err = run_argv(argv, container=name, **run_kwargs)
     outer = {k: r.count - before[k] for k, r in recs.items()}
     outer_all = dict(outer)
     # 予熱の受信は判定用の outer_counts に入れず回ごとに別に残す（Issue #1415）。
@@ -968,13 +994,64 @@ def summarize(results: dict[str, Any]) -> str:
                 lines.append(f"- WARNING: route {r} is unobservable but has {v['outer_count']} outer receipt(s); "
                              "review for a possible real leak")
         lines += redirect_diag_block(mode, data, data.get("outer_counts", {}))
+        lines += _testnet_verdict_block(data)
+    lines += _testnet_observe_block(results.get("testnet_observe"))
     return "\n".join(lines) + "\n"
+
+
+def _testnet_verdict_block(data: dict[str, Any]) -> list[str]:
+    """TEST-NET-1 宛ての判定表（Issue #1515）。件数は重複除去後を括弧で併記する。要求されなかったときは空。"""
+    tv = data.get("testnet_verdicts")
+    if not tv:
+        return []
+    lines = ["", "TEST-NET-1 routes (runner-side observation; pkts = raw (unique flows) at the NIC)", "",
+             "| route | verdict | container pkts | control pkts | WFP drops (with SID / SID match) | filters | reason |",
+             "| ----- | ------- | -------------- | ----------- | -------------------------------- | ------- | ------ |"]
+    for r, v in tv.items():
+        lines.append(
+            f"| {r} | {v['verdict']} | {v['negative_packets']} ({v['negative_unique']}) | "
+            f"{v['control_packets']} ({v['control_unique']}) | {v['wfp_drops']} "
+            f"({v['wfp_drops_with_sid']} / {v['wfp_package_sid_match']}) | {', '.join(v['filter_names']) or '-'} | "
+            f"{v['reason']} |")
+    lines.append(f"- method: {judge.TESTNET_METHOD}")
+    return lines
+
+
+def _testnet_observe_block(obs: Any) -> list[str]:
+    """TEST-NET 観測の足場・状態・片付け・形の診断（生データは含まない。Issue #1515）。"""
+    if not isinstance(obs, dict):
+        return []
+    lines = ["", "## TEST-NET-1 observation (pktmon + WFP net events)", ""]
+    lines.append(f"- unavailable: {obs.get('unavailable')}")
+    lines.append(f"- scaffold: {obs.get('scaffold')}")
+    lines.append(f"- cleanup: {obs.get('cleanup')}")
+    for key in ("pktmon", "wfp"):
+        part = obs.get(key) or {}
+        lines.append(f"- {key} diagnostics: {part.get('diag')}")
+        un = {k: v for k, v in (part.get('routes') or {}).items() if k == "unattributed"}
+        if un:
+            lines.append(f"- {key} unattributed (TEST-NET destinations outside the harness port ranges): {un}")
+    lines.append(f"- command diagnostics: {obs.get('diag')}")
+    return lines
 
 
 def validate_loopback_exempt(requested: bool, plat: str, modes: list[str]) -> None:
     """`--appcontainer-loopback-exempt` は Windows の appcontainer モードがあるときだけ受け付ける（Issue #1401）。"""
     if requested and (plat != "win32" or "appcontainer" not in modes):
         raise ValueError("--appcontainer-loopback-exempt needs win32 and the appcontainer mode")
+
+
+def validate_testnet_observe(requested: bool, plat: str, modes: list[str], loopback_exempt: bool) -> None:
+    """`--appcontainer-testnet-observe` は Windows の appcontainer モードがあるときだけ受け付ける（Issue #1515）。
+
+    loopback 免除（`--appcontainer-loopback-exempt`）を必須にする。免除が無いと容器の中からページを配信できず、陽性が出ない。
+    """
+    if not requested:
+        return
+    if plat != "win32" or "appcontainer" not in modes:
+        raise ValueError("--appcontainer-testnet-observe needs win32 and the appcontainer mode")
+    if not loopback_exempt:
+        raise ValueError("--appcontainer-testnet-observe needs --appcontainer-loopback-exempt")
 
 
 def _unavailable_deny_log_reason(data: dict[str, Any]) -> str | None:
@@ -998,6 +1075,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--appcontainer-loopback-exempt", action="store_true",
                         help="Opt-in (needs administrator; used only by the xos-measure Windows job): add "
                         "CheckNetIsolation LoopbackExempt for the harness-created AppContainer SID and remove it afterwards.")
+    parser.add_argument("--appcontainer-testnet-observe", action="store_true",
+                        help="Opt-in (needs administrator and --appcontainer-loopback-exempt; used only by the xos-measure "
+                        "Windows job): also try TEST-NET-1 (192.0.2.0/24) destinations and judge them from runner-side "
+                        "pktmon and WFP net events (Issue #1515).")
     parser.add_argument("--warmup-count", type=int, default=None,
                         help="macOS only: number of blocked-302 warm-up loads before the verdict routes "
                         "(0-10; default 5; Issue #1415). Diagnostic only, not part of verdicts.")
@@ -1015,6 +1096,7 @@ def main(argv: list[str] | None = None) -> int:
         if not modes or modes[0] != "baseline" or any(m not in allowed for m in modes):
             raise ValueError("--modes must start with baseline and use known modes")
         validate_loopback_exempt(args.appcontainer_loopback_exempt, plat, modes)
+        validate_testnet_observe(args.appcontainer_testnet_observe, plat, modes, args.appcontainer_loopback_exempt)
         warmup_count, warmup_wait_ms = resolve_warmup(plat, args.warmup_count, args.warmup_wait_ms)
         image = validate_image(args.docker_image) if args.docker_image else None
         if "docker-none" in modes and image is None:
@@ -1040,6 +1122,8 @@ def main(argv: list[str] | None = None) -> int:
         resolv_file.write_text(judge.RESOLV_CONF, encoding="utf-8")
         recs, ports = start_outer_listeners(diag=sys.platform == "darwin", warmup_count=warmup_count)
         results: dict[str, Any] = {"modes": {}}
+        observer: testnet_observe.TestnetObserver | None = None
+        testnet_obs: dict[str, Any] | None = None
         try:
             version = subprocess.run([str(host), "--version"], capture_output=True, text=True,  # noqa: S603
                                      timeout=20, check=False).stdout.strip()[:80]
@@ -1056,25 +1140,39 @@ def main(argv: list[str] | None = None) -> int:
                 "warmup_count": warmup_count if sys.platform == "darwin" else None,
                 "warmup_wait_ms": warmup_wait_ms if sys.platform == "darwin" else None,
             }
+            if args.appcontainer_testnet_observe:
+                # 採取 1 回で baseline と appcontainer の両方を覆う。片付けは下の finally で必ず行う（Issue #1515）。
+                observer = testnet_observe.TestnetObserver(sysroot=appcontainer.trusted_system_root())
+                observer.start()
             for mode in modes:
                 # モードごとにポートを取り直す（close 直後の再 bind が EADDRINUSE になるのを避ける）。
                 page_port = 0 if sys.platform.startswith("linux") else free_port()
-                results["modes"][mode] = run_mode(mode, host=host, ports=ports, recs=recs, out_dir=out_dir,
+                observe_on = observer is not None and mode in testnet.TESTNET_MODES
+                mode_ports = {**ports, **testnet.testnet_ports(mode)} if observe_on else ports
+                results["modes"][mode] = run_mode(mode, host=host, ports=mode_ports, recs=recs, out_dir=out_dir,
                                                   hosts_file=hosts_file, image=image,
                                                   resolv_file=resolv_file, page_port=page_port,
                                                   loopback_exempt=args.appcontainer_loopback_exempt,
-                                                  warmup_wait_ms=warmup_wait_ms)
+                                                  warmup_wait_ms=warmup_wait_ms,
+                                                  testnet_observe_on=observe_on)
                 if mode == "docker-none" and image is not None:
                     results["modes"][mode]["image_id"] = docker_image_id(image)
         finally:
             for r in recs.values():
                 r.stop()
+            if observer is not None:
+                testnet_obs = finish_testnet_observe(observer, results)
+                results["testnet_observe"] = testnet_obs
     control = results["modes"]["baseline"]["outer_counts"]
     base_sha = results["modes"]["baseline"].get("binary_sha256")
     for mode, data in results["modes"].items():
         if mode in judge.ISOLATED_MODES:
             # 陽性対照（baseline）と同一バイナリでなければ、対照が当該モードの根拠にならない。
             data["binary_match"] = bool(base_sha) and data.get("binary_sha256") == base_sha
+            if testnet_obs is not None and mode == "appcontainer":
+                # 片付けの成否は AppContainer の cleanup にも写す（loopback 経路の pass も妨げる。fail-closed）。
+                data.setdefault("appcontainer", {}).setdefault("cleanup", {}).update(
+                    {f"testnet_{k}": v for k, v in testnet_obs["cleanup"].items()})
             data["verdicts"] = judge.judge_all(mode, data["inner"], data["outer_counts"], control,
                                                binary_match=data["binary_match"],
                                                mode_unavailable=data.get("unavailable"),
@@ -1083,7 +1181,36 @@ def main(argv: list[str] | None = None) -> int:
                                                wildcard_routes=frozenset(
                                                    (data.get("deny_log") or {}).get("wildcard_routes") or ()),
                                                route_notes=redirect_notes(data))
+            if testnet_obs is not None and mode == "appcontainer":
+                data["testnet_verdicts"] = judge.judge_testnet(
+                    mode, observation=testnet_obs, positive_ok=bool((data.get("inner") or {}).get("positive_ok")),
+                    binary_match=data["binary_match"],
+                    cleanup_incomplete=(appcontainer_cleanup_reason(data)
+                                        or testnet_observe.cleanup_reason(testnet_obs.get("cleanup"))))
     return finalize(results, out_dir)
+
+
+def finish_testnet_observe(observer: testnet_observe.TestnetObserver, results: dict[str, Any]) -> dict[str, Any]:
+    """採取を止めて集計を取り、片付ける（Issue #1515）。どの段が失敗しても cleanup は必ず試し、成否を `cleanup` に残す。
+
+    集計に使う package SID はハーネスが作った AppContainer の SID（メモリ上で比べるだけで、結果には残さない）。
+    """
+    sid = ((((results.get("modes") or {}).get("appcontainer") or {}).get("appcontainer") or {})
+           .get("profile") or {}).get("sid")
+    obs: dict[str, Any]
+    try:
+        obs = observer.stop_and_collect(sid if isinstance(sid, str) else None)
+    except Exception as exc:  # noqa: BLE001  (最後の砦: 観測不能として記録し、cleanup へ進む)
+        observer.unavailable = observer.unavailable or f"collection raised {type(exc).__name__}"
+        obs = {"unavailable": observer.unavailable, "scaffold": observer.scaffold, "diag": observer.diag,
+               "pktmon": {"routes": {}, "diag": {}}, "wfp": {"routes": {}, "diag": {}}}
+    try:
+        cleanup = observer.cleanup()
+    except Exception as exc:  # noqa: BLE001
+        cleanup = {"pktmon_stopped": False, "pktmon_filters_removed": False, "netevents_restored": False,
+                   "raw_removed": False, "error": type(exc).__name__}
+    obs["cleanup"] = cleanup
+    return obs
 
 
 # 管理者操作（Windows のループバック免除）の解除が不成立だったときの終了コード。
@@ -1104,6 +1231,12 @@ def admin_restore_failures(results: dict[str, Any]) -> list[str]:
             for key in ("loopback_exempt_removed", "loopback_exempt_absent_after_remove"):
                 if key in cleanup and cleanup[key] is not True:
                     failures.append(f"{mode}: {key} is not true")
+    tn = results.get("testnet_observe")
+    if isinstance(tn, dict):
+        cleanup = tn.get("cleanup") or {}
+        for key in ("pktmon_stopped", "pktmon_filters_removed", "netevents_restored"):
+            if cleanup.get(key) is not True:
+                failures.append(f"testnet_observe: {key} is not true")
     return failures
 
 

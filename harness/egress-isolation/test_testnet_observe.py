@@ -1,0 +1,372 @@
+"""testnet_observe.py の自己テスト（Issue #1515）。偽のコマンド実行で、開始・停止・片付けの順序と失敗時の記録を確かめる。
+
+実 Windows・pktmon・netsh は使わない。偽物は pktmon の状態（動作中・filter）と WFP の netevents 設定を持ち、
+片付けが状態を元へ戻したかを観測できる。
+"""
+
+from __future__ import annotations
+
+import json
+import sys
+import unittest
+from pathlib import Path
+from typing import Any
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import judge  # noqa: E402
+import testnet  # noqa: E402
+import testnet_observe as to  # noqa: E402
+from test_testnet_parse import DROP, NIC, SID, epb, eth, events_xml, idb, ipv4, netevent, shb  # noqa: E402
+
+FILTERS_XML = ("<wfpdiag><filters><item><filterId>100</filterId><displayData>"
+               "<name>UWP Default Outbound Block Rule</name></displayData></item></filters></wfpdiag>")
+
+
+class FakeWindows:
+    """pktmon / netsh / powershell の偽物。引数は呼び出しごとに `calls` へ残す。"""
+
+    def __init__(self, **over: Any) -> None:
+        self.calls: list[list[str]] = []
+        self.pm_running = over.get("pm_running", False)
+        self.pm_filters = over.get("pm_filters", False)
+        self.netevents = over.get("netevents", False)
+        self.fail = set(over.get("fail", ()))        # 失敗させる操作名
+        self.restore_fail = over.get("restore_fail", False)  # off への set が効かない（復元の失敗）
+        self.firewall = over.get("firewall", "True")
+        self.status_out = over.get("status_out")
+        self.pcap_frames: list[bytes] = over.get("pcap_frames", [])
+        self.events: list[str] = over.get("events", [])
+        self.bad_pcap = over.get("bad_pcap", False)
+
+    def _rc(self, name: str, out: str = "") -> dict[str, Any]:
+        return {"rc": 1 if name in self.fail else 0, "out": out, "error": None}
+
+    def __call__(self, args: list[str], *, cwd: Path | None = None, timeout: int = 60) -> dict[str, Any]:
+        self.calls.append(args)
+        exe = args[0].rsplit("\\", 1)[-1].lower()
+        rest = args[1:]
+        if exe == "powershell.exe":
+            script = args[-1]
+            if "Get-NetConnectionProfile" in script:
+                return self._rc("ps", '{"NetworkCategory":"Public"}')
+            if "Get-NetFirewallProfile" in script:
+                return self._rc("ps", json.dumps([{"Name": "Public", "Enabled": self.firewall}]))
+            return self._rc("ps", json.dumps([{"Name": "mpssvc", "Status": "Running"}, {"Name": "bfe", "Status": "Running"}]))
+        if exe == "pktmon.exe":
+            return self._pktmon(rest)
+        if exe == "netsh.exe":
+            return self._netsh(rest)
+        raise AssertionError(f"unexpected executable: {args[0]}")
+
+    def _pktmon(self, rest: list[str]) -> dict[str, Any]:
+        sub = rest[0]
+        if sub == "status":
+            return self._rc("status", self.status_out or ("Collection status: Running" if self.pm_running
+                                                           else "Collection status: Not running"))
+        if sub == "filter":
+            op = rest[1]
+            if op == "list":
+                return self._rc("filter-list", "Filter Name  Protocol  IP Address" if self.pm_filters else "No filters set.")
+            if op == "add":
+                if "filter-add" not in self.fail:
+                    self.pm_filters = True
+                return self._rc("filter-add")
+            if op == "remove":
+                if "filter-remove" not in self.fail:
+                    self.pm_filters = False
+                return self._rc("filter-remove")
+        if sub == "start":
+            if "start" not in self.fail:
+                self.pm_running = True
+            return self._rc("start")
+        if sub == "stop":
+            if "stop" not in self.fail:
+                self.pm_running = False
+            return self._rc("stop")
+        if sub == "etl2pcap":
+            if "etl2pcap" not in self.fail:
+                data = b"\x01\x02" if self.bad_pcap else shb() + idb(1) + b"".join(epb(f) for f in self.pcap_frames)
+                Path(rest[-1]).write_bytes(data)
+            return self._rc("etl2pcap")
+        raise AssertionError(f"unexpected pktmon args: {rest}")
+
+    def _netsh(self, rest: list[str]) -> dict[str, Any]:
+        assert rest[0] == "wfp", rest
+        if rest[1:3] == ["show", "options"]:
+            return self._rc("show-options", "Net events: ON" if self.netevents else "Net events: OFF")
+        if rest[1:3] == ["set", "options"]:
+            want = rest[3].split("=", 1)[1] == "on"
+            if "set-options" not in self.fail and not (self.restore_fail and not want):
+                self.netevents = want
+            return self._rc("set-options")
+        if rest[1:3] == ["show", "netevents"]:
+            if "show-netevents" not in self.fail:
+                Path(rest[3].split("=", 1)[1]).write_text(events_xml_text(self.events), encoding="utf-8")
+            return self._rc("show-netevents")
+        if rest[1:3] == ["show", "filters"]:
+            Path(rest[3].split("=", 1)[1]).write_text(FILTERS_XML, encoding="utf-8")
+            return self._rc("show-filters")
+        raise AssertionError(f"unexpected netsh args: {rest}")
+
+    def names(self) -> list[str]:
+        out = []
+        for a in self.calls:
+            exe = a[0].rsplit("\\", 1)[-1].lower()
+            out.append(" ".join([exe, *a[1:3]]) if exe != "powershell.exe" else "powershell")
+        return out
+
+
+def events_xml_text(items: list[str]) -> str:
+    return events_xml(*items).getvalue().decode()
+
+
+def observer(fake: FakeWindows) -> to.TestnetObserver:
+    return to.TestnetObserver(sysroot="C:\\Windows", run=fake)
+
+
+def syn(sport: int, dport: int) -> bytes:
+    return eth(ipv4(NIC, sport, "192.0.2.1", dport, "tcp_syn"))
+
+
+class HappyPathTest(unittest.TestCase):
+    def test_collects_counts_restores_state_and_removes_raw_data(self) -> None:
+        fake = FakeWindows(
+            pcap_frames=[syn(5000, 47300), syn(5000, 47300), syn(5001, 47301)],          # baseline のみ NIC に出た
+            events=[netevent(DROP, "192.0.2.1", 47316, fid="100"), netevent(DROP, "192.0.2.1", 47317, fid="100")])
+        obs = observer(fake)
+        raw = obs.workdir
+        obs.start()
+        self.assertIsNone(obs.unavailable)
+        self.assertTrue(fake.pm_running and fake.pm_filters and fake.netevents)
+        result = obs.stop_and_collect(SID)
+        cleanup = obs.cleanup()
+        self.assertIsNone(result["unavailable"])
+        self.assertEqual(result["pktmon"]["routes"]["baseline/testnet_redirect"]["packets"], {"tcp_syn": 2})
+        self.assertEqual(result["pktmon"]["routes"]["baseline/testnet_redirect"]["unique_flows"], {"tcp_syn": 1})
+        self.assertEqual(result["wfp"]["routes"]["appcontainer/testnet_redirect"]["package_sid_match"], 1)
+        self.assertEqual(result["wfp"]["routes"]["appcontainer/testnet_redirect"]["filter_names"],
+                         {"100": "UWP Default Outbound Block Rule"})
+        self.assertEqual(cleanup, {"pktmon_stopped": True, "pktmon_filters_removed": True,
+                                   "netevents_restored": True, "raw_removed": True})
+        self.assertFalse(raw.exists())
+        self.assertFalse(fake.pm_running or fake.pm_filters or fake.netevents)
+        self.assertIsNone(to.cleanup_reason(cleanup))
+        json.dumps(result)
+
+    def test_end_to_end_judgement_pass_and_fail(self) -> None:
+        # 陰性（appcontainer）は NIC 0 件・SID つき drop あり、陽性（baseline）は NIC に出た -> 全 TCP 経路 pass。
+        frames = [syn(5000 + i, testnet.testnet_ports("baseline")[r]) for i, r in enumerate(testnet.TESTNET_TCP_ROUTES)]
+        events = [netevent(DROP, "192.0.2.1", testnet.testnet_ports("appcontainer")[r]) for r in testnet.TESTNET_TCP_ROUTES]
+        fake = FakeWindows(pcap_frames=frames, events=events)
+        obs = observer(fake)
+        obs.start()
+        result = obs.stop_and_collect(SID)
+        cleanup = obs.cleanup()
+        verdicts = judge.judge_testnet("appcontainer", observation=result, positive_ok=True, binary_match=True,
+                                       cleanup_incomplete=to.cleanup_reason(cleanup))
+        for r in testnet.TESTNET_TCP_ROUTES:
+            self.assertEqual(verdicts[r]["verdict"], judge.PASS, verdicts[r]["reason"])
+        # UDP は baseline の陽性パケットも drop も無いので pass にしない。
+        self.assertEqual(verdicts["testnet_udp"]["verdict"], judge.UNOBSERVABLE)
+        # 陰性でパケットが出たら fail。
+        leak = frames + [syn(6000, testnet.testnet_ports("appcontainer")["testnet_img"])]
+        fake2 = FakeWindows(pcap_frames=leak, events=events)
+        o2 = observer(fake2)
+        o2.start()
+        r2 = o2.stop_and_collect(SID)
+        o2.cleanup()
+        v2 = judge.judge_testnet("appcontainer", observation=r2, positive_ok=True, binary_match=True)
+        self.assertEqual(v2["testnet_img"]["verdict"], judge.FAIL)
+        self.assertEqual(v2["testnet_redirect"]["verdict"], judge.PASS)
+
+    def test_only_approved_commands_are_used(self) -> None:
+        fake = FakeWindows()
+        obs = observer(fake)
+        obs.start()
+        obs.stop_and_collect(SID)
+        obs.cleanup()
+        allowed_pktmon = {"status", "filter", "start", "stop", "etl2pcap"}
+        for a in fake.calls:
+            exe = a[0].rsplit("\\", 1)[-1].lower()
+            self.assertTrue(a[0].startswith("C:\\Windows\\System32\\"), a[0])
+            if exe == "pktmon.exe":
+                self.assertIn(a[1], allowed_pktmon)
+            elif exe == "netsh.exe":
+                self.assertEqual(a[1], "wfp")
+                self.assertIn(a[2], {"show", "set"})
+                self.assertNotIn("capture", a)
+            else:
+                self.assertEqual(exe, "powershell.exe")
+
+
+class PreExistingStateTest(unittest.TestCase):
+    def test_running_pktmon_is_left_untouched(self) -> None:
+        fake = FakeWindows(pm_running=True)
+        obs = observer(fake)
+        obs.start()
+        self.assertIn("already running", obs.unavailable or "")
+        result = obs.stop_and_collect(SID)
+        cleanup = obs.cleanup()
+        self.assertIsNotNone(result["unavailable"])
+        self.assertTrue(fake.pm_running)  # 他人の採取を止めない
+        names = fake.names()
+        self.assertNotIn("pktmon.exe stop", names)
+        self.assertNotIn("pktmon.exe start", names)
+        self.assertFalse(any(a[1:3] == ["filter", "remove"] for a in fake.calls))
+        self.assertTrue(all(cleanup.values()))
+
+    def test_existing_filters_are_not_removed(self) -> None:
+        fake = FakeWindows(pm_filters=True)
+        obs = observer(fake)
+        obs.start()
+        obs.stop_and_collect(SID)
+        cleanup = obs.cleanup()
+        self.assertIn("filters already existed", obs.unavailable or "")
+        self.assertTrue(fake.pm_filters)
+        self.assertFalse(any(a[1:3] == ["filter", "remove"] for a in fake.calls))
+        self.assertTrue(all(cleanup.values()))
+
+    def test_unrecognized_state_output_is_fail_closed(self) -> None:
+        fake = FakeWindows(status_out="???")
+        obs = observer(fake)
+        obs.start()
+        self.assertIn("could not be determined", obs.unavailable or "")
+        self.assertFalse(any(a[1] == "start" for a in fake.calls if a[0].endswith("pktmon.exe")))
+        obs.cleanup()
+
+    def test_netevents_originally_on_is_restored_to_on(self) -> None:
+        fake = FakeWindows(netevents=True)
+        obs = observer(fake)
+        obs.start()
+        obs.stop_and_collect(SID)
+        self.assertTrue(obs.cleanup()["netevents_restored"])
+        self.assertTrue(fake.netevents)
+
+
+class FailureHandlingTest(unittest.TestCase):
+    def test_start_failure_still_cleans_up(self) -> None:
+        fake = FakeWindows(fail={"start"})
+        obs = observer(fake)
+        obs.start()
+        self.assertEqual(obs.unavailable, "pktmon start failed")
+        result = obs.stop_and_collect(SID)
+        cleanup = obs.cleanup()
+        self.assertEqual(result["unavailable"], "pktmon start failed")
+        self.assertEqual(cleanup["pktmon_filters_removed"], True)
+        self.assertFalse(fake.pm_filters)
+        self.assertFalse(fake.netevents)  # netevents=on は start の失敗で行っていない
+
+    def test_filter_add_failure_is_unavailable(self) -> None:
+        fake = FakeWindows(fail={"filter-add"})
+        obs = observer(fake)
+        obs.start()
+        self.assertEqual(obs.unavailable, "pktmon filter add failed")
+        obs.cleanup()
+
+    def test_netevents_set_failure_is_unavailable_and_restore_is_attempted(self) -> None:
+        fake = FakeWindows(fail={"set-options"})
+        obs = observer(fake)
+        obs.start()
+        self.assertIn("netevents=on failed", obs.unavailable or "")
+        obs.stop_and_collect(SID)
+        cleanup = obs.cleanup()
+        self.assertTrue(any(a[1:4] == ["wfp", "set", "options"] for a in fake.calls))
+        self.assertFalse(fake.pm_running or fake.pm_filters)
+        self.assertIn("netevents_restored", cleanup)
+
+    def test_failed_restore_is_not_reported_as_restored(self) -> None:
+        fake = FakeWindows(restore_fail=True)
+        obs = observer(fake)
+        obs.start()
+        obs.stop_and_collect(SID)
+        cleanup = obs.cleanup()
+        self.assertTrue(fake.netevents)  # 元は off だったのに on のまま残った
+        self.assertFalse(cleanup["netevents_restored"])
+        self.assertIsNotNone(to.cleanup_reason(cleanup))
+
+    def test_failed_stop_is_not_reported_as_stopped(self) -> None:
+        fake = FakeWindows(fail={"stop"})
+        obs = observer(fake)
+        obs.start()
+        obs.stop_and_collect(SID)
+        cleanup = obs.cleanup()
+        self.assertFalse(cleanup["pktmon_stopped"])
+        self.assertIsNotNone(to.cleanup_reason(cleanup))
+
+    def test_failed_filter_remove_is_not_reported_as_removed(self) -> None:
+        fake = FakeWindows(fail={"filter-remove"})
+        obs = observer(fake)
+        obs.start()
+        obs.stop_and_collect(SID)
+        self.assertFalse(obs.cleanup()["pktmon_filters_removed"])
+
+    def test_etl2pcap_failure_and_bad_pcap_are_unavailable(self) -> None:
+        for kw, text in (({"fail": {"etl2pcap"}}, "etl2pcap failed"), ({"bad_pcap": True}, "could not be parsed")):
+            fake = FakeWindows(**kw)
+            obs = observer(fake)
+            obs.start()
+            result = obs.stop_and_collect(SID)
+            obs.cleanup()
+            self.assertIn(text, result["unavailable"] or "")
+
+    def test_show_netevents_failure_is_unavailable(self) -> None:
+        fake = FakeWindows(fail={"show-netevents"})
+        obs = observer(fake)
+        obs.start()
+        result = obs.stop_and_collect(SID)
+        obs.cleanup()
+        self.assertIn("show netevents failed", result["unavailable"] or "")
+
+    def test_firewall_disabled_scaffold_is_unavailable(self) -> None:
+        fake = FakeWindows(firewall="False")
+        obs = observer(fake)
+        obs.start()
+        self.assertIn("firewall profile", obs.unavailable or "")
+        self.assertFalse(fake.pm_running)
+        obs.cleanup()
+
+    def test_unavailable_makes_every_route_unobservable_but_leak_still_fails(self) -> None:
+        obs_dict = {"unavailable": "pktmon start failed", "pktmon": {"routes": {}}, "wfp": {"routes": {}}}
+        v = judge.judge_testnet("appcontainer", observation=obs_dict, positive_ok=True, binary_match=True)
+        self.assertTrue(all(x["verdict"] == judge.UNOBSERVABLE for x in v.values()))
+        leak = {"unavailable": "netsh wfp show netevents failed",
+                "pktmon": {"routes": {"appcontainer/testnet_fetch": {"packets": {"tcp_syn": 1}, "unique_flows": {"tcp_syn": 1}}}},
+                "wfp": {"routes": {}}}
+        v2 = judge.judge_testnet("appcontainer", observation=leak, positive_ok=True, binary_match=True)
+        self.assertEqual(v2["testnet_fetch"]["verdict"], judge.FAIL)
+
+    def test_cleanup_is_idempotent(self) -> None:
+        fake = FakeWindows()
+        obs = observer(fake)
+        obs.start()
+        obs.stop_and_collect(SID)
+        first = obs.cleanup()
+        n = len(fake.calls)
+        self.assertEqual(obs.cleanup(), first)
+        self.assertEqual(len(fake.calls), n)
+
+    def test_cleanup_reason_requires_every_key_true(self) -> None:
+        full = {"pktmon_stopped": True, "pktmon_filters_removed": True, "netevents_restored": True, "raw_removed": True}
+        self.assertIsNone(to.cleanup_reason(full))
+        for k in full:
+            self.assertIsNotNone(to.cleanup_reason({**full, k: False}))
+            partial = dict(full)
+            del partial[k]
+            self.assertIsNotNone(to.cleanup_reason(partial))
+        self.assertIsNotNone(to.cleanup_reason(None))
+
+
+class RunCmdTest(unittest.TestCase):
+    def test_run_cmd_reports_missing_executable_without_raising(self) -> None:
+        r = to.run_cmd(["/nonexistent/definitely-missing-binary"])
+        self.assertIsNone(r["rc"])
+        self.assertEqual(r["out"], "")
+
+    def test_run_cmd_captures_output_and_rc(self) -> None:
+        r = to.run_cmd([sys.executable, "-c", "print('hi'); import sys; sys.exit(3)"])
+        self.assertEqual(r["rc"], 3)
+        self.assertIn("hi", r["out"])
+
+
+if __name__ == "__main__":
+    unittest.main()

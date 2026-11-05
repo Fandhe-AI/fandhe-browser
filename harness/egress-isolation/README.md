@@ -7,6 +7,9 @@ Linux の範囲**を測るハーネス。**方式の採否は決めない**。�
 ## 何を測るか
 
 許可外の宛先を loopback のダミー listener（127.0.0.2 / 127.0.0.3）に置き、Servo ホストに次の経路を試させる。
+安全規則の例外は 1 つだけ: Windows の `--appcontainer-testnet-observe`（#1515）のときに限り、TEST-NET-1（192.0.2.0/24。RFC 5737 の
+文書用アドレスで実在のホストに割り当てられない）の IP リテラルも宛先にする。それ以外（ランナー自身の NIC の IP・RFC 1918・
+他の文書用帯・名前）は宛先にしない（`testnet.validate_egress_dest`）。listener の bind 規則（127.0.0.0/8）は変えない。
 
 | 経路 | 内容 | 観測手段 |
 | ---- | ---- | -------- |
@@ -238,7 +241,7 @@ macOS・Windows の GitHub ホステッドランナー。結果は #1003 に記�
     `internetClient`＋`privateNetworkClientServer`）で実行し、容器内の loopback 自己接続と、preflight 専用の外側 listener（127.0.0.2）への
     到達を記録する。`netcap` でも外側に届かなければ loopback 遮断と egress 遮断を区別できず、listener 経路は理由つきの `unobservable`
     （`judge.appcontainer_confound`）。preflight が無い・不正な場合も同じ（fail-closed）。
-  - 宛先は 127.0.0.0/8 のダミーだけ。TCP 5 経路は試行の根拠（写し listener・拒否ログ）が無いため `unobservable` のまま。`udp_direct` の
+  - 宛先は 127.0.0.0/8 のダミーだけ（TEST-NET-1 は下記の `--appcontainer-testnet-observe` のときだけ）。TCP 5 経路は試行の根拠（写し listener・拒否ログ）が無いため `unobservable` のまま。`udp_direct` の
     errno は生の値を `probes.udp_direct` に記録するだけで、Windows の拒否 errno は実測前に判定へ入れない
     （`in_sandbox.APPCONTAINER_DENY_ERRNOS` は空。観測した値を根拠に追加する）。
   - ループバック免除（#1401。オーナー承認 2026-11-01: `xos-measure.yml` の Windows ジョブ〔使い捨て runner〕に限り、ハーネスが作った
@@ -249,13 +252,38 @@ macOS・Windows の GitHub ホステッドランナー。結果は #1003 に記�
     交絡の判定は 3 通り: (1) `nocap` が外側に届いた場合は loopback 宛ての listener では egress を測れないとして listener 経路を理由つきの
     `unobservable`（外側の受信由来の fail も `unobservable` に変え、件数は `outer_count` に残す）、(2) `nocap` 0 件・`netcap` 1 件以上なら交絡なし、
     (3) 両方 0 件なら免除ありでも区別できず `unobservable`。
-  - 免除で測れない場合の代替案（未検証。採否はオーナー判断）:
+  - 免除で測れない場合の方式（#1427 の予備実験を受けて #1515 で採用・実装。オーナー承認 2026-11-05）:
 
-    | 案 | 内容 | 懸念 |
-    | -- | ---- | ---- |
-    | (a) runner 自身の NIC アドレス | loopback 以外の自機アドレスの listener | 宛先を 127.0.0.0/8 以外に向けない安全規則に反する。隔離が自機の全アドレスに及ぶ可能性も未確認 |
-    | (b) 別ホスト・別 VM の listener | ジョブ間のネットワーク設計が要る | 実在アドレスへのプローブになる |
-    | (c) WFP の監査（`auditpol` の Filtering Platform Connection 等） | 試行そのものを観測する | 本承認の範囲外の管理者操作 |
+    | 案 | 結論 |
+    | -- | ---- |
+    | (a) runner 自身の NIC アドレス | 採らない。宛先を実在のアドレスに向けない安全規則に反する |
+    | (b) 別ホスト・別 VM の listener | 採らない。実在アドレスへのプローブになる |
+    | (c) WFP の監査（`auditpol`） | 採らない。代わりに net events（`netsh wfp set options netevents`）を使う（下記） |
+    | **採った方式: TEST-NET-1 宛て + ランナー側の観測** | 宛先は 192.0.2.1（IP リテラル。DNS はしない）。到達の有無を `pktmon`（NIC から出たパケット）、試行の有無を WFP net events の drop の記録（package SID つき）で判定する |
+
+  - TEST-NET 宛ての経路（`measure.py --appcontainer-testnet-observe`。opt-in。Windows の `appcontainer` モードがあり、
+    `--appcontainer-loopback-exempt` を併用するときだけ受け付ける。`xos-measure.yml` の `egress-isolation-windows` だけが付ける。既定・ローカル・`ci.yml` では送らない）:
+    - 経路は `testnet_redirect`・`testnet_img`・`testnet_fetch`・`testnet_ws`（Servo ホストが読むページ）と `testnet_udp`（内側ランナー自身の `sendto`）。
+      経路ごとに一意のポート（`testnet.py` のポート帯。baseline は 47300〜47304、appcontainer は 47316〜47320）を割り当て、ポートだけで経路とモードに帰属させる。
+      ページの配信は従来どおり容器内の 127.0.0.1（loopback 免除）。`internal` は TEST-NET では意味を持たないため対象外。
+    - 判定（`judge.judge_testnet_route`）: `pass` は、(1) 陰性（capability なしの容器）で NIC から 0 件、(2) 同じ経路に package SID つきの WFP drop
+      （ハーネスが作った AppContainer の SID と一致するもの）がある、(3) 陽性の対照（baseline の通常プロセス）で同じ経路のパケットが出ている、
+      の 3 つがすべてそろい、観測と片付けが完全なときだけ。`fail` は陰性でパケットが出たとき（観測が一部欠けていても優先）。
+      それ以外（陽性が出ない・観測が取れない・足場が想定と違う・片付けが不完全）は `unobservable`。UDP の `sendto` の成功や TCP の `WSAEACCES` は根拠にしない。
+      pktmon は同じパケットを複数コンポーネントで記録し SYN も再送されるため、有無（1 件以上か）で判定し、生の件数と重複除去後の件数を両方残す。
+      loopback 経路の判定（`appcontainer_confound`）は変えず、TEST-NET の経路には当てない。
+    - 足場の確認（読み取りのみ）: 接続プロファイルのカテゴリに対応する firewall プロファイルが有効・`mpssvc` と `bfe` が Running・
+      AppContainer 既定の遮断 filter（`UWP Default Outbound Block Rule` 等）が 1 件以上、のどれかが欠ければ `unobservable`。
+    - 管理者操作（使い捨て runner。承認範囲はこれだけ）: `pktmon`（filter add / remove / list、start / stop / status、etl2pcap）と
+      `netsh wfp`（show options / set options netevents / show netevents / show filters）。`netsh wfp capture` は使わない。
+      採取の前に pktmon が動いていない・filter が無いことを確かめ、そうでなければ他人の状態を壊さないよう何もせず `unobservable`。
+      netevents は元の設定を記録して on にし、終わりに元へ戻して読み直して確認する。pktmon の停止・filter の削除・netevents の復元・
+      生データの削除は `try/finally` で必ず試し、成否を `testnet_observe.cleanup`（と `appcontainer.cleanup` の `testnet_*`）に記録する。
+      不完全なら pass にせず、pktmon の未停止・filter の未削除・netevents の未復元は終了コード 3。
+    - 生データ（etl・pcapng・net events と filters の xml）はアーティファクトの外（`--out` の外の一時ディレクトリ）に置き、集計後に削除する。
+      結果に出すのは宛先で絞った件数・種類・filter 名・SID の一致件数と、数字を `#` に潰した形の診断だけ（送信元 IP・SID の値・範囲外の宛先は出さない）。
+    - 実測: `xos-measure.yml` の suite `egress-isolation`（`egress-isolation-windows`）で行う。run ID と結果は未記録（実装時点では未実測。実測後に PR と設計 §8.1・§9.2 へ転記する）。
+    - 後続の候補: `internetClient` を付けた容器を陽性の対照に足す（Servo のセッションが 3 つ目になり、ipc-channel の制約〔#1421〕も絡むため今回は採らない）。
 
 - Windows の runner は管理者で動くため、「非管理者で loopback 例外を作れるか」には答えられない（設計 §6.2）。
 
@@ -343,5 +371,6 @@ Issue #1457 の残課題「AppArmor の制限が無い環境・6.7 未満のカ�
 ## 承認事項（この issue では実装しない）
 
 Landlock ルールの適用（`landlock` クレートまたは `unsafe`）・seccomp-bpf・許可リスト付きプロキシ（本番の実装。netns 内の中継の成立性だけは #1431 の proxy-relay で確認済み）・
-Windows の TCP 経路の試行の観測手段（WFP の監査等）・古いカーネルでの再測定。
+古いカーネルでの再測定。
+（Windows の TCP 経路の試行の観測手段は #1515 で実装済み: TEST-NET-1 宛てと WFP net events。上記。）
 （`CheckNetIsolation LoopbackExempt` は #1401 で承認済みの opt-in〔xos-measure の Windows のみ〕として実装済み。Windows の AppContainer ランチャー〔ctypes〕は #1396 でオーナー承認のうえ実装済み。範囲はこのディレクトリの Python ハーネスに限る。）

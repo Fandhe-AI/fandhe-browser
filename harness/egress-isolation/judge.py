@@ -17,6 +17,8 @@ from __future__ import annotations
 
 from typing import Any
 
+import testnet
+
 PASS = "pass"
 FAIL = "fail"
 UNOBSERVABLE = "unobservable"
@@ -297,4 +299,104 @@ def judge_all(
         evidence = (inner.get("attempt_evidence") or {}).get(route)
         if isinstance(evidence, str):
             out[route]["evidence"] = evidence
+    return out
+
+
+# --- TEST-NET-1 宛ての経路（Windows の AppContainer。Issue #1515・予備実験 #1427） ---------------------------------
+# loopback 宛ての listener では egress の遮断を測れない（loopback 免除のせいで capability なしでも届く）ため、宛先を
+# TEST-NET-1 にして、ランナー側の観測（pktmon で NIC から出たパケット・WFP の drop の記録）で判定する。
+TESTNET_ROUTES = testnet.TESTNET_ROUTES
+TESTNET_METHOD = ("runner-side pktmon (NIC egress) + WFP net events (drop with package SID); "
+                  "positive control: baseline process")
+# 観測できなかった理由（定型）。
+TESTNET_NO_CONTROL_REASON = "baseline control did not reach the NIC (no packet to the destination was captured)"
+TESTNET_NO_DROP_REASON = "no WFP drop with the container's package SID was recorded for this route (no evidence of an attempt)"
+TESTNET_POSITIVE_REASON = "positive check failed (selftest or loopback load)"
+TESTNET_BINARY_REASON = "binary inside the sandbox differs from the baseline control binary"
+TESTNET_NOT_REQUESTED_REASON = "TEST-NET observation was not requested"
+
+
+def judge_testnet_route(
+    *,
+    negative_packets: int,
+    control_packets: int,
+    wfp_drops_with_sid: int,
+    observation_unavailable: str | None,
+    cleanup_incomplete: str | None,
+    positive_ok: bool,
+    binary_match: bool,
+) -> tuple[str, str]:
+    """TEST-NET 宛て 1 経路の判定。(verdict, reason) を返す。
+
+    fail: 陰性（capability なしの容器）で NIC からパケットが出た。観測の一部が欠けていても、出たパケットは漏れの証拠なので
+        先に fail にする。
+    pass: 陰性で NIC から 0 件・同じ経路に package SID つきの WFP drop がある（試行したが遮断された）・陽性の対照
+        （baseline の通常プロセス）で同じ経路のパケットが出ている、がすべてそろい、観測と片付けが完全なとき。
+    unobservable: それ以外（観測が取れない・足場が想定と違う・片付けが不完全・陽性が出ない・試行の根拠がない）。
+    UDP の送信成功（sendto の戻り）は根拠にしない。
+    """
+    if negative_packets >= 1:
+        return FAIL, f"{negative_packets} packet(s) to the destination left the NIC from the isolated container"
+    if observation_unavailable is not None:
+        return UNOBSERVABLE, f"observation unavailable: {observation_unavailable}"
+    if cleanup_incomplete is not None:
+        return UNOBSERVABLE, cleanup_incomplete
+    if not positive_ok:
+        return UNOBSERVABLE, TESTNET_POSITIVE_REASON
+    if control_packets < 1:
+        return UNOBSERVABLE, TESTNET_NO_CONTROL_REASON
+    if wfp_drops_with_sid < 1:
+        return UNOBSERVABLE, TESTNET_NO_DROP_REASON
+    if not binary_match:
+        return UNOBSERVABLE, TESTNET_BINARY_REASON
+    return PASS, "no packet left the NIC; WFP dropped the attempt (package SID); control packets reached the NIC"
+
+
+def _entry(routes: Any, key: str) -> dict[str, Any]:
+    ent = routes.get(key) if isinstance(routes, dict) else None
+    return ent if isinstance(ent, dict) else {}
+
+
+def _total(counts: Any) -> int:
+    if not isinstance(counts, dict):
+        return 0
+    return sum(v for v in counts.values() if isinstance(v, int) and not isinstance(v, bool))
+
+
+def judge_testnet(
+    mode: str, *, observation: dict[str, Any] | None, positive_ok: bool, binary_match: bool,
+    cleanup_incomplete: str | None = None,
+) -> dict[str, dict[str, Any]]:
+    """TEST-NET 宛ての全経路を判定する（`mode` は陰性側。陽性の対照は同じ観測の baseline の同じ経路）。
+
+    `observation` は `testnet_observe.TestnetObserver.stop_and_collect` の戻り値
+    （`unavailable`・`pktmon.routes`・`wfp.routes`）。None は観測が要求されなかった。
+    loopback の交絡（`appcontainer_confound`）は loopback の listener の話なので、ここには当てない。
+    """
+    out: dict[str, dict[str, Any]] = {}
+    obs = observation if isinstance(observation, dict) else None
+    unavailable = TESTNET_NOT_REQUESTED_REASON if obs is None else obs.get("unavailable")
+    if obs is not None and unavailable is not None and not isinstance(unavailable, str):
+        unavailable = "malformed observation"
+    pk = _entry(obs, "pktmon").get("routes", {}) if obs else {}
+    wf = _entry(obs, "wfp").get("routes", {}) if obs else {}
+    for route in TESTNET_ROUTES:
+        neg_key, ctl_key = testnet.route_key(mode, route), testnet.route_key("baseline", route)
+        neg, ctl = _entry(pk, neg_key), _entry(pk, ctl_key)
+        wfp = _entry(wf, neg_key)
+        neg_raw, ctl_raw = _total(neg.get("packets")), _total(ctl.get("packets"))
+        sid_drops = int(wfp.get("package_sid_match", 0) or 0)
+        verdict, reason = judge_testnet_route(
+            negative_packets=neg_raw, control_packets=ctl_raw, wfp_drops_with_sid=sid_drops,
+            observation_unavailable=unavailable, cleanup_incomplete=cleanup_incomplete,
+            positive_ok=positive_ok, binary_match=binary_match)
+        out[route] = {
+            "verdict": verdict, "reason": reason, "method": TESTNET_METHOD,
+            "negative_packets": neg_raw, "negative_unique": _total(neg.get("unique_flows")),
+            "control_packets": ctl_raw, "control_unique": _total(ctl.get("unique_flows")),
+            "wfp_drops": int(wfp.get("drops", 0) or 0), "wfp_drops_with_sid": int(wfp.get("drops_with_sid", 0) or 0),
+            "wfp_package_sid_match": sid_drops,
+            "filter_names": sorted(set((wfp.get("filter_names") or {}).values())) if isinstance(
+                wfp.get("filter_names"), dict) else [],
+        }
     return out

@@ -1314,13 +1314,13 @@ jobs:
         run: bash harness/egress-isolation/self-test.sh
       - name: "[egress-isolation] プラットフォームの記録（読み取りのみ）"
         run: python -I -B harness/egress-isolation/platform_probe.py
-      - name: "[egress-isolation] 実行（baseline の対照と AppContainer。ループバック免除つき preflight。#1401）"
+      - name: "[egress-isolation] 実行（baseline の対照と AppContainer。ループバック免除つき preflight〔#1401〕と TEST-NET 宛ての観測〔#1515〕）"
         run: |
           $out = Join-Path $env:RUNNER_TEMP 'egress-isolation'
           New-Item -ItemType Directory -Force -Path $out | Out-Null
           $bin = Join-Path $env:SERVO_HOST_TARGET_DIR 'release\fandhe-browser-servo-host.exe'
           python -I -B harness/egress-isolation/measure.py --host $bin --modes baseline,appcontainer `
-            --appcontainer-loopback-exempt --out $out
+            --appcontainer-loopback-exempt --appcontainer-testnet-observe --out $out
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: "[egress-isolation] AppContainer プロファイルの残骸の確認（読み取りのみ）"
         if: ${{ !cancelled() }}
@@ -1334,6 +1334,13 @@ jobs:
           $lines = & "$env:SystemRoot\System32\CheckNetIsolation.exe" LoopbackExempt -s
           $n = @($lines | Select-String -SimpleMatch 'S-1-15-2-').Count
           Write-Host "loopback-exempt SID lines: $n"
+      - name: "[egress-isolation] pktmon と WFP net events の残骸の確認（読み取りのみ。#1515）"
+        if: ${{ !cancelled() }}
+        run: |
+          # stop / remove は呼ばない（確認だけ）。採取が残っていれば片付けの不成立。
+          & "$env:SystemRoot\System32\pktmon.exe" status
+          & "$env:SystemRoot\System32\pktmon.exe" filter list
+          & "$env:SystemRoot\System32\netsh.exe" wfp show options optionsfor=netevents
       - name: "[egress-isolation] servo-host の異常終了イベント（WER。読み取りのみ。#1413）"
         if: ${{ !cancelled() }}
         run: |
