@@ -8,7 +8,6 @@
 !crates/
 !harness/wpt_subset_runner/
 !benches/
-!profiles/
 !docs/design/host-api.schema.json
 !scripts/gen-cargo-licenses.sh
 !scripts/check-static-link.sh

@@ -31,11 +31,11 @@ fandhe-browser/
 ├── Dockerfile / compose.yaml      # 開発コンテナ（環境非依存の `make docker-ci`）
 ├── docker/                        # 配布用 Dockerfile（Dockerfile.release: 既定コンテナ（V8）・軽量コンテナ（`--target lite`・boa のみ）・musl 静的・scratch。x86_64 必須・aarch64 任意〔`--platform linux/arm64`〕。TASK-64.1・64.2・64.3・CTR-1・CTR-4）
 ├── .markdownlint.jsonc / .yamllint / .editorconfig-checker.json  # lint-docs 設定
-├── Cargo.toml                     #（予定）workspace 定義
+├── Cargo.toml                     # workspace 定義（公開 8 crate は publish 継承・内部ツールは publish = false。`make check-publish-ready`）
 ├── about.toml                     # cargo-about 設定（`make license-inventory`。全依存の解決後ライセンス一覧・OSS-4・TASK-78.2。deny.toml と同期。Servo ホスト側は servo-host/about.toml）
 ├── deny.toml                      # cargo-deny 設定（ライセンス・advisories 検査。本体用で MPL-2.0 は未許可。Servo ホスト側は servo-host/deny.toml）
 ├── crates/                        # 各 crate（mcp は stdio サーバー基盤のみ）
-│   ├── fandhe-browser-core/       #   fetch・HTML パース・DOM・query・CSSOM・config・可観測性
+│   ├── fandhe-browser-core/       #   fetch・HTML パース・DOM・query・CSSOM・config・可観測性。profiles/ に CSSOM gating 用ブラウザ挙動プロファイルデータ（chrome.json・safari.json・README.md。TASK-100.1・PLUG-8。crates.io 公開パッケージに含めるため crate 配下）
 │   ├── fandhe-browser-js/         #   JS エンジン抽象（V8 既定 / boa）
 │   ├── fandhe-browser-ai/         #   AI 最適化 API（アクセシビリティツリー・簡約 DOM）・プラグイン API
 │   ├── fandhe-browser-cdp/        #   CDP 互換サーバー
@@ -52,13 +52,12 @@ fandhe-browser/
 │   └── tests/                     #   結合テスト
 ├── tests/ / benches/              #（予定）結合テスト・ベンチ
 ├── scripts/                       # Makefile の実体（lib.sh・versions.sh・cargo-gate.sh・harness.sh・lint-docs.sh・setup.sh・deny.sh・about.sh・help.sh 等）と依存グラフ検査等のスクリプト。check-render-isolation.sh（TASK-34.1・RENDER-1）・check-egress-constants.sh（RENDER-3・#1450・egress プロキシと中継の複製定数の一致検査。check-render-isolation.sh の検査 F）・check-servo-host-isolation.sh（TASK-38・RENDER-1・servo-host が本体 members に無いこととルート Cargo.lock に Servo 系が無いことの検査）・check-js-engine-isolation.sh（TASK-32.4・JS-1）・check-static-link.sh（TASK-93.3・PLUG-1・musl 配布バイナリの動的リンクなし検査）・check-dynamic-link-macos.sh（TASK-93.4・PLUG-1・macOS 配布バイナリの動的リンクを許可リストと照合。当面は記録のみ）・check-dynamic-link-windows.sh（TASK-93.5・PLUG-1・Windows 配布バイナリの動的リンクを許可リストと照合。当面は記録のみ）・ci-changes.sh（CI の docs-only 判定）・ci-prune-target.sh（CI cache 保存前の prune）
-├── profiles/                      # CSSOM gating 用ブラウザ挙動プロファイルデータ（chrome.json・safari.json・README.md。TASK-100.1・PLUG-8）
 ├── harness/                       # 互換性テストハーネス。compat-regression/（TASK-9.2・対象サイト群の動作率回帰チェック）・playwright-trace/（TASK-43.1・Playwright newPage() 到達までの CDP トレース収集）・compat-practical/（TASK-71.1・22 タスク定義・アクセス確認・実行対象バイナリ解決・TASK-71.2・22 タスク実行 run_core.sh・TASK-71.3・Chromium 実測との突合 make_matrix.sh・TASK-72.1・類型別動作率集計 aggregate_by_type.sh）・playwright-connect/（TASK-44.1・Playwright 接続試験の実行基盤）・puppeteer-connect/（TASK-45.1・Puppeteer 接続試験の実行基盤・TASK-45.2・段階別到達結果の回収）・binary-size/（TASK-34.2・既定 feature リリースバイナリのサイズ検査・TASK-31.1・JS エンジン構成別サイズ計測）・container-size/（TASK-65.1・コンテナイメージサイズ計測）・container-smoke/（TASK-66.1・CTR-2・軽量 / 既定コンテナでの代表タスク確認。`query --file` を使用。旧バイナリでは blocked）・container-js-smoke/（TASK-66.3・CTR-2・既定コンテナ内の JS スモーク。ワーカープロトコル経由）・container-memory/（TASK-67・コンテナ同時起動の集約メモリ測定）・cli-conformance/（TASK-49・CLI コンフォーマンステストの実行スクリプト）・compat-practical の repeat_core.sh（TASK-59・繰り返し実行と 22/28 件の集計）・endpoint-swap/（TASK-46・CDP-4・Playwright/Puppeteer のエンドポイント差し替え測定。npm は測定時に一時導入）・egress-isolation/（#1377・TASK-38・RENDER-3・Servo ホストの egress 隔離の Linux 実測。自己テストは `make check-egress-isolation`）実装済み
 ├── docs/
 │   ├── design/                    # 設計ドキュメント（public。servo-host-design.md・render-host-protocol.schema.json 等）
 │   ├── setup/                     # 環境別セットアップ手順書（windows.md）
 │   └── spec/                      # fandhe-browser-spec submodule（private・要アクセス権）
-├── .github/workflows/             # ai-review・update-external・ci（push/pull_request で稼働・PR は ubuntu＋`cross-target-check`＋OS 依存の変更〔profile crate・cfg 差分〕のときだけ macOS・Windows の `rust-test`、main push で 3 OS・docs-only 判定は `scripts/ci-changes.sh`）/ release（発火条件は workflow_dispatch 限定のまま）/ xos-measure（手動専用。TASK-49・TASK-59 の 3 OS 計測。required に含めない）
+├── .github/workflows/             # ai-review・update-external・ci（push/pull_request で稼働・PR は ubuntu＋`cross-target-check`＋OS 依存の変更〔profile crate・cfg 差分〕のときだけ macOS・Windows の `rust-test`、main push で 3 OS・docs-only 判定は `scripts/ci-changes.sh`）/ release（crates.io 公開。8 crate・dry-run 既定・Environment 承認。発火条件は workflow_dispatch 限定のまま。#1531）/ xos-measure（手動専用。TASK-49・TASK-59 の 3 OS 計測。required に含めない）
 ├── .agents/skills/                # npx skills add の導入実体
 └── .claude/
     ├── agents/                    # カテゴリ別 subagent 定義

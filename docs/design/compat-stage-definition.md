@@ -20,7 +20,7 @@ spec の内容は ID とパスで参照し、本文は転記しない。SSOT は
 | 段階 | 到達水準（指標・閾値） | 測り方 | 根拠 | 現状 |
 | ---- | ---------------------- | ------ | ---- | ---- |
 | 0 基本互換 | 全体動作率 70% 以上、かつ静的・SPA・フォーム類型の類型別動作率がそれぞれ 70% 以上 | `make check-compat-regression`（`harness/compat-regression/check-matrix.sh --threshold 70 --categories static,spa,form`）。実測は `harness/compat-practical/run_core.sh`、類型別集計は `aggregate_by_type.sh` | `PLUG-7`・`COMPAT-1`・`COMPAT-4` | 達成（2026-10-31・#392 でオーナーが確認）。下記「段階 0 の判定」 |
-| 1 CSSOM 層の feature gating | カバレッジ率 85% 以上、プロファイル読み込みのバイナリ増分 10% 以内、アイドル RSS 増分 1.2MB 以内。識別面（UA 等）は変更しない | プロファイル: `profiles/README.md`。コスト: `make measure-cssom-profile-cost`（`docs/design/cssom-profile-cost-report.md`） | `PLUG-7`・`PLUG-8`・`SEC-1`・`SEC-2` | 指標は実測で基準内。ただし cli の `--profile` 配線が未了で、`PLUG-8` は spec 上「検討中」のため、達成とは書かない |
+| 1 CSSOM 層の feature gating | カバレッジ率 85% 以上、プロファイル読み込みのバイナリ増分 10% 以内、アイドル RSS 増分 1.2MB 以内。識別面（UA 等）は変更しない | プロファイル: `crates/fandhe-browser-core/profiles/README.md`。コスト: `make measure-cssom-profile-cost`（`docs/design/cssom-profile-cost-report.md`） | `PLUG-7`・`PLUG-8`・`SEC-1`・`SEC-2` | 指標は実測で基準内。ただし cli の `--profile` 配線が未了で、`PLUG-8` は spec 上「検討中」のため、達成とは書かない |
 | 2 JS/Web API 層の feature gating | 未定義（保留）。`PLUG-9` の再挑戦条件を満たした後に指標化する | 条件の確認は `docs/design/plug9-retry-watch.md` のトリガーで行う | `PLUG-7`・`PLUG-9`・TASK-102 | 保留のまま（指標なし）。条件確認の記録は 2026-10-10 時点で止まっている |
 | 3 レイアウト／描画忠実度 | 2 段（判断 (c)）。v1 水準: 境界ボックス 80% 以上が ±5% 以内で一致するサイトが代表 5 サイト以上。v2 水準: 画像全体の SSIM 0.90 以上（`RENDER-5`・2026-10-29 確定に合わせる） | `harness/render-screenshot/RUNBOOK.md`（`capture_screenshots.py` → `measure_ssim.py`） | `PLUG-7`・`RENDER-4`・`RENDER-5`・`RENDER-7` | v1 水準は 6 サイト中 5 サイトで合格。v2 水準は 1/6 サイトで目標。`PLUG-7` 原文との差は下記判断記録の (c) |
 
@@ -87,8 +87,8 @@ spec の内容は ID とパスで参照し、本文は転記しない。SSOT は
 ### 段階 1（CSSOM 層の feature gating）
 
 - 指標は `PLUG-8` が定義する。実装は TASK-100（MS-8）
-- カバレッジ率: 88.8%（318 / 358）。出典 `profiles/README.md`「件数・カバレッジ」。基準 85% 以上を超える。PoC-16 の実測は 89.4%（320 件）
-- 読み込みコスト（TASK-100.6 の再計測・再マッピング後。出典 `profiles/README.md`「件数・カバレッジ」）: バイナリ増分 +4.41%（strip なし）・+4.69%（strip あり）、アイドル RSS 増分 0.168 MiB・0.145 MiB。基準（10% 以内・1.2 MiB 以内）の内に収まる。RSS の対応は、バイナリと同じ strip なし・strip ありの順と読んだ（`profiles/README.md` は RSS の対応を明記していない）。`profiles/README.md` は値が Chrome と Safari のどちらの読み込みかを示していない。旧レポート（`docs/design/cssom-profile-cost-report.md`。+4.03%・+4.25%、+200 KiB・+192 KiB）は計測コミット `2119e371d14b` の結果で、Chrome と Safari を両方読み込む構成で計測した。再計測も同じ構成かは README に記載がない
+- カバレッジ率: 88.8%（318 / 358）。出典 `crates/fandhe-browser-core/profiles/README.md`「件数・カバレッジ」。基準 85% 以上を超える。PoC-16 の実測は 89.4%（320 件）
+- 読み込みコスト（TASK-100.6 の再計測・再マッピング後。出典 `crates/fandhe-browser-core/profiles/README.md`「件数・カバレッジ」）: バイナリ増分 +4.41%（strip なし）・+4.69%（strip あり）、アイドル RSS 増分 0.168 MiB・0.145 MiB。基準（10% 以内・1.2 MiB 以内）の内に収まる。RSS の対応は、バイナリと同じ strip なし・strip ありの順と読んだ（`crates/fandhe-browser-core/profiles/README.md` は RSS の対応を明記していない）。`crates/fandhe-browser-core/profiles/README.md` は値が Chrome と Safari のどちらの読み込みかを示していない。旧レポート（`docs/design/cssom-profile-cost-report.md`。+4.03%・+4.25%、+200 KiB・+192 KiB）は計測コミット `2119e371d14b` の結果で、Chrome と Safari を両方読み込む構成で計測した。再計測も同じ構成かは README に記載がない
 - 限界: 計測は Linux のみ。cli が `cssom_profile` を参照せず、`--profile` の実配線は未了のため、出荷バイナリでの再計測が要る（同レポート「限界」）。このため段階 1 は達成と書かない
 - 識別面（UA 文字列・フィンガープリント）は変更しない（`SEC-2`。`docs/design/anti-bot-review.md`）
 
@@ -159,6 +159,6 @@ spec の内容は ID とパスで参照し、本文は転記しない。SSOT は
 - `docs/spec/05-tasks.md` TASK-99、`docs/spec/06-roadmap.md` MS-9
 - `docs/spec/04-behavior/plugin-extension.md` `PLUG-7`〜`PLUG-9`、`compat-level.md` `COMPAT-1`・`COMPAT-4`、`rendering-layer.md` `RENDER-4`・`RENDER-5`・`RENDER-7`
 - `harness/compat-practical/type-report.md`・`harness/compat-practical/results/matrix.json`
-- `profiles/README.md`・`docs/design/cssom-profile-cost-report.md`
+- `crates/fandhe-browser-core/profiles/README.md`・`docs/design/cssom-profile-cost-report.md`
 - `docs/design/plug9-retry-watch.md`・`docs/design/rendering-fallback-plan.md`・`harness/render-screenshot/RUNBOOK.md`
 - Issue: #392（オーナー判断コメント 2026-10-31）・#318・#314・#317・#57・#1315・#1365

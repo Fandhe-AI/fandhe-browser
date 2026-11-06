@@ -20,7 +20,7 @@
 #
 # 判定（fail-closed。どれにも当てはまらないパスは rust=true）:
 #   1. ビルド・検査に影響しうるパス（crates・Cargo.*・.github・scripts・Makefile・
-#      deny.toml・rust-toolchain.toml・profiles・benches・tests・Dockerfile・
+#      deny.toml・rust-toolchain.toml・benches・tests・Dockerfile・
 #      compose.yaml）-> rust=true
 #   2. harness/ 配下 -> harness=true。Rust から読まれないと確認済みのディレクトリ（binary-size・
 #      render-screenshot・cold-start・multi-instance-memory・container-memory・cli-conformance・
@@ -76,7 +76,7 @@ classify() {
       # docs/design/ はテスト・ビルドが include_str! / read_to_string で読む（host-api.schema.json・
       # mcp-token-reduction-report.md 等）ため、*.md・docs/* より前で rust 扱いにする
       crates/* | Cargo.* | .github/* | scripts/* | Makefile | deny.toml | \
-        rust-toolchain.toml | profiles/* | benches/* | tests/* | Dockerfile | compose.yaml | \
+        rust-toolchain.toml | benches/* | tests/* | Dockerfile | compose.yaml | \
         docs/design/*)
         rust=true
         ;;
@@ -190,7 +190,7 @@ self_test() {
   expect "mixed (docs + crates + harness)" "rust=true harness=true servo=false" $'docs/a.md\ncrates/a/src/lib.rs\nharness/cold-start/run.sh'
   expect "Makefile" "rust=true harness=false servo=false" $'Makefile'
   expect "deny.toml" "rust=true harness=false servo=false" $'deny.toml'
-  expect "profiles" "rust=true harness=false servo=false" $'profiles/chrome.json'
+  expect "core profiles data" "rust=true harness=false servo=false" $'crates/fandhe-browser-core/profiles/chrome.json'
   expect "benches" "rust=true harness=false servo=false" $'benches/a/self-test.sh'
   expect "tests" "rust=true harness=false servo=false" $'tests/a.rs'
   expect "Dockerfile / compose.yaml" "rust=true harness=false servo=false" $'Dockerfile\ncompose.yaml'

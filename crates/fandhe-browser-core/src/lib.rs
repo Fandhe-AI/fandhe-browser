@@ -60,7 +60,7 @@
 //! （105.4.1・#551）・スタイル源収集と Stylesheet 構築（105.4.2・#552）・セレクタマッチング（105.5・#259）・カスケード解決と computed style API（105.6・#260）を追加した。
 //! 外部入力の上限検証（105.7・#261）も含む。結合テスト（105.8・#262・`tests/cssom.rs`）も含む
 //! （`!important` 未反映等は [`cssom`] の doc を参照）。
-//! [`cssom_profile`] モジュール（TASK-100.2・#266・`PLUG-8`・MS-8）は `profiles/*.json` を
+//! [`cssom_profile`] モジュール（TASK-100.2・#266・`PLUG-8`・MS-8）は `profiles/*.json`（core crate 配下）を
 //! 埋め込み、CSS プロパティ単位の対応可否を照会する。TASK-100.3（#267）で公開入口
 //! [`profile_gate`] を、TASK-100.4（#268）で gating 本体（宣言の除去）を追加した。
 //! [`page_script`] モジュール（TASK-109・#774・`JS-4`・`JS-6`）は、パース済み DOM から

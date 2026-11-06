@@ -67,9 +67,21 @@ workspace と crate 骨格（`crates/fandhe-browser-*`）の実装段階です�
 
 `servo-host/` は上の crate 一覧（本体 workspace）の外にある別 workspace で、バイナリ `fandhe-browser-servo-host` を作ります（ルート `Cargo.toml` の `exclude`）。
 
+## インストール（crates.io）
+
+crates.io への公開後は、次のコマンドで CLI（`fandhe-browser`）を導入できます（#1531。公開は `.github/workflows/release.yml` で、オーナーが承認して実行します）。
+
+```bash
+cargo install fandhe-browser-cli --locked
+```
+
+- Rust（stable）と C ツールチェーンが要ります（macOS は Xcode Command Line Tools、Linux は `build-essential` 相当）。既定ビルドは V8 の prebuilt 静的ライブラリをダウンロードするため、crates.io と GitHub Releases への接続が要ります
+- `servo-host`（描画ホスト `fandhe-browser-servo-host`。MPL-2.0 の Servo を含むため別 workspace・別配布）は crates.io の公開対象外です。そのため `cargo install` した `fandhe-browser` の `screenshot` は、描画ホストが無い環境では `rendering is not available` で失敗します（`query`・`navigate`・`launch` は動きます）
+- 公開対象は 8 crate（`fandhe-browser-profile`・`-js`・`-core`・`-ai`・`-cdp`・`-render`・`-cli`・`-mcp`）で、版は共通です
+
 ## クイックスタート
 
-現時点ではエンドユーザー向け CLI は未提供です（`fandhe-browser-cli` は TASK-41 で追加予定）。以下はソースからビルド・テストする手順です。
+以下はソースからビルド・テストする手順です。
 
 ### 前提ツール
 

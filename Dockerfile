@@ -38,7 +38,7 @@ FROM base
 # 要件は上記コメント参照）。
 # yamllint: make ci の lint-yaml に必要（Python 製のため npx で賄えない。Debian
 # パッケージで導入し、追加 PyPI 依存を持ち込まない）。
-# jq: make check-publish-private が cargo metadata の JSON を解析するために必要
+# jq: make check-publish-ready が cargo metadata の JSON を解析するために必要
 # （未導入だと同ターゲットが fail-closed で停止する。コンテナ内でも実際に
 # ゲートとして機能させるため導入する）。
 RUN apt-get update && apt-get install -y --no-install-recommends \

@@ -13,11 +13,12 @@ name = "wpt-subset-runner"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-# `make check-publish-private` が検証する契約（root Cargo.toml 参照）。
-publish.workspace = true
+# 内部ツールのため crates.io へ公開しない（workspace の `publish = true` を継承せず明示する。
+# `make check-publish-ready` が検証する契約。root Cargo.toml 参照）。
+publish = false
 
 [dependencies]
-fandhe-browser-core = { path = "../../crates/fandhe-browser-core" }
+fandhe-browser-core = { workspace = true }
 
 # `default` は必ず空にする。既定 feature でエンジンを有効にすると feature unification により
 # `cargo test --workspace` の既定構成で core・js の「エンジンなし」前提のテストが壊れる。

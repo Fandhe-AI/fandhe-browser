@@ -3,11 +3,10 @@ name = "fandhe-browser-render"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-# ルート Cargo.toml の [workspace.package] コメントが定める契約: `publish` は
-# 他フィールドと異なり自動継承されないため、各 crate 側で明示しないと Cargo の
-# 既定値 `publish = true` になってしまう。`make check-publish-private` が
-# 全 member crate に対してこの明記を機械検証する。
 publish.workspace = true
+repository.workspace = true
+readme.workspace = true
+description = "Client for the out-of-process Servo rendering host of fandhe-browser (does not depend on Servo)"
 
 [dependencies]
 # プロトコル型・コーデック（TASK-38・#989）。workspace 承認済み（Issue #419）の固定版への
@@ -17,7 +16,7 @@ serde_json = { workspace = true }
 # core の `Renderer` トレイトの実装（`HostRenderer`。TASK-38・#235）のための workspace 内 path 依存
 # （依存承認は不要。core の既定 feature は空で v8・boa は入らず、Servo 系も入らない。RENDER-1）。
 # core は reqwest/rustls/ring を引くため、ci.yml の `cross-target-check` では本 crate を除外している。
-fandhe-browser-core = { path = "../fandhe-browser-core" }
+fandhe-browser-core = { workspace = true }
 # 本 crate は cli の無条件依存（TASK-38.7・#236。feature `rendering` は廃止）。Servo（MPL-2.0）は
 # 別 workspace のホストに隔離し、本 crate には入れない（RENDER-1）。
 
