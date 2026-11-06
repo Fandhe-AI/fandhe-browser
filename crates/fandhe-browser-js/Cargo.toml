@@ -4,6 +4,9 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
+repository.workspace = true
+readme.workspace = true
+description = "JavaScript engine abstraction for fandhe-browser with optional V8 and boa backends"
 
 # V8（rusty_v8 = crates.io の `v8` crate）は TASK-29（29.1）・JS-1 で
 # Issue #151（2026-09-25 承認）に従い追加した（dependency-policy.md）。

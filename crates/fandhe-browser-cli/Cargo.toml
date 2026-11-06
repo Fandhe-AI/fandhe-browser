@@ -4,7 +4,9 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
-description = "fandhe-browser の CLI バイナリ crate。現状は core・profile・cdp・ai を組み立ててサーバーを起動するだけの最小雛形（TASK-41.5）で、サブコマンドは TASK-47 で追加する"
+repository.workspace = true
+readme.workspace = true
+description = "Command-line interface of fandhe-browser (installs the fandhe-browser binary)"
 
 [[bin]]
 name = "fandhe-browser"
@@ -13,12 +15,13 @@ path = "src/main.rs"
 # workspace 内 path 依存・承認済みの workspace 依存のみ（registry クレートの追加ではない）。
 # ai は AI API ルータ（`/ai/*`）を cli サーバーへ合成するために依存に加える（TASK-19.3・#225・AISNAP-6）。
 [dependencies]
-fandhe-browser-core = { path = "../fandhe-browser-core" }
-fandhe-browser-profile = { path = "../fandhe-browser-profile" }
-fandhe-browser-cdp = { path = "../fandhe-browser-cdp" }
-# `default-features = false` は ai の既定 feature `plugin-registry` を cli の同名 feature 経由でだけ
-# 有効にするため（#822・`PERF-7`）。registry クレートの追加・更新ではなく feature の転送のみ。
-fandhe-browser-ai = { path = "../fandhe-browser-ai", default-features = false }
+fandhe-browser-core = { workspace = true }
+fandhe-browser-profile = { workspace = true }
+fandhe-browser-cdp = { workspace = true }
+# ai の既定 feature `plugin-registry` は cli の同名 feature 経由でだけ有効にする（#822・`PERF-7`）。
+# そのための `default-features = false` はルート `[workspace.dependencies]` 側で指定している
+# （edition 2024 ではメンバー側で指定できない）。
+fandhe-browser-ai = { workspace = true }
 # Server・BoundServer（#171 で承認済み）
 fandhe-backend-core = { workspace = true }
 # Router・RouterMergeError（#171 で承認済み）
@@ -29,7 +32,7 @@ tokio = { workspace = true }
 # ホストバイナリはパスが解決できたときだけ `HostRenderer` として遅延起動する（TASK-38.7・#236・設計 §3.2・RENDER-1）。
 # workspace 内 path 依存で registry クレートの追加ではない。既定ビルドに Servo 系が入らないことは
 # scripts/check-render-isolation.sh が担保する。
-fandhe-browser-render = { path = "../fandhe-browser-render" }
+fandhe-browser-render = { workspace = true }
 
 [features]
 # TASK-30.2・JS-2・JS-1「JS エンジンの切替方式」決定 2・3・MS-3（#160）: JS エンジンの同梱を決める

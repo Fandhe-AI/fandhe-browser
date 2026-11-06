@@ -11,6 +11,8 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
+repository.workspace = true
+readme.workspace = true
 description = "MCP reference plugin for fandhe-browser (separate binary, stdio)"
 
 [[bin]]

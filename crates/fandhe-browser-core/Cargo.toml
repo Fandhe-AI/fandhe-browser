@@ -16,10 +16,10 @@ name = "fandhe-browser-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-# root Cargo.toml の [workspace.package] コメントに明記された契約: `publish` は
-# 他フィールドと異なり自動継承されないため、各 crate が明示する
-# （`make check-publish-private` が機械的に検証する）。
 publish.workspace = true
+repository.workspace = true
+readme.workspace = true
+description = "Core library of fandhe-browser: fetch, HTML parsing, DOM, queries, CSSOM and configuration"
 
 # TASK-41.1（Issue #169）: `state` モジュール（共通 `AppState`）が `Profile` を保持する
 # ため `fandhe-browser-profile` への path 依存を追加した。AGENTS.md「crate 間の許可依存」
@@ -42,7 +42,7 @@ publish.workspace = true
 #   (de)serialize 基盤。Issue #213（TASK-91.hdep）で承認済み（2026-09-25）。
 #   `config.rs` の doc コメントの通り、serde/toml の型は公開 API に漏らさない。
 [dependencies]
-fandhe-browser-profile = { path = "../fandhe-browser-profile" }
+fandhe-browser-profile = { workspace = true }
 html5ever = "=0.40.1"
 reqwest = { workspace = true }
 rustls = { workspace = true }
@@ -53,7 +53,7 @@ toml = { workspace = true }
 # 外部（registry）クレートの追加ではない（spec の依存方向: js に依存するのは
 # core のみ）。js の既定 feature は `[]` のため既定ビルドの依存グラフへ v8 等を
 # 持ち込まない。`js-v8`/`js-boa` は下の `[features]` で転送する。
-fandhe-browser-js = { path = "../fandhe-browser-js" }
+fandhe-browser-js = { workspace = true }
 
 # `JsEngineNotCompiled` のエラーメッセージが案内する `--features js-v8` /
 # `--features js-boa` を core 対象のビルドでも有効にするための feature 転送
