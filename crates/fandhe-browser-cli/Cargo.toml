@@ -85,3 +85,15 @@ path = "../../benches/competitor_lightpanda/support.rs"
 name = "competitor_lightpanda_measure"
 path = "../../benches/competitor_lightpanda/measure_tests.rs"
 harness = false
+
+# `cargo install fandhe-browser-cli` はワークスペースのルート manifest を読まず、パッケージ内の
+# manifest の profile だけを使うため、ルート `Cargo.toml` の `[profile.release]` をここへ複製する
+# （#1531。配布バイナリのサイズ最小化と `panic = "abort"` 前提を `cargo install` でも保つ）。
+# ワークスペース内のビルドではルートの設定が優先され、cargo は「profiles for the non root
+# package will be ignored」と警告する（無害）。値はルートと一致させる。一致は
+# `make check-publish-ready` が検査する。
+[profile.release]
+panic = "abort"
+opt-level = "z"
+lto = true
+strip = true
