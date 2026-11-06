@@ -6,7 +6,12 @@ name: release
 #   verify-macos  同じ dry-run を macOS で行い、ビルドされた `fandhe-browser` をスモーク実行する
 #   publish       mode=publish のときだけ。Environment `crates-io-release`（承認ゲートのみ）の承認後、公開順に `cargo publish`
 #   smoke-macos   公開後（crate が all か fandhe-browser-cli のとき）に macOS で `cargo install` し、同じスモークを実行する
-# mode の既定は dry-run-only（安全側）。タグ push 起点は採用しない（入力のバージョン整合ガードのほうが誤公開に対して
+# mode の既定は dry-run-only（安全側）。mode=publish は main の commit からだけ許す（plan が GITHUB_REF で失敗させ、
+# publish・smoke-macos の if でも絞る）。mode=publish の verify は Environment crates-io-release に required reviewers が
+# あることも GitHub API で確かめる。公開は `cargo publish --no-verify`（token のある環境で依存の build.rs・proc-macro を
+# 動かさない。検証は同じ commit の verify・verify-macos の dry-run が済ませる）。途中再開では、公開済みの .crate の
+# .cargo_vcs_info.json の commit が GITHUB_SHA と一致することを要求する（別 commit の成果物を混ぜない）。
+# タグ push 起点は採用しない（入力のバージョン整合ガードのほうが誤公開に対して
 # fail-closed なため）。ガード・公開・スモークの実体は scripts/release.sh・scripts/release-smoke.sh にあり、
 # 本ファイルは呼び出しだけを持つ（.claude/rules/makefile.md）。入力は env 経由で扱い、`${{ }}` を run に展開しない。
 #
@@ -76,6 +81,10 @@ jobs:
     name: "verify: guards + cargo publish --dry-run (${{ inputs.crate }})"
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    permissions:
+      contents: read
+      # Environment の保護ルールの読み取り（GET /repos/{owner}/{repo}/environments/{name}）に使う
+      actions: read
     env:
       RELEASE_CRATE: ${{ inputs.crate }}
       RELEASE_VERSION: ${{ inputs.version }}
@@ -89,8 +98,14 @@ jobs:
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
         with:
           toolchain: stable
-      - name: "guard: 入力・バージョン一致・crates.io 公開状況"
+      - name: "guard: 入力・バージョン一致・crates.io 公開状況（publish は main の commit だけ）"
         run: bash scripts/release.sh plan
+      - name: "guard: Environment crates-io-release の required reviewers（mode=publish）"
+        # Environment が無いと publish ジョブの初回実行で保護ルールなしに自動作成されるため、ここで止める。
+        if: ${{ inputs.mode == 'publish' }}
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: bash scripts/release.sh check-environment
       - name: "cargo publish --dry-run（未公開の全 crate・--locked）"
         run: bash scripts/release.sh dry-run
 
@@ -134,7 +149,8 @@ jobs:
 
   publish:
     name: "publish: cargo publish (${{ inputs.crate }})"
-    if: ${{ inputs.mode == 'publish' }}
+    # main の commit からだけ公開する（plan も同じ条件で失敗させる）
+    if: ${{ inputs.mode == 'publish' && github.ref == 'refs/heads/main' }}
     needs: [verify, verify-macos]
     runs-on: ubuntu-latest
     timeout-minutes: 180
@@ -172,7 +188,9 @@ jobs:
 
   smoke-macos:
     name: "smoke-macos: cargo install + smoke"
-    if: ${{ inputs.mode == 'publish' && (inputs.crate == 'all' || inputs.crate == 'fandhe-browser-cli') }}
+    if: >-
+      ${{ inputs.mode == 'publish' && github.ref == 'refs/heads/main'
+      && (inputs.crate == 'all' || inputs.crate == 'fandhe-browser-cli') }}
     needs: publish
     runs-on: macos-latest
     timeout-minutes: 90
