@@ -163,8 +163,12 @@ main() {
     echo "error: jq failed to evaluate publish settings" >&2
     exit 1
   }
-  problems+="$(profile_problems Cargo.toml crates/fandhe-browser-cli/Cargo.toml)"
-  problems+="$(workflow_problems .github/workflows/release.yml)"
+  # 各検査の出力を改行で区切って連結する（改行が無いと別の検査の行が 1 行に繋がる）
+  local more
+  more="$(profile_problems Cargo.toml crates/fandhe-browser-cli/Cargo.toml)"
+  [ -z "${more}" ] || problems+=$'\n'"${more}"
+  more="$(workflow_problems .github/workflows/release.yml)"
+  [ -z "${more}" ] || problems+=$'\n'"${more}"
   if [ -n "${problems}" ]; then
     echo "NG: crates.io publish readiness violations:" >&2
     printf '%s\n' "${problems}" >&2
