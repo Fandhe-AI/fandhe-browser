@@ -32,7 +32,7 @@ Servo は現時点でどの crate の依存にも入っていません（`fandhe
 3. Visual Studio Build Tools の「C++ によるデスクトップ開発」ワークロード（MSVC と Windows SDK を含みます。管理者権限が必要）。C コードを含む依存のビルドとリンクに使います。
 4. GNU Make（[Chocolatey](https://community.chocolatey.org/packages/make) または [Scoop](https://scoop.sh/)）。`Makefile` は `SHELL := /bin/bash` を前提とするため、`make` は Git Bash など Windows 側で動く bash から実行します（WSL は別方式のため、後述の「WSL について」を参照）。
 5. Node.js（`npx` を含む LTS）。`winget install OpenJS.NodeJS.LTS` または [公式インストーラ](https://nodejs.org/) で導入します。`make setup` の hooks は `lefthook` 未導入かつ `brew` 不在の環境では `npx` で lefthook を導入するため、Windows では実質必須です。`make ci` の `lint-md`・`lint-editorconfig`・`lint-commits` も `npx` を使います。
-6. `jq`（`winget install jqlang.jq` または `choco install jq` / `scoop install jq`）。`make ci` の `check-compat-regression`・`check-publish-private` 等が使い、未導入だと fail-closed で止まります。
+6. `jq`（`winget install jqlang.jq` または `choco install jq` / `scoop install jq`）。`make ci` の `check-compat-regression`・`check-publish-ready` 等が使い、未導入だと fail-closed で止まります。
 7. `yamllint` または `uv`（`uvx`）のどちらか。`make ci` の `lint-yaml` は `yamllint` があればそれを、なければ `uvx` の固定版を使い、どちらも無ければ失敗します。`pip install yamllint` か、`uv` の導入（[Python と uv](#python-と-uv) を参照）のいずれかを済ませてください。
 8. lefthook（任意）。導入済みなら `make hooks` はそれを使います。未導入でも上記 5 の `npx` があれば自動で固定版を使うため、単独での導入は不要です。
 

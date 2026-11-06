@@ -7,7 +7,7 @@
 #   fmt | fmt-check | lint | test                 既定 feature の整形・clippy・test
 #   lint-rendering | test-rendering               --features rendering（Servo 込み。feature 未定義の間は skip）
 #   check-render-isolation | check-js-engine-isolation   依存グラフ分離検証（正本は各 check-*-isolation.sh）
-#   check-publish-private     全 member crate が publish = false であること
+#   check-publish-ready       全 member が「公開 allowlist の 8 crate（公開要件を満たす）」か「publish = false」であること
 #
 # member crate が 0 件の仮想 workspace では fmt / clippy / test / tree が「対象パッケージが無い」
 # エラーで落ちる（cargo の仕様）。一方 Cargo.toml 自体の妥当性は member に依存せず検証できるため
@@ -30,8 +30,7 @@ need_members() {
 # cargo_metadata: `cargo metadata --no-deps` の出力を返す。失敗は feature 未定義と区別して fail-closed。
 cargo_metadata() {
   local meta
-  meta="$(cargo metadata --no-deps --format-version 1 2>&1)" || {
-    echo "${meta}" >&2
+  meta="$(cargo metadata --no-deps --format-version 1)" || {
     echo "error: cargo metadata failed" >&2
     exit 1
   }
@@ -95,22 +94,12 @@ case "${gate}" in
       || skip "no Cargo.toml or no fandhe-browser-cli; ${gate} skipped"
     bash scripts/check-js-engine-isolation.sh
     ;;
-  check-publish-private)
-    # Cargo の既定は publish = true（公開可能）で member が明記しない限り継承されないため、
-    # コメントでの申し送りに頼らず機械的に検証する。`cargo metadata` では公開可能な crate は
-    # `"publish": null`、非公開（false / 空リスト）は `"publish": []` になる。
+  check-publish-ready)
+    # 公開 allowlist の 8 crate か publish = false のどちらかであること等の判定は
+    # check-publish-ready.sh が持つ（#1531。新規 crate が黙って公開可能にならない fail-closed）。
     need_members
-    require_cmd jq "required by ${gate}"
-    meta="$(cargo_metadata)"
-    bad="$(printf '%s\n' "${meta}" | jq -r '.packages[] | select(.publish != []) | .name')" || {
-      echo "error: jq failed to evaluate publish settings" >&2
-      exit 1
-    }
-    if [ -n "${bad}" ]; then
-      echo "error: these crates do not set publish = false (or publish.workspace = true):" >&2
-      printf '%s\n' "${bad}" >&2
-      exit 1
-    fi
+    bash scripts/check-publish-ready.sh
+    bash scripts/check-publish-ready.sh --self-test
     ;;
   *)
     echo "error: unknown gate: ${gate}" >&2

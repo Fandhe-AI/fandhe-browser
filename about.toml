@@ -38,7 +38,7 @@ ignore-build-dependencies = false
 ignore-dev-dependencies = false
 
 [private]
-# workspace crate（publish = false。`make check-publish-private` が全 member で保証）を一覧から外す。
+# workspace crate（公開 8 crate と publish = false の内部ツール。`make check-publish-ready` が全 member を検査）を一覧から外す。
 # 本体の LICENSE-MIT / LICENSE-APACHE が適用されるため棚卸しの網羅性は欠けない。
 # 必須: cargo-about 0.9.2 は `license.workspace = true` の crate の manifest を合成する際、
 # 非 ASCII（日本語コメント）を含む manifest で文字境界 panic を起こすため、これで走査自体を避ける。

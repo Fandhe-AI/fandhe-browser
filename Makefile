@@ -25,7 +25,7 @@
 .PHONY: help setup rustup submodule hooks \
 	lint-md lint-yaml lint-editorconfig lint-commits lint-docs \
 	check-workspace-manifest fmt fmt-check lint test test-harness lint-rendering test-rendering \
-	check-render-isolation check-egress-constants check-js-engine-isolation check-publish-private deny deny-servo-host license-inventory license-inventory-servo-host check-deny-license-reject ci \
+	check-render-isolation check-egress-constants check-js-engine-isolation check-publish-ready deny deny-servo-host license-inventory license-inventory-servo-host check-deny-license-reject ci \
 	check-compat-practical check-cli-conformance measure-cli-conformance check-compat-regression bench-record check-ci-changes check-bench-record \
 	check-binary-size check-static-link check-dynamic-link-macos check-dynamic-link-windows measure-mcp-envelope check-mcp-envelope measure-plugin-overhead check-plugin-overhead measure-js-binary-size measure-container-size check-container-smoke check-container-js-smoke check-container-memory check-egress-isolation measure-container-memory compare-container-memory measure-cssom-profile-cost \
 	docker-build docker-shell docker-ci trace-playwright check-playwright-trace check-puppeteer-connect check-playwright-connect test-playwright-connect
@@ -104,8 +104,8 @@ check-render-isolation: ## 既定ビルド（cli 既定 feature 含む）の依�
 check-js-engine-isolation: ## 軽量ビルド・エンジンなし構成の依存グラフに v8（エンジンなしは boa_engine も）が含まれないことを検証する
 	@scripts/cargo-gate.sh check-js-engine-isolation
 
-check-publish-private: ## workspace 内の全 member crate が publish = false であることを検証する
-	@scripts/cargo-gate.sh check-publish-private
+check-publish-ready: ## crates.io 公開可否（公開 allowlist の 8 crate の要件・他は publish = false・cli の release profile 一致）を検証する
+	@scripts/cargo-gate.sh check-publish-ready
 
 deny: ## cargo deny check advisories bans licenses sources（本体と servo-host の両方。cargo-deny 未導入なら自動導入）
 	@scripts/deny.sh
@@ -125,7 +125,7 @@ check-deny-license-reject: ## cargo deny が許可外ライセンスを reject �
 # `rendering` feature（Servo）を含めた検証（ci.md「既定ビルドと --features rendering の両方で検証」）も
 # make ci に含める。lint-rendering / test-rendering は feature 未定義の段階では skip して 0 終了するため、
 # workspace 作成前・render crate 追加前の CI を壊さない。docker-ci は make ci を呼ぶため自動的に含む。
-ci: lint-docs check-workspace-manifest fmt-check lint lint-rendering check-render-isolation check-js-engine-isolation check-publish-private test test-rendering deny check-deny-license-reject check-compat-regression check-compat-practical check-puppeteer-connect check-playwright-connect check-bench-record check-mcp-envelope check-container-memory check-ci-changes ## ローカルゲート（.claude/rules/ci.md）と同等のチェックを一括実行する
+ci: lint-docs check-workspace-manifest fmt-check lint lint-rendering check-render-isolation check-js-engine-isolation check-publish-ready test test-rendering deny check-deny-license-reject check-compat-regression check-compat-practical check-puppeteer-connect check-playwright-connect check-bench-record check-mcp-envelope check-container-memory check-ci-changes ## ローカルゲート（.claude/rules/ci.md）と同等のチェックを一括実行する
 
 # --------------------------------------------------
 # 実測ハーネス・ベンチ・計測（各 README: harness/*/README.md・benches/*/README.md）
