@@ -19,17 +19,9 @@ DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=./lib.sh
 source "${DIR}/lib.sh"
 
-# 公開 allowlist。公開順（依存の下位から）。`release.yml` の公開順と一致させる。
-PUBLIC_CRATES=(
-  fandhe-browser-profile
-  fandhe-browser-js
-  fandhe-browser-core
-  fandhe-browser-ai
-  fandhe-browser-cdp
-  fandhe-browser-render
-  fandhe-browser-cli
-  fandhe-browser-mcp
-)
+# 公開 allowlist と公開順の正本は publish-crates.sh（release.yml・release.sh と共有）。
+# shellcheck source=./publish-crates.sh
+source "${DIR}/publish-crates.sh"
 
 # metadata_problems <cargo metadata --no-deps の JSON>: 違反を 1 行ずつ標準出力へ出す（無ければ空）。
 metadata_problems() {
@@ -77,6 +69,20 @@ profile_problems() {
     echo "fandhe-browser-cli has no [profile.release] section (cargo install ignores the workspace root profile)"
   elif [ "${root}" != "${cli}" ]; then
     echo "[profile.release] of fandhe-browser-cli differs from the root Cargo.toml"
+  fi
+}
+
+# workflow_problems <release.yml>: inputs.crate の choice 選択肢が allowlist と一致するか。
+# 一覧の転記漏れ（公開できない crate・存在しない crate が選べる状態）を防ぐ。
+workflow_problems() {
+  local c listed
+  [ -f "$1" ] || { echo "$1 does not exist"; return; }
+  for c in "${PUBLIC_CRATES[@]}"; do
+    grep -Eq "^ +- ${c}$" "$1" || echo "$1: crate choice is missing ${c}"
+  done
+  listed="$(grep -Ec '^ +- fandhe-browser-[a-z]+$' "$1" || true)"
+  if [ "${listed}" != "${#PUBLIC_CRATES[@]}" ]; then
+    echo "$1: expected ${#PUBLIC_CRATES[@]} crate choices, found ${listed}"
   fi
 }
 
@@ -158,6 +164,7 @@ main() {
     exit 1
   }
   problems+="$(profile_problems Cargo.toml crates/fandhe-browser-cli/Cargo.toml)"
+  problems+="$(workflow_problems .github/workflows/release.yml)"
   if [ -n "${problems}" ]; then
     echo "NG: crates.io publish readiness violations:" >&2
     printf '%s\n' "${problems}" >&2
