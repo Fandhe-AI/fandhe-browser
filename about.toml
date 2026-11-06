@@ -38,9 +38,11 @@ ignore-build-dependencies = false
 ignore-dev-dependencies = false
 
 [private]
-# workspace crate（公開 8 crate と publish = false の内部ツール。`make check-publish-ready` が全 member を検査）を一覧から外す。
+# `publish = false` の workspace crate（内部ツール）を一覧から外す。crates.io 公開（#1531）で `publish = true` になった
+# 公開 8 crate は除外されず一覧に載る（`make license-inventory` が通ることを確認済み。`make check-publish-ready` が全 member を検査）。
 # 本体の LICENSE-MIT / LICENSE-APACHE が適用されるため棚卸しの網羅性は欠けない。
 # 必須: cargo-about 0.9.2 は `license.workspace = true` の crate の manifest を合成する際、
 # 非 ASCII（日本語コメント）を含む manifest で文字境界 panic を起こすため、これで走査自体を避ける。
+# 公開 8 crate は走査対象に入るが、0.9.2 で panic せず一覧に載ることを #1531 で確認した（再発したら panic の再確認が要る）。
 # registry・git 由来の外部 crate は対象に残る。
 ignore = true

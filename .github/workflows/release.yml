@@ -4,7 +4,7 @@ name: release
 # workflow_dispatch の明示入力（crate・version・mode）で起動し、次のジョブで進める。
 #   verify        入力のガードと `cargo publish --dry-run`（ubuntu。トークン不要）
 #   verify-macos  同じ dry-run を macOS で行い、ビルドされた `fandhe-browser` をスモーク実行する
-#   publish       mode=publish のときだけ。Environment `crates-io-release` の承認後、公開順に `cargo publish`
+#   publish       mode=publish のときだけ。Environment `crates-io-release`（承認ゲートのみ）の承認後、公開順に `cargo publish`
 #   smoke-macos   公開後（crate が all か fandhe-browser-cli のとき）に macOS で `cargo install` し、同じスモークを実行する
 # mode の既定は dry-run-only（安全側）。タグ push 起点は採用しない（入力のバージョン整合ガードのほうが誤公開に対して
 # fail-closed なため）。ガード・公開・スモークの実体は scripts/release.sh・scripts/release-smoke.sh にあり、
@@ -24,10 +24,10 @@ name: release
 # 8 crate の初回公開では 6 件目以降が 429 になるため、publish は待って再試行する（5 分間隔・crate ごとに最大 12 回）。
 #
 # 前提（オーナー作業。本ワークフローは存在確認のみ行い作成しない）:
-#   - GitHub Environment `crates-io-release` を作成し required reviewers を設定する（初回 run で自動作成された
-#     場合は保護ルールが空のため、必ず手動で追加する）
-#   - 同 Environment の secret `CARGO_REGISTRY_TOKEN`（crates.io の API トークン。publish-new / publish-update
-#     スコープ）を設定する。トークンは publish ステップの env にだけ注入し、他のステップ・ジョブへは渡さない
+#   - GitHub Environment `crates-io-release` を作成し required reviewers を設定する（承認ゲートのみ。初回 run で
+#     自動作成された場合は保護ルールが空のため、必ず手動で追加する。secret は置かない）
+#   - org secret `CARGO_REGISTRY_TOKEN`（crates.io の API トークン。publish-new / publish-update スコープ）が
+#     本リポから参照できること。トークンは publish ステップの env にだけ注入し、他のステップ・ジョブへは渡さない
 #   - private submodule（docs/spec）は公開処理に不要なため取得しない
 # 各ステップは crates.io（index.crates.io・static.crates.io）への到達性を前提とする。到達できない場合の失敗は環境エラー。
 
@@ -138,7 +138,7 @@ jobs:
     needs: [verify, verify-macos]
     runs-on: ubuntu-latest
     timeout-minutes: 180
-    # 承認ゲート。mode=publish の実公開だけが Environment の保護ルールを通る。
+    # 承認ゲート（Environment は承認のみで secret は持たない）。mode=publish の実公開だけが保護ルールを通る。
     environment: crates-io-release
     env:
       RELEASE_CRATE: ${{ inputs.crate }}
@@ -160,7 +160,7 @@ jobs:
           HAS_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN != '' }}
         run: |
           if [ "${HAS_TOKEN}" != "true" ]; then
-            echo "::error::secret CARGO_REGISTRY_TOKEN is not set in the Environment crates-io-release"
+            echo "::error::secret CARGO_REGISTRY_TOKEN is not available to this repository (org secret)"
             exit 1
           fi
       - name: "guard: 公開状況の再判定（承認待ちの間の変化に備える）"

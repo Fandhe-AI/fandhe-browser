@@ -94,7 +94,7 @@ cargo test --workspace
 
 ## 公開（`release.yml`。crates.io。#1531）
 
-- `release.yml` は `ci.yml` とは別 workflow で `workflow_dispatch` のみ。入力は `crate`（8 crate か `all`）・`version`・`mode`（`dry-run-only` 既定 / `publish`）。ジョブ（`verify`・`verify-macos`・`publish`・`smoke-macos`）の check-run は PR では出ず、required checks に含めない（ruleset の更新は不要）。`publish` は Environment `crates-io-release`（required reviewers）の承認を通る。Environment と secret `CARGO_REGISTRY_TOKEN` の作成はオーナー作業
+- `release.yml` は `ci.yml` とは別 workflow で `workflow_dispatch` のみ。入力は `crate`（8 crate か `all`）・`version`・`mode`（`dry-run-only` 既定 / `publish`）。ジョブ（`verify`・`verify-macos`・`publish`・`smoke-macos`）の check-run は PR では出ず、required checks に含めない（ruleset の更新は不要）。`publish` は Environment `crates-io-release`（required reviewers。承認ゲートのみ）の承認を通る。トークンは org secret `CARGO_REGISTRY_TOKEN`（本リポから参照可能と確認済み）。Environment の作成と承認者の設定はオーナー作業
 - 公開対象は profile・js・core・ai・cdp・render・cli・mcp の 8 crate（版は共通）。`harness/wpt_subset_runner` は `publish = false`、`servo-host/` は対象外。一覧と公開順の正本は `scripts/publish-crates.sh`、ガード・dry-run・公開（公開済みを飛ばす途中再開・429 の再試行）は `scripts/release.sh`、スモークは `scripts/release-smoke.sh`
 - `make check-publish-ready`（`make ci` に含む）: 全 member が「公開 allowlist の 8 crate」か「`publish = false`」のどちらかであること（新規 crate が黙って公開可能にならない）、公開 crate の description・repository・license・readme、path 依存の version、cli の `[profile.release]` がルートと一致すること、`release.yml` の crate 選択肢が allowlist と一致することを検査する。`release.sh` の自己テストも含む
 - crates.io の新規 crate 公開は burst 5 件、以後 10 分に 1 件のため、8 crate の初回公開は 429 を待つ（`release.sh publish` が再試行する）
