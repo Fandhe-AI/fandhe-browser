@@ -52,7 +52,7 @@ cargo test --workspace
 
 - **pull_request**: ubuntu のネイティブでビルド・テスト・分離検証を行う。macOS・Windows のネイティブジョブ（`*-macos`・`*-windows`・`windows-servo-prereqs`）は skipped にする（例外: OS 依存の変更〔`native=true`: profile crate 配下、または `*.rs` 差分の `cfg(windows`・`cfg(unix`・`target_os` 等〕を含む PR では `rust-test-macos`・`rust-test-windows` だけ実行する。2026-10-17 のユーザー承認。他の macOS・Windows ジョブは枠待ちで CI が詰まるのを避けるため対象外）。また、代わりに `cross-target-check` が Linux 上で macOS・Windows 向けの型検査を行う（範囲は下記）
 - **main への push**: 3 OS すべてのネイティブランナーで全ジョブを実行する（OS 依存のファイルシステム挙動のテスト〔パス・大文字小文字・ロック〕を含む）
-- **release 前**: 3 OS のネイティブで全部回す。`release.yml` は発火条件が `workflow_dispatch` 限定のため、`gh workflow run ci.yml --ref <ref>` で `ci.yml` を実行する（`workflow_dispatch` では 3 OS で回る）
+- **release 前**: 3 OS のネイティブで全部回す。`release.yml`（crates.io 公開。発火条件は `workflow_dispatch` 限定）は 3 OS の検査を持たない（verify は ubuntu と macOS）ため、公開前に `gh workflow run ci.yml --ref <ref>` で `ci.yml` を実行する（`workflow_dispatch` では 3 OS で回る）
 - 見落とすのは macOS・Windows 固有の **実行時の誤り**（テストの失敗・BSD / Git Bash のツール差・パス・大文字小文字・改行）で、PR では検出できず main への push 後に判明する。これはマージ前の待ち時間と引き換えにオーナーが判断した残存リスク。main の push で macOS・Windows だけが失敗した場合は、修正 PR で直す
 - concurrency: group は `${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}`・`cancel-in-progress: true`。main への新しい push は実行中の古い main の CI（3 OS）を取り消す。取り消された commit の macOS・Windows の結果は残らず、後続 commit の main の 3 OS 実行で検出する（`workflow_dispatch` を main へ向けた場合も同じ group）
 - ruleset の required には PR で生成される check-run をすべて登録する。macOS・Windows のジョブは PR で skipped になるため required に含めてよい（skipped は required を満たす）
@@ -91,6 +91,13 @@ cargo test --workspace
 
 - `on: workflow_dispatch` のみ。`ci.yml` とは別 workflow で、PR・push では動かない。人間担当の計測 TASK-49（#292。CLI コンフォーマンステスト `harness/cli-conformance/`）と TASK-59（#294。PoC-1 代表タスク `harness/compat-practical/repeat_core.sh`）を 3 OS の GitHub ホステッドランナーで実行する。suite `egress-isolation`（#1387・TASK-38。`harness/egress-isolation/` を macOS・Windows で実測。ubuntu は対象外）と suite `egress-host`（#1437・TASK-38。render の `real_host` の `render3_egress_*` を隔離下で実行。ubuntu〔bubblewrap を apt で導入。ubuntu-latest の 2 エントリ matrix〔ubuntu: 既定のまま・ubuntu-noaa: AppArmor の userns 制限を sysctl で 0 にして測る。ubuntu-22.04 は Servo 0.7.0 の freetype 要件〔2.12 以上。22.04 は 2.11.1〕でビルドできず使わない〔run 41813316652〕。6.7 未満のカーネルはホステッドでは測れない〔ubuntu-latest は 7.0 系。run 41813316652・41813309725〕。#1487〕・macOS。Windows は対象外）も同 workflow にある（オーナー承認 2026-10-29: 実機の代替）。結果は Step Summary とアーティファクトに出すだけで、合否・OS 間の差の判定は人間が行う
 - ここの check-run は required に登録しない（PR で pending のままになりマージできなくなる）。ジョブ名・構成の変更で ruleset の更新は要らない。`ci.yml` には手を入れない（`ci.yml` のジョブ追加・改名は ruleset の更新を伴う）。起動例は `gh workflow run xos-measure.yml -f suite=cli-conformance`
+
+## 公開（`release.yml`。crates.io。#1531）
+
+- `release.yml` は `ci.yml` とは別 workflow で `workflow_dispatch` のみ。入力は `crate`（8 crate か `all`）・`version`・`mode`（`dry-run-only` 既定 / `publish`）。ジョブ（`verify`・`verify-macos`・`publish`・`smoke-macos`）の check-run は PR では出ず、required checks に含めない（ruleset の更新は不要）。`publish` は Environment `crates-io-release`（required reviewers）の承認を通る。Environment と secret `CARGO_REGISTRY_TOKEN` の作成はオーナー作業
+- 公開対象は profile・js・core・ai・cdp・render・cli・mcp の 8 crate（版は共通）。`harness/wpt_subset_runner` は `publish = false`、`servo-host/` は対象外。一覧と公開順の正本は `scripts/publish-crates.sh`、ガード・dry-run・公開（公開済みを飛ばす途中再開・429 の再試行）は `scripts/release.sh`、スモークは `scripts/release-smoke.sh`
+- `make check-publish-ready`（`make ci` に含む）: 全 member が「公開 allowlist の 8 crate」か「`publish = false`」のどちらかであること（新規 crate が黙って公開可能にならない）、公開 crate の description・repository・license・readme、path 依存の version、cli の `[profile.release]` がルートと一致すること、`release.yml` の crate 選択肢が allowlist と一致することを検査する。`release.sh` の自己テストも含む
+- crates.io の新規 crate 公開は burst 5 件、以後 10 分に 1 件のため、8 crate の初回公開は 429 を待つ（`release.sh publish` が再試行する）
 
 ## ワークフロー変更時の注意
 

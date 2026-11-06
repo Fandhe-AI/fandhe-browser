@@ -100,6 +100,8 @@ case "${gate}" in
     need_members
     bash scripts/check-publish-ready.sh
     bash scripts/check-publish-ready.sh --self-test
+    # 公開ガード・途中再開・429 再試行の判定（合成 index と cargo shim。ネットワーク不要）
+    bash scripts/release.sh self-test
     ;;
   *)
     echo "error: unknown gate: ${gate}" >&2

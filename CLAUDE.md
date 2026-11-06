@@ -31,7 +31,7 @@ fandhe-browser/
 ├── Dockerfile / compose.yaml      # 開発コンテナ（環境非依存の `make docker-ci`）
 ├── docker/                        # 配布用 Dockerfile（Dockerfile.release: 既定コンテナ（V8）・軽量コンテナ（`--target lite`・boa のみ）・musl 静的・scratch。x86_64 必須・aarch64 任意〔`--platform linux/arm64`〕。TASK-64.1・64.2・64.3・CTR-1・CTR-4）
 ├── .markdownlint.jsonc / .yamllint / .editorconfig-checker.json  # lint-docs 設定
-├── Cargo.toml                     #（予定）workspace 定義
+├── Cargo.toml                     # workspace 定義（公開 8 crate は publish 継承・内部ツールは publish = false。`make check-publish-ready`）
 ├── about.toml                     # cargo-about 設定（`make license-inventory`。全依存の解決後ライセンス一覧・OSS-4・TASK-78.2。deny.toml と同期。Servo ホスト側は servo-host/about.toml）
 ├── deny.toml                      # cargo-deny 設定（ライセンス・advisories 検査。本体用で MPL-2.0 は未許可。Servo ホスト側は servo-host/deny.toml）
 ├── crates/                        # 各 crate（mcp は stdio サーバー基盤のみ）
@@ -57,7 +57,7 @@ fandhe-browser/
 │   ├── design/                    # 設計ドキュメント（public。servo-host-design.md・render-host-protocol.schema.json 等）
 │   ├── setup/                     # 環境別セットアップ手順書（windows.md）
 │   └── spec/                      # fandhe-browser-spec submodule（private・要アクセス権）
-├── .github/workflows/             # ai-review・update-external・ci（push/pull_request で稼働・PR は ubuntu＋`cross-target-check`＋OS 依存の変更〔profile crate・cfg 差分〕のときだけ macOS・Windows の `rust-test`、main push で 3 OS・docs-only 判定は `scripts/ci-changes.sh`）/ release（発火条件は workflow_dispatch 限定のまま）/ xos-measure（手動専用。TASK-49・TASK-59 の 3 OS 計測。required に含めない）
+├── .github/workflows/             # ai-review・update-external・ci（push/pull_request で稼働・PR は ubuntu＋`cross-target-check`＋OS 依存の変更〔profile crate・cfg 差分〕のときだけ macOS・Windows の `rust-test`、main push で 3 OS・docs-only 判定は `scripts/ci-changes.sh`）/ release（crates.io 公開。8 crate・dry-run 既定・Environment 承認。発火条件は workflow_dispatch 限定のまま。#1531）/ xos-measure（手動専用。TASK-49・TASK-59 の 3 OS 計測。required に含めない）
 ├── .agents/skills/                # npx skills add の導入実体
 └── .claude/
     ├── agents/                    # カテゴリ別 subagent 定義

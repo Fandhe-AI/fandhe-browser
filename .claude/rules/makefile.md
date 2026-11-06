@@ -23,11 +23,12 @@ description: >
 | -------- | ---- |
 | `scripts/lib.sh` | 共有ヘルパー（`require_cmd`・`reject_args`・`has_cargo`・`has_members`・`skip`）。source して使い、リポジトリルートへ `cd` する |
 | `scripts/versions.sh` | ツール版・サイズ上限値の正本（`: "${VAR:=default}"` 形式。環境変数または `make <target> VAR=value` で上書き可） |
-| `scripts/cargo-gate.sh <gate>` | Cargo.toml・member crate が無い間は skip する cargo 系ゲート（fmt・lint・test・rendering・分離検証・publish 検査） |
+| `scripts/cargo-gate.sh <gate>` | Cargo.toml・member crate が無い間は skip する cargo 系ゲート（fmt・lint・test・rendering・分離検証・公開可否検査 `check-publish-ready`） |
 | `scripts/harness.sh <name>` | 実測ハーネス・ベンチ・計測系の実体 |
 | `scripts/lint-docs.sh <kind>` | markdownlint・yamllint・editorconfig-checker・commitlint |
 | `scripts/help.sh` | Make 非依存のターゲット一覧（手動保守） |
-| その他 | `setup.sh`・`rustup-check.sh`・`submodule.sh`・`install-hooks.sh`・`deny.sh`・`about.sh`・`check-deny-license-reject.sh`、CI も直接呼ぶ `check-render-isolation.sh`・`check-egress-constants.sh`・`check-js-engine-isolation.sh`・`check-static-link.sh`・`check-dynamic-link-windows.sh`・`check-dynamic-link-macos.sh`・`ci-changes.sh`・`ci-prune-target.sh` |
+| `scripts/release.sh`・`release-smoke.sh`・`publish-crates.sh` | crates.io 公開の制御（`release.yml` が呼ぶ。自己テスト付き）・リリース成果物のスモーク・公開対象 crate と公開順の正本 |
+| その他 | `setup.sh`・`rustup-check.sh`・`submodule.sh`・`install-hooks.sh`・`deny.sh`・`about.sh`・`check-deny-license-reject.sh`・`check-publish-ready.sh`、CI も直接呼ぶ `check-render-isolation.sh`・`check-egress-constants.sh`・`check-js-engine-isolation.sh`・`check-static-link.sh`・`check-dynamic-link-windows.sh`・`check-dynamic-link-macos.sh`・`ci-changes.sh`・`ci-prune-target.sh` |
 
 `scripts/hooks/**` は存在しない。lefthook の編集方針は [git-hooks](./git-hooks.md) が担当し、`lefthook.yml` の `run:` はインラインで書く。
 
