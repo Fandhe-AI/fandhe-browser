@@ -104,8 +104,7 @@ multiple-versions = "warn"
 # バージョン要求 `*` の依存宣言を拒否する（バージョン無指定はサプライチェーン上
 # 任意の最新版を受け入れる宣言であり、`=x.y.z` 完全固定方針に反するため fail-closed で弾く）。
 wildcards = "deny"
-# workspace 内クレート（core / js / ai / cdp / render / profile / cli / mcp）は
-# `publish = false` の private クレートで、相互参照はバージョン無しの path 依存
-# （cargo 上は `*` 扱い）のため、private クレートの path 依存に限り wildcards の
-# 対象外とする。
-allow-wildcard-paths = true
+# workspace 内クレート（core / js / ai / cdp / render / profile / cli / mcp）の相互参照は
+# crates.io 公開（#1531）のため `version = "=0.1.0"` 付きの path 依存で、dev-dependencies
+# を含めて `*` 扱いにならない（`[workspace.dependencies]` に集約）。そのため
+# `allow-wildcard-paths` は使わず、wildcards の例外を置かない。
