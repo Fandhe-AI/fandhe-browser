@@ -30,7 +30,9 @@ bin="$1"
 }
 require_cmd curl "required for the launch check"
 
-work="$(mktemp -d)"
+# macOS の mktemp は /var/folders/... を返し、/var は /private/var への symlink になる。プロファイルの
+# パス検証（PROF-1）は経路上の symlink を拒否するため、symlink を解決した実パスを作業ディレクトリにする。
+work="$(cd "$(mktemp -d)" && pwd -P)"
 server_pid=""
 cleanup() {
   if [ -n "${server_pid}" ]; then
