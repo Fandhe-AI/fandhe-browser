@@ -353,8 +353,8 @@ mod diff {
         BrowserProfile, ComputedStyle, ParseOptions, parse_document, profile_gate,
     };
 
-    const CHROME_JSON: &str = include_str!("../../../profiles/chrome.json");
-    const SAFARI_JSON: &str = include_str!("../../../profiles/safari.json");
+    const CHROME_JSON: &str = include_str!("../profiles/chrome.json");
+    const SAFARI_JSON: &str = include_str!("../profiles/safari.json");
 
     const CHROME_ONLY: [&str; 2] = ["interpolate-size", "text-size-adjust"];
     const SAFARI_ONLY: [&str; 1] = ["hanging-punctuation"];

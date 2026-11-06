@@ -28,7 +28,7 @@
 //   超過分は無視し（例外は投げない）、ページごとに 1 回だけ `consoleMessage` op（warn）で通知する。
 // - プロパティ集合（`in` 判定用）はベンダー接頭辞の無い標準名の最小集合を固定リストで持つ。
 //   `webkit*` / `Moz*` / `ms*` 等の接頭辞付きの名前は定義しない（`'WebkitAnimation' in style` は
-//   false。特定ブラウザの対応可否を装わない。SEC-2）。`profiles/` の CSSOM プロファイル（PLUG-8）は
+//   false。特定ブラウザの対応可否を装わない。SEC-2）。`crates/fandhe-browser-core/profiles/` の CSSOM プロファイル（PLUG-8）は
 //   ブラウザ別の識別面に近づくため JS の面には反映しない。
 // - ES2015 の範囲に留める（V8 と boa で同一のソース。class / Proxy は使わない）。
 //

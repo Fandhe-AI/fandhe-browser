@@ -134,7 +134,7 @@ docs/design/data-license-review.md。TASK-103.2・Issue #396・PR #1260)。
 
 | データ | 版 | SPDX | 出典 | 同梱される条件 |
 | ------ | -- | ---- | ---- | -------------- |
-| web-features | 3.39.0 | Apache-2.0 | https://github.com/web-platform-dx/web-features | profiles/chrome.json・profiles/safari.json の元データ。fandhe-browser-core が include_str! で埋め込むため、全ビルド構成のバイナリと既定・軽量コンテナに含まれる |
+| web-features | 3.39.0 | Apache-2.0 | https://github.com/web-platform-dx/web-features | crates/fandhe-browser-core/profiles/chrome.json・safari.json の元データ。fandhe-browser-core が include_str! で埋め込むため、全ビルド構成のバイナリと既定・軽量コンテナに含まれる |
 | caniuse-lite | 1.0.30001810 | CC-BY-4.0 | https://github.com/browserslist/caniuse-lite (元データ: https://caniuse.com/) | 同上 |
 | web-platform-tests (WPT) | リビジョン 74ca910926d76710943f2a8798817102f69d6e40 | BSD-3-Clause | https://github.com/web-platform-tests/wpt | 配布物に含まれない。harness/wpt_subset_runner/wpt-subset.json にテストのパスの一覧だけを置き、テスト本体は実行時に取得してコミットも配布もしない |
 
@@ -146,7 +146,7 @@ caniuse-lite (CC-BY-4.0) について:
 - ライセンス: Creative Commons Attribution 4.0 International
   (https://creativecommons.org/licenses/by/4.0/)
 - 改変あり: 元データから CSS 機能の対応可否の一部を抜き出し、プロパティから機能への
-  対応を手で補正した (除外と追加の規則は profiles/README.md の「キュレーション記録」)。
+  対応を手で補正した (除外と追加の規則は crates/fandhe-browser-core/profiles/README.md の「キュレーション記録」)。
 - CC-BY-4.0 はライセンスへの URI の提示で足りるため (第 3 条 (a)(1))、全文は
   LICENSE-THIRD-PARTY に収録しない。
 

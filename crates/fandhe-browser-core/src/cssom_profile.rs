@@ -29,8 +29,8 @@ use std::sync::OnceLock;
 
 use crate::cssom::{ComputedDeclaration, ComputedStyle};
 
-const CHROME_JSON: &str = include_str!("../../../profiles/chrome.json");
-const SAFARI_JSON: &str = include_str!("../../../profiles/safari.json");
+const CHROME_JSON: &str = include_str!("../profiles/chrome.json");
+const SAFARI_JSON: &str = include_str!("../profiles/safari.json");
 
 /// エラーに載せる入力値の上限バイト数（無制限なエコーバックを避ける）。
 const MAX_PROFILE_NAME_BYTES: usize = 64;

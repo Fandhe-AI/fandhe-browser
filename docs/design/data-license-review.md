@@ -18,7 +18,7 @@
 
 | データ | 版 | SPDX | 取得元 | リポジトリ内の所在 | 埋め込み方式 | 配布物 |
 | ------ | -- | ---- | ------ | ------------------ | ------------ | ------ |
-| web-features | 3.39.0（tarball sha256 は `profiles/README.md` に記録） | Apache-2.0 | npm | `profiles/chrome.json`・`profiles/safari.json`（事前生成した派生データ） | `include_str!`（`fandhe-browser-core` の `cssom_profile.rs`） | 含まれる |
+| web-features | 3.39.0（tarball sha256 は `crates/fandhe-browser-core/profiles/README.md` に記録） | Apache-2.0 | npm | `crates/fandhe-browser-core/profiles/chrome.json`・`crates/fandhe-browser-core/profiles/safari.json`（事前生成した派生データ） | `include_str!`（`fandhe-browser-core` の `cssom_profile.rs`） | 含まれる |
 | caniuse-lite | 1.0.30001810 | CC-BY-4.0 | npm | 同上 | 同上 | 含まれる |
 | WPT | リビジョン `74ca910926d76710943f2a8798817102f69d6e40` | BSD-3-Clause | git（`web-platform-tests/wpt` の sparse checkout。npm ではない） | `harness/wpt_subset_runner/wpt-subset.json`（テストのパス一覧 257 件のみ） | テスト時のみ `include_str!`（`src/report.rs` の test と `tests/subset_schema.rs`） | 含まれない |
 
@@ -36,10 +36,10 @@ WPT の補足: テスト本体は `fetch-wpt.sh` が実行時に取得し、`.gi
 | 確認項目 | 結果 |
 | -------- | ---- |
 | GPL / LGPL / AGPL / MPL 系でないこと | 3 データとも Apache-2.0・CC-BY-4.0・BSD-3-Clause で、該当しない |
-| 出典の記録 | `profiles/*.json` の `sources[]`（name・version・license・url）に web-features・caniuse-lite がある。WPT は `wpt-subset.json` の `source`（`wptSource`・`wptRevision`）にある |
-| CC-BY-4.0 の帰属表記 | JSON の `sources[].attribution` と `profiles/README.md` が同一文言「Compatibility data derived from caniuse.com (CC-BY-4.0)」。JSON の出典表記は `tests/cssom_profile_data.rs` が検査している |
+| 出典の記録 | `crates/fandhe-browser-core/profiles/*.json` の `sources[]`（name・version・license・url）に web-features・caniuse-lite がある。WPT は `wpt-subset.json` の `source`（`wptSource`・`wptRevision`）にある |
+| CC-BY-4.0 の帰属表記 | JSON の `sources[].attribution` と `crates/fandhe-browser-core/profiles/README.md` が同一文言「Compatibility data derived from caniuse.com (CC-BY-4.0)」。JSON の出典表記は `tests/cssom_profile_data.rs` が検査している |
 | NOTICE への記載 | NOTICE 第 4 節に記載済み（PR #1259・TASK-103.1）。基準コミット `d93f480b` では未反映だった |
-| 改変の有無 | 上流データをそのまま同梱せず、`PLUG-8` 用に feature を絞って再構成した派生データ。経緯は `profiles/README.md`「生成手順」に記録がある |
+| 改変の有無 | 上流データをそのまま同梱せず、`PLUG-8` 用に feature を絞って再構成した派生データ。経緯は `crates/fandhe-browser-core/profiles/README.md`「生成手順」に記録がある |
 | 配布物への混入 | プロファイル JSON は全ビルドのバイナリに入る。WPT のテスト本体は入らない |
 
 ## 証跡（再現手順）
@@ -50,13 +50,13 @@ WPT の補足: テスト本体は `fetch-wpt.sh` が実行時に取得し、`.gi
 grep -nE 'name = "(caniuse|web-features|wpt)' Cargo.lock           # wpt-subset-runner の 1 件のみ
 git ls-files | grep -E '(^|/)package(-lock)?\.json$|pnpm-lock|yarn.lock'  # スキルのサンプルのみ
 git grep -n 'include_str!' -- crates harness | grep -E 'profiles/|wpt-subset'
-jq -c '.sources' profiles/chrome.json profiles/safari.json
+jq -c ".sources" crates/fandhe-browser-core/profiles/chrome.json crates/fandhe-browser-core/profiles/safari.json
 jq '.source.wptRevision' harness/wpt_subset_runner/wpt-subset.json
 ```
 
 ## 再レビューのトリガー
 
-- web-features・caniuse-lite の版の更新、`profiles/*.json` の再生成
+- web-features・caniuse-lite の版の更新、`crates/fandhe-browser-core/profiles/*.json` の再生成
 - `wpt-subset.json` の WPT リビジョンの更新
 - Cargo 外のデータを新たに `include_str!` 等で埋め込むとき
 - npm のマニフェスト・ロックファイルを導入するとき

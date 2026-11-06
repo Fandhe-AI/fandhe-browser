@@ -7,8 +7,8 @@
 //! JSON 構文・必須フィールド・`cssProperties` の参照先 feature の存在も、依存を増やさず
 //! テスト内の最小パーサーで検証する（読み込みモジュール本体は TASK-100.2 の責務）。
 
-const CHROME: &str = include_str!("../../../profiles/chrome.json");
-const SAFARI: &str = include_str!("../../../profiles/safari.json");
+const CHROME: &str = include_str!("../profiles/chrome.json");
+const SAFARI: &str = include_str!("../profiles/safari.json");
 
 #[test]
 fn plug8_profile_data_declares_browser() {
