@@ -7,7 +7,8 @@
 //!
 //! ただし解決・検証の後に、ホストの `--version` を上限付きで 1 回だけ実行して CLI との版の一致を
 //! 確かめる（`version` モジュール・#1540）。これは `HostRenderer` の遅延起動とは別物の短命プロセスで、
-//! 隔離の外で動く。ページ読み込み経路の起動引数（`HostProcess` の `--stdio`）は変えない。
+//! `HostProcess` と同じ egress 隔離の下で動く（プロキシなし・送信先なし。`required` で隔離できなければ
+//! 実行しない。#1553）。ページ読み込み経路の起動引数（`HostProcess` の `--stdio`）は変えない。
 //!
 //! # スタブについて
 //!
@@ -23,12 +24,14 @@
 
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use fandhe_browser_core::EgressIsolationMode;
 use fandhe_browser_core::render::{DisabledRenderer, Renderer};
 use fandhe_browser_render::host_process::{
-    EgressIsolationUnavailable, HostBinary, HostProcessConfig, HostProcessError,
-    egress_isolation_warning_message, probe_system, resolve_host_binary_from_process,
+    EgressIsolationUnavailable, EgressIsolationWarning, HostBinary, HostProcessConfig,
+    HostProcessError, HostVersionRunConfig, IsolationProbe, egress_isolation_warning_message,
+    probe_system, resolve_host_binary_from_process,
 };
 use fandhe_browser_render::host_renderer::{HostRenderer, HostRendererConfig};
 
@@ -47,13 +50,7 @@ pub(crate) fn renderer_from_process(
     configured: Option<&Path>,
     egress: EgressIsolationMode,
 ) -> Result<Arc<dyn Renderer>, StartupError> {
-    select_renderer_checked(
-        resolve_host_binary_from_process(configured),
-        egress,
-        probe_system,
-        version::check_host_version,
-        None,
-    )
+    renderer_from_process_inner(configured, None, egress, IsolationProbe::System)
 }
 
 /// [`renderer_from_process`] に `load` の上限（ミリ秒）を渡す版。`screenshot --timeout` が呼ぶ。
@@ -65,23 +62,67 @@ pub(crate) fn renderer_from_process_with_load_timeout(
     load_timeout_ms: Option<u32>,
     egress: EgressIsolationMode,
 ) -> Result<Arc<dyn Renderer>, StartupError> {
-    select_renderer_checked(
+    renderer_from_process_inner(configured, load_timeout_ms, egress, IsolationProbe::System)
+}
+
+/// 2 つの公開入口の共通部。`version_probe` は版の検査の隔離可否の判定元で、本番は `System`
+/// （テストだけが実環境の bwrap の有無に左右されないよう差し替える）。
+///
+/// 警告の通知先は版の検査と `HostProcess` で共有し、`best-effort` で隔離できないときの
+/// 「隔離なしで動く」警告を 1 回に抑える（起動時と初回の描画時の二重表示を避ける。#1553）。
+fn renderer_from_process_inner(
+    configured: Option<&Path>,
+    load_timeout_ms: Option<u32>,
+    egress: EgressIsolationMode,
+    version_probe: IsolationProbe,
+) -> Result<Arc<dyn Renderer>, StartupError> {
+    let warning = isolation_warning_sink();
+    let version_config = HostVersionRunConfig::new(egress)
+        .with_isolation_probe(version_probe)
+        .with_isolation_warning(Arc::clone(&warning));
+    select_renderer_checked_with(
         resolve_host_binary_from_process(configured),
         egress,
         probe_system,
-        version::check_host_version,
+        |b| version::check_host_version(b, &version_config),
         load_timeout_ms,
+        warning,
     )
 }
 
+/// 警告の通知先の型（版の検査と `HostProcess` が共有する）。
+type WarningSink = Arc<dyn Fn(EgressIsolationWarning) + Send + Sync>;
+
+/// 警告を stderr へ英語 1 行で出す共有の通知先。`Unisolated`（隔離なしで動く）は最初の 1 回だけ、
+/// それ以外（`TmpfsUnlimited`）は毎回通す（`HostProcess` が 1 インスタンスにつき 1 回に絞っている）。
+fn isolation_warning_sink() -> WarningSink {
+    dedup_unisolated(Arc::new(|warning| {
+        eprintln!("warning: {}", egress_isolation_warning_message(warning));
+    }))
+}
+
+/// `inner` を包み、`Unisolated` だけを 1 回に抑える（純粋な部分。件数をテストで固定する）。
+fn dedup_unisolated(inner: WarningSink) -> WarningSink {
+    let reported = AtomicBool::new(false);
+    Arc::new(move |warning| {
+        let suppress = matches!(warning, EgressIsolationWarning::Unisolated(_))
+            && reported.swap(true, Ordering::SeqCst);
+        if !suppress {
+            inner(warning);
+        }
+    })
+}
+
 /// 本番の `HostProcessConfig`。各種既定値のまま、egress 隔離の水準と警告の出力先だけを足す。
-/// 警告（`best-effort` で隔離できず隔離なしで起動するとき）は stderr へ英語 1 行で出す。
-fn production_config(binary: HostBinary, egress: EgressIsolationMode) -> HostProcessConfig {
+/// 警告（`best-effort` で隔離できず隔離なしで起動するとき）は共有の通知先（stderr へ英語 1 行）へ渡す。
+fn production_config(
+    binary: HostBinary,
+    egress: EgressIsolationMode,
+    warning: WarningSink,
+) -> HostProcessConfig {
     HostProcessConfig::new(binary)
         .with_egress_isolation(egress)
-        .with_isolation_warning(Arc::new(|warning| {
-            eprintln!("warning: {}", egress_isolation_warning_message(warning));
-        }))
+        .with_isolation_warning(warning)
 }
 
 /// [`select_renderer_with`] に egress 隔離の前倒し判定を足した本番の入口。
@@ -94,6 +135,7 @@ fn production_config(binary: HostBinary, egress: EgressIsolationMode) -> HostPro
 /// ホストの版が CLI と一致するか確かめ、不一致・検証不能なら [`StartupError::RenderHostVersion`]
 /// （`RENDER-3`・`SEC-2`・#1540）。`probe` が先なのは、隔離できない `required` 環境でホストを一切
 /// 実行しないため。`Disabled`・不正パスでは呼ばない（未検証のバイナリを実行しない）。
+#[cfg(test)]
 pub(crate) fn select_renderer_checked(
     resolved: Result<HostBinary, HostProcessError>,
     egress: EgressIsolationMode,
@@ -101,15 +143,40 @@ pub(crate) fn select_renderer_checked(
     check_version: impl FnOnce(&HostBinary) -> Result<(), HostVersionError>,
     load_timeout_ms: Option<u32>,
 ) -> Result<Arc<dyn Renderer>, StartupError> {
+    select_renderer_checked_with(
+        resolved,
+        egress,
+        probe,
+        check_version,
+        load_timeout_ms,
+        isolation_warning_sink(),
+    )
+}
+
+/// [`select_renderer_checked`] に警告の通知先を足した版（本番は版の検査と共有の通知先を渡す）。
+///
+/// 版の検査が隔離できないと報告した場合（`required` の防御。先行の `probe` と同じ理由）は
+/// [`StartupError::RenderIsolation`] に写し、利用者へ既存の隔離エラーと同じ文言を出す。
+fn select_renderer_checked_with(
+    resolved: Result<HostBinary, HostProcessError>,
+    egress: EgressIsolationMode,
+    probe: impl FnOnce() -> Result<(), EgressIsolationUnavailable>,
+    check_version: impl FnOnce(&HostBinary) -> Result<(), HostVersionError>,
+    load_timeout_ms: Option<u32>,
+    warning: WarningSink,
+) -> Result<Arc<dyn Renderer>, StartupError> {
     if resolved.is_ok() && egress == EgressIsolationMode::Required {
         probe().map_err(StartupError::RenderIsolation)?;
     }
     if let Ok(binary) = &resolved {
-        check_version(binary).map_err(StartupError::RenderHostVersion)?;
+        check_version(binary).map_err(|e| match e {
+            HostVersionError::IsolationUnavailable(r) => StartupError::RenderIsolation(r),
+            other => StartupError::RenderHostVersion(other),
+        })?;
     }
     select_renderer_with(
         resolved,
-        |binary| production_config(binary, egress),
+        |binary| production_config(binary, egress, warning),
         load_timeout_ms,
     )
 }
@@ -405,15 +472,15 @@ mod tests {
             let call = |p: &Path| {
                 let mut last = None;
                 for _ in 0..20 {
-                    let r = if with_timeout {
-                        renderer_from_process_with_load_timeout(
-                            Some(p),
-                            Some(1_000),
-                            EgressIsolationMode::BestEffort,
-                        )
-                    } else {
-                        renderer_from_process(Some(p), EgressIsolationMode::BestEffort)
-                    };
+                    // 隔離の有無は実環境の bwrap に左右させない（隔離下の観測は render 側のテストが持つ）。
+                    let r = renderer_from_process_inner(
+                        Some(p),
+                        with_timeout.then_some(1_000),
+                        EgressIsolationMode::BestEffort,
+                        IsolationProbe::Unavailable(
+                            EgressIsolationUnavailable::SandboxToolNotFound,
+                        ),
+                    );
                     if matches!(
                         r,
                         Err(StartupError::RenderHostVersion(
@@ -444,6 +511,53 @@ mod tests {
                 "{err:?}"
             );
         }
+    }
+
+    /// `RENDER-3`・#1553: 版の検査が「隔離できない」と報告したら、既存の隔離エラーと同じ文言の起動エラーになる。
+    #[test]
+    fn render3_version_isolation_unavailable_maps_to_render_isolation_error() {
+        let binary = resolve_host_binary(Some(&std::env::current_exe().unwrap()), None, None)
+            .expect("absolute existing path resolves");
+        let err = select_renderer_checked(
+            Ok(binary),
+            EgressIsolationMode::Required,
+            || Ok(()),
+            |_| {
+                Err(HostVersionError::IsolationUnavailable(
+                    EgressIsolationUnavailable::SandboxToolNotFound,
+                ))
+            },
+            None,
+        )
+        .err()
+        .expect("must refuse");
+        assert!(matches!(
+            err,
+            StartupError::RenderIsolation(EgressIsolationUnavailable::SandboxToolNotFound)
+        ));
+        assert_eq!(
+            err.to_string(),
+            "render host egress isolation is required but unavailable: \
+             sandbox tool (bwrap or sandbox-exec) was not found"
+        );
+    }
+
+    /// `RENDER-3`・#1553: 共有の通知先は `Unisolated` を 1 回に抑え、`TmpfsUnlimited` は毎回通す。
+    #[test]
+    fn render3_unisolated_warning_is_reported_once_across_version_check_and_host() {
+        use fandhe_browser_render::host_process::TmpfsUnlimitedReason;
+        use std::sync::Mutex;
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        let shared = dedup_unisolated(Arc::new(move |w| sink.lock().unwrap().push(w)));
+        let unisolated =
+            EgressIsolationWarning::Unisolated(EgressIsolationUnavailable::UnsupportedPlatform);
+        let tmpfs = EgressIsolationWarning::TmpfsUnlimited(TmpfsUnlimitedReason::SizeUnsupported);
+        shared(unisolated); // 版の検査
+        shared(unisolated); // HostProcess
+        shared(tmpfs);
+        shared(tmpfs);
+        assert_eq!(*seen.lock().unwrap(), vec![unisolated, tmpfs, tmpfs]);
     }
 
     /// `RENDER-3`・#1436: 設定ファイルの `[rendering] egress_isolation` が cli の起動設定から読める。

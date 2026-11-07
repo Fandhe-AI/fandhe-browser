@@ -2,7 +2,8 @@
 //! （RENDER-3・RENDER-4・SEC-2・XOS-1。TASK-38・#1436・設計
 //! `docs/design/servo-host-egress-isolation.md`）。
 //!
-//! [`super::HostProcess`] の `spawn()` が呼ぶ。許可リスト付き CONNECT プロキシ（`egress_proxy`・
+//! [`super::HostProcess`] の `spawn()` が呼ぶ。版の検査（`version_run`。`--version` を 1 回実行する）も
+//! 同じ判定・同じ包み方で呼ぶが、プロキシは起動せず送信先を持たせない（#1553）。許可リスト付き CONNECT プロキシ（`egress_proxy`・
 //! #1434）の待ち受けと、ホスト側の引数（servo-host の `args.rs`・#1435）は部品として main に
 //! あり、本モジュールはそれらを OS のコマンドで包む部分を担う。依存追加も `unsafe` もなく、
 //! `pre_exec`・FFI は使わず外部コマンドの引数配列だけで隔離する（シェルを介さない）。
@@ -694,6 +695,52 @@ pub(super) fn linux_argv(
     if !relay_uds.starts_with(workdir) {
         return None;
     }
+    let mut trailing: Vec<OsString> = HOST_ARGS.iter().map(OsString::from).collect();
+    trailing.push(OsString::from("--egress-relay-uds"));
+    trailing.push(relay_uds.as_os_str().to_owned());
+    Some(linux_host_argv(
+        bwrap,
+        hidden,
+        workdir,
+        parent_to_hide,
+        host,
+        &trailing,
+    ))
+}
+
+/// 版の検査（`--version`）用の Linux 起動コマンド。本番の [`linux_argv`] と同じ包み方
+/// （[`linux_host_argv`]）で、ホストの引数だけが `--version`。中継も UDS も渡さないので、netns の中は
+/// loopback しか無く送信先に届かない（`RENDER-3`・`SEC-2`・#1553）。`--ro-bind <ホスト>` は
+/// ホストが隠れる場所（例: `~/.cargo/bin`）にあるときだけ付く。戻さないと `required` で起動できない。
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(super) fn linux_version_argv(
+    bwrap: &Path,
+    hidden: &HiddenPaths,
+    workdir: &Path,
+    parent_to_hide: Option<&Path>,
+    host: &Path,
+) -> (PathBuf, Vec<OsString>) {
+    linux_host_argv(
+        bwrap,
+        hidden,
+        workdir,
+        parent_to_hide,
+        host,
+        &[OsString::from("--version")],
+    )
+}
+
+/// [`linux_argv`] と [`linux_version_argv`] の共通部。bwrap の包み方（名前空間・tmpfs・bind の順序）を
+/// 1 か所に保つ。`trailing` はホストの後ろに続く引数。
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn linux_host_argv(
+    bwrap: &Path,
+    hidden: &HiddenPaths,
+    workdir: &Path,
+    parent_to_hide: Option<&Path>,
+    host: &Path,
+    trailing: &[OsString],
+) -> (PathBuf, Vec<OsString>) {
     let mut binds = vec![(BindKind::ReadWrite, workdir)];
     if hidden.hides(host, parent_to_hide) {
         binds.push((BindKind::ReadOnly, host));
@@ -704,10 +751,8 @@ pub(super) fn linux_argv(
         &binds,
     );
     args.push(host.as_os_str().to_owned());
-    args.extend(HOST_ARGS.iter().map(OsString::from));
-    args.push(OsString::from("--egress-relay-uds"));
-    args.push(relay_uds.as_os_str().to_owned());
-    Some((bwrap.to_path_buf(), args))
+    args.extend(trailing.iter().cloned());
+    (bwrap.to_path_buf(), args)
 }
 
 /// プローブ用の bwrap 起動コマンド。本番と同じフラグ（[`linux_wrapper_args`]。tmpfs も同じ）の後ろに、
@@ -793,6 +838,23 @@ pub(super) fn macos_argv(host: &Path, port: NonZeroU16) -> (PathBuf, Vec<OsStrin
     (PathBuf::from(SANDBOX_EXEC_PATH), args)
 }
 
+/// 版の検査用の Seatbelt の profile。すべての送信を拒否する（`(remote ip)` の許可行を持たない。
+/// `RENDER-3`・`SEC-2`・#1553）。固定文字列で、外部入力は入らない。
+pub(super) const SEATBELT_DENY_ALL_OUTBOUND: &str =
+    "(version 1)(allow default)(deny network-outbound)";
+
+/// 版の検査用の macOS 起動コマンド。プロキシは起動せず、送信先を持たせない。
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(super) fn macos_version_argv(host: &Path) -> (PathBuf, Vec<OsString>) {
+    let args = vec![
+        OsString::from("-p"),
+        OsString::from(SEATBELT_DENY_ALL_OUTBOUND),
+        host.as_os_str().to_owned(),
+        OsString::from("--version"),
+    ];
+    (PathBuf::from(SANDBOX_EXEC_PATH), args)
+}
+
 /// 中継用 UDS のパスが servo-host の規則（絶対・正規化済み・NUL なし・100 バイト以下）を満たすか。
 /// ホストに拒否されて起動後に失敗するのを避けるため、起動前に検査する。絶対判定は `/` 始まりの
 /// 文字列で行う（UDS は unix 専用で、Windows の `is_absolute` はドライブ指定を要するため）。
@@ -873,12 +935,24 @@ pub(super) fn socket_dir_for(
     workdir: &Path,
     hidden: &HiddenPaths,
 ) -> Result<SocketDir, EgressIsolationUnavailable> {
+    sandbox_dir_for(workdir, hidden, true)
+}
+
+/// [`socket_dir_for`] の共通部。`check_socket` が偽なら UDS のパス規則を検査しない（版の検査は
+/// UDS を置かないため。#1553）。検査の順は 正規化 -> `/run` -> UDS パス -> 親 で、`socket_dir_for` と同じ。
+pub(super) fn sandbox_dir_for(
+    workdir: &Path,
+    hidden: &HiddenPaths,
+    check_socket: bool,
+) -> Result<SocketDir, EgressIsolationUnavailable> {
     let canonical = std::fs::canonicalize(workdir)
         .map_err(|_| EgressIsolationUnavailable::SocketPathInvalid)?;
     if workdir_hidden_by_sandbox(&canonical) {
         return Err(EgressIsolationUnavailable::WorkDirHiddenBySandbox);
     }
-    relay_socket_path_ok(&canonical.join(EGRESS_SOCKET_NAME))?;
+    if check_socket {
+        relay_socket_path_ok(&canonical.join(EGRESS_SOCKET_NAME))?;
+    }
     let parent_to_hide = parent_to_hide(canonical.parent(), hidden)?;
     Ok(SocketDir {
         dir: canonical,
@@ -2878,6 +2952,94 @@ mod tests {
                 "65535",
             ]
         );
+    }
+
+    /// RENDER-3・SEC-2（#1553）: 版の検査の Linux argv は本番と同じ bwrap の包みで、末尾が `--version` だけ。
+    /// `--stdio`・中継・プロキシの引数を持たない。ホストが隠れない場所なら `--ro-bind` も付かない。
+    #[test]
+    fn render3_version_argv_linux_is_wrapped_by_bwrap() {
+        let hidden =
+            HiddenPaths::new(PathBuf::from("/home/u")).with_tmpfs_limit(TmpfsLimit::Unsupported);
+        let (prog, args) = linux_version_argv(
+            Path::new("/usr/bin/bwrap"),
+            &hidden,
+            Path::new("/tmp/w"),
+            None,
+            Path::new("/opt/h/fandhe-browser-servo-host"),
+        );
+        assert_eq!(prog, PathBuf::from("/usr/bin/bwrap"));
+        let got = argv_strs(&args);
+        assert_eq!(
+            got,
+            [
+                "--die-with-parent",
+                "--unshare-net",
+                "--unshare-pid",
+                "--dev-bind",
+                "/",
+                "/",
+                "--proc",
+                "/proc",
+                "--tmpfs",
+                "/run",
+                "--tmpfs",
+                "/tmp",
+                "--tmpfs",
+                "/var/tmp",
+                "--tmpfs",
+                "/dev/shm",
+                "--tmpfs",
+                "/home/u",
+                "--bind",
+                "/tmp/w",
+                "/tmp/w",
+                "--",
+                "/opt/h/fandhe-browser-servo-host",
+                "--version",
+            ]
+        );
+        for banned in ["--stdio", "--egress-relay-uds", "--egress-proxy-port"] {
+            assert!(!got.contains(&banned), "{banned}");
+        }
+    }
+
+    /// RENDER-3・SEC-2（#1553）: ホストが `$HOME` 配下（`cargo install` の置き場）なら ro で戻す。
+    #[test]
+    fn render3_version_argv_linux_rebinds_host_under_home() {
+        let hidden =
+            HiddenPaths::new(PathBuf::from("/home/u")).with_tmpfs_limit(TmpfsLimit::Unsupported);
+        let host = "/home/u/.cargo/bin/fandhe-browser-servo-host";
+        let (_, args) = linux_version_argv(
+            Path::new("/usr/bin/bwrap"),
+            &hidden,
+            Path::new("/tmp/w"),
+            None,
+            Path::new(host),
+        );
+        let got = argv_strs(&args);
+        let pos = got.iter().position(|a| *a == "--ro-bind").expect("ro-bind");
+        assert_eq!(
+            &got[pos..],
+            ["--ro-bind", host, host, "--", host, "--version"]
+        );
+    }
+
+    /// RENDER-3・SEC-2（#1553）: 版の検査の macOS argv はすべての送信を拒否する Seatbelt。
+    #[test]
+    fn render3_version_argv_macos_denies_all_outbound() {
+        let (prog, args) = macos_version_argv(Path::new("/opt/host/servo-host"));
+        assert_eq!(prog, PathBuf::from("/usr/bin/sandbox-exec"));
+        assert_eq!(
+            argv_strs(&args),
+            [
+                "-p",
+                "(version 1)(allow default)(deny network-outbound)",
+                "/opt/host/servo-host",
+                "--version",
+            ]
+        );
+        assert!(!SEATBELT_DENY_ALL_OUTBOUND.contains("localhost"));
+        assert!(!SEATBELT_DENY_ALL_OUTBOUND.contains("allow network-outbound"));
     }
 
     /// RENDER-3（#1436）: UDS パスの規則は servo-host の `args.rs` と同じ。

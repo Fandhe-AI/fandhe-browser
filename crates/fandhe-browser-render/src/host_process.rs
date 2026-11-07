@@ -37,7 +37,8 @@
 //! （Linux: bwrap・macOS: sandbox-exec・Windows: 隔離なし）。設定 `[rendering] egress_isolation`
 //! の値は [`HostProcessConfig::egress_isolation`] で受ける。`best-effort`（既定）は隔離できなければ
 //! 警告（コールバック未設定なら stderr に 1 行）して隔離なしで起動し、`required` は [`HostProcessError::EgressIsolationUnavailable`] で
-//! 起動しない。隔離中は WebSocket が使えない。
+//! 起動しない。隔離中は WebSocket が使えない。cli の版の検査（`--version`）も同じ判定・同じ包み方で、
+//! プロキシなし・送信先なしで実行する（[`run_host_version`]・#1553）。
 //!
 //! # 未実装・暫定
 //!
@@ -52,6 +53,7 @@ mod isolation;
 mod resolve;
 mod rss;
 mod stderr_tail;
+mod version_run;
 mod workdir;
 
 use std::ffi::OsString;
@@ -78,6 +80,10 @@ pub use resolve::{
     resolve_host_binary_from_process,
 };
 pub use stderr_tail::STDERR_TAIL_BYTES;
+pub use version_run::{
+    DEFAULT_HOST_VERSION_TIMEOUT, HOST_VERSION_ARGS, HOST_VERSION_STDOUT_MAX, HostVersionOutput,
+    HostVersionRunConfig, HostVersionRunError, run_host_version,
+};
 
 use crate::codec::{
     MAX_HELLO_FRAME_BYTES, MAX_REQUEST_FRAME_BYTES, decode_hello, decode_response, effective_limit,
