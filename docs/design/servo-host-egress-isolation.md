@@ -282,6 +282,7 @@ options §7 を引き継ぐ。本書で新たに加わった未確認事項と�
 - 測定（#1433）は `--ro-bind / /` で行ったが、本番は `--dev-bind / /` である。そのため、測定は本番の FS 上の UDS の迂回を覆っていない。#1485 の隠蔽の実地確認は、`isolation.rs` と `tests/host_process.rs` の本物の bwrap を使うテストが担う。実 Servo ホストでの確認はマージ後の xos-measure `egress-host`（人間が実行）。
 - macOS のプローブは試走の終了コードだけで判定し、ns の比較のような偽物を排する手段が無い（Linux は #1459・#1466 で解決）。残余リスクとして受け入れる（2026-11-04・#1457）。
 - 信頼判定の TOCTOU（#1466）: 実起動は、プローブ時にキャッシュした bwrap の実体パスを `select_trusted` で通し直さずに使う。実体は root 所有で祖先まで書き込み不可のまま、プロセスの生存中は変わらない前提に立つ。差し替えには root が要るため脅威モデルの外とする。
+- 版の検査（`--version`。#1540）も同じサンドボックスで包む（#1553）。Linux は bwrap の `--unshare-net` のまま中継・UDS・プロキシを渡さず、macOS はすべての送信を拒否する Seatbelt（`(deny network-outbound)`）で、到達できる送信先を持たせない。`required` は隔離できなければホストを実行しない。孫プロセス（bwrap 下は pid 名前空間で消える）と検査後の再 exec の TOCTOU の扱いは [servo-host-design.md](./servo-host-design.md) §2.6 を参照。
 
 ### 9.4 判断済みの事項（#1459）
 

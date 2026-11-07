@@ -9,26 +9,19 @@
 //!
 //! - 利便のための整合確認であり、信頼の境界ではない（`--version` は自己申告）。バイナリ自体の検証は
 //!   `resolve_host_binary` が担う。
-//! - 隔離の外で動かすのはこの `--version` だけ。ページ読み込み経路（`HostProcess` の `--stdio`）は変えない。
+//! - `--version` は `HostProcess` と同じ OS サンドボックスの下で実行する（`required` で隔離できなければ実行しない。
+//!   プロキシなし・送信先なし・cwd は専用 WorkDir。#1553）。ページ読み込み経路（`--stdio`）は変えない。
 //! - ホストの出力は untrusted。文法を通った版トークンだけを表示し、それ以外の生出力は一切出さない。
 
+use fandhe_browser_render::host_process::{
+    EgressIsolationUnavailable, HOST_BINARY_STEM, HostBinary, HostVersionRunConfig,
+    HostVersionRunError, run_host_version,
+};
 use std::fmt;
-use std::io::{self, Read};
-use std::path::Path;
-use std::process::{Command, Stdio};
-use std::sync::mpsc;
-use std::time::{Duration, Instant};
+use std::io;
 
-use fandhe_browser_render::host_process::{HOST_BINARY_STEM, HostBinary, PASSTHROUGH_ENV_NAMES};
-
-/// `--version` の完了を待つ上限。大きな未署名バイナリの初回起動を見込み、egress 判定の 5 秒より長くする。
-pub(crate) const VERSION_TIMEOUT: Duration = Duration::from_secs(10);
-/// `--version` の stdout の上限バイト数。
-pub(crate) const VERSION_STDOUT_MAX: u64 = 256;
 /// 版トークンの最大バイト数。
 const VERSION_TOKEN_MAX: usize = 64;
-/// 終了待ちのポーリング間隔。
-const POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 /// 版の検査の失敗。表示は固定の英語で、パス・URL・ホストの生出力を含めない（`Mismatch` の版は文法検証済み）。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -36,6 +29,10 @@ const POLL_INTERVAL: Duration = Duration::from_millis(10);
 pub(crate) enum HostVersionError {
     /// 版が CLI と異なる。`host` は文法を通った版トークン。
     Mismatch { host: String },
+    /// `required` で egress 隔離できず、ホストを実行していない（`StartupError::RenderIsolation` へ写す）。
+    IsolationUnavailable(EgressIsolationUnavailable),
+    /// 専用の作業ディレクトリを用意できなかった。
+    WorkDirFailed,
     /// `--version` を起動できなかった。
     SpawnFailed(io::ErrorKind),
     /// 上限時間内に終わらなかった。
@@ -60,6 +57,8 @@ fn guidance(cli: &str) -> String {
 impl HostVersionError {
     fn reason(&self) -> &'static str {
         match self {
+            Self::IsolationUnavailable(_) => "egress isolation is unavailable",
+            Self::WorkDirFailed => "failed to prepare its working directory",
             Self::SpawnFailed(_) => "failed to start",
             Self::Timeout => "timed out",
             Self::ExitFailure => "exited with an error",
@@ -91,24 +90,42 @@ impl fmt::Display for HostVersionError {
 
 impl std::error::Error for HostVersionError {}
 
-/// 解決済みホストの版を CLI と比べる本番の入口。
-pub(crate) fn check_host_version(binary: &HostBinary) -> Result<(), HostVersionError> {
-    check_host_version_with(
-        binary.path(),
-        VERSION_TIMEOUT,
-        VERSION_STDOUT_MAX,
-        env!("CARGO_PKG_VERSION"),
-    )
+impl From<HostVersionRunError> for HostVersionError {
+    fn from(e: HostVersionRunError) -> Self {
+        match e {
+            HostVersionRunError::IsolationUnavailable(r) => Self::IsolationUnavailable(r),
+            HostVersionRunError::WorkDirFailed => Self::WorkDirFailed,
+            HostVersionRunError::SpawnFailed(k) => Self::SpawnFailed(k),
+            HostVersionRunError::Timeout => Self::Timeout,
+            HostVersionRunError::ExitFailure => Self::ExitFailure,
+            HostVersionRunError::ReadFailed => Self::ReadFailed,
+            HostVersionRunError::OutputTooLarge => Self::OutputTooLarge,
+            // 将来のバリアントは検証不能として扱う（fail-closed）。
+            _ => Self::ReadFailed,
+        }
+    }
 }
 
-fn check_host_version_with(
-    binary: &Path,
-    timeout: Duration,
-    stdout_max: u64,
+/// 解決済みホストの版を CLI と比べる本番の入口。
+///
+/// `--version` は render の `run_host_version` が `HostProcess` と同じ egress 隔離の下で実行する
+/// （プロキシなし・送信先なし。#1553）。`config` は隔離の水準と、`best-effort` で隔離なしに落ちたときの
+/// 警告の通知先を持つ（`render_host` が `HostProcess` と共有する通知先を渡す）。
+pub(crate) fn check_host_version(
+    binary: &HostBinary,
+    config: &HostVersionRunConfig,
+) -> Result<(), HostVersionError> {
+    check_host_version_with(binary, config, env!("CARGO_PKG_VERSION"))
+}
+
+/// [`check_host_version`] の本体。テストが隔離の判定元などを差し込めるよう設定を受ける。
+pub(crate) fn check_host_version_with(
+    binary: &HostBinary,
+    config: &HostVersionRunConfig,
     expected: &str,
 ) -> Result<(), HostVersionError> {
-    let out = read_host_version_output(binary, timeout, stdout_max)?;
-    let host = parse_host_version(&out)?;
+    let out = run_host_version(binary, config)?;
+    let host = parse_host_version(&out.stdout)?;
     if host == expected {
         Ok(())
     } else {
@@ -116,123 +133,6 @@ fn check_host_version_with(
             host: host.to_owned(),
         })
     }
-}
-
-/// 子プロセスの cwd に使える形へパスを整える。
-///
-/// Windows の `canonicalize` は verbatim 形式（`\\?\C:\...`）を返すが、`CreateProcessW` の
-/// `lpCurrentDirectory` はこれを受け付けず spawn が失敗する。ドライブ形式の verbatim 接頭辞だけを
-/// 外して通常のパスにする。UNC の verbatim（`\\?\UNC\...`）など安全に変換できない形は
-/// `None`（cwd を設定しない）にする。Windows 以外では通常のパスをそのまま返す。
-fn child_cwd(dir: &Path) -> Option<std::path::PathBuf> {
-    let Some(text) = dir.to_str() else {
-        return Some(dir.to_path_buf());
-    };
-    let rest = text
-        .strip_prefix("\\\\?\\")
-        .or_else(|| text.strip_prefix("//?/"));
-    let Some(rest) = rest else {
-        return Some(dir.to_path_buf());
-    };
-    let b = rest.as_bytes();
-    if b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':' {
-        Some(std::path::PathBuf::from(rest))
-    } else {
-        None
-    }
-}
-
-/// `--version` を実行して stdout を返す。
-///
-/// シェルなし・引数固定。環境は `env_clear` のうえ render の引き継ぎ許可リストだけを渡し、cwd は
-/// バイナリの親ディレクトリにする（利用者の cwd で実行しない）。stdout は別スレッドで上限付きに読む。
-/// 終了後にまとめて読む方式だと、孫プロセスが stdout を握り続けたとき時間の上限が破れるため。
-/// 読み取りスレッドは孫が握る場合に限りプロセス終了まで残り得るが、起動時 1 回で害はない。
-fn read_host_version_output(
-    binary: &Path,
-    timeout: Duration,
-    stdout_max: u64,
-) -> Result<Vec<u8>, HostVersionError> {
-    let mut cmd = Command::new(binary);
-    cmd.arg("--version")
-        .env_clear()
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null());
-    for name in PASSTHROUGH_ENV_NAMES {
-        if let Some(v) = std::env::var_os(name) {
-            cmd.env(name, v);
-        }
-    }
-    if let Some(dir) = binary.parent().and_then(child_cwd) {
-        cmd.current_dir(dir);
-    }
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| HostVersionError::SpawnFailed(e.kind()))?;
-    let Some(stdout) = child.stdout.take() else {
-        kill_and_reap(&mut child);
-        return Err(HostVersionError::ReadFailed);
-    };
-    let (tx, rx) = mpsc::channel::<io::Result<Vec<u8>>>();
-    let spawned = std::thread::Builder::new()
-        .name("host-version-read".into())
-        .spawn(move || {
-            let mut buf = Vec::new();
-            let r = stdout
-                .take(stdout_max.saturating_add(1))
-                .read_to_end(&mut buf)
-                .map(|_| buf);
-            let _ = tx.send(r);
-        });
-    if spawned.is_err() {
-        kill_and_reap(&mut child);
-        return Err(HostVersionError::ReadFailed);
-    }
-    let Some(deadline) = Instant::now().checked_add(timeout) else {
-        kill_and_reap(&mut child);
-        return Err(HostVersionError::Timeout);
-    };
-    let out = match rx.recv_timeout(timeout) {
-        Ok(Ok(buf)) => buf,
-        Ok(Err(_)) | Err(mpsc::RecvTimeoutError::Disconnected) => {
-            kill_and_reap(&mut child);
-            return Err(HostVersionError::ReadFailed);
-        }
-        Err(mpsc::RecvTimeoutError::Timeout) => {
-            kill_and_reap(&mut child);
-            return Err(HostVersionError::Timeout);
-        }
-    };
-    if u64::try_from(out.len()).map_or(true, |n| n > stdout_max) {
-        kill_and_reap(&mut child);
-        return Err(HostVersionError::OutputTooLarge);
-    }
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                return if status.success() {
-                    Ok(out)
-                } else {
-                    Err(HostVersionError::ExitFailure)
-                };
-            }
-            Ok(None) if Instant::now() >= deadline => {
-                kill_and_reap(&mut child);
-                return Err(HostVersionError::Timeout);
-            }
-            Ok(None) => std::thread::sleep(POLL_INTERVAL),
-            Err(_) => {
-                kill_and_reap(&mut child);
-                return Err(HostVersionError::ReadFailed);
-            }
-        }
-    }
-}
-
-fn kill_and_reap(child: &mut std::process::Child) {
-    let _ = child.kill();
-    let _ = child.wait();
 }
 
 /// `fandhe-browser-servo-host <version>\n` を解析して版トークンを返す（純関数）。
@@ -265,27 +165,10 @@ fn parse_host_version(stdout: &[u8]) -> Result<&str, HostVersionError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fandhe_browser_core::EgressIsolationMode;
+    use std::sync::Arc;
 
     const CLI: &str = env!("CARGO_PKG_VERSION");
-
-    /// `RENDER-3`・#1540: verbatim 接頭辞は外し、UNC verbatim は cwd 指定なしにし、通常パスは保つ。
-    #[test]
-    fn render3_child_cwd_strips_verbatim_drive_prefix() {
-        use std::path::{Path, PathBuf};
-        assert_eq!(
-            child_cwd(Path::new("\\\\?\\C:\\host\\bin")),
-            Some(PathBuf::from("C:\\host\\bin"))
-        );
-        assert_eq!(
-            child_cwd(Path::new("//?/C:/host/bin")),
-            Some(PathBuf::from("C:/host/bin"))
-        );
-        assert_eq!(child_cwd(Path::new("\\\\?\\UNC\\srv\\share")), None);
-        assert_eq!(
-            child_cwd(Path::new("/usr/local/bin")),
-            Some(PathBuf::from("/usr/local/bin"))
-        );
-    }
 
     /// `RENDER-3`・#1540: 正常な出力から版トークンを取り出す。
     #[test]
@@ -350,6 +233,16 @@ mod tests {
                 HostVersionError::SpawnFailed(io::ErrorKind::NotFound),
                 "failed to start",
             ),
+            (
+                HostVersionError::IsolationUnavailable(
+                    EgressIsolationUnavailable::SandboxToolNotFound,
+                ),
+                "egress isolation is unavailable",
+            ),
+            (
+                HostVersionError::WorkDirFailed,
+                "failed to prepare its working directory",
+            ),
             (HostVersionError::Timeout, "timed out"),
             (HostVersionError::ExitFailure, "exited with an error"),
             (HostVersionError::ReadFailed, "failed to read its output"),
@@ -366,19 +259,33 @@ mod tests {
         }
     }
 
-    /// `RENDER-3`・#1540: 存在しないパスは起動失敗（3 OS 共通の実プロセス経路）。
-    #[test]
-    fn render3_missing_binary_is_spawn_failed() {
-        let missing = std::env::temp_dir().join("fandhe-no-such-host-1540");
-        let err = check_host_version_with(&missing, Duration::from_secs(2), 256, CLI).unwrap_err();
-        assert!(matches!(err, HostVersionError::SpawnFailed(_)), "{err:?}");
+    /// 隔離なしに固定した設定（実環境の bwrap の有無に左右されない。隔離下の観測は render 側のテストが持つ）。
+    fn unisolated(mode: EgressIsolationMode) -> HostVersionRunConfig {
+        HostVersionRunConfig::new(mode)
+            .with_isolation_probe(
+                fandhe_browser_render::host_process::IsolationProbe::Unavailable(
+                    EgressIsolationUnavailable::SandboxToolNotFound,
+                ),
+            )
+            .with_timeout(std::time::Duration::from_secs(10))
+            .with_isolation_warning(Arc::new(|_| {}))
+    }
+
+    fn binary_at(path: &std::path::Path) -> HostBinary {
+        fandhe_browser_render::host_process::resolve_host_binary(Some(path), None, None)
+            .expect("absolute existing path resolves")
     }
 
     /// `RENDER-3`・#1540: `--version` を理解しない実バイナリ（テストバイナリ自身）は失敗として扱う。
     #[test]
     fn render3_binary_that_rejects_version_flag_is_failure() {
         let exe = std::env::current_exe().expect("current exe");
-        let err = check_host_version_with(&exe, Duration::from_secs(10), 256, CLI).unwrap_err();
+        let err = check_host_version_with(
+            &binary_at(&exe),
+            &unisolated(EgressIsolationMode::BestEffort),
+            CLI,
+        )
+        .unwrap_err();
         assert!(
             matches!(
                 err,
@@ -388,11 +295,28 @@ mod tests {
         );
     }
 
+    /// `RENDER-3`・#1553: 隔離できない `required` は検査の失敗（ホスト未実行）として返り、写像は隔離エラー用。
+    #[test]
+    fn render3_required_without_isolation_does_not_run_host_version() {
+        let exe = std::env::current_exe().expect("current exe");
+        let err = check_host_version_with(
+            &binary_at(&exe),
+            &unisolated(EgressIsolationMode::Required),
+            CLI,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            HostVersionError::IsolationUnavailable(EgressIsolationUnavailable::SandboxToolNotFound)
+        );
+    }
+
     #[cfg(unix)]
     mod unix {
         use super::*;
         use std::os::unix::fs::PermissionsExt;
-        use std::path::PathBuf;
+        use std::path::{Path, PathBuf};
+        use std::time::{Duration, Instant};
 
         struct Dir(PathBuf);
         impl Dir {
@@ -419,15 +343,19 @@ mod tests {
 
         /// 書き込み直後の実行は ETXTBSY になり得るため、その失敗に限ってやり直す。
         fn run(path: &Path, timeout: Duration, max: u64) -> Result<(), HostVersionError> {
+            let binary = binary_at(path);
+            let config = unisolated(EgressIsolationMode::BestEffort)
+                .with_timeout(timeout)
+                .with_stdout_max(max);
             for _ in 0..20 {
-                match check_host_version_with(path, timeout, max, CLI) {
+                match check_host_version_with(&binary, &config, CLI) {
                     Err(HostVersionError::SpawnFailed(io::ErrorKind::ExecutableFileBusy)) => {
                         std::thread::sleep(Duration::from_millis(50));
                     }
                     other => return other,
                 }
             }
-            check_host_version_with(path, timeout, max, CLI)
+            check_host_version_with(&binary, &config, CLI)
         }
 
         const T: Duration = Duration::from_secs(5);
@@ -533,7 +461,17 @@ mod tests {
             let text = std::fs::read_to_string(&log).expect("log");
             assert_eq!(text.lines().next(), Some("--version"));
             assert!(!text.contains("CARGO_MANIFEST_DIR"), "{text}");
-            assert!(!text.contains("HOME="), "{text}");
+            // HOME は親の値ではなく、専用 WorkDir 配下（`fandhe-render-*/home`）を指す（#1553）。
+            let parent_home = std::env::var("HOME").unwrap_or_default();
+            let home = text
+                .lines()
+                .find_map(|l| l.strip_prefix("HOME="))
+                .expect("HOME is set to the work dir");
+            assert_ne!(home, parent_home, "{text}");
+            assert!(
+                home.contains("fandhe-render-") && home.ends_with("/home"),
+                "{home}"
+            );
         }
     }
 }
