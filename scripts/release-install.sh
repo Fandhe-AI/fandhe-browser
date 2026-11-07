@@ -7,7 +7,9 @@
 #   - 対象なのに未公開なら失敗し、対象外で未公開なら notice を出して飛ばす（例: CLI だけの再公開でホストが
 #     その版で未公開のとき）
 #   - 導入できたものを HAVE_CLI=1・HAVE_HOST=1 として GITHUB_ENV（未設定なら標準出力）へ出す
-# 公開直後は index への反映待ちがあり得るため、導入は最大 6 回再試行する（RELEASE_INSTALL_SLEEP 秒間隔。既定 60）。
+# 公開直後は index への反映待ちがあり得るため、対象 crate の公開済み判定と導入の双方を最大 6 回再試行する
+# （RELEASE_INSTALL_SLEEP 秒間隔。既定 60）。対象外 crate の未公開判定は待つ理由がないので再試行せず即 skip する。
+# `--self-test` で再試行の挙動を偽 release.sh・偽 cargo で検証する（release-install-selftest.sh）。
 # `--locked` で配布物の Cargo.lock を使う。出力文字列は英語（japanese-style.md）。
 set -euo pipefail
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -15,6 +17,10 @@ DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${DIR}/lib.sh"
 # shellcheck source=./publish-crates.sh
 source "${DIR}/publish-crates.sh"
+
+if [ "${1:-}" = --self-test ]; then
+  exec bash "${DIR}/release-install-selftest.sh"
+fi
 
 [ "$#" -eq 1 ] || {
   echo "usage: $(basename "$0") <install-root>" >&2
@@ -43,21 +49,44 @@ install_with_retry() {
   return 1
 }
 
+# required NAME: この実行で公開されているはずの crate か（all か名前一致）。
+required() {
+  case "${RELEASE_CRATE}" in
+    all | "$1") return 0 ;;
+  esac
+  return 1
+}
+
+# published_state NAME: is-published の結果（yes / no）を出力する。対象 crate は no の間、最大 6 回再試行する
+# （公開直後の sparse index の反映遅延で偽の未公開にならないように）。is-published 自体の失敗は再試行せず致命。
+published_state() {
+  local name="$1" state attempt
+  for attempt in 1 2 3 4 5 6; do
+    state="$(bash "${RELEASE_SH:-${DIR}/release.sh}" is-published "${name}")" || return 1
+    if [ "${state}" = yes ] || ! required "${name}"; then
+      break
+    fi
+    if [ "${attempt}" -lt 6 ]; then
+      echo "${name} ${RELEASE_VERSION} is not in the index yet (attempt ${attempt} of 6); retrying in ${RELEASE_INSTALL_SLEEP:-60}s" >&2
+      sleep "${RELEASE_INSTALL_SLEEP:-60}"
+    fi
+  done
+  echo "${state}"
+}
+
 # handle NAME VAR: 導入する（または飛ばす）。
 handle() {
   local name="$1" var="$2" state
-  state="$(bash "${DIR}/release.sh" is-published "${name}")" || exit 1
+  state="$(published_state "${name}")" || exit 1
   if [ "${state}" = yes ]; then
     install_with_retry "${name}" || exit 1
     emit "${var}" 1
     return 0
   fi
-  case "${RELEASE_CRATE}" in
-    all | "${name}")
-      echo "::error::${name} ${RELEASE_VERSION} is not published" >&2
-      exit 1
-      ;;
-  esac
+  if required "${name}"; then
+    echo "::error::${name} ${RELEASE_VERSION} is not published" >&2
+    exit 1
+  fi
   echo "::notice::${name} ${RELEASE_VERSION} is not published; skipped"
 }
 
