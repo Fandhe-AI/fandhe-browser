@@ -4,6 +4,8 @@
 //! 「既定ハンドラ（引数なし）」「help」「登録済みコマンド」「usage エラー」のいずれかへ振り分ける。
 //! 引数パーサは #281 の決定どおり新規依存なしの手書き（`args_os` 起点。非 UTF-8 でも panic しない）。
 //!
+//! 第 1 引数の `--version`・`-V` は `fandhe-browser <版>` を 1 行出して終了する（#1536・`CLI-1`。ホストの `--version` と同じ形）。
+//!
 //! `query --file PATH`（#824・`PERF-7`）はネットワークを使わずローカル HTML を照会する（cold start 計測用）。
 //!
 //! 拡張点: 後続の TASK-47.2〜47.5（#283〜#287）は `commands/<name>.rs` を追加し、
@@ -62,6 +64,8 @@ pub(crate) enum CommandOutcome {
     Completed,
     /// help を表示した。
     HelpShown,
+    /// 版を表示した。
+    VersionShown,
 }
 
 /// サブコマンドのハンドラ型。
@@ -103,6 +107,7 @@ pub(crate) struct Registry<'a> {
 enum Invocation<'a> {
     Default,
     Help,
+    Version,
     Command {
         spec: &'a CommandSpec,
         args: CommandArgs,
@@ -299,6 +304,9 @@ fn parse<'a>(
     if matches!(first.as_str(), "-h" | "--help" | "help") {
         return Ok(Invocation::Help);
     }
+    if matches!(first.as_str(), "-V" | "--version") {
+        return Ok(Invocation::Version);
+    }
     if first.starts_with('-') {
         return Err(UsageError::UnknownOption(first));
     }
@@ -313,6 +321,11 @@ fn parse<'a>(
     }
 }
 
+/// 版を 1 行書き出す（`fandhe-browser <version>`。ホストの `--version` と同じ形。#1536）。
+fn write_version(out: &mut impl Write) -> io::Result<()> {
+    writeln!(out, "fandhe-browser {}", env!("CARGO_PKG_VERSION"))
+}
+
 /// help を書き出す。
 fn write_help(out: &mut impl Write, registry: &Registry<'_>) -> io::Result<()> {
     writeln!(out, "Usage: fandhe-browser [COMMAND] [ARGS]...")?;
@@ -324,6 +337,10 @@ fn write_help(out: &mut impl Write, registry: &Registry<'_>) -> io::Result<()> {
         writeln!(out, "  {:<12} {}", c.name, c.summary)?;
     }
     writeln!(out, "  {:<12} Show this help", "help")?;
+    writeln!(out)?;
+    writeln!(out, "Top-level options (before any command):")?;
+    writeln!(out, "  {:<18} Show this help", "-h, --help")?;
+    writeln!(out, "  {:<18} Print the version and exit", "-V, --version")?;
     writeln!(out)?;
     writeln!(out, "Options (all commands, after the command name):")?;
     writeln!(
@@ -367,6 +384,10 @@ pub(crate) fn dispatch(
         Invocation::Help => {
             write_help(out, registry).map_err(CommandError::Output)?;
             Ok(CommandOutcome::HelpShown)
+        }
+        Invocation::Version => {
+            write_version(out).map_err(CommandError::Output)?;
+            Ok(CommandOutcome::VersionShown)
         }
         Invocation::Command { spec, args } => (spec.run)(args),
     }
@@ -468,6 +489,57 @@ mod tests {
             assert!(text.starts_with("Usage: fandhe-browser"), "{text}");
             assert!(text.contains("demo"), "{text}");
             assert!(text.contains("Demo command"), "{text}");
+        }
+    }
+
+    fn default_must_not_run() -> Result<CommandOutcome, CommandError> {
+        Err(CommandError::Startup(StartupError::NonLoopbackAddr))
+    }
+
+    #[test]
+    fn cli1_version_flags_print_version() {
+        let registry = Registry {
+            default: default_must_not_run,
+            commands: TEST_COMMANDS,
+        };
+        let expected = format!("fandhe-browser {}\n", env!("CARGO_PKG_VERSION"));
+        for args in [&["--version"][..], &["-V"], &["--version", "extra"]] {
+            let mut out = Vec::new();
+            let r = dispatch(os(args), &registry, &mut out).expect("version succeeds");
+            assert_eq!(r, CommandOutcome::VersionShown);
+            assert_eq!(String::from_utf8(out).expect("utf8"), expected);
+        }
+    }
+
+    #[test]
+    fn cli1_help_lists_version_option() {
+        let mut out = Vec::new();
+        dispatch(os(&["--help"]), &registry(), &mut out).expect("help");
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(
+            text.contains(
+                "Top-level options (before any command):\n  -h, --help         Show this help\n  -V, --version      Print the version and exit\n"
+            ),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn cli1_similar_version_options_are_unknown() {
+        for flag in ["-v", "--versions", "-version"] {
+            let err = dispatch(os(&[flag]), &registry(), &mut Vec::new()).expect_err("usage");
+            assert!(matches!(
+                err,
+                CommandError::Usage(UsageError::UnknownOption(ref n)) if n == flag
+            ));
+            assert_eq!(
+                err.to_string(),
+                format!("unknown option '{flag}'; run 'fandhe-browser --help' for usage")
+            );
+            assert_eq!(
+                format!("{:?}", err.exit_code()),
+                format!("{:?}", ExitCode::from(2))
+            );
         }
     }
 
