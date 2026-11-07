@@ -21,6 +21,7 @@
 //! | [`HostProcessError`] | core の `RenderError` |
 //! | -------------------- | --------------------- |
 //! | `Disabled`・`InvalidHostBinary` | `RenderingDisabled` |
+//! | `ExitedBeforeHello` | `HostExitedBeforeHello` |
 //! | `SpawnFailed`・`WorkDirFailed`・`Crashed`・`ResourceLimitExceeded`・`CircuitOpen`・`EgressIsolationUnavailable` | `HostUnavailable` |
 //! | `Timeout` | `Timeout` |
 //! | `ProtocolMismatch`・`ProtocolViolation` | `ProtocolMismatch` |
@@ -154,8 +155,13 @@ pub enum HostProcessError {
     WorkDirFailed,
     /// 期限内に応答が無かった（ホストは kill して破棄済み）。
     Timeout(TimeoutPhase),
-    /// ホストが終了した・パイプが壊れた。
+    /// `hello` を返した後にホストが終了した・パイプが壊れた。
     Crashed,
+    /// `hello` を受け取る前にホストの stdout が閉じた・切り詰められた・読めなかった
+    /// （RENDER-3・TASK-38・#1539）。引数検査での即終了など、CLI とホストの版の不一致が
+    /// 典型だが、版以外の原因（隔離の失敗等）でも同じ分類になる。終了コードは見ない。
+    /// ブレーカーには `Crashed` と同じく数える。
+    ExitedBeforeHello,
     /// RSS 上限超過（または監視の連続失敗）で kill した。
     ResourceLimitExceeded,
     /// サーキットブレーカー作動中のため起動しなかった。
@@ -183,6 +189,7 @@ impl fmt::Display for HostProcessError {
             Self::WorkDirFailed => "failed to create render host work directory",
             Self::Timeout(_) => "render host timed out",
             Self::Crashed => "render host exited unexpectedly",
+            Self::ExitedBeforeHello => "render host exited before completing startup",
             Self::ResourceLimitExceeded => "render host exceeded its memory limit",
             Self::CircuitOpen => "render host restarts are suspended after repeated failures",
             Self::ProtocolMismatch => "render host protocol version is not supported",
@@ -208,6 +215,7 @@ impl fmt::Debug for HostProcessError {
             Self::SpawnFailed => f.write_str("SpawnFailed"),
             Self::WorkDirFailed => f.write_str("WorkDirFailed"),
             Self::Crashed => f.write_str("Crashed"),
+            Self::ExitedBeforeHello => f.write_str("ExitedBeforeHello"),
             Self::ResourceLimitExceeded => f.write_str("ResourceLimitExceeded"),
             Self::CircuitOpen => f.write_str("CircuitOpen"),
             Self::ProtocolMismatch => f.write_str("ProtocolMismatch"),
@@ -230,6 +238,7 @@ impl HostProcessError {
             Self::SpawnFailed
                 | Self::Timeout(_)
                 | Self::Crashed
+                | Self::ExitedBeforeHello
                 | Self::ResourceLimitExceeded
                 | Self::ProtocolMismatch
                 | Self::ProtocolViolation(_)
@@ -866,7 +875,9 @@ impl HostProcess {
         let err = if exceeded
             && matches!(
                 err,
-                HostProcessError::Crashed | HostProcessError::Timeout(_)
+                HostProcessError::Crashed
+                    | HostProcessError::ExitedBeforeHello
+                    | HostProcessError::Timeout(_)
             ) {
             HostProcessError::ResourceLimitExceeded
         } else {
@@ -1220,6 +1231,12 @@ impl HostProcess {
                 )
             }
         };
+        // `hello` 前の終了は `hello` 後の `Crashed` と区別する。`classify_read` は `roundtrip` と
+        // 共用のため、ここ（ハンドシェイク）だけで変換する（#1539）。
+        let outcome = outcome.map_err(|e| match e {
+            HostProcessError::Crashed => HostProcessError::ExitedBeforeHello,
+            other => other,
+        });
         let hello = match outcome.and_then(|bytes| {
             decode_hello(&bytes).map_err(|e| match e {
                 ProtocolError::ProtocolMismatch { .. } => HostProcessError::ProtocolMismatch,
@@ -1712,8 +1729,8 @@ mod tests {
         ] {
             let got = run_failing_bwrap(mode, Some(body), false);
             // 失敗の種類は具体値で固定する（ホストがハンドシェイク前に EOF）。
-            assert_eq!(got.0.first().map(String::as_str), Some("Crashed"));
-            assert_no_downgrade(got, 0, "Crashed", BREAKER_THRESHOLD);
+            assert_eq!(got.0.first().map(String::as_str), Some("ExitedBeforeHello"));
+            assert_no_downgrade(got, 0, "ExitedBeforeHello", BREAKER_THRESHOLD);
         }
     }
 
@@ -1744,8 +1761,8 @@ mod tests {
             EgressIsolationMode::Required,
         ] {
             let got = run_failing_bwrap(mode, Some(body), true);
-            assert_eq!(got.0.first().map(String::as_str), Some("Crashed"));
-            assert_no_downgrade(got, 1, "Crashed", BREAKER_THRESHOLD);
+            assert_eq!(got.0.first().map(String::as_str), Some("ExitedBeforeHello"));
+            assert_no_downgrade(got, 1, "ExitedBeforeHello", BREAKER_THRESHOLD);
         }
     }
 }

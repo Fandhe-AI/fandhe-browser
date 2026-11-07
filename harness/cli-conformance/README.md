@@ -47,7 +47,7 @@ CLI_CONFORMANCE_ARGS="--render-host <path>" make measure-cli-conformance   # 自
 
 前提未充足になる条件:
 
-- `CT-SHOT-*`: 描画ホストを解決できない固定シグネチャ（`error: rendering is not available (render host not found; set FANDHE_BROWSER_RENDER_HOST)`・終了コード 1）。それ以外の失敗は `fail`
+- `CT-SHOT-*`: 描画ホストを解決できない固定シグネチャ（`error: rendering is not available (render host not found; set FANDHE_BROWSER_RENDER_HOST, or on macOS/Linux run 'cargo install fandhe-browser-servo-host --locked')`・終了コード 1）。それ以外の失敗は `fail`
 - `CT-LAUNCH-*`・`CT-LAUNCH-E2`・`CT-PROFILE-E3`: `127.0.0.1:9333` が使用中（`launch` は 9333 固定のため）。`CT-LAUNCH-E2` は加えて node が無いとき
 - `CT-NAV-*`・`CT-QUERY-*`・`CT-SHOT-*`・`CT-QUERY-E3`: `FIXTURE_URL`（`https://example.com/`）の事前確認（仕様書 2.3）が期待と食い違うとき。`--attr src` の確認だけは `<script src=/s.js>` が無いときに前提未充足
 - `CT-PROFILE-E5`・`CT-PROFILE-E6`: Windows（symlink を作る unix 専用ケース）

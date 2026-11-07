@@ -22,6 +22,16 @@ fn run(tag: &str, args: &[&str]) -> Outcome {
 
 /// `config` を設定ファイルとして書き、`FANDHE_BROWSER_CONFIG` で渡して起動する。
 fn run_with_config(tag: &str, args: &[&str], config: Option<&str>) -> Outcome {
+    run_with_host(tag, args, config, None)
+}
+
+/// `render_host` があれば `FANDHE_BROWSER_RENDER_HOST` で渡し、なければ外して起動する。
+fn run_with_host(
+    tag: &str,
+    args: &[&str],
+    config: Option<&str>,
+    render_host: Option<&std::path::Path>,
+) -> Outcome {
     let home: PathBuf =
         std::env::temp_dir().join(format!("fandhe-cli-dispatch-{}-{tag}", std::process::id()));
     std::fs::create_dir_all(&home).expect("home dir can be created");
@@ -36,7 +46,14 @@ fn run_with_config(tag: &str, args: &[&str], config: Option<&str>) -> Outcome {
             cmd.env_remove("FANDHE_BROWSER_CONFIG");
         }
     }
-    cmd.env_remove("FANDHE_BROWSER_RENDER_HOST");
+    match render_host {
+        Some(host) => {
+            cmd.env("FANDHE_BROWSER_RENDER_HOST", host);
+        }
+        None => {
+            cmd.env_remove("FANDHE_BROWSER_RENDER_HOST");
+        }
+    }
     let mut child = cmd
         .args(args)
         .env("HOME", &home)
@@ -338,7 +355,7 @@ fn cli1_screenshot_is_wired_and_reports_rendering_unavailable_without_host() {
     assert_eq!(out.code, Some(1), "stderr: {}", out.stderr);
     assert_eq!(
         out.stderr.trim(),
-        "error: rendering is not available (render host not found; set FANDHE_BROWSER_RENDER_HOST)"
+        "error: rendering is not available (render host not found; set FANDHE_BROWSER_RENDER_HOST, or on macOS/Linux run 'cargo install fandhe-browser-servo-host --locked')"
     );
     assert!(out.stdout.is_empty());
     assert!(!std::path::Path::new(&target).exists());
@@ -407,7 +424,7 @@ fn cli1_screenshot_valid_timeout_reaches_host_resolution() {
     assert_eq!(out.code, Some(1), "stderr: {}", out.stderr);
     assert_eq!(
         out.stderr.trim(),
-        "error: rendering is not available (render host not found; set FANDHE_BROWSER_RENDER_HOST)"
+        "error: rendering is not available (render host not found; set FANDHE_BROWSER_RENDER_HOST, or on macOS/Linux run 'cargo install fandhe-browser-servo-host --locked')"
     );
     assert!(!std::path::Path::new(&target).exists());
 }
@@ -682,4 +699,35 @@ fn cli1_query_file_without_value_exits_with_usage_error() {
         out.stderr.trim(),
         "error: missing required argument 'PATH'; run 'fandhe-browser --help' for usage"
     );
+}
+
+/// `RENDER-3`・#1539: ホストが `hello` の前に終了したら、版を揃える案内を最終行に出して失敗する。
+#[cfg(unix)]
+#[test]
+fn render3_screenshot_reports_host_exit_before_hello_with_version_hint() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = OutDir::new("exit-before-hello");
+    let host = std::path::Path::new(&dir.file("fake-host")).to_path_buf();
+    std::fs::write(&host, "#!/bin/sh\nexit 1\n").expect("fake host can be written");
+    std::fs::set_permissions(&host, std::fs::Permissions::from_mode(0o755))
+        .expect("fake host can be made executable");
+    let target = dir.file("out.png");
+    let out = run_with_host(
+        "shot-exit-before-hello",
+        &["screenshot", "https://a.example/", &target],
+        None,
+        Some(&host),
+    );
+    assert_eq!(out.code, Some(1), "stderr: {}", out.stderr);
+    // 隔離できない環境では先に warning 行が出るため、最終行で比較する。
+    let last = out.stderr.lines().last().unwrap_or_default();
+    let version = env!("CARGO_PKG_VERSION");
+    assert_eq!(
+        last,
+        format!(
+            "error: render host exited before completing startup; its version may not match this CLI ({version}). Install the same version: on macOS/Linux run 'cargo install fandhe-browser-servo-host --version {version} --locked --force'; if FANDHE_BROWSER_RENDER_HOST is set, point it at the new binary"
+        )
+    );
+    assert!(out.stdout.is_empty());
+    assert!(!std::path::Path::new(&target).exists());
 }

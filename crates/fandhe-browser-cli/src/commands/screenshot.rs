@@ -264,19 +264,32 @@ pub(crate) enum ScreenshotError {
     Write(io::Error),
 }
 
+/// ホスト未解決時の表示（CLI-1・RENDER-5）。`harness/cli-conformance` が完全一致で比較する。
+/// 版は含めない（開発版で crates.io に無い版を案内しないため）。
+const RENDER_HOST_NOT_FOUND_MESSAGE: &str = "rendering is not available (render host not found; set FANDHE_BROWSER_RENDER_HOST, or on macOS/Linux run 'cargo install fandhe-browser-servo-host --locked')";
+
+/// ホストが `hello` の前に終了したときの表示（RENDER-3・TASK-38・#1539）。CLI の版はコンパイル時定数で、
+/// 実行時の値（URL・パス・stderr）は含めない。Windows は `cargo install` の対象外のため案内しない。
+const RENDER_HOST_EXITED_BEFORE_HELLO_MESSAGE: &str = concat!(
+    "render host exited before completing startup; its version may not match this CLI (",
+    env!("CARGO_PKG_VERSION"),
+    "). Install the same version: on macOS/Linux run 'cargo install fandhe-browser-servo-host --version ",
+    env!("CARGO_PKG_VERSION"),
+    " --locked --force'; if FANDHE_BROWSER_RENDER_HOST is set, point it at the new binary"
+);
+
 impl fmt::Display for ScreenshotError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Navigate(e) => write!(f, "{e}"),
-            Self::NoDocument => f.write_str(
-                "screenshot requires a fetched document (about:blank has no content)",
-            ),
+            Self::NoDocument => {
+                f.write_str("screenshot requires a fetched document (about:blank has no content)")
+            }
             Self::UserinfoNotAllowed => f.write_str("URL must not contain userinfo"),
             Self::OutputPath(e) => write!(f, "{e}"),
             Self::Render(e) => f.write_str(match e {
-                RenderError::RenderingDisabled => {
-                    "rendering is not available (render host not found; set FANDHE_BROWSER_RENDER_HOST)"
-                }
+                RenderError::RenderingDisabled => RENDER_HOST_NOT_FOUND_MESSAGE,
+                RenderError::HostExitedBeforeHello => RENDER_HOST_EXITED_BEFORE_HELLO_MESSAGE,
                 RenderError::Timeout => "render timed out",
                 RenderError::HostUnavailable => "render host is unavailable",
                 RenderError::ProtocolMismatch => "render host protocol mismatch",
@@ -763,16 +776,18 @@ mod tests {
             err,
             ScreenshotError::Render(RenderError::RenderingDisabled)
         ));
-        assert_eq!(
-            err.to_string(),
-            "rendering is not available (render host not found; set FANDHE_BROWSER_RENDER_HOST)"
-        );
+        assert_eq!(err.to_string(), RENDER_HOST_NOT_FOUND_MESSAGE);
+        assert!(RENDER_HOST_NOT_FOUND_MESSAGE.contains("cargo install fandhe-browser-servo-host"));
     }
 
     /// `CLI-1`: load 失敗の表示は固定文言で、Internal の詳細を含まない。
     #[test]
     fn cli1_screenshot_load_failures_have_fixed_messages() {
-        let cases: [(LoadFn, &str); 3] = [
+        let cases: [(LoadFn, &str); 4] = [
+            (
+                || Err(RenderError::HostExitedBeforeHello),
+                RENDER_HOST_EXITED_BEFORE_HELLO_MESSAGE,
+            ),
             (|| Err(RenderError::Timeout), "render timed out"),
             (
                 || Err(RenderError::HostUnavailable),
@@ -788,6 +803,16 @@ mod tests {
             assert_eq!(err.to_string(), expected);
             assert!(!format!("{err:?}").contains("secret"));
         }
+        let m = RENDER_HOST_EXITED_BEFORE_HELLO_MESSAGE;
+        assert!(m.contains("cargo install fandhe-browser-servo-host"), "{m}");
+        assert!(
+            m.contains(&format!("--version {}", env!("CARGO_PKG_VERSION"))),
+            "{m}"
+        );
+        assert!(
+            m.contains("--force") && m.contains("FANDHE_BROWSER_RENDER_HOST"),
+            "{m}"
+        );
     }
 
     /// `CLI-1`: URL の事前検証に落ちたらレンダラーの load を呼ばない。
