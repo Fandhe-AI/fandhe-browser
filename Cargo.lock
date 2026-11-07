@@ -746,7 +746,7 @@ dependencies = [
 
 [[package]]
 name = "fandhe-browser-ai"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "fandhe-backend-http",
  "fandhe-backend-routes",
@@ -759,7 +759,7 @@ dependencies = [
 
 [[package]]
 name = "fandhe-browser-cdp"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "fandhe-backend-core",
  "fandhe-backend-http",
@@ -772,7 +772,7 @@ dependencies = [
 
 [[package]]
 name = "fandhe-browser-cli"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "fandhe-backend-core",
  "fandhe-backend-http",
@@ -788,7 +788,7 @@ dependencies = [
 
 [[package]]
 name = "fandhe-browser-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "fandhe-browser-js",
  "fandhe-browser-profile",
@@ -802,7 +802,7 @@ dependencies = [
 
 [[package]]
 name = "fandhe-browser-js"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "boa_engine",
  "rustix 1.1.5",
@@ -812,7 +812,7 @@ dependencies = [
 
 [[package]]
 name = "fandhe-browser-mcp"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "rmcp",
  "serde_json",
@@ -821,7 +821,7 @@ dependencies = [
 
 [[package]]
 name = "fandhe-browser-profile"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "rustix 1.1.5",
  "windows-sys 0.61.2",
@@ -829,7 +829,7 @@ dependencies = [
 
 [[package]]
 name = "fandhe-browser-render"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "fandhe-browser-core",
  "serde_json",
@@ -3273,7 +3273,7 @@ checksum = "d135d17ab770252ad95e9a872d365cf3090e3be864a34ab46f48555993efc904"
 
 [[package]]
 name = "wpt-subset-runner"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "fandhe-browser-core",
 ]
