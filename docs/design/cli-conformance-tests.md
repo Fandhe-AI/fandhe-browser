@@ -145,7 +145,7 @@ ID は `CT-<コマンド>-<LINUX|MACOS|WINDOWS>`。3 OS とも argv の形は同
 - argv: `["screenshot", "https://example.com/", "<TMP>/shot.png"]`（Windows は `<TMP>\shot.png`）
 - 期待 stdout: `width=1280 height=800 bytes=<N> url=https://example.com/`（1 行）。stderr は空。終了コード 0
 - 副作用: `shot.png` ができる。先頭 8 バイトが PNG シグネチャ `89 50 4E 47 0D 0A 1A 0A`、IHDR が 1280×800、ファイルサイズが `<N>` と一致する
-- 描画ホストが無い場合: stderr `error: rendering is not available (render host not found; set FANDHE_BROWSER_RENDER_HOST)`・終了コード 1（Linux で実測）。これは前提未充足のシグネチャとして記録し、合格にはしない
+- 描画ホストが無い場合: stderr `error: rendering is not available (render host not found; set FANDHE_BROWSER_RENDER_HOST, or on macOS/Linux run 'cargo install fandhe-browser-servo-host --locked')`・終了コード 1（Linux で実測）。これは前提未充足のシグネチャとして記録し、合格にはしない
 
 ### 3.5 プロファイル指定（`CT-PROFILE-*`）
 

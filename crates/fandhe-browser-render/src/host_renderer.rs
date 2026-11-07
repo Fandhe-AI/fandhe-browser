@@ -208,6 +208,7 @@ fn map_host_error(err: HostProcessError) -> RenderError {
         HostProcessError::Disabled | HostProcessError::InvalidHostBinary(_) => {
             RenderError::RenderingDisabled
         }
+        HostProcessError::ExitedBeforeHello => RenderError::HostExitedBeforeHello,
         HostProcessError::SpawnFailed
         | HostProcessError::WorkDirFailed
         | HostProcessError::Crashed
@@ -334,6 +335,10 @@ mod tests {
             (HostProcessError::SpawnFailed, R::HostUnavailable),
             (HostProcessError::WorkDirFailed, R::HostUnavailable),
             (HostProcessError::Crashed, R::HostUnavailable),
+            (
+                HostProcessError::ExitedBeforeHello,
+                R::HostExitedBeforeHello,
+            ),
             (HostProcessError::ResourceLimitExceeded, R::HostUnavailable),
             (HostProcessError::CircuitOpen, R::HostUnavailable),
             (

@@ -199,7 +199,7 @@ mod tests {
     }
 
     /// `RENDER-3`: ホストパスが与えられると `AppState` 経由の描画呼び出しがホストの起動に届く。
-    /// 構築時には起動しない（遅延起動）。偽ホストは hello を返さず終了するため `HostUnavailable`。
+    /// 構築時には起動しない（遅延起動）。偽ホストは hello を返さず終了するため `HostExitedBeforeHello`。
     /// unix 限定なのは偽実行ファイル（シェルスクリプト）の仕組みが unix 依存のため
     /// （3 OS での完全な往復は #237・TASK-38.8a）。
     #[cfg(unix)]
@@ -247,7 +247,7 @@ mod tests {
         let err = app
             .capture_screenshot(&ScreenshotOptions::default())
             .unwrap_err();
-        assert!(matches!(err, RenderError::HostUnavailable), "{err:?}");
+        assert!(matches!(err, RenderError::HostExitedBeforeHello), "{err:?}");
         assert!(reached.exists(), "host must have been spawned");
     }
 

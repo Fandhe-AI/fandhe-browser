@@ -35,6 +35,7 @@ pub fn variant(e: &RenderError) -> &'static str {
         RenderError::ElementNotFound => "ElementNotFound",
         RenderError::Timeout => "Timeout",
         RenderError::HostUnavailable => "HostUnavailable",
+        RenderError::HostExitedBeforeHello => "HostExitedBeforeHello",
         RenderError::ProtocolMismatch => "ProtocolMismatch",
         RenderError::PageNotLoaded => "PageNotLoaded",
         RenderError::Internal(_) => "Internal",
@@ -392,7 +393,7 @@ fn t_api_recovery_after_failure() {
 fn t_api_circuit_breaker() {
     let (root, r) = loaded("b-breaker", "crash-on-start", short_timeouts());
     for _ in 0..3 {
-        expect_variant(&r, "load", "HostUnavailable");
+        expect_variant(&r, "load", "HostExitedBeforeHello");
     }
     assert_eq!(count(&root.0, "spawns"), 3);
     expect_variant(&r, "load", "HostUnavailable");

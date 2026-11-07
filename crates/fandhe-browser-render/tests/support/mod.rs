@@ -177,6 +177,15 @@ pub fn fake_host() -> ! {
     match scenario {
         "hello-timeout" => std::thread::sleep(Duration::from_secs(60)),
         "crash-on-start" => std::process::exit(1),
+        // hello 前に RSS 上限を超える（ハンドシェイク中の ResourceLimitExceeded 昇格の確認用）。
+        "rss-before-hello" => {
+            let mut mem = vec![0u8; 96 * 1024 * 1024];
+            for i in (0..mem.len()).step_by(4096) {
+                mem[i] = 1;
+            }
+            std::hint::black_box(&mem);
+            std::thread::sleep(Duration::from_secs(60));
+        }
         _ => {}
     }
     let mut hello: Value = serde_json::from_str(HELLO_OK).expect("fixture");

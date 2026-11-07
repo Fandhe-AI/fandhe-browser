@@ -331,6 +331,10 @@ pub enum RenderError {
     /// ホストが未起動・クラッシュ済み、またはサーキットブレーカー作動中（RENDER-3・TASK-38。
     /// 設計 §2.6・§2.7）。
     HostUnavailable,
+    /// `hello` を返す前にホストが終了した（RENDER-3・TASK-38・#1539）。`hello` 後の終了や
+    /// ブレーカー作動中の [`RenderError::HostUnavailable`] と区別する。CLI とホストの版の
+    /// 不一致が典型だが、版以外の原因でも同じ分類になるため断定しない。
+    HostExitedBeforeHello,
     /// `hello` のプロトコル版の不一致、またはプロトコル違反（RENDER-3・TASK-38。設計 §2.2）。
     ProtocolMismatch,
     /// 描画するページがない（ナビゲーション未実行、または遷移中で結果なし）。
@@ -355,6 +359,7 @@ impl std::fmt::Debug for RenderError {
             Self::ElementNotFound => f.write_str("ElementNotFound"),
             Self::Timeout => f.write_str("Timeout"),
             Self::HostUnavailable => f.write_str("HostUnavailable"),
+            Self::HostExitedBeforeHello => f.write_str("HostExitedBeforeHello"),
             Self::ProtocolMismatch => f.write_str("ProtocolMismatch"),
             Self::PageNotLoaded => f.write_str("PageNotLoaded"),
             // 内部詳細（ファイルパス等）を含みうるため、variant 名のみを出力し
@@ -385,6 +390,9 @@ impl std::fmt::Display for RenderError {
             Self::ElementNotFound => write!(f, "element not found"),
             Self::Timeout => write!(f, "render operation timed out"),
             Self::HostUnavailable => write!(f, "render host is unavailable"),
+            Self::HostExitedBeforeHello => {
+                write!(f, "render host exited before completing startup")
+            }
             Self::ProtocolMismatch => write!(f, "render host protocol mismatch"),
             Self::PageNotLoaded => write!(f, "no page is loaded for rendering"),
             Self::Internal(_) => write!(f, "internal render error"),
@@ -594,6 +602,10 @@ mod tests {
             "render host is unavailable"
         );
         assert_eq!(
+            RenderError::HostExitedBeforeHello.to_string(),
+            "render host exited before completing startup"
+        );
+        assert_eq!(
             RenderError::ProtocolMismatch.to_string(),
             "render host protocol mismatch"
         );
@@ -607,6 +619,10 @@ mod tests {
     #[test]
     fn render3_new_variants_debug_is_variant_name() {
         assert_eq!(format!("{:?}", RenderError::Timeout), "Timeout");
+        assert_eq!(
+            format!("{:?}", RenderError::HostExitedBeforeHello),
+            "HostExitedBeforeHello"
+        );
         assert_eq!(
             format!("{:?}", RenderError::HostUnavailable),
             "HostUnavailable"
@@ -675,6 +691,7 @@ mod tests {
         assert_eq!(RenderError::ElementNotFound.internal_detail(), None);
         assert_eq!(RenderError::Timeout.internal_detail(), None);
         assert_eq!(RenderError::HostUnavailable.internal_detail(), None);
+        assert_eq!(RenderError::HostExitedBeforeHello.internal_detail(), None);
         assert_eq!(RenderError::ProtocolMismatch.internal_detail(), None);
         assert_eq!(RenderError::PageNotLoaded.internal_detail(), None);
     }
