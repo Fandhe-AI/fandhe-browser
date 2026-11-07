@@ -674,5 +674,85 @@ mod tests {
                 Err(e) => panic!("{e:?}"),
             }
         }
+
+        /// 偽ホスト: 版を出し、loopback の listener へ `nc` で接続を試みて終了コードを出す。
+        /// env が空（PATH なし）のため絶対パスを使う。出力は stdout 上限 256 バイトに収まる。
+        #[cfg(target_os = "macos")]
+        fn nc_probe_host(d: &Dir, port: u16) -> PathBuf {
+            fake_host(
+                d,
+                &format!(
+                    "echo 'fandhe-browser-servo-host 1.0.0'; /usr/bin/nc -z -w 2 127.0.0.1 {port}; echo \"nc=$?\""
+                ),
+            )
+        }
+
+        /// RENDER-3・SEC-2（#1556）: 実 sandbox-exec（Seatbelt）の下で版の検査が通り、外向きの接続
+        /// （loopback を含む）が拒否される。listener に接続が届かないことも確かめる。
+        /// sandbox-exec が使えない環境ではその理由を確かめる（CI では必ず使える）。
+        #[cfg(target_os = "macos")]
+        #[test]
+        fn render3_version_run_under_seatbelt_denies_outbound() {
+            let d = Dir::new("seatbelt");
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+            listener.set_nonblocking(true).expect("nonblocking");
+            let port = listener.local_addr().expect("addr").port();
+            let h = nc_probe_host(&d, port);
+            let config = HostVersionRunConfig::new(EgressIsolationMode::Required)
+                .with_temp_root(d.work())
+                .with_timeout(Duration::from_secs(10))
+                .with_isolation_warning(Arc::new(|_| {}));
+            match run(&h, &config) {
+                Ok(out) => {
+                    assert_eq!(
+                        out.isolation,
+                        EgressIsolationStatus::Isolated(
+                            crate::host_process::IsolationBackend::SandboxExec
+                        )
+                    );
+                    let text = String::from_utf8(out.stdout).expect("utf8");
+                    assert!(text.contains("fandhe-browser-servo-host 1.0.0"), "{text}");
+                    assert!(text.contains("nc="), "nc must have run: {text}");
+                    assert!(!text.contains("nc=0"), "outbound must be denied: {text}");
+                    let accepted = listener.accept();
+                    assert!(
+                        matches!(&accepted, Err(e) if e.kind() == io::ErrorKind::WouldBlock),
+                        "no connection must reach the listener: {accepted:?}"
+                    );
+                }
+                Err(HostVersionRunError::IsolationUnavailable(r)) => {
+                    let ci = std::env::var("GITHUB_ACTIONS").is_ok_and(|v| v == "true");
+                    assert!(!ci, "sandbox-exec must work in CI: {r:?}");
+                    eprintln!("skipped: isolation unavailable: {r:?}");
+                }
+                Err(e) => panic!("{e:?}"),
+            }
+        }
+
+        /// RENDER-3・SEC-2（#1556）: 陽性対照。同じ偽ホストを隔離なしで走らせると `nc` が成功し、
+        /// listener に接続が届く（`nc` が存在し、拒否の検証が空振りでないことの証明）。
+        #[cfg(target_os = "macos")]
+        #[test]
+        fn render3_version_run_unisolated_nc_reaches_listener_positive_control() {
+            let d = Dir::new("seatbelt-ctl");
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+            listener.set_nonblocking(true).expect("nonblocking");
+            let port = listener.local_addr().expect("addr").port();
+            let h = nc_probe_host(&d, port);
+            let out = run_unisolated(&d, &h, Duration::from_secs(10), 256).expect("ok");
+            let text = String::from_utf8(out.stdout).expect("utf8");
+            assert!(text.contains("nc=0"), "nc must connect: {text}");
+            let deadline = Instant::now() + Duration::from_secs(3);
+            loop {
+                match listener.accept() {
+                    Ok(_) => break,
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                        assert!(Instant::now() < deadline, "no connection reached listener");
+                        std::thread::sleep(Duration::from_millis(50));
+                    }
+                    Err(e) => panic!("{e:?}"),
+                }
+            }
+        }
     }
 }
