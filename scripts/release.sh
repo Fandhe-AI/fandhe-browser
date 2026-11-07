@@ -1,24 +1,29 @@
 #!/usr/bin/env bash
 # crates.io 公開の制御（#1531）。`.github/workflows/release.yml` の verify・publish ジョブが呼ぶ。
-# 公開対象 8 crate と公開順は publish-crates.sh が正本。
+# 公開対象 9 件（本体 workspace の 8 crate と別 workspace の Servo ホスト）と公開順は publish-crates.sh が正本。
 #
 # 使い方: scripts/release.sh <plan|dry-run|publish|index-path NAME|self-test>
 #   plan      入力の検証と公開状況の判定（トークン不要）。結果を RELEASE_DRYRUN・RELEASE_PENDING として
 #             GITHUB_ENV（未設定なら標準出力）へ出す
-#   dry-run   plan が出した RELEASE_DRYRUN の crate 群に対し `cargo publish --dry-run --locked` を実行する
+#   dry-run [workspace|host]
+#             plan が出した RELEASE_DRYRUN の crate 群に対し `cargo publish --dry-run --locked` を実行する。
+#             workspace: 本体の crate だけ（`-p` 群を 1 回で検証）、host: Servo ホストだけ
+#             （`--manifest-path servo-host/Cargo.toml`）、引数なし: 両方を順に。対象が無い側は notice を出して成功する
+#   is-published NAME  NAME が RELEASE_VERSION で公開済みかを yes / no で出力する（smoke ジョブの判定用）
 #   publish   plan が出した RELEASE_PENDING を公開順に `cargo publish --no-verify` する（公開済みは飛ばす。
 #             レート制限 429 は待って再試行する。要 CARGO_REGISTRY_TOKEN）
 #   check-environment  Environment crates-io-release が存在し required_reviewers の保護ルールを持つことを
 #             GitHub API で確かめる（mode=publish の verify で実行。要 GITHUB_TOKEN・GITHUB_REPOSITORY）
 #   self-test cargo の公開 API を模した shim と合成 index で上の判定を確認する（ネットワーク不要）
-# 入力は環境変数（式を run に展開しない）: RELEASE_CRATE（8 crate 名 または all）・RELEASE_VERSION・RELEASE_MODE
+# 入力は環境変数（式を run に展開しない）: RELEASE_CRATE（9 件の名前 または all）・RELEASE_VERSION・RELEASE_MODE
 #
 # 途中再開の方針（crates.io への公開は取り消せず、8 crate の公開は途中で止まり得るため）:
 #   - crate=all: 一部が公開済みでも続行し、未公開分だけを対象にする。全件公開済みなら失敗
 #   - crate=単一: 公開済みなら失敗
 #   - dry-run は「未公開の全 crate」を一括で行う（未公開の workspace 依存を registry から解決できない
 #     ため、単一 crate を指定しても未公開の依存ぶんを同時に検証する。cargo は一括指定の crate 同士を
-#     ローカルの一時 registry で解決する）
+#     ローカルの一時 registry で解決する）。Servo ホストは本体と依存し合わないため、ホスト単一指定ではホストだけ、
+#     本体 crate の単一指定ではホストを含めない（Servo のコールドビルドを不用意に走らせない。#1543）
 #   - mode=publish は main ブランチ（GITHUB_REF=refs/heads/main）からだけ許す（plan で失敗させる）
 #   - mode=publish で公開済みの crate がある場合、その .crate の .cargo_vcs_info.json の git.sha1 が
 #     GITHUB_SHA と一致することを要求する（途中再開で別 commit の成果物が混在しないように。読めない・
@@ -28,7 +33,7 @@
 #   - mode=publish の単一指定は、その crate の workspace 依存（dev 依存を含む）が公開済みであること
 #     を要求する（公開時の依存解決に必要）
 # レート制限: crates.io の新規 crate 公開は burst 5 件、以後 10 分に 1 件（crates.io の rate_limiter.rs）。
-# 8 crate の初回公開では 6 件目以降が 429 になるため、待って再試行する。
+# 9 件の初回公開では 6 件目以降が 429 になるため、待って再試行する。
 set -euo pipefail
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=./lib.sh
@@ -168,6 +173,20 @@ in_list() { # in_list NEEDLE LIST...
   return 1
 }
 
+# version_problems META VERSION TARGETS...: 対象 crate の Cargo.toml の version が入力と一致しない場合に
+# 1 行目へ理由を出力する（一致すれば空）。META は本体とホストの packages を合わせた JSON。
+version_problems() {
+  local meta="$1" want="$2" c v
+  shift 2
+  for c in "$@"; do
+    v="$(printf '%s\n' "${meta}" | jq -r --arg n "${c}" '[.packages[] | select(.name == $n) | .version][0] // "(not found)"')"
+    if [ "${v}" != "${want}" ]; then
+      echo "version mismatch: ${c} Cargo.toml has '${v}' but input version is '${want}'"
+      return 0
+    fi
+  done
+}
+
 plan() {
   : "${RELEASE_CRATE:?RELEASE_CRATE is required}" "${RELEASE_VERSION:?RELEASE_VERSION is required}" "${RELEASE_MODE:?RELEASE_MODE is required}"
   require_cmd jq "required by release.sh"
@@ -180,31 +199,43 @@ plan() {
 
   local targets=()
   if [ "${RELEASE_CRATE}" = all ]; then
-    targets=("${PUBLIC_CRATES[@]}")
-  elif in_list "${RELEASE_CRATE}" "${PUBLIC_CRATES[@]}"; then
+    targets=("${RELEASE_CRATES[@]}")
+  elif in_list "${RELEASE_CRATE}" "${RELEASE_CRATES[@]}"; then
     targets=("${RELEASE_CRATE}")
   else
     die "crate '${RELEASE_CRATE}' is not in the public crate list"
   fi
 
-  local meta c v
+  # 本体 workspace とホスト（別 workspace）の metadata を 1 つの packages 配列に合わせる
+  local meta host_meta c vp
   meta="$(cargo metadata --no-deps --format-version 1 --locked)" || die "cargo metadata failed"
-  for c in "${targets[@]}"; do
-    v="$(printf '%s\n' "${meta}" | jq -r --arg n "${c}" '.packages[] | select(.name == $n) | .version')"
-    [ "${v}" = "${RELEASE_VERSION}" ] \
-      || die "version mismatch: ${c} Cargo.toml has '${v}' but input version is '${RELEASE_VERSION}'"
-  done
+  host_meta="$(cargo metadata --no-deps --format-version 1 --locked --manifest-path "${HOST_MANIFEST}")" \
+    || die "cargo metadata failed for ${HOST_MANIFEST}"
+  meta="$(jq -s -c '{packages: (map(.packages) | add)}' <<<"${meta}"$'\n'"${host_meta}")" \
+    || die "could not merge cargo metadata"
+  vp="$(version_problems "${meta}" "${RELEASE_VERSION}" "${targets[@]}")"
+  [ -z "${vp}" ] || die "${vp}"
 
-  # 全 8 crate の公開状況（未公開の全 crate は dry-run 対象。途中再開でも一括で検証する）
+  # 全 9 件の公開状況（未公開の全 crate は dry-run 対象。途中再開でも一括で検証する）
   local dryrun=() pending=() s
   local state=()
-  for c in "${PUBLIC_CRATES[@]}"; do
+  for c in "${RELEASE_CRATES[@]}"; do
     s="$(published "${c}" "${RELEASE_VERSION}")" || exit 1
     state+=("${s}")
     [ "${s}" = no ] && dryrun+=("${c}")
   done
+  # dry-run の対象を絞る（ホストと本体は依存し合わない。ホスト単一指定はホストだけ、本体の単一指定はホストを除く）
+  if [ "${RELEASE_CRATE}" = "${HOST_CRATE}" ]; then
+    local only_host=()
+    in_list "${HOST_CRATE}" ${dryrun[@]+"${dryrun[@]}"} && only_host=("${HOST_CRATE}")
+    dryrun=(${only_host[@]+"${only_host[@]}"})
+  elif [ "${RELEASE_CRATE}" != all ]; then
+    local only_ws=()
+    for c in ${dryrun[@]+"${dryrun[@]}"}; do [ "${c}" = "${HOST_CRATE}" ] || only_ws+=("${c}"); done
+    dryrun=(${only_ws[@]+"${only_ws[@]}"})
+  fi
   local i=0
-  for c in "${PUBLIC_CRATES[@]}"; do
+  for c in "${RELEASE_CRATES[@]}"; do
     if in_list "${c}" "${targets[@]}" && [ "${state[$i]}" = no ]; then pending+=("${c}"); fi
     i=$((i + 1))
   done
@@ -213,7 +244,7 @@ plan() {
   if [ "${RELEASE_MODE}" = publish ]; then
     local got
     i=0
-    for c in "${PUBLIC_CRATES[@]}"; do
+    for c in "${RELEASE_CRATES[@]}"; do
       if [ "${state[$i]}" = yes ]; then
         : "${GITHUB_SHA:?GITHUB_SHA is required to resume a publish}"
         got="$(crate_commit "${c}" "${RELEASE_VERSION}")" \
@@ -227,7 +258,7 @@ plan() {
 
   if [ "${RELEASE_CRATE}" = all ]; then
     [ "${#pending[@]}" -gt 0 ] || die "all public crates are already published at ${RELEASE_VERSION}"
-    [ "${#pending[@]}" -eq "${#PUBLIC_CRATES[@]}" ] \
+    [ "${#pending[@]}" -eq "${#RELEASE_CRATES[@]}" ] \
       || echo "::notice::resuming: already published crates are skipped (pending: ${pending[*]})"
   else
     [ "${#pending[@]}" -gt 0 ] || die "${RELEASE_CRATE} ${RELEASE_VERSION} is already published"
@@ -253,10 +284,29 @@ plan() {
 
 dry_run() {
   : "${RELEASE_DRYRUN:?run plan first}"
-  local args=() c
-  for c in ${RELEASE_DRYRUN}; do args+=(-p "${c}"); done
-  [ "${#args[@]}" -gt 0 ] || die "nothing to dry-run"
-  cargo publish --dry-run --locked "${args[@]}"
+  local which="${1:-both}" ws=() host=0 c ran=0
+  case "${which}" in both | workspace | host) ;; *) die "usage: dry-run [workspace|host]" ;; esac
+  for c in ${RELEASE_DRYRUN}; do
+    if [ "${c}" = "${HOST_CRATE}" ]; then host=1; else ws+=(-p "${c}"); fi
+  done
+  [ "${#ws[@]}" -gt 0 ] || [ "${host}" -eq 1 ] || die "nothing to dry-run"
+  if [ "${which}" != host ]; then
+    if [ "${#ws[@]}" -gt 0 ]; then
+      cargo publish --dry-run --locked "${ws[@]}"
+      ran=1
+    else
+      echo "::notice::no workspace crate in this dry-run"
+    fi
+  fi
+  if [ "${which}" != workspace ]; then
+    if [ "${host}" -eq 1 ]; then
+      cargo publish --dry-run --locked --manifest-path "${HOST_MANIFEST}"
+      ran=1
+    else
+      echo "::notice::${HOST_CRATE} is not part of this dry-run"
+    fi
+  fi
+  [ "${ran}" -eq 1 ] || echo "::notice::dry-run (${which}): nothing to do"
 }
 
 publish() {
@@ -265,7 +315,7 @@ publish() {
   local pending_list=()
   read -r -a pending_list <<<"${RELEASE_PENDING}"
   out="$(mktemp)"
-  for c in "${PUBLIC_CRATES[@]}"; do
+  for c in "${RELEASE_CRATES[@]}"; do
     in_list "${c}" ${pending_list[@]+"${pending_list[@]}"} || continue
     attempt=1
     while :; do
@@ -278,7 +328,9 @@ publish() {
       echo "publishing ${c} ${RELEASE_VERSION} (attempt ${attempt}/${max})"
       # --no-verify: token を持つこの環境で依存の build.rs・proc-macro を動かさない。検証ビルドは同じ commit の
       # verify・verify-macos の dry-run が済ませている（mode=publish は main だけ・commit 一致も plan が確認する）
-      if cargo publish -p "${c}" --locked --no-verify 2>&1 | tee "${out}"; then
+      # ホストは別 workspace のため `-p` ではなく `--manifest-path` で指定する（crate_select_args）
+      crate_select_args "${c}"
+      if cargo publish "${CRATE_SEL[@]}" --locked --no-verify 2>&1 | tee "${out}"; then
         break
       fi
       # tee 越しの終了コードは pipefail で cargo のものになる。公開済みになっていれば成功扱い
@@ -316,7 +368,15 @@ self_test() {
 #!/usr/bin/env bash
 if [ "\$1" = publish ]; then
   name=""; prev=""
-  for a in "\$@"; do [ "\$prev" = -p ] && name="\$a"; prev="\$a"; done
+  for a in "\$@"; do
+    [ "\$prev" = -p ] && name="\$a"
+    case "\$prev:\$a" in --manifest-path:*servo-host/Cargo.toml) name=fandhe-browser-servo-host ;; esac
+    prev="\$a"
+  done
+  # 対象が -p でも --manifest-path servo-host/Cargo.toml でもない呼び出しは想定外（失敗させて検出する）
+  [ -n "\$name" ] || { echo "shim: unexpected cargo publish invocation: \$*" >&2; exit 99; }
+  # dry-run は公開ではない（index へ書かない）
+  case " \$* " in *" --dry-run "*) echo "\$*" >>"${tmp}/dryrun.log"; exit 0 ;; esac
   echo "\$*" >>"${tmp}/publish.log"
   if [ -f "${tmp}/failmsg-\${name}" ]; then
     cat "${tmp}/failmsg-\${name}"
@@ -338,7 +398,7 @@ SHIM
     shift 2
     ( cd "${ROOT_DIR}" && env PATH="${tmp}/bin:${PATH}" RELEASE_INDEX_DIR="${tmp}/index" RELEASE_RETRY_SLEEP=0 \
         RELEASE_CRATE_DIR="${tmp}/crates" GITHUB_REF=refs/heads/main GITHUB_SHA="${sha}" \
-        CARGO_REGISTRY_TOKEN=dummy "$@" bash "${DIR}/release.sh" "${SELF_CMD}" ) >"${tmp}/out" 2>&1 || rc=$?
+        CARGO_REGISTRY_TOKEN=dummy "$@" bash "${DIR}/release.sh" ${SELF_CMD} ) >"${tmp}/out" 2>&1 || rc=$?
     if { [ "${expect}" = ok ] && [ "${rc}" -eq 0 ]; } || { [ "${expect}" = fail ] && [ "${rc}" -ne 0 ]; }; then
       echo "OK(self-test): ${label}"
     else
@@ -367,7 +427,7 @@ SHIM
   run "version mismatch" fail RELEASE_CRATE=all RELEASE_VERSION=9.9.9 RELEASE_MODE=dry-run-only
   # 何も公開されていない
   run "plan all (nothing published)" ok RELEASE_CRATE=all RELEASE_VERSION="${version}" RELEASE_MODE=dry-run-only
-  has "all pending in order" "publish=\[fandhe-browser-profile fandhe-browser-js fandhe-browser-core fandhe-browser-ai fandhe-browser-cdp fandhe-browser-render fandhe-browser-cli fandhe-browser-mcp\]"
+  has "all pending in order" "publish=\[fandhe-browser-profile fandhe-browser-js fandhe-browser-core fandhe-browser-ai fandhe-browser-cdp fandhe-browser-render fandhe-browser-cli fandhe-browser-mcp fandhe-browser-servo-host\]"
   run "single cli, dry-run-only, deps unpublished" ok RELEASE_CRATE=fandhe-browser-cli RELEASE_VERSION="${version}" RELEASE_MODE=dry-run-only
   run "single cli, publish, deps unpublished" fail RELEASE_CRATE=fandhe-browser-cli RELEASE_VERSION="${version}" RELEASE_MODE=publish
   run "single profile, publish" ok RELEASE_CRATE=fandhe-browser-profile RELEASE_VERSION="${version}" RELEASE_MODE=publish
@@ -404,10 +464,10 @@ SHIM
   # publish: 429 を 1 回挟んで再開できる（profile・js は公開済みで飛ばす）
   printf 'error: failed to publish to registry at https://crates.io\n\nCaused by:\n  the remote server responded with an error (status 429 Too Many Requests): You have published too many new crates in a short period of time. Please try again after Fri, 06 Nov 2026 12:00:00 GMT\n' >"${tmp}/failmsg-fandhe-browser-ai"
   SELF_CMD=publish
-  run "publish with 429 retry" ok RELEASE_CRATE=all RELEASE_VERSION="${version}" RELEASE_MODE=publish RELEASE_PENDING="fandhe-browser-core fandhe-browser-ai fandhe-browser-cdp fandhe-browser-render fandhe-browser-cli fandhe-browser-mcp"
+  run "publish with 429 retry" ok RELEASE_CRATE=all RELEASE_VERSION="${version}" RELEASE_MODE=publish RELEASE_PENDING="fandhe-browser-core fandhe-browser-ai fandhe-browser-cdp fandhe-browser-render fandhe-browser-cli fandhe-browser-mcp fandhe-browser-servo-host"
   has "retry message" "rate limited"
-  if [ "$(grep -c . "${tmp}/publish.log")" = 7 ] && ! grep -q 'fandhe-browser-profile' "${tmp}/publish.log"; then
-    echo "OK(self-test): publish order and skip (7 attempts incl. one retry)"
+  if [ "$(grep -c . "${tmp}/publish.log")" = 8 ] && ! grep -q 'fandhe-browser-profile' "${tmp}/publish.log"; then
+    echo "OK(self-test): publish order and skip (8 attempts incl. one retry)"
   else
     echo "NG(self-test): unexpected publish log:" >&2; sed 's/^/    /' "${tmp}/publish.log" >&2; fail=1
   fi
@@ -416,6 +476,18 @@ SHIM
   else
     echo "NG(self-test): cargo publish without --no-verify" >&2; fail=1
   fi
+  # ホストは最後に `--manifest-path servo-host/Cargo.toml` で公開され、`-p` では指定されない
+  if [ "$(tail -n 1 "${tmp}/publish.log")" = "publish --manifest-path servo-host/Cargo.toml --locked --no-verify" ] \
+    && ! grep -q -- '-p fandhe-browser-servo-host' "${tmp}/publish.log"; then
+    echo "OK(self-test): host is published last via --manifest-path"
+  else
+    echo "NG(self-test): host publish invocation:" >&2; sed 's/^/    /' "${tmp}/publish.log" >&2; fail=1
+  fi
+  # ホストへの 429 も再試行する
+  rm -f "${tmp}/index/$(index_path fandhe-browser-servo-host)"
+  printf 'error: failed to publish to registry\n\nCaused by:\n  the remote server responded with an error (status 429 Too Many Requests): slow down\n' >"${tmp}/failmsg-fandhe-browser-servo-host"
+  run "429 on the host is retried" ok RELEASE_CRATE=all RELEASE_VERSION="${version}" RELEASE_MODE=publish RELEASE_PENDING="fandhe-browser-servo-host"
+  has "host retried" "rate limited"
   # 数字の偶然一致（429 を含む別の文面）では再試行せず失敗する
   rm -f "${tmp}/index/$(index_path fandhe-browser-cdp)"
   printf 'error: failed to publish: archive is 14290 bytes\n' >"${tmp}/failmsg-fandhe-browser-cdp"
@@ -425,11 +497,88 @@ SHIM
   run "429 (Code variant) is retried" ok RELEASE_CRATE=all RELEASE_VERSION="${version}" RELEASE_MODE=publish RELEASE_PENDING="fandhe-browser-cdp"
   has "retried" "rate limited"
   SELF_CMD=plan
-  for c in "${PUBLIC_CRATES[@]}"; do mark "${c}"; done
+  for c in "${RELEASE_CRATES[@]}"; do mark "${c}"; done
   run "all published -> fail" fail RELEASE_CRATE=all RELEASE_VERSION="${version}" RELEASE_MODE=publish
   has "all published message" "already published"
   SELF_CMD=publish
   run "publish requires token" fail RELEASE_CRATE=all RELEASE_VERSION="${version}" RELEASE_MODE=publish RELEASE_PENDING="fandhe-browser-core" CARGO_REGISTRY_TOKEN=
+
+  # --- Servo ホスト（別 workspace）の経路（#1543） ---
+  # 0.1.0 の実状況の再現: 本体 8 crate が公開済み・ホストだけ未公開
+  rm -rf "${tmp}/index" "${tmp}/crates" "${tmp}/publish.log" "${tmp}/dryrun.log"
+  mkdir -p "${tmp}/index" "${tmp}/crates"
+  SELF_CMD=plan
+  for c in "${PUBLIC_CRATES[@]}"; do mark "${c}"; done
+  run "plan all, only the host unpublished (publish)" ok RELEASE_CRATE=all RELEASE_VERSION="${version}" RELEASE_MODE=publish
+  has "host-only plan" "dry-run=\[fandhe-browser-servo-host\] publish=\[fandhe-browser-servo-host\]"
+  run "plan all, host only (dry-run-only)" ok RELEASE_CRATE=all RELEASE_VERSION="${version}" RELEASE_MODE=dry-run-only
+  mark fandhe-browser-js cccccccccccccccccccccccccccccccccccccccc
+  run "published workspace crate from another commit (host pending)" fail RELEASE_CRATE=all RELEASE_VERSION="${version}" RELEASE_MODE=publish
+  has "host-pending commit mismatch" "came from commit"
+  mark fandhe-browser-js
+  # 公開済みのホストが別 commit なら再開できない
+  mark fandhe-browser-servo-host cccccccccccccccccccccccccccccccccccccccc
+  run "published host from another commit" fail RELEASE_CRATE=all RELEASE_VERSION="${version}" RELEASE_MODE=publish
+  has "host commit mismatch" "published fandhe-browser-servo-host .* came from commit"
+  run "host already published (single)" fail RELEASE_CRATE=fandhe-browser-servo-host RELEASE_VERSION="${version}" RELEASE_MODE=dry-run-only
+  rm -rf "${tmp}/index" "${tmp}/crates"
+  mkdir -p "${tmp}/index" "${tmp}/crates"
+  # 何も公開されていない状態でのホスト単一指定（ホストは本体 crate に依存しないため公開も通る）
+  run "single host, dry-run-only" ok RELEASE_CRATE=fandhe-browser-servo-host RELEASE_VERSION="${version}" RELEASE_MODE=dry-run-only
+  has "single host dry-run target" "dry-run=\[fandhe-browser-servo-host\] publish=\[fandhe-browser-servo-host\]"
+  run "single host, publish" ok RELEASE_CRATE=fandhe-browser-servo-host RELEASE_VERSION="${version}" RELEASE_MODE=publish
+  # 本体 crate の単一指定の dry-run 対象にホストは含めない
+  run "single cli excludes the host from dry-run" ok RELEASE_CRATE=fandhe-browser-cli RELEASE_VERSION="${version}" RELEASE_MODE=dry-run-only
+  if grep -q 'dry-run=\[[^]]*servo-host' "${tmp}/out"; then
+    echo "NG(self-test): host leaked into a workspace crate dry-run" >&2; sed 's/^/    /' "${tmp}/out" >&2; fail=1
+  else
+    echo "OK(self-test): host excluded from a workspace crate dry-run"
+  fi
+  # dry-run のコマンド分割（workspace は -p 群だけ、host は --manifest-path だけ）
+  SELF_CMD="dry-run workspace"
+  : >"${tmp}/dryrun.log"
+  run "dry-run workspace" ok RELEASE_DRYRUN="fandhe-browser-core fandhe-browser-servo-host"
+  if [ "$(cat "${tmp}/dryrun.log")" = "publish --dry-run --locked -p fandhe-browser-core" ]; then
+    echo "OK(self-test): dry-run workspace uses -p only"
+  else
+    echo "NG(self-test): dry-run workspace log:" >&2; sed 's/^/    /' "${tmp}/dryrun.log" >&2; fail=1
+  fi
+  SELF_CMD="dry-run host"
+  : >"${tmp}/dryrun.log"
+  run "dry-run host" ok RELEASE_DRYRUN="fandhe-browser-core fandhe-browser-servo-host"
+  if [ "$(cat "${tmp}/dryrun.log")" = "publish --dry-run --locked --manifest-path servo-host/Cargo.toml" ]; then
+    echo "OK(self-test): dry-run host uses --manifest-path only"
+  else
+    echo "NG(self-test): dry-run host log:" >&2; sed 's/^/    /' "${tmp}/dryrun.log" >&2; fail=1
+  fi
+  run "dry-run host without the host in the plan" ok RELEASE_DRYRUN="fandhe-browser-core"
+  has "host skipped notice" "not part of this dry-run"
+  SELF_CMD="dry-run"
+  : >"${tmp}/dryrun.log"
+  run "dry-run both" ok RELEASE_DRYRUN="fandhe-browser-core fandhe-browser-servo-host"
+  if [ "$(grep -c . "${tmp}/dryrun.log")" = 2 ]; then
+    echo "OK(self-test): dry-run runs both groups"
+  else
+    echo "NG(self-test): dry-run both log:" >&2; sed 's/^/    /' "${tmp}/dryrun.log" >&2; fail=1
+  fi
+  run "dry-run with nothing" fail RELEASE_DRYRUN=" "
+  # is-published（smoke ジョブの判定）
+  SELF_CMD="is-published fandhe-browser-servo-host"
+  run "is-published (no)" ok RELEASE_VERSION="${version}"
+  has "is-published prints no" "^no$"
+  mark fandhe-browser-servo-host
+  run "is-published (yes)" ok RELEASE_VERSION="${version}"
+  has "is-published prints yes" "^yes$"
+  SELF_CMD="is-published not-a-crate"
+  run "is-published rejects an unknown crate" fail RELEASE_VERSION="${version}"
+  # version_problems（本体とホストの合成 metadata）
+  local vm='{"packages":[{"name":"a","version":"0.1.0"},{"name":"fandhe-browser-servo-host","version":"0.2.0"}]}'
+  if [ -z "$(version_problems "${vm}" 0.1.0 a)" ] && [[ "$(version_problems "${vm}" 0.1.0 a fandhe-browser-servo-host)" == *"fandhe-browser-servo-host Cargo.toml has '0.2.0'"* ]] \
+    && [[ "$(version_problems "${vm}" 0.1.0 missing)" == *"(not found)"* ]]; then
+    echo "OK(self-test): version_problems detects a host version skew"
+  else
+    echo "NG(self-test): version_problems" >&2; fail=1
+  fi
 
   # Environment の保護ルール検査（応答は GET environments/{name} の形）
   SELF_CMD=check-environment
@@ -452,10 +601,15 @@ SHIM
 
 case "${1:-}" in
   plan) plan ;;
-  dry-run) dry_run ;;
+  dry-run) dry_run "${2:-both}" ;;
+  is-published)
+    : "${RELEASE_VERSION:?RELEASE_VERSION is required}"
+    in_list "${2:?name required}" "${RELEASE_CRATES[@]}" || die "crate '$2' is not in the release list"
+    published "$2" "${RELEASE_VERSION}"
+    ;;
   publish) publish ;;
   check-environment) check_environment ;;
   index-path) index_path "${2:?name required}" ;;
   self-test) self_test ;;
-  *) echo "usage: $(basename "$0") <plan|dry-run|publish|check-environment|self-test>" >&2; exit 2 ;;
+  *) echo "usage: $(basename "$0") <plan|dry-run [workspace|host]|publish|is-published NAME|check-environment|self-test>" >&2; exit 2 ;;
 esac

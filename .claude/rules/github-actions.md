@@ -146,6 +146,6 @@ gh api repos/Fandhe-AI/fandhe-browser/actions/runs/<run-id>/jobs --paginate   # 
 | `update-external.yml` | schedule・dispatch | 約 2 分 | 日次 |
 | `bench-competitor.yml` | schedule・dispatch | 約 2〜3 分 | 週次・3 OS。対象バイナリ未配線のため skipped が多い |
 | `xos-measure.yml` | workflow_dispatch | 未計測（初回実行後に記入） | 手動のみ・3 OS・cache なし。timeout は cli-conformance が ubuntu 75・macOS 80・Windows 90 分、egress-isolation（#1387）が macOS 55・Windows 90 分、egress-host（#1437）が ubuntu 75（ubuntu・ubuntu-noaa の両エントリ）・macOS 60 分、compat-practical が 150 分（`repeat` 最大 5 回 × run_core.sh の全体期限 1200 秒）。実測で見直す |
-| `release.yml` | workflow_dispatch | 未計測（初回実行後に記入） | 手動のみ・required に含めない。crates.io 公開（8 crate）。`verify`（ubuntu）60 分・`verify-macos` 90 分・`publish` 180 分（新規 crate 公開のレート制限 burst 5・以後 10 分に 1 件の待ちを含む）・`smoke-macos` 90 分。詳細は [ci](./ci.md)「公開」
+| `release.yml` | workflow_dispatch | 8 crate の dry-run + 公開（run 42331194122）は verify 約 2 分・verify-macos 約 2.6 分・publish 約 26 分・smoke-macos 約 2.4 分。ホスト追加後は未計測 | 手動のみ・required に含めない。crates.io 公開（8 crate と Servo ホストの 9 件。#1543）。`timeout-minutes`: `verify`（ubuntu）90 分（ホストの dev コールドビルド約 30 分〔`servo-host-ubuntu` cache なし 29 分 53 秒〕＋本体 dry-run 約 2 分の約 1.5 倍）・`verify-macos` 90 分（ホスト dev 約 11 分＋本体約 3 分）・`publish` 180 分（新規 crate 公開のレート制限 burst 5・以後 10 分に 1 件の待ちを含む）・`smoke-macos` 120 分（ホストの release ビルド約 24 分で、遅延により 55 分で timeout した前例がある〔run 41711653563〕）・`smoke-ubuntu` 75 分（`egress-host-ubuntu` と同じ）。詳細は [ci](./ci.md)「公開」
 
 短縮余地は残るが、`rust-features-ubuntu` を複数ジョブに分割すると required checks の追加（ruleset 更新）が要るため、実施する場合はユーザー判断とする。

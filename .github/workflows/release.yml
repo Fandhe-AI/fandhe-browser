@@ -2,10 +2,12 @@ name: release
 
 # crates.io 公開ワークフロー（#1531。fandhe-frontend の release.yml の構成を参考にした）。
 # workflow_dispatch の明示入力（crate・version・mode）で起動し、次のジョブで進める。
-#   verify        入力のガードと `cargo publish --dry-run`（ubuntu。トークン不要）
-#   verify-macos  同じ dry-run を macOS で行い、ビルドされた `fandhe-browser` をスモーク実行する
+#   verify        入力のガードと `cargo publish --dry-run`（ubuntu。トークン不要。Servo ホストはディスク対策で本体の dry-run の後に別 target で行う）
+#   verify-macos  同じ dry-run を macOS で行い、ビルドされた `fandhe-browser` と Servo ホストをスモーク実行する
 #   publish       mode=publish のときだけ。Environment `crates-io-release`（承認ゲートのみ）の承認後、公開順に `cargo publish`
-#   smoke-macos   公開後（crate が all か fandhe-browser-cli のとき）に macOS で `cargo install` し、同じスモークを実行する
+#   smoke-macos   公開後（crate が all・fandhe-browser-cli・fandhe-browser-servo-host のとき）に macOS で CLI とホストを
+#                 `cargo install` し、スモークと render の実ホスト結合テスト（real_host）を実行する
+#   smoke-ubuntu  同じ内容を ubuntu で行い、egress 隔離（bubblewrap）の環境情報を記録する（隔離できなくても失敗にしない）
 # mode の既定は dry-run-only（安全側）。mode=publish は main の commit からだけ許す（plan が GITHUB_REF で失敗させ、
 # publish・smoke-macos の if でも絞る）。mode=publish の verify は Environment crates-io-release に required reviewers が
 # あることも GitHub API で確かめる。公開は `cargo publish --no-verify`（token のある環境で依存の build.rs・proc-macro を
@@ -15,18 +17,21 @@ name: release
 # fail-closed なため）。ガード・公開・スモークの実体は scripts/release.sh・scripts/release-smoke.sh にあり、
 # 本ファイルは呼び出しだけを持つ（.claude/rules/makefile.md）。入力は env 経由で扱い、`${{ }}` を run に展開しない。
 #
-# 公開対象は 8 crate（fandhe-browser-profile・js・core・ai・cdp・render・cli・mcp。版は共通）。
-# `harness/wpt_subset_runner`（publish = false）と `servo-host/`（別 workspace・MPL-2.0 の隔離。別配布）は対象外。
+# 公開対象は 9 件。本体 workspace の 8 crate（fandhe-browser-profile・js・core・ai・cdp・render・cli・mcp。版は共通）と、
+# 別 workspace の Servo ホスト fandhe-browser-servo-host（`--manifest-path servo-host/Cargo.toml` で扱う。MPL-2.0 の
+# 隔離は変えない。対象は macOS・Linux で Windows は対象外。#1543・RENDER-1・XOS-4）。
+# `harness/wpt_subset_runner`（publish = false）は対象外。
 # crate 入力を choice 型に固定して任意文字列・存在しない crate の指定を構造的に排除する。選択肢は
 # scripts/publish-crates.sh の一覧と一致させる（`make check-publish-ready` が検査する）。
 #
-# 公開順（`all`）: profile -> js -> core -> ai -> cdp -> render -> cli -> mcp（依存の下位から。mcp は独立）。
+# 公開順（`all`）: profile -> js -> core -> ai -> cdp -> render -> cli -> mcp -> servo-host（依存の下位から。mcp・ホストは独立）。
 # 単一 crate の公開は、その crate の workspace 依存（dev 依存を含む）が公開済みのときだけ通る。
 # 途中再開: `all` は一部が公開済みでも未公開分だけ続行し、全件公開済みなら失敗する。単一指定は公開済みなら失敗する。
-# dry-run は未公開の全 crate を一括で検証する（未公開の依存は registry から解決できないため）。
+# dry-run は未公開の全 crate を一括で検証する（未公開の依存は registry から解決できないため）。ホストは本体と依存し合わ
+# ないため、ホスト単一指定ではホストだけ、本体 crate の単一指定ではホストを含めない（Servo のビルドを不用意に走らせない）。
 #
 # レート制限: crates.io の新規 crate 公開は burst 5 件、以後 10 分に 1 件（crates.io の rate_limiter.rs）。
-# 8 crate の初回公開では 6 件目以降が 429 になるため、publish は待って再試行する（5 分間隔・crate ごとに最大 12 回）。
+# 9 件の初回公開では 6 件目以降が 429 になるため、publish は待って再試行する（5 分間隔・crate ごとに最大 12 回）。
 #
 # 前提（オーナー作業。本ワークフローは存在確認のみ行い作成しない）:
 #   - GitHub Environment `crates-io-release` を作成し required reviewers を設定する（承認ゲートのみ。初回 run で
@@ -54,6 +59,7 @@ on:
           - fandhe-browser-render
           - fandhe-browser-cli
           - fandhe-browser-mcp
+          - fandhe-browser-servo-host
       version:
         description: "公開するバージョン（例: 0.1.0）。対象 crate の Cargo.toml の version と完全一致する必要がある"
         type: string
@@ -80,7 +86,9 @@ jobs:
   verify:
     name: "verify: guards + cargo publish --dry-run (${{ inputs.crate }})"
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    # ホストの dev コールドビルドは PR の CI で約 30 分（servo-host-ubuntu・cache なし 29 分 53 秒）、
+    # 本体の dry-run は約 2 分（run 42331194122）。合計の約 1.5 倍に余裕を足して 90 分
+    timeout-minutes: 90
     permissions:
       contents: read
       # Environment の保護ルールの読み取り（GET /repos/{owner}/{repo}/environments/{name}）に使う
@@ -106,8 +114,43 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: bash scripts/release.sh check-environment
-      - name: "cargo publish --dry-run（未公開の全 crate・--locked）"
-        run: bash scripts/release.sh dry-run
+      - name: "cargo publish --dry-run（未公開の本体 crate・--locked）"
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/verify-ws
+        run: bash scripts/release.sh dry-run workspace
+      # 小さい runner のディスク枯渇対策（#1525）。本体の target を消してからホストの検証ビルドに入る
+      - name: "ディスク空きの記録と本体 target の削除"
+        run: |
+          df -h /
+          rm -rf "${RUNNER_TEMP}/verify-ws"
+          df -h /
+      - name: "Servo ホストのビルド前提（apt・libclang）"
+        if: ${{ contains(format(' {0} ', env.RELEASE_DRYRUN), ' fandhe-browser-servo-host ') }}
+        run: bash scripts/release-host-env.sh ubuntu
+      - name: "cargo publish --dry-run（Servo ホスト・--locked）"
+        if: ${{ contains(format(' {0} ', env.RELEASE_DRYRUN), ' fandhe-browser-servo-host ') }}
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/verify-host
+          CARGO_PROFILE_DEV_DEBUG: line-tables-only
+        run: |
+          bash scripts/release.sh dry-run host
+          df -h /
+      - name: "smoke: 検証ビルドされた fandhe-browser-servo-host --selftest"
+        if: ${{ contains(format(' {0} ', env.RELEASE_DRYRUN), ' fandhe-browser-servo-host ') }}
+        run: |
+          set -euo pipefail
+          # cargo publish の検証ビルドの出力位置は cargo の版で変わり得るため、target 内から探す（無ければ失敗）
+          bin="$(find "${RUNNER_TEMP}/verify-host" -type f -name fandhe-browser-servo-host \
+            -path '*/debug/*' ! -path '*/deps/*' | head -1)"
+          if [ -z "${bin}" ] || [ ! -x "${bin}" ]; then
+            echo "::error::verified host binary not found under ${RUNNER_TEMP}/verify-host"
+            exit 1
+          fi
+          out="$("${bin}" --selftest)"
+          case "${out}" in
+            "selftest ok:"*) echo "OK: ${out}" ;;
+            *) echo "::error::host --selftest: unexpected output: ${out}"; exit 1 ;;
+          esac
 
   verify-macos:
     name: "verify-macos: cargo publish --dry-run + smoke (${{ inputs.crate }})"
@@ -132,8 +175,8 @@ jobs:
         run: echo "CARGO_TARGET_DIR=${RUNNER_TEMP}/verify-target" >> "${GITHUB_ENV}"
       - name: "guard: 入力・バージョン一致・crates.io 公開状況"
         run: bash scripts/release.sh plan
-      - name: "cargo publish --dry-run（未公開の全 crate・--locked）"
-        run: bash scripts/release.sh dry-run
+      - name: "cargo publish --dry-run（未公開の本体 crate・--locked）"
+        run: bash scripts/release.sh dry-run workspace
       - name: "smoke: 検証ビルドされた fandhe-browser"
         # cli が公開済みで検証対象外のときはバイナリが無いため、スモークは publish 後の smoke-macos が担う。
         run: |
@@ -146,6 +189,30 @@ jobs:
             esac
           fi
           bash scripts/release-smoke.sh "${bin}"
+      # ホストは CLI の隣に置かない（別の target で検証ビルドする）。隣に置くと CLI のスモークの前提が崩れる
+      - name: "Servo ホストのビルド前提（LLVM_OBJDUMP）"
+        if: ${{ contains(format(' {0} ', env.RELEASE_DRYRUN), ' fandhe-browser-servo-host ') }}
+        run: bash scripts/release-host-env.sh macos
+      - name: "cargo publish --dry-run（Servo ホスト・--locked）"
+        if: ${{ contains(format(' {0} ', env.RELEASE_DRYRUN), ' fandhe-browser-servo-host ') }}
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/verify-host-target
+        run: bash scripts/release.sh dry-run host
+      - name: "smoke: 検証ビルドされた fandhe-browser-servo-host --selftest"
+        if: ${{ contains(format(' {0} ', env.RELEASE_DRYRUN), ' fandhe-browser-servo-host ') }}
+        run: |
+          set -euo pipefail
+          bin="$(find "${RUNNER_TEMP}/verify-host-target" -type f -name fandhe-browser-servo-host \
+            -path '*/debug/*' ! -path '*/deps/*' | head -1)"
+          if [ -z "${bin}" ] || [ ! -x "${bin}" ]; then
+            echo "::error::verified host binary not found under ${RUNNER_TEMP}/verify-host-target"
+            exit 1
+          fi
+          out="$("${bin}" --selftest)"
+          case "${out}" in
+            "selftest ok:"*) echo "OK: ${out}" ;;
+            *) echo "::error::host --selftest: unexpected output: ${out}"; exit 1 ;;
+          esac
 
   publish:
     name: "publish: cargo publish (${{ inputs.crate }})"
@@ -190,14 +257,19 @@ jobs:
     name: "smoke-macos: cargo install + smoke"
     if: >-
       ${{ inputs.mode == 'publish' && github.ref == 'refs/heads/main'
-      && (inputs.crate == 'all' || inputs.crate == 'fandhe-browser-cli') }}
+      && (inputs.crate == 'all' || inputs.crate == 'fandhe-browser-cli'
+      || inputs.crate == 'fandhe-browser-servo-host') }}
     needs: publish
     runs-on: macos-latest
-    timeout-minutes: 90
+    # ホストの release ビルドは約 24 分（servo-host-macos）で、遅延により 55 分で timeout した前例がある（run 41711653563）。
+    # これに CLI の install（約 2.3 分）と real_host のビルド・実行を足して 120 分
+    timeout-minutes: 120
     env:
+      RELEASE_CRATE: ${{ inputs.crate }}
       RELEASE_VERSION: ${{ inputs.version }}
     steps:
       # スモークのスクリプトを取得するためだけに checkout する（導入するのは crates.io 上の公開物）。
+      # real_host は同じ commit の render crate のテストを使う。
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
           ref: ${{ github.sha }}
@@ -206,19 +278,63 @@ jobs:
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
         with:
           toolchain: stable
-      - name: "cargo install fandhe-browser-cli --locked"
-        # 公開直後は index への反映待ちがあり得るため、数回再試行する。
+      - name: "Servo ホストのビルド前提（LLVM_OBJDUMP）"
+        run: bash scripts/release-host-env.sh macos
+      - name: "cargo install（CLI とホスト・--locked）"
+        # 公開直後は index への反映待ちがあり得るため、スクリプトが数回再試行する。
+        run: bash scripts/release-install.sh "${RUNNER_TEMP}/install"
+      - name: "smoke: インストールされた fandhe-browser（とホスト）"
+        if: ${{ env.HAVE_CLI == '1' }}
         run: |
           set -euo pipefail
-          for attempt in 1 2 3 4 5 6; do
-            if cargo install fandhe-browser-cli --version "${RELEASE_VERSION}" --locked \
-              --root "${RUNNER_TEMP}/install"; then
-              exit 0
-            fi
-            echo "install attempt ${attempt} failed; retrying in 60s"
-            sleep 60
-          done
-          echo "::error::cargo install failed"
-          exit 1
-      - name: "smoke: インストールされた fandhe-browser"
-        run: bash scripts/release-smoke.sh "${RUNNER_TEMP}/install/bin/fandhe-browser"
+          host=""
+          if [ "${HAVE_HOST:-}" = 1 ]; then host="${RUNNER_TEMP}/install/bin/fandhe-browser-servo-host"; fi
+          bash scripts/release-smoke.sh "${RUNNER_TEMP}/install/bin/fandhe-browser" ${host:+"${host}"}
+      - name: "real_host: 公開されたホストで loopback のページを描画（ライブラリ層・外部へ出ない）"
+        if: ${{ env.HAVE_HOST == '1' }}
+        run: bash scripts/release-host-env.sh real-host "${RUNNER_TEMP}/install/bin/fandhe-browser-servo-host"
+
+  smoke-ubuntu:
+    name: "smoke-ubuntu: cargo install + smoke"
+    if: >-
+      ${{ inputs.mode == 'publish' && github.ref == 'refs/heads/main'
+      && (inputs.crate == 'all' || inputs.crate == 'fandhe-browser-cli'
+      || inputs.crate == 'fandhe-browser-servo-host') }}
+    needs: publish
+    runs-on: ubuntu-latest
+    # xos-measure の egress-host-ubuntu と同じ 75 分（ホストの release 約 15 分に本体の debug ビルドと実行）
+    timeout-minutes: 75
+    env:
+      RELEASE_CRATE: ${{ inputs.crate }}
+      RELEASE_VERSION: ${{ inputs.version }}
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          ref: ${{ github.sha }}
+          submodules: false
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
+        with:
+          toolchain: stable
+      - name: "Servo ホストのビルド前提（apt・libclang・bubblewrap）"
+        run: bash scripts/release-host-env.sh ubuntu
+      - name: "cargo install（CLI とホスト・--locked）"
+        run: bash scripts/release-install.sh "${RUNNER_TEMP}/install"
+      - name: "smoke: インストールされた fandhe-browser（とホスト）"
+        if: ${{ env.HAVE_CLI == '1' }}
+        run: |
+          set -euo pipefail
+          host=""
+          if [ "${HAVE_HOST:-}" = 1 ]; then host="${RUNNER_TEMP}/install/bin/fandhe-browser-servo-host"; fi
+          bash scripts/release-smoke.sh "${RUNNER_TEMP}/install/bin/fandhe-browser" ${host:+"${host}"}
+      - name: "real_host: 公開されたホストで loopback のページを描画（ライブラリ層・外部へ出ない）"
+        if: ${{ env.HAVE_HOST == '1' }}
+        run: |
+          df -h /
+          bash scripts/release-host-env.sh real-host "${RUNNER_TEMP}/install/bin/fandhe-browser-servo-host"
+          df -h /
+      # ubuntu-latest は AppArmor の制限で bubblewrap が使えないことがある。隔離できるかはログに残すだけで失敗にしない
+      - name: "egress 隔離の環境情報の記録（best-effort）"
+        if: ${{ !cancelled() }}
+        run: bash scripts/release-host-env.sh record-isolation

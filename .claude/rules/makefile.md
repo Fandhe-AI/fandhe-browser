@@ -27,7 +27,7 @@ description: >
 | `scripts/harness.sh <name>` | 実測ハーネス・ベンチ・計測系の実体 |
 | `scripts/lint-docs.sh <kind>` | markdownlint・yamllint・editorconfig-checker・commitlint |
 | `scripts/help.sh` | Make 非依存のターゲット一覧（手動保守） |
-| `scripts/release.sh`・`release-smoke.sh`・`publish-crates.sh` | crates.io 公開の制御（`release.yml` が呼ぶ。自己テスト付き）・リリース成果物のスモーク・公開対象 crate と公開順の正本 |
+| `scripts/release.sh`・`release-smoke.sh`・`release-install.sh`・`release-host-env.sh`・`publish-crates.sh` | crates.io 公開の制御（`release.yml` が呼ぶ。自己テスト付き）・リリース成果物のスモーク・公開後の導入・Servo ホストのビルド前提と real_host の実行・公開対象 crate と公開順の正本 |
 | その他 | `setup.sh`・`rustup-check.sh`・`submodule.sh`・`install-hooks.sh`・`deny.sh`・`about.sh`・`check-deny-license-reject.sh`・`check-publish-ready.sh`、CI も直接呼ぶ `check-render-isolation.sh`・`check-egress-constants.sh`・`check-js-engine-isolation.sh`・`check-static-link.sh`・`check-dynamic-link-windows.sh`・`check-dynamic-link-macos.sh`・`ci-changes.sh`・`ci-prune-target.sh` |
 
 `scripts/hooks/**` は存在しない。lefthook の編集方針は [git-hooks](./git-hooks.md) が担当し、`lefthook.yml` の `run:` はインラインで書く。
