@@ -76,7 +76,7 @@ cargo install fandhe-browser-cli --locked
 ```
 
 - Rust（stable）と C ツールチェーンが要ります（macOS は Xcode Command Line Tools、Linux は `build-essential` 相当）。既定ビルドは V8 の prebuilt 静的ライブラリをダウンロードするため、crates.io と GitHub Releases への接続が要ります
-- 公開対象は 8 crate（`fandhe-browser-profile`・`-js`・`-core`・`-ai`・`-cdp`・`-render`・`-cli`・`-mcp`）で、版は共通です。別 workspace の `fandhe-browser-servo-host`（描画ホスト）も同じ版で公開する予定です（初回は 0.1.1。公開パイプラインへの追加は #1543）
+- 公開対象は 8 crate（`fandhe-browser-profile`・`-js`・`-core`・`-ai`・`-cdp`・`-render`・`-cli`・`-mcp`）で、版は共通です。別 workspace の `fandhe-browser-servo-host`（描画ホスト。macOS・Linux 向け）も同じ版で公開します（初回は 0.1.1。公開パイプライン `release.yml` は 9 件を扱う。#1543）
 
 ### 描画ホスト（screenshot）
 

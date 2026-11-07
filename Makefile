@@ -104,7 +104,7 @@ check-render-isolation: ## 既定ビルド（cli 既定 feature 含む）の依�
 check-js-engine-isolation: ## 軽量ビルド・エンジンなし構成の依存グラフに v8（エンジンなしは boa_engine も）が含まれないことを検証する
 	@scripts/cargo-gate.sh check-js-engine-isolation
 
-check-publish-ready: ## crates.io 公開可否（公開 allowlist の 8 crate の要件・他は publish = false・cli の release profile 一致）を検証する
+check-publish-ready: ## crates.io 公開可否（公開 allowlist の 8 crate とホストの要件・他は publish = false・cli とホストの release profile 一致）を検証する
 	@scripts/cargo-gate.sh check-publish-ready
 
 deny: ## cargo deny check advisories bans licenses sources（本体と servo-host の両方。cargo-deny 未導入なら自動導入）

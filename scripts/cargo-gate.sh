@@ -7,7 +7,7 @@
 #   fmt | fmt-check | lint | test                 既定 feature の整形・clippy・test
 #   lint-rendering | test-rendering               --features rendering（Servo 込み。feature 未定義の間は skip）
 #   check-render-isolation | check-js-engine-isolation   依存グラフ分離検証（正本は各 check-*-isolation.sh）
-#   check-publish-ready       全 member が「公開 allowlist の 8 crate（公開要件を満たす）」か「publish = false」であること
+#   check-publish-ready       全 member が「公開 allowlist の 8 crate（公開要件を満たす）」か「publish = false」であること（別 workspace の Servo ホストの公開要件も検査）
 #
 # member crate が 0 件の仮想 workspace では fmt / clippy / test / tree が「対象パッケージが無い」
 # エラーで落ちる（cargo の仕様）。一方 Cargo.toml 自体の妥当性は member に依存せず検証できるため
