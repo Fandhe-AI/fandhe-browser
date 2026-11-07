@@ -7,7 +7,7 @@
 #   - publish が制限されていない（`publish.workspace = true` で `[workspace.package]` の true を継承）
 #   - description・repository・license・readme がある（crates.io は description 欠落を拒否する）
 #   - path 依存（通常・build・dev すべて）に `=<依存先の version>` の version がある
-#   - 公開 crate の version が互いに一致する（共通版 0.1.0 の方針）
+#   - 公開 crate の version が互いに一致する（共通版の方針）
 # また servo-host の version がルートの version と一致すること（#1540。cli の起動前検査が完全一致を要求する）。
 # さらに cli と servo-host の `[profile.release]` がルート `Cargo.toml` と一致すること（`cargo install` は
 # ルートの profile を読まないため複製している。panic = "abort" 前提の維持）を検査する。

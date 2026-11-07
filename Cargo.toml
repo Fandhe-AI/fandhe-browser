@@ -34,12 +34,12 @@ exclude = ["servo-host"]
 # 同様）でここから継承する。
 #
 # crates.io 公開（#1531）: 公開対象は profile・js・core・ai・cdp・render・cli・mcp の 8 crate
-# （版は共通の 0.1.0）。公開 crate は `publish.workspace = true` で下の `publish = true` を継承する。
+# （版は共通。現行は下の `version`）。公開 crate は `publish.workspace = true` で下の `publish = true` を継承する。
 # 内部ツール（`harness/wpt_subset_runner`）は `publish = false` を直接明記する。`publish` は
 # 他フィールドと異なり自動継承されないため、`make check-publish-ready`（`make ci` に含む）が
 # 全 member crate を「公開 allowlist の 8 crate」か「`publish = false`」のどちらかに限り、
 # 新規 crate が黙って公開可能にならないようにする（fail-closed）。
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/Fandhe-AI/fandhe-browser"
@@ -49,19 +49,19 @@ publish = true
 
 [workspace.dependencies]
 # workspace 内 crate への path 依存。`cargo publish` は path 依存に `version` を要求するため、
-# ここに `version = "=0.1.0"` を集約して各 crate は `workspace = true` で参照する
+# ここに `version = "=<共通版>"` を集約して各 crate は `workspace = true` で参照する
 # （dev-dependencies も同様。dev 依存を含めても公開順 profile・js -> core -> ai・cdp・render
 # -> cli で循環しない）。バージョンを上げるときは `[workspace.package]` の version と
 # 下の 6 件を同時に更新する（`make check-publish-ready` が不一致を検出する）。
 # ai は cli の `plugin-registry` feature 経由でだけ既定 feature を有効にするため
 # `default-features = false`（#822・`PERF-7`）。edition 2024 ではメンバー側で
 # `default-features = false` を指定できず、workspace 側で決める必要がある。
-fandhe-browser-profile = { path = "crates/fandhe-browser-profile", version = "=0.1.0" }
-fandhe-browser-js = { path = "crates/fandhe-browser-js", version = "=0.1.0" }
-fandhe-browser-core = { path = "crates/fandhe-browser-core", version = "=0.1.0" }
-fandhe-browser-ai = { path = "crates/fandhe-browser-ai", version = "=0.1.0", default-features = false }
-fandhe-browser-cdp = { path = "crates/fandhe-browser-cdp", version = "=0.1.0" }
-fandhe-browser-render = { path = "crates/fandhe-browser-render", version = "=0.1.0" }
+fandhe-browser-profile = { path = "crates/fandhe-browser-profile", version = "=0.1.1" }
+fandhe-browser-js = { path = "crates/fandhe-browser-js", version = "=0.1.1" }
+fandhe-browser-core = { path = "crates/fandhe-browser-core", version = "=0.1.1" }
+fandhe-browser-ai = { path = "crates/fandhe-browser-ai", version = "=0.1.1", default-features = false }
+fandhe-browser-cdp = { path = "crates/fandhe-browser-cdp", version = "=0.1.1" }
+fandhe-browser-render = { path = "crates/fandhe-browser-render", version = "=0.1.1" }
 
 # TASK-14.2（Issue #93・AISNAP-1）: 生 HTML のトークン量（cl100k_base）計測用。
 # 採否・バージョンは Issue #92 に記録済み。ライセンスは MIT。配置は
