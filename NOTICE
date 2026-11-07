@@ -93,6 +93,14 @@ FreeType の帰属 (Servo ホストの配布物。TASK-38・Issue #996):
    `servo-host/Cargo.lock` で固定され、ソースは crates.io の各パッケージ (と各 crate の
    repository) から入手できる。
 6. MPL-2.0 全文は LICENSE-THIRD-PARTY 節 15 にある。
+7. crates.io で公開する `fandhe-browser-servo-host` パッケージ (ソース配布) に入るのは、自前のコード・
+   `Cargo.lock`・同梱の文書とライセンスファイルだけで、Servo のソースは含まない。パッケージ自体の
+   ライセンスは MIT OR Apache-2.0 である。この公開によって第 1 項の適用範囲は変わらない。
+8. 同パッケージから利用者がビルドしたバイナリ (`cargo install` 等) は Servo などの MPL-2.0 の部品を
+   含み、MPL-2.0 が適用される。再配布するときは MPL-2.0 の義務が生じる。ソースの入手先は
+   第 3 項・第 5 項のとおり。
+9. 同パッケージに LICENSE-THIRD-PARTY は含まれない。全文はリポジトリの
+   https://github.com/Fandhe-AI/fandhe-browser/blob/main/LICENSE-THIRD-PARTY にある。
 
 Servo ホストが静的リンクする harfbuzz-sys 同梱の HarfBuzz (`bundled` 有効) と、
 mozjs_sys 同梱の SpiderMonkey 由来の third-party 部品の帰属表示は未整備である
