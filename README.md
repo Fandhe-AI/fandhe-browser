@@ -100,7 +100,7 @@ fandhe-browser-servo-host --selftest   # stdout が selftest ok: で始まれば
 fandhe-browser screenshot https://example.com example.png
 ```
 
-- 導入済みの版は `cargo install --list` で確認します（CLI に `--version` はありません）。ずれたときは `cargo install fandhe-browser-servo-host --version <CLI の版> --locked --force` で揃えます
+- 導入済みの版は `fandhe-browser --version` で確認します（この機能を持たない古い版は `cargo install --list` で確認します）。ずれたときは `cargo install fandhe-browser-servo-host --version <CLI の版> --locked --force` で揃えます
 - 両方を `cargo install` すると同じディレクトリに入り、本体がホストを隣から見つけるため環境変数は不要です。`--root` などで別の場所に入れたときは `FANDHE_BROWSER_RENDER_HOST` にホストの絶対パスを渡します
 - 出力先に既存ファイルがあると上書きせず失敗します
 - Homebrew の llvm を PATH に足さないでください（Apple clang を覆います）

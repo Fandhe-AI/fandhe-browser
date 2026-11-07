@@ -111,6 +111,28 @@ fn cli1_help_flag_prints_usage_and_exits_zero() {
 }
 
 #[test]
+fn cli1_version_flags_print_version_and_exit_zero() {
+    let expected = format!("fandhe-browser {}\n", env!("CARGO_PKG_VERSION"));
+    for (tag, flag) in [("version-long", "--version"), ("version-short", "-V")] {
+        let out = run(tag, &[flag]);
+        assert_eq!(out.code, Some(0), "stderr: {}", out.stderr);
+        assert_eq!(out.stdout, expected);
+        assert_eq!(out.stderr, "");
+        assert!(!out.stderr.contains("DevTools listening"));
+    }
+}
+
+#[test]
+fn cli1_version_after_command_is_unknown_option() {
+    let out = run("launch-version", &["launch", "--version"]);
+    assert_eq!(out.code, Some(2), "stderr: {}", out.stderr);
+    assert_eq!(
+        out.stderr.trim(),
+        "error: unknown option '--version'; run 'fandhe-browser --help' for usage"
+    );
+}
+
+#[test]
 fn cli1_launch_with_extra_argument_exits_with_usage_error() {
     let out = run("launch-extra", &["launch", "extra"]);
     assert_eq!(out.code, Some(2), "stderr: {}", out.stderr);
