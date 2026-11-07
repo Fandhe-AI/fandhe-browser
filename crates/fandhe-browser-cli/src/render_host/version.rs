@@ -118,6 +118,30 @@ fn check_host_version_with(
     }
 }
 
+/// 子プロセスの cwd に使える形へパスを整える。
+///
+/// Windows の `canonicalize` は verbatim 形式（`\\?\C:\...`）を返すが、`CreateProcessW` の
+/// `lpCurrentDirectory` はこれを受け付けず spawn が失敗する。ドライブ形式の verbatim 接頭辞だけを
+/// 外して通常のパスにする。UNC の verbatim（`\\?\UNC\...`）など安全に変換できない形は
+/// `None`（cwd を設定しない）にする。Windows 以外では通常のパスをそのまま返す。
+fn child_cwd(dir: &Path) -> Option<std::path::PathBuf> {
+    let Some(text) = dir.to_str() else {
+        return Some(dir.to_path_buf());
+    };
+    let rest = text
+        .strip_prefix("\\\\?\\")
+        .or_else(|| text.strip_prefix("//?/"));
+    let Some(rest) = rest else {
+        return Some(dir.to_path_buf());
+    };
+    let b = rest.as_bytes();
+    if b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':' {
+        Some(std::path::PathBuf::from(rest))
+    } else {
+        None
+    }
+}
+
 /// `--version` を実行して stdout を返す。
 ///
 /// シェルなし・引数固定。環境は `env_clear` のうえ render の引き継ぎ許可リストだけを渡し、cwd は
@@ -140,7 +164,7 @@ fn read_host_version_output(
             cmd.env(name, v);
         }
     }
-    if let Some(dir) = binary.parent() {
+    if let Some(dir) = binary.parent().and_then(child_cwd) {
         cmd.current_dir(dir);
     }
     let mut child = cmd
@@ -243,6 +267,25 @@ mod tests {
     use super::*;
 
     const CLI: &str = env!("CARGO_PKG_VERSION");
+
+    /// `RENDER-3`・#1540: verbatim 接頭辞は外し、UNC verbatim は cwd 指定なしにし、通常パスは保つ。
+    #[test]
+    fn render3_child_cwd_strips_verbatim_drive_prefix() {
+        use std::path::{Path, PathBuf};
+        assert_eq!(
+            child_cwd(Path::new("\\\\?\\C:\\host\\bin")),
+            Some(PathBuf::from("C:\\host\\bin"))
+        );
+        assert_eq!(
+            child_cwd(Path::new("//?/C:/host/bin")),
+            Some(PathBuf::from("C:/host/bin"))
+        );
+        assert_eq!(child_cwd(Path::new("\\\\?\\UNC\\srv\\share")), None);
+        assert_eq!(
+            child_cwd(Path::new("/usr/local/bin")),
+            Some(PathBuf::from("/usr/local/bin"))
+        );
+    }
 
     /// `RENDER-3`・#1540: 正常な出力から版トークンを取り出す。
     #[test]
