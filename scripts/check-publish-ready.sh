@@ -7,6 +7,7 @@
 #   - description・repository・license・readme がある（crates.io は description 欠落を拒否する）
 #   - path 依存（通常・build・dev すべて）に `=<依存先の version>` の version がある
 #   - 公開 crate の version が互いに一致する（共通版 0.1.0 の方針）
+# また servo-host の version がルートの version と一致すること（#1540。cli の起動前検査が完全一致を要求する）。
 # さらに cli の `[profile.release]` がルート `Cargo.toml` と一致すること（`cargo install` は
 # ルートの profile を読まないため複製している。panic = "abort" 前提の維持）を検査する。
 #
@@ -50,6 +51,24 @@ metadata_problems() {
         ( [ $m.packages[] | select(.name as $n | ($allow | index($n)) != null) | .version ] | unique
           | if length > 1 then "public crates do not share one version: \(join(", "))" else empty end )
       )'
+}
+
+# host_version_problems <root Cargo.toml> <servo-host Cargo.toml>: Servo ホストの [package] version が
+# ルート [workspace.package] の version と一致するか（#1540。cli の起動前検査は両者の完全一致を要求する。
+# 別 workspace のため自動では揃わず、ずれるとリリース済みの組でも描画系が全面的に起動拒否になる）。
+section_version() { # $1=Cargo.toml $2=節見出し（完全一致）: 節内の最初の version 値
+  awk -v sec="$2" '$0 == sec { f = 1; next } /^\[/ { f = 0 } f' "$1" \
+    | grep -E '^version[[:space:]]*=' | head -1 | sed -E 's/^[^"]*"([^"]*)".*/\1/' || true
+}
+host_version_problems() {
+  local root host
+  root="$(section_version "$1" '[workspace.package]')"
+  host="$(section_version "$2" '[package]')"
+  if [ -z "${root}" ] || [ -z "${host}" ]; then
+    echo "cannot read versions (root='${root}', servo-host='${host}')"
+  elif [ "${root}" != "${host}" ]; then
+    echo "servo-host version ${host} differs from the workspace version ${root} (the CLI requires an exact match; see docs/design/servo-host-design.md)"
+  fi
 }
 
 # release_profile <Cargo.toml>: `[profile.release]` 節をコメント・空白を除いて並べ替えて出力する。
@@ -141,6 +160,17 @@ self_test() {
   out="$(profile_problems "${tmp}/root.toml" "${tmp}/none.toml")"
   if [[ "${out}" == *"has no [profile.release]"* ]]; then echo "OK(self-test): profile missing"; else echo "NG(self-test): profile missing: '${out}'" >&2; fail=1; fi
 
+  # servo-host 版の一致（#1540）
+  printf '[workspace.package]\nversion = "0.1.0"\n[workspace.dependencies]\nversion = "9"\n' >"${tmp}/rootv.toml"
+  printf '[package]\nname = "h"\nversion = "0.1.0"\n' >"${tmp}/hostok.toml"
+  printf '[package]\nname = "h"\nversion = "0.2.0"\n' >"${tmp}/hostng.toml"
+  out="$(host_version_problems "${tmp}/rootv.toml" "${tmp}/hostok.toml")"
+  if [ -z "${out}" ]; then echo "OK(self-test): host version same"; else echo "NG(self-test): host version same: ${out}" >&2; fail=1; fi
+  out="$(host_version_problems "${tmp}/rootv.toml" "${tmp}/hostng.toml")"
+  if [[ "${out}" == *"differs"* ]]; then echo "OK(self-test): host version differs"; else echo "NG(self-test): host version differs: '${out}'" >&2; fail=1; fi
+  out="$(host_version_problems "${tmp}/rootv.toml" "${tmp}/none.toml")"
+  if [[ "${out}" == *"cannot read"* ]]; then echo "OK(self-test): host version missing"; else echo "NG(self-test): host version missing: '${out}'" >&2; fail=1; fi
+
   [ "${fail}" -eq 0 ] || { echo "NG: check-publish-ready self-test failed" >&2; exit 1; }
   echo "OK: check-publish-ready self-test passed"
 }
@@ -166,6 +196,8 @@ main() {
   # 各検査の出力を改行で区切って連結する（改行が無いと別の検査の行が 1 行に繋がる）
   local more
   more="$(profile_problems Cargo.toml crates/fandhe-browser-cli/Cargo.toml)"
+  [ -z "${more}" ] || problems+=$'\n'"${more}"
+  more="$(host_version_problems Cargo.toml servo-host/Cargo.toml)"
   [ -z "${more}" ] || problems+=$'\n'"${more}"
   more="$(workflow_problems .github/workflows/release.yml)"
   [ -z "${more}" ] || problems+=$'\n'"${more}"
