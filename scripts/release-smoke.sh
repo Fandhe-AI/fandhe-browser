@@ -20,7 +20,8 @@
 #   6. 版を偽るスタブホストを渡した `launch` が `render host version mismatch` で非 0 終了する
 # 実ホストでのページ描画は `fandhe-browser-render` の `real_host` 結合テスト（ワークフローのステップ）が担う。
 # CLI の `screenshot` はローカル・プライベート宛を SSRF の既定で拒否し切り替え手段が無いため、
-# loopback のページを撮る確認はここでは行わない（`RENDER-3`・`SEC-2`）。# 失敗は非 0 で終了する。出力文字列は英語（japanese-style.md）。
+# loopback のページを撮る確認はここでは行わない（`RENDER-3`・`SEC-2`）。
+# 失敗は非 0 で終了する。出力文字列は英語（japanese-style.md）。
 set -euo pipefail
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=./lib.sh
