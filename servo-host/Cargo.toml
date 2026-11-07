@@ -14,13 +14,22 @@
 # `serde_json` は stdio サーバー（#993）のフレーム JSON 用（オーナー承認済み。Servo 経由で
 # Cargo.lock に同版が既にあり新規 crate は増えない）。`serde` の derive は未承認で使わない。toolchain は親ディレクトリの
 # rust-toolchain.toml を rustup が探索して使う（ここにはコピーを置かない）。
+#
+# crates.io の公開対象（オーナー判断 2026-11-07・#1541。`cargo install` した CLI の `screenshot` が
+# ホストを使えるようにするため）。crate に入るのは自前のコードと Cargo.lock だけで、Servo のソースは含まない
+# （依存として crates.io の servo を取得する）。ビルドしたバイナリには MPL-2.0 が適用される（NOTICE）。
+# 隔離（別 workspace・本体の依存グラフに入れない）は変わらない。対象は macOS・Linux で、Windows は対象外。
 
 [package]
 name = "fandhe-browser-servo-host"
 version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
-publish = false
+description = "Out-of-process Servo rendering host of fandhe-browser (built binary includes MPL-2.0 components)"
+repository = "https://github.com/Fandhe-AI/fandhe-browser"
+readme = "README.md"
+# 公開 package から外す開発用ファイル（Windows 向け rustflags と cargo-deny / cargo-about 設定）。
+exclude = ["/.cargo/", "/about.toml", "/deny.toml"]
 
 [[bin]]
 name = "fandhe-browser-servo-host"

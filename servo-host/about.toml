@@ -32,7 +32,8 @@ ignore-build-dependencies = false
 ignore-dev-dependencies = false
 
 [private]
-# 自リポの workspace crate を外す。理由はルートの about.toml と同じ（cargo-about 0.9.2 の panic 回避）。
+# `publish = false` の crate を一覧から外す設定。理由はルートの about.toml と同じ（cargo-about 0.9.2 の
+# panic 回避）。ホスト自身は #1541 で公開対象になったため、一覧には 1 件載る（panic はしない）。
 ignore = true
 
 [webpki-roots]
