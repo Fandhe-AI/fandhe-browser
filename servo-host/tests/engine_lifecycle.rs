@@ -95,6 +95,19 @@ fn unknown_and_missing_args_are_rejected() {
     }
 }
 
+/// RENDER-3・#1540: `--version` の出力形式は CLI 側の版の検査（`fandhe-browser-cli` の
+/// `render_host/version.rs`）が解析する契約。終了コード 0・stdout は 1 行・stderr は空で固定する。
+#[test]
+fn version_output_is_the_contract_read_by_the_cli() {
+    let (code, out, err) = run(&["--version"]);
+    assert_eq!(code, Some(0), "stderr: {err}");
+    assert_eq!(
+        out,
+        format!("fandhe-browser-servo-host {}\n", env!("CARGO_PKG_VERSION"))
+    );
+    assert_eq!(err, "");
+}
+
 /// RENDER-3・SEC-2（#1435）: `--selftest` と `--version` は egress 引数を受け付けない。
 #[test]
 fn selftest_and_version_reject_egress_arguments() {

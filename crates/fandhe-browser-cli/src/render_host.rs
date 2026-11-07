@@ -5,6 +5,10 @@
 //! `DisabledRenderer`（常に `RenderingDisabled`）を返す。`HostRenderer` は構築時にホストを起動せず、
 //! 初回の描画要求で遅延起動する（起動時の自動起動はしない）。
 //!
+//! ただし解決・検証の後に、ホストの `--version` を上限付きで 1 回だけ実行して CLI との版の一致を
+//! 確かめる（`version` モジュール・#1540）。これは `HostRenderer` の遅延起動とは別物の短命プロセスで、
+//! 隔離の外で動く。ページ読み込み経路の起動引数（`HostProcess` の `--stdio`）は変えない。
+//!
 //! # スタブについて
 //!
 //! `[rendering] egress_isolation`（`best-effort` 既定・`required`。`RENDER-3`・#1436）は設定から `HostProcessConfig` へ渡す。
@@ -30,6 +34,9 @@ use fandhe_browser_render::host_renderer::{HostRenderer, HostRendererConfig};
 
 use crate::server::StartupError;
 
+mod version;
+pub(crate) use version::HostVersionError;
+
 /// プロセス環境（環境変数・実行ファイルの隣）からホストを解決して描画実装を選ぶ。
 ///
 /// `configured` は設定ファイル由来のホストパス（絶対パスのみ許可。PATH 探索はしない）。
@@ -44,6 +51,7 @@ pub(crate) fn renderer_from_process(
         resolve_host_binary_from_process(configured),
         egress,
         probe_system,
+        version::check_host_version,
         None,
     )
 }
@@ -61,6 +69,7 @@ pub(crate) fn renderer_from_process_with_load_timeout(
         resolve_host_binary_from_process(configured),
         egress,
         probe_system,
+        version::check_host_version,
         load_timeout_ms,
     )
 }
@@ -80,14 +89,23 @@ fn production_config(binary: HostBinary, egress: EgressIsolationMode) -> HostPro
 /// ホストが解決でき、かつ `required` のときだけ `probe`（本番は `probe_system`。結果はキャッシュ
 /// 済み）を呼び、隔離できなければ [`StartupError::RenderIsolation`]。`HostProcess` の起動時にも
 /// 同じ判定が走る（二重の防御）。`probe` はテストが実コマンドを呼ばないための注入点。
+///
+/// 続けて、ホストが解決できたときだけ `check_version`（本番は `version::check_host_version`）で
+/// ホストの版が CLI と一致するか確かめ、不一致・検証不能なら [`StartupError::RenderHostVersion`]
+/// （`RENDER-3`・`SEC-2`・#1540）。`probe` が先なのは、隔離できない `required` 環境でホストを一切
+/// 実行しないため。`Disabled`・不正パスでは呼ばない（未検証のバイナリを実行しない）。
 pub(crate) fn select_renderer_checked(
     resolved: Result<HostBinary, HostProcessError>,
     egress: EgressIsolationMode,
     probe: impl FnOnce() -> Result<(), EgressIsolationUnavailable>,
+    check_version: impl FnOnce(&HostBinary) -> Result<(), HostVersionError>,
     load_timeout_ms: Option<u32>,
 ) -> Result<Arc<dyn Renderer>, StartupError> {
     if resolved.is_ok() && egress == EgressIsolationMode::Required {
         probe().map_err(StartupError::RenderIsolation)?;
+    }
+    if let Ok(binary) = &resolved {
+        check_version(binary).map_err(StartupError::RenderHostVersion)?;
     }
     select_renderer_with(
         resolved,
@@ -260,6 +278,7 @@ mod tests {
             Ok(binary),
             EgressIsolationMode::Required,
             || Err(EgressIsolationUnavailable::SandboxToolNotFound),
+            |_| panic!("version check must not run"),
             None,
         )
         .err()
@@ -282,13 +301,20 @@ mod tests {
         let binary = resolve_host_binary(Some(&std::env::current_exe().unwrap()), None, None)
             .expect("absolute existing path resolves");
         let never = || -> Result<(), EgressIsolationUnavailable> { panic!("probe must not run") };
-        select_renderer_checked(Ok(binary), EgressIsolationMode::BestEffort, never, None)
-            .expect("best-effort starts regardless");
+        select_renderer_checked(
+            Ok(binary),
+            EgressIsolationMode::BestEffort,
+            never,
+            |_| Ok(()),
+            None,
+        )
+        .expect("best-effort starts regardless");
         let page = fandhe_browser_core::render::PageRef::new("https://a.example/");
         let disabled = select_renderer_checked(
             Err(HostProcessError::Disabled),
             EgressIsolationMode::Required,
             never,
+            |_| panic!("version check must not run"),
             None,
         )
         .expect("disabled is not an error");
@@ -303,8 +329,121 @@ mod tests {
     fn render3_required_with_isolation_available_builds_renderer() {
         let binary = resolve_host_binary(Some(&std::env::current_exe().unwrap()), None, None)
             .expect("absolute existing path resolves");
-        select_renderer_checked(Ok(binary), EgressIsolationMode::Required, || Ok(()), None)
-            .expect("required with isolation available");
+        select_renderer_checked(
+            Ok(binary),
+            EgressIsolationMode::Required,
+            || Ok(()),
+            |_| Ok(()),
+            None,
+        )
+        .expect("required with isolation available");
+    }
+
+    /// `RENDER-3`・#1540: 版の検査が失敗したら `RenderHostVersion` の起動エラー（不正パスでは呼ばれない）。
+    #[test]
+    fn render3_version_check_failure_is_startup_error() {
+        let binary = resolve_host_binary(Some(&std::env::current_exe().unwrap()), None, None)
+            .expect("absolute existing path resolves");
+        let err = select_renderer_checked(
+            Ok(binary),
+            EgressIsolationMode::BestEffort,
+            || Ok(()),
+            |_| {
+                Err(HostVersionError::Mismatch {
+                    host: "9.9.9".into(),
+                })
+            },
+            None,
+        )
+        .err()
+        .expect("mismatch must refuse");
+        assert!(matches!(
+            err,
+            StartupError::RenderHostVersion(HostVersionError::Mismatch { .. })
+        ));
+        assert!(err.to_string().contains("the render host is 9.9.9"));
+        let relative = resolve_host_binary(Some(Path::new("relative-host")), None, None);
+        assert!(matches!(
+            select_renderer_checked(
+                relative,
+                EgressIsolationMode::BestEffort,
+                || Ok(()),
+                |_| panic!("version check must not run"),
+                None,
+            ),
+            Err(StartupError::RenderHost(_))
+        ));
+    }
+
+    /// 偽ホストを作る（`--version` に版を返し、起動引数を記録する）。ETXTBSY のやり直しは呼び出し側。
+    #[cfg(unix)]
+    fn recording_host(dir: &Path, version: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let script = dir.join("fake-host");
+        let log = dir.join("args.log");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\necho \"$@\" >> '{}'\necho 'fandhe-browser-servo-host {version}'\n",
+                log.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        script
+    }
+
+    /// `RENDER-3`・#1540: 本番の 2 つの入口が実際に版を検査する。一致なら `--version` を 1 回だけ実行し、
+    /// ホスト本体（`--stdio`）は描画要求まで起動しない。
+    #[cfg(unix)]
+    #[test]
+    fn render3_production_entrypoints_check_host_version() {
+        let ok_ver = env!("CARGO_PKG_VERSION");
+        for with_timeout in [false, true] {
+            let tmp = TempDir::new();
+            let host = recording_host(&tmp.owned, ok_ver);
+            let call = |p: &Path| {
+                let mut last = None;
+                for _ in 0..20 {
+                    let r = if with_timeout {
+                        renderer_from_process_with_load_timeout(
+                            Some(p),
+                            Some(1_000),
+                            EgressIsolationMode::BestEffort,
+                        )
+                    } else {
+                        renderer_from_process(Some(p), EgressIsolationMode::BestEffort)
+                    };
+                    if matches!(
+                        r,
+                        Err(StartupError::RenderHostVersion(
+                            HostVersionError::SpawnFailed(std::io::ErrorKind::ExecutableFileBusy)
+                        ))
+                    ) {
+                        std::thread::sleep(std::time::Duration::from_millis(50));
+                        continue;
+                    }
+                    last = Some(r);
+                    break;
+                }
+                last.expect("retries exhausted")
+            };
+            call(&host).expect("matching version builds a renderer");
+            let log = std::fs::read_to_string(tmp.owned.join("args.log")).unwrap();
+            assert_eq!(log, "--version\n", "with_timeout={with_timeout}");
+
+            let bad = TempDir::new();
+            let bad_host = recording_host(&bad.owned, "0.0.0-other");
+            let err = call(&bad_host).err().expect("mismatch must fail");
+            assert!(
+                matches!(
+                    err,
+                    StartupError::RenderHostVersion(HostVersionError::Mismatch { ref host })
+                        if host == "0.0.0-other"
+                ),
+                "{err:?}"
+            );
+        }
     }
 
     /// `RENDER-3`・#1436: 設定ファイルの `[rendering] egress_isolation` が cli の起動設定から読める。

@@ -102,7 +102,7 @@ pub(crate) const RENDER_HOST_INVALID_MESSAGE: &str = "render host binary is inva
 
 /// 起動時のエラー。`Display` は固定の英語文言で、入力値（パス・アドレス等）を埋め込まない。
 ///
-/// 例外は [`StartupError::Config`] のみで、core の設定エラー文言（指定値・同梱エンジン一覧・
+/// 例外は [`StartupError::Config`] と、文法検証済みのホスト版を表示する [`StartupError::RenderHostVersion`] で、core の設定エラー文言（指定値・同梱エンジン一覧・
 /// 必要な feature）を透過する（spec `JS-1` 切替方式ケース (3) の要求。値は運用者自身の
 /// ローカル設定由来）。ただしファイルパスを含み得る I/O エラー（`ConfigError::Io`）と
 /// `profile.root` の値検証エラー（親ディレクトリの絶対パスを含み得る）は
@@ -131,6 +131,8 @@ pub(crate) enum StartupError {
     /// `[rendering] egress_isolation = "required"` だが、この環境では隔離できない
     /// （`RENDER-3`・TASK-38・#1436）。理由は固定文言で、パスを含まない。
     RenderIsolation(EgressIsolationUnavailable),
+    /// 描画ホストの版が CLI と一致しない、または確認できない（`RENDER-3`・`SEC-2`・#1540）。
+    RenderHostVersion(crate::render_host::HostVersionError),
     /// 非同期ランタイムの構築失敗。
     Runtime(io::Error),
     /// 待ち受けループの異常終了。
@@ -167,6 +169,7 @@ impl fmt::Display for StartupError {
                 f,
                 "render host egress isolation is required but unavailable: {reason}"
             ),
+            Self::RenderHostVersion(e) => write!(f, "{e}"),
             Self::Bind(_) => f.write_str("failed to bind listener"),
             Self::Runtime(_) => f.write_str("failed to build async runtime"),
             Self::Serve(_) => f.write_str("server terminated abnormally"),
@@ -182,7 +185,7 @@ impl std::error::Error for StartupError {
             Self::Profile(e) => Some(e),
             Self::WebSocketConfig(e) => Some(e),
             Self::RouteConflict(e) => Some(e),
-            Self::NonLoopbackAddr | Self::RenderIsolation(_) => None,
+            Self::NonLoopbackAddr | Self::RenderIsolation(_) | Self::RenderHostVersion(_) => None,
             Self::RenderHost(e) => Some(e),
             Self::Bind(e) | Self::Runtime(e) | Self::Serve(e) => Some(e),
         }

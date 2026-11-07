@@ -708,15 +708,22 @@ fn render3_screenshot_reports_host_exit_before_hello_with_version_hint() {
     use std::os::unix::fs::PermissionsExt;
     let dir = OutDir::new("exit-before-hello");
     let host = std::path::Path::new(&dir.file("fake-host")).to_path_buf();
-    std::fs::write(&host, "#!/bin/sh\nexit 1\n").expect("fake host can be written");
+    // 版の検査（#1540）は通し、`hello` 前に終了する経路を引き続き通す。
+    std::fs::write(
+        &host,
+        format!(
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo 'fandhe-browser-servo-host {}'; exit 0; fi\nexit 1\n",
+            env!("CARGO_PKG_VERSION")
+        ),
+    )
+    .expect("fake host can be written");
     std::fs::set_permissions(&host, std::fs::Permissions::from_mode(0o755))
         .expect("fake host can be made executable");
     let target = dir.file("out.png");
-    let out = run_with_host(
+    let out = run_with_host_retrying_busy(
         "shot-exit-before-hello",
         &["screenshot", "https://a.example/", &target],
-        None,
-        Some(&host),
+        &host,
     );
     assert_eq!(out.code, Some(1), "stderr: {}", out.stderr);
     // 隔離できない環境では先に warning 行が出るため、最終行で比較する。
@@ -730,4 +737,75 @@ fn render3_screenshot_reports_host_exit_before_hello_with_version_hint() {
     );
     assert!(out.stdout.is_empty());
     assert!(!std::path::Path::new(&target).exists());
+}
+
+/// 書き込み直後の偽ホスト実行が ETXTBSY（`failed to start`）になる場合に限り、やり直して実行する。
+#[cfg(unix)]
+fn run_with_host_retrying_busy(tag: &str, args: &[&str], host: &std::path::Path) -> Outcome {
+    let mut out = run_with_host(tag, args, None, Some(host));
+    for _ in 0..20 {
+        if !out.stderr.contains("(failed to start)") {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+        out = run_with_host(tag, args, None, Some(host));
+    }
+    out
+}
+
+/// 版の不一致を報告する偽ホストを作る（`--version` に別の版を返す）。
+#[cfg(unix)]
+fn mismatched_host(dir: &OutDir) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let host = PathBuf::from(dir.file("fake-host"));
+    std::fs::write(
+        &host,
+        "#!/bin/sh\necho 'fandhe-browser-servo-host 0.0.0-other'\n",
+    )
+    .expect("fake host can be written");
+    std::fs::set_permissions(&host, std::fs::Permissions::from_mode(0o755))
+        .expect("fake host can be made executable");
+    host
+}
+
+/// `RENDER-3`・#1540: ホストの版が CLI と違えば `screenshot` は描画前に失敗し、両方の版を示す。
+#[cfg(unix)]
+#[test]
+fn render3_screenshot_fails_on_host_version_mismatch() {
+    let dir = OutDir::new("version-mismatch-shot");
+    let host = mismatched_host(&dir);
+    let target = dir.file("out.png");
+    let out = run_with_host_retrying_busy(
+        "shot-version-mismatch",
+        &["screenshot", "https://a.example/", &target],
+        &host,
+    );
+    assert_eq!(out.code, Some(1), "stderr: {}", out.stderr);
+    let version = env!("CARGO_PKG_VERSION");
+    let last = out.stderr.lines().last().unwrap_or_default();
+    assert_eq!(
+        last,
+        format!(
+            "error: render host version mismatch: this CLI is {version} but the render host is 0.0.0-other. Install the same version: on macOS/Linux run 'cargo install fandhe-browser-servo-host --version {version} --locked --force'; if FANDHE_BROWSER_RENDER_HOST is set, point it at the new binary"
+        )
+    );
+    assert!(out.stdout.is_empty());
+    assert!(!std::path::Path::new(&target).exists());
+}
+
+/// `RENDER-3`・#1540: `launch` も版の不一致ではサーバーを起動せず（bind の前に）失敗する。
+#[cfg(unix)]
+#[test]
+fn render3_launch_fails_on_host_version_mismatch_before_serving() {
+    let dir = OutDir::new("version-mismatch-launch");
+    let host = mismatched_host(&dir);
+    let out =
+        run_with_host_retrying_busy("launch-version-mismatch", &["launch", "--port", "0"], &host);
+    assert_eq!(out.code, Some(1), "stderr: {}", out.stderr);
+    assert!(
+        out.stderr.contains("render host version mismatch"),
+        "{}",
+        out.stderr
+    );
+    assert!(!out.stderr.contains("listening"), "{}", out.stderr);
 }
