@@ -76,7 +76,7 @@ cargo install fandhe-browser-cli --locked
 ```
 
 - Rust（stable）と C ツールチェーンが要ります（macOS は Xcode Command Line Tools、Linux は `build-essential` 相当）。既定ビルドは V8 の prebuilt 静的ライブラリをダウンロードするため、crates.io と GitHub Releases への接続が要ります
-- `servo-host`（描画ホスト `fandhe-browser-servo-host`。MPL-2.0 の Servo を含むため別 workspace・別配布）は crates.io の公開対象外です。そのため `cargo install` した `fandhe-browser` の `screenshot` は、描画ホストが無い環境では `rendering is not available` で失敗します（`query`・`navigate`・`launch` は動きます）
+- `servo-host`（描画ホスト `fandhe-browser-servo-host`。MPL-2.0 の Servo を含むため別 workspace・別配布）は、manifest 上は crates.io へ公開できる package です（#1541。手順は `servo-host/README.md`）。ただし公開パイプライン（`release.yml` 等）への組み込みは未了のため、版が公開されるまでは `cargo install` した `fandhe-browser` の `screenshot` は、描画ホストが無い環境では `rendering is not available` で失敗します（`query`・`navigate`・`launch` は動きます）
 - 公開対象は 8 crate（`fandhe-browser-profile`・`-js`・`-core`・`-ai`・`-cdp`・`-render`・`-cli`・`-mcp`）で、版は共通です
 
 ## クイックスタート
