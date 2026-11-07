@@ -39,8 +39,8 @@ use fandhe_browser_core::EgressIsolationMode;
 use super::isolation::{self, Plan, Sandbox};
 use super::{
     EgressIsolationStatus, EgressIsolationUnavailable, EgressIsolationWarning, HostBinary,
-    HostProcessError, IsolationProbe, IsolationWarning, WorkDir, child_paths, env,
-    report_isolation_warning,
+    HostProcessError, IsolationProbe, IsolationWarning, TmpfsUnlimitedReason, WorkDir, child_paths,
+    env, report_isolation_warning,
 };
 
 /// 版の検査でホストへ渡す固定の引数。
@@ -200,6 +200,7 @@ fn run_host_version_at(
             )
         }
         Plan::Isolated(sandbox) => {
+            warn_tmpfs_unlimited(sandbox, &config.isolation_warning);
             let (program, args) = match (sandbox, &canonical) {
                 (Sandbox::Bwrap { bwrap, hidden }, Some(dir)) => isolation::linux_version_argv(
                     bwrap,
@@ -234,6 +235,24 @@ fn run_host_version_at(
     env::apply(&mut cmd, &child_root, &child_home, &child_tmp);
     let stdout = read_limited(cmd, config.timeout, config.stdout_max)?;
     Ok(HostVersionOutput { stdout, isolation })
+}
+
+/// bwrap の tmpfs に上限を付けられないとき、`HostProcess` と同じ理由で警告を 1 回通知する
+/// （「黙って緩めない」。RENDER-3・#1498・#1502。版の検査は呼び出しごとに 1 回しか走らない）。
+fn warn_tmpfs_unlimited(sandbox: &Sandbox, warning: &IsolationWarning) {
+    let Sandbox::Bwrap { hidden, .. } = sandbox else {
+        return;
+    };
+    let reason = match hidden.tmpfs_limit() {
+        isolation::TmpfsLimit::Capped(_) => return,
+        isolation::TmpfsLimit::Unsupported => TmpfsUnlimitedReason::SizeUnsupported,
+        isolation::TmpfsLimit::Undetected(_) => TmpfsUnlimitedReason::DetectionFailed,
+    };
+    report_isolation_warning(
+        warning,
+        EgressIsolationWarning::TmpfsUnlimited(reason),
+        &mut io::stderr().lock(),
+    );
 }
 
 /// 隔離の方針を決める。`required` で隔離できなければここで失敗し、ホストは実行されない。
@@ -386,6 +405,32 @@ mod tests {
             )
         );
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// RENDER-3（#1553・#1502）: bwrap の tmpfs 上限なしは理由ごとに警告し、上限ありと macOS は黙る。
+    #[test]
+    fn render3_version_run_tmpfs_unlimited_warns_by_reason() {
+        use std::path::PathBuf;
+        use std::sync::Mutex;
+        let bwrap = |limit| Sandbox::Bwrap {
+            bwrap: PathBuf::from("/usr/bin/bwrap"),
+            hidden: isolation::HiddenPaths::new(PathBuf::from("/home/u")).with_tmpfs_limit(limit),
+        };
+        let collect = |sandbox: &Sandbox| {
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let sink = Arc::clone(&seen);
+            let w = IsolationWarning(Some(Arc::new(move |e| sink.lock().unwrap().push(e))));
+            warn_tmpfs_unlimited(sandbox, &w);
+            seen.lock().unwrap().clone()
+        };
+        assert_eq!(
+            collect(&bwrap(isolation::TmpfsLimit::Unsupported)),
+            vec![EgressIsolationWarning::TmpfsUnlimited(
+                TmpfsUnlimitedReason::SizeUnsupported
+            )]
+        );
+        assert_eq!(collect(&bwrap(isolation::TmpfsLimit::Capped(1024))), vec![]);
+        assert_eq!(collect(&Sandbox::SandboxExec), vec![]);
     }
 
     /// 偽ホストを使う実プロセスのテスト（unix）。
