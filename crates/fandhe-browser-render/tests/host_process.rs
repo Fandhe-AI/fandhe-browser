@@ -302,8 +302,13 @@ fn t_circuit_breaker() {
     let root = Root::new("breaker", "crash-on-start");
     let mut h = root.host(base_timeouts());
     for _ in 0..3 {
-        let e = h.load(&page(), 1).expect_err("crash");
-        assert!(matches!(e, HostProcessError::Crashed), "{e:?}");
+        let e = h.load(&page(), 1).expect_err("exit before hello");
+        assert!(matches!(e, HostProcessError::ExitedBeforeHello), "{e:?}");
+        // 固定文言のみ（URL・パス・stderr を含めない）。
+        assert_eq!(
+            e.to_string(),
+            "render host exited before completing startup"
+        );
     }
     assert_eq!(count(&root.0, "spawns"), 3);
     let e = h.load(&page(), 1).expect_err("open");
@@ -350,6 +355,22 @@ fn t_rss_limit() {
         "{e:?}"
     );
     assert_gone(child_pid(&root, 1));
+}
+
+/// hello 前に RSS 上限を超えた場合は、版の案内に化けず `ResourceLimitExceeded` になる（#1539）。
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn t_rss_limit_before_hello() {
+    let root = Root::new("rss-hello", "rss-before-hello");
+    let cfg = root
+        .config(base_timeouts())
+        .with_rss_limit_bytes(48 * 1024 * 1024)
+        .with_rss_poll_interval(Duration::from_millis(50));
+    let mut h = HostProcess::new(cfg);
+    let e = h.load(&page(), 1).expect_err("rss");
+    assert!(
+        matches!(e, HostProcessError::ResourceLimitExceeded),
+        "{e:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -844,5 +865,7 @@ fn main() {
     tests.push(("dump_env_args_cwd", t_dump_env_args_cwd));
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     tests.push(("rss_limit", t_rss_limit));
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    tests.push(("rss_limit_before_hello", t_rss_limit_before_hello));
     run("host_process", tests);
 }

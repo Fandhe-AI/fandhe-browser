@@ -191,7 +191,7 @@ if (cmd === "--help" || cmd === "-h" || cmd === "help") {
   if (pos[0] === "about:blank") fail(1, "screenshot requires a fetched document (about:blank has no content)");
   if (fs.existsSync(pos[1])) fail(1, "output file already exists");
   if (modes.has("no-host") || !process.env.FANDHE_BROWSER_RENDER_HOST) {
-    fail(1, "rendering is not available (render host not found; set FANDHE_BROWSER_RENDER_HOST)");
+    fail(1, "rendering is not available (render host not found; set FANDHE_BROWSER_RENDER_HOST, or on macOS/Linux run 'cargo install fandhe-browser-servo-host --locked')");
   }
   const buf = Buffer.alloc(64);
   Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 13]).copy(buf, 0);

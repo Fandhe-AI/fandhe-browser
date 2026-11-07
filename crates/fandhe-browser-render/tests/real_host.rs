@@ -100,6 +100,7 @@ fn variant(e: &RenderError) -> &'static str {
         RenderError::ElementNotFound => "ElementNotFound",
         RenderError::Timeout => "Timeout",
         RenderError::HostUnavailable => "HostUnavailable",
+        RenderError::HostExitedBeforeHello => "HostExitedBeforeHello",
         RenderError::ProtocolMismatch => "ProtocolMismatch",
         RenderError::PageNotLoaded => "PageNotLoaded",
         RenderError::Internal(_) => "Internal",
