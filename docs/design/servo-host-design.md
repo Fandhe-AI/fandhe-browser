@@ -24,7 +24,8 @@
 | 決定済み | CI は明示ジョブ 3 本を追加する（ジョブ 16 → 19、required 合計 20 → 23）。ruleset はジョブ追加 PR のマージ時に更新する | オーナー判断 2026-10-15（#228。本書 §6） |
 | 決定済み | ホストのビルド cache は ubuntu のみ | オーナー判断 2026-10-15（#228。本書 §6.3） |
 | 保留 | egress 方針（Servo 内部通信の制限）は GA 前に判断する | #1003（本書 §2.5。比較設計と実測計画は [servo-host-egress-isolation.md](./servo-host-egress-isolation.md)） |
-| 保留 | 配布方式は spec の整理（`TASK-64`・`CTR-4`）後に起票する | 本書 §8.2・§10 |
+| 決定済み | crates.io のソース配布を先行する。9 個目の crate、対象は macOS・Linux（Windows は対象外）、crate は `MIT OR Apache-2.0`、`NOTICE` の MPL 適用範囲は不変、Servo `=0.7.0` のまま、版は他 crate と揃える | オーナー判断 2026-11-07（#1538。本書 §13 項目 10） |
+| 保留 | コンテナの配布は spec の整理（`TASK-64`・`CTR-4`）後に起票する。バイナリ配布は未決 | 本書 §8.2・§10 |
 
 オーナー判断の結果は §13 に記録する。
 
@@ -306,7 +307,7 @@ v1 はホストが自分で fetch する（URL のみ送る）。Cookie・セッ
 | glibc（rust:1-bookworm） | 標準の clang 14・15 では mozjs の bindgen が失敗する。backports の clang-19 で成功。直接 NEEDED は 8 個、ldd の閉包は 13 行 | 採用。glibc（Debian slim）系の別イメージでビルド・配布する。ビルドには backports の clang-19 が要る |
 
 - 出所: `servo-host/Cargo.toml` は `bundled_freetype` を無効にしているため、FreeType・fontconfig は system の共有ライブラリ、harfbuzz は静的。出所は構成によらず一意で、ホストのバイナリには FreeType 等が入らない（§5）。
-- 帰結: Servo ホストのコンテナは glibc 系の別イメージとする（§13 項目 8）。本体の既定・軽量コンテナ（musl 静的・scratch）は変えない。配布の起票は spec の整理（`TASK-64`・`CTR-4`）後とし、#1001 では起票しない。
+- 帰結: Servo ホストのコンテナは glibc 系の別イメージとする（§13 項目 8）。本体の既定・軽量コンテナ（musl 静的・scratch）は変えない。コンテナの配布の起票は spec の整理（`TASK-64`・`CTR-4`）後とし、#1001 では起票しない。
 - 未検証の点: 静的強制の SIGSEGV の原因、Servo の dlopen 先（wayland-client・libEGL）の実行時の扱い、`--selftest` のランタイムの最小集合、`bundled_freetype` を有効にした場合の出所（試していない）。
 
 ## 8. #230〜#237 の書き換え案と依存順
@@ -347,7 +348,7 @@ Issue 本文の書き換えと追加起票は、本設計のレビュー後に�
 | N1 | `NOTICE`・`LICENSE-THIRD-PARTY`・`gen-cargo-licenses.sh` のホスト対応（H1 で依存ツリー確定後） | docs-writer |
 | V1〜V3 | 検証 Issue（macOS / Windows ビルド、musl・scratch 配布、実ページ）。判断を要する項目は owner:human で分ける | 人間 + infra-builder |
 
-配布（ホスト用 release ビルド・コンテナイメージ）は `TASK-64` 系との関係を spec 側で整理してから別途起票する。
+crates.io のソース配布は #1538 配下で進める（§13 項目 10）。コンテナイメージの配布は `TASK-64` 系との関係を spec 側で整理してから別途起票する。バイナリ配布は未決。
 
 ### 8.3 依存順
 
@@ -361,7 +362,7 @@ Issue 本文の書き換えと追加起票は、本設計のレビュー後に�
 | 5 | #232・#233・#234、#236・#237a（#235 後）、R1b（CI 変更と同時） |
 | 6 | #237b（#232〜#234・H4・S2・#235 後）、S3、V1〜V3 |
 
-依存追加を伴う H1 とホスト側 PNG エンコードは、dependency-policy の承認を得るまで着手しない。ruleset 更新・egress 方針・配布方式は owner:human として分ける。
+依存追加を伴う H1 とホスト側 PNG エンコードは、dependency-policy の承認を得るまで着手しない。ruleset 更新・egress 方針・コンテナとバイナリの配布方式は owner:human として分ける。
 
 ## 9. 周辺文書の更新計画
 
@@ -387,6 +388,7 @@ AGENTS.md の変更はレビュー基準の変更として AI レビューで P0
 | `TASK-35` / `TASK-82` | サイズ増分が「ホスト単体の絶対値」になり、メモリ増分の測定対象もホストの RSS に変わる |
 | `TASK-38` | 枝番 38.1〜38.8 を §8 の分け方に合わせて改訂し、担当と成果物パスを更新する |
 | 設計文書群 | `self-repair-design.md` 決定 4、`js-engine.md` の feature `rendering` 組合せ、`plugin-boundary-policy.md` の「コンパイル時プラグインの例に `rendering` を挙げている」点（Servo ホストは実行時の別プロセス境界に近い）（`PLUG-1`） |
+| crates.io のソース配布 | 配布方式の注記を 2026-11-07 の判断（#1538。§13 項目 10）に合わせて更新する |
 | コンテナ（`CTR-4`） | Servo ホストの配布物をコンテナで扱うか。scratch + musl の前提とホストの動的リンクが衝突しうる（#1001 で musl 静的・scratch は不成立と実測。§7.1） |
 | `OSS-2` / `OSS-3` | 注記の整合（ホスト workspace 限定の MPL 許可） |
 
@@ -419,7 +421,7 @@ AGENTS.md の変更はレビュー基準の変更として AI レビューで P0
 | #230〜#237 の書き換え案と依存順 | §8 |
 | spec 側の課題 | §10 |
 
-## 13. オーナー判断（2026-10-15・2026-10-29）
+## 13. オーナー判断（2026-10-15・2026-10-29・2026-11-07）
 
 出典は #228。各項目の結果を記す。
 
@@ -429,12 +431,16 @@ AGENTS.md の変更はレビュー基準の変更として AI レビューで P0
 4. ホストのビルド cache は ubuntu のみ（§6.3）: 決定
 5. `ci.yml` のジョブは 16 → 19、required の合計は 20 → 23。ruleset はジョブ追加 PR のマージ時に更新する（§6.2）: 決定
 6. egress 方針（Servo 内部のリダイレクト・サブリソース・DNS リバインディング。§2.5）: GA 前に判断する（#1003。比較設計と実測計画は [servo-host-egress-isolation.md](./servo-host-egress-isolation.md)）
-7. 配布方式（ホスト単体 release・コンテナ。§8.2・§10）: spec の整理（`TASK-64`・`CTR-4`）後に起票する
+7. 配布方式（§8.2・§10）: ホスト単体のソース配布は項目 10 で決定。コンテナは spec の整理（`TASK-64`・`CTR-4`）後に起票する。バイナリ配布は未決
 
 2026-10-29 の判断（項目 8・9）は Issue #1001 による。実測の根拠は §7.1 と §5。
 
-8. Servo ホストのコンテナは musl 静的・scratch では配布せず、glibc（Debian slim）系の別イメージとする。本体の既定・軽量コンテナ（musl 静的・scratch）は変えない。ビルドには backports の clang-19 が要る。配布の起票は項目 7 のとおり後続とする: 決定
+8. Servo ホストのコンテナは musl 静的・scratch では配布せず、glibc（Debian slim）系の別イメージとする。本体の既定・軽量コンテナ（musl 静的・scratch）は変えない。ビルドには backports の clang-19 が要る。コンテナの配布の起票は項目 7 のとおり後続とする: 決定
 9. `NOTICE` は配布形態別に分けず 1 本のまま。ホスト単体の配布物には FreeType・fontconfig・libpng 等は同梱されないこと、コンテナでは OS パッケージの著作権ファイルを残すこと、FreeType の FTL の帰属は残すことを注記で分ける（§5）: 決定
+
+2026-11-07 の判断（項目 10）は Issue #1538 による。
+
+10. Servo ホストを crates.io へ 9 個目の crate としてソース配布する。crate は自前のコードと `Cargo.lock` だけで Servo のソースを含まず `MIT OR Apache-2.0`、対象は macOS・Linux（Windows は対象外）、Servo は `=0.7.0` のまま、版は他 crate と揃える。`NOTICE` の MPL 適用範囲（ビルドしたバイナリに適用）と、隔離（`RENDER-1`）・MPL の扱い（`OSS-2`・`OSS-3`）は変えない。コンテナとバイナリの配布は項目 7 のとおり別扱い: 決定
 
 ## 付録 A. 依存追加の承認提示雛形
 

@@ -20,6 +20,7 @@
 - 本体の workspace の依存グラフに Servo 系クレートを入れない。`fandhe-browser-render` を Servo に依存させない（TASK-33。render は Servo ホストへの IPC クライアント）
 - 既定ビルドに Servo が含まれないことの検証（`RENDER-1`・`scripts/check-render-isolation.sh`）は、従来どおり維持する
 - Servo ホスト側の `deny.toml` で許可する例外は、`MPL-2.0`・`MPL-2.0 AND BSD-3-Clause` と、`CDLA-Permissive-2.0`（`webpki-roots` の 1 件に限る）だけ。本体の `deny.toml` は変えない（`OSS-2`・`OSS-3`）
+- crates.io のソース配布（オーナー判断 2026-11-07・#1538）: `fandhe-browser-servo-host` を 9 個目の crate として公開する。crate は自前のコードと `Cargo.lock` だけで Servo のソースを含まず、`MIT OR Apache-2.0`。MPL-2.0 の適用範囲は変えず、利用者がビルドしたバイナリには適用される。対象は macOS・Linux。隔離（`RENDER-1`）と `deny.toml` の例外は緩めない。バイナリ配布・コンテナ・`LICENSE-CARGO-DEPENDENCIES` は未整備のまま別扱い
 - FreeType は FTL を選び、`NOTICE` に帰属表示を載せる
 - Servo のソースを改変しない（改変するとその差分に MPL のソース開示義務が生じる）。改変が必要になった場合はユーザーに判断を仰ぐ
 - `NOTICE`（または `LICENSE-THIRD-PARTY`）に MPL の適用範囲（Servo ホストの配布物）・ソース入手方法を記載する。`NOTICE`（MPL の適用範囲の節）と `LICENSE-THIRD-PARTY` に記載済み（#996）

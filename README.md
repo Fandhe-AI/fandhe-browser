@@ -76,8 +76,38 @@ cargo install fandhe-browser-cli --locked
 ```
 
 - Rust（stable）と C ツールチェーンが要ります（macOS は Xcode Command Line Tools、Linux は `build-essential` 相当）。既定ビルドは V8 の prebuilt 静的ライブラリをダウンロードするため、crates.io と GitHub Releases への接続が要ります
-- `servo-host`（描画ホスト `fandhe-browser-servo-host`。MPL-2.0 の Servo を含むため別 workspace・別配布）は、manifest 上は crates.io へ公開できる package です（#1541。手順は `servo-host/README.md`）。ただし公開パイプライン（`release.yml` 等）への組み込みは未了のため、版が公開されるまでは `cargo install` した `fandhe-browser` の `screenshot` は、描画ホストが無い環境では `rendering is not available` で失敗します（`query`・`navigate`・`launch` は動きます）
-- 公開対象は 8 crate（`fandhe-browser-profile`・`-js`・`-core`・`-ai`・`-cdp`・`-render`・`-cli`・`-mcp`）で、版は共通です
+- 公開対象は 8 crate（`fandhe-browser-profile`・`-js`・`-core`・`-ai`・`-cdp`・`-render`・`-cli`・`-mcp`）で、版は共通です。別 workspace の `fandhe-browser-servo-host`（描画ホスト）も同じ版で公開する予定です（初回は 0.1.1。公開パイプラインへの追加は #1543）
+
+### 描画ホスト（screenshot）
+
+`query`・`navigate`・`launch` は描画ホストなしで動きます。`screenshot` には描画ホスト `fandhe-browser-servo-host` の導入が必要で、無いと `rendering is not available` で失敗します。
+
+- 公開状況: ホストは 0.1.1 から公開する予定で、公開されるまで `cargo install` できません。公開済みの 0.1.0 の CLI に対応するホストはありません
+- 対象 OS: macOS・Linux。Windows は対象外です（`cargo install` は ANGLE の `libEGL.dll`・`libGLESv2.dll` を置かず、egress 隔離も未実装で GA の対象外のため。#1524）
+- ライセンス: ホストの crate は Servo（MPL-2.0）のソースを含まず `MIT OR Apache-2.0` ですが、ビルドしたバイナリには MPL-2.0 が適用されます（`NOTICE` 参照）
+
+macOS の手順（`<版>` には CLI とホストで同じ値を指定します。版が違うと描画が起動に失敗することがあります）:
+
+```bash
+xcode-select --install          # 未導入のとき（clang・make・python3）
+brew install cmake pkg-config   # 未導入のとき
+export LLVM_OBJDUMP="$(xcrun --find llvm-objdump 2>/dev/null || xcrun --find objdump)"
+
+cargo install fandhe-browser-cli --version <版> --locked
+cargo install fandhe-browser-servo-host --version <版> --locked
+
+fandhe-browser-servo-host --selftest   # stdout が selftest ok: で始まれば成功
+fandhe-browser screenshot https://example.com example.png
+```
+
+- 導入済みの版は `cargo install --list` で確認します（CLI に `--version` はありません）。ずれたときは `cargo install fandhe-browser-servo-host --version <CLI の版> --locked --force` で揃えます
+- 両方を `cargo install` すると同じディレクトリに入り、本体がホストを隣から見つけるため環境変数は不要です。`--root` などで別の場所に入れたときは `FANDHE_BROWSER_RENDER_HOST` にホストの絶対パスを渡します
+- 出力先に既存ファイルがあると上書きせず失敗します
+- Homebrew の llvm を PATH に足さないでください（Apple clang を覆います）
+- Servo のフルビルドのため時間とディスクを多く使います（CI の macOS release ビルドで約 24 分）
+- Linux の前提（apt・clang・`LIBCLANG_PATH`）と詳細は `servo-host/README.md` を参照してください
+- 外部サイトを描画するなら、設定ファイルに `[rendering]` の `egress_isolation = "required"` を書き、絶対パスを `FANDHE_BROWSER_CONFIG` で渡すことを勧めます。既定の `best-effort` は隔離できないと警告だけ出して動きます
+- 同梱の Servo は LTS ではない月次版 `=0.7.0` で、セキュリティ修正が戻りません（#1300）。信頼できないページの描画には注意してください
 
 ## クイックスタート
 
@@ -116,4 +146,4 @@ make ci
 
 ## ライセンス
 
-MIT OR Apache-2.0 のデュアルライセンスです（[LICENSE-MIT](./LICENSE-MIT) / [LICENSE-APACHE](./LICENSE-APACHE)）。`Servo`（MPL-2.0）は Servo ホスト（`servo-host/`）の配布物にだけ含まれ、本体バイナリと既定・軽量コンテナには含まれません。適用範囲と帰属表示は `NOTICE`・`LICENSE-THIRD-PARTY` を参照してください。
+MIT OR Apache-2.0 のデュアルライセンスです（[LICENSE-MIT](./LICENSE-MIT) / [LICENSE-APACHE](./LICENSE-APACHE)）。`Servo`（MPL-2.0）は Servo ホスト（`servo-host/`）の配布物にだけ含まれ、本体バイナリと既定・軽量コンテナには含まれません。crates.io のホスト crate は Servo のソースを含まず `MIT OR Apache-2.0` ですが、ビルドしたバイナリには MPL-2.0 が適用されます。適用範囲と帰属表示は `NOTICE`・`LICENSE-THIRD-PARTY` を参照してください。
