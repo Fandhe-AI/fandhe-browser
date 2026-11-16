@@ -78,7 +78,9 @@ tiktoken-rs = { version = "=0.12.1" }
 # 2026-09-28）。JS ワーカーの子プロセスが自身に RLIMIT_DATA を設定し、V8 ヒープ外
 # メモリ（ArrayBuffer の backing store 等）にも OS 側の上限を掛けるために使う
 # （`rustix::process::setrlimit` は safe API のため unsafe を追加しない）。
-rustix = { version = "=1.1.5", default-features = false, features = [
+# 1.1.5 → 1.1.6 は RUSTSEC-2026-0486（xattr 系関数の unsound。本リポは未使用）の解消のため
+# （ユーザー承認 2026-11-16。Rust 1.100 で赤くなった CI の修復）。
+rustix = { version = "=1.1.6", default-features = false, features = [
   "fs",
   "process",
   "std",
@@ -192,7 +194,10 @@ serde_json = { version = "=1.0.151", features = ["unbounded_depth"] }
 # PR レビューで確認する。`base64` と reqwest・oauth2 系は無効。推移依存は
 # rmcp-macros・schemars・chrono・futures・tokio-util・uuid・darling 等（いずれも
 # MIT / Apache-2.0 系・純 Rust で C/C++ ビルドなし）。
-rmcp = { version = "=3.4.1", default-features = false, features = [
+# 3.4.1 → 3.9.0 は RUSTSEC-2026-0457・0461・0462（いずれも本リポで無効の auth・Streamable HTTP
+# の feature 内）の解消のため（ユーザー承認 2026-11-16）。3.9.0 で必須の推移依存に sha2・libc（unix）
+# が加わり、`transport-io` が tokio の `net`（mio・socket2）を有効にする。rmcp-macros も 3.9.0 に揃える。
+rmcp = { version = "=3.9.0", default-features = false, features = [
     "server",
     "macros",
     "transport-io",
