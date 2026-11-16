@@ -11,8 +11,14 @@ use std::time::{Duration, Instant};
 const LIMIT: Duration = Duration::from_secs(180);
 
 fn run(args: &[&str]) -> (Option<i32>, String, String) {
+    run_with_env(args, &[])
+}
+
+/// `run` に子プロセスの環境変数を足す版。制限時間（`LIMIT`）で kill する扱いは同じ。
+fn run_with_env(args: &[&str], envs: &[(&str, &std::path::Path)]) -> (Option<i32>, String, String) {
     let mut child = Command::new(env!("CARGO_BIN_EXE_fandhe-browser-servo-host"))
         .args(args)
+        .envs(envs.iter().copied())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -135,19 +141,11 @@ fn selftest_does_not_create_http_disk_cache() {
     let base = std::env::temp_dir().join(format!("fandhe-diskcache-test-{}", std::process::id()));
     let tmp = base.join("tmp");
     std::fs::create_dir_all(&tmp).expect("create tmp");
-    let out = Command::new(env!("CARGO_BIN_EXE_fandhe-browser-servo-host"))
-        .arg("--selftest")
-        .env("TMPDIR", &tmp)
-        .env("TMP", &tmp)
-        .env("TEMP", &tmp)
-        .output()
-        .expect("run host");
-    assert_eq!(
-        out.status.code(),
-        Some(0),
-        "stderr: {}",
-        String::from_utf8_lossy(&out.stderr)
+    let (code, _out, err) = run_with_env(
+        &["--selftest"],
+        &[("TMPDIR", &tmp), ("TMP", &tmp), ("TEMP", &tmp)],
     );
+    assert_eq!(code, Some(0), "stderr: {err}");
     let mut found = Vec::new();
     for dir in [&tmp, &base] {
         for name in ["cache.sqlite3", "cache.sqlite3-wal", "cache.sqlite3-shm"] {
