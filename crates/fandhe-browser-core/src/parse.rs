@@ -1408,11 +1408,8 @@ mod tests {
         // 64 個の `<p>` の直後に、foster parenting されたテキストノードが
         // `<table>` の直前へ挿入され、その後に `<table>` 自身が続く。
         assert_eq!(body_node.children.len(), 64 + 1 + 1);
-        for i in 0..64 {
-            assert_eq!(
-                element_local_name(doc, body_node.children[i]).as_deref(),
-                Some("p")
-            );
+        for &child in body_node.children.iter().take(64) {
+            assert_eq!(element_local_name(doc, child).as_deref(), Some("p"));
         }
         assert_eq!(
             text_of(doc, body_node.children[64]).as_deref(),
