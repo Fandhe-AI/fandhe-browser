@@ -19,9 +19,13 @@ targets = [
 ]
 
 [advisories]
-# ignore は unmaintained のみ（脆弱性ではない）。vulnerability・unsound は ignore しない。
+# ignore は原則 unmaintained のみ（脆弱性ではない）。vulnerability・unsound は ignore しない。
+# 例外は RUSTSEC-2026-0459 の 1 件だけ（ユーザー承認 2026-11-16。理由は該当行）。例外を足すときは
+# 到達しない根拠をコードで固定し（テスト）、外す条件を reason に書く。
 # いずれも servo の推移依存で、本リポ側では差し替えられない。
 # 解消予定: servo の更新で依存が無くなった時点で外す（追跡先: TASK-38 親 #228）。
+# 外し忘れを防ぐため、グラフに現れなくなった ignore は fail させる（cargo-deny 0.20.2 で有効）。
+unused-ignored-advisory = "deny"
 version = 2
 ignore = [
   { id = "RUSTSEC-2025-0141", reason = "bincode 1.3.3 は webrender 0.70.0 経由の servo 推移依存（unmaintained のみ）。上流に更新版が無く、servo の更新で解消し #228 で追跡する" },
@@ -30,6 +34,7 @@ ignore = [
   { id = "RUSTSEC-2025-0080", reason = "unic-common 0.9.0 は urlpattern 0.3.0 経由の servo 推移依存（unmaintained のみ）。上流に更新版が無く、servo の更新で解消し #228 で追跡する" },
   { id = "RUSTSEC-2025-0100", reason = "unic-ucd-ident 0.9.0 は urlpattern 0.3.0 経由の servo 推移依存（unmaintained のみ）。上流に更新版が無く、servo の更新で解消し #228 で追跡する" },
   { id = "RUSTSEC-2025-0098", reason = "unic-ucd-version 0.9.0 は urlpattern 0.3.0 経由の servo 推移依存（unmaintained のみ）。上流に更新版が無く、servo の更新で解消し #228 で追跡する" },
+  { id = "RUSTSEC-2026-0459", reason = "libsqlite3-sys 0.36.0（SQLite 3.53 系）は servo-net・servo-storage 0.7.0 の rusqlite 0.38 経由で、servo 0.8.0 も同じため差し替えられない。到達しない根拠は 2 つ: (1) HTTP ディスクキャッシュ（一時ディレクトリ直下の固定名 cache.sqlite3 を開く経路）を engine.rs の network_http_disk_cache の定数で無効化し、servo-host/tests の挙動テストで固定している (2) 残る SQLite（ClientStorage・IndexedDB）は乱数名の tempdir 配下で、本体経由の起動ではさらに 0700 の専用 WorkDir 配下にあり、他者が書けるファイルを開かない。servo が rusqlite 0.41 以上（libsqlite3-sys 0.39.0 以上）に上がったら外す（unused-ignored-advisory = deny で検出）" },
 ]
 
 [licenses]
