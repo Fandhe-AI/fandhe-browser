@@ -124,3 +124,38 @@ fn selftest_and_version_reject_egress_arguments() {
         );
     }
 }
+
+/// RUSTSEC-2026-0459・RENDER-1（TASK-38）: Servo の HTTP ディスクキャッシュ（`cache.sqlite3`）を作らない。
+///
+/// 既定のままだと servo-net の `storage_dir()` が `$TMPDIR/cache.sqlite3`（固定名）に DB と WAL を作り、
+/// 他ユーザーの先置き・インスタンス間の共有を許す。専用の空ディレクトリを一時ディレクトリに渡して
+/// `--selftest`（ページ load を含む）を走らせ、その配下と親に DB 系ファイルが無いことを確かめる。
+#[test]
+fn selftest_does_not_create_http_disk_cache() {
+    let base = std::env::temp_dir().join(format!("fandhe-diskcache-test-{}", std::process::id()));
+    let tmp = base.join("tmp");
+    std::fs::create_dir_all(&tmp).expect("create tmp");
+    let out = Command::new(env!("CARGO_BIN_EXE_fandhe-browser-servo-host"))
+        .arg("--selftest")
+        .env("TMPDIR", &tmp)
+        .env("TMP", &tmp)
+        .env("TEMP", &tmp)
+        .output()
+        .expect("run host");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let mut found = Vec::new();
+    for dir in [&tmp, &base] {
+        for name in ["cache.sqlite3", "cache.sqlite3-wal", "cache.sqlite3-shm"] {
+            if dir.join(name).exists() {
+                found.push(dir.join(name));
+            }
+        }
+    }
+    let _ = std::fs::remove_dir_all(&base);
+    assert!(found.is_empty(), "disk cache files created: {found:?}");
+}

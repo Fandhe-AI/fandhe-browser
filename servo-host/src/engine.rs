@@ -55,6 +55,23 @@ impl fmt::Display for EngineError {
 
 impl std::error::Error for EngineError {}
 
+/// `network_http_disk_cache` に入れる「開けないパス」。HTTP ディスクキャッシュ（SQLite）を無効にする。
+///
+/// servo-net 0.7.0 の `storage_dir()`（`disk_cache.rs`）は `temporary_storage: true` かつ値が空だと
+/// `tempfile::tempdir()` のパスの `file_name` を `cache.sqlite3` に差し替えるため、DB と WAL が
+/// 一時ディレクトリ直下の固定名（`$TMPDIR/cache.sqlite3`）にでき、他ユーザーの先置き・キャッシュ汚染・
+/// インスタンス間の共有を許す（RUSTSEC-2026-0459・設計 §2.6・`RENDER-1`・TASK-38）。
+/// `(true, 空でない)` の分岐は `error!` を出して `None` を返し、ディスクキャッシュを作らない
+/// （メモリキャッシュは残る）。上流が将来この値をパスとして使っても `Connection::open` が必ず
+/// 失敗し、他ユーザーが作れない場所になるよう、親が作成不能な絶対パスにする（相対パスは cwd に、
+/// `/tmp` 等の共有領域は先置きに使われる）。Unix は `/dev/null` が通常ファイルでなく配下を作れない。
+/// Windows は `<`・`>` がパスに使えない文字で必ず開けない。環境変数・argv・ファイルは読まない（SEC-2）。
+/// servo の版を上げるときは `storage_dir()` の分岐を再確認する（`Cargo.toml` のコメント参照）。
+#[cfg(unix)]
+const DISABLED_HTTP_DISK_CACHE: &str = "/dev/null/fandhe-browser-disk-cache-disabled/cache.sqlite3";
+#[cfg(windows)]
+const DISABLED_HTTP_DISK_CACHE: &str = r"C:\<fandhe-browser-disk-cache-disabled>\cache.sqlite3";
+
 /// 固定の Servo `Opts`。引数を取らず、環境変数・argv・ファイルを読まない（SEC-2）。
 ///
 /// `hard_fail: true`（既定）はスレッド失敗時に終了する fail-closed 側なので変えない。
@@ -99,7 +116,8 @@ impl LoopbackProxy {
 /// 3 フィールドを常に明示代入して環境由来の値を持ち込ませない（proxy は識別面・SSRF 経路）。
 /// `proxy` が `Some` のときだけ http・https をその URI にする（`no_proxy` は常に空で、loopback 宛ても
 /// 含めて全通信が proxy 経由になる）。
-/// あわせて IntersectionObserver を有効にする（理由は本体のコメント。#1294・#1297）。
+/// あわせて IntersectionObserver を有効にし（理由は本体のコメント。#1294・#1297）、HTTP ディスク
+/// キャッシュを無効にする（[`DISABLED_HTTP_DISK_CACHE`]）。
 /// ほかの pref は既定のまま。UA 等の識別面には触れない（SEC-2）。
 fn fixed_preferences(proxy: Option<LoopbackProxy>) -> Preferences {
     let proxy_uri = proxy.map(LoopbackProxy::uri).unwrap_or_default();
@@ -117,6 +135,7 @@ fn fixed_preferences(proxy: Option<LoopbackProxy>) -> Preferences {
         // の panic（servo/servo#47875。未修正）が残る可能性があるため、クラッシュ・ハングが出たら
         // 無効に戻すかオーナーに判断を仰ぐ。Servo のソースは改変せず設定値だけを変える。
         dom_intersection_observer_enabled: true,
+        network_http_disk_cache: DISABLED_HTTP_DISK_CACHE.to_owned(),
         ..Preferences::default()
     }
 }
@@ -191,6 +210,16 @@ mod tests {
         assert_eq!(prefs.network_http_no_proxy, "");
         // #1294・#1297: IntersectionObserver を公開する（0.7.0 で上流のハング修正を取り込み済み）。
         assert!(prefs.dom_intersection_observer_enabled);
+    }
+
+    /// RUSTSEC-2026-0459・`RENDER-1`: `temporary_storage` と空でない disk cache 値の組が不変条件
+    /// （空のままだと `$TMPDIR/cache.sqlite3` に DB ができる）。
+    #[test]
+    fn http_disk_cache_is_disabled_with_temporary_storage() {
+        assert!(fixed_opts().temporary_storage);
+        let v = fixed_preferences(None).network_http_disk_cache;
+        assert_eq!(v, DISABLED_HTTP_DISK_CACHE);
+        assert!(!v.is_empty());
     }
 
     /// RENDER-3・SEC-2（#1435）: 指定時は http・https がその URI になり、`no_proxy` は空のまま。

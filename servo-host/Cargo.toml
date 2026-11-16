@@ -36,6 +36,8 @@ name = "fandhe-browser-servo-host"
 path = "src/main.rs"
 
 [dependencies]
+# 版を上げるときは servo-net の `disk_cache.rs` `storage_dir()` の分岐を再確認する
+# （engine.rs の `DISABLED_HTTP_DISK_CACHE` の前提。RUSTSEC-2026-0459）。
 servo = { version = "=0.7.0", default-features = false, features = ["baked-in-resources"] }
 serde_json = "=1.0.154"
 image = { version = "=0.25.10", default-features = false, features = ["png"] }
