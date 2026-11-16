@@ -20,7 +20,7 @@ name = "fandhe-browser-mcp"
 path = "src/main.rs"
 
 [dependencies]
-# Issue #367 で承認済み（=3.4.1・Apache-2.0）。feature は root の workspace 定義を参照。
+# Issue #367 で承認済み（採用時 =3.4.1・Apache-2.0。2026-11-16 に RUSTSEC 対応で =3.9.0 へ更新）。feature は root の workspace 定義を参照。
 rmcp = { workspace = true }
 # rmcp が必ず依存する tokio と、94.2 の `#[tokio::main]` 用。workspace 定義
 # （#35 承認・rt / macros）の再利用で新規バージョンは導入しない。

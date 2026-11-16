@@ -58,7 +58,8 @@ SHIM
   h="0123456789abcdef"
   for prof in debug release; do
     t="${tmp}/ws/target/${prof}"
-    mkdir -p "${t}/deps" "${t}/.fingerprint/fandhe-browser-ai-${h}" "${t}/.fingerprint/serde-${h}" "${t}/build/fandhe-browser-ai-${h}"
+    mkdir -p "${t}/deps" "${t}/.fingerprint/fandhe-browser-ai-${h}" "${t}/.fingerprint/serde-${h}" "${t}/build/fandhe-browser-ai-${h}" \
+      "${t}/build/fandhe-browser-ai/${h}/out" "${t}/build/serde/${h}/out"
     for f in "fandhe_browser_ai-${h}.pdb" "fandhe_browser_ai-${h}.d" "libfandhe_browser_ai-${h}.rlib" \
       "libfandhe_browser_ai-${h}.rmeta" "fandhe_browser-${h}.exe" "fandhe_browser-${h}.pdb" "fandhe-browser-${h}.d" \
       "fandhe_browser_ai-${h}.dll" "fandhe_browser_ai-${h}.dll.lib" "fandhe_browser_ai-${h}.dll.exp"; do
@@ -81,11 +82,12 @@ SHIM
   for prof in debug release; do
     t="${tmp}/ws/target/${prof}"
     for f in "deps/fandhe_browser_ai-${h}.pdb" "deps/fandhe_browser-${h}.exe" "deps/fandhe_browser_ai-${h}.dll.lib" \
-      "deps/libfandhe_browser_ai-${h}.rlib" ".fingerprint/fandhe-browser-ai-${h}" "build/fandhe-browser-ai-${h}" \
+      "deps/libfandhe_browser_ai-${h}.rlib" ".fingerprint/fandhe-browser-ai-${h}" "build/fandhe-browser-ai-${h}" "build/fandhe-browser-ai" \
       fandhe-browser.exe fandhe_browser.pdb fandhe_browser_ai.dll fandhe_browser_ai.dll.exp libfandhe_browser_ai.rlib; do
       if [ -e "${t}/${f}" ]; then echo "NG(self-test): workspace artifact kept: ${prof}/${f}" >&2; ng=1; fi
     done
-    for f in "deps/serde-${h}.pdb" "deps/libserde-${h}.rlib" "deps/serde_json-${h}.d" ".fingerprint/serde-${h}"; do
+    for f in "deps/serde-${h}.pdb" "deps/libserde-${h}.rlib" "deps/serde_json-${h}.d" ".fingerprint/serde-${h}" \
+      "build/serde/${h}"; do
       if [ ! -e "${t}/${f}" ]; then echo "NG(self-test): dependency artifact removed: ${prof}/${f}" >&2; ng=1; fi
     done
   done
@@ -217,7 +219,9 @@ names=("${mapfile_names[@]}")
 
 alt_pkgs="$(IFS='|'; printf '%s' "${pkgs[*]}")"
 alt_names="$(IFS='|'; printf '%s' "${names[*]}")"
-re_unit="^(${alt_pkgs})-[0-9a-f]{16}$"                 # .fingerprint/ build/（package 名・ハイフンのまま）
+# .fingerprint/ build/（package 名・ハイフンのまま）。Cargo 1.99 以前の build/<pkg>-<hash> と、
+# 1.100 以降の build/<pkg>/<hash>（package 名のディレクトリごと消す）の両方に一致させる
+re_unit="^(${alt_pkgs})(-[0-9a-f]{16})?$"
 # deps/（target 名・`_` 正規化）。Windows の `name_<hash>.pdb` に備え区切りは `-` と `_` の両方
 re_dep="^(lib)?(${alt_names})[-_][0-9a-f]{16}(\..+)?$"
 # <profile> 直下の uplift バイナリ（lib prefix・拡張子込み。Windows の exe・pdb・dll 系を含む）

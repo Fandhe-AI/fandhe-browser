@@ -478,9 +478,10 @@ jobs:
       - name: "[servo-host] ANGLE の DLL を配置（libEGL.dll・libGLESv2.dll）"
         run: |
           # Windows は `no-wgl`（ANGLE）で動く。mozangle の build.rs が OUT_DIR に作る DLL は、実行時に exe の隣か PATH に要る。
-          # 実行するため release の exe の隣へ置く。OUT_DIR を持つ mozangle-* ディレクトリが 1 件でない・DLL が欠けるときは fail する
+          # 実行するため release の exe の隣へ置く。Cargo 1.100 以降の配置（build\mozangle\<hash>\out）で、
+          # DLL を持つ OUT_DIR が 1 件でない・DLL が欠けるときは fail する
           $build = Join-Path $env:SERVO_HOST_TARGET_DIR 'release\build'
-          $outs = @(Get-ChildItem -Path $build -Directory -Filter 'mozangle-*' |
+          $outs = @(Get-ChildItem -Path (Join-Path $build 'mozangle') -Directory -ErrorAction SilentlyContinue |
             ForEach-Object { Join-Path $_.FullName 'out' } |
             Where-Object {
               (Test-Path (Join-Path $_ 'libEGL.dll')) -and
@@ -1274,9 +1275,10 @@ jobs:
       - name: "[servo-host] ANGLE の DLL を配置（libEGL.dll・libGLESv2.dll）"
         run: |
           # Windows は `no-wgl`（ANGLE）で動く。mozangle の build.rs が OUT_DIR に作る DLL は、実行時に exe の隣か PATH に要る。
-          # 実行するため release の exe の隣へ置く。OUT_DIR を持つ mozangle-* ディレクトリが 1 件でない・DLL が欠けるときは fail する
+          # 実行するため release の exe の隣へ置く。Cargo 1.100 以降の配置（build\mozangle\<hash>\out）で、
+          # DLL を持つ OUT_DIR が 1 件でない・DLL が欠けるときは fail する
           $build = Join-Path $env:SERVO_HOST_TARGET_DIR 'release\build'
-          $outs = @(Get-ChildItem -Path $build -Directory -Filter 'mozangle-*' |
+          $outs = @(Get-ChildItem -Path (Join-Path $build 'mozangle') -Directory -ErrorAction SilentlyContinue |
             ForEach-Object { Join-Path $_.FullName 'out' } |
             Where-Object {
               (Test-Path (Join-Path $_ 'libEGL.dll')) -and

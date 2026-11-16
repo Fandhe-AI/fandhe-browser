@@ -1380,16 +1380,13 @@ fn mount_identity(fd: BorrowedFd<'_>) -> Result<MountIdentity, ProfileError> {
 /// 場合は bind mount を識別できないため fail-closed で false とする。
 #[cfg(unix)]
 fn same_mount(root: MountIdentity, child: MountIdentity) -> bool {
-    if root.dev != child.dev {
-        return false;
-    }
     #[cfg(any(target_os = "linux", target_os = "android"))]
     {
-        matches!((root.mnt_id, child.mnt_id), (Some(a), Some(b)) if a == b)
+        root.dev == child.dev && matches!((root.mnt_id, child.mnt_id), (Some(a), Some(b)) if a == b)
     }
     #[cfg(not(any(target_os = "linux", target_os = "android")))]
     {
-        true
+        root.dev == child.dev
     }
 }
 
