@@ -39,7 +39,7 @@ exclude = ["servo-host"]
 # 他フィールドと異なり自動継承されないため、`make check-publish-ready`（`make ci` に含む）が
 # 全 member crate を「公開 allowlist の 8 crate」か「`publish = false`」のどちらかに限り、
 # 新規 crate が黙って公開可能にならないようにする（fail-closed）。
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/Fandhe-AI/fandhe-browser"
@@ -56,12 +56,12 @@ publish = true
 # ai は cli の `plugin-registry` feature 経由でだけ既定 feature を有効にするため
 # `default-features = false`（#822・`PERF-7`）。edition 2024 ではメンバー側で
 # `default-features = false` を指定できず、workspace 側で決める必要がある。
-fandhe-browser-profile = { path = "crates/fandhe-browser-profile", version = "=0.1.1" }
-fandhe-browser-js = { path = "crates/fandhe-browser-js", version = "=0.1.1" }
-fandhe-browser-core = { path = "crates/fandhe-browser-core", version = "=0.1.1" }
-fandhe-browser-ai = { path = "crates/fandhe-browser-ai", version = "=0.1.1", default-features = false }
-fandhe-browser-cdp = { path = "crates/fandhe-browser-cdp", version = "=0.1.1" }
-fandhe-browser-render = { path = "crates/fandhe-browser-render", version = "=0.1.1" }
+fandhe-browser-profile = { path = "crates/fandhe-browser-profile", version = "=0.1.2" }
+fandhe-browser-js = { path = "crates/fandhe-browser-js", version = "=0.1.2" }
+fandhe-browser-core = { path = "crates/fandhe-browser-core", version = "=0.1.2" }
+fandhe-browser-ai = { path = "crates/fandhe-browser-ai", version = "=0.1.2", default-features = false }
+fandhe-browser-cdp = { path = "crates/fandhe-browser-cdp", version = "=0.1.2" }
+fandhe-browser-render = { path = "crates/fandhe-browser-render", version = "=0.1.2" }
 
 # TASK-14.2（Issue #93・AISNAP-1）: 生 HTML のトークン量（cl100k_base）計測用。
 # 採否・バージョンは Issue #92 に記録済み。ライセンスは MIT。配置は

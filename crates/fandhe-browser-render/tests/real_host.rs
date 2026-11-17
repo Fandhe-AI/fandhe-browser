@@ -73,8 +73,10 @@ fn host_config(timeouts: HostTimeouts) -> HostProcessConfig {
     let bin = resolve_host_binary(None, Some(env.as_os_str()), None)
         .unwrap_or_else(|e| panic!("invalid host binary: {e}"));
     // 隔離なしに固定する（隔離の検証は `render3_egress_*` を参照。本テストは従来どおりの起動を確かめる）。
+    // 隔離なしでもプロキシ経由になる（RENDER-3・SEC-2）。loopback のテストサーバーへ出すため許可する。
     HostProcessConfig::new(bin)
         .with_timeouts(timeouts)
+        .with_allow_private_network_access(true)
         .with_isolation_probe(IsolationProbe::Unavailable(
             EgressIsolationUnavailable::SandboxToolNotFound,
         ))
@@ -741,6 +743,61 @@ fn render3_real_host_process_layer() {
     assert!(workdir.exists());
     p.shutdown();
     assert!(!workdir.exists(), "workdir must be removed after shutdown");
+}
+
+/// 隔離できない起動（unix）でも、ホストの通信が本体側のプロキシを経由すること（RENDER-3・SEC-2）。
+/// Windows はプロキシが無く隔離なしの起動を拒否するため対象外。
+///
+/// 経由の確認は、`allow_private_network_access` だけを変えた 2 回で比べる（許可の設定は 1 つで、
+/// 主フレームだけ許して子だけ拒否する構成はできない）。許可あり: iframe の赤が撮影に写り、サブ用
+/// サーバーにも届く（対照）。許可なし: 主フレームごとプロキシに拒否され、どちらのサーバーにも
+/// 届かない。直接接続なら許可なしでも読み込めてサブ用サーバーに届くため、本テストは失敗する。
+/// サブリソース単体の遮断は検証しない（主フレームも同じプロキシを通るため区別できない）。
+/// 外部ネットワークには出ない。
+#[cfg(unix)]
+#[test]
+fn render3_unisolated_launch_routes_through_proxy() {
+    let sub = Server::start(false);
+    let page_html = format!(
+        "<html><body style=\"margin:0\">\
+<iframe src=\"{u}\" style=\"border:0;width:600px;height:400px\"></iframe>\
+<img src=\"{u}\" width=\"10\" height=\"10\"></body></html>",
+        u = sub.url("/shot")
+    );
+    // `/ws` は本文付きサーバーが返す唯一のパス（名前は WebSocket 用だが中身は任意の HTML）。
+    let main = Server::start_inner(false, Some(page_html));
+    let url = main.url("/ws");
+
+    // 拒否側。許可なしでは主フレームもプロキシに拒否され、サブ用サーバーへは何も届かない。
+    // 拒否は読み込み失敗または時間切れで返るため、待ちを短くする（対照側は別設定で十分な時間を取る）。
+    let mut denied = HostProcess::new(
+        host_config(HostTimeouts::default()).with_allow_private_network_access(false),
+    );
+    let e = denied
+        .load(&LoadParams::new(&url, Some(5_000)).expect("params"), 1)
+        .expect_err("internal address must be denied");
+    assert!(
+        matches!(&e, HostProcessError::Host(_) | HostProcessError::Timeout(_)),
+        "unexpected error kind: {e:?}"
+    );
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(main.accepted(), 0, "main frame reached the server");
+    assert_eq!(sub.accepted(), 0, "subresource reached the server");
+    denied.shutdown();
+
+    // 対照: 許可だけを変えると iframe が読めて赤が写り、サブ用サーバーに届く。
+    let allowed = renderer(HostTimeouts::default(), true, Some(20_000));
+    let r: &dyn Renderer = &allowed;
+    r.load(&PageRef::new(url.as_str())).expect("control load");
+    let shot = r
+        .capture_screenshot(&ScreenshotOptions::new())
+        .expect("control screenshot");
+    let px = png_pixel(&shot.data, 100, 100);
+    assert!(
+        px[0] > 200 && px[1] < 60 && px[2] < 60,
+        "control pixel {px:?}"
+    );
+    assert!(sub.accepted() >= 1, "control: subresource not requested");
 }
 
 /// 隔離検証を明示する環境変数（値は `required` のみ。RENDER-3・#1437）。

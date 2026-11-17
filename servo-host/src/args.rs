@@ -5,7 +5,7 @@
 //! 1〜65535 の 10 進ポートと、正規化済みの絶対 UDS パスだけ。値はエラーメッセージに含めない
 //! （ログ注入・機密露出の回避）。
 //!
-//! 呼び出し元は `main`。`--egress-proxy-port`（macOS 向け）・`--egress-relay-uds`（Linux 向け）は
+//! 呼び出し元は `main`。`--egress-proxy-port`（macOS の隔離中と、隔離なしの unix 向け）・`--egress-relay-uds`（Linux 向け）は
 //! 本体の egress 隔離（#1436 が付与）が渡す。proxy の場所は `engine::LoopbackProxy` として
 //! Servo の proxy pref にだけ流れる。
 //! `--egress-relay-uds` は `bwrap --unshare-net` で包むときだけ渡す前提（`relay` のモジュール doc。#1444）。
@@ -36,7 +36,7 @@ pub(crate) enum Command {
 pub(crate) enum Egress {
     /// proxy なし（従来どおり）。
     None,
-    /// `127.0.0.1:<port>` の CONNECT プロキシへ向ける（macOS 向け）。
+    /// `127.0.0.1:<port>` の CONNECT プロキシへ向ける（macOS の隔離中と、隔離なしの unix 向け）。
     ProxyPort(NonZeroU16),
     /// netns 内の中継を起動し、各接続を `<path>` の UDS へ転送する（Linux 向け）。
     ///

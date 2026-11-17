@@ -14,6 +14,7 @@ mod support;
 
 #[cfg(unix)]
 use std::collections::BTreeSet;
+#[cfg(unix)]
 use std::time::{Duration, Instant};
 
 use fandhe_browser_core::EgressIsolationMode;
@@ -22,26 +23,34 @@ use fandhe_browser_render::host_process::HOST_ARGS;
 #[cfg(unix)]
 use fandhe_browser_render::host_process::HostProcessConfig;
 #[cfg(unix)]
+use fandhe_browser_render::host_process::HostTimeouts;
+#[cfg(unix)]
+use fandhe_browser_render::host_process::TimeoutPhase;
+#[cfg(unix)]
 use fandhe_browser_render::host_process::{EgressIsolationStatus, EgressIsolationWarning};
 use fandhe_browser_render::host_process::{
-    EgressIsolationUnavailable, HostProcess, HostProcessError, HostTimeouts, IsolationProbe,
-    TimeoutPhase,
+    EgressIsolationUnavailable, HostProcess, HostProcessError, IsolationProbe,
 };
 #[cfg(unix)]
 use fandhe_browser_render::host_process::{FORCED_ENV_NAMES, PASSTHROUGH_ENV_NAMES};
+use fandhe_browser_render::protocol::LoadParams;
+#[cfg(unix)]
 use fandhe_browser_render::protocol::{
-    BoundingBoxParams, LoadParams, MethodResult, ProtocolError, Request, ScreenshotParams,
-    VisibilityParams,
+    BoundingBoxParams, MethodResult, ProtocolError, VisibilityParams,
 };
+#[cfg(unix)]
+use fandhe_browser_render::protocol::{Request, ScreenshotParams};
 #[cfg(unix)]
 use serde_json::Value;
 use support::*;
 
 /// `Root` から `HostProcess` を組み立てる（HostProcess 層専用のため `support` には置かない）。
+#[cfg(unix)]
 trait RootHost {
     fn host(&self, timeouts: HostTimeouts) -> HostProcess;
 }
 
+#[cfg(unix)]
 impl RootHost for Root {
     fn host(&self, timeouts: HostTimeouts) -> HostProcess {
         HostProcess::new(self.config(timeouts))
@@ -52,10 +61,12 @@ pub fn page() -> LoadParams {
     LoadParams::new("https://example.com/", None).expect("page")
 }
 
+#[cfg(unix)]
 pub fn shot() -> Request {
     Request::Screenshot(ScreenshotParams::new(false))
 }
 
+#[cfg(unix)]
 fn t_ok_roundtrip() {
     let root = Root::new("ok", "ok");
     let mut h = root.host(base_timeouts());
@@ -86,6 +97,7 @@ fn t_ok_roundtrip() {
     assert_gone(child_pid(&root, 1));
 }
 
+#[cfg(unix)]
 fn t_invalid_request() {
     let root = Root::new("invalid", "ok");
     let mut h = root.host(base_timeouts());
@@ -100,6 +112,7 @@ fn t_invalid_request() {
     assert_eq!(count(&root.0, "spawns"), 0);
 }
 
+#[cfg(unix)]
 fn t_hello_timeout() {
     let root = Root::new("hello-timeout", "hello-timeout");
     // 遅い CI（Windows 等）でも偽ホストが pid を書き終えてから kill されるよう、
@@ -116,6 +129,7 @@ fn t_hello_timeout() {
     assert_gone(child_pid(&root, 1));
 }
 
+#[cfg(unix)]
 fn t_bad_protocol_range() {
     let root = Root::new("bad-range", "bad-protocol-range");
     let mut h = root.host(base_timeouts());
@@ -125,6 +139,7 @@ fn t_bad_protocol_range() {
     assert_eq!(h.host_generation(), 0);
 }
 
+#[cfg(unix)]
 fn t_crash_then_restart() {
     let root = Root::new("crash", "crash-after-hello\nok");
     let mut h = root.host(base_timeouts());
@@ -137,6 +152,7 @@ fn t_crash_then_restart() {
     assert_eq!(count(&root.0, "spawns"), 2);
 }
 
+#[cfg(unix)]
 fn t_load_timeout() {
     let root = Root::new("hang-load", "hang-load");
     let mut h = root.host(short_timeouts());
@@ -154,6 +170,7 @@ fn t_load_timeout() {
     assert_gone(child_pid(&root, 1));
 }
 
+#[cfg(unix)]
 fn t_query_timeouts() {
     let root = Root::new("hang-query", "hang-query");
     let mut h = root.host(short_timeouts());
@@ -172,6 +189,7 @@ fn t_query_timeouts() {
     assert_gone(child_pid(&root, 2));
 }
 
+#[cfg(unix)]
 fn t_protocol_violations() {
     let root = Root::new("garbage", "garbage-frame");
     let mut h = root.host(base_timeouts());
@@ -206,6 +224,7 @@ fn t_protocol_violations() {
     assert!(h.pid().is_none());
 }
 
+#[cfg(unix)]
 fn t_slow_shutdown_is_killed_after_grace() {
     let root = Root::new("slow-shutdown", "slow-shutdown");
     let mut h = root.host(short_timeouts());
@@ -236,7 +255,10 @@ fn t_dump_env_args_cwd() {
         .iter()
         .map(|v| v.as_str().unwrap())
         .collect();
-    assert_eq!(args, HOST_ARGS);
+    // 隔離なしでもプロキシ経由（RENDER-3・SEC-2）。末尾に `--egress-proxy-port <port>` が付く。
+    assert_eq!(&args[..HOST_ARGS.len()], HOST_ARGS);
+    assert_eq!(args.len(), HOST_ARGS.len() + 2, "{args:?}");
+    assert_eq!(args[HOST_ARGS.len()], "--egress-proxy-port");
     let names: BTreeSet<String> = obs["env"]
         .as_array()
         .unwrap()
@@ -277,6 +299,7 @@ fn t_dump_env_args_cwd() {
     assert!(!workdir.exists(), "workdir must be deleted");
 }
 
+#[cfg(unix)]
 fn t_reload_on_generation_change() {
     let root = Root::new("reload", "ok");
     let mut h = root.host(base_timeouts());
@@ -287,6 +310,7 @@ fn t_reload_on_generation_change() {
     assert_eq!(count(&root.0, "loads"), 2, "navigation generation changed");
 }
 
+#[cfg(unix)]
 fn t_reload_after_crash() {
     let root = Root::new("reload-crash", "crash-on-screenshot\nok");
     let mut h = root.host(base_timeouts());
@@ -298,6 +322,7 @@ fn t_reload_after_crash() {
     assert_eq!(count(&root.0, "loads"), 2, "new host must reload the page");
 }
 
+#[cfg(unix)]
 fn t_circuit_breaker() {
     let root = Root::new("breaker", "crash-on-start");
     let mut h = root.host(base_timeouts());
@@ -316,6 +341,7 @@ fn t_circuit_breaker() {
     assert_eq!(count(&root.0, "spawns"), 3, "no spawn while open");
 }
 
+#[cfg(unix)]
 fn t_profile_isolation() {
     let root = Root::new("prof", "ok");
     let mut a = root.host(base_timeouts());
@@ -326,6 +352,7 @@ fn t_profile_isolation() {
     assert_ne!(a.workdir_path(), b.workdir_path());
 }
 
+#[cfg(unix)]
 fn t_stderr_tail() {
     let root = Root::new("stderr", "stderr-flood");
     let mut h = root.host(base_timeouts());
@@ -467,7 +494,12 @@ fn t_best_effort_warns_once_and_starts_unwrapped() {
     let obs: Value =
         serde_json::from_str(&std::fs::read_to_string(root.0.join("obs-dump.json")).unwrap())
             .unwrap();
-    assert_eq!(obs["args"], serde_json::json!(["--stdio"]));
+    // 隔離できなくても本体側のプロキシ経由にする（RENDER-3・SEC-2）。
+    let args = obs["args"].as_array().unwrap();
+    assert_eq!(args.len(), 3, "{args:?}");
+    assert_eq!(args[0], "--stdio");
+    assert_eq!(args[1], "--egress-proxy-port");
+    assert!(args[2].as_str().unwrap().parse::<u16>().unwrap() > 0);
     assert_eq!(
         *sink.lock().unwrap(),
         vec![EgressIsolationWarning::Unisolated(reason)]
@@ -813,6 +845,54 @@ fn t_system_probe_rss_limit_kills_wrapped_host() {
     pids.into_iter().for_each(wait_gone);
 }
 
+/// Windows は本体側のプロキシが無く送信先を許可リストに限れないため、`best-effort` でも隔離なしの
+/// 起動を拒否し、ホストを起動しない（RENDER-3・SEC-2）。ブレーカーには数えない。
+#[cfg(windows)]
+fn t_windows_unisolated_launch_refused() {
+    let root = Root::new("iso-windows", "ok");
+    let reason = EgressIsolationUnavailable::UnsupportedPlatform;
+    let cfg = root
+        .config(base_timeouts())
+        .with_egress_isolation(EgressIsolationMode::BestEffort)
+        .with_isolation_probe(IsolationProbe::Unavailable(reason));
+    let mut h = HostProcess::new(cfg);
+    for _ in 0..5 {
+        let e = h.load(&page(), 1).expect_err("must refuse");
+        assert!(
+            matches!(e, HostProcessError::EgressIsolationUnavailable(r) if r == reason),
+            "{e:?}"
+        );
+    }
+    assert_eq!(count(&root.0, "spawns"), 0, "host must never be started");
+}
+
+// Windows は隔離なしの起動を拒否するため、偽ホストを起動する試験は unix だけで動かす。
+// Windows で動くのは起動拒否の試験と、起動しない試験（`required`）のみ。
+#[cfg(windows)]
+fn main() {
+    maybe_run_fake_host();
+    let tests: Vec<(&str, fn())> = vec![
+        (
+            "windows_unisolated_refused",
+            t_windows_unisolated_launch_refused,
+        ),
+        (
+            "egress_ci_guard_logic",
+            t_ci_guard_requires_sandbox_only_on_github_actions,
+        ),
+        (
+            "egress_required_unavailable",
+            t_required_unavailable_does_not_spawn,
+        ),
+        (
+            "egress_required_hide_failures",
+            t_required_hide_failures_do_not_spawn,
+        ),
+    ];
+    run("host_process", tests);
+}
+
+#[cfg(unix)]
 fn main() {
     maybe_run_fake_host();
     #[allow(unused_mut)]

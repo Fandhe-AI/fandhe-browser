@@ -22,7 +22,13 @@
 //! - macOS: `sandbox-exec -p <profile> <ホスト> --stdio --egress-proxy-port <port>`。
 //!   profile は loopback の 1 ポート以外への送信を拒否する（`harness/egress-isolation/seatbelt.py`
 //!   と同じ形）。
-//! - Windows ほか: 隔離できない（[`EgressIsolationUnavailable::UnsupportedPlatform`]。既知の制約）
+//! - Windows ほか: 隔離できない（[`EgressIsolationUnavailable::UnsupportedPlatform`]）。プロキシも
+//!   起動できず送信先を許可リストに限れないため、`best-effort` でも隔離なしの起動は拒否し、
+//!   Windows では撮影できない（RENDER-3。Windows 向けのプロキシは後続で作る）。`--version` の版検査
+//!   （ページを読まない）は隔離なしで実行できる。
+//! - unix で隔離できない（`best-effort` で降格した）場合も、プロキシは起動してホストを経由させる
+//!   （`--egress-proxy-port`・loopback TCP。サンドボックスは無いので遮断はプロキシへの協力に依存し、
+//!   WebSocket は経由しない。RENDER-3・SEC-2）。
 //!
 //! # 範囲・既知の制約
 //!

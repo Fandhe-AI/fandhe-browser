@@ -125,6 +125,11 @@ impl WebViewDelegate for PageDelegate {
         webview.paint();
     }
 
+    fn load_web_resource(&self, _webview: WebView, load: servo::WebResourceLoad) {
+        // 読み込み先を許可リストで制限する（RENDER-3・SEC-2）。
+        crate::guard::check(load);
+    }
+
     fn notify_crashed(&self, _webview: WebView, _reason: String, _backtrace: Option<String>) {
         // 理由と backtrace は URL 等の機密を含みうるため記録しない。
         self.crashed.set(true);

@@ -136,6 +136,8 @@ fn fixed_preferences(proxy: Option<LoopbackProxy>) -> Preferences {
         // 無効に戻すかオーナーに判断を仰ぐ。Servo のソースは改変せず設定値だけを変える。
         dom_intersection_observer_enabled: true,
         network_http_disk_cache: DISABLED_HTTP_DISK_CACHE.to_owned(),
+        // `file:` の許可外化（`guard`）に加え、ディレクトリ一覧の生成も止める（RENDER-3・SEC-2）。
+        network_local_directory_listing_enabled: false,
         ..Preferences::default()
     }
 }
@@ -170,6 +172,8 @@ impl Engine {
             .opts(fixed_opts())
             .preferences(fixed_preferences(proxy))
             .build();
+        // WebView に紐づかない読み込み（Worker 等）の検査。最初の WebView より前に設定する（RENDER-3）。
+        servo.set_delegate(crate::guard::GuardDelegate::new());
         Ok(Self {
             servo,
             context: Rc::new(context),
