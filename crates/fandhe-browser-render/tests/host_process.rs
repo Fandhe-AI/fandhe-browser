@@ -10,6 +10,8 @@
 //! 分岐を読める）、`GITHUB_ACTIONS=true` で `probe_system()` が Err なら失敗にする
 //! （RENDER-3・#1451。bwrap が無くて Err 分岐だけ通り緑になるのを防ぐ）。
 
+#![cfg_attr(windows, allow(dead_code, unused_imports))]
+
 mod support;
 
 #[cfg(unix)]
@@ -236,7 +238,10 @@ fn t_dump_env_args_cwd() {
         .iter()
         .map(|v| v.as_str().unwrap())
         .collect();
-    assert_eq!(args, HOST_ARGS);
+    // 隔離なしでもプロキシ経由（RENDER-3・SEC-2）。末尾に `--egress-proxy-port <port>` が付く。
+    assert_eq!(&args[..HOST_ARGS.len()], HOST_ARGS);
+    assert_eq!(args.len(), HOST_ARGS.len() + 2, "{args:?}");
+    assert_eq!(args[HOST_ARGS.len()], "--egress-proxy-port");
     let names: BTreeSet<String> = obs["env"]
         .as_array()
         .unwrap()
@@ -467,7 +472,12 @@ fn t_best_effort_warns_once_and_starts_unwrapped() {
     let obs: Value =
         serde_json::from_str(&std::fs::read_to_string(root.0.join("obs-dump.json")).unwrap())
             .unwrap();
-    assert_eq!(obs["args"], serde_json::json!(["--stdio"]));
+    // 隔離できなくても本体側のプロキシ経由にする（RENDER-3・SEC-2）。
+    let args = obs["args"].as_array().unwrap();
+    assert_eq!(args.len(), 3, "{args:?}");
+    assert_eq!(args[0], "--stdio");
+    assert_eq!(args[1], "--egress-proxy-port");
+    assert!(args[2].as_str().unwrap().parse::<u16>().unwrap() > 0);
     assert_eq!(
         *sink.lock().unwrap(),
         vec![EgressIsolationWarning::Unisolated(reason)]
@@ -813,6 +823,54 @@ fn t_system_probe_rss_limit_kills_wrapped_host() {
     pids.into_iter().for_each(wait_gone);
 }
 
+/// Windows は本体側のプロキシが無く送信先を許可リストに限れないため、`best-effort` でも隔離なしの
+/// 起動を拒否し、ホストを起動しない（RENDER-3・SEC-2）。ブレーカーには数えない。
+#[cfg(windows)]
+fn t_windows_unisolated_launch_refused() {
+    let root = Root::new("iso-windows", "ok");
+    let reason = EgressIsolationUnavailable::UnsupportedPlatform;
+    let cfg = root
+        .config(base_timeouts())
+        .with_egress_isolation(EgressIsolationMode::BestEffort)
+        .with_isolation_probe(IsolationProbe::Unavailable(reason));
+    let mut h = HostProcess::new(cfg);
+    for _ in 0..5 {
+        let e = h.load(&page(), 1).expect_err("must refuse");
+        assert!(
+            matches!(e, HostProcessError::EgressIsolationUnavailable(r) if r == reason),
+            "{e:?}"
+        );
+    }
+    assert_eq!(count(&root.0, "spawns"), 0, "host must never be started");
+}
+
+// Windows は隔離なしの起動を拒否するため、偽ホストを起動する試験は unix だけで動かす。
+// Windows で動くのは起動拒否の試験と、起動しない試験（`required`）のみ。
+#[cfg(windows)]
+fn main() {
+    maybe_run_fake_host();
+    let tests: Vec<(&str, fn())> = vec![
+        (
+            "windows_unisolated_refused",
+            t_windows_unisolated_launch_refused,
+        ),
+        (
+            "egress_ci_guard_logic",
+            t_ci_guard_requires_sandbox_only_on_github_actions,
+        ),
+        (
+            "egress_required_unavailable",
+            t_required_unavailable_does_not_spawn,
+        ),
+        (
+            "egress_required_hide_failures",
+            t_required_hide_failures_do_not_spawn,
+        ),
+    ];
+    run("host_process", tests);
+}
+
+#[cfg(unix)]
 fn main() {
     maybe_run_fake_host();
     #[allow(unused_mut)]

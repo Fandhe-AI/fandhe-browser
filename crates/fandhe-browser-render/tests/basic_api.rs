@@ -7,6 +7,8 @@
 //! 試験は `real_host.rs`（#998・TASK-38.8b）。HostProcess 層の試験は `host_process.rs`。
 //! 外部入力の経路ではないため `unwrap` / `expect` / `panic!` を使う。
 
+#![cfg_attr(windows, allow(dead_code, unused_imports))]
+
 mod support;
 
 use std::time::{Duration, Instant};
@@ -400,6 +402,29 @@ fn t_api_circuit_breaker() {
     assert_eq!(count(&root.0, "spawns"), 3, "breaker open: no more spawns");
 }
 
+/// Windows は隔離なしの起動を拒否する（RENDER-3・SEC-2）ため、偽ホストを起動するこのファイルの
+/// 試験は unix だけで動かす。Windows では拒否が `HostUnavailable` で返り、ホストが起動しないことだけ見る。
+#[cfg(windows)]
+fn t_windows_unisolated_launch_refused() {
+    let root = Root::new("basic-windows", "ok");
+    let r = renderer(&root, short_timeouts(), false);
+    expect_variant(&r, "load", "HostUnavailable");
+    assert_eq!(count(&root.0, "spawns"), 0, "host must never be started");
+}
+
+#[cfg(windows)]
+fn main() {
+    maybe_run_fake_host();
+    run(
+        "basic_api",
+        vec![(
+            "windows_unisolated_refused",
+            t_windows_unisolated_launch_refused as fn(),
+        )],
+    );
+}
+
+#[cfg(unix)]
 fn main() {
     maybe_run_fake_host();
     let tests: Vec<(&str, fn())> = vec![

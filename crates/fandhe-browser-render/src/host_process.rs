@@ -34,11 +34,20 @@
 //!
 //! 起動時に OS のサンドボックスで包み、ホストの通信を本体側の許可リスト付き CONNECT プロキシ
 //! （[`crate::egress_proxy`]）に限る。実装と制約は [`isolation`] モジュールの doc を参照
-//! （Linux: bwrap・macOS: sandbox-exec・Windows: 隔離なし）。設定 `[rendering] egress_isolation`
+//! （Linux: bwrap・macOS: sandbox-exec・Windows: 起動不可）。設定 `[rendering] egress_isolation`
 //! の値は [`HostProcessConfig::egress_isolation`] で受ける。`best-effort`（既定）は隔離できなければ
-//! 警告（コールバック未設定なら stderr に 1 行）して隔離なしで起動し、`required` は [`HostProcessError::EgressIsolationUnavailable`] で
-//! 起動しない。隔離中は WebSocket が使えない。cli の版の検査（`--version`）も同じ判定・同じ包み方で、
-//! プロキシなし・送信先なしで実行する（[`run_host_version`]・#1553）。
+//! 警告（コールバック未設定なら stderr に 1 行）して隔離なしで起動し（unix のみ）、`required` は
+//! [`HostProcessError::EgressIsolationUnavailable`] で起動しない。WebSocket は隔離の有無によらず使えない（ホスト側の読み込み検査が拒否する）。隔離できないときも unix では本体側のプロキシを
+//! loopback TCP で起動し、ホストへ `--egress-proxy-port` を渡して http(s) の送信先を許可リストに限る
+//! （サブリソースが内部アドレスへ直接つながらない。起動できなければ失敗。fail-closed）。
+//! 隔離なしでも、既定（`allow_private_network_access=false`）ではループバック・プライベート宛を拒否する。
+//! WebSocket はプロキシを通らず、別途ホスト側で扱う。
+//!
+//! Windows には本体側のプロキシが無く、送信先を許可リストに限れない。そのため `best-effort` でも
+//! 隔離なしの起動は拒否し（[`HostProcessError::EgressIsolationUnavailable`]）、Windows では撮影できない
+//! （RENDER-3・SEC-2）。Windows 向けのプロキシは後続で作る。cli の版の検査（`--version`）も同じ判定・同じ包み方で、
+//! プロキシなし・送信先なしで実行する（[`run_host_version`]・#1553）。ページを読み込まないため、Windows でも
+//! 隔離なしで実行する（`best-effort` のとき）。
 //!
 //! # 未実装・暫定
 //!
@@ -89,7 +98,9 @@ use crate::codec::{
     MAX_HELLO_FRAME_BYTES, MAX_REQUEST_FRAME_BYTES, decode_hello, decode_response, effective_limit,
     encode_request, read_frame, response_frame_limit, write_frame,
 };
-use crate::egress_proxy::{BoundEndpoint, EgressEndpoint, EgressProxy, EgressProxyConfig};
+use crate::egress_proxy::{
+    BoundEndpoint, EgressEndpoint, EgressProxy, EgressProxyConfig, EgressProxyError,
+};
 use crate::protocol::{
     Hello, HelloLimits, HostError, HostErrorKind, LoadParams, LoadResult, MAX_LOAD_TIMEOUT_MS,
     MAX_SELECTOR_BYTES, MAX_URL_BYTES, Method, MethodResult, PROTOCOL_VERSION, ProtocolError,
@@ -358,6 +369,9 @@ pub struct HostProcessConfig {
     /// テスト用: `isolation_probe` の代わりに使うサンドボックス（本番ビルドには現れない。#1498）。
     #[cfg(test)]
     injected_sandbox: Option<Sandbox>,
+    /// テスト用: 隔離なしのプロキシ起動を失敗させる（unix のみ。Windows は起動自体を拒否する）。
+    #[cfg(all(test, unix))]
+    fail_proxy_start: bool,
 }
 
 /// 隔離まわりの警告（隔離なしに落ちた・tmpfs に上限を付けられない）を通知する。コールバックがあれば
@@ -407,6 +421,8 @@ impl HostProcessConfig {
             isolation_warning: IsolationWarning::default(),
             #[cfg(test)]
             injected_sandbox: None,
+            #[cfg(all(test, unix))]
+            fail_proxy_start: false,
         }
     }
     /// タイムアウトを差し替える。
@@ -974,7 +990,58 @@ impl HostProcess {
         }
     }
 
-    /// プロキシを起動し、ホストを包むコマンドを組み立てる。`Unisolated` は従来どおりの直接起動。
+    /// 隔離できないときも送信先を許可リストに限るため、loopback TCP のプロキシを起動し、ホストの引数へ
+    /// `--egress-proxy-port` を足す（RENDER-3・SEC-2）。起動できなければ隔離なしへ落とさず失敗にする
+    /// （fail-closed）。起動失敗の原因は `SpawnFailed` に丸まるため、診断として stderr に 1 行出す。
+    #[cfg(unix)]
+    fn start_unisolated_proxy(
+        &mut self,
+        args: &mut Vec<OsString>,
+        _reason: EgressIsolationUnavailable,
+    ) -> Result<Option<EgressProxy>, HostProcessError> {
+        #[cfg(test)]
+        if self.config.fail_proxy_start {
+            return Err(self.fail_spawn());
+        }
+        let proxy_config = EgressProxyConfig::default()
+            .with_allow_private_network_access(self.config.allow_private_network_access);
+        let proxy = match EgressProxy::start(EgressEndpoint::LoopbackTcp, proxy_config) {
+            Ok(p) => p,
+            Err(e) => return Err(self.proxy_start_failed(&e)),
+        };
+        // `LoopbackTcp` で起動したプロキシは必ず Tcp かつ port 非 0 を返すため、以下の 2 つの
+        // else は到達しない防御（不変条件が崩れても隔離なしへ落とさず失敗にするためだけに置く）。
+        let BoundEndpoint::Tcp(addr) = proxy.endpoint() else {
+            return Err(self.fail_spawn());
+        };
+        let Some(port) = NonZeroU16::new(addr.port()) else {
+            return Err(self.fail_spawn());
+        };
+        args.push(OsString::from("--egress-proxy-port"));
+        args.push(OsString::from(port.to_string()));
+        Ok(Some(proxy))
+    }
+
+    /// Windows には本体側の egress プロキシが無く（`EgressProxy::start` が `UnsupportedPlatform`）、
+    /// 送信先を許可リストに限れない。隔離なしの起動は `best-effort` でも拒否する（fail-closed。
+    /// RENDER-3・SEC-2）。ブレーカーには数えない（`required` の拒否と同じ扱い）。
+    #[cfg(not(unix))]
+    fn start_unisolated_proxy(
+        &mut self,
+        _args: &mut Vec<OsString>,
+        reason: EgressIsolationUnavailable,
+    ) -> Result<Option<EgressProxy>, HostProcessError> {
+        Err(HostProcessError::EgressIsolationUnavailable(reason))
+    }
+
+    /// プロキシの起動失敗を stderr に 1 行出して `SpawnFailed` を返す（原因は戻り値では区別されない）。
+    fn proxy_start_failed(&mut self, e: &EgressProxyError) -> HostProcessError {
+        eprintln!("warning: {e}");
+        self.fail_spawn()
+    }
+
+    /// プロキシを起動し、ホストを包むコマンドを組み立てる。`Unisolated` は直接起動だが、unix では
+    /// 隔離なしでもプロキシ経由にする。
     fn build_command(
         &mut self,
         plan: Plan,
@@ -983,6 +1050,9 @@ impl HostProcess {
         let host = self.config.binary.path().to_path_buf();
         let sandbox = match plan {
             Plan::Unisolated(reason) => {
+                let mut args: Vec<OsString> = HOST_ARGS.iter().map(OsString::from).collect();
+                // Windows はここで拒否する（警告より前。隔離なしで起動するとは言わない）。
+                let proxy = self.start_unisolated_proxy(&mut args, reason)?;
                 if !self.isolation_warned {
                     self.isolation_warned = true;
                     report_isolation_warning(
@@ -993,9 +1063,9 @@ impl HostProcess {
                 }
                 return Ok(Launch {
                     program: host,
-                    args: HOST_ARGS.iter().map(OsString::from).collect(),
+                    args,
                     status: EgressIsolationStatus::Unisolated(reason),
-                    proxy: None,
+                    proxy,
                     sandbox: None,
                 });
             }
@@ -1027,7 +1097,7 @@ impl HostProcess {
         // 隔離が使える環境でプロキシだけ起動できないときは、隔離なしへ落とさず失敗にする。
         let proxy = match EgressProxy::start(endpoint, proxy_config) {
             Ok(p) => p,
-            Err(_) => return Err(self.fail_spawn()),
+            Err(e) => return Err(self.proxy_start_failed(&e)),
         };
         let (program, args) = match (&sandbox, proxy.endpoint(), &socket_dir) {
             (Sandbox::Bwrap { bwrap, hidden }, BoundEndpoint::Unix(path), Some(sd)) => {
@@ -1602,7 +1672,7 @@ mod tests {
     }
 
     /// 偽 bwrap・偽ホストの置き場（`/tmp` 直下の短い専用ディレクトリ。UDS のパス上限に収める）。
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     fn fresh_dir(tag: &str) -> PathBuf {
         use std::sync::atomic::AtomicU32;
         static SEQ: AtomicU32 = AtomicU32::new(0);
@@ -1618,11 +1688,76 @@ mod tests {
         dir
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     fn write_exec(path: &Path, body: &str) {
         use std::os::unix::fs::PermissionsExt;
         std::fs::write(path, body).unwrap();
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// RENDER-3・SEC-2: 隔離できなくても unix ではプロキシを起動し、ホストの引数へ
+    /// `--egress-proxy-port <loopback の実ポート>` を付ける。
+    #[cfg(unix)]
+    #[test]
+    fn render3_unisolated_launch_starts_proxy_and_passes_port() {
+        let dir = fresh_dir("unis");
+        let host = dir.join("host");
+        write_exec(&host, "#!/bin/sh\nexit 0\n");
+        let config = HostProcessConfig::new(
+            resolve::resolve_host_binary(Some(&host), None, None).expect("host binary"),
+        )
+        .with_temp_root(dir.clone())
+        .with_isolation_probe(IsolationProbe::Unavailable(
+            EgressIsolationUnavailable::SandboxToolNotFound,
+        ))
+        .with_isolation_warning(Arc::new(|_| {}));
+        let mut h = HostProcess::new(config);
+        let plan = Plan::Unisolated(EgressIsolationUnavailable::SandboxToolNotFound);
+        let launch = h.build_command(plan, None).expect("launch");
+        let proxy = launch.proxy.as_ref().expect("proxy must be started");
+        let BoundEndpoint::Tcp(addr) = proxy.endpoint() else {
+            panic!("expected loopback tcp");
+        };
+        assert!(addr.ip().is_loopback());
+        let got: Vec<String> = launch
+            .args
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            got,
+            ["--stdio", "--egress-proxy-port", &addr.port().to_string()]
+        );
+        assert!(launch.sandbox.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// RENDER-3・SEC-2: 隔離なしでプロキシを起動できなければ、直接起動へ落とさず `SpawnFailed`。
+    #[cfg(unix)]
+    #[test]
+    fn render3_unisolated_proxy_start_failure_fails_closed() {
+        let dir = fresh_dir("unisf");
+        let host = dir.join("host");
+        let direct = dir.join("direct");
+        write_exec(
+            &host,
+            &format!("#!/bin/sh\ntouch {}\nexit 0\n", direct.display()),
+        );
+        let mut config = HostProcessConfig::new(
+            resolve::resolve_host_binary(Some(&host), None, None).expect("host binary"),
+        )
+        .with_temp_root(dir.clone())
+        .with_isolation_probe(IsolationProbe::Unavailable(
+            EgressIsolationUnavailable::SandboxToolNotFound,
+        ))
+        .with_isolation_warning(Arc::new(|_| {}));
+        config.fail_proxy_start = true;
+        let mut h = HostProcess::new(config);
+        let page = LoadParams::new("https://example.com/", None).expect("page");
+        let err = h.load(&page, 1).expect_err("must fail");
+        assert!(matches!(err, HostProcessError::SpawnFailed), "{err:?}");
+        assert!(!direct.exists(), "host must not be spawned");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 起動後に bwrap が失敗する構成で `load` を回し、降格しないことを固定する。
