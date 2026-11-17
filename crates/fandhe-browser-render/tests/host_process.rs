@@ -59,6 +59,7 @@ pub fn page() -> LoadParams {
     LoadParams::new("https://example.com/", None).expect("page")
 }
 
+#[cfg(unix)]
 pub fn shot() -> Request {
     Request::Screenshot(ScreenshotParams::new(false))
 }
