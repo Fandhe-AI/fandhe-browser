@@ -23,6 +23,8 @@
 | 決定済み | core の `Renderer` にページ指定メソッドを追加する | オーナー判断 2026-10-15（#228。本書 §3） |
 | 決定済み | CI は明示ジョブ 3 本を追加する（ジョブ 16 → 19、required 合計 20 → 23）。ruleset はジョブ追加 PR のマージ時に更新する | オーナー判断 2026-10-15（#228。本書 §6） |
 | 決定済み | ホストのビルド cache は ubuntu のみ | オーナー判断 2026-10-15（#228。本書 §6.3） |
+| 決定済み | ページの読み込みは許可リストで検査する（主フレーム・iframe・サブリソース・Worker）。WebSocket は隔離の有無によらず拒否する | オーナー判断 2026-11-17（本書 §2.5・§13 項目 11） |
+| 決定済み | 隔離できない unix（`best-effort` の降格）でも本体のプロキシを経由させる。プロキシの起動に失敗したら起動しない。Windows は隔離なしの起動を拒否する | オーナー判断 2026-11-17（本書 §2.5・§2.6・§13 項目 12・13） |
 | 保留 | egress 方針（Servo 内部通信の制限）は GA 前に判断する | #1003（本書 §2.5。比較設計と実測計画は [servo-host-egress-isolation.md](./servo-host-egress-isolation.md)） |
 | 決定済み | crates.io のソース配布を先行する。9 個目の crate、対象は macOS・Linux（Windows は対象外）、crate は `MIT OR Apache-2.0`、`NOTICE` の MPL 適用範囲は不変、Servo `=0.7.0` のまま、版は他 crate と揃える | オーナー判断 2026-11-07（#1538。本書 §13 項目 10） |
 | 保留 | コンテナの配布は spec の整理（`TASK-64`・`CTR-4`）後に起票する。バイナリ配布は未決 | 本書 §8.2・§10 |
@@ -125,7 +127,9 @@ servo-host/
 ### 2.5 URL・セレクタの検証
 
 - URL はクライアントで送信前に検証し、ホストでも再検証する（二重化）。scheme は `http` / `https` のみ。`file:`・`data:`・`javascript:`・`about:` と userinfo は拒否。ループバック・プライベート IP・`localhost` は core の fetch と同じポリシー（`allow_private_network_access`、既定 false）に従う。
-- **既知の制約（残存リスク）**: Linux（bwrap）と macOS（sandbox-exec）では、`[rendering] egress_isolation` で Servo ホストを OS 隔離し、通信を本体の許可リスト付きプロキシに限る（#1436。`best-effort` が既定、`required` は隔離できなければ起動しない）。Windows は隔離できず既知の制約（D）とする（オーナー判断 2026-11-02・#1003・TASK-38・`RENDER-3`）。隔離していないとき（`best-effort` で隔離できなかった場合・Windows）は、Servo 内部のリダイレクト・サブリソース・DNS リバインディングを URL の検証では防げない。隔離中は WebSocket が使えず、v1 ではファイルシステムを隔離しない。macOS では loopback のプロキシに同じユーザーの他プロセスも届き、DNS の経路（mDNSResponder）は観測・遮断していない。実ホストでの検証は `real_host` の `render3_egress_*` と xos-measure の suite `egress-host`（#1437）。方式の比較・実測・判断は [servo-host-egress-isolation.md](./servo-host-egress-isolation.md)（§8.1）を参照。
+- 読み込み先の許可リスト（`RENDER-3`・`SEC-2`。オーナー判断 2026-11-17・§13 項目 11）: ページの全ての読み込み（主フレーム・iframe・サブリソース・Worker）を、Servo の `load_web_resource` で検査する。WebView 経由（`WebViewDelegate`）と、WebView に紐づかない要求（`ServoDelegate`。`engine.rs` が設定する）の両方を対象にする。許可するのは scheme が `http`・`https`・`data`・`blob` の読み込みと、`about:blank`・`about:srcdoc` の完全一致だけ。それ以外（`file:`・他の `about:`・`javascript:` 等。scheme なしを含む）は空の応答で終える（`cancel()` は使わない。撮影が止まらないため）。上の URL 検証（主フレームは `http` / `https` のみ）と違い、サブリソース・iframe は `data`・`blob`・`about:blank`・`about:srcdoc` を許可する。`blob:` は同じページのスクリプトが作る URL のため許可する。検査点に届く URL は最初の URL で、リダイレクト先は見えない。ディレクトリ一覧の生成（`network_local_directory_listing_enabled`）は無効にする。
+- WebSocket は scheme が http(s) に書き換わって届くため URL では判別できない。ハンドシェイクの `Upgrade`・`Sec-WebSocket-Key` ヘッダを持つ要求を、隔離の有無によらず拒否する（Servo の WebSocket はプロキシを通らないため。`RENDER-3`）。
+- **既知の制約（残存リスク）**: Linux（bwrap）と macOS（sandbox-exec）では、`[rendering] egress_isolation` で Servo ホストを OS 隔離し、通信を本体の許可リスト付きプロキシに限る（#1436。`best-effort` が既定、`required` は隔離できなければ起動しない）。Windows は隔離できず既知の制約（D）とする（オーナー判断 2026-11-02・#1003・TASK-38・`RENDER-3`）。2026-11-17 から、Windows は隔離もプロキシも無いため `best-effort` でも隔離なしの起動を拒否する（撮影できない。§13 項目 13）。隔離なし（`best-effort` で隔離できなかった unix）では、本体のプロキシ（loopback TCP）を経由させ、送信先を許可リストに限る。ただし遮断はサンドボックスではなく、ホストがプロキシ設定に従うことに依存する（§13 項目 12）。プロキシ経由の名前解決後の再検査（DNS リバインディング）は未測定（[servo-host-egress-isolation.md](./servo-host-egress-isolation.md) §6.5）。v1 ではファイルシステムを隔離しない。macOS では loopback のプロキシに同じユーザーの他プロセスも届き、DNS の経路（mDNSResponder）は観測・遮断していない。実ホストでの検証は `real_host` の `render3_egress_*` と xos-measure の suite `egress-host`（#1437）。方式の比較・実測・判断は [servo-host-egress-isolation.md](./servo-host-egress-isolation.md)（§8.1）を参照。
 - 可視性・境界ボックスの取得に JS 評価を使う場合、セレクタは JSON エスケープした文字列リテラルとしてのみ埋め込み、連結しない。長さと文字種も検証する。取得手段（埋込 API のレイアウト取得か JS 評価か）は**未検証**で、実装 Issue の先頭ステップで確認する。
 
 ### 2.6 起動
@@ -137,7 +141,7 @@ servo-host/
 - stderr は末尾 8 KiB を上限付きでバッファし、失敗時のログに使う。URL のクエリや機密をログに出さない。
 - **実装（TASK-38・#994・`fandhe_browser_render::host_process`）で決めた値**:
   - 本体 `HostProcess` が渡す起動引数は現在 `--stdio` のみ（`HOST_ARGS`）。ホスト側のサーバーモード（#993）はこの引数で stdio モードに入る。クライアントから任意引数は渡さない。
-  - ホストは加えて固定形式の `--egress-proxy-port <1-65535>`（macOS 向け）・`--egress-relay-uds <絶対パス>`（Linux 向け）を `--stdio` の後ろに 1 組だけ受け付ける（`RENDER-3`・`SEC-2`・TASK-38・#1435。本体からの付与は #1436 で実装済み: 設定 `[rendering] egress_isolation`（`best-effort` 既定・`required`）で Linux は bwrap・macOS は sandbox-exec で包み、Windows は隔離なし。bwrap は `--unshare-net --unshare-pid --proc /proc` で包み、pid 名前空間によりホストから本体の `/proc/<ppid>` が見えない。ラッパーを kill すれば ns 内のホストも落ちる）。両方同時・重複・未知・値欠落・形式不正（範囲外ポート、相対パス、`.`・`..`・空の要素、100 バイト超、NUL）は失敗終了（fail-closed）で、URL や任意文字列は受け取らない。Servo の http・https proxy pref は `http://127.0.0.1:<port>` 固定（`no_proxy` は空）。`--egress-relay-uds` 指定時は netns 内で `127.0.0.1:0` を待ち受ける中継（`relay.rs`）を hello の前に起動し、各接続を UDS 1 本へ双方向転送する（同時 128・無通信 300 秒は暫定値で本体プロキシ #1440 と揃える）。`*_PROXY` を環境変数で渡さない方針は変えない。
+  - ホストは加えて固定形式の `--egress-proxy-port <1-65535>`（macOS の隔離中と、隔離なしの unix のプロキシ用。2026-11-17・§13 項目 12）・`--egress-relay-uds <絶対パス>`（Linux の隔離中の中継用）を `--stdio` の後ろに 1 組だけ受け付ける（`RENDER-3`・`SEC-2`・TASK-38・#1435。本体からの付与は #1436 で実装済み: 設定 `[rendering] egress_isolation`（`best-effort` 既定・`required`）で Linux は bwrap・macOS は sandbox-exec で包み、隔離できない unix は loopback TCP のプロキシを起動して `--egress-proxy-port` を渡し、隔離なしで起動する（2026-11-17・§13 項目 12）。Windows は隔離もプロキシも無いため起動を拒否する（§13 項目 13）。bwrap は `--unshare-net --unshare-pid --proc /proc` で包み、pid 名前空間によりホストから本体の `/proc/<ppid>` が見えない。ラッパーを kill すれば ns 内のホストも落ちる）。両方同時・重複・未知・値欠落・形式不正（範囲外ポート、相対パス、`.`・`..`・空の要素、100 バイト超、NUL）は失敗終了（fail-closed）で、URL や任意文字列は受け取らない。Servo の http・https proxy pref は `http://127.0.0.1:<port>` 固定（`no_proxy` は空）。`--egress-relay-uds` 指定時は netns 内で `127.0.0.1:0` を待ち受ける中継（`relay.rs`）を hello の前に起動し、各接続を UDS 1 本へ双方向転送する（同時 128・無通信 300 秒は暫定値で本体プロキシ #1440 と揃える）。`*_PROXY` を環境変数で渡さない方針は変えない。
   - egress 隔離の残余リスク（`RENDER-3`・`SEC-2`・TASK-38・#1451）: (1) 外部コマンド（bwrap・sandbox-exec）は固定の絶対パス候補から選び、root 所有・group / other 書き込み不可の通常ファイルだけを信頼する。(2) `best-effort` で隔離なしに落ちたときは、警告コールバックが無ければ stderr に 1 行出す。(3) macOS の loopback プロキシは同一マシンの全ユーザー・全プロセスから届く（認証なし）。宛先は許可リスト内に限られるので SSRF にはならないが、本体の送信元 IP を踏み台にされうる（UDS 化・接続トークンは別途検討）。(4) FS 全体は隔離しない（`--dev-bind / /`）。`/run`・`/tmp`・`/var/tmp`・`/dev/shm`・`$HOME`・WorkDir の親は tmpfs で隠し（#1485・#1492）、WorkDir と隠れる場所にあるホストの実行ファイルだけ戻す。それ以外の場所（`/dev/log`・`/var/lib/*`・`/var/snap/*` 等の既知のソケット）の UDS は迂回路として残る。(5) macOS の Seatbelt は `(allow default)` で、mach/XPC 経由の通信と DNS 経路は止めない。(6) ns 内の全滅は bwrap の `--die-with-parent` に依存し、確認したのは bwrap 0.11.1 だけ。(7) RSS 監視のホスト pid 解決は、ホストが子プロセスを作らない（Servo `multiprocess: false`）前提で各段 1 件のときだけ辿る。 補足: Linux のプローブは終了コードに加えて netns の分離（inode の比較）まで確かめる（#1459）。
   - 環境変数は `env_clear` 後に、workdir 配下を指す強制設定（Unix: `HOME`・`TMPDIR`、Linux はさらに `XDG_CONFIG_HOME`・`XDG_CACHE_HOME`・`XDG_DATA_HOME`。Windows: `TMP`・`TEMP`）と、親に値があるときだけ引き継ぐ変数（Linux: `FONTCONFIG_FILE`・`FONTCONFIG_PATH`、Windows: `SystemRoot`、macOS: なし）だけを渡す。`PATH`・`LANG`・`LC_*`・`TZ`・`*_PROXY`（識別面。SEC-2）、`LD_*`・`DYLD_*`（注入経路）は渡さない。実機確認の状態は**すべて未確認**（Windows の `SystemRoot` は js 子プロセスでは実績あり・Servo ホストでは未確認）。HOME を一時ディレクトリにした場合の fontconfig キャッシュ再生成コストも未確認。
   - 版の検査（`RENDER-3`・`SEC-2`・`REPAIR-4`・#1540・#1553）: cli はホストの解決・検証（と `required` の隔離判定）の後、起動前に `--version` を 1 回だけ実行して CLI の版（`CARGO_PKG_VERSION`）と完全一致するか比べる。不一致・起動不能・非 0 終了・時間超過・出力過多・形式違いはすべて起動エラー（fail-closed）で、両方の版と揃え方（`cargo install fandhe-browser-servo-host --version <CLI の版> --locked --force`）を示す。上限は時間 10 s・stdout 256 バイト・版トークン 64 バイト、環境は `env_clear` に引き継ぎ許可リストのみ（`HostProcess` と同じ）。この実行は `HostProcess` と同じ判定・同じ OS サンドボックスで包む（render の `run_host_version`。Linux は bwrap の `--unshare-net` のまま中継・UDS を渡さず、macOS はすべての送信を拒否する Seatbelt、Windows は隔離なし）。プロキシは起動せず、到達できる送信先を持たせない。`required` は隔離できなければホストを実行せず起動エラー、`best-effort` は警告して隔離なしで実行する（cli は `HostProcess` と通知先を共有し、警告は 1 回）。cwd と `HOME` は専用 WorkDir（0700・終了時に削除）で、利用者の cwd は継承しない。`best-effort` でも隔離の probe は起動時に行う（結果はプロセス内でキャッシュ）。`HostProcess` の起動引数は `--stdio` のまま変えない。ホストの出力は文法を通った版だけを表示する。利便のための整合確認で信頼の境界ではない。
@@ -294,6 +298,7 @@ v1 はホストが自分で fetch する（URL のみ送る）。Cookie・セッ
 | 最小 system 依存 | `make`・Python・`uv`・libclang の個別欠如試験 | 必須ツールの一覧が確定 | `docs/setup/` に前提を追記 |
 | IPC 実装・負荷 | Servo なしの偽ホストで再起動・タイムアウト・巨大フレーム・不正 JSON を試験 | 各ケースで成功を装わず失敗する | 上限値を調整 |
 | メモリ・リソース制限 | 実ページの RSS 計測（`TASK-82` と連携） | 親側 RSS 監視が効く | OS 制限の追加を検討（承認事項） |
+| 読み込み検査（§2.5・§13 項目 11） | 実ホストの結合テスト（`servo-host/tests/stdio_server.rs` の `load_allowlist_rejects_disallowed_scheme`・`load_allowlist_rejects_disallowed_main_frame`・`websocket_connections_are_refused`）で、許可外 scheme の読み込み・iframe・Worker・主フレームの遷移・WebSocket が空の応答で終わり、同じページの http・`data:` の対照は描かれること。真理値表は単体テスト `url_allowlist_truth_table`（`servo-host/src/guard.rs`）で確かめる | 許可外が読み込まれないこと | 検査点を足す。`ServoDelegate` 側を通る経路は Servo 0.7.0 の設定では作れず、テストで固定していない |
 
 ### 7.1 musl・配布形態の実測（#1001）
 
@@ -400,7 +405,7 @@ AGENTS.md の変更はレビュー基準の変更として AI レビューで P0
 | インジェクション | URL・セレクタの検証、セレクタを JS に連結しない、引数配列で起動、シェル不使用 |
 | 不安全な設計 | フレーム・URL・セレクタの上限、ページ読み込みのタイムアウト、無制限確保の防止、資源制限、サーキットブレーカー |
 | アクセス制御の不備 | stdio IPC はポートを開かない（ただし `--egress-relay-uds` 指定時は中継が `127.0.0.1` のエフェメラルポートを開く。Linux の netns 内を前提とし、宛先は UDS 1 本固定。netns 外で誤用された場合は同一ホストの他プロセスが届き得るが、到達先は本体の許可リスト付きプロキシだけ）、バイナリ解決は絶対パスのみ・PATH 探索なし、他者書き込み可のバイナリを拒否 |
-| SSRF | scheme 制限、プライベート IP ポリシーを core と揃える。Servo 内部のリダイレクト・サブリソースは残存リスクで GA 前の判断事項。egress の宛先判定は本体の CONNECT プロキシ（#1434）が行い、ホストの中継は宛先を選べない（#1435） |
+| SSRF | scheme 制限、プライベート IP ポリシーを core と揃える。読み込み先は許可リスト（§2.5。2026-11-17）で制限する。隔離なしの経路では送信を本体のプロキシ経由に限り、Windows は起動を拒否する。egress の宛先判定は本体の CONNECT プロキシ（#1434）が行い、ホストの中継は宛先を選べない（#1435） |
 | 識別面（`SEC-2`） | UA 等を変えるメソッドを載せない、未実装を成功扱いにしない |
 | 機密情報の露出 | ホストのエラー詳細を `Display` / `Debug` に出さない、stderr は上限付き、ログから URL クエリを除く |
 | 脆弱な依存 | `=x.y.z` 固定、ホスト側 `cargo deny advisories`、更新運用は別 Issue |
@@ -422,7 +427,7 @@ AGENTS.md の変更はレビュー基準の変更として AI レビューで P0
 | #230〜#237 の書き換え案と依存順 | §8 |
 | spec 側の課題 | §10 |
 
-## 13. オーナー判断（2026-10-15・2026-10-29・2026-11-07）
+## 13. オーナー判断（2026-10-15・2026-10-29・2026-11-07・2026-11-17）
 
 出典は #228。各項目の結果を記す。
 
@@ -442,6 +447,12 @@ AGENTS.md の変更はレビュー基準の変更として AI レビューで P0
 2026-11-07 の判断（項目 10）は Issue #1538 による。
 
 10. Servo ホストを crates.io へ 9 個目の crate としてソース配布する。crate は自前のコードと `Cargo.lock` だけで Servo のソースを含まず `MIT OR Apache-2.0`、対象は macOS・Linux（Windows は対象外）、Servo は `=0.7.0` のまま、版は他 crate と揃える。`NOTICE` の MPL 適用範囲（ビルドしたバイナリに適用）と、隔離（`RENDER-1`）・MPL の扱い（`OSS-2`・`OSS-3`）は変えない。コンテナとバイナリの配布は項目 7 のとおり別扱い: 決定
+
+2026-11-17 の判断（項目 11〜13）はオーナー判断。対応する Issue の番号は本書に記さない。
+
+11. ページの全ての読み込み（主フレーム・iframe・サブリソース・Worker）を、許可リスト（scheme が `http`・`https`・`data`・`blob` と、`about:blank`・`about:srcdoc` の完全一致）で検査する。許可外は空の応答で終える。WebSocket のハンドシェイクは隔離の有無によらず拒否する。主フレームの URL 検証（`http` / `https` のみ）は従来どおり。ディレクトリ一覧は無効にする（§2.5）: 決定
+12. 隔離できない unix（`best-effort` の降格）でも、本体の egress プロキシを起動し `--egress-proxy-port` でホストへ渡す。プロキシ経由のため、既定（`allow_private_network_access=false`）ではループバック・プライベート宛を拒否する。プロキシの起動に失敗したらホストを起動しない（fail-closed）。ただし遮断はサンドボックスではなく、ホストがプロキシ設定に従うことに依存する（§2.5・§2.6）: 決定
+13. Windows（非 unix）は本体のプロキシも隔離も無いため、`best-effort` でも隔離なしの起動を拒否する。Windows では撮影できない。`--version` の版の検査は隔離なしで実行できる（ページを読まない）。Windows 向けのプロキシは後続の作業（§2.5・§2.6）: 決定
 
 ## 付録 A. 依存追加の承認提示雛形
 
