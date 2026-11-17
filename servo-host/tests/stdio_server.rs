@@ -11,7 +11,7 @@ use std::net::TcpListener;
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const LIMIT: Duration = Duration::from_secs(60);
 
@@ -918,4 +918,563 @@ fn load_goes_through_the_egress_proxy() {
             .any(|l| l.starts_with("CONNECT egress-target.invalid:443 ")),
         "https must be CONNECT :443, proxy saw: {seen:?}"
     );
+}
+
+// ---- 読み込み先の許可リスト（RENDER-3・SEC-2） ----
+
+type Routes = std::sync::Arc<std::collections::HashMap<String, (&'static str, Vec<u8>)>>;
+
+/// ループバックの待ち受けを先に作る（ページ内の URL に使うポートを、ルート登録の前に確定するため）。
+fn bind_loopback() -> (TcpListener, u16) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    (listener, port)
+}
+
+/// パス別に固定応答を返すループバックサーバー（接続ごとにスレッドで処理）。
+fn serve_routes(listener: TcpListener, routes: Routes) -> mpsc::Sender<()> {
+    listener.set_nonblocking(true).expect("nonblocking");
+    let (stop_tx, stop_rx) = mpsc::channel::<()>();
+    std::thread::spawn(move || {
+        while stop_rx.try_recv().is_err() {
+            match listener.accept() {
+                Ok((mut conn, _)) => {
+                    let routes = routes.clone();
+                    std::thread::spawn(move || {
+                        let _ = conn.set_nonblocking(false);
+                        let mut buf = [0u8; 4096];
+                        let n = conn.read(&mut buf).unwrap_or(0);
+                        let req = String::from_utf8_lossy(&buf[..n]);
+                        let path = req.split(' ').nth(1).unwrap_or("/");
+                        let (ct, body) = routes
+                            .get(path)
+                            .cloned()
+                            .unwrap_or(("text/plain", b"nf".to_vec()));
+                        let head = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: {ct}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            body.len()
+                        );
+                        let _ = conn.write_all(head.as_bytes());
+                        let _ = conn.write_all(&body);
+                    });
+                }
+                Err(_) => std::thread::sleep(Duration::from_millis(10)),
+            }
+        }
+    });
+    stop_tx
+}
+
+const RED_HTML: &str = "<body style=\"margin:0;background:#f00\">";
+const RED_SVG: &str = "<svg xmlns='http://www.w3.org/2000/svg' width='200' height='200'><rect width='200' height='200' fill='red'/></svg>";
+const RED_CSS: &str = "#t{background:#f00}";
+const RED_JS: &str = "document.getElementById('t').style.background='#f00'";
+const RED_WORKER_JS: &str = "postMessage('red')";
+const BODY_MARK: &str = "DISALLOWED_BODY";
+const DATA_RED_HTML: &str =
+    "data:text/html,%3Cbody%20style%3D%22margin%3A0%3Bbackground%3A%23f00%22%3E";
+/// ページ側で対象 `#t` を赤くする JS 式。
+const PAINT: &str = "document.getElementById('t').style.background='#f00'";
+
+/// 同じ内容を http（ルート）と file（一時ディレクトリ）の両方で提供する資源。
+const FIXTURES: [(&str, &str, &str); 6] = [
+    ("red.html", "text/html", RED_HTML),
+    ("red.svg", "image/svg+xml", RED_SVG),
+    ("red.css", "text/css", RED_CSS),
+    ("red.js", "text/javascript", RED_JS),
+    ("red.worker.js", "text/javascript", RED_WORKER_JS),
+    ("red.txt", "text/plain", BODY_MARK),
+];
+
+/// 資源を一時ディレクトリへ書き、http 用のルートの初期値を返す。
+fn fixtures(
+    tag: &str,
+) -> (
+    std::path::PathBuf,
+    std::collections::HashMap<String, (&'static str, Vec<u8>)>,
+) {
+    let dir = std::env::temp_dir().join(format!("fandhe_{tag}_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let mut routes = std::collections::HashMap::new();
+    for (n, ct, body) in FIXTURES {
+        std::fs::write(dir.join(n), body).expect("write");
+        routes.insert(format!("/{n}"), (ct, body.as_bytes().to_vec()));
+    }
+    (dir, routes)
+}
+
+/// 対象 `#t`（x=440）と対照 2 つ（x=0 の http iframe・x=220 の data: iframe）を並べたページ。
+fn page(base: &str, head: &str, target: &str, script: &str) -> String {
+    let style = "iframe,#t,img{position:absolute;top:0;width:200px;height:200px;border:0;margin:0}";
+    let ctl = format!(
+        "<iframe style=\"left:0\" src=\"{base}/red.html\"></iframe><iframe style=\"left:220px\" src=\"{DATA_RED_HTML}\"></iframe>"
+    );
+    format!(
+        "<html><head><style>{style}</style>{head}</head><body style=\"margin:0\">{ctl}{target}<script>{script}</script></body></html>"
+    )
+}
+
+/// 矩形内で条件を満たす画素の割合。
+fn fraction(img: &image::RgbaImage, x0: u32, w: u32, pred: fn([u8; 4]) -> bool) -> f32 {
+    let mut n = 0u32;
+    for y in 0..200 {
+        for x in x0..x0 + w {
+            if pred(img.get_pixel(x, y).0) {
+                n += 1;
+            }
+        }
+    }
+    n as f32 / (200 * w) as f32
+}
+
+fn is_red(p: [u8; 4]) -> bool {
+    p[0] > 200 && p[1] < 60 && p[2] < 60
+}
+
+fn is_green(p: [u8; 4]) -> bool {
+    p[0] < 60 && p[1] > 200 && p[2] < 60
+}
+
+fn red_fraction(img: &image::RgbaImage, x0: u32, w: u32) -> f32 {
+    fraction(img, x0, w, is_red)
+}
+
+fn file_url(path: &std::path::Path) -> String {
+    let s = path.to_string_lossy().replace('\\', "/");
+    if s.starts_with('/') {
+        format!("file://{s}")
+    } else {
+        format!("file:///{s}")
+    }
+}
+
+/// 要求 id を進めながら `load` を送り、結果が成功であることを確かめる。
+fn load_page(h: &mut Host, id: &mut u64, url: &str) {
+    *id += 1;
+    h.send(&load_req(*id, url, 30_000));
+    let r: serde_json::Value = serde_json::from_str(&h.recv()).unwrap();
+    assert!(r["result"].is_object(), "{r}");
+}
+
+fn shoot(h: &mut Host, id: &mut u64) -> image::RgbaImage {
+    *id += 1;
+    h.send(&format!(r#"{{"v":1,"id":{id},"method":"screenshot"}}"#));
+    let r: serde_json::Value = serde_json::from_str(&h.recv()).unwrap();
+    let png = decode_b64(r["result"]["data_base64"].as_str().expect("png"));
+    image::load_from_memory(&png).expect("png").to_rgba8()
+}
+
+/// 条件を満たすまで撮り直す（期限は 10 秒。超過時は最後の画像を返し、判定は呼び出し側の assert に任せる）。
+/// 画像と、条件を満たすまでにかかった時間を返す。
+fn poll_shot(
+    h: &mut Host,
+    id: &mut u64,
+    done: impl Fn(&image::RgbaImage) -> bool,
+) -> (image::RgbaImage, Duration) {
+    let start = Instant::now();
+    loop {
+        let img = shoot(h, id);
+        if done(&img) || start.elapsed() > Duration::from_secs(10) {
+            return (img, start.elapsed());
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn finish_host(mut h: Host, id: u64) {
+    h.send(&format!(r#"{{"v":1,"id":{id},"method":"shutdown"}}"#));
+    let _ = h.recv();
+    let (code, _, stderr) = h.finish();
+    assert_eq!(code, Some(0), "stderr: {stderr}");
+}
+
+type Case = (
+    &'static str,
+    Box<dyn Fn(&dyn Fn(&str) -> String, &str) -> String>,
+);
+
+/// 経路ごとのページ。第 1 引数は `red.*` の URL を作る関数、第 2 引数は http サーバーの base。
+/// どの経路がどの delegate を通るかは、各ケースの注記を参照（`WebViewDelegate` は `page.rs`、
+/// `ServoDelegate` は `engine.rs` の `set_delegate`）。
+fn cases() -> Vec<Case> {
+    // 対象 `#t`（x=440）。
+    let t = "<div id=t style=\"left:440px\"></div>";
+    // blob Worker を作り、`red` を受けたら対象を赤くする。`body` は Worker 内のスクリプト（JS 式の文字列連結用）。
+    let blob_worker = |body: String| {
+        format!(
+            "var b=new Blob([{body}]);var w=new Worker(URL.createObjectURL(b));w.onmessage=function(){{{PAINT}}}"
+        )
+    };
+    vec![
+        // WebViewDelegate（子フレーム）。
+        (
+            "iframe_initial",
+            Box::new(|u, b| {
+                page(
+                    b,
+                    "",
+                    &format!(
+                        "<iframe id=t style=\"left:440px\" src=\"{}\"></iframe>",
+                        u("red.html")
+                    ),
+                    "",
+                )
+            }),
+        ),
+        (
+            "iframe_js_rewrite",
+            Box::new(|u, b| {
+                page(
+                    b,
+                    "",
+                    "<iframe id=t style=\"left:440px\" src=\"about:blank\"></iframe>",
+                    &format!("document.getElementById('t').src='{}'", u("red.html")),
+                )
+            }),
+        ),
+        (
+            "img",
+            Box::new(|u, b| {
+                page(
+                    b,
+                    "",
+                    &format!("<img id=t style=\"left:440px\" src=\"{}\">", u("red.svg")),
+                    "",
+                )
+            }),
+        ),
+        (
+            "css_url",
+            Box::new(|u, b| {
+                page(
+                    b,
+                    "",
+                    &format!(
+                        "<div id=t style=\"left:440px;background:url({})\"></div>",
+                        u("red.svg")
+                    ),
+                    "",
+                )
+            }),
+        ),
+        (
+            "link_stylesheet",
+            Box::new(|u, b| {
+                page(
+                    b,
+                    &format!("<link rel=stylesheet href=\"{}\">", u("red.css")),
+                    t,
+                    "",
+                )
+            }),
+        ),
+        (
+            "css_import",
+            Box::new(|u, b| {
+                page(
+                    b,
+                    &format!("<style>@import url({});</style>", u("red.css")),
+                    t,
+                    "",
+                )
+            }),
+        ),
+        (
+            "script_src",
+            Box::new(|u, b| {
+                page(
+                    b,
+                    "",
+                    &format!(
+                        "<div id=t style=\"left:440px\"></div><script src=\"{}\"></script>",
+                        u("red.js")
+                    ),
+                    "",
+                )
+            }),
+        ),
+        (
+            "iframe_uppercase_scheme",
+            Box::new(|u, b| {
+                let s = u("red.html");
+                let (sch, rest) = s.split_once(':').unwrap();
+                page(
+                    b,
+                    "",
+                    &format!(
+                        "<iframe id=t style=\"left:440px\" src=\"{}:{rest}\"></iframe>",
+                        sch.to_uppercase()
+                    ),
+                    "",
+                )
+            }),
+        ),
+        // 以降はページから起こす Worker・XHR 経路。実測（Servo 0.7.0）では Worker 内の要求も
+        // `WebViewDelegate` を通り、`ServoDelegate` を通る経路はこのテストには無い。
+        // 予防: Servo 0.7.0 が元から止めるため、検査を外しても落ちない。上流の挙動が変わったときに検出するために置く。
+        (
+            "worker_script",
+            Box::new(move |u, b| {
+                page(
+                    b,
+                    "",
+                    t,
+                    &format!(
+                        "try{{var w=new Worker('{}');w.onmessage=function(){{{PAINT}}}}}catch(e){{}}",
+                        u("red.worker.js")
+                    ),
+                )
+            }),
+        ),
+        (
+            "blob_worker_import_scripts",
+            Box::new({
+                let bw = blob_worker;
+                move |u, b| {
+                    page(
+                        b,
+                        "",
+                        t,
+                        &bw(format!("\"importScripts('{}')\"", u("red.worker.js"))),
+                    )
+                }
+            }),
+        ),
+        // 予防: Servo 0.7.0 が元から止めるため、検査を外しても落ちない。上流の挙動が変わったときに検出するために置く。
+        (
+            "worker_fetch_cors",
+            Box::new({
+                let bw = blob_worker;
+                move |u, b| {
+                    page(
+                        b,
+                        "",
+                        t,
+                        &bw(format!(
+                            "\"fetch('{}').then(function(r){{return r.text()}}).then(function(x){{if(x.indexOf('{BODY_MARK}')>=0)postMessage('red')}}).catch(function(){{}})\"",
+                            u("red.txt")
+                        )),
+                    )
+                }
+            }),
+        ),
+        // 予防: Servo 0.7.0 が元から止めるため、検査を外しても落ちない。上流の挙動が変わったときに検出するために置く。
+        (
+            "worker_fetch_no_cors",
+            Box::new({
+                let bw = blob_worker;
+                move |u, b| {
+                    page(
+                        b,
+                        "",
+                        t,
+                        &bw(format!(
+                            "\"fetch('{}',{{mode:'no-cors'}}).then(function(r){{return r.text()}}).then(function(x){{if(x.indexOf('{BODY_MARK}')>=0)postMessage('red')}}).catch(function(){{}})\"",
+                            u("red.txt")
+                        )),
+                    )
+                }
+            }),
+        ),
+        // 予防: Servo 0.7.0 が元から止めるため、検査を外しても落ちない。上流の挙動が変わったときに検出するために置く。
+        (
+            "xhr",
+            Box::new(move |u, b| {
+                page(
+                    b,
+                    "",
+                    t,
+                    &format!(
+                        "try{{var x=new XMLHttpRequest();x.open('GET','{}');x.onload=function(){{if(x.responseText.indexOf('{BODY_MARK}')>=0){{{PAINT}}}}};x.send()}}catch(e){{}}",
+                        u("red.txt")
+                    ),
+                )
+            }),
+        ),
+    ]
+}
+
+/// RENDER-3・SEC-2: 許可外 scheme（例として `file:`）を読み込み先にした各経路は空の応答で終わって何も描かれず、同じページの http・data: の
+/// 対照と、同じ経路の http 版は赤く描かれる（対照が赤いので、読み込み完了後に撮れていることも保証する）。
+/// 撮影は条件を満たすまで撮り直す。file 版は、同じ経路の http 版が赤くなるまでにかかった時間
+/// （下限 300ms）だけ、対照が赤くなった後も待ってから最終判定の画像を撮る。
+#[test]
+fn load_allowlist_rejects_disallowed_scheme() {
+    let (dir, mut routes) = fixtures("allowlist");
+    let (listener, port) = bind_loopback();
+    let base = format!("http://127.0.0.1:{port}");
+
+    // 経路 × (http, file) のページを 1 つのサーバーへ登録する。
+    let cases = cases();
+    for (name, build) in &cases {
+        for kind in ["http", "file"] {
+            let u: Box<dyn Fn(&str) -> String> = if kind == "http" {
+                let base = base.clone();
+                Box::new(move |n| format!("{base}/{n}"))
+            } else {
+                let dir = dir.clone();
+                Box::new(move |n| file_url(&dir.join(n)))
+            };
+            routes.insert(
+                format!("/p_{name}_{kind}"),
+                ("text/html", build(&*u, &base).into_bytes()),
+            );
+        }
+    }
+    let stop = serve_routes(listener, std::sync::Arc::new(routes));
+
+    let mut h = spawn(&["--stdio"]);
+    let _hello = h.recv();
+    let mut id = 0;
+    for (name, _) in &cases {
+        let mut http_time = Duration::from_millis(300);
+        for (kind, want_red) in [("http", true), ("file", false)] {
+            load_page(&mut h, &mut id, &format!("{base}/p_{name}_{kind}"));
+            let ctl = |i: &image::RgbaImage| {
+                red_fraction(i, 0, 200) > 0.9 && red_fraction(i, 220, 200) > 0.9
+            };
+            let img = if want_red {
+                let (img, t) = poll_shot(&mut h, &mut id, |i| {
+                    ctl(i) && red_fraction(i, 440, 200) > 0.9
+                });
+                http_time = http_time.max(t);
+                img
+            } else {
+                poll_shot(&mut h, &mut id, ctl);
+                std::thread::sleep(http_time);
+                shoot(&mut h, &mut id)
+            };
+            let ctl_http = red_fraction(&img, 0, 200);
+            let ctl_data = red_fraction(&img, 220, 200);
+            let target = red_fraction(&img, 440, 200);
+            assert!(ctl_http > 0.9, "{name}/{kind}: http control {ctl_http}");
+            assert!(ctl_data > 0.9, "{name}/{kind}: data control {ctl_data}");
+            if want_red {
+                assert!(
+                    target > 0.9,
+                    "{name}/{kind}: target should be red: {target}"
+                );
+            } else {
+                assert!(
+                    target < 0.01,
+                    "{name}/{kind}: disallowed target unexpectedly loaded: {target}"
+                );
+            }
+        }
+    }
+    finish_host(h, id + 1);
+    let _ = stop.send(());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// RENDER-3・SEC-2: 主フレームを `location` で許可外 scheme（例として `file:`）へ移しても読み込まれない。
+/// 初期ページは緑。http 版は赤い全面ページへ遷移し、file 版は空の応答で白くなる（赤にならない）。
+/// 主フレームの要求は `WebViewDelegate` 側を通る。
+#[test]
+fn load_allowlist_rejects_disallowed_main_frame() {
+    let (dir, mut routes) = fixtures("mainframe");
+    let (listener, port) = bind_loopback();
+    let base = format!("http://127.0.0.1:{port}");
+    for (kind, url) in [
+        ("http", format!("{base}/red.html")),
+        ("file", file_url(&dir.join("red.html"))),
+    ] {
+        routes.insert(
+            format!("/p_{kind}"),
+            (
+                "text/html",
+                format!(
+                    "<html><body style=\"margin:0;background:#0f0\"><script>setTimeout(function(){{location='{url}'}},200)</script></body></html>"
+                )
+                .into_bytes(),
+            ),
+        );
+    }
+    let stop = serve_routes(listener, std::sync::Arc::new(routes));
+
+    let mut h = spawn(&["--stdio"]);
+    let _hello = h.recv();
+    let mut id = 0;
+    for kind in ["http", "file"] {
+        load_page(&mut h, &mut id, &format!("{base}/p_{kind}"));
+        // 緑でなくなる（遷移が済む）まで待つ。
+        let (img, _) = poll_shot(&mut h, &mut id, |i| fraction(i, 0, 200, is_green) < 0.5);
+        let red = red_fraction(&img, 0, 200);
+        if kind == "http" {
+            assert!(red > 0.9, "{kind}: should navigate to red page: {red}");
+        } else {
+            assert!(red < 0.01, "{kind}: main frame unexpectedly loaded: {red}");
+            assert!(
+                fraction(&img, 0, 200, is_green) < 0.01,
+                "{kind}: navigation did not happen"
+            );
+        }
+    }
+    finish_host(h, id + 1);
+    let _ = stop.send(());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// RENDER-3: ページからの WebSocket 接続はホストが拒否し、サーバーへ届かない
+/// （egress 隔離ありで WebSocket が使えない挙動と揃える）。
+/// ページは `WebSocket` の生成が例外なく済んだこと（または `onerror`・`onclose`）で DOM を赤くする
+/// （スクリプトが実行され生成まで進んだ証明。拒否時は応答が空のためイベントは来ない）。
+/// ホストの検査を外すとハンドシェイクがサーバーへ届き、`seen` が真になって失敗する（確認済み）。
+#[test]
+fn websocket_connections_are_refused() {
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+    let ws = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let ws_port = ws.local_addr().expect("addr").port();
+    ws.set_nonblocking(true).expect("nonblocking");
+    let seen = Arc::new(AtomicBool::new(false));
+    let seen_w = seen.clone();
+    let (ws_stop_tx, ws_stop_rx) = mpsc::channel::<()>();
+    let ws_thread = std::thread::spawn(move || {
+        while ws_stop_rx.try_recv().is_err() {
+            if let Ok((mut c, _)) = ws.accept() {
+                let _ = c.set_nonblocking(false);
+                let _ = c.set_read_timeout(Some(Duration::from_secs(2)));
+                let mut buf = [0u8; 4096];
+                let n = c.read(&mut buf).unwrap_or(0);
+                if String::from_utf8_lossy(&buf[..n])
+                    .to_ascii_lowercase()
+                    .contains("upgrade: websocket")
+                {
+                    seen_w.store(true, Ordering::SeqCst);
+                }
+            } else {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+    });
+    let html = format!(
+        "<html><body style=\"margin:0\"><div id=t style=\"width:200px;height:200px;background:#0f0\"></div><script>\
+         function f(){{document.getElementById('t').style.background='#f00'}}\
+         try{{var s=new WebSocket('ws://127.0.0.1:{ws_port}/');s.onerror=f;s.onclose=f;f()}}catch(e){{}}</script></body></html>"
+    );
+    let mut routes = std::collections::HashMap::new();
+    routes.insert("/ws".to_owned(), ("text/html", html.into_bytes()));
+    let (listener, port) = bind_loopback();
+    let stop = serve_routes(listener, Arc::new(routes));
+
+    let mut h = spawn(&["--stdio"]);
+    let _hello = h.recv();
+    let mut id = 0;
+    load_page(&mut h, &mut id, &format!("http://127.0.0.1:{port}/ws"));
+    let (img, _) = poll_shot(&mut h, &mut id, |i| red_fraction(i, 0, 200) > 0.9);
+    assert!(
+        red_fraction(&img, 0, 200) > 0.9,
+        "websocket attempt was not observed (no onerror/onclose)"
+    );
+    // 届くなら数 ms で届く。撮影の直後に取りこぼさないよう少し待つ。
+    std::thread::sleep(Duration::from_millis(500));
+    finish_host(h, id + 1);
+    assert!(
+        !seen.load(Ordering::SeqCst),
+        "websocket handshake reached the server"
+    );
+    let _ = ws_stop_tx.send(());
+    let _ = ws_thread.join();
+    let _ = stop.send(());
 }

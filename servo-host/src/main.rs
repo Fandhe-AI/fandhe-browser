@@ -12,7 +12,7 @@
 //! - `--stdio`: 本体 render crate から起動される stdio サーバー（#993。`server`）。`load`（#231）と
 //!   `screenshot`（PNG の base64 inline。#232）・`visibility`（JS 評価。#233。`layout`）は
 //!   `page::ServoHandler` で実装済み。`bounding_box`（JS 評価。#234）も同じ `layout` 経由で実装済み。
-//!   `--egress-proxy-port <port>`（macOS 向け）・`--egress-relay-uds <path>`（Linux 向け。netns 内の
+//!   `--egress-proxy-port <port>`（macOS の隔離中と、隔離なしの unix 向け）・`--egress-relay-uds <path>`（Linux 向け。netns 内の
 //!   `relay` が `127.0.0.1` で待ち受けて UDS へ転送）のどちらか 1 つを足すと、Servo の proxy pref を
 //!   `http://127.0.0.1:<port>` に向ける（`args` が検証。RENDER-3・SEC-2・#1435。設計 §2.6）。
 //! - それ以外: 標準エラーに示し、非ゼロで終了する（固定の許可リスト。SEC-2）。
@@ -27,6 +27,7 @@
 
 mod args;
 mod engine;
+mod guard;
 mod layout;
 mod page;
 #[cfg(unix)]
