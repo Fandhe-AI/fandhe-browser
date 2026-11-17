@@ -7,15 +7,14 @@
 //! 試験は `real_host.rs`（#998・TASK-38.8b）。HostProcess 層の試験は `host_process.rs`。
 //! 外部入力の経路ではないため `unwrap` / `expect` / `panic!` を使う。
 
-#![cfg_attr(windows, allow(dead_code, unused_imports))]
-
 mod support;
 
+#[cfg(unix)]
 use std::time::{Duration, Instant};
 
-use fandhe_browser_core::render::{
-    ElementRef, ImageFormat, PageRef, RenderError, Renderer, ScreenshotOptions,
-};
+#[cfg(unix)]
+use fandhe_browser_core::render::ImageFormat;
+use fandhe_browser_core::render::{ElementRef, PageRef, RenderError, Renderer, ScreenshotOptions};
 use fandhe_browser_render::host_process::HostTimeouts;
 use fandhe_browser_render::host_renderer::{HostRenderer, HostRendererConfig};
 use support::*;
@@ -45,6 +44,7 @@ pub fn variant(e: &RenderError) -> &'static str {
     }
 }
 
+#[cfg(unix)]
 fn t_renderer_roundtrip() {
     let root = Root::new("r-ok", "ok");
     let concrete = renderer(&root, base_timeouts(), false);
@@ -75,6 +75,7 @@ fn t_renderer_roundtrip() {
     assert_eq!(count(&root.0, "spawns"), 1);
 }
 
+#[cfg(unix)]
 fn t_renderer_not_loaded_before_load() {
     let root = Root::new("r-notloaded", "ok");
     let r = renderer(&root, base_timeouts(), false);
@@ -89,6 +90,7 @@ fn t_renderer_not_loaded_before_load() {
     assert_eq!(count(&root.0, "spawns"), 0, "no host spawn before load");
 }
 
+#[cfg(unix)]
 fn t_renderer_rejects_urls() {
     let root = Root::new("r-urls", "ok");
     let r = renderer(&root, base_timeouts(), false);
@@ -122,6 +124,7 @@ fn t_renderer_rejects_urls() {
     assert_eq!(loaded.final_url(), "http://127.0.0.1/");
 }
 
+#[cfg(unix)]
 fn t_renderer_host_failures() {
     let root = Root::new("r-crash", "crash-on-screenshot");
     let r = renderer(&root, short_timeouts(), false);
@@ -152,6 +155,7 @@ fn t_renderer_host_failures() {
     assert_eq!(variant(&e), "ProtocolMismatch");
 }
 
+#[cfg(unix)]
 fn t_renderer_untrusted_responses() {
     let root = Root::new("r-b64", "bad-base64");
     let r = renderer(&root, short_timeouts(), false);
@@ -179,6 +183,7 @@ fn t_renderer_untrusted_responses() {
     assert!(!format!("{e:?}{e}").contains("secret.example"));
 }
 
+#[cfg(unix)]
 fn t_renderer_final_url_rechecked() {
     let root = Root::new("r-redirect", "redirect-private");
     let r = renderer(&root, short_timeouts(), false);
@@ -197,12 +202,15 @@ fn t_renderer_final_url_rechecked() {
 }
 
 const URL_A: &str = "https://example.com/a";
+#[cfg(unix)]
 const PNG_SIG: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
 
+#[cfg(unix)]
 fn log(root: &Root) -> String {
     std::fs::read_to_string(root.0.join("requests")).unwrap_or_default()
 }
 
+#[cfg(unix)]
 fn loaded(
     root_name: &str,
     scenario: &str,
@@ -214,6 +222,7 @@ fn loaded(
 }
 
 /// 正常系 4 API を具体値で検証し、ホストが受けた要求内容も照合する（受け入れ条件 1）。
+#[cfg(unix)]
 fn t_api_roundtrip_concrete() {
     let root = Root::new("b-concrete", "ok");
     let concrete = renderer(&root, base_timeouts(), false);
@@ -245,6 +254,7 @@ fn t_api_roundtrip_concrete() {
 }
 
 /// `Arc<dyn Renderer>` を複数スレッドから使える（Send + Sync。同時 in-flight 1 に直列化）。
+#[cfg(unix)]
 fn t_api_shared_across_threads() {
     let root = Root::new("b-threads", "ok");
     let r: std::sync::Arc<dyn Renderer> =
@@ -285,6 +295,7 @@ fn expect_variant(r: &dyn Renderer, op: &str, expected: &str) {
 }
 
 /// タイムアウト（load・screenshot・bounding_box・ハンドシェイク・ホスト自身の timeout）。
+#[cfg(unix)]
 fn t_api_timeouts() {
     let started = Instant::now();
     let (root, r) = loaded("b-hang-load", "hang-load", short_timeouts());
@@ -314,6 +325,7 @@ fn t_api_timeouts() {
 }
 
 /// プロトコル違反・巨大フレーム・不正 JSON。巨大フレームは確保前に弾かれ孤児を残さない。
+#[cfg(unix)]
 fn t_api_protocol_violations() {
     let started = Instant::now();
     let (_root, r) = loaded("b-idmis", "id-mismatch", short_timeouts());
@@ -346,6 +358,7 @@ fn t_api_protocol_violations() {
 }
 
 /// クラッシュ・違反の後、呼び出し側が load し直さなくても新ホストで再ロードされ回復する。
+#[cfg(unix)]
 fn t_api_recovery_after_failure() {
     for (name, scenario, op) in [
         ("b-rec-shot", "crash-on-screenshot\nok", "shot"),
@@ -392,6 +405,7 @@ fn t_api_recovery_after_failure() {
 }
 
 /// 起動直後の crash が 3 回続いたら以後ホストを起動しない（サーキットブレーカー）。
+#[cfg(unix)]
 fn t_api_circuit_breaker() {
     let (root, r) = loaded("b-breaker", "crash-on-start", short_timeouts());
     for _ in 0..3 {
@@ -407,7 +421,7 @@ fn t_api_circuit_breaker() {
 #[cfg(windows)]
 fn t_windows_unisolated_launch_refused() {
     let root = Root::new("basic-windows", "ok");
-    let r = renderer(&root, short_timeouts(), false);
+    let r = renderer(&root, base_timeouts(), false);
     expect_variant(&r, "load", "HostUnavailable");
     assert_eq!(count(&root.0, "spawns"), 0, "host must never be started");
 }

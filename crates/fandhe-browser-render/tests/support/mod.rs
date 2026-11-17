@@ -423,6 +423,7 @@ pub fn base_timeouts() -> HostTimeouts {
     HostTimeouts::default().with_shutdown_grace(Duration::from_secs(1))
 }
 
+#[cfg(unix)]
 pub fn short_timeouts() -> HostTimeouts {
     HostTimeouts::default()
         .with_handshake(Duration::from_secs(5))
@@ -433,11 +434,13 @@ pub fn short_timeouts() -> HostTimeouts {
         .with_shutdown_grace(Duration::from_millis(300))
 }
 
+#[cfg(unix)]
 pub fn child_pid(root: &Root, n: usize) -> u32 {
     child_pid_in(&root.0, n)
 }
 
 /// `dir`（偽ホストの作業場所。隔離時は WorkDir）にある `pid-<n>` を読む。
+#[cfg(unix)]
 pub fn child_pid_in(dir: &Path, n: usize) -> u32 {
     std::fs::read_to_string(dir.join(format!("pid-{n}")))
         .expect("pid file")
@@ -446,6 +449,7 @@ pub fn child_pid_in(dir: &Path, n: usize) -> u32 {
         .expect("pid")
 }
 
+#[cfg(unix)]
 pub fn assert_gone(pid: u32) {
     if cfg!(target_os = "linux") {
         assert!(

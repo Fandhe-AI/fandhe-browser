@@ -10,12 +10,11 @@
 //! 分岐を読める）、`GITHUB_ACTIONS=true` で `probe_system()` が Err なら失敗にする
 //! （RENDER-3・#1451。bwrap が無くて Err 分岐だけ通り緑になるのを防ぐ）。
 
-#![cfg_attr(windows, allow(dead_code, unused_imports))]
-
 mod support;
 
 #[cfg(unix)]
 use std::collections::BTreeSet;
+#[cfg(unix)]
 use std::time::{Duration, Instant};
 
 use fandhe_browser_core::EgressIsolationMode;
@@ -24,26 +23,32 @@ use fandhe_browser_render::host_process::HOST_ARGS;
 #[cfg(unix)]
 use fandhe_browser_render::host_process::HostProcessConfig;
 #[cfg(unix)]
+use fandhe_browser_render::host_process::HostTimeouts;
+#[cfg(unix)]
+use fandhe_browser_render::host_process::TimeoutPhase;
+#[cfg(unix)]
 use fandhe_browser_render::host_process::{EgressIsolationStatus, EgressIsolationWarning};
 use fandhe_browser_render::host_process::{
-    EgressIsolationUnavailable, HostProcess, HostProcessError, HostTimeouts, IsolationProbe,
-    TimeoutPhase,
+    EgressIsolationUnavailable, HostProcess, HostProcessError, IsolationProbe,
 };
 #[cfg(unix)]
 use fandhe_browser_render::host_process::{FORCED_ENV_NAMES, PASSTHROUGH_ENV_NAMES};
+#[cfg(unix)]
 use fandhe_browser_render::protocol::{
-    BoundingBoxParams, LoadParams, MethodResult, ProtocolError, Request, ScreenshotParams,
-    VisibilityParams,
+    BoundingBoxParams, MethodResult, ProtocolError, VisibilityParams,
 };
+use fandhe_browser_render::protocol::{LoadParams, Request, ScreenshotParams};
 #[cfg(unix)]
 use serde_json::Value;
 use support::*;
 
 /// `Root` から `HostProcess` を組み立てる（HostProcess 層専用のため `support` には置かない）。
+#[cfg(unix)]
 trait RootHost {
     fn host(&self, timeouts: HostTimeouts) -> HostProcess;
 }
 
+#[cfg(unix)]
 impl RootHost for Root {
     fn host(&self, timeouts: HostTimeouts) -> HostProcess {
         HostProcess::new(self.config(timeouts))
@@ -58,6 +63,7 @@ pub fn shot() -> Request {
     Request::Screenshot(ScreenshotParams::new(false))
 }
 
+#[cfg(unix)]
 fn t_ok_roundtrip() {
     let root = Root::new("ok", "ok");
     let mut h = root.host(base_timeouts());
@@ -88,6 +94,7 @@ fn t_ok_roundtrip() {
     assert_gone(child_pid(&root, 1));
 }
 
+#[cfg(unix)]
 fn t_invalid_request() {
     let root = Root::new("invalid", "ok");
     let mut h = root.host(base_timeouts());
@@ -102,6 +109,7 @@ fn t_invalid_request() {
     assert_eq!(count(&root.0, "spawns"), 0);
 }
 
+#[cfg(unix)]
 fn t_hello_timeout() {
     let root = Root::new("hello-timeout", "hello-timeout");
     // 遅い CI（Windows 等）でも偽ホストが pid を書き終えてから kill されるよう、
@@ -118,6 +126,7 @@ fn t_hello_timeout() {
     assert_gone(child_pid(&root, 1));
 }
 
+#[cfg(unix)]
 fn t_bad_protocol_range() {
     let root = Root::new("bad-range", "bad-protocol-range");
     let mut h = root.host(base_timeouts());
@@ -127,6 +136,7 @@ fn t_bad_protocol_range() {
     assert_eq!(h.host_generation(), 0);
 }
 
+#[cfg(unix)]
 fn t_crash_then_restart() {
     let root = Root::new("crash", "crash-after-hello\nok");
     let mut h = root.host(base_timeouts());
@@ -139,6 +149,7 @@ fn t_crash_then_restart() {
     assert_eq!(count(&root.0, "spawns"), 2);
 }
 
+#[cfg(unix)]
 fn t_load_timeout() {
     let root = Root::new("hang-load", "hang-load");
     let mut h = root.host(short_timeouts());
@@ -156,6 +167,7 @@ fn t_load_timeout() {
     assert_gone(child_pid(&root, 1));
 }
 
+#[cfg(unix)]
 fn t_query_timeouts() {
     let root = Root::new("hang-query", "hang-query");
     let mut h = root.host(short_timeouts());
@@ -174,6 +186,7 @@ fn t_query_timeouts() {
     assert_gone(child_pid(&root, 2));
 }
 
+#[cfg(unix)]
 fn t_protocol_violations() {
     let root = Root::new("garbage", "garbage-frame");
     let mut h = root.host(base_timeouts());
@@ -208,6 +221,7 @@ fn t_protocol_violations() {
     assert!(h.pid().is_none());
 }
 
+#[cfg(unix)]
 fn t_slow_shutdown_is_killed_after_grace() {
     let root = Root::new("slow-shutdown", "slow-shutdown");
     let mut h = root.host(short_timeouts());
@@ -282,6 +296,7 @@ fn t_dump_env_args_cwd() {
     assert!(!workdir.exists(), "workdir must be deleted");
 }
 
+#[cfg(unix)]
 fn t_reload_on_generation_change() {
     let root = Root::new("reload", "ok");
     let mut h = root.host(base_timeouts());
@@ -292,6 +307,7 @@ fn t_reload_on_generation_change() {
     assert_eq!(count(&root.0, "loads"), 2, "navigation generation changed");
 }
 
+#[cfg(unix)]
 fn t_reload_after_crash() {
     let root = Root::new("reload-crash", "crash-on-screenshot\nok");
     let mut h = root.host(base_timeouts());
@@ -303,6 +319,7 @@ fn t_reload_after_crash() {
     assert_eq!(count(&root.0, "loads"), 2, "new host must reload the page");
 }
 
+#[cfg(unix)]
 fn t_circuit_breaker() {
     let root = Root::new("breaker", "crash-on-start");
     let mut h = root.host(base_timeouts());
@@ -321,6 +338,7 @@ fn t_circuit_breaker() {
     assert_eq!(count(&root.0, "spawns"), 3, "no spawn while open");
 }
 
+#[cfg(unix)]
 fn t_profile_isolation() {
     let root = Root::new("prof", "ok");
     let mut a = root.host(base_timeouts());
@@ -331,6 +349,7 @@ fn t_profile_isolation() {
     assert_ne!(a.workdir_path(), b.workdir_path());
 }
 
+#[cfg(unix)]
 fn t_stderr_tail() {
     let root = Root::new("stderr", "stderr-flood");
     let mut h = root.host(base_timeouts());
