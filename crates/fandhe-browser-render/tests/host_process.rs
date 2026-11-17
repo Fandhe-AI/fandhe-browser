@@ -33,11 +33,13 @@ use fandhe_browser_render::host_process::{
 };
 #[cfg(unix)]
 use fandhe_browser_render::host_process::{FORCED_ENV_NAMES, PASSTHROUGH_ENV_NAMES};
+use fandhe_browser_render::protocol::LoadParams;
 #[cfg(unix)]
 use fandhe_browser_render::protocol::{
     BoundingBoxParams, MethodResult, ProtocolError, VisibilityParams,
 };
-use fandhe_browser_render::protocol::{LoadParams, Request, ScreenshotParams};
+#[cfg(unix)]
+use fandhe_browser_render::protocol::{Request, ScreenshotParams};
 #[cfg(unix)]
 use serde_json::Value;
 use support::*;
