@@ -7,6 +7,9 @@
 //! 上で `WebView::take_screenshot` を期限付きで待ち、PNG 化は `screenshot` モジュールに任せる。
 //! 可視性（TASK-38.4・#233）は同じ上で `WebView::evaluate_javascript` を期限付きで待ち、
 //! スクリプト生成と結果解釈は `layout` に任せる。境界ボックスも同じ経路で取得する（#234）。
+//! 操作モード（`--interactive`。TASK-122・設計 §14）では、DOM の取得（`dom_snapshot`）も同じ経路で行い
+//! （直列化のスクリプトと結果の解釈は `dom`）、ページ識別子（起動ごとの `session` と文書番号 `doc_seq`）を持つ。
+//! `doc_seq` は `load`・URL 変更の通知・新しい文書の読み込みの開始で上げる（#1582 の判断 A）。
 //!
 //! 待機の方針（PoC-13 の失敗の再発防止）: 条件は「`LoadStatus::Complete` かつ受信フレーム数が 1 以上」。
 //! Complete より前に届いたフレームも数え、「Complete より後の新しいフレーム」は要求しない
@@ -28,12 +31,14 @@ use servo::{
     WebView, WebViewBuilder, WebViewDelegate,
 };
 
+use crate::dom;
 use crate::engine::{Engine, LoopbackProxy};
 use crate::layout;
 use crate::screenshot::{self, SCREENSHOT_TIMEOUT};
 use crate::server::{
-    BoundingBoxResult, ErrorKind, Handler, HandlerError, LoadParams, LoadResult, Method,
-    ScreenshotParams, ScreenshotResult, SelectorParams, VisibilityResult, is_valid_url,
+    BoundingBoxResult, DOM_SNAPSHOT_TIMEOUT_MS, DomSnapshotResult, ErrorKind, Handler,
+    HandlerError, LoadParams, LoadResult, MAX_URL_BYTES, Method, PageInfo, ScreenshotParams,
+    ScreenshotResult, SelectorParams, VisibilityResult, is_valid_url,
 };
 
 /// イベントループのポーリング間隔（ビジーループにしない）。
@@ -116,6 +121,14 @@ pub(crate) struct PageLoad {
 struct PageDelegate {
     frames: Cell<u64>,
     crashed: Cell<bool>,
+    /// 文書番号（`doc_seq`）。[`ServoHandler`] と共有し、WebView を作り直しても続けて数える（設計 §14.2）。
+    doc_seq: Rc<Cell<u64>>,
+}
+
+impl PageDelegate {
+    fn bump_doc_seq(&self) {
+        self.doc_seq.set(self.doc_seq.get().saturating_add(1));
+    }
 }
 
 impl WebViewDelegate for PageDelegate {
@@ -137,6 +150,19 @@ impl WebViewDelegate for PageDelegate {
             request.allow();
         } else {
             request.deny();
+        }
+    }
+
+    fn notify_url_changed(&self, _webview: WebView, _url: url::Url) {
+        // 同じ文書の中の変更（`pushState`・`replaceState`・hash）でも上げる（2026-11-18 の判断 A。#1582）。
+        self.bump_doc_seq();
+    }
+
+    fn notify_load_status_changed(&self, _webview: WebView, status: LoadStatus) {
+        // 新しい文書の読み込みの開始（スクリプト起点の遷移・戻る・進む）。初回の読み込みは `Started` が
+        // 来ないため、`ServoHandler::load_page` が別に上げる。
+        if status == LoadStatus::Started {
+            self.bump_doc_seq();
         }
     }
 
@@ -216,8 +242,12 @@ pub(crate) fn navigate(
     engine: &Engine,
     url: ServoUrl,
     deadline: Instant,
+    doc_seq: Rc<Cell<u64>>,
 ) -> Result<CurrentPage, PageError> {
-    let delegate = Rc::new(PageDelegate::default());
+    let delegate = Rc::new(PageDelegate {
+        doc_seq,
+        ..PageDelegate::default()
+    });
     let webview = WebViewBuilder::new(engine.servo(), engine.rendering_context())
         .delegate(delegate.clone())
         .url(url.into_url())
@@ -247,6 +277,18 @@ pub(crate) fn navigate(
     Ok(CurrentPage { webview, delegate })
 }
 
+/// ホストの起動ごとに変わる値（32 桁の 16 進）。`RandomState` の鍵は OS の乱数から作られるため、
+/// 起動ごとに変わる（予測できないことは求めない。設計 §14.2）。依存を足さずに作る。
+fn new_session() -> String {
+    use std::hash::{BuildHasher, Hasher};
+    let part = || {
+        let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+        h.write_u64(0);
+        h.finish()
+    };
+    format!("{:016x}{:016x}", part(), part())
+}
+
 /// Servo 組み込みのエラーページのタイトルか。
 ///
 /// ヒューリスティックで、ページ側が同じタイトルを付けると `load_failed` に倒れる（fail-closed）。
@@ -267,15 +309,47 @@ pub(crate) struct ServoHandler {
     engine_failed: bool,
     /// egress プロキシの場所。`Engine` 生成時に Servo の proxy pref へ渡す（#1435）。
     proxy: Option<LoopbackProxy>,
+    /// 操作モード（`--interactive`）。真のときだけ `dom_snapshot` を載せ、`load` に `page` を返す（設計 §14.1）。
+    interactive: bool,
+    /// ホストの起動ごとに変わる値（設計 §14.2）。
+    session: String,
+    /// 文書番号。delegate と共有する。
+    doc_seq: Rc<Cell<u64>>,
+    /// 最新の `dom_snapshot` の識別子の通し番号。
+    snapshot_seq: u64,
+    /// 最新の `dom_snapshot` の対応（番号 → 要素 ID）。文書が変わる `load` で捨てる。
+    snapshot: Option<Snapshot>,
+}
+
+/// `dom_snapshot` 1 回分の対応。ホストは最新の 1 件だけを持つ（設計 §14.4）。
+struct Snapshot {
+    // ponytail: act（TASK-126）が `id` と照合し、`element_ids` を `window.webdriverElement` で引き直す。
+    // それまでは保持だけで読まない。
+    #[allow(dead_code)]
+    id: String,
+    #[allow(dead_code)]
+    element_ids: Vec<String>,
 }
 
 impl ServoHandler {
-    pub(crate) fn new(proxy: Option<LoopbackProxy>) -> Self {
+    pub(crate) fn new(proxy: Option<LoopbackProxy>, interactive: bool) -> Self {
         Self {
             page: None,
             engine: None,
             engine_failed: false,
             proxy,
+            interactive,
+            session: new_session(),
+            doc_seq: Rc::default(),
+            snapshot_seq: 0,
+            snapshot: None,
+        }
+    }
+
+    fn page_info(&self) -> PageInfo {
+        PageInfo {
+            session: self.session.clone(),
+            doc_seq: self.doc_seq.get(),
         }
     }
 
@@ -299,8 +373,11 @@ impl ServoHandler {
     }
 
     fn load_page(&mut self, p: &LoadParams) -> Result<PageLoad, PageError> {
-        // 失敗しても現在のページは捨てる（クライアントと同じ意味論）。
+        // 失敗しても現在のページは捨てる（クライアントと同じ意味論）。`load` は常に新しい文書なので
+        // 文書番号を上げ、前の `dom_snapshot` の対応も捨てる（設計 §14.2）。
         self.page = None;
+        self.snapshot = None;
+        self.doc_seq.set(self.doc_seq.get().saturating_add(1));
         // 入口（request.rs）に加えてホスト側でも再検証する（二重化。SSRF）。
         if !is_valid_url(&p.url) {
             return Err(PageError::InvalidUrl);
@@ -315,7 +392,7 @@ impl ServoHandler {
         let deadline = Instant::now() + p.timeout;
         self.ensure_engine()?;
         let engine = self.engine.as_ref().ok_or(PageError::Engine)?;
-        let page = navigate(engine, url, deadline)?;
+        let page = navigate(engine, url, deadline, self.doc_seq.clone())?;
         if page.delegate.crashed.get() {
             return Err(PageError::Crashed);
         }
@@ -341,12 +418,22 @@ impl ServoHandler {
 
 impl Handler for ServoHandler {
     fn capabilities(&self) -> &'static [Method] {
-        &[
-            Method::Load,
-            Method::Screenshot,
-            Method::Visibility,
-            Method::BoundingBox,
-        ]
+        if self.interactive {
+            &[
+                Method::Load,
+                Method::Screenshot,
+                Method::Visibility,
+                Method::BoundingBox,
+                Method::DomSnapshot,
+            ]
+        } else {
+            &[
+                Method::Load,
+                Method::Screenshot,
+                Method::Visibility,
+                Method::BoundingBox,
+            ]
+        }
     }
 
     fn load(&mut self, p: &LoadParams) -> Result<LoadResult, HandlerError> {
@@ -354,6 +441,71 @@ impl Handler for ServoHandler {
         Ok(LoadResult {
             final_url: page.final_url,
             status: page.status,
+            page: self.interactive.then(|| self.page_info()),
+        })
+    }
+
+    /// 主フレームの DOM を番号つきの HTML で返す（`RENDER-11`・TASK-122。設計 §14.3）。
+    ///
+    /// `page` は照合しない（いまの文書を返す。§14.2）。現在の URL が http / https でなければ
+    /// `invalid_state`（`about:blank` へ移った後など。#1581 の引き継ぎ）。
+    fn dom_snapshot(&mut self) -> Result<DomSnapshotResult, HandlerError> {
+        let (Some(page), Some(engine)) = (self.page.as_ref(), self.engine.as_ref()) else {
+            return Err(HandlerError(ErrorKind::NotLoaded));
+        };
+        let current_url = || {
+            page.webview
+                .url()
+                .filter(|u| matches!(u.scheme(), "http" | "https"))
+                .map(|u| u.to_string())
+        };
+        // 評価の待ちの間もイベントループが回り、遷移や `pushState` の通知が処理されうる。評価の前後で
+        // 文書番号が変わったら、古い文書の HTML・要素 ID に新しい URL・番号を付けないよう結果を捨て、
+        // 期限内で取り直す（設計 §14.2・§14.3）。期限を過ぎたら timeout。
+        let deadline = Instant::now() + Duration::from_millis(DOM_SNAPSHOT_TIMEOUT_MS);
+        let (s, url, doc_seq) = loop {
+            let before = self.doc_seq.get();
+            current_url().ok_or(HandlerError(ErrorKind::InvalidState))?;
+            let value = match page.evaluate(engine, dom::serialize_script(), deadline) {
+                Ok(v) => v,
+                Err(e) => {
+                    if matches!(e, PageError::Crashed | PageError::DocumentGone) {
+                        self.page = None;
+                    }
+                    return Err(HandlerError(e.kind()));
+                }
+            };
+            let url = current_url().ok_or(HandlerError(ErrorKind::InvalidState))?;
+            if self.doc_seq.get() == before {
+                break (dom::parse_serialized(value), url, before);
+            }
+            if Instant::now() >= deadline {
+                return Err(HandlerError(ErrorKind::Timeout));
+            }
+        };
+        let s = s.map_err(|e| HandlerError(e.kind()))?;
+        if url.len() > MAX_URL_BYTES {
+            return Err(HandlerError(ErrorKind::TooLarge));
+        }
+        self.snapshot_seq = self.snapshot_seq.saturating_add(1);
+        let id = format!("s{}", self.snapshot_seq);
+        let element_count = s.element_ids.len() as u64;
+        self.snapshot = Some(Snapshot {
+            id: id.clone(),
+            element_ids: s.element_ids,
+        });
+        Ok(DomSnapshotResult {
+            page: PageInfo {
+                session: self.session.clone(),
+                doc_seq,
+            },
+            url,
+            html: s.html,
+            element_count,
+            snapshot: id,
+            iframes: s.iframes,
+            shadow_roots: s.shadow_roots,
+            redacted: s.redacted,
         })
     }
 
@@ -476,7 +628,7 @@ mod tests {
     /// RENDER-3: 未ロードは not_loaded、full_page は unsupported（Engine を作らない）。
     #[test]
     fn screenshot_without_page_is_rejected() {
-        let mut h = ServoHandler::new(None);
+        let mut h = ServoHandler::new(None, false);
         let err = h
             .screenshot(&ScreenshotParams { full_page: false })
             .err()
@@ -500,7 +652,7 @@ mod tests {
     #[test]
     fn capabilities_list_all_implemented_methods() {
         assert_eq!(
-            ServoHandler::new(None).capabilities(),
+            ServoHandler::new(None, false).capabilities(),
             &[
                 Method::Load,
                 Method::Screenshot,
@@ -510,10 +662,35 @@ mod tests {
         );
     }
 
+    /// RENDER-11・TASK-122: 操作モードのハンドラだけが dom_snapshot を載せる。未ロードは not_loaded。
+    #[test]
+    fn interactive_handler_advertises_dom_snapshot() {
+        let mut h = ServoHandler::new(None, true);
+        assert!(h.capabilities().contains(&Method::DomSnapshot));
+        assert!(
+            !ServoHandler::new(None, false)
+                .capabilities()
+                .contains(&Method::DomSnapshot)
+        );
+        assert_eq!(
+            h.dom_snapshot().err(),
+            Some(HandlerError(ErrorKind::NotLoaded))
+        );
+    }
+
+    /// 設計 §14.2: session は 32 桁の 16 進で、起動（ハンドラ）ごとに変わる。
+    #[test]
+    fn session_is_hex_and_changes() {
+        let a = new_session();
+        assert_eq!(a.len(), 32);
+        assert!(a.bytes().all(|b| b.is_ascii_hexdigit()));
+        assert_ne!(a, new_session());
+    }
+
     /// RENDER-3: 未ロードは not_loaded、不正なセレクタは未ロードでも invalid_params。
     #[test]
     fn visibility_without_page_is_rejected() {
-        let mut h = ServoHandler::new(None);
+        let mut h = ServoHandler::new(None, false);
         let params = |s: &str| SelectorParams {
             selector: s.to_string(),
         };
@@ -527,7 +704,7 @@ mod tests {
     /// RENDER-3（TASK-38.5・#234）: 未ロードは not_loaded、不正なセレクタは未ロードでも invalid_params。
     #[test]
     fn bounding_box_without_page_is_rejected() {
-        let mut h = ServoHandler::new(None);
+        let mut h = ServoHandler::new(None, false);
         let params = |s: &str| SelectorParams {
             selector: s.to_string(),
         };

@@ -1,7 +1,7 @@
 //! Servo ホストの stdio サーバーループ（フレーム I/O・`hello`・ディスパッチ・上限検証・`shutdown`）。
 //!
 //! 呼び出し元は `main` の `--stdio`（本体 `fandhe-browser-render` の `host_process` が固定引数
-//! `HOST_ARGS` で起動する）。実処理（load・screenshot・visibility・bounding_box）は [`Handler`] の
+//! `HOST_ARGS` で起動する）。実処理（load・screenshot・visibility・bounding_box、操作モードの dom_snapshot）は [`Handler`] の
 //! 向こうに置き、本モジュールは Servo に依存しない（`servo::*` を import しない）。後続の
 //! `page::ServoHandler`（load は #231、screenshot は #232、visibility は #233、bounding_box は #234 で実装済み）を `main` が使う。
 //!
@@ -10,6 +10,10 @@
 //! フレームは u32 LE の長さ接頭辞 + UTF-8 JSON。同時 in-flight は 1 で、要求を 1 件読んで処理し、
 //! 応答を返してから次を読む同期ループ。対応ビヘイビア: `RENDER-3`・`RENDER-4`・`PLUG-1`・`SEC-2`
 //! （関連 `REPAIR-3`・`REPAIR-4`。設計 `docs/design/servo-host-design.md` §2.1〜§2.5）。
+//!
+//! 操作モードのメソッド（dom_snapshot。TASK-122・設計 §14）は、ハンドラの `capabilities` に載るときだけ受け付け、
+//! 載らなければ実装の有無にかかわらず `unsupported` を返す。dom_snapshot の応答フレームは 12 MiB までで、
+//! 超えたら切り詰めずに `too_large` を返す（`RENDER-11`）。
 //!
 //! ログは stderr のみ（stdout はフレーム専用）。URL・セレクタ・params の中身は出さない。
 //! エラーの `message` は kind ごとの固定英語文字列で、入力値や機密を含めない。
@@ -46,6 +50,12 @@ pub(crate) const MAX_METHOD_BYTES: usize = 64;
 pub(crate) const MAX_REQUEST_ID: u64 = (1 << 53) - 1;
 pub(crate) const LOAD_TIMEOUT_DEFAULT_MS: u64 = 30_000;
 pub(crate) const LOAD_TIMEOUT_MAX_MS: u64 = 60_000;
+/// `dom_snapshot` の HTML の上限（UTF-8 のバイト。8 MiB。`RENDER-11`・設計 §14.6）。
+pub(crate) const MAX_DOM_SNAPSHOT_HTML_BYTES: usize = 8_388_608;
+/// `dom_snapshot` 応答フレームの上限（12 MiB。`RENDER-11`）。
+pub(crate) const MAX_DOM_SNAPSHOT_FRAME_BYTES: usize = 12_582_912;
+/// `dom_snapshot` の待機上限（ミリ秒。30 秒。設計 §14.6）。
+pub(crate) const DOM_SNAPSHOT_TIMEOUT_MS: u64 = 30_000;
 
 /// 同梱する Servo の版。`servo` crate は版の定数を公開しないため手で持ち、
 /// `Cargo.toml` の pin との一致をテストで検証する。
@@ -58,6 +68,8 @@ pub(crate) enum Method {
     Screenshot,
     Visibility,
     BoundingBox,
+    /// 操作モードだけ（`--interactive`。設計 §14.3）。
+    DomSnapshot,
     Shutdown,
 }
 
@@ -68,6 +80,7 @@ impl Method {
             Self::Screenshot => "screenshot",
             Self::Visibility => "visibility",
             Self::BoundingBox => "bounding_box",
+            Self::DomSnapshot => "dom_snapshot",
             Self::Shutdown => "shutdown",
         }
     }
@@ -79,6 +92,7 @@ impl Method {
             Self::Screenshot,
             Self::Visibility,
             Self::BoundingBox,
+            Self::DomSnapshot,
             Self::Shutdown,
         ]
         .into_iter()
@@ -97,6 +111,10 @@ pub(crate) enum ErrorKind {
     Timeout,
     LoadFailed,
     Internal,
+    /// 現在の URL が http / https 以外（操作モード。設計 §14.7）。
+    InvalidState,
+    /// 上限を超えた（切り詰めない。操作モード）。
+    TooLarge,
 }
 
 impl ErrorKind {
@@ -110,6 +128,8 @@ impl ErrorKind {
             Self::Timeout => "timeout",
             Self::LoadFailed => "load_failed",
             Self::Internal => "internal",
+            Self::InvalidState => "invalid_state",
+            Self::TooLarge => "too_large",
         }
     }
 
@@ -124,6 +144,8 @@ impl ErrorKind {
             Self::Timeout => "Operation timed out.",
             Self::LoadFailed => "Navigation failed.",
             Self::Internal => "Internal host error.",
+            Self::InvalidState => "Current document is not an http(s) page.",
+            Self::TooLarge => "Result exceeds the size limit.",
         }
     }
 }
@@ -138,6 +160,34 @@ pub(crate) struct LoadResult {
     /// HTTP ステータス。取得できない場合は `None` で、応答に `status` キーを出さない
     /// （固定値で成功を装わない。`REPAIR-3`・`REPAIR-4`）。
     pub status: Option<u16>,
+    /// ページ識別子。`--interactive` のホストだけが返す（設計 §14.2）。
+    pub page: Option<PageInfo>,
+}
+
+/// ページ識別子（設計 §14.2・TASK-121 の確定条件 3）。`session` はホストの起動ごとに変わる値、
+/// `doc_seq` は文書番号。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PageInfo {
+    pub session: String,
+    pub doc_seq: u64,
+}
+
+impl PageInfo {
+    fn to_json(&self) -> Value {
+        json!({ "session": self.session, "doc_seq": self.doc_seq })
+    }
+}
+
+/// `dom_snapshot` の結果（`RENDER-11`・設計 §14.3）。`html` は 8 MiB 以下に検証済み。
+pub(crate) struct DomSnapshotResult {
+    pub page: PageInfo,
+    pub url: String,
+    pub html: String,
+    pub element_count: u64,
+    pub snapshot: String,
+    pub iframes: u64,
+    pub shadow_roots: u64,
+    pub redacted: u64,
 }
 
 /// `screenshot` の結果（`format` は常に `png` でサーバーが付ける。PNG と base64 の生成は `screenshot` モジュール。#232）。
@@ -169,6 +219,11 @@ pub(crate) trait Handler {
     fn screenshot(&mut self, p: &ScreenshotParams) -> Result<ScreenshotResult, HandlerError>;
     fn visibility(&mut self, p: &SelectorParams) -> Result<VisibilityResult, HandlerError>;
     fn bounding_box(&mut self, p: &SelectorParams) -> Result<BoundingBoxResult, HandlerError>;
+    /// 主フレームの DOM の取得（操作モードだけ。設計 §14.3）。`capabilities` に載せない
+    /// ハンドラへはサーバーが渡さないため、既定は `unsupported`。
+    fn dom_snapshot(&mut self) -> Result<DomSnapshotResult, HandlerError> {
+        Err(HandlerError(ErrorKind::Unsupported))
+    }
 }
 
 /// 全メソッドを `unsupported` で拒否するスタブ（サーバーループの単体テスト専用）。
@@ -271,6 +326,30 @@ fn io_outcome(e: FrameError) -> ServeOutcome {
 }
 
 fn hello_message(caps: &[Method]) -> Value {
+    let mut msg = hello_base(caps);
+    // 操作モードの上限は、そのメソッドを載せるホストだけが申告する（設計 §14.1・§14.6）。
+    if caps.contains(&Method::DomSnapshot)
+        && let Some(limits) = msg
+            .pointer_mut("/data/limits")
+            .and_then(Value::as_object_mut)
+    {
+        limits.insert(
+            "dom_snapshot_html_bytes".into(),
+            MAX_DOM_SNAPSHOT_HTML_BYTES.into(),
+        );
+        limits.insert(
+            "dom_snapshot_frame_bytes".into(),
+            MAX_DOM_SNAPSHOT_FRAME_BYTES.into(),
+        );
+        limits.insert(
+            "dom_snapshot_timeout_ms".into(),
+            DOM_SNAPSHOT_TIMEOUT_MS.into(),
+        );
+    }
+    msg
+}
+
+fn hello_base(caps: &[Method]) -> Value {
     let mut capabilities: Vec<&str> = caps
         .iter()
         .filter(|m| **m != Method::Shutdown)
@@ -316,12 +395,16 @@ fn error_response(id: u64, kind: ErrorKind) -> Value {
 /// 検証済みの要求をハンドラへ渡し、応答値とログ用の結果 kind（成功は `ok`）を返す。
 fn dispatch<H: Handler>(h: &mut H, id: u64, req: &Request) -> (Value, &'static str) {
     let result = match req {
-        Request::Load(p) => h
-            .load(p)
-            .map(|r| match r.status {
-                Some(status) => json!({ "final_url": r.final_url, "status": status }),
-                None => json!({ "final_url": r.final_url }),
-            }),
+        Request::Load(p) => h.load(p).map(|r| {
+            let mut v = json!({ "final_url": r.final_url });
+            if let Some(status) = r.status {
+                v["status"] = status.into();
+            }
+            if let Some(page) = &r.page {
+                v["page"] = page.to_json();
+            }
+            v
+        }),
         Request::Screenshot(p) => h.screenshot(p).map(|r| {
             json!({ "format": "png", "width": r.width, "height": r.height, "data_base64": r.data_base64 })
         }),
@@ -332,6 +415,17 @@ fn dispatch<H: Handler>(h: &mut H, id: u64, req: &Request) -> (Value, &'static s
         Request::BoundingBox(p) => h
             .bounding_box(p)
             .map(|r| json!({ "x": r.x, "y": r.y, "width": r.width, "height": r.height })),
+        Request::DomSnapshot => h.dom_snapshot().map(|r| {
+            json!({
+                "page": r.page.to_json(),
+                "url": r.url,
+                "html": r.html,
+                "element_count": r.element_count,
+                "snapshot": r.snapshot,
+                "excluded": { "iframes": r.iframes, "shadow_roots": r.shadow_roots },
+                "redacted": r.redacted,
+            })
+        }),
         // shutdown は serve が処理する。ここへ来た場合は成功を装わず内部エラーにする。
         Request::Shutdown => Err(HandlerError(ErrorKind::Internal)),
     };
@@ -339,6 +433,11 @@ fn dispatch<H: Handler>(h: &mut H, id: u64, req: &Request) -> (Value, &'static s
         Ok(v) => (ok_response(id, v), "ok"),
         Err(HandlerError(kind)) => (error_response(id, kind), kind.as_str()),
     }
+}
+
+/// `label`（検証済みのメソッド名）が `hello.capabilities` に載るか。`shutdown` は常に載る。
+fn is_advertised(caps: &[Method], label: &str) -> bool {
+    label == Method::Shutdown.as_str() || caps.iter().any(|m| m.as_str() == label)
 }
 
 /// ログ 1 行を stderr 側のライタへ書く（失敗は無視。ログのために処理を止めない）。
@@ -410,11 +509,18 @@ fn serve_inner<R: Read, W: Write, H: Handler>(
                     Err(e) => io_outcome(e),
                 };
             }
+            // capabilities に無いメソッドは、実装の有無にかかわらず unsupported（操作モードのメソッドを
+            // `--interactive` でないホストで受けない。設計 §14.1）。
+            Ok(_) if !is_advertised(h.capabilities(), parsed.label) => (
+                error_response(parsed.id, ErrorKind::Unsupported),
+                MAX_RESPONSE_FRAME_BYTES,
+                ErrorKind::Unsupported.as_str(),
+            ),
             Ok(req) => {
-                let limit = if matches!(req, Request::Screenshot(_)) {
-                    MAX_SCREENSHOT_FRAME_BYTES
-                } else {
-                    MAX_RESPONSE_FRAME_BYTES
+                let limit = match req {
+                    Request::Screenshot(_) => MAX_SCREENSHOT_FRAME_BYTES,
+                    Request::DomSnapshot => MAX_DOM_SNAPSHOT_FRAME_BYTES,
+                    _ => MAX_RESPONSE_FRAME_BYTES,
                 };
                 let (resp, kind) = dispatch(h, parsed.id, req);
                 (resp, limit, kind)
@@ -426,10 +532,17 @@ fn serve_inner<R: Read, W: Write, H: Handler>(
         };
         let mut kind = kind;
         if body.len() > limit {
-            // 上限超過の応答は書かず、同じ id の internal に差し替えてループを続ける。
+            // 上限超過の応答は書かず、同じ id のエラーに差し替えてループを続ける。dom_snapshot は
+            // 符号化した後のフレーム長で判定する契約のため too_large（切り詰めない。`RENDER-11`）、
+            // 他は想定外の超過として internal。
             log_line(log, format_args!("response exceeded size limit"));
-            kind = ErrorKind::Internal.as_str();
-            body = match serde_json::to_vec(&error_response(parsed.id, ErrorKind::Internal)) {
+            let replaced = if parsed.label == Method::DomSnapshot.as_str() {
+                ErrorKind::TooLarge
+            } else {
+                ErrorKind::Internal
+            };
+            kind = replaced.as_str();
+            body = match serde_json::to_vec(&error_response(parsed.id, replaced)) {
                 Ok(b) => b,
                 Err(_) => return ServeOutcome::ProtocolViolation("response encoding failed"),
             };

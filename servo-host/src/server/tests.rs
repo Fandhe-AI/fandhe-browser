@@ -17,6 +17,10 @@ struct FakeHandler {
     calls: Rc<RefCell<Vec<&'static str>>>,
     final_url: String,
     error: Option<ErrorKind>,
+    /// 真なら操作モードのハンドラとして振る舞う（`dom_snapshot` を載せ、`load` に `page` を返す）。
+    interactive: bool,
+    /// `dom_snapshot` が返す HTML。
+    html: String,
 }
 
 impl FakeHandler {
@@ -27,6 +31,8 @@ impl FakeHandler {
                 calls: Rc::clone(&calls),
                 final_url: "https://example.com/".to_owned(),
                 error: None,
+                interactive: false,
+                html: "<html data-fandhe-n=\"0\"></html>".to_owned(),
             },
             calls,
         )
@@ -39,19 +45,44 @@ impl FakeHandler {
 
 impl Handler for FakeHandler {
     fn capabilities(&self) -> &'static [Method] {
-        &[
-            Method::Load,
-            Method::Screenshot,
-            Method::Visibility,
-            Method::BoundingBox,
-            Method::Shutdown,
-        ]
+        if self.interactive {
+            &[
+                Method::Load,
+                Method::Screenshot,
+                Method::Visibility,
+                Method::BoundingBox,
+                Method::DomSnapshot,
+                Method::Shutdown,
+            ]
+        } else {
+            &[
+                Method::Load,
+                Method::Screenshot,
+                Method::Visibility,
+                Method::BoundingBox,
+                Method::Shutdown,
+            ]
+        }
     }
     fn load(&mut self, _p: &LoadParams) -> Result<LoadResult, HandlerError> {
         self.record("load")?;
         Ok(LoadResult {
             final_url: self.final_url.clone(),
             status: Some(200),
+            page: self.interactive.then(page_info),
+        })
+    }
+    fn dom_snapshot(&mut self) -> Result<DomSnapshotResult, HandlerError> {
+        self.record("dom_snapshot")?;
+        Ok(DomSnapshotResult {
+            page: page_info(),
+            url: "https://example.com/".to_owned(),
+            html: self.html.clone(),
+            element_count: 1,
+            snapshot: "s1".to_owned(),
+            iframes: 2,
+            shadow_roots: 0,
+            redacted: 1,
         })
     }
     fn screenshot(&mut self, _p: &ScreenshotParams) -> Result<ScreenshotResult, HandlerError> {
@@ -77,6 +108,13 @@ impl Handler for FakeHandler {
             width: 120.25,
             height: 18.0,
         })
+    }
+}
+
+fn page_info() -> PageInfo {
+    PageInfo {
+        session: "0123456789abcdef0123456789abcdef".to_owned(),
+        doc_seq: 3,
     }
 }
 
@@ -596,4 +634,125 @@ fn servo_version_matches_manifest_pin() {
         manifest.contains(&format!("servo = {{ version = \"={SERVO_VERSION}\"")),
         "SERVO_VERSION is out of sync with Cargo.toml"
     );
+}
+
+fn interactive() -> (FakeHandler, Rc<RefCell<Vec<&'static str>>>) {
+    let (mut h, calls) = FakeHandler::new();
+    h.interactive = true;
+    (h, calls)
+}
+
+/// RENDER-11・TASK-122: `--interactive` でないホストは dom_snapshot を unsupported で返し、ハンドラを呼ばない。
+/// hello に操作モードの上限も載せない（設計 §14.1）。
+#[test]
+fn dom_snapshot_is_unsupported_without_interactive() {
+    let (r, calls) = run(jframe(&json!({"v":1,"id":5,"method":"dom_snapshot"})));
+    assert_eq!(
+        r.frames[1],
+        json!({"v":1,"id":5,"error":{"kind":"unsupported","message":"Method is not supported."}})
+    );
+    assert!(calls.is_empty());
+    let caps = r.frames[0]["data"]["capabilities"].as_array().unwrap();
+    assert!(!caps.contains(&json!("dom_snapshot")));
+    assert!(
+        r.frames[0]["data"]["limits"]
+            .get("dom_snapshot_html_bytes")
+            .is_none()
+    );
+}
+
+/// RENDER-11・TASK-122: 操作モードのホストは dom_snapshot を載せ、上限を申告し、結果をスキーマの形で返す。
+#[test]
+fn interactive_host_serves_dom_snapshot() {
+    let (mut h, calls) = interactive();
+    let input = [
+        jframe(&json!({"v":1,"id":1,"method":"load","params":{"url":"https://example.com/"}})),
+        jframe(&json!({"v":1,"id":2,"method":"dom_snapshot","params":{}})),
+        jframe(&json!({"v":1,"id":3,"method":"dom_snapshot","params":{"page":{"session":"x","doc_seq":1}}})),
+    ]
+    .concat();
+    let r = run_with(&mut h, input);
+    let hello = &r.frames[0]["data"];
+    assert!(
+        hello["capabilities"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("dom_snapshot"))
+    );
+    assert_eq!(hello["limits"]["dom_snapshot_html_bytes"], 8_388_608);
+    assert_eq!(hello["limits"]["dom_snapshot_frame_bytes"], 12_582_912);
+    assert_eq!(hello["limits"]["dom_snapshot_timeout_ms"], 30_000);
+    assert_eq!(
+        r.frames[1]["result"]["page"],
+        json!({"session":"0123456789abcdef0123456789abcdef","doc_seq":3})
+    );
+    assert_eq!(
+        r.frames[2]["result"],
+        json!({
+            "page": {"session":"0123456789abcdef0123456789abcdef","doc_seq":3},
+            "url": "https://example.com/",
+            "html": "<html data-fandhe-n=\"0\"></html>",
+            "element_count": 1,
+            "snapshot": "s1",
+            "excluded": {"iframes": 2, "shadow_roots": 0},
+            "redacted": 1
+        })
+    );
+    // params を持たない（page を照合しない。設計 §14.2）。
+    assert_eq!(r.frames[3]["error"]["kind"], "invalid_params");
+    assert_eq!(calls.borrow().clone(), vec!["load", "dom_snapshot"]);
+}
+
+/// RENDER-11: 符号化した後のフレーム長が 12 MiB を超える dom_snapshot は、切り詰めずに too_large。
+/// 次の要求は続けて処理する。
+#[test]
+fn dom_snapshot_over_frame_limit_is_too_large() {
+    let (mut h, _calls) = interactive();
+    // `"` は JSON で 2 バイトに増えるため、HTML の上限（8 MiB）内でもフレームは 12 MiB を超える。
+    h.html = "\"".repeat(7 * 1024 * 1024);
+    let input = [
+        jframe(&json!({"v":1,"id":1,"method":"dom_snapshot"})),
+        jframe(&json!({"v":1,"id":2,"method":"visibility","params":{"selector":"a"}})),
+    ]
+    .concat();
+    let r = run_with(&mut h, input);
+    assert_eq!(
+        r.frames[1],
+        json!({"v":1,"id":1,"error":{"kind":"too_large","message":"Result exceeds the size limit."}})
+    );
+    assert_eq!(r.frames[2]["result"]["visible"], true);
+}
+
+/// TASK-121・TASK-122: 操作モードの契約 fixture（`interactive/` の dom_snapshot の要求）をホストへ通す。
+/// 正常な要求はハンドラを呼び、不正な要求は invalid_params で返す。
+#[test]
+fn interactive_dom_snapshot_fixtures_match_host_behavior() {
+    let dir = fixture_dir().join("interactive");
+    let mut seen = 0;
+    for e in std::fs::read_dir(&dir).unwrap() {
+        let path = e.unwrap().path();
+        let name = path.file_name().unwrap().to_str().unwrap().to_owned();
+        if !name.starts_with("request-dom-snapshot-") {
+            continue;
+        }
+        let fx: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let (mut h, calls) = interactive();
+        let r = run_with(&mut h, jframe(&fx["message"]));
+        match fx["expect"].as_str().unwrap() {
+            "valid" => {
+                assert!(
+                    r.frames[1].get("result").is_some(),
+                    "{name}: {}",
+                    r.frames[1]
+                );
+                assert_eq!(calls.borrow().clone(), vec!["dom_snapshot"], "{name}");
+            }
+            _ => {
+                assert_eq!(r.frames[1]["error"]["kind"], "invalid_params", "{name}");
+                assert!(calls.borrow().is_empty(), "{name}");
+            }
+        }
+        seen += 1;
+    }
+    assert!(seen >= 2, "too few dom_snapshot fixtures: {seen}");
 }

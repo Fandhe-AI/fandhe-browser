@@ -1706,3 +1706,310 @@ fn initial_load_redirect_to_disallowed_scheme_does_not_reach_target() {
     let _ = stop.send(());
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ---- 操作モードの DOM の取得（RENDER-11・TASK-122） ----
+
+/// ループバック宛てだけを転送する最小の egress プロキシ（`--interactive` は egress の指定が必須のため）。
+/// CONNECT はトンネルにし、絶対形式の GET は経路形式に直して転送する。外部ネットワークへは出ない。
+fn serve_forwarding_proxy() -> (u16, mpsc::Sender<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    listener.set_nonblocking(true).expect("nonblocking");
+    let (stop_tx, stop_rx) = mpsc::channel::<()>();
+    std::thread::spawn(move || {
+        while stop_rx.try_recv().is_err() {
+            let Ok((mut conn, _)) = listener.accept() else {
+                std::thread::sleep(Duration::from_millis(10));
+                continue;
+            };
+            std::thread::spawn(move || {
+                let _ = conn.set_nonblocking(false);
+                let mut buf = vec![0u8; 65536];
+                let n = conn.read(&mut buf).unwrap_or(0);
+                let head = String::from_utf8_lossy(&buf[..n]).to_string();
+                let mut words = head.split(' ');
+                let (method, target) = (words.next().unwrap_or(""), words.next().unwrap_or(""));
+                let (authority, rest) = if method == "CONNECT" {
+                    (target.to_owned(), None)
+                } else {
+                    let t = target.strip_prefix("http://").unwrap_or(target);
+                    let (a, p) = t.split_at(t.find('/').unwrap_or(t.len()));
+                    (
+                        a.to_owned(),
+                        Some(head.replacen(target, if p.is_empty() { "/" } else { p }, 1)),
+                    )
+                };
+                if !authority.starts_with("127.0.0.1:") {
+                    let _ = conn.write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n");
+                    return;
+                }
+                let Ok(mut up) = std::net::TcpStream::connect(&authority) else {
+                    return;
+                };
+                match rest {
+                    None => {
+                        let _ = conn.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n");
+                    }
+                    Some(req) => {
+                        let _ = up.write_all(req.as_bytes());
+                    }
+                }
+                let (mut a, mut b) = (conn.try_clone().unwrap(), up.try_clone().unwrap());
+                let t = std::thread::spawn(move || {
+                    let _ = std::io::copy(&mut a, &mut b);
+                    let _ = b.shutdown(std::net::Shutdown::Write);
+                });
+                let _ = std::io::copy(&mut up, &mut conn);
+                let _ = conn.shutdown(std::net::Shutdown::Both);
+                let _ = t.join();
+            });
+        }
+    });
+    (port, stop_tx)
+}
+
+/// 操作モードのホストを起動し、hello を読む。
+fn spawn_interactive(proxy_port: u16) -> (Host, serde_json::Value) {
+    let port = proxy_port.to_string();
+    let mut h = spawn(&["--stdio", "--interactive", "--egress-proxy-port", &port]);
+    let hello: serde_json::Value = serde_json::from_str(&h.recv()).unwrap();
+    (h, hello)
+}
+
+fn request(h: &mut Host, id: u64, method: &str) -> serde_json::Value {
+    h.send(&format!(r#"{{"v":1,"id":{id},"method":"{method}"}}"#));
+    let r: serde_json::Value = serde_json::from_str(&h.recv()).unwrap();
+    assert_eq!(r["id"], id, "{r}");
+    r
+}
+
+/// `data-fandhe-n` の値を出現順に集める。
+fn numbers(html: &str) -> Vec<u64> {
+    html.match_indices("data-fandhe-n=\"")
+        .map(|(i, m)| {
+            let rest = &html[i + m.len()..];
+            rest[..rest.find('"').unwrap()].parse().unwrap()
+        })
+        .collect()
+}
+
+/// RENDER-11・TASK-122: 番号つきの HTML・現在値・伏せる値（第 1 層）・iframe の中身の除外・ページの
+/// 同名属性の無視を、実ホストで確かめる。egress の指定なしの `--interactive` は起動しない（設計 §14.1）。
+#[test]
+fn interactive_dom_snapshot_numbers_elements_and_redacts() {
+    let (l, port) = bind_loopback();
+    let mut m = std::collections::HashMap::new();
+    let page = concat!(
+        "<!doctype html><html><head><title>t</title></head><body>",
+        "<input id=q name=q value=initial>",
+        "<input id=pw type=password value=pw-attr-secret>",
+        "<input id=cc autocomplete=\"section-a cc-number\" value=cc-attr-secret>",
+        "<textarea id=ta>orig</textarea>",
+        "<input type=checkbox id=cb>",
+        "<select id=s><option value=a selected>A<option value=b>B</select>",
+        "<div data-fandhe-n=\"999\" id=spoof>x</div>",
+        "<iframe id=f1 srcdoc=\"<p>SRCDOC_SECRET</p>\"></iframe>",
+        "<iframe id=f2 src=\"data:text/html,DATAURL_SECRET\"></iframe>",
+        "<iframe id=f3 src=\"/rel\"></iframe>",
+        "<object id=ob data=\"data:text/html,OBJECT_SECRET\"></object>",
+        "<select id=ccm autocomplete=cc-exp-month><option value=m12 selected>12</option><option value=m01>01</option></select>",
+        "<p id=e>a &lt; b &amp; c</p>",
+        "<input type=radio id=rx name=size value=express checked>",
+        "<constructor id=k><b>kid</b></constructor>",
+        "<svg><script>if(1<2){}</script></svg>",
+        "<script>",
+        "document.getElementById('q').value='typed-value';",
+        "document.getElementById('pw').value='typed-'+'pw';",
+        "document.getElementById('ta').value='ta-value';",
+        "document.getElementById('cb').checked=true;",
+        "document.getElementById('s').value='b';",
+        "var f=document.createElement('iframe');",
+        "f.src=URL.createObjectURL(new Blob(['<p>BLOB_'+'SECRET</p>'],{type:'text/html'}));",
+        "document.body.appendChild(f);",
+        "</script></body></html>"
+    );
+    m.insert("/p".to_owned(), ("text/html", page.as_bytes().to_vec()));
+    let _stop = serve_routes(l, std::sync::Arc::new(m));
+    let (proxy, _pstop) = serve_forwarding_proxy();
+
+    // egress の指定なしの --interactive はフレームを出さずに失敗する。
+    let (code, rest, _) = spawn(&["--stdio", "--interactive"]).finish();
+    assert_ne!(code, Some(0));
+    assert_eq!(rest, 0);
+
+    let (mut h, hello) = spawn_interactive(proxy);
+    let caps = hello["data"]["capabilities"].as_array().unwrap();
+    assert!(caps.contains(&serde_json::json!("dom_snapshot")), "{hello}");
+    assert_eq!(
+        hello["data"]["limits"]["dom_snapshot_html_bytes"],
+        8_388_608
+    );
+
+    let url = format!("http://127.0.0.1:{port}/p");
+    h.send(&load_req(1, &url, 30_000));
+    let r: serde_json::Value = serde_json::from_str(&h.recv()).unwrap();
+    let page_id = r["result"]["page"].clone();
+    assert_eq!(page_id["session"].as_str().unwrap().len(), 32, "{r}");
+    assert!(page_id["doc_seq"].as_u64().unwrap() >= 1, "{r}");
+
+    let r = request(&mut h, 2, "dom_snapshot");
+    let res = &r["result"];
+    let html = res["html"].as_str().unwrap_or_else(|| panic!("{r}"));
+    assert_eq!(res["url"], url.as_str());
+    assert_eq!(res["page"]["session"], page_id["session"]);
+    assert_eq!(res["snapshot"], "s1");
+    // 番号は前順の 0 起点で重複なく振られ、ページ自身の同名属性（999）は出ない。
+    let ns = numbers(html);
+    assert_eq!(ns, (0..ns.len() as u64).collect::<Vec<_>>());
+    assert_eq!(res["element_count"], ns.len() as u64);
+    assert!(
+        html.starts_with("<!DOCTYPE html><html data-fandhe-n=\"0\">"),
+        "{html}"
+    );
+    // 現在値を書く。
+    assert!(
+        html.contains("id=\"q\" name=\"q\" value=\"typed-value\""),
+        "{html}"
+    );
+    assert!(html.contains(">ta-value</textarea>"), "{html}");
+    assert!(html.contains("id=\"cb\" value=\"on\" checked>"), "{html}");
+    // checkbox・radio も value を残す（選択肢を見分けるため）。
+    assert!(
+        html.contains("id=\"rx\" name=\"size\" value=\"express\" checked>"),
+        "{html}"
+    );
+    // 要素名が Object.prototype の名前と同じでも空要素扱いにしない。
+    assert!(html.contains("id=\"k\"><b data-fandhe-n="), "{html}");
+    assert!(html.contains(">kid</b></constructor>"), "{html}");
+    assert!(html.contains("value=\"b\" selected>"), "{html}");
+    assert!(!html.contains("value=\"a\" selected"), "{html}");
+    // 伏せる対象の値（属性・現在値とも）は出さず、数を返す。
+    for secret in ["pw-attr-secret", "typed-pw", "cc-attr-secret"] {
+        assert!(!html.contains(secret), "{secret} leaked: {html}");
+    }
+    assert!(!html.contains("value=\"m12\" selected"), "{html}");
+    assert_eq!(res["redacted"], 3);
+    // テキストはエスケープし、SVG の script は HTML の生テキスト扱いにしない（再パースで偽の要素を作らない）。
+    assert!(html.contains("a &lt; b &amp; c"), "{html}");
+    assert!(html.contains("if(1&lt;2){}"), "{html}");
+    // 相対 URL の iframe の src は http(s) に解決されるため残す。
+    assert!(html.contains("id=\"f3\" src=\"/rel\""), "{html}");
+    // iframe の中身（srcdoc・data:・blob:）は出さず、数を返す（#1581 の引き継ぎ）。
+    for secret in [
+        "SRCDOC_SECRET",
+        "DATAURL_SECRET",
+        "BLOB_SECRET",
+        "OBJECT_SECRET",
+    ] {
+        assert!(!html.contains(secret), "{secret} leaked: {html}");
+    }
+    assert_eq!(
+        res["excluded"],
+        serde_json::json!({"iframes": 4, "shadow_roots": 0})
+    );
+    // 2 回目は新しい識別子。
+    assert_eq!(
+        request(&mut h, 3, "dom_snapshot")["result"]["snapshot"],
+        "s2"
+    );
+
+    h.send(r#"{"v":1,"id":4,"method":"shutdown"}"#);
+    assert_eq!(h.recv(), r#"{"v":1,"id":4,"result":{}}"#);
+    let (code, rest, stderr) = h.finish();
+    assert_eq!(code, Some(0), "stderr: {stderr}");
+    assert_eq!(rest, 0, "stdout must contain frames only");
+    for secret in ["typed-value", "pw-attr-secret", "SRCDOC_SECRET"] {
+        assert!(!stderr.contains(secret), "{secret} in log: {stderr}");
+    }
+}
+
+/// RENDER-11・TASK-121 の確定条件 3: ページ自身の `pushState` で doc_seq が上がり、page なしの
+/// dom_snapshot で取り直せる。主フレームが `about:blank` へ移ったら invalid_state（#1581 の引き継ぎ）。
+#[test]
+fn interactive_dom_snapshot_follows_document_changes() {
+    let (l, port) = bind_loopback();
+    let mut m = std::collections::HashMap::new();
+    let page = "<p id=x>x</p><script>setTimeout(function(){history.pushState({},'','/p2')},300);\
+                setTimeout(function(){location='about:blank'},2500)</script>";
+    m.insert("/p".to_owned(), ("text/html", page.as_bytes().to_vec()));
+    let _stop = serve_routes(l, std::sync::Arc::new(m));
+    let (proxy, _pstop) = serve_forwarding_proxy();
+    let (mut h, _) = spawn_interactive(proxy);
+    h.send(&load_req(1, &format!("http://127.0.0.1:{port}/p"), 30_000));
+    let r: serde_json::Value = serde_json::from_str(&h.recv()).unwrap();
+    let first = r["result"]["page"]["doc_seq"].as_u64().unwrap();
+
+    let mut id = 1;
+    let start = Instant::now();
+    let moved = loop {
+        id += 1;
+        let r = request(&mut h, id, "dom_snapshot");
+        if r["result"]["url"]
+            .as_str()
+            .is_some_and(|u| u.ends_with("/p2"))
+        {
+            break r;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(20),
+            "pushState not observed: {r}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    assert!(
+        moved["result"]["page"]["doc_seq"].as_u64().unwrap() > first,
+        "{moved}"
+    );
+
+    let start = Instant::now();
+    loop {
+        id += 1;
+        let r = request(&mut h, id, "dom_snapshot");
+        if r["error"]["kind"] == "invalid_state" {
+            assert_eq!(
+                r["error"]["message"],
+                "Current document is not an http(s) page."
+            );
+            break;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(20),
+            "about:blank not observed: {r}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    id += 1;
+    h.send(&format!(r#"{{"v":1,"id":{id},"method":"shutdown"}}"#));
+    let _ = h.recv();
+    let (code, rest, stderr) = h.finish();
+    assert_eq!(code, Some(0), "stderr: {stderr}");
+    assert_eq!(rest, 0);
+}
+
+/// RENDER-11: HTML が 8 MiB を超えるページは、切り詰めずに too_large。
+#[test]
+fn interactive_dom_snapshot_rejects_oversized_html() {
+    let (l, port) = bind_loopback();
+    let mut m = std::collections::HashMap::new();
+    let mut page = String::from("<p>");
+    page.push_str(&"a".repeat(8 * 1024 * 1024 + 16));
+    page.push_str("</p>");
+    m.insert("/big".to_owned(), ("text/html", page.into_bytes()));
+    let _stop = serve_routes(l, std::sync::Arc::new(m));
+    let (proxy, _pstop) = serve_forwarding_proxy();
+    let (mut h, _) = spawn_interactive(proxy);
+    h.send(&load_req(
+        1,
+        &format!("http://127.0.0.1:{port}/big"),
+        60_000,
+    ));
+    let r: serde_json::Value = serde_json::from_str(&h.recv()).unwrap();
+    assert!(r["result"].is_object(), "{r}");
+    let r = request(&mut h, 2, "dom_snapshot");
+    assert_eq!(r["error"]["kind"], "too_large", "{r}");
+    h.send(r#"{"v":1,"id":3,"method":"shutdown"}"#);
+    let _ = h.recv();
+    let (code, rest, _) = h.finish();
+    assert_eq!(code, Some(0));
+    assert_eq!(rest, 0);
+}
