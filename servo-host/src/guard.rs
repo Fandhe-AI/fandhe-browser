@@ -18,12 +18,30 @@ use servo::{ServoDelegate, WebResourceLoad, WebResourceResponse};
 /// `about:blank`・`about:srcdoc` の完全一致だけ。未知の scheme・scheme なしは拒否する。
 /// `&str` の純関数にして Servo 型なしで真理値表を検証する（`Url::scheme()` 版にしない理由）。
 /// `blob:` は内側の URL の出所に関わらず許可する（blob の作成元は同じページのスクリプトで、リスク評価済み）。
+/// `data:`・`blob:` を読み込みで許す根拠は RENDER-10（2026-11-18 の判断。#1581）。主フレームの遷移は
+/// [`navigation_allowed`] が別に止める。
 pub(crate) fn url_allowed(url: &str) -> bool {
+    navigation_allowed(url)
+        || url.split_once(':').is_some_and(|(scheme, _)| {
+            scheme.eq_ignore_ascii_case("data") || scheme.eq_ignore_ascii_case("blob")
+        })
+}
+
+/// ページから始まる遷移（`request_navigation`）を許すか判定する（`RENDER-10`・TASK-120）。
+/// 許可は `http`・`https` と、`about:blank`・`about:srcdoc` の完全一致だけ。[`url_allowed`] と違い
+/// `data:`・`blob:` は許さない（主フレームの `data:`・`blob:` への遷移を止める。#1581）。
+///
+/// 検査点の範囲（TASK-117 の試作。`docs/design/servo-interactive-poc.md`）: `request_navigation` は
+/// 主フレームと iframe の script 起点の遷移（`location` 代入・フォーム送信・リンク）で呼ばれ、
+/// どちらのフレームかは区別できない。iframe の `src` 属性による読み込みとリダイレクト先は通らず、
+/// 前者は [`url_allowed`]（iframe・サブリソースの `data:`・`blob:` は読み込みを許し、操作と
+/// DOM 取得の対象にしない。RENDER-10）、後者は Servo 内部の制限が受け持つ。
+pub(crate) fn navigation_allowed(url: &str) -> bool {
     let Some((scheme, _)) = url.split_once(':') else {
         return false;
     };
     match scheme.to_ascii_lowercase().as_str() {
-        "http" | "https" | "data" | "blob" => true,
+        "http" | "https" => true,
         "about" => url == "about:blank" || url == "about:srcdoc",
         _ => false,
     }
@@ -62,7 +80,7 @@ impl ServoDelegate for GuardDelegate {
 
 #[cfg(test)]
 mod tests {
-    use super::url_allowed;
+    use super::{navigation_allowed, url_allowed};
 
     /// RENDER-3・SEC-2: 許可リストの真理値表。
     #[test]
@@ -88,6 +106,32 @@ mod tests {
             ("x", false),
         ] {
             assert_eq!(url_allowed(u), want, "{u}");
+        }
+    }
+
+    /// RENDER-10（TASK-120）: 遷移の許可は http(s) と `about:blank`・`about:srcdoc` だけで、
+    /// 読み込みでは許す `data:`・`blob:` を許さない。
+    #[test]
+    fn navigation_allowlist_truth_table() {
+        for (u, want) in [
+            ("http://a/", true),
+            ("https://a/", true),
+            ("HTTPS://a/", true),
+            ("about:blank", true),
+            ("about:srcdoc", true),
+            ("data:text/html,x", false),
+            ("DATA:text/html,x", false),
+            ("blob:http://a/x", false),
+            ("about:blank#x", false),
+            ("about:memory", false),
+            ("file:///x", false),
+            ("javascript:1", false),
+            ("view-source:http://a/", false),
+            ("ws://a/", false),
+            ("", false),
+            ("x", false),
+        ] {
+            assert_eq!(navigation_allowed(u), want, "{u}");
         }
     }
 }

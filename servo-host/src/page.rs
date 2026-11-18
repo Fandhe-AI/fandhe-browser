@@ -130,6 +130,16 @@ impl WebViewDelegate for PageDelegate {
         crate::guard::check(load);
     }
 
+    fn request_navigation(&self, _webview: WebView, request: servo::NavigationRequest) {
+        // ページから始まる遷移の scheme を絞る（RENDER-10・TASK-120）。既定（drop）は許可になるため、
+        // 許可・拒否を必ず明示する（fail-closed）。
+        if crate::guard::navigation_allowed(request.url.as_str()) {
+            request.allow();
+        } else {
+            request.deny();
+        }
+    }
+
     fn notify_crashed(&self, _webview: WebView, _reason: String, _backtrace: Option<String>) {
         // 理由と backtrace は URL 等の機密を含みうるため記録しない。
         self.crashed.set(true);

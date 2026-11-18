@@ -4,7 +4,7 @@
 //! フレーム（u32 LE 長さ接頭辞 + UTF-8 JSON）を対話的に読み書きし、hello・`load`（ループバック
 //! HTTP サーバー相手。外部ネットワークへ出ない）・`screenshot`（PNG の復号と上下の色。#232）・
 //! 未実装メソッドの `unsupported`・`shutdown`・プロトコル違反時の終了コード・stdout の純粋性・
-//! ログの秘匿・IntersectionObserver の公開とコールバック（#1294・#1297）を確かめる。このテストバイナリ自体は Servo をリンクしない（`image` は PNG の復号のみ）。
+//! ログの秘匿・IntersectionObserver の公開とコールバック（#1294・#1297）・ページから始まる遷移の scheme 制限（`RENDER-10`・#1581）を確かめる。このテストバイナリ自体は Servo をリンクしない（`image` は PNG の復号のみ）。
 
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -932,6 +932,8 @@ fn bind_loopback() -> (TcpListener, u16) {
 }
 
 /// パス別に固定応答を返すループバックサーバー（接続ごとにスレッドで処理）。
+/// 種別が [`REDIRECT`] なら本文を `Location` にした 302、[`REFRESH`] なら本文を `Refresh` ヘッダの
+/// 移動先にした空の 200 を返す（RENDER-10 の遷移経路の試験用）。
 fn serve_routes(listener: TcpListener, routes: Routes) -> mpsc::Sender<()> {
     listener.set_nonblocking(true).expect("nonblocking");
     let (stop_tx, stop_rx) = mpsc::channel::<()>();
@@ -950,10 +952,28 @@ fn serve_routes(listener: TcpListener, routes: Routes) -> mpsc::Sender<()> {
                             .get(path)
                             .cloned()
                             .unwrap_or(("text/plain", b"nf".to_vec()));
-                        let head = format!(
-                            "HTTP/1.1 200 OK\r\nContent-Type: {ct}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                            body.len()
-                        );
+                        let to = String::from_utf8_lossy(&body);
+                        let (head, body) = match ct {
+                            REDIRECT => (
+                                format!(
+                                    "HTTP/1.1 302 Found\r\nLocation: {to}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                                ),
+                                Vec::new(),
+                            ),
+                            REFRESH => (
+                                format!(
+                                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nRefresh: 0;url={to}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                                ),
+                                Vec::new(),
+                            ),
+                            _ => (
+                                format!(
+                                    "HTTP/1.1 200 OK\r\nContent-Type: {ct}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                    body.len()
+                                ),
+                                body,
+                            ),
+                        };
                         let _ = conn.write_all(head.as_bytes());
                         let _ = conn.write_all(&body);
                     });
@@ -965,6 +985,10 @@ fn serve_routes(listener: TcpListener, routes: Routes) -> mpsc::Sender<()> {
     stop_tx
 }
 
+/// [`serve_routes`] の擬似種別: 302 で本文の URL へ移す。
+const REDIRECT: &str = "redirect";
+/// [`serve_routes`] の擬似種別: `Refresh` ヘッダで本文の URL へ移す。
+const REFRESH: &str = "refresh";
 const RED_HTML: &str = "<body style=\"margin:0;background:#f00\">";
 const RED_SVG: &str = "<svg xmlns='http://www.w3.org/2000/svg' width='200' height='200'><rect width='200' height='200' fill='red'/></svg>";
 const RED_CSS: &str = "#t{background:#f00}";
@@ -1367,9 +1391,10 @@ fn load_allowlist_rejects_disallowed_scheme() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// RENDER-3・SEC-2: 主フレームを `location` で許可外 scheme（例として `file:`）へ移しても読み込まれない。
-/// 初期ページは緑。http 版は赤い全面ページへ遷移し、file 版は空の応答で白くなる（赤にならない）。
-/// 主フレームの要求は `WebViewDelegate` 側を通る。
+/// RENDER-3・SEC-2・RENDER-10: 主フレームを `location` で許可外 scheme（例として `file:`）へ移しても読み込まれない。
+/// 初期ページは緑。http 版は赤い全面ページへ遷移し、file 版は遷移の検査（`request_navigation`。TASK-120）が
+/// 先に拒否して緑のまま残る。TASK-120 より前は、遷移が始まって読み込み先の許可リストが空の応答で白くしていた。
+/// 許可リストは主フレームにも効くが、この経路では遷移の検査の後ろの二重化になる。
 #[test]
 fn load_allowlist_rejects_disallowed_main_frame() {
     let (dir, mut routes) = fixtures("mainframe");
@@ -1395,18 +1420,27 @@ fn load_allowlist_rejects_disallowed_main_frame() {
     let mut h = spawn(&["--stdio"]);
     let _hello = h.recv();
     let mut id = 0;
+    let mut http_time = Duration::from_millis(300);
     for kind in ["http", "file"] {
         load_page(&mut h, &mut id, &format!("{base}/p_{kind}"));
-        // 緑でなくなる（遷移が済む）まで待つ。
-        let (img, _) = poll_shot(&mut h, &mut id, |i| fraction(i, 0, 200, is_green) < 0.5);
+        let img = if kind == "http" {
+            // 緑でなくなる（遷移が済む）まで待つ。
+            let (img, t) = poll_shot(&mut h, &mut id, |i| fraction(i, 0, 200, is_green) < 0.5);
+            http_time = http_time.max(t);
+            img
+        } else {
+            // http 版が遷移を終えるまでにかかった時間と 1 秒の大きい方だけ待ってから撮る。
+            std::thread::sleep(http_time.max(Duration::from_secs(1)));
+            shoot(&mut h, &mut id)
+        };
         let red = red_fraction(&img, 0, 200);
         if kind == "http" {
             assert!(red > 0.9, "{kind}: should navigate to red page: {red}");
         } else {
             assert!(red < 0.01, "{kind}: main frame unexpectedly loaded: {red}");
             assert!(
-                fraction(&img, 0, 200, is_green) < 0.01,
-                "{kind}: navigation did not happen"
+                fraction(&img, 0, 200, is_green) > 0.9,
+                "{kind}: navigation should be denied before loading"
             );
         }
     }
@@ -1477,4 +1511,198 @@ fn websocket_connections_are_refused() {
     let _ = ws_stop_tx.send(());
     let _ = ws_thread.join();
     let _ = stop.send(());
+}
+
+/// 主フレームを `data:`・`blob:`・`file:` へ移そうとする経路と、その移動先を受け取ってページを返す関数。
+/// 第 1 引数は移動先 URL（JS 文字列リテラルに入れる）。初期ページは全面が緑。
+type NavCase = (&'static str, fn(&str) -> String);
+
+/// 全面を緑にし、`script` を 200ms 後に実行するページ。
+fn green_page(head: &str, script: &str) -> String {
+    format!(
+        "<html><head>{head}</head><body style=\"margin:0;background:#0f0\"><script>setTimeout(function(){{{script}}},200)</script></body></html>"
+    )
+}
+
+/// RENDER-10 の遷移経路。`{to}` を移動先として使う。
+fn nav_cases() -> Vec<NavCase> {
+    vec![
+        ("location", |to| green_page("", &format!("location='{to}'"))),
+        ("window_open_self", |to| {
+            green_page("", &format!("window.open('{to}','_self')"))
+        }),
+        ("top_location_from_blob_iframe", |to| {
+            // blob: の iframe（読み込みは許す）の中から主フレームを移す。
+            green_page(
+                "",
+                &format!(
+                    "var b=new Blob([\"<script>top.location='{to}'<\\/script>\"],{{type:'text/html'}});\
+                     var f=document.createElement('iframe');f.style.display='none';f.src=URL.createObjectURL(b);document.body.appendChild(f)"
+                ),
+            )
+        }),
+        ("target_blank", |to| {
+            green_page(
+                "",
+                &format!(
+                    "var a=document.createElement('a');a.href='{to}';a.target='_blank';document.body.appendChild(a);a.click()"
+                ),
+            )
+        }),
+        ("meta_refresh", |to| {
+            green_page(
+                &format!("<meta http-equiv=refresh content=\"0;url={to}\">"),
+                "",
+            )
+        }),
+        ("redirect", |_| String::new()), // 本文は使わない（/r_* の 302 を `location` で踏む）。
+        ("refresh_header", |_| String::new()), // 同上（/h_* の Refresh ヘッダ）。
+    ]
+}
+
+/// RENDER-10（TASK-120・#1581）: ページから始まる主フレームの遷移は、移動先が `data:`・`blob:`・`file:`
+/// なら起きず、赤い移動先は描かれない。同じ経路で http の移動先へは遷移する（対照。経路が実際に
+/// 動いたことと待ち時間の目安を与える）。`blob:` の移動先はページ内で作る（`location` 経路のみ）。
+/// 302・`Refresh` ヘッダ・`meta refresh` の移動先の拒否は Servo 内部の制限に頼る経路で、servo の
+/// 版更新で黙って変わらないよう固定する（TASK-117 の ★2 の読み替えの条件）。
+/// 実測（2026-11-18・Servo 0.7.0）: ホストの遷移の検査を外すと、`location`・`window.open(_self)`・
+/// `top.location`・`meta refresh`・`Refresh` ヘッダで `data:`・`blob:` へ移れてしまう（Servo 自身は止めない）。
+/// `file:` は読み込み先の許可リストが、302 の移動先は Servo の fetch が止める。`target=_blank` と別文書への
+/// `history.back()` は `request_navigation` を通らない（前者は新しいウィンドウを作らず、後者は検査済みの
+/// 履歴にしか戻れない）。
+#[test]
+fn main_frame_navigation_to_disallowed_scheme_is_blocked() {
+    let (dir, mut routes) = fixtures("navscheme");
+    let (listener, port) = bind_loopback();
+    let base = format!("http://127.0.0.1:{port}");
+    let targets = [
+        ("http", format!("{base}/red.html")),
+        ("data", DATA_RED_HTML.to_owned()),
+        ("file", file_url(&dir.join("red.html"))),
+    ];
+    let cases = nav_cases();
+    for (name, build) in &cases {
+        for (kind, to) in &targets {
+            let body = match *name {
+                "redirect" => {
+                    routes.insert(format!("/r_{kind}"), (REDIRECT, to.clone().into_bytes()));
+                    green_page("", &format!("location='/r_{kind}'"))
+                }
+                "refresh_header" => {
+                    routes.insert(format!("/h_{kind}"), (REFRESH, to.clone().into_bytes()));
+                    green_page("", &format!("location='/h_{kind}'"))
+                }
+                _ => build(to),
+            };
+            routes.insert(
+                format!("/p_{name}_{kind}"),
+                ("text/html", body.into_bytes()),
+            );
+        }
+    }
+    // blob: の移動先（ページ内で赤い文書の blob URL を作って移る）。
+    routes.insert(
+        "/p_location_blob".to_owned(),
+        (
+            "text/html",
+            green_page(
+                "",
+                &format!(
+                    "location=URL.createObjectURL(new Blob(['{RED_HTML}'],{{type:'text/html'}}))"
+                ),
+            )
+            .into_bytes(),
+        ),
+    );
+    let stop = serve_routes(listener, std::sync::Arc::new(routes));
+
+    let mut h = spawn(&["--stdio"]);
+    let _hello = h.recv();
+    let mut id = 0;
+    let mut runs: Vec<(String, bool)> = Vec::new();
+    for (name, _) in &cases {
+        for (kind, _) in &targets {
+            // 新しいウィンドウは作られない（RENDER-10 の `unsupported`）ため、主フレームは http でも移らない。
+            runs.push((
+                format!("{name}_{kind}"),
+                *kind == "http" && *name != "target_blank",
+            ));
+        }
+    }
+    runs.push(("location_blob".to_owned(), false));
+    let mut wait = Duration::from_millis(300);
+    for (run, want_red) in runs {
+        load_page(&mut h, &mut id, &format!("{base}/p_{run}"));
+        let img = if want_red {
+            let (img, t) = poll_shot(&mut h, &mut id, |i| red_fraction(i, 0, 200) > 0.9);
+            wait = wait.max(t);
+            img
+        } else {
+            // 拒否されると緑のまま、Servo が失敗させると白い空ページやエラーページになる。
+            // どちらでも赤くならないことを、http 版が赤くなるまでの最長時間と 1 秒の大きい方まで見る。
+            let start = Instant::now();
+            loop {
+                let img = shoot(&mut h, &mut id);
+                if start.elapsed() > wait.max(Duration::from_secs(1)) {
+                    break img;
+                }
+                assert!(
+                    red_fraction(&img, 0, 200) < 0.01,
+                    "{run}: navigated to disallowed target"
+                );
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        };
+        let red = red_fraction(&img, 0, 200);
+        if want_red {
+            assert!(
+                red > 0.9,
+                "{run}: control should navigate to red page: {red}"
+            );
+        } else {
+            assert!(red < 0.01, "{run}: navigated to disallowed target: {red}");
+        }
+    }
+    finish_host(h, id + 1);
+    let _ = stop.send(());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// RENDER-10（TASK-120）: 主フレームの初回の `load` で 302 の移動先が `data:`・`file:` なら、移動先へは
+/// 移らない（Servo 内部の制限に頼る経路の固定）。Servo 0.7.0 は `data:` への 302 を失敗にせず、元の
+/// URL の空のページで止める（実測）ため、`load_failed` か「最終 URL が元の URL のまま赤く描かれない」の
+/// どちらかを合格にする。http の移動先は成功し、最終 URL が移動先になる（対照）。
+#[test]
+fn initial_load_redirect_to_disallowed_scheme_does_not_reach_target() {
+    let (dir, mut routes) = fixtures("loadredirect");
+    let (listener, port) = bind_loopback();
+    let base = format!("http://127.0.0.1:{port}");
+    for (kind, to) in [
+        ("http", format!("{base}/red.html")),
+        ("data", DATA_RED_HTML.to_owned()),
+        ("file", file_url(&dir.join("red.html"))),
+    ] {
+        routes.insert(format!("/r_{kind}"), (REDIRECT, to.into_bytes()));
+    }
+    let stop = serve_routes(listener, std::sync::Arc::new(routes));
+
+    let mut h = spawn(&["--stdio"]);
+    let _hello = h.recv();
+    let mut id = 0;
+    for kind in ["http", "data", "file"] {
+        id += 1;
+        let start = format!("{base}/r_{kind}");
+        h.send(&load_req(id, &start, 30_000));
+        let r: serde_json::Value = serde_json::from_str(&h.recv()).unwrap();
+        if kind == "http" {
+            assert_eq!(r["result"]["final_url"], format!("{base}/red.html"), "{r}");
+        } else if r["error"]["kind"] != "load_failed" {
+            assert_eq!(r["result"]["final_url"], start.as_str(), "{kind}: {r}");
+            let red = red_fraction(&shoot(&mut h, &mut id), 0, 200);
+            assert!(red < 0.01, "{kind}: redirect target rendered: {red}");
+        }
+    }
+    finish_host(h, id + 1);
+    let _ = stop.send(());
+    let _ = std::fs::remove_dir_all(&dir);
 }
