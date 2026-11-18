@@ -517,7 +517,7 @@ AGENTS.md の変更はレビュー基準の変更として AI レビューで P0
 | ---- | -- | ---- |
 | `dom_snapshot` の HTML | 8 MiB（8,388,608 バイト） | spec `RENDER-11` |
 | `dom_snapshot` の応答フレーム | 12 MiB（12,582,912 バイト） | spec `RENDER-11` |
-| `dom_snapshot` の時間切れ | 30 秒 | 試作 (10) の 8 MiB で 13.9 秒（release・macOS arm64。`outerHTML`）。遅い環境の分を見込んで 2 倍強。番号を付ける直列化器は `outerHTML` を使えないため、TASK-122 で測り直して見直す |
+| `dom_snapshot` の時間切れ | 30 秒 | 試作 (10) の 8 MiB で 13.9 秒（release・macOS arm64。`outerHTML`）。遅い環境の分を見込んで 2 倍強。TASK-122 の直列化器（番号付き）では、7.6 MB・11.8 万要素の HTML で 1.0〜1.2 秒、上限超過の打ち切りは 1.1 秒（同じ環境）。`outerHTML` より速いが、遅い環境と要素数の多いページの分を見込んで 30 秒のままにする |
 | `act` の時間切れ | 10 秒 | 入力イベントの完了通知を待つだけで、読み込みは待たない |
 | `wait` の上限時間 | 最大 60 秒 | spec `AISNAP-18`（`load` の上限と同じ） |
 | `fill` の `text` | 8192 バイト | 要求フレーム 64 KiB に収める |
@@ -525,7 +525,7 @@ AGENTS.md の変更はレビュー基準の変更として AI レビューで P0
 | `wait` の条件の文字列 | 1024 バイト | spec `AISNAP-18` |
 | 読み取り契機の同期の最小間隔 | 1 秒 | 直前の同期から 1 秒未満で、その間に `act`・`wait` が無ければ取り直さない（TASK-125） |
 
-- 時間切れでの破棄（確定条件 6・`AISNAP-17`）: `dom_snapshot` と `act` は、本体が上の時間に 5 秒の余裕を足した期限で待ち、過ぎたらホストを破棄して `session_lost` を返す。ホストは `act` に `timeout` を返さない（`wait` だけが `timeout` を返す）。破棄の後は自動で読み直さない（§14.2）
+- 時間切れでの破棄（確定条件 6・`AISNAP-17`）: `dom_snapshot` と `act` は、本体が上の時間に 5 秒の余裕を足した期限で待ち、過ぎたらホストを破棄して `session_lost` を返す。ホストは `act` に `timeout` を返さない。`dom_snapshot` はホスト側の 30 秒の期限でも `timeout` を返し、本体は同じく破棄する（TASK-122）。破棄の後は自動で読み直さない（§14.2）
 - メモリの見積もり（多重のコピー込み。8 MiB・ASCII の最悪の場合）: ホストは、番号の対応（要素の ID。20 万件で約 6.4 MB と `Vec` の分）に加えて、ページの DOM が試作 (10) で約 1.2 GB（8 MiB のページで読み込み前から +1.18 GB）、直列化の間にさらに約 130 MB（JS の文字列〔UTF-16 で 16 MiB〕・Rust の `String` 8 MiB・符号化したフレーム 12 MiB とその途中の確保）。§2.7 の RSS 上限の既定（2 GiB）の内側だが余裕は小さく、上限を超えたらホストは破棄される。本体は、受信フレーム 12 MiB・JSON から取り出した `String` 8 MiB・番号を外した保存用の HTML 8 MiB・core の DOM（倍率は未測定）を同時に持ちうる。core の DOM の倍率と Linux での時間は TASK-138 で測り直す
 
 ### 14.7 エラー kind
@@ -537,7 +537,7 @@ AGENTS.md の変更はレビュー基準の変更として AI レビューで P0
 | `not_actionable` | ホスト | §14.4 |
 | `too_large` | ホスト | §14.3 の上限超過（切り詰めない） |
 | `unsupported` | ホスト | 未対応のメソッド、新しいウィンドウ・ファイル選択・ダウンロード |
-| `timeout` | ホスト | `wait` だけ |
+| `timeout` | ホスト | `wait`、`dom_snapshot` の時間切れ（`dom_snapshot` では本体がホストを破棄して `session_lost` にする） |
 | `session_lost`・`busy` | 本体（render） | ホストの破棄・再起動の後、同時実行の超過 |
 | `not_interactive`・`rendering_disabled`・`interactive_unavailable` | 本体（ai） | `AISNAP-21` |
 
@@ -547,7 +547,7 @@ AGENTS.md の変更はレビュー基準の変更として AI レビューで P0
 ### 14.8 契約 fixture
 
 - 操作モードの fixture は `crates/fandhe-browser-render/tests/fixtures/protocol/interactive/` に置く（32 件。各メソッドの正常・不正な要求、結果、`--interactive` の `hello`、ホストが返す新しい kind）。`tests/protocol_fixtures.rs` がスキーマとの整合と網羅を検証する
-- ホスト側（`servo-host/src/server/tests.rs`）とクライアント側（`tests/client_contract.rs`）の契約テストは直下の fixture だけを読むため、まだ影響しない。実装（TASK-122・TASK-123・TASK-126）で直下へ移し、両側の契約テストに配線する。`expected_response` は配線の時に足す
+- ホスト側（`servo-host/src/server/tests.rs`）とクライアント側（`tests/client_contract.rs`）の契約テストは直下の fixture だけを読む。ホスト側は TASK-122 で `interactive/` の `dom_snapshot` の要求を別のテスト（`interactive_dom_snapshot_fixtures_match_host_behavior`）に配線した。クライアントを実装する TASK-123 で直下へ移し、両側の契約テストに配線する。`expected_response` は配線の時に足す
 
 ### 14.9 残る判断
 

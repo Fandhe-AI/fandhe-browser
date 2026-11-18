@@ -29,6 +29,12 @@ pub(crate) enum Command {
     Selftest,
     /// `--stdio`（egress の指定つき）
     Stdio(Egress),
+    /// `--stdio --interactive`（操作モード。egress の指定が必須で、[`Egress::None`] は持たない）。
+    ///
+    /// 操作モードのメソッド（`dom_snapshot` 等）を受け付ける。本体は実際の隔離状態が `Isolated` で
+    /// `allow_private_network_access = false` のときだけ付ける（TASK-121 の確定条件 7・設計 §14.1）。
+    /// egress の指定なしを拒否するのは本体の検査の重ねで、隔離の成立を証明するものではない。
+    StdioInteractive(Egress),
 }
 
 /// Servo の通信の出口の指定。排他で、どれも検証済みの値だけを持つ。
@@ -64,6 +70,8 @@ pub(crate) enum ArgError {
     ConflictingEgress,
     /// 同じオプションの重複。
     DuplicateOption,
+    /// `--interactive` に egress の指定が無い（設計 §14.1。fail-closed）。
+    InteractiveRequiresEgress,
     /// このプラットフォームでは中継を使えない。
     #[cfg(not(unix))]
     RelayUnsupported,
@@ -75,7 +83,8 @@ impl fmt::Display for ArgError {
             Self::Usage => write!(
                 f,
                 "fandhe-browser-servo-host supports only --version, --selftest and --stdio \
-                 (optionally with --egress-proxy-port <port> or --egress-relay-uds <path>)"
+                 (optionally with --interactive, then --egress-proxy-port <port> or \
+                 --egress-relay-uds <path>)"
             ),
             Self::MissingValue(opt) => write!(f, "option {opt} requires a value"),
             Self::InvalidPort => write!(f, "egress proxy port must be an integer in 1..=65535"),
@@ -85,6 +94,10 @@ impl fmt::Display for ArgError {
                 "--egress-proxy-port and --egress-relay-uds cannot be combined"
             ),
             Self::DuplicateOption => write!(f, "duplicate egress option"),
+            Self::InteractiveRequiresEgress => write!(
+                f,
+                "--interactive requires --egress-proxy-port or --egress-relay-uds"
+            ),
             #[cfg(not(unix))]
             Self::RelayUnsupported => {
                 write!(f, "--egress-relay-uds is not supported on this platform")
@@ -97,15 +110,21 @@ impl std::error::Error for ArgError {}
 
 const OPT_PORT: &str = "--egress-proxy-port";
 const OPT_UDS: &str = "--egress-relay-uds";
+const OPT_INTERACTIVE: &str = "--interactive";
 
 /// argv（プログラム名を除く）を検査して [`Command`] にする。
 ///
-/// `--version`・`--selftest` は単独のみ。`--stdio` は先頭必須で、後続は egress オプション
-/// （名前と値の別引数）を 0 または 1 組だけ受け付ける。`--opt=value` 形式は受け付けない。
+/// `--version`・`--selftest` は単独のみ。`--stdio` は先頭必須で、直後に `--interactive` を 1 つだけ置ける。
+/// 後続は egress オプション（名前と値の別引数）を 0 または 1 組だけ受け付ける（`--interactive` のときは 1 組が必須）。
+/// `--opt=value` 形式は受け付けない。
 pub(crate) fn parse(args: &[String]) -> Result<Command, ArgError> {
     match args {
         [a] if a == "--version" => Ok(Command::Version),
         [a] if a == "--selftest" => Ok(Command::Selftest),
+        [a, b, rest @ ..] if a == "--stdio" && b == OPT_INTERACTIVE => match parse_egress(rest)? {
+            Egress::None => Err(ArgError::InteractiveRequiresEgress),
+            egress => Ok(Command::StdioInteractive(egress)),
+        },
         [a, rest @ ..] if a == "--stdio" => parse_egress(rest).map(Command::Stdio),
         _ => Err(ArgError::Usage),
     }
@@ -341,6 +360,32 @@ mod tests {
         assert_eq!(
             p(&["--stdio", "--egress-relay-uds", "C:\\x"]),
             Err(ArgError::RelayUnsupported)
+        );
+    }
+
+    /// RENDER-10・TASK-122: `--interactive` は `--stdio` の直後だけで、egress の指定が必須（設計 §14.1）。
+    #[test]
+    fn interactive_requires_egress() {
+        assert_eq!(
+            p(&["--stdio", "--interactive", "--egress-proxy-port", "8080"]),
+            Ok(Command::StdioInteractive(port(8080)))
+        );
+        assert_eq!(
+            p(&["--stdio", "--interactive"]),
+            Err(ArgError::InteractiveRequiresEgress)
+        );
+        for bad in [
+            &["--interactive", "--stdio"][..],
+            &["--stdio", "--egress-proxy-port", "8080", "--interactive"],
+            &["--stdio", "--interactive", "--interactive"],
+            &["--interactive"],
+        ] {
+            assert_eq!(p(bad), Err(ArgError::Usage), "{bad:?}");
+        }
+        assert!(
+            !ArgError::InteractiveRequiresEgress
+                .to_string()
+                .contains("8080")
         );
     }
 

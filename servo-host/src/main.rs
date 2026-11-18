@@ -15,6 +15,8 @@
 //!   `--egress-proxy-port <port>`（macOS の隔離中と、隔離なしの unix 向け）・`--egress-relay-uds <path>`（Linux 向け。netns 内の
 //!   `relay` が `127.0.0.1` で待ち受けて UDS へ転送）のどちらか 1 つを足すと、Servo の proxy pref を
 //!   `http://127.0.0.1:<port>` に向ける（`args` が検証。RENDER-3・SEC-2・#1435。設計 §2.6）。
+//! - `--stdio --interactive`: 上に加えて操作モードのメソッド（`dom_snapshot`。TASK-122）を受け付ける。egress の指定が
+//!   必須（`args`。設計 §14.1）。DOM の直列化のスクリプトと結果の解釈は Servo 非依存の `dom` が担う。
 //! - それ以外: 標準エラーに示し、非ゼロで終了する（固定の許可リスト。SEC-2）。
 //!
 //! Servo と描画コンテキストの生成・破棄は `engine` が担う（RENDER-3・#230）。
@@ -26,6 +28,7 @@
 //! 可視性判定・境界ボックス取得のスクリプト生成と結果解釈は Servo 非依存の `layout` が担う（RENDER-3・#233・#234）。
 
 mod args;
+mod dom;
 mod engine;
 mod guard;
 mod layout;
@@ -93,7 +96,8 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Ok(Command::Selftest) => run_selftest(),
-        Ok(Command::Stdio(egress)) => run_stdio(egress),
+        Ok(Command::Stdio(egress)) => run_stdio(egress, false),
+        Ok(Command::StdioInteractive(egress)) => run_stdio(egress, true),
         Err(e) => {
             eprintln!("error: {e}");
             ExitCode::FAILURE
@@ -106,7 +110,8 @@ fn main() -> ExitCode {
 /// stdout はフレーム専用（`println!` 等を stdio 経路に置かない）。ログは stderr のみ。
 /// `Engine`（Servo）は hello の送信後、最初の `load` で作る（ハンドシェイクの 10 秒以内に
 /// hello を出すため）。Servo 自身が stdout へ書き出すリスクは設計 §2.1 を参照。
-fn run_stdio(egress: Egress) -> ExitCode {
+/// `interactive` は `--interactive`（操作モードのメソッドを受け付ける。設計 §14.1）。
+fn run_stdio(egress: Egress, interactive: bool) -> ExitCode {
     // 中継は hello の前に起動する（Servo 未生成のため失敗時は `finish` 不要）。プロセス終了まで保持する。
     #[cfg(unix)]
     let mut _relay = None;
@@ -127,7 +132,7 @@ fn run_stdio(egress: Egress) -> ExitCode {
         },
     };
     // `handler` が `Engine` を持つ。Windows では drop の前に `finish` で終了する（#1413）。
-    let mut handler = page::ServoHandler::new(proxy);
+    let mut handler = page::ServoHandler::new(proxy, interactive);
     let outcome = server::serve(
         std::io::stdin().lock(),
         std::io::stdout().lock(),
@@ -202,7 +207,7 @@ fn run_selftest() -> ExitCode {
 fn selftest_run(engine: &Engine) -> Result<Duration, String> {
     let url = ServoUrl::parse(SELFTEST_URL).map_err(|e| format!("invalid selftest url: {e}"))?;
     let start = Instant::now();
-    let webview = page::navigate(engine, url, start + SELFTEST_TIMEOUT)
+    let webview = page::navigate(engine, url, start + SELFTEST_TIMEOUT, Default::default())
         .map_err(|e| format!("page load did not complete within {SELFTEST_TIMEOUT:?}: {e:?}"))?;
     let elapsed = start.elapsed();
     selftest_stage("page loaded");
