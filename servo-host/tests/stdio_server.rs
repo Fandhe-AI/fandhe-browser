@@ -1814,6 +1814,8 @@ fn interactive_dom_snapshot_numbers_elements_and_redacts() {
         "<object id=ob data=\"data:text/html,OBJECT_SECRET\"></object>",
         "<select id=ccm autocomplete=cc-exp-month><option value=m12 selected>12</option><option value=m01>01</option></select>",
         "<p id=e>a &lt; b &amp; c</p>",
+        "<input type=radio id=rx name=size value=express checked>",
+        "<constructor id=k><b>kid</b></constructor>",
         "<svg><script>if(1<2){}</script></svg>",
         "<script>",
         "document.getElementById('q').value='typed-value';",
@@ -1870,7 +1872,15 @@ fn interactive_dom_snapshot_numbers_elements_and_redacts() {
         "{html}"
     );
     assert!(html.contains(">ta-value</textarea>"), "{html}");
-    assert!(html.contains("id=\"cb\" checked>"), "{html}");
+    assert!(html.contains("id=\"cb\" value=\"on\" checked>"), "{html}");
+    // checkbox・radio も value を残す（選択肢を見分けるため）。
+    assert!(
+        html.contains("id=\"rx\" name=\"size\" value=\"express\" checked>"),
+        "{html}"
+    );
+    // 要素名が Object.prototype の名前と同じでも空要素扱いにしない。
+    assert!(html.contains("id=\"k\"><b data-fandhe-n="), "{html}");
+    assert!(html.contains(">kid</b></constructor>"), "{html}");
     assert!(html.contains("value=\"b\" selected>"), "{html}");
     assert!(!html.contains("value=\"a\" selected"), "{html}");
     // 伏せる対象の値（属性・現在値とも）は出さず、数を返す。

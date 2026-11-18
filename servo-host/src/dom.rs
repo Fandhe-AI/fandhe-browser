@@ -7,7 +7,7 @@
 //! 直列化の規則（スクリプト側）:
 //! - 主フレームの文書を前順に歩き、各要素の開始タグの先頭に `data-fandhe-n="<番号>"` を付ける。番号は
 //!   スクリプトの整数のカウンタから作り、ページの DOM には書き込まない。ページ自身の同名の属性は出さない
-//! - `input` の `value`・`checked`、`option` の `selected`、`textarea` の中身は現在値を書く。伏せる対象
+//! - `input` の `value`（checkbox・radio を含む）と `checked`、`option` の `selected`、`textarea` の中身は現在値を書く。伏せる対象
 //!   （`type=password`、`autocomplete` のトークンが `current-password`・`new-password`・`one-time-code`・
 //!   `cc-*`）の値は書かず、数を返す（第 1 層。本体の第 2 層は TASK-125）。伏せる対象の `select` は配下の
 //!   `option` の `selected` を書かない。`type=file` の値は書かない
@@ -15,11 +15,13 @@
 //!   `src`（`object` は `data`、`embed` は `src`）は書かない（`data:`・`blob:` の中身を出さない。#1581 の
 //!   引き継ぎ。相対 URL は文書の URL で解決して判定する）。shadow root の中身も含めない
 //!   （開いた shadow root を持つ要素の数を返す）。`template` の中身も含めない
+//! - 要素名の表は `Object.create(null)` で作り、`constructor` 等の名前が prototype に当たらないようにする
 //! - 空要素・生テキスト要素・`template`・`textarea` の扱いは HTML 名前空間の要素だけに適用する（SVG・MathML の
 //!   同名要素は通常の要素として子を書く）。`pre`・`textarea`・`listing` の中身が改行で始まるときは、再パースで
 //!   1 つ消えるのを補うため改行を 1 つ足す（HTML の直列化の規則）
 //! - HTML の UTF-16 の長さが上限（8 MiB）を超えた時点で打ち切り、`tooLarge` を返す（UTF-8 のバイト数は
-//!   UTF-16 の長さ以上のため、超えた時点で上限超過が確定する）。上限内でも UTF-8 のバイト数は Rust 側で数え直す
+//!   UTF-16 の長さ以上のため、超えた時点で上限超過が確定する）。ページ由来の文字列を連結・エスケープする前に、
+//!   元の長さで残りの容量を確かめる（エスケープ後は元より短くならないため、上限を大きく超える中間の文字列を作らない）。上限内でも UTF-8 のバイト数は Rust 側で数え直す
 //! - 番号を振った要素そのものを配列で返す。Servo はこれを `JSValue::Element`（要素ごとの ID）に変換し、
 //!   ホストは番号の順に保持する（`act` が `window.webdriverElement(id)` で引き直す。TASK-126）
 //!
@@ -34,14 +36,17 @@ use crate::server::{ErrorKind, MAX_DOM_SNAPSHOT_HTML_BYTES};
 const SERIALIZE_FN: &str = r#"(function(LIMIT){
 var out = [], len = 0, big = false, els = [], ifr = 0, shd = 0, red = 0, hideSel = false;
 var XHTML = "http://www.w3.org/1999/xhtml";
-var VOID = {area:1,base:1,br:1,col:1,embed:1,hr:1,img:1,input:1,link:1,meta:1,source:1,track:1,wbr:1,param:1,keygen:1,basefont:1,bgsound:1,frame:1};
-var RAW = {style:1,script:1,xmp:1,iframe:1,noembed:1,noframes:1,plaintext:1,noscript:1};
-var LF = {pre:1,textarea:1,listing:1};
-var EMBED = {iframe:"src",frame:"src",object:"data",embed:"src"};
-function push(s) { if (big) { return; } len += s.length; if (len > LIMIT) { big = true; return; } out.push(s); }
+function set(names, v) { var m = Object.create(null), a = names.split(" "); for (var i = 0; i < a.length; i++) { m[a[i]] = v; } return m; }
+var VOID = set("area base br col embed hr img input link meta source track wbr param keygen basefont bgsound frame", true);
+var RAW = set("style script xmp iframe noembed noframes plaintext noscript", true);
+var LF = set("pre textarea listing", true);
+var EMBED = Object.create(null); EMBED.iframe = "src"; EMBED.frame = "src"; EMBED.object = "data"; EMBED.embed = "src";
+function room(n) { if (big) { return false; } if (len + n > LIMIT) { big = true; return false; } return true; }
+function push(s) { if (!room(s.length)) { return; } len += s.length; out.push(s); }
 function escT(s) { return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/\u00a0/g, "&nbsp;"); }
 function escA(s) { return s.replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/\u00a0/g, "&nbsp;"); }
-function attr(n, v) { push(" " + n + "=\"" + escA(v) + "\""); }
+function text(s) { if (room(s.length)) { push(escT(s)); } }
+function attr(n, v) { if (room(n.length + v.length + 4)) { push(" " + n + "=\"" + escA(v) + "\""); } }
 function redacted(el) {
   if (el.localName === "input" && String(el.type).toLowerCase() === "password") { return true; }
   var ac = String(el.getAttribute("autocomplete") || "").toLowerCase().split(/\s+/);
@@ -64,6 +69,7 @@ function element(el) {
   if (html && (name === "iframe" || name === "frame")) { ifr++; }
   var hide = (isInput || isArea || isSelect) && redacted(el);
   if (hide) { red++; }
+  if (!room(name.length + 32)) { return; }
   push("<" + name + " data-fandhe-n=\"" + n + "\"");
   var as = el.attributes;
   for (var i = 0; i < as.length; i++) {
@@ -74,10 +80,10 @@ function element(el) {
     if (embed && (an === "srcdoc" || (an === embed && !httpUrl(a.value)))) { continue; }
     attr(an, a.value);
   }
-  if (isInput) {
+  if (isInput && !hide) {
     var t = String(el.type).toLowerCase();
-    if (t === "checkbox" || t === "radio") { if (el.checked) { push(" checked"); } }
-    else if (t !== "file" && !hide) { attr("value", String(el.value)); }
+    if (t !== "file") { attr("value", String(el.value)); }
+    if ((t === "checkbox" || t === "radio") && el.checked) { push(" checked"); }
   }
   if (isOption && el.selected && !hideSel) { push(" selected"); }
   push(">");
@@ -85,10 +91,10 @@ function element(el) {
   if (isArea) {
     var v = hide ? "" : String(el.value);
     if (v.charAt(0) === "\n") { push("\n"); }
-    push(escT(v));
+    text(v);
   } else if (html && RAW[name]) {
     var c = el.childNodes;
-    for (var j = 0; j < c.length; j++) { if (c[j].nodeType === 3) { push(c[j].data); } }
+    for (var j = 0; j < c.length && !big; j++) { if (c[j].nodeType === 3) { push(c[j].data); } }
   } else if (!(html && name === "template")) {
     var f = el.firstChild;
     if (html && LF[name] && f && f.nodeType === 3 && f.data.charAt(0) === "\n") { push("\n"); }
@@ -103,9 +109,9 @@ function node(x) {
   if (big) { return; }
   switch (x.nodeType) {
     case 1: element(x); break;
-    case 3: push(escT(x.data)); break;
-    case 8: push("<!--" + x.data + "-->"); break;
-    case 10: push("<!DOCTYPE " + x.name + ">"); break;
+    case 3: text(x.data); break;
+    case 8: if (room(x.data.length + 7)) { push("<!--" + x.data + "-->"); } break;
+    case 10: if (room(x.name.length + 11)) { push("<!DOCTYPE " + x.name + ">"); } break;
   }
 }
 function children(p) { var c = p.childNodes; for (var i = 0; i < c.length && !big; i++) { node(c[i]); } }

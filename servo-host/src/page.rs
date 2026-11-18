@@ -459,20 +459,31 @@ impl Handler for ServoHandler {
                 .filter(|u| matches!(u.scheme(), "http" | "https"))
                 .map(|u| u.to_string())
         };
-        // 評価の前に検査し、評価の後に読み直す（評価中に遷移したら、新しい文書の HTML に古い URL を付けない）。
-        current_url().ok_or(HandlerError(ErrorKind::InvalidState))?;
+        // 評価の待ちの間もイベントループが回り、遷移や `pushState` の通知が処理されうる。評価の前後で
+        // 文書番号が変わったら、古い文書の HTML・要素 ID に新しい URL・番号を付けないよう結果を捨て、
+        // 期限内で取り直す（設計 §14.2・§14.3）。期限を過ぎたら timeout。
         let deadline = Instant::now() + Duration::from_millis(DOM_SNAPSHOT_TIMEOUT_MS);
-        let value = match page.evaluate(engine, dom::serialize_script(), deadline) {
-            Ok(v) => v,
-            Err(e) => {
-                if matches!(e, PageError::Crashed | PageError::DocumentGone) {
-                    self.page = None;
+        let (s, url, doc_seq) = loop {
+            let before = self.doc_seq.get();
+            current_url().ok_or(HandlerError(ErrorKind::InvalidState))?;
+            let value = match page.evaluate(engine, dom::serialize_script(), deadline) {
+                Ok(v) => v,
+                Err(e) => {
+                    if matches!(e, PageError::Crashed | PageError::DocumentGone) {
+                        self.page = None;
+                    }
+                    return Err(HandlerError(e.kind()));
                 }
-                return Err(HandlerError(e.kind()));
+            };
+            let url = current_url().ok_or(HandlerError(ErrorKind::InvalidState))?;
+            if self.doc_seq.get() == before {
+                break (dom::parse_serialized(value), url, before);
+            }
+            if Instant::now() >= deadline {
+                return Err(HandlerError(ErrorKind::Timeout));
             }
         };
-        let s = dom::parse_serialized(value).map_err(|e| HandlerError(e.kind()))?;
-        let url = current_url().ok_or(HandlerError(ErrorKind::InvalidState))?;
+        let s = s.map_err(|e| HandlerError(e.kind()))?;
         if url.len() > MAX_URL_BYTES {
             return Err(HandlerError(ErrorKind::TooLarge));
         }
@@ -484,7 +495,10 @@ impl Handler for ServoHandler {
             element_ids: s.element_ids,
         });
         Ok(DomSnapshotResult {
-            page: self.page_info(),
+            page: PageInfo {
+                session: self.session.clone(),
+                doc_seq,
+            },
             url,
             html: s.html,
             element_count,
