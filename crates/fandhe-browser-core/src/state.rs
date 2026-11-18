@@ -35,7 +35,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use fandhe_browser_profile::Profile;
 
-use crate::interactive::{InteractiveDocument, InteractiveSync};
+use crate::interactive::{HostDomSnapshot, InteractiveDocument, InteractiveSync};
 use crate::page_actor::PageScriptHandle;
 use crate::render::{
     BoundingBox, DisabledRenderer, ElementRef, ElementVisibility, PageRef, RenderError, Renderer,
@@ -338,6 +338,16 @@ impl NavigationState {
         self.lock().clone()
     }
 
+    /// 直近の結果と、それを保存した時点の世代の組を返す（結果が無ければ `None`）。
+    ///
+    /// [`Self::latest`] と [`Self::current_generation`] を別々に読むと、その間に新しい navigate が
+    /// 始まって食い違った組になりうる。ai の `/ai/snapshot` が応答の `generation` と操作モードの
+    /// 差し替え（[`AppState::replace_interactive`]）に使う（`AISNAP-20`・TASK-125）。
+    pub fn latest_with_generation(&self) -> Option<(NavigationGeneration, Arc<NavigationResult>)> {
+        let (generation, latest) = self.snapshot();
+        latest.map(|r| (generation, r))
+    }
+
     /// 操作モードの最初の確定結果を保存する（版 1。世代の判定は [`Self::commit_navigation`] と同じ）。
     /// 呼び出し元は [`AppState::commit_interactive`]（操作モードが許されているかを確かめる）。
     fn commit_interactive(
@@ -632,6 +642,17 @@ impl AppState {
     pub fn bounding_box(&self, element: &ElementRef) -> Result<BoundingBox, RenderError> {
         self.render
             .with_page(&self.navigation, |r| r.bounding_box(element))
+    }
+
+    /// 操作モードのページの DOM をホストから取得する（`RENDER-11`・`AISNAP-20`・TASK-125）。
+    ///
+    /// 描画系メソッドと同じゲートを通し、撮影などと直列にする（操作モードのページは読み直さない）。
+    /// ページが無ければ [`RenderError::PageNotLoaded`]。結果は untrusted で、呼び出し元が
+    /// [`crate::interactive::build_interactive_document`] で検査してから [`Self::replace_interactive`] へ渡す。
+    /// ブロッキングの注意は [`Self::capture_screenshot`] と同じ。
+    pub fn dom_snapshot(&self) -> Result<HostDomSnapshot, RenderError> {
+        self.render
+            .with_page(&self.navigation, |r| r.dom_snapshot())
     }
 
     /// ナビゲート状態を返す。

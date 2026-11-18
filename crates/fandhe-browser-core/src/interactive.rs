@@ -223,6 +223,10 @@ impl InteractiveSync {
     pub fn page(&self) -> &InteractivePageId {
         self.document.page()
     }
+    /// 保存される写し（差し替えの前に ref・セレクタを試すときに使う。TASK-125）。
+    pub fn document(&self) -> &InteractiveDocument {
+        &self.document
+    }
 }
 
 /// ホストの取得結果を検査し、番号を外した文書と対応表を作る（§14.3・確定条件 1・4）。
