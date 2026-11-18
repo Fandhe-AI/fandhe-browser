@@ -416,7 +416,7 @@ fn plug4_threshold_nan_is_shortfall() -> TestResult<()> {
     Ok(())
 }
 
-/// `PLUG-4`: 実データの現状 verdict（84.0% 未達・平均約 12.5%）を固定する。
+/// `PLUG-4`: 実データの現状 verdict（84.0% 未達・平均約 10.2%）を固定する。
 ///
 /// これは PLUG-4 未達の事実の記録であり、達成を装うものではない（REPAIR-3）。snapshot の出力形式
 /// が縮んで verdict が `Met` に変わったら、本テストを `assert_plug4(&summary)?` による本ゲートに

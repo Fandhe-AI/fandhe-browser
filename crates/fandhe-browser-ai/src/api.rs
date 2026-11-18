@@ -18,7 +18,11 @@
 //!   `mode`（`static` / `interactive`）は互換のある追加（`AISNAP-20`・TASK-125）
 //! - 操作モードの確定結果なら、要約の前にホストの DOM を取り直す（[`crate::interactive::sync_interactive`]）。
 //!   同期の失敗は `session_lost`・`rendering_disabled`・`stale`（409）と `sync_failed`（502）で返し、
-//!   古い内容を返さない（`AISNAP-20`・`AISNAP-21`）
+//!   古い内容を返さない（`AISNAP-20`・`AISNAP-21`）。`stale`・`sync_failed` とステータスは spec・設計 §14.7 に
+//!   無い暫定の値（TASK-125）
+//! - 操作モードの同期（最大で `dom_snapshot` の 30 秒＋余裕 5 秒）は async のハンドラの中で同期的に呼ぶ。
+//!   core は async の呼び出し元に `spawn_blocking` 等を求めており、操作モードを本番で立てられるようにする
+//!   前（TASK-127・TASK-131）に直す。今は操作モードに入る経路がテストの入口だけ
 //! - 未ナビゲート時は 409 と `{"code":"no_navigation","message":...}` を返す（成功を装わない。
 //!   TASK-19.2・Issue #224・`AISNAP-14`）。spec 上 `AISNAP-14` の形式・ステータスは検討中で、
 //!   spec の例示形に合わせた暫定確定。エラー本文は全 variant で `code` と `message` の 2 キー
@@ -332,22 +336,19 @@ pub fn snapshot_body(nav: &NavigationState) -> Result<Vec<u8>, ApiError> {
             build_snapshot(&parsed.document).map_err(|_| ApiError::Snapshot)?
         }
     };
-    let value = envelope(latest.url(), generation, latest.mode(), &snapshot);
+    // 未知のモードを `static` と偽らない（`PageMode` は `#[non_exhaustive]`）。
+    let mode = match latest.mode() {
+        PageMode::Static => "static",
+        PageMode::Interactive => "interactive",
+        _ => return Err(ApiError::Snapshot),
+    };
+    let value = envelope(latest.url(), generation, mode, &snapshot);
     serde_json::to_vec(&value).map_err(|_| ApiError::Serialize)
 }
 
 /// `{"url", "generation", "mode", "tree", "truncated"}` のエンベロープを作る。`generation`・`mode` は
 /// 互換のある追加（`AISNAP-6` への追記・`AISNAP-20`。静的モードでも含む）。
-fn envelope(
-    url: &str,
-    generation: NavigationGeneration,
-    mode: PageMode,
-    snapshot: &Snapshot,
-) -> Value {
-    let mode = match mode {
-        PageMode::Interactive => "interactive",
-        _ => "static",
-    };
+fn envelope(url: &str, generation: NavigationGeneration, mode: &str, snapshot: &Snapshot) -> Value {
     json!({
         "url": url,
         "generation": generation.get(),

@@ -81,6 +81,8 @@ impl SyncFailure {
             RenderError::SessionLost => Self::SessionLost,
             RenderError::RenderingDisabled => Self::RenderingDisabled,
             RenderError::PageNotLoaded => Self::Stale,
+            // `dom_snapshot` の時間切れは render の `HostRenderer` がホストを破棄して `SessionLost` で返す
+            // （設計 §14.6・TASK-123）。ここへ `Timeout` などが来たら同期の失敗として扱う。
             _ => Self::Failed,
         }
     }

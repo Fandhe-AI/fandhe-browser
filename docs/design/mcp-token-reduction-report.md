@@ -91,4 +91,4 @@
 - 5 サイトの snapshot は、有効時も既定オフと同一（トークン数・truncated・`login-form` を含むバイト列）。`<script` を持つのは `login-form` のみで、`<script src>` は loopback のためアクターの `Fetcher` が接続前に拒否し（`SrcFetchFailed`・`DisallowedAddress`）、JS は 1 行も実行されない。他 4 サイトは `Skipped(NoScriptElement)`。再シリアライズ由来の差も出なかった
 - 平均 10.2% は既定オフと同じで、84.0% 未達のまま。原因は JS 実行ではなく、応答が JSON ツリーのエンベロープであること（上の「所見」と同じ）。しきい値は変更していない
 - 描画を伴うページでは snapshot が JS 描画分だけ増える（SPA 風フィクスチャで 84 → 259 トークン）。これは取得対象が実行後 DOM になる `JS-4` の意図どおりの挙動
-- 例外メッセージ・console 出力・スクリプト本文は AI 向け出力（snapshot 本文・MCP テキスト）に混入しない。静的要素の `ref` は JS 実行の有無で一致し、再読み出し・再ナビゲーションでもバイト一致する（`AISNAP-6`・`AISNAP-10`）
+- 例外メッセージ・console 出力・スクリプト本文は AI 向け出力（snapshot 本文・MCP テキスト）に混入しない。静的要素の `ref` は JS 実行の有無で一致し、再読み出しではバイト一致し、再ナビゲーションでは `generation` を除いて一致する（`AISNAP-6`・`AISNAP-10`・`AISNAP-20`）
