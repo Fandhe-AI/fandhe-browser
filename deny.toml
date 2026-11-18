@@ -49,6 +49,12 @@ ignore = [
   # 解消予定: 上流 v8 が `paste` 依存をやめた版へ追従した時点でこの ignore を
   # 外す（追跡先: #152・TASK-29 親 #139）。
   { id = "RUSTSEC-2024-0436", reason = "paste は v8 crate の直接依存の proc-macro（unmaintained のみで脆弱性ではなく実行時コードを含まない）。上流に修正版がなく解消は #152/TASK-29(#139) で追跡する" },
+  # RUSTSEC-2026-0543（`chrono` unmaintained。脆弱性ではなく、全版が対象で修正版は無い）。
+  # `fandhe-browser-mcp` の依存 `rmcp` 3.9.0 が非 wasm でも無条件に依存し、
+  # `rmcp` が有効にする `schemars` の `chrono04` feature からも入る。最新の rmcp 3.10.0 も
+  # 同じため、本リポ側で差し替えることはできない。
+  # 解消予定: rmcp が chrono への依存をやめた版へ追従した時点で外す（追跡先: #1577）。
+  { id = "RUSTSEC-2026-0543", reason = "chrono は rmcp 3.9.0（fandhe-browser-mcp の依存）と schemars の chrono04 経由（unmaintained のみで脆弱性ではない。修正版は無い）。rmcp 3.10.0 も依存するため差し替えられず、解消は #1577 で追跡する" },
 ]
 
 [licenses]

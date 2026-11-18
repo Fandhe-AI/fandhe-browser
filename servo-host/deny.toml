@@ -34,6 +34,7 @@ ignore = [
   { id = "RUSTSEC-2025-0080", reason = "unic-common 0.9.0 は urlpattern 0.3.0 経由の servo 推移依存（unmaintained のみ）。上流に更新版が無く、servo の更新で解消し #228 で追跡する" },
   { id = "RUSTSEC-2025-0100", reason = "unic-ucd-ident 0.9.0 は urlpattern 0.3.0 経由の servo 推移依存（unmaintained のみ）。上流に更新版が無く、servo の更新で解消し #228 で追跡する" },
   { id = "RUSTSEC-2025-0098", reason = "unic-ucd-version 0.9.0 は urlpattern 0.3.0 経由の servo 推移依存（unmaintained のみ）。上流に更新版が無く、servo の更新で解消し #228 で追跡する" },
+  { id = "RUSTSEC-2026-0543", reason = "chrono 0.4.45 は servo-net・servo-script・servo-devtools 0.7.0 経由の servo 推移依存（unmaintained のみ。全版が対象で修正版は無い）。servo 0.8.0 の各 crate も chrono に依存するため差し替えられない。servo が chrono への依存をやめたら外し（unused-ignored-advisory = deny で検出）、#228 で追跡する" },
   { id = "RUSTSEC-2026-0459", reason = "libsqlite3-sys 0.36.0（SQLite 3.53 系）は servo-net・servo-storage 0.7.0 の rusqlite 0.38 経由で、servo 0.8.0 も同じため差し替えられない。到達しない根拠は 2 つ: (1) HTTP ディスクキャッシュ（一時ディレクトリ直下の固定名 cache.sqlite3 を開く経路）を engine.rs の network_http_disk_cache の定数で無効化し、servo-host/tests の挙動テストで固定している (2) 残る SQLite（ClientStorage・IndexedDB）は乱数名の tempdir 配下で、本体経由の起動ではさらに 0700 の専用 WorkDir 配下にあり、他者が書けるファイルを開かない。servo が rusqlite 0.41 以上（libsqlite3-sys 0.39.0 以上）に上がったら外す（unused-ignored-advisory = deny で検出）" },
 ]
 
