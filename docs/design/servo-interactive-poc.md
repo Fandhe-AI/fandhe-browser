@@ -4,7 +4,7 @@
 
 - 実施日: 2026-11-16〜17（試作）、2026-11-18（現行 main `fd341de` で再実行）
 - 環境: macOS（arm64）・Servo `=0.7.0`・隔離なしの同一プロセス（`servo-host` の一時テスト）。試験ページはローカルの `TcpListener` から出し、外部へは出ない
-- 状態: 途中経過の記録。合格条件（★）3 件のうち ★1 は満たす、★2 は条件付きで読み替えて満たす（2026-11-18 のオーナー回答。条件は TASK-120 の完了条件）、★3 は通知が届くことをソースで確認し、`doc_seq` の起点は未確定。項目 4・6〜11 の一部は未確認（後述「残り」）。操作モードはまだ公開しない
+- 状態: 途中経過の記録。合格条件（★）3 件のうち ★1 は満たす、★2 は条件付きで読み替えて満たす（2026-11-18 のオーナー回答。条件は TASK-120 の完了条件）、★3 は通知が届くことをソースで確認し、`doc_seq` の起点は通知駆動に決定（2026-11-18。実装は TASK-121 以降）。★2 の条件は TASK-120（#1581）で実装した（後述）。項目 4・6〜11 の一部は未確認（後述「残り」）。操作モードはまだ公開しない
 - 担当: Claude Code（試作・記録）。★ の合否と操作モードの公開可否はオーナー判断
 
 ## 目的と範囲
@@ -81,10 +81,19 @@
 
 2026-11-18 のオーナー回答で、目的（遷移先の scheme を絞る）を `request_navigation` と許可リストの組で満たすと読み替えた。2 つの検問は同等ではないため、次を条件とする（TASK-120 の完了条件。spec の RENDER-10 と ★2 の文言は spec リポ側で直す）。
 
-- 書き分け: 主フレームは `request_navigation` と現在 URL の検査で止める。iframe の許可外 scheme は読み込み先の許可リストで止める。リダイレクト先の http(s) 以外は Servo 内部の制限に頼る（許可リストでは見えない）。iframe の `data:`・`blob:` は現行の許可リストでは通るため、操作モードで許すか止めるかを TASK-120 で決める
+- 書き分け: 主フレームは `request_navigation` と現在 URL の検査で止める。iframe の許可外 scheme は読み込み先の許可リストで止める。リダイレクト先の http(s) 以外は Servo 内部の制限に頼る（許可リストでは見えない）。iframe・サブリソースの `data:`・`blob:` は読み込みを許し、操作と DOM 取得の対象にしない。主フレームの `data:`・`blob:` への遷移は止める（2026-11-18 の判断。RENDER-10・#1581）
 - 回帰テスト 2 本で固定する: 「302 の移動先が `file:`・`data:` なら失敗する」「`meta refresh` で `data:`・`file:` へ行けない」。現状は Servo 内部の挙動に頼っており、`servo` の版更新で黙って変わりうる
 - 操作と DOM 取得の前に、現在 URL が http / https であることを必ず検査する（RENDER-10・RENDER-11 の `invalid_state`）
 - 試していない経路（`meta refresh`・`Refresh` ヘッダ・`target=_blank`・`history.back()`）が `request_navigation` を通るかを確かめる
+
+TASK-120 の実装結果（2026-11-18・#1581）:
+
+- ホストの `request_navigation` は、http / https・`about:blank`・`about:srcdoc` だけを許し、それ以外を明示的に拒否する（`servo-host/src/guard.rs` の `navigation_allowed`。既定の drop は許可になるため必ず応答する）。主フレームか iframe かは区別できないため、iframe をスクリプトで `data:`・`blob:` へ移す遷移も止まる（`src` 属性での読み込みは許す）
+- 検査を外して確かめた結果、Servo 0.7.0 自身は主フレームの `data:`・`blob:` への遷移を止めない。`location`・`window.open(url, '_self')`・`blob:` の iframe からの `top.location`・`meta refresh`・`Refresh` ヘッダのどれでも移れてしまうため、この検査が要る
+- 未試験だった経路: `meta refresh` と `Refresh` ヘッダは `request_navigation` を通る。`target=_blank` は通らず、新しいウィンドウも作られない（主フレームは移らない）。別文書への `history.back()` は通らないが、戻れるのは検査を通った履歴だけ
+- Servo 内部の制限に頼る経路: 302 の移動先は `request_navigation` を通らず、Servo の fetch が `data:`・`file:` への移動を止める。初回の `load` で 302 の移動先が `data:` のとき、Servo は失敗にせず元の URL の空のページで止まる。`file:` は読み込み先の許可リストも止める
+- 回帰テスト: `servo-host/tests/stdio_server.rs` の `main_frame_navigation_to_disallowed_scheme_is_blocked` と `initial_load_redirect_to_disallowed_scheme_does_not_reach_target`
+- 操作と DOM 取得の前の現在 URL の検査（`invalid_state`）と、`data:`・`blob:` の iframe を操作・取得の対象にしないことは、対象のメソッド（`dom_snapshot`・`act`）とエラー kind ができる TASK-122・TASK-126 で入れる（kind は TASK-121 で確定する）
 - 内部アドレスへの接続は egress プロキシに頼るため、TASK-121 の確定条件 7（操作モードは `Isolated` のときだけ）を前提とする
 
 ### ★3 `pushState` の通知（RENDER-10）: 前半は満たす（ソース根拠）
@@ -123,8 +132,8 @@
 
 | 項目 | 内容 | 依存する TASK |
 | ---- | ---- | ------------- |
-| ★3 後半 | `doc_seq` の起点を通知で取るか（取るなら `url` を足して実際に受け取る） | TASK-121 |
-| ★2 の条件 | 回帰テスト 2 本・現在 URL の検査・未試験の遷移経路 | TASK-120 |
+| ★3 後半 | 通知駆動に決定（2026-11-18。URL 変更の通知と新しい文書の読み込みの両方で上げる）。`url =2.5.8` を足して実際に受け取る | TASK-121 |
+| ★2 の条件 | 遷移の検査・回帰テスト・未試験の経路は TASK-120 で済み。現在 URL の検査と `data:`・`blob:` の iframe の除外は対象のメソッドと同時に入れる | TASK-122・TASK-126 |
 | (4) | 矩形・ヒットテストを Rust 側で取れるか | TASK-121（取れなければ iframe 上の拒否・スクロール上限 3 回を最終形にする） |
 | (7) | `JSValue::Element` を埋め込み API から再利用できるか | TASK-122・TASK-126 |
 | (8) | `select`・ダイアログ・新しいウィンドウ・ファイル選択の delegate の API と既定の動き | TASK-126（`window.open` は既定で `null` を返すことだけ確認済み） |
@@ -138,6 +147,8 @@
 
 1. ★2 は条件付きで読み替える（条件は上の ★2 の節。spec の文言は spec リポ側で直す）
 2. ★3 の `url =2.5.8` の追加は認める。ただし本書の PR には入れず、通知駆動を選ぶ場合に TASK-121 以降で足す
+3. iframe・サブリソースの `data:`・`blob:` は読み込みを許し、操作と DOM 取得の対象にしない。主フレームの `data:`・`blob:` への遷移は止める（#1581）
+4. ★3 は通知駆動にする。URL 変更の通知と新しい文書の読み込みの両方で `doc_seq` を上げる（#1582）
 
 残っていること:
 
