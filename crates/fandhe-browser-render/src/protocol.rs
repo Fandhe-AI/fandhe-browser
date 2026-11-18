@@ -15,9 +15,18 @@
 //! serde（derive）はルート Cargo.toml の配置方針で core 限定のため使わず、`Value` から
 //! 手作業で解釈する。フレームの読み書きは [`crate::codec`] が担当する。
 
+mod interactive;
+
 use std::fmt;
 
 use serde_json::{Map, Value, json};
+
+pub use interactive::{
+    ActExpect, ActParams, ActResult, Action, DomSnapshotResult, MAX_DOM_SNAPSHOT_HTML_BYTES,
+    MAX_EXPECT_ATTR_BYTES, MAX_EXPECT_TAG_BYTES, MAX_FILL_TEXT_BYTES, MAX_KEY_BYTES, MAX_NODE,
+    MAX_SELECT_VALUE_BYTES, MAX_SELECT_VALUES, MAX_SESSION_BYTES, MAX_WAIT_CONDITION_BYTES,
+    MAX_WAIT_TIMEOUT_MS, PageInfo, WaitCondition, WaitParams, WaitResult,
+};
 
 /// 本クライアントが話すプロトコル版（`v`）。
 pub const PROTOCOL_VERSION: u32 = 1;
@@ -130,6 +139,12 @@ pub enum Method {
     Visibility,
     /// 要素の bounding box。
     BoundingBox,
+    /// 主フレームの DOM の取得（操作モード。RENDER-11・TASK-123）。
+    DomSnapshot,
+    /// 要素への操作（操作モード。RENDER-10）。
+    Act,
+    /// 条件の成立を待つ（操作モード。AISNAP-18）。
+    Wait,
     /// ホストの終了。
     Shutdown,
 }
@@ -142,6 +157,9 @@ impl Method {
             Self::Screenshot => "screenshot",
             Self::Visibility => "visibility",
             Self::BoundingBox => "bounding_box",
+            Self::DomSnapshot => "dom_snapshot",
+            Self::Act => "act",
+            Self::Wait => "wait",
             Self::Shutdown => "shutdown",
         }
     }
@@ -324,6 +342,12 @@ pub enum Request {
     Visibility(VisibilityParams),
     /// bounding box 取得。
     BoundingBox(BoundingBoxParams),
+    /// DOM の取得（params なし。`page` を照合しない。設計 §14.2）。
+    DomSnapshot,
+    /// 要素への操作。
+    Act(ActParams),
+    /// 条件の成立を待つ。
+    Wait(WaitParams),
     /// ホスト終了（params なし）。
     Shutdown,
 }
@@ -336,6 +360,9 @@ impl Request {
             Self::Screenshot(_) => Method::Screenshot,
             Self::Visibility(_) => Method::Visibility,
             Self::BoundingBox(_) => Method::BoundingBox,
+            Self::DomSnapshot => Method::DomSnapshot,
+            Self::Act(_) => Method::Act,
+            Self::Wait(_) => Method::Wait,
             Self::Shutdown => Method::Shutdown,
         }
     }
@@ -365,6 +392,15 @@ impl Request {
             Self::BoundingBox(p) => {
                 obj.insert("params".into(), json!({ "selector": p.selector }));
             }
+            Self::DomSnapshot => {
+                obj.insert("params".into(), json!({}));
+            }
+            Self::Act(p) => {
+                obj.insert("params".into(), p.to_json());
+            }
+            Self::Wait(p) => {
+                obj.insert("params".into(), p.to_json());
+            }
             Self::Shutdown => {}
         }
         Value::Object(obj)
@@ -377,6 +413,7 @@ impl Request {
 pub struct LoadResult {
     final_url: String,
     status: Option<u16>,
+    page: Option<PageInfo>,
 }
 
 impl LoadResult {
@@ -388,6 +425,11 @@ impl LoadResult {
     /// HTTP ステータス（100..=599）。ホストが取得できない場合は `None`（応答に `status` キーが無い）。
     pub fn status(&self) -> Option<u16> {
         self.status
+    }
+
+    /// ページ識別子。`--interactive` で起動したホストだけが返す（設計 §14.2）。
+    pub fn page(&self) -> Option<&PageInfo> {
+        self.page.as_ref()
     }
 }
 
@@ -500,6 +542,12 @@ pub enum MethodResult {
     Visibility(VisibilityResult),
     /// `bounding_box` の結果。
     BoundingBox(BoundingBoxResult),
+    /// `dom_snapshot` の結果。
+    DomSnapshot(DomSnapshotResult),
+    /// `act` の結果。
+    Act(ActResult),
+    /// `wait` の結果。
+    Wait(WaitResult),
     /// `shutdown` の結果。
     Shutdown(ShutdownResult),
 }
@@ -524,6 +572,14 @@ pub enum HostErrorKind {
     LoadFailed,
     /// ホスト内部エラー。
     Internal,
+    /// 現在の URL が http / https 以外（操作モード。設計 §14.7）。
+    InvalidState,
+    /// 要求の `page`・`snapshot`・照合値が現在と違う（操作モード）。
+    Stale,
+    /// 要素を操作できない（不可視・`disabled`・被覆・iframe 上など。操作モード）。
+    NotActionable,
+    /// 上限を超えた（切り詰めない。操作モード）。
+    TooLarge,
     /// v1 の集合に無い kind（汎用エラー扱い）。
     Other,
 }
@@ -589,6 +645,8 @@ pub struct HelloLimits {
     pub error_message_bytes: u64,
     /// 同時処理数（既定 1）。
     pub max_in_flight: u64,
+    /// `dom_snapshot` 応答フレーム上限（`--interactive` のホストだけが申告する。設計 §14.6）。
+    pub dom_snapshot_frame_bytes: Option<u64>,
 }
 
 /// 起動直後にホストが送る `hello`。
@@ -681,6 +739,10 @@ fn parse_error(v: &Value) -> Result<HostError, ProtocolError> {
         Some("timeout") => HostErrorKind::Timeout,
         Some("load_failed") => HostErrorKind::LoadFailed,
         Some("internal") => HostErrorKind::Internal,
+        Some("invalid_state") => HostErrorKind::InvalidState,
+        Some("stale") => HostErrorKind::Stale,
+        Some("not_actionable") => HostErrorKind::NotActionable,
+        Some("too_large") => HostErrorKind::TooLarge,
         Some(_) => HostErrorKind::Other,
         None => return Err(bad("error kind missing")),
     };
@@ -713,9 +775,14 @@ fn parse_result(v: &Value, method: Method) -> Result<MethodResult, ProtocolError
                     )
                 }
             };
+            let page = match obj.get("page") {
+                None => None,
+                Some(v) => Some(PageInfo::from_json(v)?),
+            };
             Ok(MethodResult::Load(LoadResult {
                 final_url: final_url.to_owned(),
                 status,
+                page,
             }))
         }
         Method::Screenshot => {
@@ -775,6 +842,11 @@ fn parse_result(v: &Value, method: Method) -> Result<MethodResult, ProtocolError
                 height,
             }))
         }
+        Method::DomSnapshot => Ok(MethodResult::DomSnapshot(interactive::parse_dom_snapshot(
+            obj,
+        )?)),
+        Method::Act => Ok(MethodResult::Act(interactive::parse_act(obj)?)),
+        Method::Wait => Ok(MethodResult::Wait(interactive::parse_wait(obj)?)),
         Method::Shutdown => Ok(MethodResult::Shutdown(ShutdownResult {})),
     }
 }
@@ -856,6 +928,11 @@ impl Hello {
                 req("max_in_flight")?
             } else {
                 1
+            },
+            dom_snapshot_frame_bytes: if lim.contains_key("dom_snapshot_frame_bytes") {
+                Some(req("dom_snapshot_frame_bytes")?)
+            } else {
+                None
             },
         };
         Ok(Self {

@@ -489,3 +489,182 @@ fn render3_frame_limits_per_method() {
         MAX_RESPONSE_FRAME_BYTES
     );
 }
+
+// ---- 操作モード（TASK-123・RENDER-10・RENDER-11。fixture は `interactive/`） ----
+
+fn interactive(name: &str) -> Value {
+    let p = dir().join("interactive").join(format!("{name}.json"));
+    serde_json::from_str(&std::fs::read_to_string(p).expect("fixture")).expect("fixture json")
+}
+
+fn interactive_method(env: &Value) -> Method {
+    match env.get("method").and_then(Value::as_str) {
+        Some("dom_snapshot") => Method::DomSnapshot,
+        Some("act") => Method::Act,
+        Some("wait") => Method::Wait,
+        Some("load") => Method::Load,
+        // error 応答の fixture は method を持たない。kind の解釈はメソッドによらない。
+        _ => Method::DomSnapshot,
+    }
+}
+
+/// TASK-123: 型付きの要求が、正常な要求の fixture と同じ JSON になる（JSON を連結で組まない）。
+#[test]
+fn render10_interactive_requests_match_fixtures() {
+    use fandhe_browser_render::protocol::{
+        ActExpect, ActParams, Action, PageInfo, WaitCondition, WaitParams,
+    };
+    let page = || PageInfo::new("3f9c2a7d1b4e4c0a9d8e7f6a5b4c3d2e", 2).unwrap();
+    let act = |node, expect, action| {
+        Request::Act(ActParams::new(page(), "s-7", node, expect, action).unwrap())
+    };
+    let cases: Vec<(&str, Request)> = vec![
+        ("request-dom-snapshot-ok", Request::DomSnapshot),
+        (
+            "request-act-click-ok",
+            act(
+                12,
+                ActExpect::new("button").unwrap().with_id("submit").unwrap(),
+                Action::Click,
+            ),
+        ),
+        (
+            "request-act-fill-ok",
+            act(
+                7,
+                ActExpect::new("input")
+                    .unwrap()
+                    .with_name("q")
+                    .unwrap()
+                    .with_type("text")
+                    .unwrap(),
+                Action::fill("example query", false).unwrap(),
+            ),
+        ),
+        (
+            "request-act-select-ok",
+            act(
+                9,
+                ActExpect::new("select")
+                    .unwrap()
+                    .with_name("color")
+                    .unwrap(),
+                Action::select(&["blue"]).unwrap(),
+            ),
+        ),
+        (
+            "request-act-press-ok",
+            act(
+                7,
+                ActExpect::new("input").unwrap(),
+                Action::press("Enter").unwrap(),
+            ),
+        ),
+        (
+            "request-wait-selector-ok",
+            Request::Wait(
+                WaitParams::new(
+                    page(),
+                    WaitCondition::SelectorPresent("#result".into()),
+                    5000,
+                )
+                .unwrap(),
+            ),
+        ),
+        (
+            "request-wait-text-ok",
+            Request::Wait(
+                WaitParams::new(page(), WaitCondition::TextPresent("Done".into()), 5000).unwrap(),
+            ),
+        ),
+        (
+            "request-wait-load-complete-ok",
+            Request::Wait(WaitParams::new(page(), WaitCondition::LoadComplete, 60000).unwrap()),
+        ),
+    ];
+    for (name, req) in cases {
+        let env = interactive(name);
+        let id = RequestId::new(env["message"]["id"].as_u64().unwrap()).unwrap();
+        assert_eq!(req.to_json(id), env["message"], "{name}");
+        assert!(encode_request(id, &req).unwrap().len() <= MAX_REQUEST_FRAME_BYTES);
+    }
+}
+
+/// TASK-123: 不正な要求の fixture に当たる値は、型付きの API で組み立てられない（送信前に拒否）。
+#[test]
+fn render10_interactive_invalid_requests_cannot_be_built() {
+    use fandhe_browser_render::protocol::{
+        ActExpect, Action, MAX_FILL_TEXT_BYTES, MAX_SELECT_VALUES, MAX_WAIT_CONDITION_BYTES,
+        PageInfo, WaitCondition, WaitParams,
+    };
+    let page = PageInfo::new("s", 1).unwrap();
+    assert!(Action::fill(&"a".repeat(MAX_FILL_TEXT_BYTES + 1), false).is_err());
+    assert!(Action::select(&vec!["v"; MAX_SELECT_VALUES + 1]).is_err());
+    assert!(ActExpect::new("").is_err());
+    assert!(WaitParams::new(page.clone(), WaitCondition::LoadComplete, 60001).is_err());
+    assert!(
+        WaitParams::new(
+            page,
+            WaitCondition::SelectorAbsent("a".repeat(MAX_WAIT_CONDITION_BYTES + 1)),
+            1000
+        )
+        .is_err()
+    );
+}
+
+/// TASK-123: `interactive/` の応答・hello の fixture をクライアントが期待どおりに読む（valid は受理、
+/// invalid は拒否。新しい kind は対応する `HostErrorKind` に写る）。
+#[test]
+fn render11_interactive_responses_match_fixtures() {
+    let d = dir().join("interactive");
+    let mut seen = 0;
+    for e in std::fs::read_dir(&d).expect("dir") {
+        let path = e.expect("entry").path();
+        let name = path.file_stem().unwrap().to_string_lossy().into_owned();
+        let env: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let bytes = serde_json::to_vec(&env["message"]).unwrap();
+        let valid = env["expect"] == "valid";
+        match env["direction"].as_str() {
+            Some("response") => {
+                let r = decode_response(&bytes, interactive_method(&env));
+                assert_eq!(r.is_ok(), valid, "{name}: {r:?}");
+                seen += 1;
+            }
+            Some("hello") => {
+                let h = decode_hello(&bytes).expect(&name);
+                assert_eq!(
+                    h.limits.dom_snapshot_frame_bytes,
+                    Some(12_582_912),
+                    "{name}"
+                );
+                assert!(h.capabilities.iter().any(|c| c == "dom_snapshot"));
+                seen += 1;
+            }
+            _ => {}
+        }
+    }
+    assert!(seen >= 12, "too few interactive response fixtures: {seen}");
+    for (name, kind) in [
+        ("response-error-invalid-state", HostErrorKind::InvalidState),
+        ("response-error-stale", HostErrorKind::Stale),
+        (
+            "response-error-not-actionable",
+            HostErrorKind::NotActionable,
+        ),
+        ("response-error-too-large", HostErrorKind::TooLarge),
+    ] {
+        let env = interactive(name);
+        let r =
+            decode_response(&serde_json::to_vec(&env["message"]).unwrap(), Method::Act).unwrap();
+        assert_eq!(r.outcome.unwrap_err().kind(), kind, "{name}");
+    }
+    let env = interactive("response-load-interactive-ok");
+    let r = decode_response(&serde_json::to_vec(&env["message"]).unwrap(), Method::Load).unwrap();
+    match r.outcome {
+        Ok(MethodResult::Load(l)) => assert_eq!(l.page().map(|p| p.doc_seq()), Some(0)),
+        other => panic!("{other:?}"),
+    }
+    // dom_snapshot の応答フレームの上限は 12 MiB（他は 1 MiB）。
+    assert_eq!(response_frame_limit(Method::DomSnapshot), 12 * 1024 * 1024);
+    assert_eq!(response_frame_limit(Method::Act), MAX_RESPONSE_FRAME_BYTES);
+}

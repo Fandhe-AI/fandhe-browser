@@ -226,6 +226,12 @@ fn map_host_error(err: HostProcessError) -> RenderError {
             _ => internal("render host reported an error"),
         },
         HostProcessError::InvalidRequest => internal("invalid render host request"),
+        // 操作モード（TASK-123）の失敗。`HostRenderer` は静的モードで使うため通常は届かない。
+        // core の `RenderError` に操作モードの variant を足すのは TASK-124。それまではホストを
+        // 使えない扱いにする（成功を装わない）。
+        HostProcessError::NotInteractive
+        | HostProcessError::InteractiveUnavailable(_)
+        | HostProcessError::SessionLost => RenderError::HostUnavailable,
     }
 }
 
