@@ -8,10 +8,12 @@ use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use fandhe_backend_http::request::{ParseOutcome, parse_request_head};
 use fandhe_backend_http::response::Response;
 use fandhe_browser_ai::api::router_with_state;
+use fandhe_browser_ai::interactive::sync_interactive;
 use fandhe_browser_ai::plugin_api::AiState;
 use fandhe_browser_core::interactive::{
     HostDomSnapshot, InteractivePageId, build_interactive_document,
@@ -49,6 +51,8 @@ impl Drop for TempDir {
 struct FakeHost {
     replies: Mutex<VecDeque<Result<HostDomSnapshot, RenderError>>>,
     calls: AtomicUsize,
+    /// 取得にかかる時間（並行する同期の検査に使う）。
+    delay: Duration,
 }
 
 impl FakeHost {
@@ -72,6 +76,7 @@ impl Renderer for FakeHost {
     }
     fn dom_snapshot(&self) -> Result<HostDomSnapshot, RenderError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
+        std::thread::sleep(self.delay);
         self.replies
             .lock()
             .unwrap()
@@ -215,4 +220,31 @@ async fn aisnap20_static_page_is_not_synced() {
         (1.into(), "static".into())
     );
     assert_eq!(host.calls(), 0);
+}
+
+/// 設計 §14.6・`AISNAP-20`: 並行する同期は直列になり、後の要求は前の同期の記録を見て取り直さない
+/// （先に取得した古い DOM が後から保存されて巻き戻らない）。
+#[test]
+fn aisnap20_concurrent_syncs_take_host_dom_once() {
+    let dir = TempDir::new();
+    let host = Arc::new(FakeHost {
+        delay: Duration::from_millis(200),
+        ..FakeHost::default()
+    });
+    host.push(Ok(host_snapshot("s1", 2, FILLED)));
+    host.push(Ok(host_snapshot("s1", 3, FORM)));
+    let state = interactive_state(&dir, Arc::clone(&host));
+    let workers: Vec<_> = (0..2)
+        .map(|_| {
+            let state = Arc::clone(&state);
+            std::thread::spawn(move || sync_interactive(state.app(), state.sync_tracker()))
+        })
+        .collect();
+    for w in workers {
+        assert_eq!(w.join().unwrap(), Ok(()));
+    }
+    assert_eq!(host.calls(), 1);
+    let latest = state.app().navigation().latest().unwrap();
+    let doc = latest.interactive().unwrap();
+    assert_eq!((doc.revision(), doc.page().doc_seq()), (2, 2));
 }

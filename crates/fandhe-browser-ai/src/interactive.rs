@@ -35,6 +35,8 @@ pub const MIN_SYNC_INTERVAL: Duration = Duration::from_secs(1);
 pub const MAX_TARGET_BYTES: usize = 1024;
 
 /// 最後に同期した世代と時刻（[`MIN_SYNC_INTERVAL`] の判定に使う）。[`crate::plugin_api::AiState`] が持つ。
+///
+/// ロックは同期の判定から保存・記録までを直列化する役も持つ（[`sync_interactive`]）。
 #[derive(Debug, Default)]
 pub struct SyncTracker {
     last: Mutex<Option<(NavigationGeneration, Instant)>>,
@@ -45,19 +47,17 @@ impl SyncTracker {
     pub fn new() -> Self {
         Self::default()
     }
+}
 
-    /// `generation` のページを `now` に取り直すべきか。
-    fn due(&self, generation: NavigationGeneration, now: Instant) -> bool {
-        match *self.last.lock().unwrap_or_else(PoisonError::into_inner) {
-            Some((g, at)) if g == generation => {
-                now.saturating_duration_since(at) >= MIN_SYNC_INTERVAL
-            }
-            _ => true,
-        }
-    }
-
-    fn record(&self, generation: NavigationGeneration, at: Instant) {
-        *self.last.lock().unwrap_or_else(PoisonError::into_inner) = Some((generation, at));
+/// 最後の同期 `last` に対し、`generation` のページを `now` に取り直すべきか。
+fn due(
+    last: Option<(NavigationGeneration, Instant)>,
+    generation: NavigationGeneration,
+    now: Instant,
+) -> bool {
+    match last {
+        Some((g, at)) if g == generation => now.saturating_duration_since(at) >= MIN_SYNC_INTERVAL,
+        _ => true,
     }
 }
 
@@ -100,11 +100,17 @@ impl SyncFailure {
 
 /// 確定結果が操作モードなら、必要に応じてホストの DOM を取り直して差し替える。静的モード・未ナビゲート
 /// では何もしない（未ナビゲートの扱いは呼び出し元の `/ai/snapshot`）。ブロッキングする。
+///
+/// 判定・取得・検査・保存・記録を [`SyncTracker`] のロック 1 つで直列化する。並行する要求が
+/// それぞれ取得すると、先に取得した古い DOM が後から保存されて巻き戻り、最小間隔も守れないため。
+/// 後の要求は前の同期の完了を待ち、その記録を見て取り直さない。ロックの順は「同期 → 描画ゲート →
+/// ナビゲーション」で、描画ゲートを持ったまま同期のロックを取る経路は無い。
 pub fn sync_interactive(app: &AppState, tracker: &SyncTracker) -> Result<(), SyncFailure> {
+    let mut last = tracker.last.lock().unwrap_or_else(PoisonError::into_inner);
     let Some((generation, latest)) = app.navigation().latest_with_generation() else {
         return Ok(());
     };
-    if latest.mode() != PageMode::Interactive || !tracker.due(generation, Instant::now()) {
+    if latest.mode() != PageMode::Interactive || !due(*last, generation, Instant::now()) {
         return Ok(());
     }
     let snapshot = app
@@ -113,7 +119,7 @@ pub fn sync_interactive(app: &AppState, tracker: &SyncTracker) -> Result<(), Syn
     let sync = build_interactive_document(snapshot).map_err(|_| SyncFailure::Failed)?;
     app.replace_interactive(generation, sync)
         .map_err(|e| SyncFailure::from_state(&e))?;
-    tracker.record(generation, Instant::now());
+    *last = Some((generation, Instant::now()));
     Ok(())
 }
 
@@ -264,15 +270,14 @@ mod tests {
     /// 設計 §14.6: 同じ世代で 1 秒未満なら取り直さない。世代が変われば取り直す。
     #[test]
     fn aisnap20_sync_interval() {
-        let t = SyncTracker::new();
         let s = fandhe_browser_core::NavigationState::new();
         let g1 = s.begin_navigation().unwrap();
         let g2 = s.begin_navigation().unwrap();
         let now = Instant::now();
-        assert!(t.due(g1, now));
-        t.record(g1, now);
-        assert!(!t.due(g1, now + Duration::from_millis(999)));
-        assert!(t.due(g1, now + MIN_SYNC_INTERVAL));
-        assert!(t.due(g2, now));
+        assert!(due(None, g1, now));
+        let last = Some((g1, now));
+        assert!(!due(last, g1, now + Duration::from_millis(999)));
+        assert!(due(last, g1, now + MIN_SYNC_INTERVAL));
+        assert!(due(last, g2, now));
     }
 }

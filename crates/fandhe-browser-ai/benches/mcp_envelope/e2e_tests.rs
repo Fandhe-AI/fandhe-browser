@@ -27,12 +27,13 @@ mod tokens;
 /// 決定的な計測値: `[rawHtml, direct, mcpText, mcpLine, directBytes]`（id 桁数で変わる mcpLineBytes は除く）。
 /// snapshot の形が変わったら `make measure-mcp-envelope MCP_ENVELOPE_ARGS="--iterations 100 --markdown"`
 /// で再生成し、こことレポートを貼り直す。
+/// TASK-125 で応答に `generation`・`mode` を足した後の値（`AISNAP-20`。direct が各 8 トークン・31 バイト増）。
 const PINNED: [(&str, [usize; 5]); 5] = [
-    ("example-minimal", [103, 68, 68, 109, 276]),
-    ("wikipedia-article", [56482, 33168, 33168, 39046, 115790]),
-    ("hn-list", [10220, 11307, 11307, 13482, 37938]),
-    ("login-form", [284, 165, 165, 224, 620]),
-    ("mdn-docs", [19005, 25191, 25191, 28078, 80346]),
+    ("example-minimal", [103, 76, 76, 117, 307]),
+    ("wikipedia-article", [56482, 33176, 33176, 39054, 115821]),
+    ("hn-list", [10220, 11315, 11315, 13490, 37969]),
+    ("login-form", [284, 173, 173, 232, 651]),
+    ("mdn-docs", [19005, 25199, 25199, 28086, 80377]),
 ];
 
 #[test]
