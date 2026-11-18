@@ -223,15 +223,16 @@ fn map_host_error(err: HostProcessError) -> RenderError {
             HostErrorKind::NotLoaded => RenderError::PageNotLoaded,
             HostErrorKind::NotFound => RenderError::ElementNotFound,
             HostErrorKind::Timeout => RenderError::Timeout,
+            HostErrorKind::InvalidState => RenderError::InvalidState,
+            HostErrorKind::TooLarge => RenderError::TooLarge,
             _ => internal("render host reported an error"),
         },
         HostProcessError::InvalidRequest => internal("invalid render host request"),
-        // 操作モード（TASK-123）の失敗。`HostRenderer` は静的モードで使うため通常は届かない。
-        // core の `RenderError` に操作モードの variant を足すのは TASK-124。それまではホストを
-        // 使えない扱いにする（成功を装わない）。
-        HostProcessError::NotInteractive
-        | HostProcessError::InteractiveUnavailable(_)
-        | HostProcessError::SessionLost => RenderError::HostUnavailable,
+        // 操作モード（TASK-123・TASK-124）。`HostRenderer` は静的モードで使うため、操作モードの呼び出しを
+        // 実装する後続のタスクまで通常は届かない。
+        HostProcessError::NotInteractive => RenderError::NotInteractive,
+        HostProcessError::InteractiveUnavailable(_) => RenderError::InteractiveUnavailable,
+        HostProcessError::SessionLost => RenderError::SessionLost,
     }
 }
 
@@ -364,6 +365,17 @@ mod tests {
             (host_error("not_loaded"), R::PageNotLoaded),
             (host_error("not_found"), R::ElementNotFound),
             (host_error("timeout"), R::Timeout),
+            // 操作モード（TASK-123・TASK-124）。
+            (host_error("invalid_state"), R::InvalidState),
+            (host_error("too_large"), R::TooLarge),
+            (HostProcessError::SessionLost, R::SessionLost),
+            (HostProcessError::NotInteractive, R::NotInteractive),
+            (
+                HostProcessError::InteractiveUnavailable(
+                    crate::host_process::InteractiveUnavailable::PrivateNetworkAllowed,
+                ),
+                R::InteractiveUnavailable,
+            ),
         ];
         for (input, expected) in cases {
             let label = format!("{input:?}");

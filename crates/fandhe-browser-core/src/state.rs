@@ -35,6 +35,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use fandhe_browser_profile::Profile;
 
+use crate::interactive::{InteractiveDocument, InteractiveSync};
 use crate::page_actor::PageScriptHandle;
 use crate::render::{
     BoundingBox, DisabledRenderer, ElementRef, ElementVisibility, PageRef, RenderError, Renderer,
@@ -50,11 +51,37 @@ use crate::script_context::ScriptContextHandle;
 /// 文字コード判定（`CORE-5`・本モジュールの範囲外）を終えた文字列を渡す。
 /// 将来のフィールド追加（ステータスコード等。`REPAIR-4`）に備え `#[non_exhaustive]`
 /// とし、フィールドは非公開とする。
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone)]
 #[non_exhaustive]
 pub struct NavigationResult {
     url: String,
     html: String,
+    /// 操作モードの中身（静的モードでは `None`。TASK-124・`AISNAP-20`）。
+    interactive: Option<Arc<InteractiveDocument>>,
+}
+
+impl PartialEq for NavigationResult {
+    fn eq(&self, other: &Self) -> bool {
+        self.url == other.url
+            && self.html == other.html
+            && match (&self.interactive, &other.interactive) {
+                (None, None) => true,
+                (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+                _ => false,
+            }
+    }
+}
+
+impl Eq for NavigationResult {}
+
+/// 確定結果のモード（`AISNAP-16`・`AISNAP-20`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum PageMode {
+    /// 本体が取得し、自前の DOM を正とする（従来の動作）。
+    Static,
+    /// Servo ホストのページを正とし、その DOM を同期した結果。
+    Interactive,
 }
 
 impl fmt::Debug for NavigationResult {
@@ -64,6 +91,7 @@ impl fmt::Debug for NavigationResult {
         f.debug_struct("NavigationResult")
             .field("url_len", &self.url.len())
             .field("html_len", &self.html.len())
+            .field("mode", &self.mode())
             .finish_non_exhaustive()
     }
 }
@@ -74,7 +102,33 @@ impl NavigationResult {
         Self {
             url: url.into(),
             html: html.into(),
+            interactive: None,
         }
+    }
+
+    fn from_sync(sync: InteractiveSync, revision: u64) -> Self {
+        Self {
+            url: sync.url,
+            html: sync.html,
+            interactive: Some(Arc::new(sync.document.with_revision(revision))),
+        }
+    }
+
+    /// モード（静的・操作）。
+    pub fn mode(&self) -> PageMode {
+        if self.interactive.is_some() {
+            PageMode::Interactive
+        } else {
+            PageMode::Static
+        }
+    }
+
+    /// 操作モードの中身（ページ識別子・版・対応表・番号を外した文書）。静的モードでは `None`。
+    ///
+    /// 操作モードの利用側（ai・cdp）は [`Self::html`] を再パースせず、ここで保持した文書を使う
+    /// （再パースすると要素の並びが変わりうるため。§14.3）。
+    pub fn interactive(&self) -> Option<&Arc<InteractiveDocument>> {
+        self.interactive.as_ref()
     }
 
     /// 最終 URL を返す。
@@ -134,6 +188,12 @@ pub enum StateError {
     /// [`NavigationState::begin_navigation`] が払い出していない世代（初期値 0）が渡された。
     /// begin 無しでの保存を許さないため、状態は変更しない。
     NotStarted,
+    /// 操作モードの確定結果が無いのに差し替えようとした（静的モードのページ・結果なし。TASK-124）。
+    NotInteractive,
+    /// 差し替えの `session` が保存済みの値と違う（ホストが再起動した。黙って差し替えない。`AISNAP-21`）。
+    SessionMismatch,
+    /// 操作モードが許されていない（設定キーは TASK-131 まで受理しない。テストの入口だけが許す）。
+    InteractiveNotAllowed,
 }
 
 impl fmt::Display for StateError {
@@ -147,6 +207,9 @@ impl fmt::Display for StateError {
             ),
             Self::GenerationExhausted => f.write_str("navigation generation counter exhausted"),
             Self::NotStarted => f.write_str("navigation generation was never started"),
+            Self::NotInteractive => f.write_str("current navigation result is not interactive"),
+            Self::SessionMismatch => f.write_str("interactive session does not match"),
+            Self::InteractiveNotAllowed => f.write_str("interactive mode is not allowed"),
         }
     }
 }
@@ -275,6 +338,55 @@ impl NavigationState {
         self.lock().clone()
     }
 
+    /// 操作モードの最初の確定結果を保存する（版 1。世代の判定は [`Self::commit_navigation`] と同じ）。
+    /// 呼び出し元は [`AppState::commit_interactive`]（操作モードが許されているかを確かめる）。
+    fn commit_interactive(
+        &self,
+        generation: NavigationGeneration,
+        sync: InteractiveSync,
+    ) -> Result<(), StateError> {
+        self.replace_if_current(
+            generation,
+            Arc::new(NavigationResult::from_sync(sync, 1)),
+            false,
+        )
+    }
+
+    /// 操作モードの確定結果を、同期の結果で差し替える（スクリプトを実行しない専用の入口。TASK-124）。
+    ///
+    /// 世代が最新で、現在の結果が操作モードで、`session` が同じときだけ差し替える。`doc_seq` と URL は
+    /// 変わってよい（ページ自身の遷移）。版は 1 上げ、世代は進めない。パースと保存だけで、ページの
+    /// スクリプト・`meta refresh` を動かす経路を通らない（試作 (12)）。
+    fn replace_interactive(
+        &self,
+        generation: NavigationGeneration,
+        sync: InteractiveSync,
+    ) -> Result<(), StateError> {
+        let mut guard = self.lock();
+        let current = self.current_generation();
+        if generation.get() == 0 {
+            return Err(StateError::NotStarted);
+        }
+        if generation != current {
+            return Err(StateError::Superseded {
+                attempted: generation,
+                current,
+            });
+        }
+        let Some(prev) = guard.as_ref().and_then(|r| r.interactive.clone()) else {
+            return Err(StateError::NotInteractive);
+        };
+        if prev.page().session() != sync.page().session() {
+            return Err(StateError::SessionMismatch);
+        }
+        let revision = prev
+            .revision()
+            .checked_add(1)
+            .ok_or(StateError::GenerationExhausted)?;
+        *guard = Some(Arc::new(NavigationResult::from_sync(sync, revision)));
+        Ok(())
+    }
+
     fn replace_if_current(
         &self,
         generation: NavigationGeneration,
@@ -361,6 +473,11 @@ impl RenderGate {
         let Some(latest) = latest else {
             return Err(RenderError::PageNotLoaded);
         };
+        // 操作モードのページはホストが保っている。静的な `load` で読み直すと入力・遷移の状態が
+        // 失われるため呼ばない（ホストが居なくなっていれば描画実装が `SessionLost` を返す。TASK-124）。
+        if latest.mode() == PageMode::Interactive {
+            return f(self.renderer.as_ref());
+        }
         if *loaded != Some(generation) {
             self.renderer.load(&PageRef::new(latest.url()))?;
             *loaded = Some(generation);
@@ -376,6 +493,9 @@ impl RenderGate {
 /// プロファイル間でデータを共有する経路は持たない（`PROF-1`）。
 pub struct AppState {
     navigation: NavigationState,
+    /// 操作モードを許すか（既定 false。設定キー `[rendering] interactive` は TASK-131 まで受理せず、
+    /// 今はテストの入口 [`AppState::allow_interactive_for_tests`] だけが立てる。TASK-124）。
+    interactive_allowed: bool,
     profile: Arc<Profile>,
     render: RenderGate,
     page_scripts: PageScriptHandle,
@@ -388,6 +508,7 @@ impl AppState {
     pub fn new(profile: Arc<Profile>, renderer: Arc<dyn Renderer>) -> Self {
         Self {
             navigation: NavigationState::new(),
+            interactive_allowed: false,
             profile,
             render: RenderGate::new(renderer),
             // 既定は無効（スレッドも子プロセスも作らない。`JS-1`）。有効化は `with_page_scripts`。
@@ -395,6 +516,44 @@ impl AppState {
             // 既定は無効（スレッドも子プロセスも作らない。`PERF-7`）。有効化は `with_script_contexts`。
             script_contexts: ScriptContextHandle::disabled(),
         }
+    }
+
+    /// 操作モードを許す（テストからだけ立てられる入口。TASK-124）。
+    ///
+    /// `cfg(test)` か feature `test-support`（結合テスト専用。ai 等の dev-dependencies だけが有効にする）のときだけ
+    /// コンパイルされる。本番の入口は設定キー `[rendering] interactive`（TASK-131）。
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn allow_interactive_for_tests(mut self) -> Self {
+        self.interactive_allowed = true;
+        self
+    }
+
+    /// 操作モードの最初の確定結果を保存する（版 1。`AISNAP-16`・`AISNAP-20`）。操作モードが許されていなければ
+    /// [`StateError::InteractiveNotAllowed`]。世代の判定は [`NavigationState::commit_navigation`] と同じ。
+    pub fn commit_interactive(
+        &self,
+        generation: NavigationGeneration,
+        sync: InteractiveSync,
+    ) -> Result<(), StateError> {
+        if !self.interactive_allowed {
+            return Err(StateError::InteractiveNotAllowed);
+        }
+        self.navigation.commit_interactive(generation, sync)
+    }
+
+    /// 操作モードの確定結果を同期の結果で差し替える（スクリプトを実行しない専用の入口。`AISNAP-20`）。
+    /// 条件は [`NavigationState`] の差し替え（世代・モード・`session`）と同じ。
+    pub fn replace_interactive(
+        &self,
+        generation: NavigationGeneration,
+        sync: InteractiveSync,
+    ) -> Result<(), StateError> {
+        if !self.interactive_allowed {
+            return Err(StateError::InteractiveNotAllowed);
+        }
+        self.navigation.replace_interactive(generation, sync)
     }
 
     /// ページスクリプトのアクターのハンドルを差し替える（TASK-112・`JS-4`）。cli が設定
@@ -819,6 +978,101 @@ mod tests {
 
     fn shot(gate: &RenderGate, nav: &NavigationState) -> Result<Screenshot, RenderError> {
         gate.with_page(nav, |r| r.capture_screenshot(&ScreenshotOptions::new()))
+    }
+
+    fn sync(session: &str, doc_seq: u64, html: &str) -> crate::interactive::InteractiveSync {
+        use crate::interactive::{HostDomSnapshot, InteractivePageId, build_interactive_document};
+        build_interactive_document(
+            HostDomSnapshot::new(
+                InteractivePageId::new(session, doc_seq).unwrap(),
+                "https://a.example/",
+                html.to_owned(),
+                10,
+                "s1",
+            )
+            .unwrap(),
+        )
+        .unwrap()
+    }
+
+    /// TASK-124・AISNAP-20: 操作モードの確定結果は版 1 で始まり、差し替えのたびに版が上がる。
+    /// `session` が違う差し替え・静的モードのページ・古い世代は拒否する（黙って差し替えない。AISNAP-21）。
+    #[test]
+    fn aisnap20_interactive_commit_and_replace() {
+        let nav = NavigationState::new();
+        let g = nav.begin_navigation().unwrap();
+        nav.commit_interactive(g, sync("s", 1, r#"<p data-fandhe-n="0">a</p>"#))
+            .unwrap();
+        let latest = nav.latest().unwrap();
+        assert_eq!(latest.mode(), PageMode::Interactive);
+        assert_eq!(latest.interactive().unwrap().revision(), 1);
+        assert!(!latest.html().contains("data-fandhe-n"));
+        nav.replace_interactive(g, sync("s", 2, r#"<p data-fandhe-n="1">b</p>"#))
+            .unwrap();
+        let latest = nav.latest().unwrap();
+        let doc = latest.interactive().unwrap();
+        assert_eq!((doc.revision(), doc.page().doc_seq()), (2, 2));
+        assert_eq!(
+            nav.replace_interactive(g, sync("other", 3, "<p></p>")),
+            Err(StateError::SessionMismatch)
+        );
+        assert_eq!(nav.latest().unwrap().interactive().unwrap().revision(), 2);
+        // 新しい navigate の後は古い世代で差し替えられない。静的モードのページは差し替えない。
+        let g2 = nav.begin_navigation().unwrap();
+        assert!(matches!(
+            nav.replace_interactive(g, sync("s", 4, "<p></p>")),
+            Err(StateError::Superseded { .. })
+        ));
+        nav.commit_navigation(g2, NavigationResult::new("https://b.example/", "<p></p>"))
+            .unwrap();
+        assert_eq!(nav.latest().unwrap().mode(), PageMode::Static);
+        assert_eq!(
+            nav.replace_interactive(g2, sync("s", 5, "<p></p>")),
+            Err(StateError::NotInteractive)
+        );
+    }
+
+    /// TASK-124: 操作モードは許可（テストの入口。本番は TASK-131 の設定キー）が無ければ保存できない。
+    #[test]
+    fn aisnap16_app_state_requires_interactive_permission() {
+        let dir = fandhe_browser_profile::test_base_dir()
+            .join(format!("fandhe-core-interactive-{}", std::process::id()));
+        let profile = Arc::new(Profile::open(&dir).expect("profile"));
+        let state = AppState::with_disabled_renderer(Arc::clone(&profile));
+        let g = state.navigation().begin_navigation().unwrap();
+        assert_eq!(
+            state.commit_interactive(g, sync("s", 1, "<p></p>")),
+            Err(StateError::InteractiveNotAllowed)
+        );
+        assert_eq!(
+            state.replace_interactive(g, sync("s", 1, "<p></p>")),
+            Err(StateError::InteractiveNotAllowed)
+        );
+        drop(state);
+        let state = AppState::with_disabled_renderer(profile).allow_interactive_for_tests();
+        let g = state.navigation().begin_navigation().unwrap();
+        state
+            .commit_interactive(g, sync("s", 1, "<p></p>"))
+            .unwrap();
+        assert_eq!(
+            state.navigation().latest().unwrap().mode(),
+            PageMode::Interactive
+        );
+        drop(state);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// TASK-124: 操作モードのページは描画ゲートから静的な `load` で読み直さない（ホストの状態を保つ）。
+    #[test]
+    fn aisnap20_gate_does_not_reload_interactive_page() {
+        let r = CountingRenderer::new();
+        let gate = RenderGate::new(r.clone());
+        let nav = NavigationState::new();
+        let g = nav.begin_navigation().unwrap();
+        nav.commit_interactive(g, sync("s", 1, "<p></p>")).unwrap();
+        shot(&gate, &nav).unwrap();
+        shot(&gate, &nav).unwrap();
+        assert_eq!((r.loads(), r.renders()), (0, 2));
     }
 
     #[test]

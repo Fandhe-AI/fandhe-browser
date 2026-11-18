@@ -19,6 +19,8 @@
 //!   格納自体は [`crate::state::AppState`] で実装済み（TASK-41.1・#169）
 //! - `fandhe-browser-render`（Servo）側の本実装（`RENDER-1`、`TASK-33` 本体・`TASK-38`、`MS-1`/`MS-4`）
 
+use crate::interactive::{HostDomSnapshot, InteractivePageId};
+
 /// 描画機能（スクリーンショット・可視性判定・境界ボックス取得）への唯一の境界となるトレイト
 /// （RENDER-1）。
 ///
@@ -52,6 +54,47 @@ pub trait Renderer: Send + Sync {
 
     /// 指定した要素の境界ボックスを取得する（RENDER-1）。
     fn bounding_box(&self, element: &ElementRef) -> Result<BoundingBox, RenderError>;
+
+    /// 操作モードでページを読み込む（TASK-124・`AISNAP-16`。設計 §14.1・§14.2）。
+    ///
+    /// 既定実装は [`RenderError::InteractiveUnavailable`]（成功を装わない。REPAIR-3）。実装は
+    /// render crate の `HostRenderer`（後続のタスク）。操作モードのページは [`crate::state::AppState`] の
+    /// 描画ゲートから読み直されない（ホストの状態が失われるため）。
+    fn load_interactive(&self, page: &PageRef) -> Result<InteractivePageLoad, RenderError> {
+        let _ = page;
+        Err(RenderError::InteractiveUnavailable)
+    }
+
+    /// 操作モードのページの DOM を取得する（TASK-124・`RENDER-11`・`AISNAP-20`。設計 §14.3）。
+    ///
+    /// 既定実装は [`RenderError::NotInteractive`]。結果は [`crate::interactive::build_interactive_document`]
+    /// で検査してから確定結果へ差し替える。
+    fn dom_snapshot(&self) -> Result<HostDomSnapshot, RenderError> {
+        Err(RenderError::NotInteractive)
+    }
+}
+
+/// 操作モードの読み込み結果（最終 URL とページ識別子。TASK-124）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct InteractivePageLoad {
+    load: PageLoad,
+    page: InteractivePageId,
+}
+
+impl InteractivePageLoad {
+    /// 作る（`HostRenderer` が成功結果を作る経路）。
+    pub fn new(load: PageLoad, page: InteractivePageId) -> Self {
+        Self { load, page }
+    }
+    /// 読み込みの結果。
+    pub fn load(&self) -> &PageLoad {
+        &self.load
+    }
+    /// ページ識別子。
+    pub fn page(&self) -> &InteractivePageId {
+        &self.page
+    }
 }
 
 /// レンダリング層が無効（feature `rendering` 無効時、または `fandhe-browser-render`
@@ -93,6 +136,15 @@ impl Renderer for DisabledRenderer {
     }
 
     fn bounding_box(&self, _element: &ElementRef) -> Result<BoundingBox, RenderError> {
+        Err(RenderError::RenderingDisabled)
+    }
+
+    // 操作モードも描画層が無効であることを返す（`AISNAP-21` の `rendering_disabled`）。
+    fn load_interactive(&self, _page: &PageRef) -> Result<InteractivePageLoad, RenderError> {
+        Err(RenderError::RenderingDisabled)
+    }
+
+    fn dom_snapshot(&self) -> Result<HostDomSnapshot, RenderError> {
         Err(RenderError::RenderingDisabled)
     }
 }
@@ -341,6 +393,18 @@ pub enum RenderError {
     /// [`crate::state::AppState`] が前ページの描画を返さず fail-closed にするために使う
     /// （RENDER-3・TASK-38）。要素が無い [`RenderError::ElementNotFound`] とは意味が異なる。
     PageNotLoaded,
+    /// 操作モードのページを保っていたホストが破棄・再起動された。自動で読み直さない
+    /// （`AISNAP-21`・TASK-121 の確定条件 3）。
+    SessionLost,
+    /// 操作モードでないページ・描画実装に、操作モードの要求をした（`AISNAP-21` の `not_interactive`）。
+    NotInteractive,
+    /// 操作モードを始められない（隔離が成立しない・内部アドレスを許す設定・ホストが未対応。
+    /// `AISNAP-16`・`AISNAP-21` の `interactive_unavailable`）。
+    InteractiveUnavailable,
+    /// 現在の URL が http / https でない（`RENDER-10`・`RENDER-11` の `invalid_state`）。
+    InvalidState,
+    /// 上限を超えた（切り詰めない。`RENDER-11` の `too_large`）。
+    TooLarge,
     /// 上記に分類できない内部エラー。
     ///
     /// `message` はファイルパス等の内部実装詳細を含みうるため、`Display` と `Debug`
@@ -362,6 +426,11 @@ impl std::fmt::Debug for RenderError {
             Self::HostExitedBeforeHello => f.write_str("HostExitedBeforeHello"),
             Self::ProtocolMismatch => f.write_str("ProtocolMismatch"),
             Self::PageNotLoaded => f.write_str("PageNotLoaded"),
+            Self::SessionLost => f.write_str("SessionLost"),
+            Self::NotInteractive => f.write_str("NotInteractive"),
+            Self::InteractiveUnavailable => f.write_str("InteractiveUnavailable"),
+            Self::InvalidState => f.write_str("InvalidState"),
+            Self::TooLarge => f.write_str("TooLarge"),
             // 内部詳細（ファイルパス等）を含みうるため、variant 名のみを出力し
             // メッセージ本体は伏せる。詳細取得は `internal_detail()` を使うこと。
             Self::Internal(_) => f.write_str("Internal(..)"),
@@ -395,6 +464,11 @@ impl std::fmt::Display for RenderError {
             }
             Self::ProtocolMismatch => write!(f, "render host protocol mismatch"),
             Self::PageNotLoaded => write!(f, "no page is loaded for rendering"),
+            Self::SessionLost => write!(f, "interactive session was lost"),
+            Self::NotInteractive => write!(f, "page is not in interactive mode"),
+            Self::InteractiveUnavailable => write!(f, "interactive mode is unavailable"),
+            Self::InvalidState => write!(f, "current document is not an http(s) page"),
+            Self::TooLarge => write!(f, "render result exceeds the size limit"),
             Self::Internal(_) => write!(f, "internal render error"),
         }
     }

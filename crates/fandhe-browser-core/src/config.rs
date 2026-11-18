@@ -1554,6 +1554,22 @@ mod tests {
         assert_eq!(EgressIsolationMode::BestEffort.as_str(), "best-effort");
     }
 
+    /// TASK-124・AISNAP-16: 操作モードの設定キー `[rendering] interactive` は TASK-131 まで受理せず、
+    /// 書かれていたら起動エラー（既存の未知キーの扱いと同じ）。
+    #[test]
+    fn aisnap16_interactive_key_is_rejected_until_task131() {
+        for input in [
+            "[rendering]\ninteractive = true\n",
+            "[rendering]\ninteractive = false\n",
+        ] {
+            let err = Config::from_toml_str(input).expect_err("interactive は未受理");
+            assert!(
+                matches!(err, Error::Config(ConfigError::Syntax { .. })),
+                "{input}: {err:?}"
+            );
+        }
+    }
+
     /// RENDER-3（TASK-38・#1436）: 未知の値は設定エラー、型違いは構文エラー。
     #[test]
     fn render_3_egress_isolation_rejects_unknown_values() {

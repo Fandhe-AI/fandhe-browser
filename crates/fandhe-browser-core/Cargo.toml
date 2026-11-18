@@ -65,6 +65,9 @@ fandhe-browser-js = { workspace = true }
 default = []
 js-v8 = ["fandhe-browser-js/js-v8"]
 js-boa = ["fandhe-browser-js/js-boa"]
+# 結合テスト専用の入口（`AppState::allow_interactive_for_tests`。TASK-124）。新しい依存を増やさない。
+# 本番のビルドでは有効にしない（使うのは他 crate の dev-dependencies だけ）。
+test-support = []
 
 [dev-dependencies]
 tokio = { workspace = true }
