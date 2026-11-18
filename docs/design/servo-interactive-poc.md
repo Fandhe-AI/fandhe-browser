@@ -28,7 +28,7 @@
 | (6) `file:` のサブリソース | 0.1.2 で拒否 | #1571 の許可リストで読み込み前に拒否（GHSA-pxmc-hqwc-jh66） |
 | (12) 保存 HTML の再パースでの実行 | 経路なし | 書き戻した HTML を navigate の経路へ再投入しない限り、スクリプト・`meta refresh` は動かない |
 | (4) Rust 側の矩形・ヒットテスト | 取れる（WebDriver の命令経由） | ページが上書きできない判定でクリック先を確かめられる。使うには `servo-base` の直接依存が要る（TASK-126 の着手時に承認を求める） |
-| (7) `JSValue::Element` の再利用 | WebDriver の命令でだけ再利用できる | 要素 ID は文書が変わると `NoSuchElement`、要素を消すと `StaleElementReference` になる |
+| (7) `JSValue::Element` の再利用 | WebDriver の命令と、ページの JS の `window.webdriverElement(id)` で再利用できる | 要素が動いても同じ要素を引ける。操作モードの番号を要素そのものに結びつけられる（`servo-host-design.md` §14.4） |
 | (8) delegate の既定の動き | 応答せずに捨てても止まらない | ダイアログ・選択肢・ファイル選択・新しいウィンドウの要求は、捨てても操作は進む。ダイアログの扱いは TASK-126 で決める |
 | (9) 入力・座標・resize | 成立。初回フレーム前の入力は失敗する | 座標は CSS px（`WebViewPoint::Page`）で渡す。最初のフレームを待ってから入力する |
 | (10) 8 MiB 級の DOM | release で直列化に約 13 秒・常駐メモリ約 1.5 GB | `dom_snapshot` の時間切れと上限、メモリの見積もりの根拠にする（TASK-121 の確定条件 5・6） |
@@ -154,12 +154,15 @@ TASK-120 の実装結果（2026-11-18・#1581）:
 - 受け口（`GenericSender`）を作る `servo_base::generic_channel::channel()` は `servo` から再輸出されていない。本採用には `servo-base =0.7.0` を直接依存に足す必要がある（MPL-2.0。`servo-host` の workspace だけ。[dependency-policy](../../.claude/rules/dependency-policy.md)）
 - TASK-121 の確定条件 2 への影響: 照合値・可視判定を自己申告で扱う前提に、ページが上書きできない判定を足せる。採るなら iframe 上の拒否は `ElementClickIntercepted` で兼ねられる。採らなければ、iframe 上の拒否とスクロール上限 3 回を最終形にする。どちらにするかは依存の承認とあわせて TASK-126 で決める（プロトコルはどちらでも変わらない。`servo-host-design.md` §14.4）
 
-### (7) `JSValue::Element` の再利用: WebDriver の命令でだけできる
+### (7) `JSValue::Element` の再利用: WebDriver の命令とページの JS でできる
 
 - `evaluate_javascript` が要素を返すと `JSValue::Element` に 32 桁の 16 進の ID が入る。`FindElementsCSSSelector` が返す ID と同じで、`GetElementRect` 等にそのまま渡せる
-- `evaluate_javascript` は文字列しか受け取らないため、ID を JS へ戻して要素を引くことはできない
+- `evaluate_javascript` は文字列しか受け取らないが、Servo 0.7.0 はページの JS に `window.webdriverElement(id)` を公開している（`Window.webidl` の WebDriver 拡張。pref による制限なし。Servo 自身が「公開すべきでないが当面公開している」と注記）。ID を JSON の文字列リテラルとして渡すと要素に戻せる（2026-11-19 の追加の試作。依存なし）
+  - 2 つの `li` を入れ替えた後も、同じ ID で同じ要素（`textContent` が同じ）を引けた。要素を消すと `null`
+  - 20 万要素の ID の取得（`getElementsByTagName('*')` を配列で返す）は初回 0.65 秒、2 回目 0.08 秒（release・macOS arm64。初回は ID を振る分）
+  - ページは `window.webdriverElement` を置き換えられる（自己申告として扱う）
 - 別の文書へ移った後は `NoSuchElement`、同じ文書で要素を消した後は `StaleElementReference`。試した 2 例では、古い ID で別の要素を操作することは無かった
-- ID はホストの中だけで使い、本体へは出さない前提にする（本体へ出すのは TASK-121 の確定条件 1 の番号）
+- ID はホストの中だけで使い、本体へは出さない前提にする（本体へ出すのは TASK-121 の確定条件 1 の番号）。操作モードでの使い方は `servo-host-design.md` §14.4
 
 ### (8) delegate の既定の動き: 応答せずに捨てても止まらない
 
@@ -212,7 +215,7 @@ release（macOS arm64）で 1 回測った。同じエンジンで 1 MiB を先�
 | ★3 後半 | 通知駆動に決定（2026-11-18。URL 変更の通知と新しい文書の読み込みの両方で上げる）。`url =2.5.8` を足して実際に受け取る | TASK-121 |
 | ★2 の条件 | 遷移の検査・回帰テスト・未試験の経路は TASK-120 で済み。現在 URL の検査と `data:`・`blob:` の iframe の除外は対象のメソッドと同時に入れる | TASK-122・TASK-126 |
 | (4) | WebDriver の命令で取れる。本採用には `servo-base =0.7.0` の直接依存の承認が要る | TASK-126（採らなければ iframe 上の拒否・スクロール上限 3 回を最終形にする。プロトコルは TASK-121 で確定済み） |
-| (7) | WebDriver の命令でだけ再利用できる（(4) と同じ依存が要る） | TASK-122・TASK-126 |
+| (7) | WebDriver の命令（(4) と同じ依存が要る）と、依存なしの `window.webdriverElement(id)` で再利用できる | TASK-122・TASK-126 |
 | (8) | 既定（捨てる）で操作は止まらない。ダイアログの扱いと右クリックのメニューは未決 | TASK-126 |
 | (9) | 確かめた。全ページ撮影で `fixed`・`vh` の要素がどう写るかの扱いは未決 | TASK-126・撮影の強化（RENDER-9） |
 | (10) | 測った。上限と時間切れの値は未決 | TASK-121（確定条件 5・6） |

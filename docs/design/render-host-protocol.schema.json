@@ -278,14 +278,14 @@
       "description": "html は主フレームの直列化で、各要素に属性 data-fandhe-n（前順の 0 起点の番号。整数から整形）を付ける。本体はパース後にこの属性を全要素から外し、文書順 → 番号の対応表を作る（番号の一意性と 0 以上 element_count 未満を検査し、違反は同期失敗。設計 §14.3）。保存する HTML に番号は残さない。伏せる対象の値は含めない（第 1 層）。iframe・shadow root の中身は含めず、数を excluded で返す（REPAIR-3）。HTML の長さ（8 MiB）と符号化した後のフレーム長（12 MiB）を超えるときは切り詰めずに too_large。maxLength は文字数で、バイト数の上限は実装が強制する。",
       "type": "object",
       "additionalProperties": true,
-      "required": ["page", "url", "html", "element_count", "structure", "excluded"],
+      "required": ["page", "url", "html", "element_count", "snapshot", "excluded"],
       "properties": {
         "page": { "$ref": "#/$defs/PageInfo" },
         "url": { "type": "string", "minLength": 1, "maxLength": 2048 },
         "html": { "type": "string", "maxLength": 8388608 },
         "element_count": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
-        "structure": {
-          "description": "要素の並び（前順のタグ名の列）からホストが作る値。act の要求でそのまま返し、ホストは操作の前に数え直して違えば stale を返す（同じ文書の中で要素が増減・移動して番号がずれたことを検出する。設計 §14.4）。中身は不透明として扱う。",
+        "snapshot": {
+          "description": "この取得の識別子（ホストが作る不透明な値）。ホストは最新の取得 1 件について「番号 → 要素そのもの」の対応を保持し、act はこの値と番号で要素を指す。要素が動いても同じ要素を指し、消えていれば stale（設計 §14.4）。",
           "type": "string", "minLength": 1, "maxLength": 64
         },
         "excluded": {
@@ -301,13 +301,13 @@
       }
     },
     "ActParams": {
-      "description": "要素への操作（RENDER-10・TASK-126。設計 §14.4）。node は dom_snapshot の番号、expect は照合値で、一致しなければ stale。セレクタはホストへ渡さない（本体が写しの上で解決する。確定条件 8）。入力文字は入力イベントで渡し、評価する JS へ連結しない。",
+      "description": "要素への操作（RENDER-10・TASK-126。設計 §14.4）。snapshot と node で dom_snapshot の時点の要素そのものを指す。expect は照合値で、一致しなければ stale。セレクタはホストへ渡さない（本体が写しの上で解決する。確定条件 8）。入力文字は入力イベントで渡し、評価する JS へ連結しない。",
       "type": "object",
       "additionalProperties": false,
-      "required": ["page", "structure", "node", "expect", "action"],
+      "required": ["page", "snapshot", "node", "expect", "action"],
       "properties": {
         "page": { "$ref": "#/$defs/PageRef" },
-        "structure": { "description": "dom_snapshot の結果の structure。", "type": "string", "minLength": 1, "maxLength": 64 },
+        "snapshot": { "description": "dom_snapshot の結果の snapshot。最新の取得でなければ stale。", "type": "string", "minLength": 1, "maxLength": 64 },
         "node": { "type": "integer", "minimum": 0, "maximum": 199999 },
         "expect": { "$ref": "#/$defs/ActExpect" },
         "action": {

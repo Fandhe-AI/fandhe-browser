@@ -1,5 +1,5 @@
 {
-  "case": "act-no-structure",
+  "case": "act-no-snapshot",
   "direction": "request",
   "method": "act",
   "expect": "invalid",
@@ -22,5 +22,5 @@
       }
     }
   },
-  "note": "structure は必須（同じ文書の中での番号のずれを検出する。設計 §14.4）"
+  "note": "snapshot は必須（どの取得の番号かを示す。設計 §14.4）"
 }

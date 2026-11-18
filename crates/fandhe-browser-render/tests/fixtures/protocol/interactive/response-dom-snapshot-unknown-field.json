@@ -14,7 +14,7 @@
       "url": "https://example.com/",
       "html": "<html data-fandhe-n=\"0\"></html>",
       "element_count": 1,
-      "structure": "9a3c5e7f10b2d4e6",
+      "snapshot": "s-7",
       "excluded": {
         "iframes": 0,
         "shadow_roots": 0

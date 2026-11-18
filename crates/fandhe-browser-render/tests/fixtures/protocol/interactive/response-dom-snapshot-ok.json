@@ -13,7 +13,7 @@
       "url": "https://example.com/form",
       "html": "<html data-fandhe-n=\"0\"><head data-fandhe-n=\"1\"></head><body data-fandhe-n=\"2\"><form data-fandhe-n=\"3\"><input data-fandhe-n=\"4\" name=\"q\" value=\"shoes\"><input data-fandhe-n=\"5\" type=\"password\" name=\"pw\"><iframe data-fandhe-n=\"6\" src=\"https://example.com/ad\"></iframe></form></body></html>",
       "element_count": 7,
-      "structure": "9a3c5e7f10b2d4e6",
+      "snapshot": "s-7",
       "excluded": {
         "iframes": 1,
         "shadow_roots": 0

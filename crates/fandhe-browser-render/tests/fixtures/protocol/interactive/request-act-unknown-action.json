@@ -12,7 +12,7 @@
         "session": "3f9c2a7d1b4e4c0a9d8e7f6a5b4c3d2e",
         "doc_seq": 2
       },
-      "structure": "9a3c5e7f10b2d4e6",
+      "snapshot": "s-7",
       "node": 7,
       "expect": {
         "tag": "input"
