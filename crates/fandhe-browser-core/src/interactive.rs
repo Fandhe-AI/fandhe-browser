@@ -428,7 +428,7 @@ mod tests {
             build_interactive_document(snap(&many, 0)).err(),
             Some(SyncError::TooManyElements)
         );
-        // html・head・body の 3 段を含めて深さちょうど 512 は通る。
+        // 祖先の html・body の 2 段を含めて深さちょうど 512 は通る。
         let ok = "<div>".repeat(MAX_INTERACTIVE_DEPTH - 2);
         assert!(build_interactive_document(snap(&ok, 0)).is_ok());
         let s = build_interactive_document(snap("<p>secret-text</p>", 0)).unwrap();
