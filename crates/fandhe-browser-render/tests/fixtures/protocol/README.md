@@ -10,6 +10,13 @@
 型・コーデックの実装は #989（クライアント）・#993（ホスト）の範囲。ホスト側の契約テストが
 本ディレクトリを読む配線も #993・#995 の範囲。
 
+## 操作モードの fixture（`interactive/`）
+
+操作モードのメソッド（`dom_snapshot`・`act`・`wait`。TASK-121・`RENDER-10`・`RENDER-11`）は設計を確定した段階で、
+ホスト・クライアントとも未実装。その fixture は `interactive/` に置き、`tests/protocol_fixtures.rs` だけが
+スキーマとの整合と網羅を検証する。ホスト側・クライアント側の契約テストは本ディレクトリの直下だけを読む。
+実装（TASK-122・TASK-123・TASK-126）で直下へ移し、両側の契約テストに配線する（設計 `servo-host-design.md` §14.8）。
+
 ## 封筒（envelope）
 
 ```json

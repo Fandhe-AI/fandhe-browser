@@ -1,0 +1,13 @@
+{
+  "case": "error-not-actionable",
+  "direction": "response",
+  "expect": "valid",
+  "message": {
+    "v": 1,
+    "id": 1,
+    "error": {
+      "kind": "not_actionable",
+      "message": "Element is not actionable."
+    }
+  }
+}

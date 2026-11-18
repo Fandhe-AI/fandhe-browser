@@ -1,0 +1,13 @@
+{
+  "case": "error-too-large",
+  "direction": "response",
+  "expect": "valid",
+  "message": {
+    "v": 1,
+    "id": 1,
+    "error": {
+      "kind": "too_large",
+      "message": "DOM snapshot exceeds the size limit."
+    }
+  }
+}

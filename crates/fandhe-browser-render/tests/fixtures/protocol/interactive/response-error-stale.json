@@ -1,0 +1,13 @@
+{
+  "case": "error-stale",
+  "direction": "response",
+  "expect": "valid",
+  "message": {
+    "v": 1,
+    "id": 1,
+    "error": {
+      "kind": "stale",
+      "message": "Page or element no longer matches."
+    }
+  }
+}

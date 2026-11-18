@@ -1,0 +1,22 @@
+{
+  "case": "wait-selector-ok",
+  "direction": "request",
+  "method": "wait",
+  "expect": "valid",
+  "message": {
+    "v": 1,
+    "id": 1,
+    "method": "wait",
+    "params": {
+      "page": {
+        "session": "3f9c2a7d1b4e4c0a9d8e7f6a5b4c3d2e",
+        "doc_seq": 2
+      },
+      "condition": {
+        "kind": "selector_present",
+        "selector": "#result"
+      },
+      "timeout_ms": 5000
+    }
+  }
+}

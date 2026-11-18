@@ -1,0 +1,19 @@
+{
+  "case": "dom-snapshot-page-unknown-field",
+  "direction": "request",
+  "method": "dom_snapshot",
+  "expect": "invalid",
+  "message": {
+    "v": 1,
+    "id": 1,
+    "method": "dom_snapshot",
+    "params": {
+      "page": {
+        "session": "3f9c2a7d1b4e4c0a9d8e7f6a5b4c3d2e",
+        "doc_seq": 2,
+        "url": "https://example.com/"
+      }
+    }
+  },
+  "note": "要求側の PageRef は未知フィールドを拒否する"
+}
