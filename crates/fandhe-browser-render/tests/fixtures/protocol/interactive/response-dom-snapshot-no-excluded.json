@@ -1,0 +1,21 @@
+{
+  "case": "dom-snapshot-no-excluded",
+  "direction": "response",
+  "expect": "invalid",
+  "message": {
+    "v": 1,
+    "id": 1,
+    "result": {
+      "page": {
+        "session": "3f9c2a7d1b4e4c0a9d8e7f6a5b4c3d2e",
+        "doc_seq": 2
+      },
+      "url": "https://example.com/",
+      "html": "<html></html>",
+      "element_count": 1,
+      "snapshot": "s-7"
+    }
+  },
+  "method": "dom_snapshot",
+  "note": "iframe・shadow root を含めないことを excluded で明記する（RENDER-11・REPAIR-3）"
+}

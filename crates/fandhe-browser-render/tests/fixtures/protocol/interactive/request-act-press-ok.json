@@ -1,0 +1,26 @@
+{
+  "case": "act-press-ok",
+  "direction": "request",
+  "method": "act",
+  "expect": "valid",
+  "message": {
+    "v": 1,
+    "id": 1,
+    "method": "act",
+    "params": {
+      "page": {
+        "session": "3f9c2a7d1b4e4c0a9d8e7f6a5b4c3d2e",
+        "doc_seq": 2
+      },
+      "snapshot": "s-7",
+      "node": 7,
+      "expect": {
+        "tag": "input"
+      },
+      "action": {
+        "kind": "press",
+        "key": "Enter"
+      }
+    }
+  }
+}

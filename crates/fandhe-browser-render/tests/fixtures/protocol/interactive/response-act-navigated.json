@@ -1,0 +1,18 @@
+{
+  "case": "act-navigated",
+  "direction": "response",
+  "expect": "valid",
+  "message": {
+    "v": 1,
+    "id": 1,
+    "result": {
+      "page": {
+        "session": "3f9c2a7d1b4e4c0a9d8e7f6a5b4c3d2e",
+        "doc_seq": 3
+      },
+      "navigated": true
+    }
+  },
+  "method": "act",
+  "note": "遷移先の URL は返さない"
+}

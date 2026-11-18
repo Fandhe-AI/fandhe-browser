@@ -1,0 +1,18 @@
+{
+  "case": "load-interactive-ok",
+  "direction": "response",
+  "expect": "valid",
+  "message": {
+    "v": 1,
+    "id": 1,
+    "result": {
+      "final_url": "https://example.com/",
+      "page": {
+        "session": "3f9c2a7d1b4e4c0a9d8e7f6a5b4c3d2e",
+        "doc_seq": 0
+      }
+    }
+  },
+  "method": "load",
+  "note": "--interactive のホストは load の結果に page を足す（設計 §14.2）"
+}

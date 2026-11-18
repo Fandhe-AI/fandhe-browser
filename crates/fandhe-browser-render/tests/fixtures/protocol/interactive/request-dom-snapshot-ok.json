@@ -1,0 +1,13 @@
+{
+  "case": "dom-snapshot-ok",
+  "direction": "request",
+  "method": "dom_snapshot",
+  "expect": "valid",
+  "message": {
+    "v": 1,
+    "id": 1,
+    "method": "dom_snapshot",
+    "params": {}
+  },
+  "note": "params は空（page を照合しない。いまの文書を返す。設計 §14.2）"
+}

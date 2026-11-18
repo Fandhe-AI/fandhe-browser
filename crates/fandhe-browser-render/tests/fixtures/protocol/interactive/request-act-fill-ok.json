@@ -1,0 +1,30 @@
+{
+  "case": "act-fill-ok",
+  "direction": "request",
+  "method": "act",
+  "expect": "valid",
+  "message": {
+    "v": 1,
+    "id": 1,
+    "method": "act",
+    "params": {
+      "page": {
+        "session": "3f9c2a7d1b4e4c0a9d8e7f6a5b4c3d2e",
+        "doc_seq": 2
+      },
+      "snapshot": "s-7",
+      "node": 7,
+      "expect": {
+        "tag": "input",
+        "name": "q",
+        "type": "text"
+      },
+      "action": {
+        "kind": "fill",
+        "text": "example query",
+        "sensitive": false
+      }
+    }
+  },
+  "note": "text はログ・エラー・応答に出さない（設計 §14.4）"
+}

@@ -1,0 +1,27 @@
+{
+  "case": "dom-snapshot-unknown-field",
+  "direction": "response",
+  "expect": "valid",
+  "message": {
+    "v": 1,
+    "id": 1,
+    "result": {
+      "page": {
+        "session": "3f9c2a7d1b4e4c0a9d8e7f6a5b4c3d2e",
+        "doc_seq": 2,
+        "future": 1
+      },
+      "url": "https://example.com/",
+      "html": "<html data-fandhe-n=\"0\"></html>",
+      "element_count": 1,
+      "snapshot": "s-7",
+      "excluded": {
+        "iframes": 0,
+        "shadow_roots": 0
+      },
+      "future": true
+    }
+  },
+  "method": "dom_snapshot",
+  "note": "応答側の未知フィールドは無視する（REPAIR-4）"
+}

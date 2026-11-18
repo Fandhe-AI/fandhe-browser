@@ -1,0 +1,62 @@
+{
+  "case": "act-select-too-many",
+  "direction": "request",
+  "method": "act",
+  "expect": "invalid",
+  "message": {
+    "v": 1,
+    "id": 1,
+    "method": "act",
+    "params": {
+      "page": {
+        "session": "3f9c2a7d1b4e4c0a9d8e7f6a5b4c3d2e",
+        "doc_seq": 2
+      },
+      "snapshot": "s-7",
+      "node": 9,
+      "expect": {
+        "tag": "select",
+        "name": "color"
+      },
+      "action": {
+        "kind": "select",
+        "values": [
+          "0",
+          "1",
+          "2",
+          "3",
+          "4",
+          "5",
+          "6",
+          "7",
+          "8",
+          "9",
+          "10",
+          "11",
+          "12",
+          "13",
+          "14",
+          "15",
+          "16",
+          "17",
+          "18",
+          "19",
+          "20",
+          "21",
+          "22",
+          "23",
+          "24",
+          "25",
+          "26",
+          "27",
+          "28",
+          "29",
+          "30",
+          "31",
+          "32"
+        ]
+      }
+    }
+  },
+  "note": "values は 32 件まで"
+}

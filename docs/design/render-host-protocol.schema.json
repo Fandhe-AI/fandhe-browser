@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/Fandhe-AI/fandhe-browser/blob/main/docs/design/render-host-protocol.schema.json",
   "title": "fandhe-browser render host protocol (v1)",
-  "description": "本体（fandhe-browser-render の IPC クライアント）と Servo ホスト（別 workspace の servo-host/）の間の stdio プロトコル契約（TASK-38・PLUG-1・SEC-2・REPAIR-4。設計は docs/design/servo-host-design.md §2.1〜§2.5・§3.1）。両側は型を共有しないため、本スキーマと crates/fandhe-browser-render/tests/fixtures/protocol/ のゴールデン fixture を契約の正本とし、型・コーデックは各側（#989・#993）で実装する。トランスポートは stdio のみ（ポートを開かない）で、フレームは u32 LE の長さ接頭辞 + UTF-8 JSON。ホストは起動直後に HelloEvent（{\"v\":1,\"event\":\"hello\",\"data\":{...}}。id を持たず応答と区別できる）を 1 回送る。要求は Request、応答は Response（result か error のどちらか一方。反対側のキーの存在は null でも禁止）。要求の id が有効な RequestId として取り出せない場合（欠落・負数・文字列・範囲外）と JSON として解釈できない場合、ホストは応答を返さずプロトコル違反として接続を閉じる（無関係な id の応答は返さない。設計 §2.2）。暫定上限（実測後に確定。設計 §2.4）: 要求フレーム 64 KiB、応答フレーム 1 MiB、hello フレーム 16 KiB、スクリーンショット応答フレーム 24 MiB、url 2048 B、selector 1024 B、エラーメッセージ 512 B。上限は確保前に検証する（実装側の契約）。maxLength は文字数であり、UTF-8 バイト数の上限は実装が強制する。未知フィールドの方針（REPAIR-4）: 応答側（Response・result・error・Hello・HelloLimits）は additionalProperties: true で、クライアントは未知フィールドを無視する。要求側（Request・各 *Params）は additionalProperties: false で、ホストは invalid_request / invalid_params で拒否する（fail-closed）。識別面（SEC-2）: どの *Params にも UA・ヘッダ・Cookie・locale・タイムゾーン・TLS・proxy・ビューポート・画面サイズのパラメータを置かない。未実装メソッドは成功を装わず unsupported を返す。ホストからの応答も untrusted として、クライアントがスキーマ相当の検証をする。url の scheme は http / https のみで、file:・data:・javascript:・about:・userinfo 付きは invalid_params で拒否する（実装側の二重検証。設計 §2.5）。Servo 内部のリダイレクト・サブリソースの制限は #1003 に委ねる。",
+  "description": "本体（fandhe-browser-render の IPC クライアント）と Servo ホスト（別 workspace の servo-host/）の間の stdio プロトコル契約（TASK-38・PLUG-1・SEC-2・REPAIR-4。設計は docs/design/servo-host-design.md §2.1〜§2.5・§3.1）。両側は型を共有しないため、本スキーマと crates/fandhe-browser-render/tests/fixtures/protocol/ のゴールデン fixture を契約の正本とし、型・コーデックは各側（#989・#993）で実装する。トランスポートは stdio のみ（ポートを開かない）で、フレームは u32 LE の長さ接頭辞 + UTF-8 JSON。ホストは起動直後に HelloEvent（{\"v\":1,\"event\":\"hello\",\"data\":{...}}。id を持たず応答と区別できる）を 1 回送る。要求は Request、応答は Response（result か error のどちらか一方。反対側のキーの存在は null でも禁止）。要求の id が有効な RequestId として取り出せない場合（欠落・負数・文字列・範囲外）と JSON として解釈できない場合、ホストは応答を返さずプロトコル違反として接続を閉じる（無関係な id の応答は返さない。設計 §2.2）。暫定上限（実測後に確定。設計 §2.4）: 要求フレーム 64 KiB、応答フレーム 1 MiB、hello フレーム 16 KiB、スクリーンショット応答フレーム 24 MiB、url 2048 B、selector 1024 B、エラーメッセージ 512 B。上限は確保前に検証する（実装側の契約）。maxLength は文字数であり、UTF-8 バイト数の上限は実装が強制する。未知フィールドの方針（REPAIR-4）: 応答側（Response・result・error・Hello・HelloLimits）は additionalProperties: true で、クライアントは未知フィールドを無視する。要求側（Request・各 *Params）は additionalProperties: false で、ホストは invalid_request / invalid_params で拒否する（fail-closed）。識別面（SEC-2）: どの *Params にも UA・ヘッダ・Cookie・locale・タイムゾーン・TLS・proxy・ビューポート・画面サイズのパラメータを置かない。未実装メソッドは成功を装わず unsupported を返す。操作モードのメソッド（dom_snapshot・act・wait。RENDER-10・RENDER-11）は TASK-121 で確定した設計で（設計 §14）、--interactive で起動したホストだけが capabilities に載せる。ホストの実装（TASK-122・TASK-126）までは、その契約 fixture を crates/fandhe-browser-render/tests/fixtures/protocol/interactive/ に置き、スキーマとの整合だけを検証する。dom_snapshot の応答フレームの上限は 12 MiB。ホストからの応答も untrusted として、クライアントがスキーマ相当の検証をする。url の scheme は http / https のみで、file:・data:・javascript:・about:・userinfo 付きは invalid_params で拒否する（実装側の二重検証。設計 §2.5）。Servo 内部のリダイレクト・サブリソースの制限は #1003 に委ねる。",
   "$defs": {
     "Version": {
       "description": "プロトコル版。v1 は 1 固定。",
@@ -56,7 +56,7 @@
       }
     },
     "Error": {
-      "description": "エラー。kind は v1 のホストが返す値の集合で、クライアントは未知の kind を汎用エラーにマップする。message は入力値（URL のクエリ等）・機密を含まない固定の英語で、512 文字以下。",
+      "description": "エラー。kind は v1 のホストが返す値の集合で、クライアントは未知の kind を汎用エラーにマップする。invalid_state・stale・not_actionable・too_large は操作モードのメソッド（dom_snapshot・act・wait。TASK-121・設計 §14.7）だけが返す。session_lost・busy 等はクライアント側の kind で、ホストは返さない。message は入力値（URL のクエリ等）・機密を含まない固定の英語で、512 文字以下。",
       "type": "object",
       "additionalProperties": true,
       "required": ["kind", "message"],
@@ -70,7 +70,11 @@
             "not_found",
             "timeout",
             "load_failed",
-            "internal"
+            "internal",
+            "invalid_state",
+            "stale",
+            "not_actionable",
+            "too_large"
           ]
         },
         "message": { "type": "string", "maxLength": 512 }
@@ -139,7 +143,14 @@
         "load_timeout_max_ms": { "type": "integer", "minimum": 1, "default": 60000 },
         "screenshot_timeout_ms": { "type": "integer", "minimum": 1, "default": 20000 },
         "query_timeout_ms": { "type": "integer", "minimum": 1, "default": 5000 },
-        "shutdown_grace_ms": { "type": "integer", "minimum": 1, "default": 3000 }
+        "shutdown_grace_ms": { "type": "integer", "minimum": 1, "default": 3000 },
+        "dom_snapshot_html_bytes": { "description": "操作モード（--interactive のホストだけが申告する。設計 §14.6）。以下同じ。", "type": "integer", "minimum": 1, "default": 8388608 },
+        "dom_snapshot_frame_bytes": { "type": "integer", "minimum": 1, "default": 12582912 },
+        "dom_snapshot_timeout_ms": { "type": "integer", "minimum": 1, "default": 30000 },
+        "act_timeout_ms": { "type": "integer", "minimum": 1, "default": 10000 },
+        "wait_timeout_max_ms": { "type": "integer", "minimum": 1, "default": 60000 },
+        "fill_text_bytes": { "type": "integer", "minimum": 1, "default": 8192 },
+        "wait_condition_bytes": { "type": "integer", "minimum": 1, "default": 1024 }
       }
     },
     "LoadParams": {
@@ -161,6 +172,10 @@
         "status": {
           "description": "HTTP ステータス。ホストが取得できない場合（Servo 0.6.0・0.7.0 等）はキーごと省略する。ホストは成功を装う値を入れない（REPAIR-3）。",
           "type": "integer", "minimum": 100, "maximum": 599
+        },
+        "page": {
+          "description": "読み込んだページの識別子。--interactive で起動したホストだけが返す（設計 §14.2）。",
+          "$ref": "#/$defs/PageInfo"
         }
       }
     },
@@ -229,6 +244,195 @@
     "ShutdownResult": {
       "type": "object",
       "additionalProperties": true
+    },
+    "PageRef": {
+      "description": "要求側のページ識別子（設計 §14.2・TASK-121 の確定条件 3）。session はホストの起動ごとに変わる値、doc_seq は文書番号（load・URL 変更の通知・新しい文書の読み込みで上がる）。act・wait で使い、現在値と違えばホストは stale を返す。",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["session", "doc_seq"],
+      "properties": {
+        "session": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "doc_seq": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 }
+      }
+    },
+    "PageInfo": {
+      "description": "応答側のページ識別子。項目は PageRef と同じで、未知フィールドは無視する（REPAIR-4）。",
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["session", "doc_seq"],
+      "properties": {
+        "session": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "doc_seq": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 }
+      }
+    },
+    "DomSnapshotParams": {
+      "description": "主フレームの DOM の取得（RENDER-11・TASK-122。設計 §14.3）。params を持たず、page を照合しない。いまの文書の DOM と page を返すため、ホスト側だけで doc_seq が上がった後（pushState・スクリプト起点の遷移等）も、本体はこの要求で同期を取り直せる。",
+      "type": "object",
+      "additionalProperties": false
+    },
+    "DomSnapshotResult": {
+      "description": "html は主フレームの直列化で、各要素に属性 data-fandhe-n（前順の 0 起点の番号。整数から整形）を付ける。本体はパース後にこの属性を全要素から外し、文書順 → 番号の対応表を作る（番号の一意性と 0 以上 element_count 未満を検査し、違反は同期失敗。設計 §14.3）。保存する HTML に番号は残さない。伏せる対象の値は含めない（第 1 層）。iframe・shadow root の中身は含めず、数を excluded で返す（REPAIR-3）。HTML の長さ（8 MiB）と符号化した後のフレーム長（12 MiB）を超えるときは切り詰めずに too_large。maxLength は文字数で、バイト数の上限は実装が強制する。",
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["page", "url", "html", "element_count", "snapshot", "excluded"],
+      "properties": {
+        "page": { "$ref": "#/$defs/PageInfo" },
+        "url": { "type": "string", "minLength": 1, "maxLength": 2048 },
+        "html": { "type": "string", "maxLength": 8388608 },
+        "element_count": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+        "snapshot": {
+          "description": "この取得の識別子（ホストが作る不透明な値）。ホストは最新の取得 1 件について「番号 → 要素そのもの」の対応を保持し、act はこの値と番号で要素を指す。要素が動いても同じ要素を指し、消えていれば stale（設計 §14.4）。",
+          "type": "string", "minLength": 1, "maxLength": 64
+        },
+        "excluded": {
+          "type": "object",
+          "additionalProperties": true,
+          "required": ["iframes", "shadow_roots"],
+          "properties": {
+            "iframes": { "type": "integer", "minimum": 0 },
+            "shadow_roots": { "type": "integer", "minimum": 0 }
+          }
+        },
+        "redacted": { "description": "値を伏せた要素の数。", "type": "integer", "minimum": 0 }
+      }
+    },
+    "ActParams": {
+      "description": "要素への操作（RENDER-10・TASK-126。設計 §14.4）。snapshot と node で dom_snapshot の時点の要素そのものを指す。expect は照合値で、一致しなければ stale。セレクタはホストへ渡さない（本体が写しの上で解決する。確定条件 8）。入力文字は入力イベントで渡し、評価する JS へ連結しない。",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["page", "snapshot", "node", "expect", "action"],
+      "properties": {
+        "page": { "$ref": "#/$defs/PageRef" },
+        "snapshot": { "description": "dom_snapshot の結果の snapshot。最新の取得でなければ stale。", "type": "string", "minLength": 1, "maxLength": 64 },
+        "node": { "type": "integer", "minimum": 0, "maximum": 199999 },
+        "expect": { "$ref": "#/$defs/ActExpect" },
+        "action": {
+          "oneOf": [
+            { "$ref": "#/$defs/ClickAction" },
+            { "$ref": "#/$defs/FillAction" },
+            { "$ref": "#/$defs/SelectAction" },
+            { "$ref": "#/$defs/PressAction" }
+          ]
+        }
+      }
+    },
+    "ActExpect": {
+      "description": "照合値。tag は小文字のローカル名で必須。id・name・type は属性値で、送ったものだけを照合する（本体の写しに属性が無い、または 256 文字を超える場合は送らない）。照合値は自己申告（ページが書き換えられる）として扱う（確定条件 2）。",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["tag"],
+      "properties": {
+        "tag": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "id": { "type": "string", "maxLength": 256 },
+        "name": { "type": "string", "maxLength": 256 },
+        "type": { "type": "string", "maxLength": 256 }
+      }
+    },
+    "ClickAction": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind"],
+      "properties": {
+        "kind": { "const": "click" }
+      }
+    },
+    "FillAction": {
+      "description": "text はログ・エラー・応答に出さない。sensitive は本体が伏せる対象に加えるための印で、ホストは値を記録しないことだけに使う。",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "text"],
+      "properties": {
+        "kind": { "const": "fill" },
+        "text": { "type": "string", "maxLength": 8192 },
+        "sensitive": { "type": "boolean", "default": false }
+      }
+    },
+    "SelectAction": {
+      "description": "values は option の value（32 件・各 512 文字まで。要求フレーム 64 KiB に収めるため）。複数選択でない select に 2 件以上は invalid_params。",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "values"],
+      "properties": {
+        "kind": { "const": "select" },
+        "values": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 32,
+          "items": { "type": "string", "maxLength": 512 }
+        }
+      }
+    },
+    "PressAction": {
+      "description": "key はキー名（Enter・Tab・Escape・Backspace・矢印キー等の固定の一覧）か 1 文字。一覧外は invalid_params。",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "key"],
+      "properties": {
+        "kind": { "const": "press" },
+        "key": { "type": "string", "minLength": 1, "maxLength": 32 }
+      }
+    },
+    "ActResult": {
+      "description": "操作の後のページ識別子。navigated は doc_seq が変わったか。遷移先の URL は返さない（クエリを応答に出さないため）。",
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["page", "navigated"],
+      "properties": {
+        "page": { "$ref": "#/$defs/PageInfo" },
+        "navigated": { "type": "boolean" }
+      }
+    },
+    "WaitParams": {
+      "description": "条件の成立を待つ（AISNAP-18・TASK-126。設計 §14.5）。timeout_ms は必須で最大 60 秒。selector と text は同じ検証（1024 B 以下）をかけ、ホストは JSON の文字列リテラルとして評価する JS へ渡す（連結しない。確定条件 8）。",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["page", "condition", "timeout_ms"],
+      "properties": {
+        "page": { "$ref": "#/$defs/PageRef" },
+        "condition": {
+          "oneOf": [
+            { "$ref": "#/$defs/SelectorCondition" },
+            { "$ref": "#/$defs/TextCondition" },
+            { "$ref": "#/$defs/LoadCompleteCondition" }
+          ]
+        },
+        "timeout_ms": { "type": "integer", "minimum": 1, "maximum": 60000 }
+      }
+    },
+    "SelectorCondition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "selector"],
+      "properties": {
+        "kind": { "enum": ["selector_present", "selector_absent"] },
+        "selector": { "type": "string", "minLength": 1, "maxLength": 1024 }
+      }
+    },
+    "TextCondition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "text"],
+      "properties": {
+        "kind": { "const": "text_present" },
+        "text": { "type": "string", "minLength": 1, "maxLength": 1024 }
+      }
+    },
+    "LoadCompleteCondition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind"],
+      "properties": {
+        "kind": { "const": "load_complete" }
+      }
+    },
+    "WaitResult": {
+      "description": "条件が成立した時点のページ識別子。上限時間までに成立しなければ timeout（ホストは破棄しない）。待機中に文書が変われば stale（load_complete を除く）。",
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["page"],
+      "properties": {
+        "page": { "$ref": "#/$defs/PageInfo" }
+      }
     }
   }
 }

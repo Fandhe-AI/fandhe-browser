@@ -1,0 +1,18 @@
+{
+  "case": "dom-snapshot-with-page",
+  "direction": "request",
+  "method": "dom_snapshot",
+  "expect": "invalid",
+  "message": {
+    "v": 1,
+    "id": 1,
+    "method": "dom_snapshot",
+    "params": {
+      "page": {
+        "session": "3f9c2a7d1b4e4c0a9d8e7f6a5b4c3d2e",
+        "doc_seq": 2
+      }
+    }
+  },
+  "note": "dom_snapshot は page を取らない（未知の params は拒否する）"
+}

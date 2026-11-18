@@ -28,6 +28,7 @@
 | 保留 | egress 方針（Servo 内部通信の制限）は GA 前に判断する | #1003（本書 §2.5。比較設計と実測計画は [servo-host-egress-isolation.md](./servo-host-egress-isolation.md)） |
 | 決定済み | crates.io のソース配布を先行する。9 個目の crate、対象は macOS・Linux（Windows は対象外）、crate は `MIT OR Apache-2.0`、`NOTICE` の MPL 適用範囲は不変、Servo `=0.7.0` のまま、版は他 crate と揃える | オーナー判断 2026-11-07（#1538。本書 §13 項目 10） |
 | 保留 | コンテナの配布は spec の整理（`TASK-64`・`CTR-4`）後に起票する。バイナリ配布は未決 | 本書 §8.2・§10 |
+| 確定（TASK-121） | 操作モードのプロトコル（`dom_snapshot`・`act`・`wait`・ページ識別子・上限・エラー kind・契約 fixture）。実装は TASK-122〜TASK-126 | 本書 §14・#1582 |
 
 オーナー判断の結果は §13 に記録する。
 
@@ -93,6 +94,7 @@ servo-host/
 | `visibility` | `selector` | `visible`, `reason?` |
 | `bounding_box` | `selector` | `x`, `y`, `width`, `height` |
 | `shutdown` | なし | なし |
+| `dom_snapshot`・`act`・`wait` | §14 | §14（操作モード。`--interactive` のホストだけ。TASK-121 で設計を確定し、実装は TASK-122・TASK-126） |
 
 - 戻り値は将来拡張できる構造型（`#[non_exhaustive]`。`REPAIR-4`）。未知メソッドは `unsupported` エラー、応答側の未知フィールドはクライアントが無視する。
 - 契約は `docs/design/render-host-protocol.schema.json`（`host-api.schema.json` と同流儀。作成は §10 の P1）で定義する。
@@ -122,6 +124,7 @@ servo-host/
 | 要素クエリ | 5 秒 |
 | `shutdown` | 3 秒の猶予後に kill |
 
+- 操作モードのメソッドの上限・時間切れは §14.6。
 - バイナリは v1 では base64 inline で返す。一時ファイルパス返却はパス検証・TOCTOU・シンボリックリンクのリスクがあるため v1 では不採用で、サイズ実測後に再検討する。
 
 ### 2.5 URL・セレクタの検証
@@ -453,6 +456,106 @@ AGENTS.md の変更はレビュー基準の変更として AI レビューで P0
 11. ページの全ての読み込み（主フレーム・iframe・サブリソース・Worker）を、許可リスト（scheme が `http`・`https`・`data`・`blob` と、`about:blank`・`about:srcdoc` の完全一致）で検査する。許可外は空の応答で終える。WebSocket のハンドシェイクは隔離の有無によらず拒否する。主フレームの URL 検証（`http` / `https` のみ）は従来どおり。ディレクトリ一覧は無効にする（§2.5）: 決定
 12. 隔離できない unix（`best-effort` の降格）でも、本体の egress プロキシを起動し `--egress-proxy-port` でホストへ渡す。プロキシ経由のため、既定（`allow_private_network_access=false`）ではループバック・プライベート宛を拒否する。プロキシの起動に失敗したらホストを起動しない（fail-closed）。ただし遮断はサンドボックスではなく、ホストがプロキシ設定に従うことに依存する（§2.5・§2.6）: 決定
 13. Windows（非 unix）は本体のプロキシも隔離も無いため、`best-effort` でも隔離なしの起動を拒否する。Windows では撮影できない。`--version` の版の検査は隔離なしで実行できる（ページを読まない）。Windows 向けのプロキシは後続の作業（§2.5・§2.6）: 決定
+
+## 14. 操作モードのプロトコル（TASK-121・#1582）
+
+対応 `TASK-121` / `MS-10` / ビヘイビア `RENDER-10` / `RENDER-11` / `AISNAP-16`〜`AISNAP-21`（spec `rendering-layer.md`「Servo ホスト側のページの操作」節）。契約はスキーマ（`render-host-protocol.schema.json`）と fixture（§14.8）で、本節はその理由と、スキーマで表せない振る舞いを記す。確定条件 1〜8 は spec `05-tasks.md` の TASK-121。試作の結果は [servo-interactive-poc.md](./servo-interactive-poc.md)。
+
+### 14.1 範囲と起動
+
+- 追加するメソッドは `dom_snapshot`（TASK-122）・`act`・`wait`（TASK-126）の 3 つ。撮影の範囲（`RENDER-9`・TASK-134）と画面サイズ（`RENDER-8`・TASK-133）は含めない
+- プロトコルの版（`v`）は 1 のまま。追加のメソッドは `hello` の `capabilities` で知らせ、載せていないホストは `unsupported` を返す（§2.2 と同じ）
+- ホストは固定の起動引数 `--interactive` のときだけ 3 つを `capabilities` に載せて受け付け、`hello` の `limits` に §14.6 の項目を足す（fixture `hello-interactive-ok`）。`--interactive` は egress の引数（`--egress-proxy-port`・`--egress-relay-uds`。§2.6）と一緒のときだけ受け付け、単独なら起動を拒否する（fail-closed）
+- 本体は、いま動いているホストの実際の隔離状態が `Isolated` で、`allow_private_network_access = false` のときだけ `--interactive` を付けて起動する（確定条件 7・`AISNAP-16`）。ホスト側の上の条件は本体の検査の重ねで、隔離の成立を証明するものではない。内部アドレスへの接続は egress プロキシが止める（TASK-120 の前提）
+
+### 14.2 ページ識別子（確定条件 3）
+
+- `page` は `{"session": <文字列>, "doc_seq": <整数>}`。`session` はホストの起動ごとに変わる値（1〜64 文字。ホストが起動時に作る）で、予測できないことは求めない（同じ値を再び使わないことだけ）。`doc_seq` は 0 から始まる文書番号
+- `doc_seq` は、`load`・URL 変更の通知（`notify_url_changed`）・新しい文書の読み込みの開始で 1 上げる（2026-11-18 の判断。#1582）。同じ文書の中の `pushState`・`replaceState`・hash の変更でも上がる。SPA で取り直しが重い場合は、後から同じ文書の中の変更を除く方向で緩める。通知を受けるため `servo-host` に `url =2.5.8` を足す（承認済み。TASK-122）
+- `--interactive` のホストは `load` の結果に `page` を足す（fixture `response-load-interactive-ok`）。`act`・`wait` は要求に `page` を持ち、ホストは現在の値と違えば処理せずに `stale` を返す。応答は処理の後の `page`
+- 同期の取り直し: ページが `load` の応答の後に `pushState`・hash の変更・スクリプト起点の遷移を行うと、`doc_seq` はホスト側だけで上がる。`dom_snapshot` は `page` を照合せずにいまの文書の DOM と `page` を返すため、本体は `stale` を受けたら `dom_snapshot` で取り直して続けられる（再 `load` は要らない）。本体は返った `page` を保存済みの値と比べ、違えば文書が変わったとして確定結果を差し替える（TASK-124）。`act` は本体が直前に取り直す（`AISNAP-17`）ので、照合の厳密さは保たれる
+- `session_lost` はクライアント側の kind。ホストの破棄・再起動の後、クライアントは自動で `load` し直さず、新しい navigate まで `session_lost` を返す（`AISNAP-21`）。確定条件 3 の「テストで固定する」は、クライアントを実装する TASK-123 のテストで行う（本タスクは契約までで、クライアントの実装を含まないため）
+- 判断: ページ識別子をホストが持つのは、文書が変わったこと（戻る・進む・スクリプト起点の遷移）を本体が知る手段がホストの通知しかないため。本体のナビゲーション世代（`generation`）とは別の値で、対応づけは TASK-124 の確定結果が持つ
+
+### 14.3 DOM の取得（`dom_snapshot`。確定条件 1・4・5・`RENDER-11`）
+
+- 要求は params なし（`page` を照合しない。§14.2）。結果は `page`・`url`（現在の URL）・`html`・`element_count`・`snapshot`（§14.4）・`excluded`（`iframes`・`shadow_roots` の数）・`redacted`（値を伏せた要素の数）
+- 現在の URL が http / https でなければ `invalid_state`（`about:blank` も含む）
+- 番号: ホストの直列化器は、主フレームの要素に前順で 0 から番号を振り、各要素に属性 `data-fandhe-n="<番号>"` を付ける。番号は直列化器の整数のカウンタから整形し、ページ由来の文字列を使わない（確定条件 8）。属性は直列化の出力にだけ書き、ページの DOM には足さない（ページから見えない）。ページ自身が同名の属性を持っていても出力しない
+- 本体の検査: パースした後に全要素から `data-fandhe-n` を外し、「本体の文書順 → ホストの番号」の対応表を確定結果に持つ（TASK-124）。値は先頭 0 なしの十進の数字列で、0 以上 `element_count` 未満、重複なし。どれかに違反すれば同期失敗にする。番号の無い要素（再パースでパーサーが補った要素）は操作の対象にしない。保存する HTML に番号を残さない（確定条件 1）。本体は `noscript` の中身を、ホストと同じくスクリプトが有効な扱い（生のテキスト）でパースする。ページが同名の属性を文字列で仕込んでも、要素として解釈されなければ番号にならない。解釈されて番号が重なれば同期失敗になる（自分のページの同期を壊すだけで、別の要素を操作させることはできない）
+- 判断: 番号を HTML の外の表だけで渡す案は、本体の再パースで要素の並びが変わる場合（試作 (5)。DOM 操作で作った形の 9 試料中 5 件）に対応づけができないため採らない。属性で渡して本体が外す方式なら、並びが変わっても番号は要素に付いて移る
+- 現在値: `input` の `value`・`checked`、`option` の `selected`、`textarea` の内容は、DOM の属性ではなく現在値を書く。伏せる対象（`type=password`、`autocomplete` が `current-password`・`new-password`・`one-time-code`・`cc-*` で始まる値）の値は書かない（第 1 層。本体の第 2 層は TASK-125）
+- iframe・shadow root の中身は含めず、数を `excluded` で返す（`REPAIR-3`）。`data:`・`blob:` の iframe も同じく中身を含めない（#1581 の引き継ぎ）
+- 上限: ホストは HTML の UTF-8 の長さが 8 MiB を超えるとき、または応答を符号化した後のフレーム長が 12 MiB を超えるとき、切り詰めずに `too_large` を返す（確定条件 5）。本体はパースの時に要素数（200,000）と深さ（512）を数え、HTML の長さと `url` の長さ（2048）・scheme（http / https）も自分で検査する（確定条件 4）。応答フレームの上限は `dom_snapshot` だけ 12 MiB で、他のメソッドは従来の 1 MiB
+- 直列化のスクリプトは固定の関数式で、ページのグローバルへ書き込まない。ページは prototype を書き換えて出力を変えられるため、取得した DOM は自己申告として扱う（本体の検査が前提）
+
+### 14.4 操作（`act`。確定条件 2・8・`RENDER-10`）
+
+- 要求は `page`・`snapshot`・`node`（`dom_snapshot` の番号）・`expect`（照合値）・`action`。`action` は `click`・`fill`（`text`・`sensitive`）・`select`（`values`）・`press`（`key`）のどれか
+- 照合値は `tag`（小文字のローカル名。必須）と、`id`・`name`・`type` の属性値（本体の写しにあり 256 文字以下のものだけを送る。送ったものだけを照合する）。ホストは `snapshot` と `node` から要素そのもの（下記）を引き、照合値が一致しなければ `stale`。番号が範囲外のときも `stale`
+- 要素の同一性: `doc_seq` は遷移でしか上がらないため、番号を「前順で何番目か」として引き直すと、`dom_snapshot` から `act` までの間に要素が増減・移動したときに番号がずれる。`id`・`name` の無い同じ形の要素が並ぶと照合値も一致し、隣の要素を操作しうる（`AISNAP-17`「推測で別要素を操作しない」に反する）。そこで番号は位置ではなく要素そのものを指す。ホストは `dom_snapshot` のとき、番号を振った要素を `evaluate_javascript` の戻り値として受け取り、Servo が要素ごとに振る ID（`JSValue::Element`）を番号の順に保持する。`act` では番号に対応する ID を `window.webdriverElement(id)`（Servo 0.7.0 がページの JS に公開している関数）で要素に戻して操作する。要素が動いても同じ要素を指し、消えていれば `null` で `stale` になる（試作の結果は [servo-interactive-poc.md](./servo-interactive-poc.md) (7)）。ホストが保持するのは最新の取得 1 件だけで、`snapshot` はその取得の識別子（違えば `stale`）。ID は本体へ出さない
+- 自己申告: ページは `window.webdriverElement` を置き換えられるため、要素の引き直しも自己申告として扱う（ページは自分の DOM とイベントを常に変えられ、置き換えで得られるのは「自分のページの別の要素を操作させる」ことに限る）。照合値の検査は引き直した要素に対しても行う
+- ホストへの値の渡し方: 要素の ID・照合値・`select` の `values` は、ホストが `serde_json` で JSON のリテラルにしてから固定のスクリプトへ渡す（連結しない）。比較はそのスクリプトの中で行う
+- セレクタはホストへ渡さない。本体が同期済みの写しの上で解決し、番号で送る（確定条件 8・spec の判断 3）
+- 検査の順: 現在の URL（http / https でなければ `invalid_state`）→ `page`（`stale`）→ `snapshot`（`stale`）→ 番号から要素を引き直す（消えていれば `stale`）→ 照合値（`stale`）→ 操作できるか（`not_actionable`）→ 操作 → `fill` は入力の前後でフォーカスが対象にあるか（外れていたら `not_actionable`）
+- `not_actionable`: 不可視・`disabled`・他の要素に隠れている・クリック点が iframe 等の上・スクロールしても画面に入らない（スクロールのやり直しは 3 回まで）
+- 自己申告の扱い（確定条件 2）: JS から取る矩形・可視判定・クリック点の要素は、ページが prototype を書き換えて偽れる。ホストはこれらを操作してよいかの判定にだけ使い、偽られた場合に起きるのは「別の座標をクリックする」ことに限る（入力値は入力イベントで渡すため、偽装で値が別の経路へ漏れない）。試作 (4) で、`Servo::execute_webdriver_command` の WebDriver の命令を使えば、ページが書き換えられない矩形とヒットテスト（隠れていれば `ElementClickIntercepted`）を Rust 側で取れると分かった。使うには `servo-base =0.7.0` の直接依存が要るため、採るかどうかは TASK-126 の着手時に承認を求める。プロトコルはどちらでも変わらない
+- `unsupported`: 新しいウィンドウ（`request_create_new`）・ファイル選択（`FilePicker`）・ダウンロード。delegate の要求は応答せずに捨てても操作は止まらない（試作 (8)）。ダイアログの扱いは TASK-126 で決める（§14.9）
+- 入力文字は入力イベント（`notify_input_event`）で渡し、評価する JS へ連結しない。`text` と `press` の値、遷移先の URL のクエリを、ログ・エラー・応答に出さない（応答は `page` と `navigated` だけ）
+- 人の操作に見せるための遅延・軌跡・乱数は入れない（`SEC-2`）
+
+### 14.5 待機（`wait`。確定条件 8・`AISNAP-18`）
+
+- 要求は `page`・`condition`・`timeout_ms`（必須・1〜60,000）。`condition` は `selector_present`・`selector_absent`（`selector`）、`text_present`（`text`）、`load_complete` のどれか
+- `selector` と `text` には同じ検証（1〜1024 バイト）をかけ、ホストは `serde_json` で JSON の文字列リテラルにしてから固定のスクリプトへ渡す（連結しない）
+- 成立すれば `page` を返す。`timeout_ms` までに成立しなければ `timeout`（ホストは破棄しない）。待機中に `doc_seq` が変わったら `stale`（`load_complete` を除く）
+- 同時に待てるのは 1 件（`max_in_flight` が 1）。待機中の他の要求を `busy` で返すのは本体（`AISNAP-18`）
+
+### 14.6 上限・時間切れ・メモリ（確定条件 4〜6）
+
+| 項目 | 値 | 判断 |
+| ---- | -- | ---- |
+| `dom_snapshot` の HTML | 8 MiB（8,388,608 バイト） | spec `RENDER-11` |
+| `dom_snapshot` の応答フレーム | 12 MiB（12,582,912 バイト） | spec `RENDER-11` |
+| `dom_snapshot` の時間切れ | 30 秒 | 試作 (10) の 8 MiB で 13.9 秒（release・macOS arm64。`outerHTML`）。遅い環境の分を見込んで 2 倍強。番号を付ける直列化器は `outerHTML` を使えないため、TASK-122 で測り直して見直す |
+| `act` の時間切れ | 10 秒 | 入力イベントの完了通知を待つだけで、読み込みは待たない |
+| `wait` の上限時間 | 最大 60 秒 | spec `AISNAP-18`（`load` の上限と同じ） |
+| `fill` の `text` | 8192 バイト | 要求フレーム 64 KiB に収める |
+| `select` の `values` | 32 件・各 512 バイト | 同上（通常は封筒を含めて 64 KiB に収まる。制御文字が多く符号化後に 64 KiB を超える要求は、本体が送らずに `invalid_params` にする） |
+| `wait` の条件の文字列 | 1024 バイト | spec `AISNAP-18` |
+| 読み取り契機の同期の最小間隔 | 1 秒 | 直前の同期から 1 秒未満で、その間に `act`・`wait` が無ければ取り直さない（TASK-125） |
+
+- 時間切れでの破棄（確定条件 6・`AISNAP-17`）: `dom_snapshot` と `act` は、本体が上の時間に 5 秒の余裕を足した期限で待ち、過ぎたらホストを破棄して `session_lost` を返す。ホストは `act` に `timeout` を返さない（`wait` だけが `timeout` を返す）。破棄の後は自動で読み直さない（§14.2）
+- メモリの見積もり（多重のコピー込み。8 MiB・ASCII の最悪の場合）: ホストは、番号の対応（要素の ID。20 万件で約 6.4 MB と `Vec` の分）に加えて、ページの DOM が試作 (10) で約 1.2 GB（8 MiB のページで読み込み前から +1.18 GB）、直列化の間にさらに約 130 MB（JS の文字列〔UTF-16 で 16 MiB〕・Rust の `String` 8 MiB・符号化したフレーム 12 MiB とその途中の確保）。§2.7 の RSS 上限の既定（2 GiB）の内側だが余裕は小さく、上限を超えたらホストは破棄される。本体は、受信フレーム 12 MiB・JSON から取り出した `String` 8 MiB・番号を外した保存用の HTML 8 MiB・core の DOM（倍率は未測定）を同時に持ちうる。core の DOM の倍率と Linux での時間は TASK-138 で測り直す
+
+### 14.7 エラー kind
+
+| kind | 返すもの | 意味 |
+| ---- | -------- | ---- |
+| `invalid_state` | ホスト | 現在の URL が http / https 以外 |
+| `stale` | ホスト | `page` が現在と違う、`snapshot` が最新の取得でない、番号が範囲外、番号の要素が消えた、照合値の不一致、待機中に文書が変わった |
+| `not_actionable` | ホスト | §14.4 |
+| `too_large` | ホスト | §14.3 の上限超過（切り詰めない） |
+| `unsupported` | ホスト | 未対応のメソッド、新しいウィンドウ・ファイル選択・ダウンロード |
+| `timeout` | ホスト | `wait` だけ |
+| `session_lost`・`busy` | 本体（render） | ホストの破棄・再起動の後、同時実行の超過 |
+| `not_interactive`・`rendering_disabled`・`interactive_unavailable` | 本体（ai） | `AISNAP-21` |
+
+- ホストが返す kind はスキーマの `Error.kind` に足した。本体側の kind はホストとの間を流れないため、スキーマに載せない
+- エラーの `message` は固定の英語で、入力値・URL・セレクタを含めない（§2.2 と同じ）
+
+### 14.8 契約 fixture
+
+- 操作モードの fixture は `crates/fandhe-browser-render/tests/fixtures/protocol/interactive/` に置く（32 件。各メソッドの正常・不正な要求、結果、`--interactive` の `hello`、ホストが返す新しい kind）。`tests/protocol_fixtures.rs` がスキーマとの整合と網羅を検証する
+- ホスト側（`servo-host/src/server/tests.rs`）とクライアント側（`tests/client_contract.rs`）の契約テストは直下の fixture だけを読むため、まだ影響しない。実装（TASK-122・TASK-123・TASK-126）で直下へ移し、両側の契約テストに配線する。`expected_response` は配線の時に足す
+
+### 14.9 残る判断
+
+- WebDriver の命令（§14.4）を使うための `servo-base =0.7.0` の直接依存: TASK-126 の着手時に承認を求める
+- 8 MiB 級の DOM の Linux での時間・本体のメモリ: TASK-138 で測り、§14.6 の値を見直す
+- ページのダイアログ（`alert()`・`confirm()`・`prompt()`）の扱い: TASK-126 で決める
+- `pushState` を繰り返すページでは `act` が毎回 `stale` になりうる。本体が取り直して再試行する回数の上限を TASK-124・TASK-126 で決める
+- `window.webdriverElement` は Servo が「公開すべきでないが当面公開している」と注記している拡張で、版の更新で消えうる。消えたら要素の同一性（§14.4）を WebDriver の命令（`servo-base` の依存が要る）で取り直す。servo の版を上げるときに確かめる
 
 ## 付録 A. 依存追加の承認提示雛形
 
