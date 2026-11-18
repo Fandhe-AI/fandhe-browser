@@ -4,7 +4,7 @@
 
 - 実施日: 2026-11-16〜17（試作）、2026-11-18（現行 main `fd341de` で再実行）
 - 環境: macOS（arm64）・Servo `=0.7.0`・隔離なしの同一プロセス（`servo-host` の一時テスト）。試験ページはローカルの `TcpListener` から出し、外部へは出ない
-- 状態: 途中経過の記録。合格条件（★）3 件のうち ★1 は満たす、★2 は部分的、★3 は未確定。項目 4・6〜11 の一部は未確認（後述「残り」）。操作モードはまだ公開しない
+- 状態: 途中経過の記録。合格条件（★）3 件のうち ★1 は満たす、★2 は条件付きで読み替えて満たす（2026-11-18 のオーナー回答。条件は TASK-120 の完了条件）、★3 は通知が届くことをソースで確認し、`doc_seq` の起点は未確定。項目 4・6〜11 の一部は未確認（後述「残り」）。操作モードはまだ公開しない
 - 担当: Claude Code（試作・記録）。★ の合否と操作モードの公開可否はオーナー判断
 
 ## 目的と範囲
@@ -22,8 +22,8 @@
 | 文字入力（キー・IME） | 成立 | 同上。非 ASCII は IME の確定イベントで入る |
 | 全ページ撮影 | 成立（`resize` 方式） | `take_screenshot` の矩形はビューポートに丸められるため、高さを広げてから撮る |
 | ★1 `navigator.webdriver` | 満たす（主フレーム） | `UserContentManager::add_script` で登録できる。iframe は既知の制約 |
-| ★2 `request_navigation` | 部分的 | script 起点の遷移は止められる。iframe の `src`・302 の移動先は通らないため、読み込み先の許可リスト（#1571）と組み合わせて scheme を絞る |
-| ★3 `pushState` の通知 | 未確定 | `notify_url_changed` を受けるには `url` クレートの型名が要る（依存追加は未承認）。URL のポーリングでは検出できる |
+| ★2 `request_navigation` | 条件付きで満たす | script 起点の遷移は止められる。iframe の `src`・302 の移動先は通らないため、読み込み先の許可リスト（#1571）と組で scheme を絞る。回帰テストと現在 URL の検査を TASK-120 の完了条件にする |
+| ★3 `pushState` の通知 | 前半は満たす（ソース根拠） | `WebView::url()` を書き換える唯一の経路 `set_history` が直後に必ず `notify_url_changed` を呼ぶ。`doc_seq` の起点を通知で取る場合だけ `url` の直接依存が要る |
 | (5) 再パースの要素順 | パーサー由来は不変、DOM 操作由来は一部変化 | 書き戻し方式で順序が変わる場合があることを前提に、番号の対応表を本体で検査する（TASK-121 の確定条件 1） |
 | (6) `file:` のサブリソース | 0.1.2 で拒否 | #1571 の許可リストで読み込み前に拒否（GHSA-pxmc-hqwc-jh66） |
 | (12) 保存 HTML の再パースでの実行 | 経路なし | 書き戻した HTML を navigate の経路へ再投入しない限り、スクリプト・`meta refresh` は動かない |
@@ -63,7 +63,7 @@
   - インスタンス側への上書き（`Object.defineProperty(navigator, ...)`）は止められない
   - getter の `toString()` が `function(){return true}` と見える
 
-### ★2 `request_navigation`（RENDER-10）: 部分的
+### ★2 `request_navigation`（RENDER-10）: 条件付きで満たす
 
 呼ばれる（拒否すると遷移が止まる）:
 
@@ -77,14 +77,23 @@
 - iframe の `src` 属性の変更と、初期 HTML の `<iframe src>`
 - `javascript:` の URL（スクリプトは実行されるが、scheme は変わらない）
 
-呼び出しは constellation の `schedule_navigation` に限られる。iframe の `src` 経由の読み込みは、ホストの読み込み先の許可リスト（`servo-host/src/guard.rs`。#1571・0.1.2）が読み込み前に拒否する。spec の ★2 は「リダイレクト・`javascript:` でも呼ばれる」ことを求めているため、文言どおりには満たさない。目的（遷移先の scheme を絞る）を `request_navigation` と許可リストの組で満たすと読み替えてよいかは、オーナー判断が要る。
+呼び出しは constellation の `schedule_navigation` に限られる。iframe の `src` 経由の読み込みは、ホストの読み込み先の許可リスト（`servo-host/src/guard.rs`。#1571・0.1.2）が読み込み前に拒否する。spec の ★2 は「リダイレクト・`javascript:` でも呼ばれる」ことを求めているため、文言どおりには満たさない。
 
-### ★3 `pushState` の通知（RENDER-10）: 未確定
+2026-11-18 のオーナー回答で、目的（遷移先の scheme を絞る）を `request_navigation` と許可リストの組で満たすと読み替えた。2 つの検問は同等ではないため、次を条件とする（TASK-120 の完了条件。spec の RENDER-10 と ★2 の文言は spec リポ側で直す）。
+
+- 書き分け: 主フレームは `request_navigation` と現在 URL の検査、iframe とリダイレクトは読み込み先の許可リスト（`data:`・`blob:` を含む）で止める
+- 回帰テスト 2 本で固定する: 「302 の移動先が `file:`・`data:` なら失敗する」「`meta refresh` で `data:`・`file:` へ行けない」。現状は Servo 内部の挙動に頼っており、`servo` の版更新で黙って変わりうる
+- 操作と DOM 取得の前に、現在 URL が http / https であることを必ず検査する（RENDER-10・RENDER-11 の `invalid_state`）
+- 試していない経路（`meta refresh`・`Refresh` ヘッダ・`target=_blank`・`history.back()`）が `request_navigation` を通るかを確かめる
+- 内部アドレスへの接続は egress プロキシに頼るため、TASK-121 の確定条件 7（操作モードは `Isolated` のときだけ）を前提とする
+
+### ★3 `pushState` の通知（RENDER-10）: 前半は満たす（ソース根拠）
 
 - `WebViewDelegate::notify_url_changed` は引数が `url::Url` で、`servo` が `Url` を再輸出していない。`servo-host` は `url` に依存していないため、この通知を受け取る実装を書けなかった
 - 代わりに `WebView::url()` のポーリングで、`pushState`・`replaceState`・`location.hash` の変更を検出できた。いずれも `load_status` の通知は出ない
 - 通常の遷移の通知の順: `request_navigation` → `title None` → `Started` → `title` → `HeadParsed` → `Complete`。初回の読み込みは `Started` が来ない。`history.back()` は `title` の通知だけ
-- 確かめるには `url =2.5.8`（`servo-host/Cargo.lock` に既にある版）を `servo-host` の直接依存に足す必要がある。依存の追加はユーザー承認制（[dependency-policy](../../.claude/rules/dependency-policy.md)）
+- ソースでの根拠（2026-11-18）: `servo-0.7.0/webview.rs` の `set_history` は、`WebView::url()` が読む履歴（`back_forward_list` と位置）を書き換えた直後に、無条件で `notify_url_changed` を呼ぶ。履歴を書き換えるのは `set_history` だけ（constellation の `HistoryChanged` から呼ばれる。`servo.rs`）。ポーリングで `url()` の変化を見た `pushState`・`replaceState`・`location.hash` では、通知も出ている
+- よって ★3 の前半（通知が届く）は、依存を足さずにソースを根拠に満たすと記録する。`doc_seq` の起点を通知で取る（通知駆動にする）場合だけ、`url =2.5.8`（`servo-host/Cargo.lock` に既にある版）を `servo-host` の直接依存に足す。足すときは `=2.5.8` に固定し、`servo` の版更新と同時に上げる旨を `Cargo.toml` のコメントに書く。足す直前に侵害情報を確かめ直す（[dependency-policy](../../.claude/rules/dependency-policy.md)）
 
 ## その他の確認項目
 
@@ -110,9 +119,12 @@
 
 ## 残り（未確認の項目）
 
+追跡は MS-10 のトラッキング #1589。項目 4・7〜11 は #1579、★2 の条件は #1581（TASK-120）、★3 後半は #1582（TASK-121）。
+
 | 項目 | 内容 | 依存する TASK |
 | ---- | ---- | ------------- |
-| ★3 | `notify_url_changed` が届くか、`doc_seq` の起点に使える通知 | `url` の依存追加の承認 |
+| ★3 後半 | `doc_seq` の起点を通知で取るか（取るなら `url` を足して実際に受け取る） | TASK-121 |
+| ★2 の条件 | 回帰テスト 2 本・現在 URL の検査・未試験の遷移経路 | TASK-120 |
 | (4) | 矩形・ヒットテストを Rust 側で取れるか | TASK-121（取れなければ iframe 上の拒否・スクロール上限 3 回を最終形にする） |
 | (7) | `JSValue::Element` を埋め込み API から再利用できるか | TASK-122・TASK-126 |
 | (8) | `select`・ダイアログ・新しいウィンドウ・ファイル選択の delegate の API と既定の動き | TASK-126（`window.open` は既定で `null` を返すことだけ確認済み） |
@@ -120,11 +132,16 @@
 | (10) | 8 MiB 級の DOM の直列化の時間とメモリ | TASK-121（メモリの見積もり） |
 | (11) | Cookie を一時領域の外へ書かないか。console の出力・フォームの値が stderr に出るか | TASK-126・TASK-130 |
 
-## オーナー判断が要る事項
+## オーナー判断
 
-1. ★2 を「`request_navigation` と読み込み先の許可リストの組で遷移先の scheme を絞る」と読み替えてよいか（読み替える場合、spec の ★2 の文言は spec リポ側で直す）
-2. ★3 の確認のために `url =2.5.8` を `servo-host` の直接依存に足すか（版は既に `Cargo.lock` にあり、ビルドされるコードは増えない）。足さない場合は URL のポーリングで代える
-3. ★1 の制約（iframe には注入されない・インスタンス側の上書きは止められない）を既知の制約として TASK-118 の判断記録に載せるか
+決まったこと（2026-11-18）:
+
+1. ★2 は条件付きで読み替える（条件は上の ★2 の節。spec の文言は spec リポ側で直す）
+2. ★3 の `url =2.5.8` の追加は認める。ただし本書の PR には入れず、通知駆動を選ぶ場合に TASK-121 以降で足す
+
+残っていること:
+
+- ★1 の制約（iframe には注入されない・インスタンス側の上書きは止められない）を既知の制約として TASK-118 の判断記録に載せるか
 
 ## 再現方法
 
