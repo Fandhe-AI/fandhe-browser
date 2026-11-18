@@ -2,16 +2,16 @@
 
 対応 `TASK-117` / `MS-10` / ビヘイビア `RENDER-10` / `RENDER-11` / `SEC-5`（[spec-reference](../../.claude/rules/spec-reference.md)）。
 
-- 実施日: 2026-11-16〜17（試作）、2026-11-18（現行 main `fd341de` で再実行）
+- 実施日: 2026-11-16〜17（試作）、2026-11-18（現行 main `fd341de` で再実行）、2026-11-19（項目 4・7〜11。main `8810a98`。#1579）
 - 環境: macOS（arm64）・Servo `=0.7.0`・隔離なしの同一プロセス（`servo-host` の一時テスト）。試験ページはローカルの `TcpListener` から出し、外部へは出ない
-- 状態: 途中経過の記録。合格条件（★）3 件のうち ★1 は満たす、★2 は条件付きで読み替えて満たす（2026-11-18 のオーナー回答。条件は TASK-120 の完了条件）、★3 は通知が届くことをソースで確認し、`doc_seq` の起点は通知駆動に決定（2026-11-18。実装は TASK-121 以降）。★2 の条件は TASK-120（#1581）で実装した（後述）。項目 4・6〜11 の一部は未確認（後述「残り」）。操作モードはまだ公開しない
+- 状態: 途中経過の記録。合格条件（★）3 件のうち ★1 は満たす、★2 は条件付きで読み替えて満たす（2026-11-18 のオーナー回答。条件は TASK-120 の完了条件）、★3 は通知が届くことをソースで確認し、`doc_seq` の起点は通知駆動に決定（2026-11-18。実装は TASK-121 以降）。★2 の条件は TASK-120（#1581）で実装した（後述）。項目 4・7〜11 は 2026-11-19 に確かめた（後述「TASK-117 の残りの結果」）。操作モードはまだ公開しない
 - 担当: Claude Code（試作・記録）。★ の合否と操作モードの公開可否はオーナー判断
 
 ## 目的と範囲
 
 操作モード（ページを Servo ホスト側で保ち、クリック・文字入力をそこで行う方式。spec `rendering-layer.md`「Servo ホスト側のページの操作」節）を実装する前に、Servo 0.7.0 の公開 API で必要な挙動が取れるかを確かめる。本体側でページ JS を保つ案は、本体が読み込み後にページ JS のヒープを持たない（`crates/fandhe-browser-cdp/src/runtime/evaluate.rs`）ことと #1350 の判断から採らない。
 
-- Servo のソースは改変しない（[licensing](../../.claude/rules/licensing.md)）。依存は追加していない
+- Servo のソースは改変しない（[licensing](../../.claude/rules/licensing.md)）。依存はリポジトリに追加していない（(4)・(7) の実測のときだけ手元で `servo-base` を足した。後述）
 - 試作コードは使い捨てで、リポジトリには入れていない（一時モジュールを `#[test] #[ignore]` で動かし、終了後に戻した）
 
 ## 結果の要約
@@ -27,6 +27,12 @@
 | (5) 再パースの要素順 | パーサー由来は不変、DOM 操作由来は一部変化 | 書き戻し方式で順序が変わる場合があることを前提に、番号の対応表を本体で検査する（TASK-121 の確定条件 1） |
 | (6) `file:` のサブリソース | 0.1.2 で拒否 | #1571 の許可リストで読み込み前に拒否（GHSA-pxmc-hqwc-jh66） |
 | (12) 保存 HTML の再パースでの実行 | 経路なし | 書き戻した HTML を navigate の経路へ再投入しない限り、スクリプト・`meta refresh` は動かない |
+| (4) Rust 側の矩形・ヒットテスト | 取れる（WebDriver の命令経由） | ページが上書きできない判定でクリック先を確かめられる。使うには `servo-base` の直接依存が要る（TASK-121 で承認を求める） |
+| (7) `JSValue::Element` の再利用 | WebDriver の命令でだけ再利用できる | 要素 ID は文書が変わると `NoSuchElement`、要素を消すと `StaleElementReference` になる |
+| (8) delegate の既定の動き | 応答せずに捨てても止まらない | ダイアログ・選択肢・ファイル選択・新しいウィンドウの要求は、捨てても操作は進む。ダイアログの扱いは TASK-126 で決める |
+| (9) 入力・座標・resize | 成立。初回フレーム前の入力は失敗する | 座標は CSS px（`WebViewPoint::Page`）で渡す。最初のフレームを待ってから入力する |
+| (10) 8 MiB 級の DOM | release で直列化に約 13 秒・常駐メモリ約 1.5 GB | `dom_snapshot` の時間切れと上限、メモリの見積もりの根拠にする（TASK-121 の確定条件 5・6） |
+| (11) Cookie・stderr | 一時領域の外に残らない。Servo は console とフォームの値を stderr に出さない | macOS だけで確かめた。stdout、Linux、ログを有効にした場合は未確認 |
 
 ## 入力と撮影（2026-11-16 試作・2026-11-18 再実行）
 
@@ -126,20 +132,91 @@ TASK-120 の実装結果（2026-11-18・#1581）:
 - `on*` 属性・`meta refresh` を実行する箇所は無い
 - 未確認: js crate のエンジン内部に DOM 経由の遷移 API があるか、cli の `query --file` などの別の入口
 
+## TASK-117 の残りの結果（2026-11-19・#1579）
+
+試作は使い捨てで、終了後に一時の変更を戻した（後述「再現方法」）。(4)・(7) の実測のときだけ、手元で `servo-base =0.7.0`（`servo-host/Cargo.lock` に既にある版）を `servo-host` の直接依存に足した（2026-11-19 の利用者判断。コミットしない）。時間とメモリは release（`opt-level = "z"`・LTO）で測った。dev では 8 MiB の DOM の直列化が 60 秒で終わらなかった。
+
+### (4) Rust 側の矩形・ヒットテスト: 取れる
+
+`Servo::execute_webdriver_command` に `WebDriverCommandMsg::ScriptCommand`（閲覧文脈の ID は `WebView::id()` から変換できる）で WebDriver の命令を送ると、script スレッドの Rust 側の処理が答える。ページが `Element.prototype.getBoundingClientRect`・`getClientRects`・`Document.prototype.elementFromPoint` を上書きしても影響を受けない。
+
+| 命令 | 試験ページの要素 | 結果 |
+| ---- | ---------------- | ---- |
+| `GetElementRect` | 上書きで JS からは `1x1 at (0,0)` に見えるボタン | `100x40 at (100,100)`（実際の位置） |
+| `ElementClick` | 何にも隠れていないボタン | 成功（要素 ID を返す） |
+| `ElementClick` | 半透明の `div` に隠れたボタン | `ElementClickIntercepted` |
+| `ElementClick` | iframe（`srcdoc`・背景透明）に隠れたボタン | `ElementClickIntercepted` |
+| `ElementClick` | 画面外（`top: 2000px`）のボタン | 成功。スクロールして画面に入れる（`scrollY` は 1240） |
+| `ElementClick` | `display: none` のボタン | `ElementNotInteractable` |
+
+- `ElementClick` は、表示中の中心点で `ElementsFromPoint` を呼び、先頭が対象の要素（またはその子孫）でなければ拒否する（`servo-script` の `webdriver_handlers.rs`）。`option` 以外ではイベントを出さず、クリックそのものは埋め込み側が入力イベントで送る（試験でも `click` は 0 件）
+- 限界: 判定と入力の送信は別の手順のため、その間にページが要素を動かせる。座標へのクリックになる点は変わらない
+- 受け口（`GenericSender`）を作る `servo_base::generic_channel::channel()` は `servo` から再輸出されていない。本採用には `servo-base =0.7.0` を直接依存に足す必要がある（MPL-2.0。`servo-host` の workspace だけ。[dependency-policy](../../.claude/rules/dependency-policy.md)）
+- TASK-121 の確定条件 2 への影響: 照合値・可視判定を自己申告で扱う前提に、ページが上書きできない判定を足せる。採るなら iframe 上の拒否は `ElementClickIntercepted` で兼ねられる。採らなければ、iframe 上の拒否とスクロール上限 3 回を最終形にする。どちらにするかは依存の承認とあわせて TASK-121 で決める
+
+### (7) `JSValue::Element` の再利用: WebDriver の命令でだけできる
+
+- `evaluate_javascript` が要素を返すと `JSValue::Element` に 32 桁の 16 進の ID が入る。`FindElementsCSSSelector` が返す ID と同じで、`GetElementRect` 等にそのまま渡せる
+- `evaluate_javascript` は文字列しか受け取らないため、ID を JS へ戻して要素を引くことはできない
+- 別の文書へ移った後は `NoSuchElement`、同じ文書で要素を消した後は `StaleElementReference`。試した 2 例では、古い ID で別の要素を操作することは無かった
+- ID はホストの中だけで使い、本体へは出さない前提にする（本体へ出すのは TASK-121 の確定条件 1 の番号）
+
+### (8) delegate の既定の動き: 応答せずに捨てても止まらない
+
+ホストの `PageDelegate` は `show_embedder_control`・`request_create_new` を実装していない。試験では受け取った内容を記録してから捨てた（既定と同じ）。
+
+| ページの操作 | 届く要求 | 捨てたときのページの見え方 |
+| ------------ | -------- | -------------------------- |
+| `alert()`・`confirm()`・`prompt()` | `SimpleDialog`（Alert・Confirm・Prompt） | `undefined`・`false`・`null`。止まらずに戻る |
+| `select` のクリック | `SelectElement`（選択肢 3 件・現在の選択） | 値は変わらず、`change` は出ない |
+| `input type=file` のクリック | `FilePicker` | `files.length` は 0。`change`・`cancel` は出ない |
+| `input type=color` のクリック | `ColorPicker` と `InputMethod` | 値は変わらない |
+| `window.open`（クリック起点・スクリプト起点） | `request_create_new` | `null`。新しい WebView は作られない |
+
+- 右クリックのメニュー（`ContextMenu`）は試していない。捨てたときは「選ばなかった」になる（ソースの `Drop`）
+- 操作モードでも既定のままで操作は止まらない。ダイアログの扱い・選択肢の選び方・ファイル選択は TASK-126 で決める
+
+### (9) 入力・座標・resize・初回フレーム前のクリック
+
+- キーごとの非 ASCII: `Key::Character` に `あ`・`漢`・`é`・`😀` を 1 文字ずつ送ると、IME の確定イベントなしで `input` に入る（`value="aあ漢é😀"`）
+- hidpi: 倍率 2 で `devicePixelRatio=2`・`innerWidth=640`。`WebViewPoint::Page`（CSS px）と `WebViewPoint::Device`（2 倍した値）はどちらも目的の要素に当たる。`Device` に CSS px をそのまま渡すと半分の位置（62, 62）に当たる。ホストは CSS px を `Page` で渡す
+- resize: `WebView::resize` で高さを 3000 にすると `innerHeight`・`100vh` の要素が 3000、`position: fixed; bottom: 0` の要素の上端が 2980 になる。全ページ撮影の画像では、最下部に `fixed` の要素（青）が写った（`vh` の要素の写り方は画素では確かめていない）。800 に戻すと値も元に戻る。dev の実行で、描画コンテキストを直接 `resize` してから `WebView::resize` を呼ぶと、大きさが変わらず `innerHeight` も 800 のままだった（`WebView::resize` だけを使う）
+- 初回フレーム前のクリック: WebView を作った直後に送ったクリックは、3 件とも `notify_input_event_handled` が `DispatchFailed` を返し、ページに届かない。ホストは最初のフレームを待ってから入力する（現在の `load` は待っている）
+
+### (10) 8 MiB 級の DOM の直列化
+
+release（macOS arm64）で 1 回測った。同じエンジンで 1 MiB を先に読み込んだ後に 8 MiB を読み込んでいる。
+
+| 試験ページ | 要素数 | 読み込み | `outerHTML.length` | `outerHTML` を Rust へ返す | 常駐メモリ（読み込み前 → 後 → 直列化中の最大） |
+| ---------- | ------ | -------- | ------------------ | -------------------------- | ---------------------------------------------- |
+| 1 MiB | 26,773 | 0.60 秒 | 0.19 秒 | 0.19 秒（1.1 MB） | 114 → 273 → 275 MB |
+| 8 MiB | 210,023 | 4.8 秒 | 12.6 秒 | 13.9 秒（8.8 MB） | 277 MB → 1.46 GB → 1.59 GB |
+
+- 直列化の時間は大きさに比例せず、8 倍の大きさで約 66 倍かかった
+- 読み込みだけで常駐メモリが元の HTML の約 140 倍増えた。直列化と受け渡しの分はさらに約 130 MB
+- TASK-121 への影響: `dom_snapshot` の時間切れは 8 MiB で 15 秒を超えうる。上限を 8 MiB より小さくするか、時間切れを長くするかを確定条件 5・6 で決める。メモリの見積もりはこの値を起点にする
+
+### (11) Cookie と stderr
+
+- `Set-Cookie`（`Max-Age=3600`）と `document.cookie`（`max-age=3600`）の両方がページから見える状態で、フォームに文字を入れて送信した
+- ファイル: エンジンの動作中と破棄後の両方で、`$TMPDIR` の下（深さ 4 まで）に Servo が作ったファイルは無かった（新しいファイルは、無関係なツールが作った 1 件だけ）。`~/Library` の `Application Support`・`Preferences`・`Caches`・`HTTPStorages`・`Cookies`、`~/.config`・`~/.local`・`~/.cache`、作業ディレクトリの新しいファイルにも Cookie の値は無かった（一致したのは、この試験を動かした端末の記録だけ）
+- stderr: Servo は `console.log`・`console.error`・`console.warn` の文字列とフォームの値を出さなかった（ホストはログを設定していない。フォームの値は試験サーバーへの送信にだけ現れた）。stdout は調べていない
+- 限界: macOS だけで確かめた。新しいファイルを値で探しただけで、Servo が書く場所を網羅したわけではない。ログを有効にする変更を入れるときは確かめ直す（TASK-126・TASK-130）
+
 ## 残り（未確認の項目）
 
-追跡は MS-10 のトラッキング #1589。項目 4・7〜11 は #1579、★2 の条件は #1581（TASK-120）、★3 後半は #1582（TASK-121）。
+追跡は MS-10 のトラッキング #1589。項目 4・7〜11 は #1579 で確かめた（上の節）。★2 の条件は #1581（TASK-120）、★3 後半は #1582（TASK-121）。
 
 | 項目 | 内容 | 依存する TASK |
 | ---- | ---- | ------------- |
 | ★3 後半 | 通知駆動に決定（2026-11-18。URL 変更の通知と新しい文書の読み込みの両方で上げる）。`url =2.5.8` を足して実際に受け取る | TASK-121 |
 | ★2 の条件 | 遷移の検査・回帰テスト・未試験の経路は TASK-120 で済み。現在 URL の検査と `data:`・`blob:` の iframe の除外は対象のメソッドと同時に入れる | TASK-122・TASK-126 |
-| (4) | 矩形・ヒットテストを Rust 側で取れるか | TASK-121（取れなければ iframe 上の拒否・スクロール上限 3 回を最終形にする） |
-| (7) | `JSValue::Element` を埋め込み API から再利用できるか | TASK-122・TASK-126 |
-| (8) | `select`・ダイアログ・新しいウィンドウ・ファイル選択の delegate の API と既定の動き | TASK-126（`window.open` は既定で `null` を返すことだけ確認済み） |
-| (9) | キーごとの非 ASCII 入力、hidpi の座標変換、resize 後の `vh`・`fixed` とサイズ復元、初回フレーム前のクリック | TASK-126・撮影の強化（RENDER-9） |
-| (10) | 8 MiB 級の DOM の直列化の時間とメモリ | TASK-121（メモリの見積もり） |
-| (11) | Cookie を一時領域の外へ書かないか。console の出力・フォームの値が stderr に出るか | TASK-126・TASK-130 |
+| (4) | WebDriver の命令で取れる。本採用には `servo-base =0.7.0` の直接依存の承認が要る | TASK-121（採らなければ iframe 上の拒否・スクロール上限 3 回を最終形にする） |
+| (7) | WebDriver の命令でだけ再利用できる（(4) と同じ依存が要る） | TASK-122・TASK-126 |
+| (8) | 既定（捨てる）で操作は止まらない。ダイアログの扱いと右クリックのメニューは未決 | TASK-126 |
+| (9) | 確かめた。全ページ撮影で `fixed`・`vh` の要素がどう写るかの扱いは未決 | TASK-126・撮影の強化（RENDER-9） |
+| (10) | 測った。上限と時間切れの値は未決 | TASK-121（確定条件 5・6） |
+| (11) | macOS で確かめた。Linux とログを有効にした場合は未確認 | TASK-126・TASK-130 |
 
 ## オーナー判断
 
@@ -156,4 +233,4 @@ TASK-120 の実装結果（2026-11-18・#1581）:
 
 ## 再現方法
 
-試作コードは使い捨てでリポジトリに無い。再現する場合は、`servo-host/src/` に一時モジュールを置き `main.rs` に `#[cfg(test)] mod ...;` を足して、`cargo test --manifest-path servo-host/Cargo.toml <名前> -- --ignored --nocapture --test-threads=1` で実行する。`Engine` は 1 プロセスに 1 つしか作れないため、試作テストは 1 本ずつ実行する（2 本目は `AlreadyCreated` で失敗する）。終わったら一時の変更を戻す。
+試作コードは使い捨てでリポジトリに無い。再現する場合は、`servo-host/src/` に一時モジュールを置き `main.rs` に `#[cfg(test)] mod ...;` を足して、`cargo test --manifest-path servo-host/Cargo.toml <名前> -- --ignored --nocapture --test-threads=1` で実行する。`Engine` は 1 プロセスに 1 つしか作れないため、試作テストは 1 本ずつ実行する（2 本目は `AlreadyCreated` で失敗する）。時間とメモリを測るときは `--release` を付ける。(4)・(7) の試作は `servo-host/Cargo.toml` に `servo-base = "=0.7.0"` を一時的に足す。終わったら一時の変更（`Cargo.toml`・`Cargo.lock`・`main.rs`）を戻す。
