@@ -8,8 +8,8 @@
 # （`baked-in-resources` は起動に必須。オーナー承認 2026-10-15）。#1297 で `=0.7.0` に上げた
 # （オーナー承認 2026-10-28）。0.7.0 は LTS ではない月次版で、spec の採用版（0.6 LTS 系列。#229）を
 # 一時的に緩めている。MDN のハング（servo/servo#45915）の修正を取り込み IntersectionObserver を
-# 有効にするためで、修正を含む次の LTS が出たら LTS 系列へ戻す。`dpi`・`url` は未承認のため
-# 直接依存にせず、Servo の再エクスポート（`ServoUrl` 等）を使う。`image` はスクリーンショットの PNG エンコード用に
+# 有効にするためで、修正を含む次の LTS が出たら LTS 系列へ戻す。`dpi` は未承認のため
+# 直接依存にせず、Servo の再エクスポート（`ServoUrl` 等）を使う。`url` は通知の型のためだけに足した（下の `[dependencies]`）。`image` はスクリーンショットの PNG エンコード用に
 # #232 の記載（オーナー承認 2026-10-15）に基づき `png` 機能のみで追加した（Cargo.lock に同版が既にあり新規 crate は増えない）。
 # `serde_json` は stdio サーバー（#993）のフレーム JSON 用（オーナー承認済み。Servo 経由で
 # Cargo.lock に同版が既にあり新規 crate は増えない）。`serde` の derive は未承認で使わない。toolchain は親ディレクトリの
@@ -41,6 +41,11 @@ path = "src/main.rs"
 servo = { version = "=0.7.0", default-features = false, features = ["baked-in-resources"] }
 serde_json = "=1.0.154"
 image = { version = "=0.25.10", default-features = false, features = ["png"] }
+# `WebViewDelegate::notify_url_changed` の引数の型（`url::Url`。servo は再エクスポートしない）を書くためだけに使う。
+# 操作モードの文書番号（`doc_seq`）を URL 変更の通知で上げるため（TASK-121 の確定条件 3・#1582。オーナー承認 2026-11-18）。
+# Cargo.lock に servo 経由で同版が既にあり、新しい crate は増えない。servo の版を上げるときは、servo が使う
+# `url` の版に合わせて同時に上げる（型が一致しないとトレイトを実装できない）。
+url = "=2.5.8"
 
 # Windows のみ ANGLE（mozangle）を既定にする `no-wgl` を足す（#999・オーナー承認 2026-10-16）。
 # 既定の WGL バックエンドは GPU の無い環境で WGL_NV_DX_interop が無く software rendering context を

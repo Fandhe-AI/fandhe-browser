@@ -40,6 +40,8 @@ pub(crate) enum Request {
     Screenshot(ScreenshotParams),
     Visibility(SelectorParams),
     BoundingBox(SelectorParams),
+    /// params を持たない（`page` を照合しない。設計 §14.2・§14.3）。
+    DomSnapshot,
     Shutdown,
 }
 
@@ -141,12 +143,15 @@ fn parse_params(method: Method, p: &Map<String, Value>) -> Result<Request, Error
                 Request::BoundingBox(params)
             })
         }
-        Method::Shutdown => {
-            if p.is_empty() {
-                Ok(Request::Shutdown)
-            } else {
-                Err(invalid)
+        Method::DomSnapshot | Method::Shutdown => {
+            if !p.is_empty() {
+                return Err(invalid);
             }
+            Ok(if method == Method::DomSnapshot {
+                Request::DomSnapshot
+            } else {
+                Request::Shutdown
+            })
         }
     }
 }
