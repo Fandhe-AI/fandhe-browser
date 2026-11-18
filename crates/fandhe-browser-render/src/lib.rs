@@ -15,7 +15,8 @@
 //! （済み。RENDER-3・TASK-38・#989）。子プロセス管理は [`host_process`]
 //! （済み。RENDER-3・RENDER-4・PLUG-1・TASK-38・#994）。core の `Renderer` の実装は
 //! [`host_renderer`]（済み。RENDER-3・TASK-38・#235）。Servo ホストの egress 用 CONNECT
-//! プロキシ単体は [`egress_proxy`]（済み。RENDER-3・TASK-38・#1434）。`HostProcess` の起動を bwrap・sandbox-exec で包んで egress をこのプロキシに限る組み込みは済み（RENDER-3・TASK-38・#1436。[`host_process`] の「egress 隔離」節）。
+//! プロキシ単体は [`egress_proxy`]（済み。RENDER-3・TASK-38・#1434）。操作モード（`dom_snapshot`・`act`・`wait`）の
+//! クライアント側は [`protocol`] の型と [`host_process`] の `call_interactive`（RENDER-10・RENDER-11・TASK-123）。`HostProcess` の起動を bwrap・sandbox-exec で包んで egress をこのプロキシに限る組み込みは済み（RENDER-3・TASK-38・#1436。[`host_process`] の「egress 隔離」節）。
 //!
 //! # スタブについて
 //!

@@ -193,6 +193,18 @@ pub fn fake_host() -> ! {
     if scenario == "bad-protocol-range" {
         hello["data"]["protocol"] = json!({"min": 2, "max": 2});
     }
+    // 操作モード（`--stdio --interactive`。TASK-123）。`int-no-caps` は版の古いホストを装い、載せない。
+    let interactive = std::env::args().any(|a| a == "--interactive");
+    if interactive && scenario != "int-no-caps" {
+        if let Some(caps) = hello["data"]["capabilities"].as_array_mut() {
+            for m in ["dom_snapshot", "act", "wait"] {
+                caps.push(json!(m));
+            }
+        }
+        hello["data"]["limits"]["dom_snapshot_frame_bytes"] = json!(12_582_912);
+    }
+    let page_of =
+        |loads: usize| json!({"session": "0123456789abcdef0123456789abcdef", "doc_seq": loads});
     write_frame(&mut stdout, &serde_json::to_vec(&hello).unwrap(), 1 << 20).expect("hello");
 
     let mut stdin = std::io::stdin().lock();
@@ -308,6 +320,11 @@ pub fn fake_host() -> ! {
                 err.flush().expect("flush");
                 std::process::exit(1);
             }
+            ("int-dom-timeout", "dom_snapshot") | ("int-wait-timeout", "wait") => {
+                send_error(&mut stdout, id, "timeout");
+                continue;
+            }
+            ("int-hang-dom", "dom_snapshot") => std::thread::sleep(Duration::from_secs(60)),
             ("rss", _) => {
                 let mut mem = vec![0u8; 96 * 1024 * 1024];
                 for i in (0..mem.len()).step_by(4096) {
@@ -323,8 +340,34 @@ pub fn fake_host() -> ! {
             "load" => {
                 append(&root.join("loads"), "x");
                 let url = v["params"]["url"].as_str().expect("url").to_string();
-                send(&mut stdout, id, json!({"final_url": url, "status": 200}));
+                let mut res = json!({"final_url": url, "status": 200});
+                if interactive {
+                    res["page"] = page_of(count(&root, "loads"));
+                }
+                send(&mut stdout, id, res);
             }
+            "dom_snapshot" => send(
+                &mut stdout,
+                id,
+                json!({
+                    "page": page_of(count(&root, "loads")),
+                    "url": "https://example.com/",
+                    "html": "<html data-fandhe-n=\"0\"></html>",
+                    "element_count": 1,
+                    "snapshot": "s1",
+                    "excluded": {"iframes": 0, "shadow_roots": 0}
+                }),
+            ),
+            "act" => send(
+                &mut stdout,
+                id,
+                json!({"page": page_of(count(&root, "loads")), "navigated": false}),
+            ),
+            "wait" => send(
+                &mut stdout,
+                id,
+                json!({"page": page_of(count(&root, "loads"))}),
+            ),
             "screenshot" => {
                 let height = if params["full_page"] == json!(true) {
                     2400
@@ -464,6 +507,11 @@ pub fn assert_gone(pid: u32) {
 /// （`--egress-relay-uds <path>`・`--egress-proxy-port <port>`。#1436）。
 pub fn maybe_run_fake_host() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // 操作モードでは `--stdio` の直後に `--interactive` が入る（TASK-123）。
+    let mut args = args;
+    if args.get(1).is_some_and(|a| a == "--interactive") {
+        args.remove(1);
+    }
     let base = HOST_ARGS.len();
     let is_host = args.get(..base).is_some_and(|a| a == HOST_ARGS)
         && match args.get(base..) {

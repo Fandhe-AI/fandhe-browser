@@ -866,6 +866,215 @@ fn t_windows_unisolated_launch_refused() {
     assert_eq!(count(&root.0, "spawns"), 0, "host must never be started");
 }
 
+// ---- 操作モード（TASK-123・RENDER-10・RENDER-11・設計 §14） ----
+
+/// 操作モードは実際の隔離状態が `Isolated` のときだけ起動する。隔離できない・内部アドレスを許す設定では
+/// ホストを起動せず `InteractiveUnavailable` を返す（確定条件 7。隔離なしへ黙って落とさない）。
+#[cfg(unix)]
+fn t_interactive_requires_isolation() {
+    use fandhe_browser_render::host_process::InteractiveUnavailable;
+    let root = Root::new("int-refuse", "ok");
+    let mut h = HostProcess::new(root.config(base_timeouts()).with_interactive(true));
+    assert!(matches!(
+        h.load(&page(), 1),
+        Err(HostProcessError::InteractiveUnavailable(
+            InteractiveUnavailable::NotIsolated(EgressIsolationUnavailable::SandboxToolNotFound)
+        ))
+    ));
+    let mut h = HostProcess::new(
+        root.config(base_timeouts())
+            .with_interactive(true)
+            .with_allow_private_network_access(true),
+    );
+    assert!(matches!(
+        h.load(&page(), 1),
+        Err(HostProcessError::InteractiveUnavailable(
+            InteractiveUnavailable::PrivateNetworkAllowed
+        ))
+    ));
+    assert_eq!(count(&root.0, "spawns"), 0, "must not spawn");
+    // 操作モードでない設定に操作モードの要求は送らない。
+    let mut plain = root.host(base_timeouts());
+    assert!(matches!(
+        plain.call_interactive(Request::DomSnapshot),
+        Err(HostProcessError::NotInteractive)
+    ));
+}
+
+/// 実際の隔離（Linux は bwrap、macOS は sandbox-exec）の下で偽ホストを操作モードで動かす。
+/// 使えない環境（ローカルの Linux で bwrap が無い等）では `None`（CI の Linux では使えることを必須にする）。
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn interactive_host(
+    tag: &str,
+    scenario: &str,
+    timeouts: HostTimeouts,
+) -> Option<(Root, HostProcess)> {
+    #[cfg(target_os = "linux")]
+    let root = match system_probe_for(tag) {
+        Ok(()) => Root::new_visible(tag, scenario),
+        Err(_) => return None,
+    };
+    #[cfg(target_os = "macos")]
+    let root = {
+        if fandhe_browser_render::host_process::probe_system().is_err() {
+            eprintln!("{tag}: egress isolation probe: unavailable");
+            return None;
+        }
+        Root::new(tag, scenario)
+    };
+    let h = HostProcess::new(
+        root.config_system(timeouts)
+            .with_egress_isolation(EgressIsolationMode::Required)
+            .with_interactive(true),
+    );
+    Some((root, h))
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn int_page(h: &HostProcess) -> fandhe_browser_render::protocol::PageInfo {
+    let _ = h;
+    fandhe_browser_render::protocol::PageInfo::new("0123456789abcdef0123456789abcdef", 1).unwrap()
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn click(h: &HostProcess) -> Request {
+    use fandhe_browser_render::protocol::{ActExpect, ActParams, Action};
+    Request::Act(
+        ActParams::new(
+            int_page(h),
+            "s1",
+            0,
+            ActExpect::new("html").unwrap(),
+            Action::Click,
+        )
+        .unwrap(),
+    )
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn wait_load(h: &HostProcess) -> Request {
+    use fandhe_browser_render::protocol::{WaitCondition, WaitParams};
+    Request::Wait(WaitParams::new(int_page(h), WaitCondition::LoadComplete, 1000).unwrap())
+}
+
+/// TASK-123: 操作モードのページへ dom_snapshot・act・wait を送る。ホストが dom_snapshot に timeout を
+/// 返したらホストを破棄して `SessionLost`。以後は読み直さず（ホストも起動しない）`SessionLost` を返し、
+/// 新しい `load` で戻る（`AISNAP-17`・`AISNAP-21`・確定条件 3）。
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn t_interactive_session_lost_is_not_reloaded() {
+    let Some((_root, mut h)) = interactive_host("int-lost", "int-dom-timeout", base_timeouts())
+    else {
+        return;
+    };
+    let loaded = h.load(&page(), 1).expect("load");
+    assert_eq!(loaded.page().map(|p| p.doc_seq()), Some(1));
+    assert!(matches!(
+        h.egress_isolation(),
+        Some(EgressIsolationStatus::Isolated(_))
+    ));
+    match h.call_interactive(click(&h)) {
+        Ok(MethodResult::Act(a)) => assert!(!a.navigated()),
+        other => panic!("act: {other:?}"),
+    }
+    assert!(matches!(
+        h.call_interactive(wait_load(&h)),
+        Ok(MethodResult::Wait(_))
+    ));
+    assert!(matches!(
+        h.call_interactive(Request::DomSnapshot),
+        Err(HostProcessError::SessionLost)
+    ));
+    assert_eq!(h.pid(), None, "host must be destroyed");
+    // 以後は起動も読み直しもしない。
+    let generation = h.host_generation();
+    assert!(matches!(
+        h.call_interactive(Request::DomSnapshot),
+        Err(HostProcessError::SessionLost)
+    ));
+    assert!(matches!(
+        h.call_on_page(&page(), 1, shot()),
+        Err(HostProcessError::SessionLost)
+    ));
+    assert_eq!(h.pid(), None);
+    assert_eq!(h.host_generation(), generation);
+    // 新しい load で戻る。
+    h.load(&page(), 2).expect("load again");
+    assert_eq!(h.host_generation(), generation + 1);
+    assert!(matches!(
+        h.call_interactive(click(&h)),
+        Ok(MethodResult::Act(_))
+    ));
+    h.shutdown();
+}
+
+/// TASK-123: wait の timeout はホストを保ったまま返す（`AISNAP-18`）。dom_snapshot の結果を解釈する。
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn t_interactive_wait_timeout_keeps_host() {
+    let Some((_root, mut h)) = interactive_host("int-wait", "int-wait-timeout", base_timeouts())
+    else {
+        return;
+    };
+    h.load(&page(), 1).expect("load");
+    let pid = h.pid();
+    match h.call_interactive(wait_load(&h)) {
+        Err(HostProcessError::Host(e)) => {
+            assert_eq!(
+                e.kind(),
+                fandhe_browser_render::protocol::HostErrorKind::Timeout
+            )
+        }
+        other => panic!("wait: {other:?}"),
+    }
+    assert_eq!(h.pid(), pid, "host must be kept");
+    match h.call_interactive(Request::DomSnapshot) {
+        Ok(MethodResult::DomSnapshot(d)) => {
+            assert_eq!(
+                (d.element_count(), d.snapshot(), d.url()),
+                (1, "s1", "https://example.com/")
+            );
+            assert_eq!(d.page().doc_seq(), 1);
+        }
+        other => panic!("dom_snapshot: {other:?}"),
+    }
+    h.shutdown();
+}
+
+/// TASK-123: 応答しない dom_snapshot は本体の期限（30 秒 + 5 秒。ここでは短縮値）でホストを破棄し、
+/// `SessionLost` を返す（`timeout` は返さない。確定条件 6）。
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn t_interactive_hang_destroys_host() {
+    let timeouts = base_timeouts()
+        .with_dom_snapshot(Duration::from_millis(300))
+        .with_interactive_grace(Duration::from_millis(100));
+    let Some((_root, mut h)) = interactive_host("int-hang", "int-hang-dom", timeouts) else {
+        return;
+    };
+    h.load(&page(), 1).expect("load");
+    let started = Instant::now();
+    assert!(matches!(
+        h.call_interactive(Request::DomSnapshot),
+        Err(HostProcessError::SessionLost)
+    ));
+    assert!(started.elapsed() < Duration::from_secs(10));
+    assert_eq!(h.pid(), None);
+}
+
+/// TASK-123: hello が操作モードのメソッドを載せないホスト（版の不一致など）は使わない。
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn t_interactive_requires_host_support() {
+    use fandhe_browser_render::host_process::InteractiveUnavailable;
+    let Some((_root, mut h)) = interactive_host("int-nocap", "int-no-caps", base_timeouts()) else {
+        return;
+    };
+    assert!(matches!(
+        h.load(&page(), 1),
+        Err(HostProcessError::InteractiveUnavailable(
+            InteractiveUnavailable::HostLacksSupport
+        ))
+    ));
+    assert_eq!(h.pid(), None);
+}
+
 // Windows は隔離なしの起動を拒否するため、偽ホストを起動する試験は unix だけで動かす。
 // Windows で動くのは起動拒否の試験と、起動しない試験（`required`）のみ。
 #[cfg(windows)]
@@ -943,6 +1152,29 @@ fn main() {
     }
     #[cfg(unix)]
     tests.push(("dump_env_args_cwd", t_dump_env_args_cwd));
+    tests.push((
+        "interactive_requires_isolation",
+        t_interactive_requires_isolation,
+    ));
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        tests.push((
+            "interactive_session_lost_is_not_reloaded",
+            t_interactive_session_lost_is_not_reloaded,
+        ));
+        tests.push((
+            "interactive_wait_timeout_keeps_host",
+            t_interactive_wait_timeout_keeps_host,
+        ));
+        tests.push((
+            "interactive_hang_destroys_host",
+            t_interactive_hang_destroys_host,
+        ));
+        tests.push((
+            "interactive_requires_host_support",
+            t_interactive_requires_host_support,
+        ));
+    }
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     tests.push(("rss_limit", t_rss_limit));
     #[cfg(any(target_os = "linux", target_os = "macos"))]

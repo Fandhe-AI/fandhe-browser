@@ -49,6 +49,24 @@
 //! プロキシなし・送信先なしで実行する（[`run_host_version`]・#1553）。ページを読み込まないため、Windows でも
 //! 隔離なしで実行する（`best-effort` のとき）。
 //!
+//! # 操作モード（TASK-123・RENDER-10・RENDER-11。設計 `docs/design/servo-host-design.md` §14）
+//!
+//! [`HostProcessConfig::with_interactive`] でホストを `--stdio --interactive` で起動し、
+//! [`HostProcess::call_interactive`] で `dom_snapshot`・`act`・`wait` を送る。
+//!
+//! - 起動の条件: 実際の隔離状態が `Isolated` で、`allow_private_network_access = false` のときだけ。
+//!   満たさない・ホストの `hello` が操作モードのメソッドを載せないときは
+//!   [`HostProcessError::InteractiveUnavailable`]（隔離なしへ黙って落とさない。確定条件 7）
+//! - 読み直さない: ページを読み込んだホストが破棄・再起動されたら [`HostProcessError::SessionLost`]。
+//!   `call_interactive` も `call_on_page` もホストを起動せず、ページを読み直さない（確定条件 3・`AISNAP-21`）。
+//!   新しい `load` で戻る
+//! - 時間切れでの破棄: `dom_snapshot`（30 s）・`act`（10 s）・`wait`（要求の `timeout_ms`）に 5 s を足した期限で
+//!   待ち、過ぎたらホストを破棄して `SessionLost`（`timeout` は返さない）。ホストが `dom_snapshot`・`act` に
+//!   `timeout` を返したときも破棄する。`wait` の `timeout` はホストを保ったまま返す（`AISNAP-18`）
+//! - 応答フレームの上限: `dom_snapshot` は 12 MiB（ホストの申告との小さい方）、`act`・`wait` は 1 MiB
+//!
+//! core の `Renderer` から操作モードを呼ぶ入口と、`RenderError` の対応する variant は TASK-124 で足す。
+//!
 //! # 未実装・暫定
 //!
 //! - Windows の RSS 監視と Job Object は未実装（新規 `unsafe` と `windows-sys` が要るため承認事項。
@@ -154,8 +172,26 @@ pub enum TimeoutPhase {
     Screenshot,
     /// `visibility`・`bounding_box`。
     ElementQuery,
+    /// `dom_snapshot`（操作モード）。
+    DomSnapshot,
+    /// `act`（操作モード）。
+    Act,
+    /// `wait`（操作モード）。
+    Wait,
     /// `shutdown`。
     Shutdown,
+}
+
+/// 操作モードで起動できない理由（TASK-121 の確定条件 7・設計 §14.1・`AISNAP-16`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum InteractiveUnavailable {
+    /// `allow_private_network_access = true` との併用。
+    PrivateNetworkAllowed,
+    /// 実際の隔離状態が `Isolated` でない（隔離なしへ降格した。理由つき）。
+    NotIsolated(EgressIsolationUnavailable),
+    /// ホストの `hello` が操作モードのメソッドを載せていない（版の不一致など）。
+    HostLacksSupport,
 }
 
 /// ホスト子プロセス管理のエラー。`Display` は固定の英語文言で、URL・パス・stderr を含めない。
@@ -195,6 +231,13 @@ pub enum HostProcessError {
     /// 理由は `Debug` で取れる。環境の問題でありホストの失敗ではないため、ブレーカーには数えない
     /// （数えると `CircuitOpen` に化けて理由が見えなくなる）。
     EgressIsolationUnavailable(EgressIsolationUnavailable),
+    /// 操作モードのメソッドが、操作モードでない設定（[`HostProcessConfig::with_interactive`]）で呼ばれた。
+    NotInteractive,
+    /// 操作モードで起動できない（ホストは起動しない・破棄済み）。環境・設定の問題のためブレーカーには数えない。
+    InteractiveUnavailable(InteractiveUnavailable),
+    /// 操作モードのページを保っていたホストが破棄・再起動された（時間切れ・クラッシュ・上限超過を含む）。
+    /// 自動で読み直さない（`AISNAP-21`・TASK-121 の確定条件 3）。新しい `load` まで続く。
+    SessionLost,
 }
 
 impl fmt::Display for HostProcessError {
@@ -216,6 +259,9 @@ impl fmt::Display for HostProcessError {
             Self::EgressIsolationUnavailable(_) => {
                 "render host egress isolation is required but unavailable"
             }
+            Self::NotInteractive => "render host is not in interactive mode",
+            Self::InteractiveUnavailable(_) => "render host interactive mode is unavailable",
+            Self::SessionLost => "render host session was lost",
         })
     }
 }
@@ -241,6 +287,11 @@ impl fmt::Debug for HostProcessError {
                 .debug_tuple("EgressIsolationUnavailable")
                 .field(r)
                 .finish(),
+            Self::NotInteractive => f.write_str("NotInteractive"),
+            Self::InteractiveUnavailable(r) => {
+                f.debug_tuple("InteractiveUnavailable").field(r).finish()
+            }
+            Self::SessionLost => f.write_str("SessionLost"),
         }
     }
 }
@@ -281,6 +332,12 @@ pub struct HostTimeouts {
     pub shutdown_grace: Duration,
     /// `load` でホスト自身の `timeout` 応答が先に届くための上乗せ（暫定 2 s）。
     pub load_grace: Duration,
+    /// `dom_snapshot`（30 s。設計 §14.6）。
+    pub dom_snapshot: Duration,
+    /// `act`（10 s。設計 §14.6）。
+    pub act: Duration,
+    /// 操作モードのメソッドの上乗せ（5 s。`wait` は要求の `timeout_ms` に足す。設計 §14.6）。
+    pub interactive_grace: Duration,
 }
 
 impl Default for HostTimeouts {
@@ -293,6 +350,9 @@ impl Default for HostTimeouts {
             element_query: Duration::from_secs(5),
             shutdown_grace: Duration::from_secs(3),
             load_grace: Duration::from_secs(2),
+            dom_snapshot: Duration::from_secs(30),
+            act: Duration::from_secs(10),
+            interactive_grace: Duration::from_secs(5),
         }
     }
 }
@@ -334,6 +394,22 @@ impl HostTimeouts {
         self
     }
 
+    /// `dom_snapshot` を変える。
+    pub fn with_dom_snapshot(mut self, d: Duration) -> Self {
+        self.dom_snapshot = d.min(MAX_STAGE_TIMEOUT);
+        self
+    }
+    /// `act` を変える。
+    pub fn with_act(mut self, d: Duration) -> Self {
+        self.act = d.min(MAX_STAGE_TIMEOUT);
+        self
+    }
+    /// 操作モードのメソッドの上乗せを変える。
+    pub fn with_interactive_grace(mut self, d: Duration) -> Self {
+        self.interactive_grace = d.min(MAX_STAGE_TIMEOUT);
+        self
+    }
+
     /// 要求された `load` の `timeout_ms` を既定・上限で丸める（最小 1 ms）。
     pub fn load_timeout_ms(&self, requested: Option<u32>) -> u32 {
         let to_ms = |d: Duration| u32::try_from(d.as_millis()).unwrap_or(u32::MAX);
@@ -365,6 +441,8 @@ pub struct HostProcessConfig {
     pub allow_private_network_access: bool,
     /// 隔離可否の判定元（既定 [`IsolationProbe::System`]。差し替えはテスト用）。
     pub isolation_probe: IsolationProbe,
+    /// 操作モード（既定 false。[`HostProcessConfig::with_interactive`]）。
+    pub interactive: bool,
     isolation_warning: IsolationWarning,
     /// テスト用: `isolation_probe` の代わりに使うサンドボックス（本番ビルドには現れない。#1498）。
     #[cfg(test)]
@@ -418,6 +496,7 @@ impl HostProcessConfig {
             egress_isolation: EgressIsolationMode::default(),
             allow_private_network_access: false,
             isolation_probe: IsolationProbe::default(),
+            interactive: false,
             isolation_warning: IsolationWarning::default(),
             #[cfg(test)]
             injected_sandbox: None,
@@ -456,6 +535,15 @@ impl HostProcessConfig {
         self
     }
     /// 隔離可否の判定元を差し替える（テスト用。本番は既定の `System`）。
+    /// 操作モードにする（TASK-123・設計 §14.1）。ホストを `--stdio --interactive` で起動し、
+    /// 実際の隔離状態が `Isolated` で `allow_private_network_access = false` のときだけ起動する
+    /// （満たさなければ [`HostProcessError::InteractiveUnavailable`]。隔離なしへ黙って落とさない）。
+    /// 操作モードでは、ホストの破棄・再起動の後にページを読み直さず [`HostProcessError::SessionLost`] を返す。
+    pub fn with_interactive(mut self, interactive: bool) -> Self {
+        self.interactive = interactive;
+        self
+    }
+
     pub fn with_isolation_probe(mut self, probe: IsolationProbe) -> Self {
         self.isolation_probe = probe;
         self
@@ -550,6 +638,8 @@ pub struct HostProcess {
     isolation_warned: bool,
     /// tmpfs の容量上限が無いことの警告を出したか（HostProcess ごとに 1 回。#1498）。
     tmpfs_limit_warned: bool,
+    /// 操作モードで、読み込んだページを保っていたホストが破棄された（次の `load` で戻る）。
+    session_lost: bool,
 }
 
 impl fmt::Debug for HostProcess {
@@ -580,7 +670,12 @@ fn request_within_limits(
         Request::Load(p) => p.url().len() <= url_max,
         Request::Visibility(p) => p.selector().len() <= selector_max,
         Request::BoundingBox(p) => p.selector().len() <= selector_max,
-        Request::Screenshot(_) | Request::Shutdown => true,
+        // 操作モードの要求は、各コンストラクタが上限（設計 §14.6）を検証済み。フレーム長だけを見る。
+        Request::Screenshot(_)
+        | Request::Shutdown
+        | Request::DomSnapshot
+        | Request::Act(_)
+        | Request::Wait(_) => true,
     };
     param_ok && frame_len <= frame_max
 }
@@ -651,6 +746,7 @@ impl HostProcess {
             stderr_tail: Arc::new(Mutex::new(StderrTail::new())),
             isolation_warned: false,
             tmpfs_limit_warned: false,
+            session_lost: false,
         }
     }
 
@@ -732,16 +828,29 @@ impl HostProcess {
         request: Request,
         on_reload: impl FnOnce(&LoadResult) -> Result<(), HostProcessError>,
     ) -> Result<MethodResult, HostProcessError> {
-        if matches!(request, Request::Load(_) | Request::Shutdown) {
+        if matches!(
+            request,
+            Request::Load(_)
+                | Request::Shutdown
+                | Request::DomSnapshot
+                | Request::Act(_)
+                | Request::Wait(_)
+        ) {
             return Err(HostProcessError::InvalidRequest);
         }
-        self.ensure_running()?;
-        if needs_reload(
+        let reload = needs_reload(
             self.loaded.as_ref(),
             page.url(),
             nav_generation,
             self.host_generation,
-        ) {
+        );
+        // 操作モードでは読み直さない（ホストの状態〔入力値・Cookie・遷移先〕が失われているため。
+        // TASK-121 の確定条件 3・`AISNAP-21`）。起動もしない。
+        if self.config.interactive && (reload || self.running.is_none()) {
+            return Err(HostProcessError::SessionLost);
+        }
+        self.ensure_running()?;
+        if reload {
             let loaded = self.load_inner(page, nav_generation)?;
             if let Err(e) = on_reload(&loaded) {
                 // 不許可のページがホストに載ったままにならないよう、記録を捨てて次回は再ロードさせる。
@@ -751,6 +860,54 @@ impl HostProcess {
         }
         let (wait, phase) = self.wait_for(&request);
         self.exchange(&request, wait, phase)
+    }
+
+    /// 操作モードの要求（`dom_snapshot`・`act`・`wait`）を、読み込み済みのページに送る（TASK-123・設計 §14）。
+    ///
+    /// ホストを起動せず、ページを読み直さない。ページを読み込んだホストが居なくなっていれば
+    /// [`HostProcessError::SessionLost`]。時間切れ・クラッシュ・プロトコル違反はホストを破棄して
+    /// `SessionLost` にする（`timeout` は返さない。`AISNAP-17`）。ホストが `dom_snapshot`・`act` に
+    /// `timeout` を返したときも同じく破棄する。`wait` の `timeout` はホストを保ったまま返す（`AISNAP-18`）。
+    pub fn call_interactive(&mut self, request: Request) -> Result<MethodResult, HostProcessError> {
+        if !self.config.interactive {
+            return Err(HostProcessError::NotInteractive);
+        }
+        let method = request.method();
+        if !matches!(method, Method::DomSnapshot | Method::Act | Method::Wait) {
+            return Err(HostProcessError::InvalidRequest);
+        }
+        let alive = self.running.as_ref().is_some_and(|r| {
+            r.child
+                .lock()
+                .map(|mut c| matches!(c.try_wait(), Ok(None)))
+                .unwrap_or(false)
+        });
+        if !alive {
+            if self.running.is_some() {
+                let _ = self.discard(HostProcessError::Crashed);
+            }
+            return Err(if self.session_lost || self.loaded.is_none() {
+                HostProcessError::SessionLost
+            } else {
+                HostProcessError::Crashed
+            });
+        }
+        if self.loaded.as_ref().map(|l| l.host_generation) != Some(self.host_generation) {
+            return Err(HostProcessError::SessionLost);
+        }
+        let (wait, phase) = self.wait_for(&request);
+        match self.exchange(&request, wait, phase) {
+            Ok(m) => Ok(m),
+            Err(HostProcessError::Host(e))
+                if e.kind() == HostErrorKind::Timeout && method != Method::Wait =>
+            {
+                let _ = self.discard(HostProcessError::Timeout(phase));
+                Err(HostProcessError::SessionLost)
+            }
+            Err(e @ (HostProcessError::Host(_) | HostProcessError::InvalidRequest)) => Err(e),
+            // exchange は失敗時にホストを破棄済み。
+            Err(_) => Err(HostProcessError::SessionLost),
+        }
     }
 
     /// `shutdown` 要求 → 猶予 → kill → wait → 一時ディレクトリ削除。何度呼んでもよい。
@@ -797,6 +954,16 @@ impl HostProcess {
                 TimeoutPhase::Load,
             ),
             Request::Shutdown => (t.shutdown_grace, TimeoutPhase::Shutdown),
+            Request::DomSnapshot => (
+                t.dom_snapshot.saturating_add(t.interactive_grace),
+                TimeoutPhase::DomSnapshot,
+            ),
+            Request::Act(_) => (t.act.saturating_add(t.interactive_grace), TimeoutPhase::Act),
+            Request::Wait(p) => (
+                Duration::from_millis(u64::from(p.timeout_ms()))
+                    .saturating_add(t.interactive_grace),
+                TimeoutPhase::Wait,
+            ),
             _ => (t.element_query, TimeoutPhase::ElementQuery),
         }
     }
@@ -820,6 +987,7 @@ impl HostProcess {
         }
         match result? {
             MethodResult::Load(l) => {
+                self.session_lost = false;
                 self.loaded = Some(LoadedPage {
                     url: page.url().to_string(),
                     nav_generation,
@@ -853,12 +1021,11 @@ impl HostProcess {
             if !request_within_limits(r.hello.as_ref().map(|h| &h.limits), request, payload.len()) {
                 return Err(HostProcessError::InvalidRequest);
             }
-            let declared = r.hello.as_ref().map(|h| {
-                if method == Method::Screenshot {
-                    h.limits.screenshot_frame_bytes
-                } else {
-                    h.limits.response_frame_bytes
-                }
+            let declared = r.hello.as_ref().and_then(|h| match method {
+                Method::Screenshot => Some(h.limits.screenshot_frame_bytes),
+                // 申告が無ければ固定上限（12 MiB）だけで判定する。
+                Method::DomSnapshot => h.limits.dom_snapshot_frame_bytes,
+                _ => Some(h.limits.response_frame_bytes),
             });
             let limit = effective_limit(response_frame_limit(method), declared);
             roundtrip(r, payload, limit, deadline_after(wait), phase)
@@ -905,6 +1072,9 @@ impl HostProcess {
         } else {
             err
         };
+        if self.config.interactive && self.loaded.is_some() {
+            self.session_lost = true;
+        }
         self.teardown();
         self.loaded = None;
         if err.counts_as_failure() {
@@ -1137,14 +1307,28 @@ impl HostProcess {
     }
 
     fn spawn(&mut self) -> Result<(), HostProcessError> {
+        if self.config.interactive && self.config.allow_private_network_access {
+            return Err(HostProcessError::InteractiveUnavailable(
+                InteractiveUnavailable::PrivateNetworkAllowed,
+            ));
+        }
         let workdir = WorkDir::create(&self.config.temp_root)?;
         let (plan, socket_dir) = self.plan_isolation(&workdir)?;
+        // 操作モードは実際の隔離状態が `Isolated` のときだけ（隔離なしへ黙って落とさない。確定条件 7）。
+        if let (true, Plan::Unisolated(reason)) = (self.config.interactive, &plan) {
+            return Err(HostProcessError::InteractiveUnavailable(
+                InteractiveUnavailable::NotIsolated(*reason),
+            ));
+        }
         // 隔離（bwrap）時は tmpfs で隠れた後に戻るのは正規化済みの WorkDir だけなので、cwd と
         // 子の環境変数（HOME・TMPDIR・XDG_*）もそのパスから作る。temp_root が symlink 経由でも
         // 子の指し先が消えない（#1485）。
         let (child_root, child_home, child_tmp) =
             child_paths(socket_dir.as_ref().map(|sd| sd.dir.as_path()), &workdir);
         let mut launch = self.build_command(plan, socket_dir)?;
+        if self.config.interactive {
+            insert_interactive_flag(&mut launch.args);
+        }
         let mut cmd = Command::new(&launch.program);
         cmd.args(&launch.args)
             .env_clear()
@@ -1326,6 +1510,16 @@ impl HostProcess {
         if !(hello.protocol.min..=hello.protocol.max).contains(&supported) {
             return Err(self.discard(HostProcessError::ProtocolMismatch));
         }
+        if self.config.interactive
+            && !hello
+                .capabilities
+                .iter()
+                .any(|c| c == Method::DomSnapshot.as_str())
+        {
+            return Err(self.discard(HostProcessError::InteractiveUnavailable(
+                InteractiveUnavailable::HostLacksSupport,
+            )));
+        }
         if let Some(r) = self.running.as_mut() {
             r.hello = Some(hello);
         }
@@ -1337,6 +1531,14 @@ impl HostProcess {
 impl Drop for HostProcess {
     fn drop(&mut self) {
         self.shutdown();
+    }
+}
+
+/// 起動引数の `--stdio` の直後に `--interactive` を入れる（ホストは `--stdio --interactive <egress>` の順を
+/// 求める。設計 §14.1）。隔離のラッパー（bwrap・sandbox-exec）の引数は `--stdio` を含まない。
+fn insert_interactive_flag(args: &mut Vec<OsString>) {
+    if let Some(i) = args.iter().position(|a| a == "--stdio") {
+        args.insert(i + 1, OsString::from("--interactive"));
     }
 }
 
@@ -1565,6 +1767,56 @@ mod tests {
         });
     }
 
+    /// TASK-123: `--interactive` は `--stdio` の直後に入る（ラッパーの引数には触れない）。
+    #[test]
+    fn render10_interactive_flag_follows_stdio() {
+        let mut v: Vec<OsString> = [
+            "--die-with-parent",
+            "--",
+            "/h",
+            "--stdio",
+            "--egress-relay-uds",
+            "/s",
+        ]
+        .iter()
+        .map(OsString::from)
+        .collect();
+        insert_interactive_flag(&mut v);
+        let got: Vec<String> = v.iter().map(|a| a.to_string_lossy().into_owned()).collect();
+        assert_eq!(
+            got,
+            [
+                "--die-with-parent",
+                "--",
+                "/h",
+                "--stdio",
+                "--interactive",
+                "--egress-relay-uds",
+                "/s"
+            ]
+        );
+    }
+
+    /// TASK-123・設計 §14.6: 操作モードの期限（dom_snapshot 30 s・act 10 s・wait は要求の値、いずれも + 5 s）。
+    #[test]
+    fn render10_interactive_deadlines() {
+        use crate::protocol::{PageInfo, WaitCondition, WaitParams};
+        let exe = std::env::current_exe().unwrap();
+        let bin = resolve::resolve_host_binary(Some(&exe), None, None).expect("host binary");
+        let h = HostProcess::new(HostProcessConfig::new(bin));
+        assert_eq!(
+            h.wait_for(&Request::DomSnapshot),
+            (Duration::from_secs(35), TimeoutPhase::DomSnapshot)
+        );
+        let page = PageInfo::new("s", 1).unwrap();
+        let wait = Request::Wait(WaitParams::new(page, WaitCondition::LoadComplete, 1500).unwrap());
+        assert_eq!(
+            h.wait_for(&wait),
+            (Duration::from_millis(6500), TimeoutPhase::Wait)
+        );
+        assert_eq!(response_frame_limit(Method::DomSnapshot), 12 * 1024 * 1024);
+    }
+
     fn limits(request: u64, url: u64, selector: u64) -> HelloLimits {
         HelloLimits {
             request_frame_bytes: request,
@@ -1575,6 +1827,7 @@ mod tests {
             selector_bytes: selector,
             error_message_bytes: 512,
             max_in_flight: 1,
+            dom_snapshot_frame_bytes: None,
         }
     }
 

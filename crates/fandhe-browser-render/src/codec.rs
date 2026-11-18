@@ -24,10 +24,14 @@ pub const MAX_HELLO_FRAME_BYTES: usize = 16 * 1024;
 /// スクリーンショット応答フレームの上限（24 MiB）。
 pub const MAX_SCREENSHOT_RESPONSE_FRAME_BYTES: usize = 24 * 1024 * 1024;
 
-/// メソッドに応じた応答フレームの上限。`screenshot` だけ 24 MiB、他は 1 MiB。
+/// `dom_snapshot` 応答フレームの上限（12 MiB。`RENDER-11`）。
+pub const MAX_DOM_SNAPSHOT_RESPONSE_FRAME_BYTES: usize = 12 * 1024 * 1024;
+
+/// メソッドに応じた応答フレームの上限。`screenshot` は 24 MiB、`dom_snapshot` は 12 MiB、他は 1 MiB。
 pub fn response_frame_limit(method: Method) -> usize {
     match method {
         Method::Screenshot => MAX_SCREENSHOT_RESPONSE_FRAME_BYTES,
+        Method::DomSnapshot => MAX_DOM_SNAPSHOT_RESPONSE_FRAME_BYTES,
         _ => MAX_RESPONSE_FRAME_BYTES,
     }
 }
