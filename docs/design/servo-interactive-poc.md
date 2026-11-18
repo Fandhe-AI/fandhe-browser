@@ -29,10 +29,10 @@
 | (12) 保存 HTML の再パースでの実行 | 経路なし | 書き戻した HTML を navigate の経路へ再投入しない限り、スクリプト・`meta refresh` は動かない |
 | (4) Rust 側の矩形・ヒットテスト | 取れる（WebDriver の命令経由） | ページが上書きできない判定でクリック先を確かめられる。使うには `servo-base` の直接依存が要る（TASK-121 で承認を求める） |
 | (7) `JSValue::Element` の再利用 | WebDriver の命令でだけ再利用できる | 要素 ID は文書が変わると `NoSuchElement`、要素を消すと `StaleElementReference` になる |
-| (8) delegate の既定の動き | 応答せずに捨てると安全側に倒れる | ダイアログ・選択肢・ファイル選択・新しいウィンドウは、既定のままで操作を止めない |
+| (8) delegate の既定の動き | 応答せずに捨てても止まらない | ダイアログ・選択肢・ファイル選択・新しいウィンドウの要求は、捨てても操作は進む。ダイアログの扱いは TASK-126 で決める |
 | (9) 入力・座標・resize | 成立。初回フレーム前の入力は失敗する | 座標は CSS px（`WebViewPoint::Page`）で渡す。最初のフレームを待ってから入力する |
 | (10) 8 MiB 級の DOM | release で直列化に約 13 秒・常駐メモリ約 1.5 GB | `dom_snapshot` の時間切れと上限、メモリの見積もりの根拠にする（TASK-121 の確定条件 5・6） |
-| (11) Cookie・stderr | 一時領域の外に残らない。console とフォームの値は stderr に出ない | macOS だけで確かめた。Linux とログを有効にした場合は未確認 |
+| (11) Cookie・stderr | 一時領域の外に残らない。Servo は console とフォームの値を stderr に出さない | macOS だけで確かめた。stdout、Linux、ログを有効にした場合は未確認 |
 
 ## 入力と撮影（2026-11-16 試作・2026-11-18 再実行）
 
@@ -158,10 +158,10 @@ TASK-120 の実装結果（2026-11-18・#1581）:
 
 - `evaluate_javascript` が要素を返すと `JSValue::Element` に 32 桁の 16 進の ID が入る。`FindElementsCSSSelector` が返す ID と同じで、`GetElementRect` 等にそのまま渡せる
 - `evaluate_javascript` は文字列しか受け取らないため、ID を JS へ戻して要素を引くことはできない
-- 別の文書へ移った後は `NoSuchElement`、同じ文書で要素を消した後は `StaleElementReference`。古い ID で別の要素を操作する経路は無い
+- 別の文書へ移った後は `NoSuchElement`、同じ文書で要素を消した後は `StaleElementReference`。試した 2 例では、古い ID で別の要素を操作することは無かった
 - ID はホストの中だけで使い、本体へは出さない前提にする（本体へ出すのは TASK-121 の確定条件 1 の番号）
 
-### (8) delegate の既定の動き: 応答せずに捨てると安全側に倒れる
+### (8) delegate の既定の動き: 応答せずに捨てても止まらない
 
 ホストの `PageDelegate` は `show_embedder_control`・`request_create_new` を実装していない。試験では受け取った内容を記録してから捨てた（既定と同じ）。
 
@@ -174,13 +174,13 @@ TASK-120 の実装結果（2026-11-18・#1581）:
 | `window.open`（クリック起点・スクリプト起点） | `request_create_new` | `null`。新しい WebView は作られない |
 
 - 右クリックのメニュー（`ContextMenu`）は試していない。捨てたときは「選ばなかった」になる（ソースの `Drop`）
-- 操作モードでも既定のままで操作は止まらない。選択肢の選び方・ファイル選択を将来扱う場合は TASK-126 で決める
+- 操作モードでも既定のままで操作は止まらない。ダイアログの扱い・選択肢の選び方・ファイル選択は TASK-126 で決める
 
 ### (9) 入力・座標・resize・初回フレーム前のクリック
 
 - キーごとの非 ASCII: `Key::Character` に `あ`・`漢`・`é`・`😀` を 1 文字ずつ送ると、IME の確定イベントなしで `input` に入る（`value="aあ漢é😀"`）
 - hidpi: 倍率 2 で `devicePixelRatio=2`・`innerWidth=640`。`WebViewPoint::Page`（CSS px）と `WebViewPoint::Device`（2 倍した値）はどちらも目的の要素に当たる。`Device` に CSS px をそのまま渡すと半分の位置（62, 62）に当たる。ホストは CSS px を `Page` で渡す
-- resize: `WebView::resize` で高さを 3000 にすると `innerHeight`・`100vh` の要素が 3000、`position: fixed; bottom: 0` の要素の上端が 2980 になる。全ページ撮影では、`fixed` の要素は画像の最下部に、`vh` の要素は広げた高さで写る。800 に戻すと値も元に戻る。描画コンテキストを直接 `resize` してから `WebView::resize` を呼ぶと、大きさが変わらず `innerHeight` も 800 のままだった（`WebView::resize` だけを使う）
+- resize: `WebView::resize` で高さを 3000 にすると `innerHeight`・`100vh` の要素が 3000、`position: fixed; bottom: 0` の要素の上端が 2980 になる。全ページ撮影の画像では、最下部に `fixed` の要素（青）が写った（`vh` の要素の写り方は画素では確かめていない）。800 に戻すと値も元に戻る。dev の実行で、描画コンテキストを直接 `resize` してから `WebView::resize` を呼ぶと、大きさが変わらず `innerHeight` も 800 のままだった（`WebView::resize` だけを使う）
 - 初回フレーム前のクリック: WebView を作った直後に送ったクリックは、3 件とも `notify_input_event_handled` が `DispatchFailed` を返し、ページに届かない。ホストは最初のフレームを待ってから入力する（現在の `load` は待っている）
 
 ### (10) 8 MiB 級の DOM の直列化
@@ -199,8 +199,8 @@ release（macOS arm64）で 1 回測った。同じエンジンで 1 MiB を先�
 ### (11) Cookie と stderr
 
 - `Set-Cookie`（`Max-Age=3600`）と `document.cookie`（`max-age=3600`）の両方がページから見える状態で、フォームに文字を入れて送信した
-- ファイル: エンジンの動作中と破棄後の両方で、`$TMPDIR` の下（深さ 4 まで）に新しいファイルは無かった。`~/Library` の `Application Support`・`Preferences`・`Caches`・`HTTPStorages`・`Cookies`、`~/.config`・`~/.local`・`~/.cache`、作業ディレクトリの新しいファイルにも Cookie の値は無かった（一致したのは、この試験を動かした端末の記録だけ）
-- stderr: `console.log`・`console.error`・`console.warn` の文字列とフォームの値は出なかった（ホストはログを設定していない）
+- ファイル: エンジンの動作中と破棄後の両方で、`$TMPDIR` の下（深さ 4 まで）に Servo が作ったファイルは無かった（新しいファイルは、無関係なツールが作った 1 件だけ）。`~/Library` の `Application Support`・`Preferences`・`Caches`・`HTTPStorages`・`Cookies`、`~/.config`・`~/.local`・`~/.cache`、作業ディレクトリの新しいファイルにも Cookie の値は無かった（一致したのは、この試験を動かした端末の記録だけ）
+- stderr: Servo は `console.log`・`console.error`・`console.warn` の文字列とフォームの値を出さなかった（ホストはログを設定していない。フォームの値は試験サーバーへの送信にだけ現れた）。stdout は調べていない
 - 限界: macOS だけで確かめた。新しいファイルを値で探しただけで、Servo が書く場所を網羅したわけではない。ログを有効にする変更を入れるときは確かめ直す（TASK-126・TASK-130）
 
 ## 残り（未確認の項目）
@@ -213,7 +213,7 @@ release（macOS arm64）で 1 回測った。同じエンジンで 1 MiB を先�
 | ★2 の条件 | 遷移の検査・回帰テスト・未試験の経路は TASK-120 で済み。現在 URL の検査と `data:`・`blob:` の iframe の除外は対象のメソッドと同時に入れる | TASK-122・TASK-126 |
 | (4) | WebDriver の命令で取れる。本採用には `servo-base =0.7.0` の直接依存の承認が要る | TASK-121（採らなければ iframe 上の拒否・スクロール上限 3 回を最終形にする） |
 | (7) | WebDriver の命令でだけ再利用できる（(4) と同じ依存が要る） | TASK-122・TASK-126 |
-| (8) | 既定（捨てる）で安全側に倒れる。右クリックのメニューは未試験 | TASK-126 |
+| (8) | 既定（捨てる）で操作は止まらない。ダイアログの扱いと右クリックのメニューは未決 | TASK-126 |
 | (9) | 確かめた。全ページ撮影で `fixed`・`vh` の要素がどう写るかの扱いは未決 | TASK-126・撮影の強化（RENDER-9） |
 | (10) | 測った。上限と時間切れの値は未決 | TASK-121（確定条件 5・6） |
 | (11) | macOS で確かめた。Linux とログを有効にした場合は未確認 | TASK-126・TASK-130 |
