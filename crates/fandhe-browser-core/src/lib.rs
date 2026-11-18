@@ -106,6 +106,7 @@ pub mod event_loop;
 mod exception_summary;
 pub mod fetch;
 pub mod host;
+pub mod interactive;
 pub mod js_shim;
 pub mod js_stub;
 pub mod observability;

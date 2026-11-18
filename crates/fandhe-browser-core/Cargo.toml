@@ -65,6 +65,9 @@ fandhe-browser-js = { workspace = true }
 default = []
 js-v8 = ["fandhe-browser-js/js-v8"]
 js-boa = ["fandhe-browser-js/js-boa"]
+# 結合テスト専用の入口（`AppState::allow_interactive_for_tests`。TASK-124）。新しい依存を増やさない。
+# 本番のビルドでは有効にしない（使うのは本 crate の結合テスト `state_interactive` と他 crate の dev-dependencies だけ）。
+test-support = []
 
 [dev-dependencies]
 tokio = { workspace = true }
@@ -183,3 +186,10 @@ test = true
 name = "compat_page_script_probe"
 path = "../../harness/compat-practical/page_script_probe/main.rs"
 test = true
+
+# TASK-124: 操作モードの公開 API の結合テスト。許可の入口 `allow_interactive_for_tests` が feature
+# `test-support` の下にあるため、そのときだけ動かす（CI の `rust-test-*` は `--all-features`）。
+[[test]]
+name = "state_interactive"
+path = "tests/state_interactive.rs"
+required-features = ["test-support"]
