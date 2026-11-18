@@ -554,6 +554,7 @@ AGENTS.md の変更はレビュー基準の変更として AI レビューで P0
 - WebDriver の命令（§14.4）を使うための `servo-base =0.7.0` の直接依存: TASK-126 の着手時に承認を求める
 - 8 MiB 級の DOM の Linux での時間・本体のメモリ: TASK-138 で測り、§14.6 の値を見直す
 - ページのダイアログ（`alert()`・`confirm()`・`prompt()`）の扱い: TASK-126 で決める
+- `pushState` を繰り返すページでは `act` が毎回 `stale` になりうる。本体が取り直して再試行する回数の上限を TASK-124・TASK-126 で決める
 - `window.webdriverElement` は Servo が「公開すべきでないが当面公開している」と注記している拡張で、版の更新で消えうる。消えたら要素の同一性（§14.4）を WebDriver の命令（`servo-base` の依存が要る）で取り直す。servo の版を上げるときに確かめる
 
 ## 付録 A. 依存追加の承認提示雛形
