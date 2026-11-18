@@ -304,6 +304,27 @@ impl Action {
         })
     }
 
+    /// 上限を検査する（variant を直接組んだ値も、送信前にここで拒否する）。
+    fn validate(&self) -> Result<(), ProtocolError> {
+        match self {
+            Self::Click => Ok(()),
+            Self::Fill { text, .. } if text.len() > MAX_FILL_TEXT_BYTES => {
+                Err(ProtocolError::InvalidParams("fill text too long"))
+            }
+            Self::Select { values }
+                if values.is_empty()
+                    || values.len() > MAX_SELECT_VALUES
+                    || values.iter().any(|v| v.len() > MAX_SELECT_VALUE_BYTES) =>
+            {
+                Err(ProtocolError::InvalidParams("select values out of range"))
+            }
+            Self::Press { key } if key.is_empty() || key.len() > MAX_KEY_BYTES => Err(
+                ProtocolError::InvalidParams("press key length out of range"),
+            ),
+            _ => Ok(()),
+        }
+    }
+
     fn to_json(&self) -> Value {
         match self {
             Self::Click => json!({ "kind": "click" }),
@@ -342,6 +363,7 @@ impl ActParams {
         if node > MAX_NODE {
             return Err(ProtocolError::InvalidParams("node out of range"));
         }
+        action.validate()?;
         Ok(Self {
             page,
             snapshot: snapshot.to_owned(),
@@ -386,8 +408,8 @@ impl ActResult {
     }
 }
 
-/// `wait` の条件（`AISNAP-18`）。文字列はセレクタ・テキストとも 1〜1024 バイト。
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// `wait` の条件（`AISNAP-18`）。文字列はセレクタ・テキストとも 1〜1024 バイト。`Debug` に文字列は出さない。
+#[derive(Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum WaitCondition {
     /// セレクタに一致する要素が現れる。
@@ -398,6 +420,17 @@ pub enum WaitCondition {
     TextPresent(String),
     /// 読み込みの完了。
     LoadComplete,
+}
+
+impl fmt::Debug for WaitCondition {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::SelectorPresent(_) => "SelectorPresent",
+            Self::SelectorAbsent(_) => "SelectorAbsent",
+            Self::TextPresent(_) => "TextPresent",
+            Self::LoadComplete => "LoadComplete",
+        })
+    }
 }
 
 impl WaitCondition {
@@ -495,10 +528,7 @@ pub(super) fn parse_dom_snapshot(
 ) -> Result<DomSnapshotResult, ProtocolError> {
     let page = PageInfo::from_json(obj.get("page").ok_or(bad("page missing"))?)?;
     let url = str_field(obj, "url", MAX_URL_BYTES, "invalid url")?;
-    let lower = url
-        .get(..8)
-        .map(str::to_ascii_lowercase)
-        .unwrap_or_default();
+    let lower: String = url.chars().take(8).collect::<String>().to_ascii_lowercase();
     if !(lower.starts_with("http://") || lower.starts_with("https://")) {
         return Err(bad("url scheme must be http or https"));
     }
@@ -572,6 +602,17 @@ mod tests {
         assert!(ActParams::new(page(), "s1", MAX_NODE, e.clone(), Action::Click).is_ok());
         assert!(ActParams::new(page(), "s1", MAX_NODE + 1, e.clone(), Action::Click).is_err());
         assert!(ActParams::new(page(), "", 0, e, Action::Click).is_err());
+        // variant を直接組んでも ActParams::new が拒否する。
+        for bad in [
+            Action::Fill {
+                text: "a".repeat(MAX_FILL_TEXT_BYTES + 1),
+                sensitive: false,
+            },
+            Action::Select { values: vec![] },
+            Action::Press { key: String::new() },
+        ] {
+            assert!(ActParams::new(page(), "s1", 0, ActExpect::new("a").unwrap(), bad).is_err());
+        }
         assert!(PageInfo::new("", 0).is_err());
         assert!(PageInfo::new("s", MAX_REQUEST_ID + 1).is_err());
     }

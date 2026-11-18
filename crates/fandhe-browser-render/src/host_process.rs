@@ -838,19 +838,29 @@ impl HostProcess {
         ) {
             return Err(HostProcessError::InvalidRequest);
         }
-        let reload = needs_reload(
+        if self.config.interactive {
+            // 操作モードでは起動も読み直しもしない（ホストの状態〔入力値・Cookie・遷移先〕が失われて
+            // いるため。TASK-121 の確定条件 3・`AISNAP-21`）。合間に死んだホストも検出する。
+            self.ensure_interactive_session()?;
+            if needs_reload(
+                self.loaded.as_ref(),
+                page.url(),
+                nav_generation,
+                self.host_generation,
+            ) {
+                return Err(HostProcessError::SessionLost);
+            }
+            let (wait, phase) = self.wait_for(&request);
+            return self.exchange(&request, wait, phase);
+        }
+        // 静的モード: 合間に死んだホストは起動し直してから、世代を見て読み直す（評価は起動の後）。
+        self.ensure_running()?;
+        if needs_reload(
             self.loaded.as_ref(),
             page.url(),
             nav_generation,
             self.host_generation,
-        );
-        // 操作モードでは読み直さない（ホストの状態〔入力値・Cookie・遷移先〕が失われているため。
-        // TASK-121 の確定条件 3・`AISNAP-21`）。起動もしない。
-        if self.config.interactive && (reload || self.running.is_none()) {
-            return Err(HostProcessError::SessionLost);
-        }
-        self.ensure_running()?;
-        if reload {
+        ) {
             let loaded = self.load_inner(page, nav_generation)?;
             if let Err(e) = on_reload(&loaded) {
                 // 不許可のページがホストに載ったままにならないよう、記録を捨てて次回は再ロードさせる。
@@ -876,22 +886,7 @@ impl HostProcess {
         if !matches!(method, Method::DomSnapshot | Method::Act | Method::Wait) {
             return Err(HostProcessError::InvalidRequest);
         }
-        let alive = self.running.as_ref().is_some_and(|r| {
-            r.child
-                .lock()
-                .map(|mut c| matches!(c.try_wait(), Ok(None)))
-                .unwrap_or(false)
-        });
-        if !alive {
-            if self.running.is_some() {
-                let _ = self.discard(HostProcessError::Crashed);
-            }
-            return Err(if self.session_lost || self.loaded.is_none() {
-                HostProcessError::SessionLost
-            } else {
-                HostProcessError::Crashed
-            });
-        }
+        self.ensure_interactive_session()?;
         if self.loaded.as_ref().map(|l| l.host_generation) != Some(self.host_generation) {
             return Err(HostProcessError::SessionLost);
         }
@@ -908,6 +903,24 @@ impl HostProcess {
             // exchange は失敗時にホストを破棄済み。
             Err(_) => Err(HostProcessError::SessionLost),
         }
+    }
+
+    /// 操作モードで、ページを保つホストが生きていることを確かめる。居ない・合間に死んでいたら
+    /// （死んでいれば破棄して）[`HostProcessError::SessionLost`]。起動はしない。
+    fn ensure_interactive_session(&mut self) -> Result<(), HostProcessError> {
+        let alive = self.running.as_ref().is_some_and(|r| {
+            r.child
+                .lock()
+                .map(|mut c| matches!(c.try_wait(), Ok(None)))
+                .unwrap_or(false)
+        });
+        if alive {
+            return Ok(());
+        }
+        if self.running.is_some() {
+            let _ = self.discard(HostProcessError::Crashed);
+        }
+        Err(HostProcessError::SessionLost)
     }
 
     /// `shutdown` 要求 → 猶予 → kill → wait → 一時ディレクトリ削除。何度呼んでもよい。

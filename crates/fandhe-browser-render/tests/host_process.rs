@@ -901,6 +901,42 @@ fn t_interactive_requires_isolation() {
     ));
 }
 
+/// 呼び出しの合間にホストを外から kill し、終了する（ゾンビになる）まで待つ。reap は HostProcess が行う。
+#[cfg(unix)]
+fn kill_between_calls(pid: u32) {
+    let _ = std::process::Command::new("kill")
+        .args(["-9", &pid.to_string()])
+        .status();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        let stat = std::process::Command::new("ps")
+            .args(["-o", "stat=", "-p", &pid.to_string()])
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .unwrap_or_default();
+        if stat.is_empty() || stat.starts_with('Z') {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    panic!("process {pid} is still running");
+}
+
+/// 静的モードで合間にホストが死んだら、起動し直して読み直してから送る（TASK-123 の変更で退行しない）。
+#[cfg(unix)]
+fn t_static_reloads_after_host_died_between_calls() {
+    let root = Root::new("dead-static", "ok");
+    let mut h = root.host(base_timeouts());
+    h.load(&page(), 1).expect("load");
+    kill_between_calls(h.pid().expect("pid"));
+    assert!(matches!(
+        h.call_on_page(&page(), 1, shot()),
+        Ok(MethodResult::Screenshot(_))
+    ));
+    assert_eq!(count(&root.0, "loads"), 2, "must reload on the new host");
+    h.shutdown();
+}
+
 /// 実際の隔離（Linux は bwrap、macOS は sandbox-exec）の下で偽ホストを操作モードで動かす。
 /// 使えない環境（ローカルの Linux で bwrap が無い等）では `None`（CI の Linux では使えることを必須にする）。
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -1005,6 +1041,27 @@ fn t_interactive_session_lost_is_not_reloaded() {
         Ok(MethodResult::Act(_))
     ));
     h.shutdown();
+}
+
+/// TASK-123: 操作モードで合間にホストが死んだら、起動も読み直しもせず `SessionLost`（確定条件 3）。
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn t_interactive_host_died_between_calls() {
+    let Some((_root, mut h)) = interactive_host("int-dead", "ok", base_timeouts()) else {
+        return;
+    };
+    h.load(&page(), 1).expect("load");
+    let generation = h.host_generation();
+    kill_between_calls(h.pid().expect("pid"));
+    assert!(matches!(
+        h.call_on_page(&page(), 1, shot()),
+        Err(HostProcessError::SessionLost)
+    ));
+    assert_eq!(h.pid(), None, "must not respawn");
+    assert!(matches!(
+        h.call_interactive(Request::DomSnapshot),
+        Err(HostProcessError::SessionLost)
+    ));
+    assert_eq!(h.host_generation(), generation);
 }
 
 /// TASK-123: wait の timeout はホストを保ったまま返す（`AISNAP-18`）。dom_snapshot の結果を解釈する。
@@ -1156,6 +1213,10 @@ fn main() {
         "interactive_requires_isolation",
         t_interactive_requires_isolation,
     ));
+    tests.push((
+        "static_reloads_after_host_died_between_calls",
+        t_static_reloads_after_host_died_between_calls,
+    ));
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
         tests.push((
@@ -1169,6 +1230,10 @@ fn main() {
         tests.push((
             "interactive_hang_destroys_host",
             t_interactive_hang_destroys_host,
+        ));
+        tests.push((
+            "interactive_host_died_between_calls",
+            t_interactive_host_died_between_calls,
         ));
         tests.push((
             "interactive_requires_host_support",
