@@ -291,11 +291,22 @@ fn stability_cases(handle: &PageScriptHandle, spa: &SpaRun) {
         );
     }
 
-    eprintln!("case: AISNAP-6/JS-4 re-navigation to the same page yields identical bytes");
+    eprintln!(
+        "case: AISNAP-6/JS-4 re-navigation to the same page yields identical bytes except generation"
+    );
     let second = pipeline(handle, &nav, fixtures::SPA_URL, fixtures::SPA_HTML);
     assert_eq!(second.stage, Stage::Executed);
+    // 応答の `generation`（TASK-125・`AISNAP-20`）だけは navigate ごとに進む。それ以外は同じページで一致する。
+    let mut a: Value = serde_json::from_str(&first.body).expect("JSON");
+    let mut b: Value = serde_json::from_str(&second.body).expect("JSON");
     assert_eq!(
-        first.body, second.body,
+        (a["generation"].clone(), b["generation"].clone()),
+        (1.into(), 2.into())
+    );
+    a["generation"] = Value::Null;
+    b["generation"] = Value::Null;
+    assert_eq!(
+        a, b,
         "a new generation changed the snapshot of the same page"
     );
 }
@@ -351,7 +362,7 @@ fn diagnostics_cases(spa: &SpaRun) {
         );
     }
 
-    eprintln!("case: PLUG-4 envelope keeps exactly the three keys and survives re-serialization");
+    eprintln!("case: PLUG-4 envelope keeps exactly the five keys and survives re-serialization");
     assert_eq!(text, spa.on.body, "interpret-like transform changed bytes");
     let value: Value = serde_json::from_str(&spa.on.body).expect("JSON");
     let mut keys: Vec<&str> = value
@@ -361,7 +372,8 @@ fn diagnostics_cases(spa: &SpaRun) {
         .map(String::as_str)
         .collect();
     keys.sort_unstable();
-    assert_eq!(keys, ["tree", "truncated", "url"]);
+    // `generation`・`mode` は TASK-125 の互換のある追加（`AISNAP-20`）。
+    assert_eq!(keys, ["generation", "mode", "tree", "truncated", "url"]);
 }
 
 /// 1 サイト分の測定行（有効時）。

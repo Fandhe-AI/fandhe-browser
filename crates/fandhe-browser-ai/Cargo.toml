@@ -56,6 +56,9 @@ tiktoken-rs = { workspace = true }
 fandhe-browser-profile = { workspace = true }
 # 結合テストの #[tokio::test]（feature は workspace 定義のまま）
 tokio = { workspace = true }
+# 操作モードの結合テスト（`tests/interactive_snapshot.rs`。TASK-125）が core のテスト専用の許可
+# `AppState::allow_interactive_for_tests` を使う。既存の path 依存に feature を足すだけで新しい依存は無い。
+fandhe-browser-core = { workspace = true, features = ["test-support"] }
 
 # 生 HTML トークン量の計測ベンチ。独自 main で結果を stdout へ出すため
 # harness = false。TASK-14.3（Issue #94・AISNAP-1）で snapshot 側の計測・削減率・平均を追加した。
