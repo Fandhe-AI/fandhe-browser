@@ -1,0 +1,26 @@
+{
+  "case": "act-no-structure",
+  "direction": "request",
+  "method": "act",
+  "expect": "invalid",
+  "message": {
+    "v": 1,
+    "id": 1,
+    "method": "act",
+    "params": {
+      "page": {
+        "session": "3f9c2a7d1b4e4c0a9d8e7f6a5b4c3d2e",
+        "doc_seq": 2
+      },
+      "node": 12,
+      "expect": {
+        "tag": "button",
+        "id": "submit"
+      },
+      "action": {
+        "kind": "click"
+      }
+    }
+  },
+  "note": "structure は必須（同じ文書の中での番号のずれを検出する。設計 §14.4）"
+}

@@ -1,0 +1,26 @@
+{
+  "case": "dom-snapshot-ok",
+  "direction": "response",
+  "expect": "valid",
+  "message": {
+    "v": 1,
+    "id": 1,
+    "result": {
+      "page": {
+        "session": "3f9c2a7d1b4e4c0a9d8e7f6a5b4c3d2e",
+        "doc_seq": 2
+      },
+      "url": "https://example.com/form",
+      "html": "<html data-fandhe-n=\"0\"><head data-fandhe-n=\"1\"></head><body data-fandhe-n=\"2\"><form data-fandhe-n=\"3\"><input data-fandhe-n=\"4\" name=\"q\" value=\"shoes\"><input data-fandhe-n=\"5\" type=\"password\" name=\"pw\"><iframe data-fandhe-n=\"6\" src=\"https://example.com/ad\"></iframe></form></body></html>",
+      "element_count": 7,
+      "structure": "9a3c5e7f10b2d4e6",
+      "excluded": {
+        "iframes": 1,
+        "shadow_roots": 0
+      },
+      "redacted": 1
+    }
+  },
+  "method": "dom_snapshot",
+  "note": "番号は data-fandhe-n。本体がパース後に外して対応表にする。password の値は含めない（第 1 層）"
+}

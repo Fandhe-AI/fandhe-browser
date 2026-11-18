@@ -1,0 +1,13 @@
+{
+  "case": "dom-snapshot-no-page",
+  "direction": "request",
+  "method": "dom_snapshot",
+  "expect": "invalid",
+  "message": {
+    "v": 1,
+    "id": 1,
+    "method": "dom_snapshot",
+    "params": {}
+  },
+  "note": "page は必須（stale の検出に使う。設計 §14.2）"
+}

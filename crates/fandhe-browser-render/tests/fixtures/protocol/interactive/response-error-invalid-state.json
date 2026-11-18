@@ -1,0 +1,13 @@
+{
+  "case": "error-invalid-state",
+  "direction": "response",
+  "expect": "valid",
+  "message": {
+    "v": 1,
+    "id": 1,
+    "error": {
+      "kind": "invalid_state",
+      "message": "Current document is not an http(s) page."
+    }
+  }
+}

@@ -1,0 +1,27 @@
+{
+  "case": "act-selector",
+  "direction": "request",
+  "method": "act",
+  "expect": "invalid",
+  "message": {
+    "v": 1,
+    "id": 1,
+    "method": "act",
+    "params": {
+      "page": {
+        "session": "3f9c2a7d1b4e4c0a9d8e7f6a5b4c3d2e",
+        "doc_seq": 2
+      },
+      "structure": "9a3c5e7f10b2d4e6",
+      "node": 12,
+      "selector": "#submit",
+      "expect": {
+        "tag": "button"
+      },
+      "action": {
+        "kind": "click"
+      }
+    }
+  },
+  "note": "node があってもセレクタは渡せない。本体が写しの上で解決して番号で送る（確定条件 8）"
+}

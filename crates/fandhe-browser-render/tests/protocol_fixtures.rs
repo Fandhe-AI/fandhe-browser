@@ -6,6 +6,11 @@
 //! 依存を足さずにテスト内の最小 JSON Schema 検証器で機械的に保証する。
 //! プロトコル型・コーデックの実装は #989（クライアント）・#993（ホスト）の範囲で、
 //! 本テストは外部入力の経路ではないため `expect` / `panic!` を使う。
+//!
+//! 操作モードのメソッド（`dom_snapshot`・`act`・`wait`。TASK-121・`RENDER-10`・`RENDER-11`）は
+//! 設計を確定した段階で、ホスト・クライアントは未実装。その fixture は `tests/fixtures/protocol/interactive/`
+//! に置き、本テストだけがスキーマとの整合を検証する（ホスト側・クライアント側の契約テストは直下だけを読む）。
+//! 実装（TASK-122・TASK-123・TASK-126）で直下へ移し、両側の契約テストに配線する。
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -20,6 +25,11 @@ const METHODS: [&str; 5] = [
     "bounding_box",
     "shutdown",
 ];
+/// 操作モードのメソッド（設計 §14。fixture は `interactive/`）。
+const INTERACTIVE_METHODS: [&str; 3] = ["dom_snapshot", "act", "wait"];
+/// 操作モードのメソッドだけが返す kind（設計 §14.7）。
+const INTERACTIVE_ERROR_KINDS: [&str; 4] =
+    ["invalid_state", "stale", "not_actionable", "too_large"];
 const ERROR_KINDS: [&str; 8] = [
     "unsupported",
     "invalid_request",
@@ -105,6 +115,7 @@ fn frame_limit(direction: &str, method: Option<&str>) -> usize {
     match (direction, method) {
         ("request", _) => 65536,
         ("response", Some("screenshot")) => 25_165_824,
+        ("response", Some("dom_snapshot")) => 12_582_912,
         ("response", _) => 1_048_576,
         ("hello", _) => 16384,
         other => panic!("direction {other:?}"),
@@ -264,9 +275,22 @@ fn fixtures_dir() -> PathBuf {
         .join("protocol")
 }
 
+/// スキーマが定義する全メソッド（v1 の実装済みと操作モード）。
+fn all_methods() -> impl Iterator<Item = &'static str> {
+    METHODS.into_iter().chain(INTERACTIVE_METHODS)
+}
+
 fn load_fixtures() -> Vec<Fixture> {
+    load_fixtures_in(&fixtures_dir())
+}
+
+fn load_interactive_fixtures() -> Vec<Fixture> {
+    load_fixtures_in(&fixtures_dir().join("interactive"))
+}
+
+fn load_fixtures_in(dir: &Path) -> Vec<Fixture> {
     let mut out = Vec::new();
-    for e in std::fs::read_dir(fixtures_dir()).expect("fixtures dir must exist") {
+    for e in std::fs::read_dir(dir).expect("fixtures dir must exist") {
         let p = e.expect("dir entry").path();
         if p.extension().and_then(|x| x.to_str()) != Some("json") {
             continue;
@@ -307,7 +331,7 @@ fn violations(root: &Value, f: &Fixture) -> Vec<String> {
             if let Some(name) = method {
                 assert_eq!(mm, Some(name), "{}: method mismatch", f.file);
             }
-            if let Some(name) = mm.filter(|n| METHODS.contains(n)) {
+            if let Some(name) = mm.filter(|n| all_methods().any(|m| m == *n)) {
                 // params 省略は空オブジェクトとして照合する（必須項目は省略でも強制する）。
                 let empty = Value::Object(serde_json::Map::new());
                 let p = m.get("params").unwrap_or(&empty);
@@ -369,7 +393,8 @@ fn plug1_schema_uses_only_supported_keywords() {
 #[test]
 fn plug1_fixtures_match_schema() {
     let root = schema();
-    let fixtures = load_fixtures();
+    let mut fixtures = load_fixtures();
+    fixtures.extend(load_interactive_fixtures());
     assert!(!fixtures.is_empty(), "no fixtures found");
     for f in &fixtures {
         let errs = violations(&root, f);
@@ -524,9 +549,26 @@ fn sec2_params_have_no_identity_surface() {
     ];
     let root = schema();
     let defs = root["$defs"].as_object().expect("$defs");
+    // 要求の中に入れ子で現れる定義（操作モード）も、閉じていて識別面を持たないことを確かめる。
+    const NESTED_REQUEST_DEFS: [&str; 9] = [
+        "PageRef",
+        "ActExpect",
+        "ClickAction",
+        "FillAction",
+        "SelectAction",
+        "PressAction",
+        "SelectorCondition",
+        "TextCondition",
+        "LoadCompleteCondition",
+    ];
     let mut seen = 0;
-    for (name, d) in defs.iter().filter(|(n, _)| n.ends_with("Params")) {
-        seen += 1;
+    for (name, d) in defs
+        .iter()
+        .filter(|(n, _)| n.ends_with("Params") || NESTED_REQUEST_DEFS.contains(&n.as_str()))
+    {
+        if name.ends_with("Params") {
+            seen += 1;
+        }
         assert_eq!(
             d["additionalProperties"],
             Value::Bool(false),
@@ -544,14 +586,20 @@ fn sec2_params_have_no_identity_surface() {
             }
         }
     }
-    assert_eq!(seen, METHODS.len(), "unexpected number of *Params defs");
+    assert_eq!(
+        seen,
+        all_methods().count(),
+        "unexpected number of *Params defs"
+    );
+    for n in NESTED_REQUEST_DEFS {
+        assert!(defs.contains_key(n), "schema has no $defs/{n}");
+    }
 }
 
 #[test]
 fn repair4_result_defs_allow_unknown_fields() {
     let root = schema();
-    let mut names: Vec<String> = METHODS
-        .iter()
+    let mut names: Vec<String> = all_methods()
         .map(|m| format!("{}Result", pascal(m)))
         .collect();
     names.extend(
@@ -562,6 +610,7 @@ fn repair4_result_defs_allow_unknown_fields() {
             "HelloEvent",
             "ResultResponse",
             "ErrorResponse",
+            "PageInfo",
         ]
         .map(String::from),
     );
@@ -578,7 +627,7 @@ fn repair4_result_defs_allow_unknown_fields() {
 fn plug1_limits_defaults_are_consistent() {
     let root = schema();
     let lim = &def(&root, "HelloLimits")["properties"];
-    let expect: [(&str, u64); 14] = [
+    let expect: [(&str, u64); 21] = [
         ("request_frame_bytes", 65536),
         ("response_frame_bytes", 1_048_576),
         ("hello_frame_bytes", 16384),
@@ -593,6 +642,13 @@ fn plug1_limits_defaults_are_consistent() {
         ("screenshot_timeout_ms", 20000),
         ("query_timeout_ms", 5000),
         ("shutdown_grace_ms", 3000),
+        ("dom_snapshot_html_bytes", 8_388_608),
+        ("dom_snapshot_frame_bytes", 12_582_912),
+        ("dom_snapshot_timeout_ms", 30000),
+        ("act_timeout_ms", 10000),
+        ("wait_timeout_max_ms", 60000),
+        ("fill_text_bytes", 8192),
+        ("wait_condition_bytes", 1024),
     ];
     for (k, v) in expect {
         assert_eq!(lim[k]["default"].as_u64(), Some(v), "limit {k}");
@@ -608,11 +664,74 @@ fn plug1_limits_defaults_are_consistent() {
         d("ScreenshotResult", "data_base64", "maxLength"),
         Some(25_165_824)
     );
+    // 操作モード（設計 §14.6）。スキーマの上限と申告の既定値を揃える。
+    assert_eq!(d("DomSnapshotResult", "html", "maxLength"), Some(8_388_608));
+    assert_eq!(d("FillAction", "text", "maxLength"), Some(8192));
+    assert_eq!(d("SelectorCondition", "selector", "maxLength"), Some(1024));
+    assert_eq!(d("TextCondition", "text", "maxLength"), Some(1024));
+    assert_eq!(d("WaitParams", "timeout_ms", "maximum"), Some(60000));
+    assert_eq!(d("ActParams", "node", "maximum"), Some(199_999));
+}
+
+/// 操作モード（TASK-121・`RENDER-10`・`RENDER-11`）の fixture の網羅。メソッドごとの正常な要求・結果と、
+/// 操作モードだけが返す kind を `interactive/` に揃える。
+#[test]
+fn render10_interactive_fixture_coverage() {
+    let fixtures = load_interactive_fixtures();
+    let find = |dir: &str, method: &str, expect: &str| {
+        fixtures.iter().any(|f| {
+            f.s("direction") == Some(dir)
+                && f.s("expect") == Some(expect)
+                && f.s("method") == Some(method)
+        })
+    };
+    for m in INTERACTIVE_METHODS {
+        assert!(find("request", m, "valid"), "no valid request for {m}");
+        assert!(find("request", m, "invalid"), "no invalid request for {m}");
+        assert!(find("response", m, "valid"), "no valid result for {m}");
+    }
+    let kinds: BTreeSet<&str> = fixtures
+        .iter()
+        .filter_map(|f| f.v.get("message")?.get("error")?.get("kind")?.as_str())
+        .collect();
+    for k in INTERACTIVE_ERROR_KINDS {
+        assert!(kinds.contains(k), "error kind {k} is not covered");
+    }
+    // 直下の fixture と名前が重ならない（実装時に直下へ移すため）。
+    let top: BTreeSet<String> = load_fixtures().into_iter().map(|f| f.file).collect();
+    for f in &fixtures {
+        assert!(
+            !top.contains(&f.file),
+            "{}: duplicated in both dirs",
+            f.file
+        );
+    }
+}
+
+/// Error.kind の列挙が、v1 の kind と操作モードの kind の和に一致する。
+#[test]
+fn plug1_error_kind_enum_matches_lists() {
+    let root = schema();
+    let got: BTreeSet<String> = def(&root, "Error")["properties"]["kind"]["enum"]
+        .as_array()
+        .expect("kind enum")
+        .iter()
+        .map(|v| v.as_str().expect("kind string").to_owned())
+        .collect();
+    let want: BTreeSet<String> = ERROR_KINDS
+        .iter()
+        .chain(INTERACTIVE_ERROR_KINDS.iter())
+        .map(|k| (*k).to_owned())
+        .collect();
+    assert_eq!(got, want);
 }
 
 #[test]
 fn plug1_fixture_messages_fit_frame_limits() {
-    for f in load_fixtures() {
+    for f in load_fixtures()
+        .into_iter()
+        .chain(load_interactive_fixtures())
+    {
         let Some(m) = message(&f) else { continue };
         let limit = frame_limit(f.s("direction").unwrap_or("?"), f.s("method"));
         let len = serde_json::to_string(&m).expect("serialize").len();
@@ -630,8 +749,7 @@ fn plug1_method_defs_are_paired() {
             .filter(|k| k.ends_with(suffix) && k.as_str() != "ResultResponse")
             .cloned()
             .collect();
-        let want: BTreeSet<String> = METHODS
-            .iter()
+        let want: BTreeSet<String> = all_methods()
             .map(|m| format!("{}{suffix}", pascal(m)))
             .collect();
         assert_eq!(got, want, "*{suffix} defs must match the method list");
