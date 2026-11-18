@@ -84,6 +84,8 @@
 //!   `MS-4`）。`GET /ai/snapshot` の正常系の骨格は実装済み（TASK-19.1・Issue #223。
 //!   [`api::router`]）。未ナビゲート時エラー（409 / `no_navigation`）も実装済み（TASK-19.2・
 //!   Issue #224）。cli への合成も実装済み（TASK-19.3・Issue #225。`default_router_factories`）。結合テスト（TASK-19.4・Issue #226）は cli の `server.rs` テストで実装済み
+//! - 操作モードの `/ai/snapshot` の同期と最小間隔、応答の `generation`・`mode`、ref・セレクタの解決
+//!   （`AISNAP-20`・`AISNAP-17`・TASK-125。[`interactive`]）。伏せる値の第 2 層は判断待ちで未実装（同モジュールの doc）
 //! - プラグインレジストリ（プロセス分離・stdio 経由の外部プラグイン呼び出し。
 //!   動的ライブラリの実行時ロードは行わない方針。security.md 参照。
 //!   `PLUG-2`、`TASK-92`、`MS-9`）。マニフェスト型は実装済み（TASK-92.1・Issue #353。
@@ -93,6 +95,7 @@
 pub mod api;
 pub mod compress_table;
 pub mod data_leaf;
+pub mod interactive;
 pub mod plugin_api;
 pub mod retention;
 pub mod snapshot;

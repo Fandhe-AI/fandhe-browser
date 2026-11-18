@@ -232,10 +232,13 @@ fn leaf_no_ref(role: &str, name: &str) -> Value {
     serde_json::json!({"role": role, "name": name, "children": []})
 }
 
-/// ルート（`document`。`ref` キーは省略される）を包むエンベロープ期待 JSON。
+/// ルート（`document`。`ref` キーは省略される）を包むエンベロープ期待 JSON。世代は 1 回目の navigate の 1、
+/// 静的モード（`AISNAP-20` の `generation`・`mode`）。
 fn envelope(url: &str, doc_name: &str, children: Vec<Value>) -> Value {
     serde_json::json!({
         "url": url,
+        "generation": 1,
+        "mode": "static",
         "tree": {"role": "document", "name": doc_name, "children": children},
         "truncated": false,
     })
@@ -428,5 +431,8 @@ async fn aisnap7_cdp_errors_do_not_poison_later_navigations() {
     let text = String::from_utf8(f.body.clone()).expect("utf8");
     assert!(!text.contains("dummy-hidden-value"), "hidden value leaked");
     let v: Value = serde_json::from_slice(&f.body).expect("json");
-    assert_eq!(v, expected_form("https://example.com/form"));
+    // 2 回目の navigate なので世代は 2。
+    let mut want = expected_form("https://example.com/form");
+    want["generation"] = 2.into();
+    assert_eq!(v, want);
 }

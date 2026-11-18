@@ -33,6 +33,8 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use fandhe_browser_core::AppState;
 
+use crate::interactive::SyncTracker;
+
 use serde_json::{Map, Value, json};
 
 /// `id` の最大文字数（Unicode コードポイント数）。
@@ -651,6 +653,8 @@ impl fmt::Debug for PluginRegistry {
 /// `plugin-registry` feature が off のときはレジストリを保持しない（`PERF-7`・TASK-104・Issue #822）。
 pub struct AiState {
     app: Arc<AppState>,
+    /// 操作モードの同期の記録（`/ai/snapshot` の最小間隔。TASK-125）。
+    sync: SyncTracker,
     #[cfg(feature = "plugin-registry")]
     plugins: PluginRegistry,
 }
@@ -660,6 +664,7 @@ impl AiState {
     pub fn new(app: Arc<AppState>) -> Self {
         Self {
             app,
+            sync: SyncTracker::new(),
             #[cfg(feature = "plugin-registry")]
             plugins: PluginRegistry::new(),
         }
@@ -668,6 +673,11 @@ impl AiState {
     /// 内包する core の共通状態。
     pub fn app(&self) -> &Arc<AppState> {
         &self.app
+    }
+
+    /// 操作モードの同期の記録（TASK-125）。
+    pub fn sync_tracker(&self) -> &SyncTracker {
+        &self.sync
     }
 
     /// プラグインレジストリ（`plugin-registry` feature が on のときだけ存在する）。

@@ -13,8 +13,16 @@
 //! # スタブ・暫定仕様について（REPAIR-3）
 //!
 //! - JSON の形は spec `api-ai-snapshot.md` の想定スキーマ（検討中）に寄せた暫定形で、
-//!   確定スキーマではない。エンベロープは `{"url", "tree", "truncated"}`。`url` は
-//!   `NavigationResult::url` の値で、[`Snapshot`] 型には持たせない
+//!   確定スキーマではない。エンベロープは `{"url", "generation", "mode", "tree", "truncated"}`。`url` は
+//!   `NavigationResult::url` の値で、[`Snapshot`] 型には持たせない。`generation`（ナビゲーション世代）と
+//!   `mode`（`static` / `interactive`）は互換のある追加（`AISNAP-20`・TASK-125）
+//! - 操作モードの確定結果なら、要約の前にホストの DOM を取り直す（[`crate::interactive::sync_interactive`]）。
+//!   同期の失敗は `session_lost`・`rendering_disabled`・`stale`（409）と `sync_failed`（502）で返し、
+//!   古い内容を返さない（`AISNAP-20`・`AISNAP-21`）。`stale`・`sync_failed` とステータスは spec・設計 §14.7 に
+//!   無い暫定の値（TASK-125）
+//! - 操作モードの同期（最大で `dom_snapshot` の 30 秒＋余裕 5 秒）は async のハンドラの中で同期的に呼ぶ。
+//!   core は async の呼び出し元に `spawn_blocking` 等を求めており、操作モードを本番で立てられるようにする
+//!   前（TASK-127・TASK-131）に直す。今は操作モードに入る経路がテストの入口だけ
 //! - 未ナビゲート時は 409 と `{"code":"no_navigation","message":...}` を返す（成功を装わない。
 //!   TASK-19.2・Issue #224・`AISNAP-14`）。spec 上 `AISNAP-14` の形式・ステータスは検討中で、
 //!   spec の例示形に合わせた暫定確定。エラー本文は全 variant で `code` と `message` の 2 キー
@@ -49,9 +57,11 @@ use fandhe_backend_http::response::Response;
 use fandhe_backend_routes::Router;
 use fandhe_browser_core::host::{Authority, HostError};
 use fandhe_browser_core::parse::{ParseOptions, parse_document};
-use fandhe_browser_core::{AppState, NavigationState};
+use fandhe_browser_core::state::PageMode;
+use fandhe_browser_core::{AppState, NavigationGeneration, NavigationState};
 use serde_json::{Map, Value, json};
 
+use crate::interactive::{SyncFailure, sync_interactive};
 use crate::plugin_api::AiState;
 #[cfg(feature = "plugin-registry")]
 use crate::plugin_api::{ManifestError, PluginManifest, PluginRegistry, RegistryError};
@@ -72,6 +82,8 @@ pub enum ApiError {
     Snapshot,
     /// JSON 化に失敗した。
     Serialize,
+    /// 操作モードの同期に失敗した（`AISNAP-20`・TASK-125）。
+    Sync(SyncFailure),
 }
 
 impl fmt::Display for ApiError {
@@ -81,6 +93,10 @@ impl fmt::Display for ApiError {
             ApiError::Parse => "failed to parse document",
             ApiError::Snapshot => "failed to build snapshot",
             ApiError::Serialize => "failed to serialize snapshot",
+            ApiError::Sync(SyncFailure::SessionLost) => "rendering host session was lost",
+            ApiError::Sync(SyncFailure::RenderingDisabled) => "rendering is disabled",
+            ApiError::Sync(SyncFailure::Stale) => "page changed during synchronization",
+            ApiError::Sync(_) => "failed to synchronize interactive page",
         })
     }
 }
@@ -114,6 +130,10 @@ pub fn router_with_state(state: Arc<AiState>) -> Router {
         // 応答前に行い、不正な Host には snapshot（直近ページの URL・内容）を渡さない。
         if let Err(e) = Authority::from_host_header(head.header("host")) {
             return host_error_response(e);
+        }
+        // 操作モードなら先にホストの DOM を取り直す。失敗したら古い内容を返さない（`AISNAP-20`・TASK-125）。
+        if let Err(e) = sync_interactive(snapshot_state.app(), snapshot_state.sync_tracker()) {
+            return error_response(ApiError::Sync(e));
         }
         match snapshot_body(snapshot_state.app().navigation()) {
             Ok(body) => Response::new(200, body).with_content_type(JSON_CONTENT_TYPE),
@@ -290,6 +310,10 @@ fn error_response(e: ApiError) -> Response {
         ApiError::Parse => (500, "parse_failed"),
         ApiError::Snapshot => (500, "snapshot_failed"),
         ApiError::Serialize => (500, "serialize_failed"),
+        ApiError::Sync(SyncFailure::SessionLost) => (409, "session_lost"),
+        ApiError::Sync(SyncFailure::RenderingDisabled) => (409, "rendering_disabled"),
+        ApiError::Sync(SyncFailure::Stale) => (409, "stale"),
+        ApiError::Sync(_) => (502, "sync_failed"),
     };
     let body = json!({ "code": code, "message": e.to_string() })
         .to_string()
@@ -297,20 +321,38 @@ fn error_response(e: ApiError) -> Response {
     Response::new(status, body).with_content_type(JSON_CONTENT_TYPE)
 }
 
-/// 直近のナビゲート結果から JSON 本文を作る純粋部。`Profile` に依存せず 3 OS でテストできる。
+/// 直近のナビゲート結果から JSON 本文を作る純粋部（同期はしない。操作モードの同期は
+/// [`sync_interactive`] が先に行う）。`Profile` に依存せず 3 OS でテストできる。
+///
+/// 操作モードの確定結果は、保存済みの写し（番号の対応表を持つ文書）から要約を作る。HTML を
+/// 再パースしないため、ref の解決（[`crate::interactive::resolve_target`]）と同じ要素を指す。
 pub fn snapshot_body(nav: &NavigationState) -> Result<Vec<u8>, ApiError> {
-    let latest = nav.latest().ok_or(ApiError::NoNavigation)?;
-    let parsed =
-        parse_document(latest.html(), &ParseOptions::default()).map_err(|_| ApiError::Parse)?;
-    let snapshot = build_snapshot(&parsed.document).map_err(|_| ApiError::Snapshot)?;
-    let value = envelope(latest.url(), &snapshot);
+    let (generation, latest) = nav.latest_with_generation().ok_or(ApiError::NoNavigation)?;
+    let snapshot = match latest.interactive() {
+        Some(doc) => build_snapshot(doc.document()).map_err(|_| ApiError::Snapshot)?,
+        None => {
+            let parsed = parse_document(latest.html(), &ParseOptions::default())
+                .map_err(|_| ApiError::Parse)?;
+            build_snapshot(&parsed.document).map_err(|_| ApiError::Snapshot)?
+        }
+    };
+    // 未知のモードを `static` と偽らない（`PageMode` は `#[non_exhaustive]`）。
+    let mode = match latest.mode() {
+        PageMode::Static => "static",
+        PageMode::Interactive => "interactive",
+        _ => return Err(ApiError::Snapshot),
+    };
+    let value = envelope(latest.url(), generation, mode, &snapshot);
     serde_json::to_vec(&value).map_err(|_| ApiError::Serialize)
 }
 
-/// `{"url", "tree", "truncated"}` のエンベロープを作る。
-fn envelope(url: &str, snapshot: &Snapshot) -> Value {
+/// `{"url", "generation", "mode", "tree", "truncated"}` のエンベロープを作る。`generation`・`mode` は
+/// 互換のある追加（`AISNAP-6` への追記・`AISNAP-20`。静的モードでも含む）。
+fn envelope(url: &str, generation: NavigationGeneration, mode: &str, snapshot: &Snapshot) -> Value {
     json!({
         "url": url,
+        "generation": generation.get(),
+        "mode": mode,
         "tree": node_json(&snapshot.tree),
         "truncated": snapshot.truncated,
     })

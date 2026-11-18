@@ -811,9 +811,8 @@ pub fn build_snapshot(doc: &Document) -> Result<Snapshot, SnapshotError> {
 /// `Snapshot` が実際に ref を発行した要素 1 件分の記録（`AISNAP-10`・TASK-17.1）。
 ///
 /// `build_snapshot` が共有予算つきの `NameIndex` で算出した role・name・ref をそのまま
-/// 保持する。ref の再特定ヘルパー（テスト専用）が名前を再計算せず Snapshot 自身の
-/// 結果を使うための crate 内部フックで、公開 API ではない。
-#[cfg_attr(not(test), allow(dead_code))]
+/// 保持する。操作モードの ref の解決（TASK-125）と ref の再特定のテストが、名前を再計算せず
+/// Snapshot 自身の結果を使うための crate 内部フックで、公開 API ではない。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RefHolder {
     /// ref を発行した DOM 要素（通常ノード・圧縮表のヘッダセル・行内コントロール）。
@@ -827,10 +826,10 @@ pub(crate) struct RefHolder {
     pub(crate) r#ref: String,
 }
 
-/// [`build_snapshot`] と同じ構築を行い、ref を発行した要素の記録も返す（テスト専用）。
+/// [`build_snapshot`] と同じ構築を行い、ref を発行した要素の記録も返す。
 ///
-/// 戻り値の `Snapshot` は `build_snapshot` と同一（内部実装を共有する）。
-#[cfg(test)]
+/// 戻り値の `Snapshot` は `build_snapshot` と同一（内部実装を共有する）。操作モードの ref の解決
+/// （[`crate::interactive::resolve_target`]。TASK-125）と ref の再特定のテストが使う。
 pub(crate) fn build_snapshot_with_holders(
     doc: &Document,
 ) -> Result<(Snapshot, Vec<RefHolder>), SnapshotError> {
@@ -839,9 +838,7 @@ pub(crate) fn build_snapshot_with_holders(
     Ok((snapshot, holders))
 }
 
-/// [`build_snapshot`] の本体。`sink` が `Some` のときだけ ref 発行要素を記録する
-/// （非テストビルドでは常に `None` で、記録処理は何もしない）。
-#[cfg_attr(not(test), allow(unused_mut, unused_variables))]
+/// [`build_snapshot`] の本体。`sink` が `Some` のときだけ ref 発行要素を記録する。
 fn build_snapshot_inner(
     doc: &Document,
     mut sink: Option<&mut Vec<RefHolder>>,
@@ -873,8 +870,7 @@ fn build_snapshot_inner(
         full_truncated: false,
         dom: None,
     }];
-    // 折り畳んだ要素（テストの RefHolder から除外するため）。
-    #[cfg(test)]
+    // 折り畳んだ要素（RefHolder から除外するため）。
     let mut collapsed_ids: HashSet<NodeId> = HashSet::new();
 
     loop {
@@ -911,7 +907,6 @@ fn build_snapshot_inner(
                         });
                     if done.collapse || foldable_listitem {
                         // 子を親の位置へ繰り上げる（文書順は保たれる。子なしなら剪定）。
-                        #[cfg(test)]
                         if let Some(id) = done.dom {
                             collapsed_ids.insert(id);
                         }
@@ -921,13 +916,11 @@ fn build_snapshot_inner(
                     }
                 }
                 None => {
-                    #[cfg(test)]
                     if let Some(sink) = sink.as_deref_mut() {
                         sink.retain(|h| !collapsed_ids.contains(&h.node));
                     }
                     let outcome = apply_disambiguation(&mut done.node);
                     truncated |= outcome.truncated;
-                    #[cfg(test)]
                     if let Some(sink) = sink.as_deref_mut() {
                         // holder は木と同じ文字列（残余縮約・区別子付与後）を持つ。
                         for h in sink.iter_mut() {
@@ -1109,7 +1102,6 @@ fn build_snapshot_inner(
         // ref は変わらない（AISNAP-10）。
         if emit {
             node.r#ref = Some(elem_ref.to_ref_string());
-            #[cfg(test)]
             if let Some(sink) = sink.as_deref_mut() {
                 sink.push(RefHolder {
                     node: child,
@@ -1139,7 +1131,6 @@ fn build_snapshot_inner(
                         .map(|r| r.row),
                 );
             }
-            #[cfg(test)]
             if let Some(sink) = sink.as_deref_mut() {
                 for h in &headers {
                     sink.push(RefHolder {
@@ -1156,7 +1147,6 @@ fn build_snapshot_inner(
             for (r, plan) in compressed.rows.into_iter().zip(plans.iter()) {
                 let (controls, controls_truncated) =
                     build_row_controls(doc, &index, &mut refs, elem_ref, plan, &mut truncated)?;
-                #[cfg(test)]
                 if let Some(sink) = sink.as_deref_mut() {
                     for ((id, _), c) in plan.kept.iter().zip(controls.iter()) {
                         sink.push(RefHolder {
