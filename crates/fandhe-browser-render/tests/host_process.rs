@@ -1064,6 +1064,22 @@ fn t_interactive_host_died_between_calls() {
     assert_eq!(h.host_generation(), generation);
 }
 
+/// TASK-123: 操作モードの撮影の応答待ちでホストが落ちても、`Crashed` ではなく `SessionLost`（`call_interactive` と同じ）。
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn t_interactive_crash_during_screenshot_is_session_lost() {
+    let Some((_root, mut h)) =
+        interactive_host("int-crshot", "crash-on-screenshot", base_timeouts())
+    else {
+        return;
+    };
+    h.load(&page(), 1).expect("load");
+    assert!(matches!(
+        h.call_on_page(&page(), 1, shot()),
+        Err(HostProcessError::SessionLost)
+    ));
+    assert_eq!(h.pid(), None);
+}
+
 /// TASK-123: wait の timeout はホストを保ったまま返す（`AISNAP-18`）。dom_snapshot の結果を解釈する。
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn t_interactive_wait_timeout_keeps_host() {
@@ -1234,6 +1250,10 @@ fn main() {
         tests.push((
             "interactive_host_died_between_calls",
             t_interactive_host_died_between_calls,
+        ));
+        tests.push((
+            "interactive_crash_during_screenshot_is_session_lost",
+            t_interactive_crash_during_screenshot_is_session_lost,
         ));
         tests.push((
             "interactive_requires_host_support",

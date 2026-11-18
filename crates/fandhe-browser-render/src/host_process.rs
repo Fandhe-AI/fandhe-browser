@@ -638,8 +638,6 @@ pub struct HostProcess {
     isolation_warned: bool,
     /// tmpfs の容量上限が無いことの警告を出したか（HostProcess ごとに 1 回。#1498）。
     tmpfs_limit_warned: bool,
-    /// 操作モードで、読み込んだページを保っていたホストが破棄された（次の `load` で戻る）。
-    session_lost: bool,
 }
 
 impl fmt::Debug for HostProcess {
@@ -746,7 +744,6 @@ impl HostProcess {
             stderr_tail: Arc::new(Mutex::new(StderrTail::new())),
             isolation_warned: false,
             tmpfs_limit_warned: false,
-            session_lost: false,
         }
     }
 
@@ -851,7 +848,12 @@ impl HostProcess {
                 return Err(HostProcessError::SessionLost);
             }
             let (wait, phase) = self.wait_for(&request);
-            return self.exchange(&request, wait, phase);
+            return match self.exchange(&request, wait, phase) {
+                Ok(m) => Ok(m),
+                Err(e @ (HostProcessError::Host(_) | HostProcessError::InvalidRequest)) => Err(e),
+                // exchange は失敗時にホストを破棄済み。操作モードのページは失われた（`call_interactive` と同じ）。
+                Err(_) => Err(HostProcessError::SessionLost),
+            };
         }
         // 静的モード: 合間に死んだホストは起動し直してから、世代を見て読み直す（評価は起動の後）。
         self.ensure_running()?;
@@ -1000,7 +1002,6 @@ impl HostProcess {
         }
         match result? {
             MethodResult::Load(l) => {
-                self.session_lost = false;
                 self.loaded = Some(LoadedPage {
                     url: page.url().to_string(),
                     nav_generation,
@@ -1085,9 +1086,6 @@ impl HostProcess {
         } else {
             err
         };
-        if self.config.interactive && self.loaded.is_some() {
-            self.session_lost = true;
-        }
         self.teardown();
         self.loaded = None;
         if err.counts_as_failure() {
