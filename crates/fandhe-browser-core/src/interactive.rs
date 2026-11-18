@@ -200,13 +200,22 @@ impl InteractiveDocument {
     }
 }
 
-/// 検査済みの同期の結果（[`InteractiveDocument`] と、保存用の番号なし HTML・URL）。
-#[derive(Debug)]
+/// 検査済みの同期の結果（[`InteractiveDocument`] と、保存用の番号なし HTML・URL）。`Debug` は長さだけを出す。
 #[non_exhaustive]
 pub struct InteractiveSync {
     pub(crate) url: String,
     pub(crate) html: String,
     pub(crate) document: InteractiveDocument,
+}
+
+impl fmt::Debug for InteractiveSync {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("InteractiveSync")
+            .field("url_len", &self.url.len())
+            .field("html_len", &self.html.len())
+            .field("document", &self.document)
+            .finish()
+    }
 }
 
 impl InteractiveSync {
@@ -228,6 +237,15 @@ pub fn build_interactive_document(snapshot: HostDomSnapshot) -> Result<Interacti
         .collect();
     if elements.len() > MAX_INTERACTIVE_ELEMENTS {
         return Err(SyncError::TooManyElements);
+    }
+    // ホストは `template` の中身を出さない（§14.3）。中身があれば応答の不正として扱う（`descendants` は
+    // 中身を巡回しないが直列化は出力するため、番号や上限の検査を通らない要素が保存 HTML に残るのを防ぐ）。
+    if elements.iter().any(|&id| {
+        document
+            .template_contents(id)
+            .is_some_and(|c| document.children(c).next().is_some())
+    }) {
+        return Err(SyncError::Malformed);
     }
     let mut depth: HashMap<NodeId, usize> = HashMap::with_capacity(elements.len());
     let mut numbers: HashMap<NodeId, u32> = HashMap::new();
@@ -393,6 +411,28 @@ mod tests {
         let s = HostDomSnapshot::new(page(), "https://secret.example/?q=1", "pw".into(), 0, "s1")
             .unwrap();
         assert!(!format!("{s:?}").contains("secret"));
+    }
+
+    /// template の中身に要素があれば同期失敗（番号・上限の検査を迂回させない）。要素数の上限と深さの境界。
+    #[test]
+    fn render11_template_contents_and_limits() {
+        let html = r#"<body data-fandhe-n="0"><template data-fandhe-n="1"><p data-fandhe-n="01">x</p></template></body>"#;
+        assert_eq!(
+            build_interactive_document(snap(html, 2)).err(),
+            Some(SyncError::Malformed)
+        );
+        let empty = r#"<body data-fandhe-n="0"><template data-fandhe-n="1"></template></body>"#;
+        assert!(build_interactive_document(snap(empty, 2)).is_ok());
+        let many = "<i></i>".repeat(MAX_INTERACTIVE_ELEMENTS);
+        assert_eq!(
+            build_interactive_document(snap(&many, 0)).err(),
+            Some(SyncError::TooManyElements)
+        );
+        // html・head・body の 3 段を含めて深さちょうど 512 は通る。
+        let ok = "<div>".repeat(MAX_INTERACTIVE_DEPTH - 2);
+        assert!(build_interactive_document(snap(&ok, 0)).is_ok());
+        let s = build_interactive_document(snap("<p>secret-text</p>", 0)).unwrap();
+        assert!(!format!("{s:?}").contains("secret-text"));
     }
 
     #[test]
