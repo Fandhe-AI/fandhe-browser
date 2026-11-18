@@ -22,7 +22,7 @@
 | 文字入力（キー・IME） | 成立 | 同上。非 ASCII は IME の確定イベントで入る |
 | 全ページ撮影 | 成立（`resize` 方式） | `take_screenshot` の矩形はビューポートに丸められるため、高さを広げてから撮る |
 | ★1 `navigator.webdriver` | 満たす（主フレーム） | `UserContentManager::add_script` で登録できる。iframe は既知の制約 |
-| ★2 `request_navigation` | 条件付きで満たす | script 起点の遷移は止められる。iframe の `src`・302 の移動先は通らないため、読み込み先の許可リスト（#1571）と組で scheme を絞る。回帰テストと現在 URL の検査を TASK-120 の完了条件にする |
+| ★2 `request_navigation` | 条件付きで満たす | script 起点の遷移は止められる。iframe の `src`・302 の移動先は通らないため、iframe は読み込み先の許可リスト（#1571）、リダイレクト先は Servo 内部の制限と組で scheme を絞る。回帰テストと現在 URL の検査を TASK-120 の完了条件にする |
 | ★3 `pushState` の通知 | 前半は満たす（ソース根拠） | `WebView::url()` を書き換える唯一の経路 `set_history` が直後に必ず `notify_url_changed` を呼ぶ。`doc_seq` の起点を通知で取る場合だけ `url` の直接依存が要る |
 | (5) 再パースの要素順 | パーサー由来は不変、DOM 操作由来は一部変化 | 書き戻し方式で順序が変わる場合があることを前提に、番号の対応表を本体で検査する（TASK-121 の確定条件 1） |
 | (6) `file:` のサブリソース | 0.1.2 で拒否 | #1571 の許可リストで読み込み前に拒否（GHSA-pxmc-hqwc-jh66） |
@@ -77,11 +77,11 @@
 - iframe の `src` 属性の変更と、初期 HTML の `<iframe src>`
 - `javascript:` の URL（スクリプトは実行されるが、scheme は変わらない）
 
-呼び出しは constellation の `schedule_navigation` に限られる。iframe の `src` 経由の読み込みは、ホストの読み込み先の許可リスト（`servo-host/src/guard.rs`。#1571・0.1.2）が読み込み前に拒否する。spec の ★2 は「リダイレクト・`javascript:` でも呼ばれる」ことを求めているため、文言どおりには満たさない。
+呼び出しは constellation の `schedule_navigation` に限られる。iframe の `src` 経由の読み込みのうち許可外の scheme（`file:` 等）は、ホストの読み込み先の許可リスト（`servo-host/src/guard.rs`。#1571・0.1.2）が読み込み前に拒否する。ただし許可リストは `data:`・`blob:` を許可するため、iframe の `data:`・`blob:` は現状では拒否されない。また検査点に渡るのは最初の URL だけで、リダイレクト先は許可リストでは見えない（移動先が http(s) 以外なら Servo 内部の fetch が拒否する）。spec の ★2 は「リダイレクト・`javascript:` でも呼ばれる」ことを求めているため、文言どおりには満たさない。
 
 2026-11-18 のオーナー回答で、目的（遷移先の scheme を絞る）を `request_navigation` と許可リストの組で満たすと読み替えた。2 つの検問は同等ではないため、次を条件とする（TASK-120 の完了条件。spec の RENDER-10 と ★2 の文言は spec リポ側で直す）。
 
-- 書き分け: 主フレームは `request_navigation` と現在 URL の検査、iframe とリダイレクトは読み込み先の許可リスト（`data:`・`blob:` を含む）で止める
+- 書き分け: 主フレームは `request_navigation` と現在 URL の検査で止める。iframe の許可外 scheme は読み込み先の許可リストで止める。リダイレクト先の http(s) 以外は Servo 内部の制限に頼る（許可リストでは見えない）。iframe の `data:`・`blob:` は現行の許可リストでは通るため、操作モードで許すか止めるかを TASK-120 で決める
 - 回帰テスト 2 本で固定する: 「302 の移動先が `file:`・`data:` なら失敗する」「`meta refresh` で `data:`・`file:` へ行けない」。現状は Servo 内部の挙動に頼っており、`servo` の版更新で黙って変わりうる
 - 操作と DOM 取得の前に、現在 URL が http / https であることを必ず検査する（RENDER-10・RENDER-11 の `invalid_state`）
 - 試していない経路（`meta refresh`・`Refresh` ヘッダ・`target=_blank`・`history.back()`）が `request_navigation` を通るかを確かめる
