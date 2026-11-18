@@ -7,11 +7,7 @@
     "v": 1,
     "id": 1,
     "method": "dom_snapshot",
-    "params": {
-      "page": {
-        "session": "3f9c2a7d1b4e4c0a9d8e7f6a5b4c3d2e",
-        "doc_seq": 2
-      }
-    }
-  }
+    "params": {}
+  },
+  "note": "params は空（page を照合しない。いまの文書を返す。設計 §14.2）"
 }

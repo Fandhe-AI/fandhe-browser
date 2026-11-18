@@ -246,7 +246,7 @@
       "additionalProperties": true
     },
     "PageRef": {
-      "description": "要求側のページ識別子（設計 §14.2・TASK-121 の確定条件 3）。session はホストの起動ごとに変わる値、doc_seq は文書番号（load・URL 変更の通知・新しい文書の読み込みで上がる）。現在値と違えばホストは stale を返す。",
+      "description": "要求側のページ識別子（設計 §14.2・TASK-121 の確定条件 3）。session はホストの起動ごとに変わる値、doc_seq は文書番号（load・URL 変更の通知・新しい文書の読み込みで上がる）。act・wait で使い、現在値と違えばホストは stale を返す。",
       "type": "object",
       "additionalProperties": false,
       "required": ["session", "doc_seq"],
@@ -266,13 +266,9 @@
       }
     },
     "DomSnapshotParams": {
-      "description": "主フレームの DOM の取得（RENDER-11・TASK-122。設計 §14.3）。",
+      "description": "主フレームの DOM の取得（RENDER-11・TASK-122。設計 §14.3）。params を持たず、page を照合しない。いまの文書の DOM と page を返すため、ホスト側だけで doc_seq が上がった後（pushState・スクリプト起点の遷移等）も、本体はこの要求で同期を取り直せる。",
       "type": "object",
-      "additionalProperties": false,
-      "required": ["page"],
-      "properties": {
-        "page": { "$ref": "#/$defs/PageRef" }
-      }
+      "additionalProperties": false
     },
     "DomSnapshotResult": {
       "description": "html は主フレームの直列化で、各要素に属性 data-fandhe-n（前順の 0 起点の番号。整数から整形）を付ける。本体はパース後にこの属性を全要素から外し、文書順 → 番号の対応表を作る（番号の一意性と 0 以上 element_count 未満を検査し、違反は同期失敗。設計 §14.3）。保存する HTML に番号は残さない。伏せる対象の値は含めない（第 1 層）。iframe・shadow root の中身は含めず、数を excluded で返す（REPAIR-3）。HTML の長さ（8 MiB）と符号化した後のフレーム長（12 MiB）を超えるときは切り詰めずに too_large。maxLength は文字数で、バイト数の上限は実装が強制する。",
