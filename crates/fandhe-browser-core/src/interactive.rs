@@ -10,8 +10,12 @@
 //! - 番号は先頭 0 なしの十進で、0 以上 `element_count` 未満・重複なし。違反は同期失敗（[`SyncError`]）。
 //!   番号の無い要素（パーサーが補った要素）は対応表に載らず、操作の対象にならない
 //! - スクリプトは実行しない。パースと直列化だけを行い、遷移・`meta refresh` を起こす経路は無い（試作 (12)）
-//! - 伏せる値の第 2 層（ホストが伏せずに返した値を本体でも消す）は、ここでは行わない（TASK-125。
-//!   どの層で CDP に渡る前に消すかは利用者の判断待ち。PR の前提を参照）
+//! - 伏せる値の第 2 層（ホストが伏せずに返した値を本体でも消す。`AISNAP-20`・TASK-125）を保存の前に行う
+//!   （2026-11-19 のオーナー判断で core の 1 か所に置く）。保存する文書と HTML の両方から消すため、要約（ai）・
+//!   CDP の `DOM.*`・要素の指定はどれも消した後の写しを見る。条件はホストの第 1 層（`servo-host/src/dom.rs`）と
+//!   同じ: `input` の `type=password`、`autocomplete` のトークンが `current-password`・`new-password`・
+//!   `one-time-code`・`cc-*` の `input`・`textarea`・`select`。伏せる対象を特定できない（`autocomplete` が
+//!   [`MAX_AUTOCOMPLETE_BYTES`] を超える）ときは、すべての `input`・`textarea`・`select` の値を消す
 
 use std::collections::HashMap;
 use std::fmt;
@@ -29,6 +33,9 @@ pub const MAX_INTERACTIVE_DEPTH: usize = 512;
 pub const MAX_INTERACTIVE_URL_BYTES: usize = 2048;
 /// `session`・`snapshot` の上限（バイト）。
 pub const MAX_INTERACTIVE_ID_BYTES: usize = 64;
+
+/// 伏せる対象を判定する `autocomplete` の長さの上限（バイト）。超えたら判定せず、すべての入力欄の値を消す。
+pub const MAX_AUTOCOMPLETE_BYTES: usize = 1024;
 
 const NUMBER_ATTR: &str = "data-fandhe-n";
 
@@ -277,6 +284,7 @@ pub fn build_interactive_document(snapshot: HostDomSnapshot) -> Result<Interacti
             .remove_attribute(id, NUMBER_ATTR)
             .map_err(|_| SyncError::Malformed)?;
     }
+    redact_values(&mut document, &elements).map_err(|_| SyncError::Malformed)?;
     let html = document
         .serialize_html()
         .map_err(|_| SyncError::Malformed)?
@@ -292,6 +300,95 @@ pub fn build_interactive_document(snapshot: HostDomSnapshot) -> Result<Interacti
             numbers,
         },
     })
+}
+
+/// 入力欄の伏せる区分。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Sensitivity {
+    Plain,
+    Sensitive,
+    /// 判定できない（すべての入力欄を消す）。
+    Unknown,
+}
+
+fn sensitivity(document: &Document, id: NodeId, name: &str) -> Sensitivity {
+    if name == "input"
+        && document
+            .attribute(id, "type")
+            .is_some_and(|t| t.eq_ignore_ascii_case("password"))
+    {
+        return Sensitivity::Sensitive;
+    }
+    let Some(ac) = document.attribute(id, "autocomplete") else {
+        return Sensitivity::Plain;
+    };
+    if ac.len() > MAX_AUTOCOMPLETE_BYTES {
+        return Sensitivity::Unknown;
+    }
+    // ホストの第 1 層は JS の `/\s+/` で分ける。`char::is_whitespace` に U+FEFF を足すと、その上位集合になる
+    // （U+00A0・U+3000 などの区切りでも伏せる）。
+    let hit = ac
+        .split(|c: char| c.is_whitespace() || c == '\u{feff}')
+        .filter(|t| !t.is_empty())
+        .any(|t| {
+            let t = t.to_ascii_lowercase();
+            t == "current-password"
+                || t == "new-password"
+                || t == "one-time-code"
+                || t.starts_with("cc-")
+        });
+    if hit {
+        Sensitivity::Sensitive
+    } else {
+        Sensitivity::Plain
+    }
+}
+
+/// 伏せる値の第 2 層（モジュールの doc）。`input` は `value`・`checked`、`textarea` は中身、`select` は配下の
+/// `option` の `selected` を消す。名前空間は問わない（ホストより広く消す側に倒す）。SVG・MathML の中の
+/// `textarea` は子要素ごと外れるが、外れた要素は木から辿れないため対応表に残っても使われない。
+fn redact_values(document: &mut Document, elements: &[NodeId]) -> crate::error::Result<()> {
+    let fields: Vec<(NodeId, &'static str)> = elements
+        .iter()
+        .filter_map(|&id| {
+            let name = match document.local_name(id)? {
+                "input" => "input",
+                "textarea" => "textarea",
+                "select" => "select",
+                _ => return None,
+            };
+            Some((id, name))
+        })
+        .collect();
+    let kinds: Vec<Sensitivity> = fields
+        .iter()
+        .map(|&(id, name)| sensitivity(document, id, name))
+        .collect();
+    let all = kinds.contains(&Sensitivity::Unknown);
+    for (&(id, name), kind) in fields.iter().zip(kinds) {
+        if !all && kind == Sensitivity::Plain {
+            continue;
+        }
+        match name {
+            "input" => {
+                document.remove_attribute(id, "value")?;
+                document.remove_attribute(id, "checked")?;
+            }
+            "textarea" => {
+                document.set_text_content(id, "")?;
+            }
+            _ => {
+                let options: Vec<NodeId> = document
+                    .descendants(id)
+                    .filter(|&o| document.local_name(o) == Some("option"))
+                    .collect();
+                for o in options {
+                    document.remove_attribute(o, "selected")?;
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// 先頭 0 なしの十進（`"0"` は可）で、`element_count` 未満の番号。
@@ -437,6 +534,104 @@ mod tests {
         assert!(build_interactive_document(snap(&ok, 0)).is_ok());
         let s = build_interactive_document(snap("<p>secret-text</p>", 0)).unwrap();
         assert!(!format!("{s:?}").contains("secret-text"));
+    }
+
+    /// AISNAP-20・TASK-125: ホストが伏せずに返した値を、保存する文書と HTML の両方から消す（第 2 層）。
+    /// 伏せる対象でない入力欄の現在値は残す。
+    #[test]
+    fn aisnap20_redacts_sensitive_values_before_saving() {
+        let html = concat!(
+            "<input id=q value=plain-value>",
+            "<input id=pw type=PassWord value=pw-secret>",
+            "<input id=cc autocomplete=\"section-a billing CC-Number\" value=cc-secret>",
+            "<input id=otp autocomplete=one-time-code value=otp-secret>",
+            "<input id=np autocomplete=new-password type=checkbox checked value=np-secret>",
+            "<textarea id=ta autocomplete=current-password>ta-secret</textarea>",
+            "<textarea id=tb>plain-text</textarea>",
+            "<select id=ex autocomplete=cc-exp><option value=a>1</option><option value=b selected>12</option></select>",
+            "<select id=ln><option value=x selected>Ja</option></select>",
+        );
+        let s = build_interactive_document(snap(html, 0)).unwrap();
+        for secret in [
+            "pw-secret",
+            "cc-secret",
+            "otp-secret",
+            "np-secret",
+            "ta-secret",
+        ] {
+            assert!(!s.html.contains(secret), "{secret}: {}", s.html);
+        }
+        assert!(
+            s.html.contains("plain-value") && s.html.contains("plain-text"),
+            "{}",
+            s.html
+        );
+        let d = &s.document.document;
+        let by_id = |id: &str| {
+            d.descendants(d.root())
+                .find(|&n| d.attribute(n, "id") == Some(id))
+                .unwrap()
+        };
+        assert_eq!(d.attribute(by_id("q"), "value"), Some("plain-value"));
+        assert_eq!(d.attribute(by_id("np"), "checked"), None);
+        assert_eq!(d.text_content(by_id("ta")).as_deref(), Some(""));
+        let selected = |sel: &str| {
+            d.descendants(by_id(sel))
+                .filter(|&o| d.attribute(o, "selected").is_some())
+                .count()
+        };
+        assert_eq!((selected("ex"), selected("ln")), (0, 1));
+    }
+
+    /// AISNAP-20・TASK-125: `autocomplete` の区切りはホストの `/\s+/` と同じく ASCII 以外の空白も認める
+    /// （U+00A0・U+000B・U+3000・U+FEFF）。伏せた欄も対応表には残る（操作の対象にできる）。
+    #[test]
+    fn aisnap20_autocomplete_separators_match_host() {
+        for sep in ["&nbsp;", "\u{a0}", "\u{b}", "\u{3000}", "\u{feff}", "\t"] {
+            let html = format!(
+                "<input data-fandhe-n=\"0\" autocomplete=\"section-a{sep}current-password\" value=sep-secret>"
+            );
+            let s = build_interactive_document(snap(&html, 1)).unwrap();
+            assert!(!s.html.contains("sep-secret"), "{sep:?}: {}", s.html);
+            let d = &s.document.document;
+            let input = d
+                .descendants(d.root())
+                .find(|&n| d.local_name(n) == Some("input"))
+                .unwrap();
+            assert_eq!(s.document.host_number(input), Some(0));
+        }
+    }
+
+    /// TASK-125: 判定の上限ちょうど（1024 バイト）は判定し、超えたら（1025 バイト）すべての入力欄の値を消す。
+    #[test]
+    fn aisnap20_autocomplete_length_boundary() {
+        let field = |len: usize| {
+            let ac = "a".repeat(len);
+            let html = format!("<input value=plain-value><input autocomplete=\"{ac}\" value=v2>");
+            build_interactive_document(snap(&html, 0)).unwrap().html
+        };
+        assert!(field(MAX_AUTOCOMPLETE_BYTES).contains("plain-value"));
+        assert!(!field(MAX_AUTOCOMPLETE_BYTES + 1).contains("plain-value"));
+    }
+
+    /// AISNAP-20・TASK-125: 伏せる対象を特定できない（`autocomplete` が上限を超える）ときは、すべての入力欄の値を消す。
+    #[test]
+    fn aisnap20_unknown_sensitivity_clears_all_fields() {
+        let long = "x ".repeat(MAX_AUTOCOMPLETE_BYTES);
+        let html = format!(
+            "<input id=q value=plain-value><input autocomplete=\"{long}\" value=v2><textarea>plain-text</textarea><select><option selected>Ja</option></select>"
+        );
+        let s = build_interactive_document(snap(&html, 0)).unwrap();
+        assert!(
+            !s.html.contains("plain-value") && !s.html.contains("v2"),
+            "{}",
+            s.html
+        );
+        assert!(
+            !s.html.contains("plain-text") && !s.html.contains("selected"),
+            "{}",
+            s.html
+        );
     }
 
     #[test]

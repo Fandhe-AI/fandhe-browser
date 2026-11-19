@@ -484,7 +484,7 @@ AGENTS.md の変更はレビュー基準の変更として AI レビューで P0
 - 番号: ホストの直列化器は、主フレームの要素に前順で 0 から番号を振り、各要素に属性 `data-fandhe-n="<番号>"` を付ける。番号は直列化器の整数のカウンタから整形し、ページ由来の文字列を使わない（確定条件 8）。属性は直列化の出力にだけ書き、ページの DOM には足さない（ページから見えない）。ページ自身が同名の属性を持っていても出力しない
 - 本体の検査: パースした後に全要素から `data-fandhe-n` を外し、「本体の文書順 → ホストの番号」の対応表を確定結果に持つ（TASK-124）。値は先頭 0 なしの十進の数字列で、0 以上 `element_count` 未満、重複なし。どれかに違反すれば同期失敗にする。番号の無い要素（再パースでパーサーが補った要素）は操作の対象にしない。保存する HTML に番号を残さない（確定条件 1）。本体は `noscript` の中身を、ホストと同じくスクリプトが有効な扱い（生のテキスト）でパースする。ページが同名の属性を文字列で仕込んでも、要素として解釈されなければ番号にならない。解釈されて番号が重なれば同期失敗になる（自分のページの同期を壊すだけで、別の要素を操作させることはできない）
 - 判断: 番号を HTML の外の表だけで渡す案は、本体の再パースで要素の並びが変わる場合（試作 (5)。DOM 操作で作った形の 9 試料中 5 件）に対応づけができないため採らない。属性で渡して本体が外す方式なら、並びが変わっても番号は要素に付いて移る
-- 現在値: `input` の `value`・`checked`、`option` の `selected`、`textarea` の内容は、DOM の属性ではなく現在値を書く。伏せる対象（`type=password`、`autocomplete` が `current-password`・`new-password`・`one-time-code`・`cc-*` で始まる値）の値は書かない（第 1 層。本体の第 2 層は TASK-125）
+- 現在値: `input` の `value`・`checked`、`option` の `selected`、`textarea` の内容は、DOM の属性ではなく現在値を書く。伏せる対象（`type=password`、`autocomplete` が `current-password`・`new-password`・`one-time-code`・`cc-*` で始まる値）の値は書かない（第 1 層）。本体は保存の前に同じ条件で値を消す（第 2 層。TASK-125・2026-11-19 のオーナー判断。`input` の `value`・`checked`、`textarea` の中身、`select` 配下の `option` の `selected`。`autocomplete` の区切りは JS の `/\s+/` と同じく ASCII 以外の空白も認める。`autocomplete` が 1024 バイトを超えて判定できないときは、すべての `input`・`textarea`・`select` の値を消す。保存する文書と HTML の両方から消すため、要約・CDP の `DOM.*`・要素の指定は同じ結果を見る）
 - iframe・shadow root の中身は含めず、数を `excluded` で返す（`REPAIR-3`）。`data:`・`blob:` の iframe も同じく中身を含めない（#1581 の引き継ぎ）
 - 上限: ホストは HTML の UTF-8 の長さが 8 MiB を超えるとき、または応答を符号化した後のフレーム長が 12 MiB を超えるとき、切り詰めずに `too_large` を返す（確定条件 5）。本体はパースの時に要素数（200,000）と深さ（512）を数え、HTML の長さと `url` の長さ（2048）・scheme（http / https）も自分で検査する（確定条件 4）。応答フレームの上限は `dom_snapshot` だけ 12 MiB で、他のメソッドは従来の 1 MiB
 - 直列化のスクリプトは固定の関数式で、ページのグローバルへ書き込まない。ページは prototype を書き換えて出力を変えられるため、取得した DOM は自己申告として扱う（本体の検査が前提）
@@ -540,6 +540,7 @@ AGENTS.md の変更はレビュー基準の変更として AI レビューで P0
 | `timeout` | ホスト | `wait`、`dom_snapshot` の時間切れ（`dom_snapshot` では本体がホストを破棄して `session_lost` にする） |
 | `session_lost`・`busy` | 本体（render） | ホストの破棄・再起動の後、同時実行の超過 |
 | `not_interactive`・`rendering_disabled`・`interactive_unavailable` | 本体（ai） | `AISNAP-21` |
+| `stale`・`sync_failed`（409・502） | 本体（ai） | `/ai/snapshot` の同期の失敗。`stale` は同期の途中で新しい navigate が始まった、`sync_failed` はそれ以外の取得・検査の失敗。`stale` 以外では確定結果を無効にする（`AISNAP-20`。2026-11-19 のオーナー判断・TASK-125） |
 
 - ホストが返す kind はスキーマの `Error.kind` に足した。本体側の kind はホストとの間を流れないため、スキーマに載せない
 - エラーの `message` は固定の英語で、入力値・URL・セレクタを含めない（§2.2 と同じ）
