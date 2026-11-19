@@ -72,6 +72,163 @@ pub trait Renderer: Send + Sync {
     fn dom_snapshot(&self) -> Result<HostDomSnapshot, RenderError> {
         Err(RenderError::NotInteractive)
     }
+
+    /// 操作モードのページの要素を操作する（TASK-128・`AISNAP-17`・`RENDER-10`。設計 §14.4）。
+    ///
+    /// 既定実装は [`RenderError::NotInteractive`]。要素は最新の [`Self::dom_snapshot`] の番号で指し、照合値が
+    /// 一致しなければ実装は [`RenderError::Stale`] を返す。時間切れは実装がホストを破棄して
+    /// [`RenderError::SessionLost`] にする（`timeout` は返さない）。
+    fn act(&self, request: &ActRequest) -> Result<ActOutcome, RenderError> {
+        let _ = request;
+        Err(RenderError::NotInteractive)
+    }
+}
+
+/// `fill` の文字列の上限（バイト。ホストの `fill_text_bytes` と同じ。設計 §14.6）。
+pub const MAX_FILL_TEXT_BYTES: usize = 8192;
+
+/// 照合値（`id`・`name`・`type`）の上限（バイト）。超える値は送らない（送ったものだけを照合する。設計 §14.4）。
+pub const MAX_EXPECT_VALUE_BYTES: usize = 256;
+
+/// 照合値の要素名の上限（バイト。ホストの照合値 `tag` の上限と同じ。設計 §14.4）。
+pub const MAX_ACT_TAG_BYTES: usize = 64;
+
+/// 操作の種類（`AISNAP-17`。2026-11-19 のオーナー判断で、最初は `click`・`fill` だけを入れる。
+/// `select`・`press` は後続）。`Debug` は入力文字列を出さない。
+#[derive(Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ActAction {
+    /// クリック。
+    Click,
+    /// 文字の入力。`sensitive` は本体が伏せる対象に加える印（ホストへもそのまま渡す）。
+    Fill {
+        /// 入力する文字列（[`MAX_FILL_TEXT_BYTES`] 以下）。
+        text: String,
+        /// 伏せる対象として扱うか。
+        sensitive: bool,
+    },
+}
+
+impl std::fmt::Debug for ActAction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Click => f.write_str("Click"),
+            Self::Fill { text, sensitive } => f
+                .debug_struct("Fill")
+                .field("text_len", &text.len())
+                .field("sensitive", sensitive)
+                .finish(),
+        }
+    }
+}
+
+/// 操作の要求（`AISNAP-17`。設計 §14.4）。照合値は本体の写しの要素から作る。
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ActRequest {
+    page: InteractivePageId,
+    snapshot: String,
+    node: u32,
+    tag: String,
+    id: Option<String>,
+    name: Option<String>,
+    type_: Option<String>,
+    action: ActAction,
+}
+
+impl ActRequest {
+    /// 作る。`fill` の文字列は [`MAX_FILL_TEXT_BYTES`] 以下（超えれば [`RenderError::InvalidParams`]）。
+    /// `tag` は写しのローカル名をそのまま渡す（ホストは `localName` と厳密に比べるため、SVG の
+    /// `foreignObject` のような大小混じりを変えない）。空か [`MAX_ACT_TAG_BYTES`] を超える要素は照合値を
+    /// 作れないため [`RenderError::NotActionable`]。`id`・`name`・`type` は [`MAX_EXPECT_VALUE_BYTES`] を
+    /// 超えれば送らない。
+    pub fn new(
+        page: InteractivePageId,
+        snapshot: &str,
+        node: u32,
+        tag: &str,
+        attrs: [Option<&str>; 3],
+        action: ActAction,
+    ) -> Result<Self, RenderError> {
+        if tag.is_empty() || tag.len() > MAX_ACT_TAG_BYTES {
+            return Err(RenderError::NotActionable);
+        }
+        if let ActAction::Fill { text, .. } = &action
+            && text.len() > MAX_FILL_TEXT_BYTES
+        {
+            return Err(RenderError::InvalidParams);
+        }
+        let keep = |v: Option<&str>| {
+            v.filter(|v| v.len() <= MAX_EXPECT_VALUE_BYTES)
+                .map(str::to_owned)
+        };
+        let [id, name, type_] = attrs;
+        Ok(Self {
+            page,
+            snapshot: snapshot.to_owned(),
+            node,
+            tag: tag.to_owned(),
+            id: keep(id),
+            name: keep(name),
+            type_: keep(type_),
+            action,
+        })
+    }
+    /// 取得時のページ識別子。
+    pub fn page(&self) -> &InteractivePageId {
+        &self.page
+    }
+    /// 取得の識別子。
+    pub fn snapshot(&self) -> &str {
+        &self.snapshot
+    }
+    /// ホストの番号。
+    pub fn node(&self) -> u32 {
+        self.node
+    }
+    /// 照合値の `tag`。
+    pub fn tag(&self) -> &str {
+        &self.tag
+    }
+    /// 照合値の `id`（送るものだけ）。
+    pub fn id(&self) -> Option<&str> {
+        self.id.as_deref()
+    }
+    /// 照合値の `name`（送るものだけ）。
+    pub fn name(&self) -> Option<&str> {
+        self.name.as_deref()
+    }
+    /// 照合値の `type`（送るものだけ）。
+    pub fn type_attr(&self) -> Option<&str> {
+        self.type_.as_deref()
+    }
+    /// 操作。
+    pub fn action(&self) -> &ActAction {
+        &self.action
+    }
+}
+
+/// 操作の結果（`AISNAP-17`）。`navigated` は最善努力（設計 §14.4）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ActOutcome {
+    page: InteractivePageId,
+    navigated: bool,
+}
+
+impl ActOutcome {
+    /// 作る（`HostRenderer` が成功結果を作る経路）。
+    pub fn new(page: InteractivePageId, navigated: bool) -> Self {
+        Self { page, navigated }
+    }
+    /// 操作の後のページ識別子。
+    pub fn page(&self) -> &InteractivePageId {
+        &self.page
+    }
+    /// 操作で遷移が始まったか（最善努力）。
+    pub fn navigated(&self) -> bool {
+        self.navigated
+    }
 }
 
 /// 操作モードの読み込み結果（最終 URL とページ識別子。TASK-124）。
@@ -407,8 +564,15 @@ pub enum RenderError {
     TooLarge,
     /// ホストが要求を受け付けなかった（ホストの kind `unsupported`）。操作モードの `load`・`dom_snapshot` では、
     /// 主フレームの `navigator.webdriver` が `true` でない文書を断ったことを表す（SEC-5・#1609。設計 §14.3）。
-    /// ai はこれを `interactive_unavailable` で返す（TASK-127。2026-11-19 のオーナー判断）。
+    /// ai はこれを `interactive_unavailable` で返す（TASK-127。2026-11-19 のオーナー判断）。`act` では、操作が
+    /// 新しいウィンドウ・ファイル選択を要求したことを表す（`AISNAP-17` の `unsupported`）。
     Unsupported,
+    /// 操作の対象が取得の後に変わった（文書・取得・要素・照合値。`AISNAP-17` の `stale`）。
+    Stale,
+    /// 対象を操作できない（不可視・`disabled`・隠れている・フォーカスが外れた。`AISNAP-17` の `not_actionable`）。
+    NotActionable,
+    /// 要求の引数が不正（`AISNAP-17` の `invalid_params`）。
+    InvalidParams,
     /// 上記に分類できない内部エラー。
     ///
     /// `message` はファイルパス等の内部実装詳細を含みうるため、`Display` と `Debug`
@@ -436,6 +600,9 @@ impl std::fmt::Debug for RenderError {
             Self::InvalidState => f.write_str("InvalidState"),
             Self::TooLarge => f.write_str("TooLarge"),
             Self::Unsupported => f.write_str("Unsupported"),
+            Self::Stale => f.write_str("Stale"),
+            Self::NotActionable => f.write_str("NotActionable"),
+            Self::InvalidParams => f.write_str("InvalidParams"),
             // 内部詳細（ファイルパス等）を含みうるため、variant 名のみを出力し
             // メッセージ本体は伏せる。詳細取得は `internal_detail()` を使うこと。
             Self::Internal(_) => f.write_str("Internal(..)"),
@@ -475,6 +642,9 @@ impl std::fmt::Display for RenderError {
             Self::InvalidState => write!(f, "current document is not an http(s) page"),
             Self::TooLarge => write!(f, "render result exceeds the size limit"),
             Self::Unsupported => write!(f, "render host does not support the request"),
+            Self::Stale => write!(f, "target changed after the snapshot"),
+            Self::NotActionable => write!(f, "target is not actionable"),
+            Self::InvalidParams => write!(f, "invalid render request parameters"),
             Self::Internal(_) => write!(f, "internal render error"),
         }
     }
@@ -698,6 +868,80 @@ mod tests {
             "render host does not support the request"
         );
         assert_eq!(format!("{:?}", RenderError::Unsupported), "Unsupported");
+    }
+
+    /// AISNAP-17・TASK-128: 操作の要求の検査。`fill` の文字列の上限、照合値の長さ（超えた値は送らない）、
+    /// `tag` は小文字にする。`Debug` は入力文字列を出さない。
+    #[test]
+    fn aisnap17_act_request_validation() {
+        let page = || InteractivePageId::new("s", 1).unwrap();
+        let fill = |n: usize| ActAction::Fill {
+            text: "x".repeat(n),
+            sensitive: false,
+        };
+        assert!(
+            ActRequest::new(
+                page(),
+                "snap",
+                3,
+                "INPUT",
+                [None; 3],
+                fill(MAX_FILL_TEXT_BYTES)
+            )
+            .is_ok()
+        );
+        assert!(matches!(
+            ActRequest::new(
+                page(),
+                "snap",
+                3,
+                "input",
+                [None; 3],
+                fill(MAX_FILL_TEXT_BYTES + 1)
+            ),
+            Err(RenderError::InvalidParams)
+        ));
+        for tag in [String::new(), "x".repeat(MAX_ACT_TAG_BYTES + 1)] {
+            assert!(matches!(
+                ActRequest::new(page(), "snap", 3, &tag, [None; 3], ActAction::Click),
+                Err(RenderError::NotActionable)
+            ));
+        }
+        // 要素名は大小を変えずに渡す（SVG の `foreignObject` 等。ホストは厳密に比べる）。
+        let r = ActRequest::new(
+            page(),
+            "snap",
+            3,
+            "foreignObject",
+            [None; 3],
+            ActAction::Click,
+        )
+        .unwrap();
+        assert_eq!(r.tag(), "foreignObject");
+        let long = "i".repeat(MAX_EXPECT_VALUE_BYTES + 1);
+        let r = ActRequest::new(
+            page(),
+            "snap",
+            3,
+            "input",
+            [Some(long.as_str()), Some("n"), Some("text")],
+            ActAction::Click,
+        )
+        .unwrap();
+        assert_eq!(
+            (r.tag(), r.id(), r.name(), r.type_attr()),
+            ("input", None, Some("n"), Some("text"))
+        );
+        let secret = ActAction::Fill {
+            text: "hunter2".into(),
+            sensitive: true,
+        };
+        assert!(!format!("{secret:?}").contains("hunter2"));
+        assert_eq!(
+            RenderError::Stale.to_string(),
+            "target changed after the snapshot"
+        );
+        assert_eq!(format!("{:?}", RenderError::NotActionable), "NotActionable");
     }
 
     /// RENDER-3: 新 variant の `Debug` は variant 名のみ。

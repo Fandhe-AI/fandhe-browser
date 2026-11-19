@@ -655,6 +655,11 @@ pub struct AiState {
     app: Arc<AppState>,
     /// 操作モードの同期の記録（`/ai/snapshot` の最小間隔。TASK-125）。
     sync: SyncTracker,
+    /// 操作の排他（TASK-128・`AISNAP-17`。2026-11-19 のオーナー判断）。`/ai/act` は書き込み、操作モードの
+    /// `/ai/snapshot` の同期は読み取りを `try_*` で取り、取れなければ待たせずに `busy` で返す。
+    /// `/ai/snapshot` 同士は読み取りどうしで重ならない（同期の直列化は [`SyncTracker`] のロック）。
+    /// ロックの順は「操作 → 同期 → 描画ゲート → `HostRenderer` → ナビゲーション」。
+    operation: std::sync::RwLock<()>,
     #[cfg(feature = "plugin-registry")]
     plugins: PluginRegistry,
 }
@@ -665,6 +670,7 @@ impl AiState {
         Self {
             app,
             sync: SyncTracker::new(),
+            operation: std::sync::RwLock::new(()),
             #[cfg(feature = "plugin-registry")]
             plugins: PluginRegistry::new(),
         }
@@ -678,6 +684,11 @@ impl AiState {
     /// 操作モードの同期の記録（TASK-125）。
     pub fn sync_tracker(&self) -> &SyncTracker {
         &self.sync
+    }
+
+    /// 操作の排他（TASK-128。`busy` の判定に使う）。
+    pub fn operation_lock(&self) -> &std::sync::RwLock<()> {
+        &self.operation
     }
 
     /// プラグインレジストリ（`plugin-registry` feature が on のときだけ存在する）。

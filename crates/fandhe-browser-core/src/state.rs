@@ -38,8 +38,8 @@ use fandhe_browser_profile::Profile;
 use crate::interactive::{HostDomSnapshot, InteractiveDocument, InteractiveSync};
 use crate::page_actor::PageScriptHandle;
 use crate::render::{
-    BoundingBox, DisabledRenderer, ElementRef, ElementVisibility, InteractivePageLoad, PageRef,
-    RenderError, Renderer, Screenshot, ScreenshotOptions,
+    ActOutcome, ActRequest, BoundingBox, DisabledRenderer, ElementRef, ElementVisibility,
+    InteractivePageLoad, PageRef, RenderError, Renderer, Screenshot, ScreenshotOptions,
 };
 use crate::script_context::ScriptContextHandle;
 
@@ -194,6 +194,9 @@ pub enum StateError {
     SessionMismatch,
     /// 操作モードが許されていない（設定キーは TASK-131 まで受理しない。テストの入口だけが許す）。
     InteractiveNotAllowed,
+    /// `sensitive` の操作があった世代に、すべての入力欄の値を消していない同期の結果を保存しようとした
+    /// （`AISNAP-17`・TASK-128。[`NavigationState::mark_redact_all`]）。
+    RedactionRequired,
 }
 
 impl fmt::Display for StateError {
@@ -210,6 +213,9 @@ impl fmt::Display for StateError {
             Self::NotInteractive => f.write_str("current navigation result is not interactive"),
             Self::SessionMismatch => f.write_str("interactive session does not match"),
             Self::InteractiveNotAllowed => f.write_str("interactive mode is not allowed"),
+            Self::RedactionRequired => {
+                f.write_str("all input values must be redacted in this generation")
+            }
         }
     }
 }
@@ -226,6 +232,8 @@ pub struct NavigationState {
     generation: AtomicU64,
     /// 操作モードの確定結果を同期の失敗で無効にした世代（0 は無し）。[`Self::interactive_lost`] が使う。
     lost_generation: AtomicU64,
+    /// `sensitive` の操作があった世代（0 は無し。[`NavigationState::mark_redact_all`]）。
+    redact_all_generation: AtomicU64,
     scope: NavigationScope,
 }
 
@@ -261,6 +269,7 @@ impl NavigationState {
             latest: Mutex::new(None),
             generation: AtomicU64::new(generation),
             lost_generation: AtomicU64::new(0),
+            redact_all_generation: AtomicU64::new(0),
             // wrap は実用上起こらない（u64）。起きても scope が重なるだけで安全側（打ち切り過多）。
             scope: NavigationScope(NEXT_NAVIGATION_SCOPE.fetch_add(1, Ordering::Relaxed)),
         }
@@ -392,6 +401,12 @@ impl NavigationState {
         if prev.page().session() != sync.page().session() {
             return Err(StateError::SessionMismatch);
         }
+        // `sensitive` の操作があった世代では、すべての値を消した結果しか保存しない（1 か所で守る。`AISNAP-17`）。
+        if !sync.all_redacted
+            && self.redact_all_generation.load(Ordering::SeqCst) == generation.get()
+        {
+            return Err(StateError::RedactionRequired);
+        }
         let revision = prev
             .revision()
             .checked_add(1)
@@ -428,6 +443,53 @@ impl NavigationState {
         self.lost_generation
             .store(generation.get(), Ordering::SeqCst);
         Ok(())
+    }
+
+    /// `generation` の間、操作モードの同期の結果はすべての入力欄の値を消したものだけを保存する、と印を付ける
+    /// （`AISNAP-17`・TASK-128。2026-11-19 のオーナー判断）。呼び出し元は `/ai/act` で、`sensitive` の操作か、
+    /// 伏せる対象だった要素への操作を、ホストへ送る前に付ける。新しい navigate で外れる（世代が進むため）。
+    /// 世代が最新でなければ [`StateError::Superseded`]。
+    ///
+    /// 保存済みの操作モードの結果も、同じロックの中で値を全部伏せた写しへ置き換える（版を 1 上げる）。CDP は
+    /// 保存済みの結果を直接読むため、次の同期を待つと直前の同期で保存した値が見えてしまう。写しを作れなければ
+    /// 印を付けず [`StateError::RedactionRequired`]（呼び出し元は操作を送らない）。
+    pub fn mark_redact_all(&self, generation: NavigationGeneration) -> Result<(), StateError> {
+        let mut guard = self.lock();
+        let current = self.current_generation();
+        if generation != current {
+            return Err(StateError::Superseded {
+                attempted: generation,
+                current,
+            });
+        }
+        let redacted = match guard.as_ref() {
+            Some(record) => match record.interactive.as_ref() {
+                Some(doc) => {
+                    let sync = doc
+                        .redacted_all(&record.url)
+                        .map_err(|_| StateError::RedactionRequired)?;
+                    let revision = doc
+                        .revision()
+                        .checked_add(1)
+                        .ok_or(StateError::GenerationExhausted)?;
+                    Some(Arc::new(NavigationResult::from_sync(sync, revision)))
+                }
+                None => None,
+            },
+            None => None,
+        };
+        if let Some(r) = redacted {
+            *guard = Some(r);
+        }
+        self.redact_all_generation
+            .store(generation.get(), Ordering::SeqCst);
+        Ok(())
+    }
+
+    /// `generation` に [`Self::mark_redact_all`] の印があるか（ai の同期が、すべての値を消して組み立てるかに使う）。
+    pub fn redacts_all(&self, generation: NavigationGeneration) -> bool {
+        generation.get() != 0
+            && self.redact_all_generation.load(Ordering::SeqCst) == generation.get()
     }
 
     /// 現在の世代の操作モードの確定結果を [`Self::invalidate_interactive`] で無効にしたか。新しい navigate で
@@ -765,6 +827,14 @@ impl AppState {
         }
         self.render
             .load_interactive(&self.navigation, generation, page)
+    }
+
+    /// 操作モードのページの要素を操作する（TASK-128・`AISNAP-17`）。描画系と同じゲートを通し、撮影などと直列にする
+    /// （操作モードのページは読み直さない）。ページが無ければ [`RenderError::PageNotLoaded`]。呼び出し元は ai の
+    /// `POST /ai/act`（直前に同期し、写しの上で対象を解決してから呼ぶ）。ブロッキングの注意は
+    /// [`Self::capture_screenshot`] と同じ。
+    pub fn act(&self, request: &ActRequest) -> Result<ActOutcome, RenderError> {
+        self.render.with_page(&self.navigation, |r| r.act(request))
     }
 
     /// 操作モードが許されているか（設定キーは TASK-131 まで受理しない。今はテストの入口だけが立てる）。
@@ -1240,6 +1310,62 @@ mod tests {
             nav.replace_interactive(g2, sync("s", 5, "<p></p>")),
             Err(StateError::NotInteractive)
         );
+    }
+
+    /// AISNAP-17・TASK-128: 印を付けた世代では、すべての値を消していない同期の結果を差し替えない。
+    /// 印は最新の世代にだけ付き、新しい navigate で外れる。
+    #[test]
+    fn aisnap17_redact_all_mark_is_enforced_until_next_navigation() {
+        use crate::interactive::{
+            HostDomSnapshot, InteractivePageId, build_interactive_document_with,
+        };
+        let built = |all: bool| {
+            build_interactive_document_with(
+                HostDomSnapshot::new(
+                    InteractivePageId::new("s", 2).unwrap(),
+                    "https://a.example/",
+                    r#"<input data-fandhe-n="0" value="v">"#.to_owned(),
+                    1,
+                    "snap",
+                )
+                .unwrap(),
+                all,
+            )
+            .unwrap()
+        };
+        let nav = NavigationState::new();
+        let g = nav.begin_navigation().unwrap();
+        nav.commit_interactive(g, sync("s", 1, "<p></p>")).unwrap();
+        assert!(!nav.redacts_all(g));
+        nav.replace_interactive(g, built(false)).unwrap();
+        assert!(nav.latest().unwrap().html().contains("value=\"v\""));
+        let before = nav.latest().unwrap().interactive().unwrap().revision();
+        nav.mark_redact_all(g).unwrap();
+        assert!(nav.redacts_all(g));
+        // 印と同時に、保存済みの結果も値を全部伏せた写しへ置き換わる（次の同期を待たない）。
+        let latest = nav.latest().unwrap();
+        assert!(!latest.html().contains("value=\"v\""), "{}", latest.html());
+        let doc = latest.interactive().unwrap();
+        assert_eq!(doc.revision(), before + 1);
+        let input = doc
+            .document()
+            .descendants(doc.document().root())
+            .find(|&n| doc.document().local_name(n) == Some("input"))
+            .unwrap();
+        assert_eq!(doc.document().attribute(input, "value"), None);
+        assert_eq!(doc.host_number(input), Some(0), "numbers are kept");
+        assert_eq!(
+            nav.replace_interactive(g, built(false)),
+            Err(StateError::RedactionRequired)
+        );
+        nav.replace_interactive(g, built(true)).unwrap();
+        assert!(!nav.latest().unwrap().html().contains("value=\"v\""));
+        let g2 = nav.begin_navigation().unwrap();
+        assert!(matches!(
+            nav.mark_redact_all(g),
+            Err(StateError::Superseded { .. })
+        ));
+        assert!(!nav.redacts_all(g2));
     }
 
     /// AISNAP-21・TASK-125: 同期の失敗で無効にすると、新しい navigate まで結果は無く `interactive_lost` が立つ。

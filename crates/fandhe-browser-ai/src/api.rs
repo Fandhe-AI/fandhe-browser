@@ -68,6 +68,7 @@ use fandhe_browser_core::state::PageMode;
 use fandhe_browser_core::{AppState, NavigationGeneration, NavigationState};
 use serde_json::{Map, Value, json};
 
+use crate::act::{ActError, act};
 use crate::blocking::run_blocking;
 use crate::interactive::{SyncFailure, sync_interactive};
 use crate::navigate::{NavigateError, navigate};
@@ -134,6 +135,7 @@ pub fn router(app: Arc<AppState>) -> Router {
 pub fn router_with_state(state: Arc<AiState>) -> Router {
     let snapshot_state = Arc::clone(&state);
     let navigate_state = Arc::clone(&state);
+    let act_state = Arc::clone(&state);
     #[cfg(feature = "plugin-registry")]
     let plugins_state = Arc::clone(&state);
     #[cfg(feature = "plugin-registry")]
@@ -178,6 +180,31 @@ pub fn router_with_state(state: Arc<AiState>) -> Router {
                         Response::new(200, body).with_content_type(JSON_CONTENT_TYPE)
                     }
                     Some(Err(e)) => navigate_error_response(e),
+                    None => internal_error_response(),
+                }
+            }
+        })
+        .route_async("POST", "/ai/act", move |head, body| {
+            // 前段の検査は navigate と同じ（TASK-128・`AISNAP-17`）。
+            let pre = post_precheck(head);
+            let body = body.to_vec();
+            let state = Arc::clone(&act_state);
+            async move {
+                if let Err(r) = pre {
+                    return r;
+                }
+                match run_blocking(move || act(&state, &body)).await {
+                    Some(Ok(ok)) => {
+                        let body = json!({
+                            "ok": true,
+                            "generation": ok.generation().get(),
+                            "navigated": ok.navigated(),
+                        })
+                        .to_string()
+                        .into_bytes();
+                        Response::new(200, body).with_content_type(JSON_CONTENT_TYPE)
+                    }
+                    Some(Err(e)) => act_error_response(e),
                     None => internal_error_response(),
                 }
             }
@@ -330,7 +357,18 @@ fn post_precheck(head: &fandhe_backend_http::request::RequestHead) -> Result<(),
 }
 
 /// `/ai/snapshot` の応答（操作モードの同期を含む。ブロッキングする）。
+///
+/// 操作の排他を読み取りで `try_read` し、`/ai/act` の実行中なら待たせずに `busy`（409）を返す（確定結果は無効に
+/// しない。`AISNAP-20`・2026-11-19 のオーナー判断）。確定結果のモードによらず取る（先にモードを見て省くと、
+/// 見た後に操作モードの結果が確定した場合に排他の外で同期し、`/ai/act` を同期のロックで待たせてしまう）。
 fn snapshot_response(state: &AiState) -> Response {
+    let _guard = match state.operation_lock().try_read() {
+        Ok(g) => g,
+        Err(std::sync::TryLockError::WouldBlock) => {
+            return act_error_response(ActError::Busy);
+        }
+        Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
+    };
     // 操作モードなら先にホストの DOM を取り直す。失敗したら古い内容を返さない（`AISNAP-20`・TASK-125）。
     if let Err(e) = sync_interactive(state.app(), state.sync_tracker()) {
         return error_response(ApiError::Sync(e));
@@ -343,6 +381,12 @@ fn snapshot_response(state: &AiState) -> Response {
 
 /// `POST /ai/navigate` の失敗の応答（2026-11-19 のオーナー判断の表。本文は `{"code","message"}`）。
 fn navigate_error_response(e: NavigateError) -> Response {
+    let (status, code) = e.status_and_code();
+    fixed_error_response(status, code, &e.to_string())
+}
+
+/// `POST /ai/act` の失敗の応答（2026-11-19 のオーナー判断の表。本文は `{"code","message"}`）。
+fn act_error_response(e: ActError) -> Response {
     let (status, code) = e.status_and_code();
     fixed_error_response(status, code, &e.to_string())
 }

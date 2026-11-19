@@ -229,6 +229,20 @@ pub struct Document {
 }
 
 impl Document {
+    /// 同じ arena の写しを作る（ノード ID を保つ）。操作モードの確定結果を、入力値を伏せた写しへ
+    /// 置き換えるときに使う（core の `interactive`。`AISNAP-17`・TASK-128）。
+    pub(crate) fn duplicate(&self) -> Self {
+        Self {
+            nodes: self.nodes.clone(),
+            root: self.root,
+            quirks_mode: self.quirks_mode,
+            recorder: self.recorder.clone(),
+            limits: self.limits,
+            retained_bytes: self.retained_bytes,
+            scripting_enabled: self.scripting_enabled,
+        }
+    }
+
     /// 変更 API の上限設定を返す（TASK-107・`JS-6`）。
     pub fn limits(&self) -> DomLimits {
         self.limits
