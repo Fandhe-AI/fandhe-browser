@@ -162,10 +162,11 @@ async fn aisnap20_snapshot_reflects_host_dom_and_keeps_min_interval() {
     assert_eq!(host.calls(), 1);
 }
 
-/// `AISNAP-20`・`AISNAP-21`: 同期に失敗したら古い内容を返さずエラーにする。ホストが作り直された
-/// （`session` が変わった）結果も差し替えず `session_lost` にする。
+/// `AISNAP-20`・`AISNAP-21`: 同期に失敗したら古い内容を返さずエラーにし、確定結果を無効にする（2026-11-19 の
+/// オーナー判断）。ホストが作り直された（`session` が変わった）結果も差し替えない。無効にした後は、新しい navigate
+/// まで `/ai/snapshot` は `session_lost`、CDP が読む確定結果は無い（ホストへは取りに行かない）。
 #[tokio::test]
-async fn aisnap21_sync_failure_does_not_return_old_content() {
+async fn aisnap21_sync_failure_invalidates_and_does_not_return_old_content() {
     for (reply, status, code) in [
         (Err(RenderError::SessionLost), 409, "session_lost"),
         (Ok(host_snapshot("s2", 1, FILLED)), 409, "session_lost"),
@@ -188,16 +189,41 @@ async fn aisnap21_sync_failure_does_not_return_old_content() {
         let text = String::from_utf8(res.body.clone()).unwrap();
         assert!(!text.contains("initial-heading"), "{text}");
         assert!(!text.contains("Saved"), "{text}");
+        assert!(state.app().navigation().latest().is_none());
+
+        let again = get_snapshot(&state).await;
         assert_eq!(
-            state
-                .app()
-                .navigation()
-                .latest()
-                .unwrap()
-                .interactive()
-                .unwrap()
-                .revision(),
-            1
+            (again.status, json(&again)["code"].clone()),
+            (409, "session_lost".into())
+        );
+        assert_eq!(host.calls(), 1);
+    }
+}
+
+/// `AISNAP-20`: 伏せないホストが入力欄の値を返しても、要約と、CDP の `DOM.*` が読む保存済みの HTML に出ない
+/// （第 2 層。core が保存の前に消す）。伏せる対象でない入力欄の状態は残る。
+#[tokio::test]
+async fn aisnap20_unredacting_host_values_do_not_reach_summary_or_saved_html() {
+    let dir = TempDir::new();
+    let host = Arc::new(FakeHost::default());
+    let leaky = concat!(
+        r#"<label data-fandhe-n="4">Password <input type="password" value="pw-secret-1" data-fandhe-n="5"></label>"#,
+        r#"<label data-fandhe-n="6">Card <input autocomplete="cc-number" value="4111-secret" data-fandhe-n="7"></label>"#,
+        r#"<button data-fandhe-n="8">Pay <input value="plain-shown" data-fandhe-n="9"></button>"#,
+    );
+    host.push(Ok(host_snapshot("s1", 2, leaky)));
+    let state = interactive_state(&dir, Arc::clone(&host));
+    let res = get_snapshot(&state).await;
+    assert_eq!(res.status, 200);
+    let text = String::from_utf8(res.body.clone()).unwrap();
+    assert!(text.contains("plain-shown"), "{text}");
+    let latest = state.app().navigation().latest().unwrap();
+    for secret in ["pw-secret-1", "4111-secret"] {
+        assert!(!text.contains(secret), "{secret}: {text}");
+        assert!(
+            !latest.html().contains(secret),
+            "{secret}: {}",
+            latest.html()
         );
     }
 }

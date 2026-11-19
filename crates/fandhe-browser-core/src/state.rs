@@ -224,6 +224,8 @@ impl std::error::Error for StateError {}
 pub struct NavigationState {
     latest: Mutex<Option<Arc<NavigationResult>>>,
     generation: AtomicU64,
+    /// 操作モードの確定結果を同期の失敗で無効にした世代（0 は無し）。[`Self::interactive_lost`] が使う。
+    lost_generation: AtomicU64,
     scope: NavigationScope,
 }
 
@@ -258,6 +260,7 @@ impl NavigationState {
         Self {
             latest: Mutex::new(None),
             generation: AtomicU64::new(generation),
+            lost_generation: AtomicU64::new(0),
             // wrap は実用上起こらない（u64）。起きても scope が重なるだけで安全側（打ち切り過多）。
             scope: NavigationScope(NEXT_NAVIGATION_SCOPE.fetch_add(1, Ordering::Relaxed)),
         }
@@ -395,6 +398,44 @@ impl NavigationState {
             .ok_or(StateError::GenerationExhausted)?;
         *guard = Some(Arc::new(NavigationResult::from_sync(sync, revision)));
         Ok(())
+    }
+
+    /// 操作モードの確定結果を、同期の失敗で無効にする（`AISNAP-20`・`AISNAP-21`・TASK-125）。
+    ///
+    /// 2026-11-19 のオーナー判断。無効にした後は新しい navigate まで、[`Self::latest`] が `None` を返し
+    /// （CDP は文書なし）、[`Self::interactive_lost`] が `true` を返す（ai の `/ai/snapshot` は `session_lost`）。
+    /// 世代が最新で現在の結果が操作モードのときだけ無効にする（新しい navigate を壊さない）。呼び出し元は
+    /// ai の同期（同期の途中で新しい navigate が始まった場合は呼ばない）。
+    pub fn invalidate_interactive(
+        &self,
+        generation: NavigationGeneration,
+    ) -> Result<(), StateError> {
+        let mut guard = self.lock();
+        let current = self.current_generation();
+        if generation != current {
+            return Err(StateError::Superseded {
+                attempted: generation,
+                current,
+            });
+        }
+        if guard
+            .as_ref()
+            .is_none_or(|r| r.mode() != PageMode::Interactive)
+        {
+            return Err(StateError::NotInteractive);
+        }
+        *guard = None;
+        self.lost_generation
+            .store(generation.get(), Ordering::SeqCst);
+        Ok(())
+    }
+
+    /// 現在の世代の操作モードの確定結果を [`Self::invalidate_interactive`] で無効にしたか。新しい navigate で
+    /// `false` に戻る（世代が進むため）。
+    pub fn interactive_lost(&self) -> bool {
+        let _guard = self.lock();
+        let lost = self.lost_generation.load(Ordering::SeqCst);
+        lost != 0 && lost == self.current_generation().get()
     }
 
     fn replace_if_current(
@@ -1051,6 +1092,40 @@ mod tests {
             nav.replace_interactive(g2, sync("s", 5, "<p></p>")),
             Err(StateError::NotInteractive)
         );
+    }
+
+    /// AISNAP-21・TASK-125: 同期の失敗で無効にすると、新しい navigate まで結果は無く `interactive_lost` が立つ。
+    /// 古い世代・静的モードの結果は無効にしない。
+    #[test]
+    fn aisnap21_invalidate_interactive_until_next_navigation() {
+        let nav = NavigationState::new();
+        let g = nav.begin_navigation().unwrap();
+        assert_eq!(
+            nav.invalidate_interactive(g),
+            Err(StateError::NotInteractive)
+        );
+        nav.commit_interactive(g, sync("s", 1, "<p></p>")).unwrap();
+        assert!(!nav.interactive_lost());
+        nav.invalidate_interactive(g).unwrap();
+        assert!(nav.latest().is_none());
+        assert!(nav.interactive_lost());
+        assert_eq!(
+            nav.replace_interactive(g, sync("s", 2, "<p></p>")),
+            Err(StateError::NotInteractive)
+        );
+        let g2 = nav.begin_navigation().unwrap();
+        assert!(!nav.interactive_lost());
+        assert!(matches!(
+            nav.invalidate_interactive(g),
+            Err(StateError::Superseded { .. })
+        ));
+        nav.commit_navigation(g2, NavigationResult::new("https://b.example/", "<p></p>"))
+            .unwrap();
+        assert_eq!(
+            nav.invalidate_interactive(g2),
+            Err(StateError::NotInteractive)
+        );
+        assert!(nav.latest().is_some());
     }
 
     /// TASK-124: 操作モードは許可（テストの入口。本番は TASK-131 の設定キー）が無ければ保存できない。
