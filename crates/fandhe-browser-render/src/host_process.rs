@@ -882,6 +882,7 @@ impl HostProcess {
     /// [`HostProcessError::SessionLost`]。時間切れ・クラッシュ・プロトコル違反はホストを破棄して
     /// `SessionLost` にする（`timeout` は返さない。`AISNAP-17`）。ホストが `dom_snapshot`・`act` に
     /// `timeout` を返したときも同じく破棄する。`wait` の `timeout` はホストを保ったまま返す（`AISNAP-18`）。
+    /// 読み取りだけの描画要求の `timeout` も、ホストが応答できているため破棄しない。
     pub fn call_interactive(&mut self, request: Request) -> Result<MethodResult, HostProcessError> {
         if !self.config.interactive {
             return Err(HostProcessError::NotInteractive);
@@ -906,7 +907,8 @@ impl HostProcess {
         match self.exchange(&request, wait, phase) {
             Ok(m) => Ok(m),
             Err(HostProcessError::Host(e))
-                if e.kind() == HostErrorKind::Timeout && method != Method::Wait =>
+                if e.kind() == HostErrorKind::Timeout
+                    && matches!(method, Method::DomSnapshot | Method::Act) =>
             {
                 let _ = self.discard(HostProcessError::Timeout(phase));
                 Err(HostProcessError::SessionLost)

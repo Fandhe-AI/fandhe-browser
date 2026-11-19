@@ -1200,7 +1200,7 @@ fn t_renderer_interactive_roundtrip() {
 /// `dom_snapshot` の URL も最終 URL と同じ検査にかけ、userinfo を含めば拒否する。
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn t_renderer_interactive_errors() {
-    use fandhe_browser_core::render::{PageRef, RenderError, Renderer};
+    use fandhe_browser_core::render::{PageRef, RenderError, Renderer, ScreenshotOptions};
     let Some((_root, r)) = interactive_renderer("rint-uns", "int-unsupported") else {
         return;
     };
@@ -1221,6 +1221,19 @@ fn t_renderer_interactive_errors() {
     r.load_interactive(&PageRef::new("https://example.com/a"))
         .expect("load_interactive");
     assert!(matches!(r.dom_snapshot(), Err(RenderError::SessionLost)));
+    // 読み取りだけの描画要求の `timeout` 応答では、操作モードのホストを破棄しない。
+    let Some((root, r)) = interactive_renderer("rint-sto", "int-shot-timeout") else {
+        return;
+    };
+    r.load_interactive(&PageRef::new("https://example.com/a"))
+        .expect("load_interactive");
+    assert!(matches!(
+        r.capture_screenshot(&ScreenshotOptions::new()),
+        Err(RenderError::Timeout)
+    ));
+    r.dom_snapshot()
+        .expect("session kept after screenshot timeout");
+    assert_eq!(count(&root.0, "spawns"), 1);
     // 内部アドレスは送る前に拒否する（SSRF。静的の `load` と同じ検査）。
     assert!(matches!(
         r.load_interactive(&PageRef::new("http://127.0.0.1/")),

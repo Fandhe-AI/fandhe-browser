@@ -320,7 +320,9 @@ pub fn fake_host() -> ! {
                 err.flush().expect("flush");
                 std::process::exit(1);
             }
-            ("int-dom-timeout", "dom_snapshot") | ("int-wait-timeout", "wait") => {
+            ("int-dom-timeout", "dom_snapshot")
+            | ("int-wait-timeout", "wait")
+            | ("int-shot-timeout", "screenshot") => {
                 send_error(&mut stdout, id, "timeout");
                 continue;
             }
