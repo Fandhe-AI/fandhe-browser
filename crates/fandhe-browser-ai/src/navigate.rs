@@ -163,10 +163,11 @@ pub fn navigate(
         .begin_navigation()
         .map_err(|_| NavigateError::LoadFailed)?;
     // 前のページの JS 実行・評価コンテキストを打ち切る（CDP の `Page.navigate` と同じ。`JS-4`・`JS-6`）。
+    // 評価コンテキストを失効できなければ、CDP と同じく読み込まずに失敗にする（fail-closed）。
     app.page_scripts().begin_generation(nav.scope(), generation);
-    let _ = app
-        .script_contexts()
-        .begin_generation(nav.scope(), generation);
+    app.script_contexts()
+        .begin_generation(nav.scope(), generation)
+        .map_err(|_| NavigateError::LoadFailed)?;
     let (load, snapshot) = app
         .load_interactive(generation, &PageRef::new(&request.url))
         .map_err(|e| match e {
