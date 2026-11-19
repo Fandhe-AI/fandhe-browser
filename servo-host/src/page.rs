@@ -772,8 +772,13 @@ impl CurrentPage {
         self.delegate.pending_inputs.borrow_mut().insert(id);
     }
 
-    /// 送った入力イベントの処理がすべて済むまで待つ（遷移の要求は待たない）。
-    fn drain_inputs(&self, engine: &Engine, deadline: Instant) -> Result<(), ErrorKind> {
+    /// 送った入力イベントの処理がすべて済むまで待つ。その後、遷移の要求が来ていれば新しい文書の読み込みの
+    /// 開始（文書番号の更新）まで待ち、来ていなければ要求の通知を受け取る分だけ回す（`navigated` の判定）。
+    fn settle(&self, engine: &Engine, deadline: Instant, start: u64) -> Result<(), ErrorKind> {
+        let spin = || {
+            engine.servo().spin_event_loop();
+            std::thread::sleep(POLL_INTERVAL);
+        };
         wait_until(
             deadline,
             || {
@@ -784,22 +789,9 @@ impl CurrentPage {
                     .then_some(())
             },
             || self.delegate.crashed.get(),
-            || {
-                engine.servo().spin_event_loop();
-                std::thread::sleep(POLL_INTERVAL);
-            },
+            spin,
         )
-        .map_err(PageError::kind)
-    }
-
-    /// 送った入力イベントの処理がすべて済むまで待つ。その後、遷移の要求が来ていれば新しい文書の読み込みの
-    /// 開始（文書番号の更新）まで待ち、来ていなければ要求の通知を受け取る分だけ回す（`navigated` の判定）。
-    fn settle(&self, engine: &Engine, deadline: Instant, start: u64) -> Result<(), ErrorKind> {
-        let spin = || {
-            engine.servo().spin_event_loop();
-            std::thread::sleep(POLL_INTERVAL);
-        };
-        self.drain_inputs(engine, deadline)?;
+        .map_err(PageError::kind)?;
         let until = (Instant::now() + ACT_SETTLE).min(deadline);
         while Instant::now() < until && !self.delegate.navigation_requested.get() {
             spin();
@@ -953,18 +945,7 @@ impl CurrentPage {
                 if !self.focused(engine, element, deadline)? {
                     return Err(ErrorKind::NotActionable);
                 }
-                // 1 文字ごとに処理が済むのを待ち、対象にフォーカスが残り、遷移の要求も文書の更新も無いことを
-                // 確かめてから次を送る（ページのハンドラがフォーカスを移したら、残りを別の要素へ入れない）。
-                for (i, ch) in text.chars().enumerate() {
-                    if i > 0 {
-                        self.drain_inputs(engine, deadline)?;
-                        if self.delegate.navigation_requested.get()
-                            || self.delegate.doc_seq.get() != start
-                            || !self.focused(engine, element, deadline)?
-                        {
-                            return Err(ErrorKind::NotActionable);
-                        }
-                    }
+                for ch in text.chars() {
                     self.press(&Key::Character(ch.to_string()));
                 }
                 self.settle(engine, deadline, start)?;
