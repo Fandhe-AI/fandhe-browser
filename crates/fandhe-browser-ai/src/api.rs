@@ -19,7 +19,7 @@
 //! - 操作モードの確定結果なら、要約の前にホストの DOM を取り直す（[`crate::interactive::sync_interactive`]）。
 //!   同期の失敗は `session_lost`・`rendering_disabled`・`stale`（409）と `sync_failed`（502）で返し、
 //!   古い内容を返さない（`AISNAP-20`・`AISNAP-21`）。`stale` 以外では確定結果を無効にし、新しい navigate まで
-//!   `session_lost` を返す。エラー名とステータスは 2026-11-19 のオーナー判断で spec の AISNAP-20 に足す
+//!   `session_lost` を返す。エラー名とステータスは 2026-11-19 のオーナー判断で spec の AISNAP-20 に足した
 //!   （Fandhe-AI/fandhe-browser-spec#52）
 //! - 操作モードの同期（最大で `dom_snapshot` の 30 秒＋余裕 5 秒）は async のハンドラの中で同期的に呼ぶ。
 //!   core は async の呼び出し元に `spawn_blocking` 等を求めており、操作モードを本番で立てられるようにする
