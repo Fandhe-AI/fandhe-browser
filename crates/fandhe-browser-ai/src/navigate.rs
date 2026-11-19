@@ -44,7 +44,7 @@ pub struct NavigateOk {
 }
 
 impl NavigateOk {
-    /// 最終 URL。
+    /// 最終 URL（読み込みと同時に取った DOM の URL。保存する文書・`/ai/snapshot` と同じ）。
     pub fn url(&self) -> &str {
         &self.url
     }
@@ -168,7 +168,7 @@ pub fn navigate(
     app.script_contexts()
         .begin_generation(nav.scope(), generation)
         .map_err(|_| NavigateError::LoadFailed)?;
-    let (load, snapshot) = app
+    let (_load, snapshot) = app
         .load_interactive(generation, &PageRef::new(&request.url))
         .map_err(|e| match e {
             InteractiveLoadError::NotAllowed => NavigateError::Unavailable,
@@ -177,6 +177,9 @@ pub fn navigate(
             _ => NavigateError::LoadFailed,
         })?;
     let sync = build_interactive_document(snapshot).map_err(|_| NavigateError::LoadFailed)?;
+    // 応答の URL は保存する文書と同じ取得時の URL にする（読み込みから取得までにページが自分で
+    // 遷移しても `/ai/snapshot` と食い違わない）。保存後に共有状態を読み直すと別の navigate と競合する。
+    let url = sync.url().to_owned();
     app.commit_interactive(generation, sync)
         .map_err(|e| match e {
             StateError::Superseded { .. } => NavigateError::Stale,
@@ -184,10 +187,7 @@ pub fn navigate(
             _ => NavigateError::LoadFailed,
         })?;
     tracker.record(generation);
-    Ok(NavigateOk {
-        url: load.load().final_url().to_owned(),
-        generation,
-    })
+    Ok(NavigateOk { url, generation })
 }
 
 fn from_render(e: &RenderError) -> NavigateError {

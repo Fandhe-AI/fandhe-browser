@@ -142,7 +142,7 @@ fn json(res: &Response) -> Value {
 
 const OK_BODY: &str = r#"{"url":"https://a.example/form?token=secret","mode":"interactive"}"#;
 
-/// `AISNAP-16`: 操作モードで読み込み、最終 URL・世代・モードを返す。続く `/ai/snapshot` は同じ世代の
+/// `AISNAP-16`: 操作モードで読み込み、取得時の URL・世代・モードを返す。続く `/ai/snapshot` は同じ世代の
 /// 操作モードの要約で、読み込みと同時に取った DOM を使う（すぐには取り直さない）。
 #[tokio::test]
 async fn aisnap16_navigate_interactive_then_snapshot() {
@@ -153,7 +153,8 @@ async fn aisnap16_navigate_interactive_then_snapshot() {
     assert_eq!(res.status, 200);
     let v = json(&res);
     assert_eq!(v["ok"], true);
-    assert_eq!(v["url"], "https://a.example/form?token=secret#final");
+    // 読み込みの最終 URL（`#final`）ではなく、保存した文書の取得時の URL を返す。
+    assert_eq!(v["url"], "https://a.example/form");
     assert_eq!(v["mode"], "interactive");
     let generation = v["generation"].as_u64().unwrap();
     assert_eq!(host.calls(), (1, 1));
@@ -163,6 +164,7 @@ async fn aisnap16_navigate_interactive_then_snapshot() {
     let v = json(&res);
     assert_eq!(v["mode"], "interactive");
     assert_eq!(v["generation"].as_u64(), Some(generation));
+    assert_eq!(v["url"], "https://a.example/form");
     assert!(v["tree"].to_string().contains("Go"));
     assert_eq!(host.calls(), (1, 1), "no re-sync right after navigate");
 }
