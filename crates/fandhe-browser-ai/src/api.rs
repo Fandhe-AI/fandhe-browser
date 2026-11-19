@@ -18,8 +18,9 @@
 //!   `mode`（`static` / `interactive`）は互換のある追加（`AISNAP-20`・TASK-125）
 //! - 操作モードの確定結果なら、要約の前にホストの DOM を取り直す（[`crate::interactive::sync_interactive`]）。
 //!   同期の失敗は `session_lost`・`rendering_disabled`・`stale`（409）と `sync_failed`（502）で返し、
-//!   古い内容を返さない（`AISNAP-20`・`AISNAP-21`）。`stale`・`sync_failed` とステータスは spec・設計 §14.7 に
-//!   無い暫定の値（TASK-125）
+//!   古い内容を返さない（`AISNAP-20`・`AISNAP-21`）。`stale` 以外では確定結果を無効にし、新しい navigate まで
+//!   `session_lost` を返す。エラー名とステータスは 2026-11-19 のオーナー判断で spec の AISNAP-20 に足す
+//!   （Fandhe-AI/fandhe-browser-spec#52）
 //! - 操作モードの同期（最大で `dom_snapshot` の 30 秒＋余裕 5 秒）は async のハンドラの中で同期的に呼ぶ。
 //!   core は async の呼び出し元に `spawn_blocking` 等を求めており、操作モードを本番で立てられるようにする
 //!   前（TASK-127・TASK-131）に直す。今は操作モードに入る経路がテストの入口だけ
