@@ -82,7 +82,7 @@ cargo install fandhe-browser-cli --locked
 
 `query`・`navigate`・`launch` は描画ホストなしで動きます。`screenshot` には描画ホスト `fandhe-browser-servo-host` の導入が必要で、無いと `rendering is not available` で失敗します。
 
-- 公開状況: ホストは 0.1.1 から公開する予定で、公開されるまで `cargo install` できません。公開済みの 0.1.0 の CLI に対応するホストはありません
+- 公開状況: ホストは 0.1.1 から crates.io で公開しています。0.1.0・0.1.1 は脆弱性のため取り下げ済みです。最新版を使い、CLI とホストは同じ版にしてください
 - 対象 OS: macOS・Linux。Windows は対象外です（`cargo install` は ANGLE の `libEGL.dll`・`libGLESv2.dll` を置かず、egress 隔離も未実装で GA の対象外のため。#1524）
 - ライセンス: ホストの crate は Servo（MPL-2.0）のソースを含まず `MIT OR Apache-2.0` ですが、ビルドしたバイナリには MPL-2.0 が適用されます（`NOTICE` 参照）
 
