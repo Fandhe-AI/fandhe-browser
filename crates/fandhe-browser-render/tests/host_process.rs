@@ -1278,8 +1278,7 @@ fn t_renderer_interactive_act() {
         ("invalid_params", "InvalidParams"),
         ("timeout", "SessionLost"),
     ] {
-        let Some((_root, r)) =
-            interactive_renderer(&format!("ract-{kind}"), &format!("int-act-{kind}"))
+        let Some((_root, r)) = interactive_renderer(&format!("ract-{kind}"), &format!("ia-{kind}"))
         else {
             return;
         };
