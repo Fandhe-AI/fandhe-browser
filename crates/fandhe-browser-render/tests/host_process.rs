@@ -1239,6 +1239,65 @@ fn t_renderer_interactive_errors() {
     ));
 }
 
+/// TASK-128・`AISNAP-17`: `act` は最新の取得の番号と照合値で操作モードのホストへ送り、結果のページ識別子と
+/// `navigated` を返す。ホストの kind を写す（時間切れはホストを破棄して `SessionLost`）。読み込み前は `NotInteractive`。
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn t_renderer_interactive_act() {
+    use fandhe_browser_core::interactive::InteractivePageId;
+    use fandhe_browser_core::render::{ActAction, ActRequest, PageRef, RenderError, Renderer};
+    let request = || {
+        ActRequest::new(
+            InteractivePageId::new("0123456789abcdef0123456789abcdef", 1).unwrap(),
+            "s1",
+            0,
+            "html",
+            [Some("i"), None, None],
+            ActAction::Fill {
+                text: "hello".into(),
+                sensitive: false,
+            },
+        )
+        .unwrap()
+    };
+    let Some((_root, r)) = interactive_renderer("ract-ok", "ok") else {
+        return;
+    };
+    assert!(matches!(
+        r.act(&request()),
+        Err(RenderError::NotInteractive)
+    ));
+    r.load_interactive(&PageRef::new("https://example.com/a"))
+        .expect("load_interactive");
+    let out = r.act(&request()).expect("act");
+    assert_eq!((out.page().doc_seq(), out.navigated()), (1, false));
+    for (kind, want) in [
+        ("stale", "Stale"),
+        ("not_actionable", "NotActionable"),
+        ("unsupported", "Unsupported"),
+        ("invalid_state", "InvalidState"),
+        ("invalid_params", "InvalidParams"),
+        ("timeout", "SessionLost"),
+    ] {
+        let Some((_root, r)) =
+            interactive_renderer(&format!("ract-{kind}"), &format!("int-act-{kind}"))
+        else {
+            return;
+        };
+        r.load_interactive(&PageRef::new("https://example.com/a"))
+            .expect("load_interactive");
+        let got = match r.act(&request()) {
+            Err(RenderError::Stale) => "Stale",
+            Err(RenderError::NotActionable) => "NotActionable",
+            Err(RenderError::Unsupported) => "Unsupported",
+            Err(RenderError::InvalidState) => "InvalidState",
+            Err(RenderError::InvalidParams) => "InvalidParams",
+            Err(RenderError::SessionLost) => "SessionLost",
+            other => panic!("{kind}: unexpected {other:?}"),
+        };
+        assert_eq!(got, want, "{kind}");
+    }
+}
+
 /// TASK-127: 隔離が成立しない設定では、操作モードのホストを起動せず `InteractiveUnavailable`
 /// （静的モードのホストへ落とさない。確定条件 7）。
 #[cfg(unix)]
@@ -1386,6 +1445,7 @@ fn main() {
             t_renderer_interactive_roundtrip,
         ));
         tests.push(("renderer_interactive_errors", t_renderer_interactive_errors));
+        tests.push(("renderer_interactive_act", t_renderer_interactive_act));
     }
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     tests.push(("rss_limit", t_rss_limit));

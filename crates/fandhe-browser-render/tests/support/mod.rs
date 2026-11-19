@@ -327,6 +327,11 @@ pub fn fake_host() -> ! {
                 continue;
             }
             ("int-hang-dom", "dom_snapshot") => std::thread::sleep(Duration::from_secs(60)),
+            // `act` に指定の kind のエラーを返す（`int-act-<kind>`。TASK-128）。
+            (sc, "act") if sc.starts_with("int-act-") => {
+                send_error(&mut stdout, id, &sc["int-act-".len()..]);
+                continue;
+            }
             // `navigator.webdriver` の確認の失敗（SEC-5・#1609）を装う（TASK-127）。
             ("int-unsupported", "load") if interactive => {
                 send_error(&mut stdout, id, "unsupported");

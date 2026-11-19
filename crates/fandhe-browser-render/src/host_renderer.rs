@@ -14,6 +14,7 @@
 //! | `bounding_box` | `bounding_box` |
 //! | `load_interactive` | 操作モードのホスト（`--interactive`）の `load` |
 //! | `dom_snapshot` | 操作モードのホストの `dom_snapshot` |
+//! | `act` | 操作モードのホストの `act`（TASK-128） |
 //!
 //! 操作モード（TASK-127・`AISNAP-16`・設計 §14.1）は、静的モードとは別の [`HostProcess`]
 //! （[`HostProcessConfig::with_interactive`]）で扱う。同時に動かすホストは 1 つにする（片方を読み込むときに
@@ -51,14 +52,14 @@ use std::sync::Mutex;
 use fandhe_browser_core::check_network_target_url;
 use fandhe_browser_core::interactive::{HostDomSnapshot, InteractivePageId};
 use fandhe_browser_core::render::{
-    BoundingBox, ElementRef, ElementVisibility, ImageFormat, InteractivePageLoad, PageLoad,
-    PageRef, RenderError, Renderer, Screenshot, ScreenshotOptions,
+    ActAction, ActOutcome, ActRequest, BoundingBox, ElementRef, ElementVisibility, ImageFormat,
+    InteractivePageLoad, PageLoad, PageRef, RenderError, Renderer, Screenshot, ScreenshotOptions,
 };
 
 use crate::host_process::{HostProcess, HostProcessConfig, HostProcessError};
 use crate::protocol::{
-    BoundingBoxParams, HostErrorKind, LoadParams, MethodResult, Request, ScreenshotParams,
-    VisibilityParams,
+    ActExpect, ActParams, Action, BoundingBoxParams, HostErrorKind, LoadParams, MethodResult,
+    PageInfo, Request, ScreenshotParams, VisibilityParams,
 };
 
 /// PNG ファイルの先頭 8 バイト。
@@ -251,6 +252,10 @@ fn map_host_error(err: HostProcessError) -> RenderError {
             HostErrorKind::TooLarge => RenderError::TooLarge,
             // 操作モードの `load`・`dom_snapshot` では、`navigator.webdriver` の確認の失敗（SEC-5・#1609）。
             HostErrorKind::Unsupported => RenderError::Unsupported,
+            // 操作モードの `act`（TASK-128・設計 §14.7）。
+            HostErrorKind::Stale => RenderError::Stale,
+            HostErrorKind::NotActionable => RenderError::NotActionable,
+            HostErrorKind::InvalidParams => RenderError::InvalidParams,
             _ => internal("render host reported an error"),
         },
         HostProcessError::InvalidRequest => internal("invalid render host request"),
@@ -405,6 +410,48 @@ impl Renderer for HostRenderer {
         )
         .map_err(|_| RenderError::ProtocolMismatch)
     }
+
+    fn act(&self, request: &ActRequest) -> Result<ActOutcome, RenderError> {
+        let params = act_params(request)?;
+        let mut inner = self.lock()?;
+        if !inner.interactive_loaded {
+            return Err(RenderError::NotInteractive);
+        }
+        let result = inner
+            .interactive
+            .call_interactive(Request::Act(params))
+            .map_err(map_host_error);
+        let MethodResult::Act(a) = result? else {
+            return Err(RenderError::ProtocolMismatch);
+        };
+        let id = InteractivePageId::new(a.page().session(), a.page().doc_seq())
+            .map_err(|_| RenderError::ProtocolMismatch)?;
+        Ok(ActOutcome::new(id, a.navigated()))
+    }
+}
+
+/// core の操作の要求をプロトコルの `act` のパラメータにする。検査に通らなければ [`RenderError::InvalidParams`]
+/// （ホストへ送らない）。入力文字列はエラーに含めない。
+fn act_params(request: &ActRequest) -> Result<ActParams, RenderError> {
+    let invalid = |_| RenderError::InvalidParams;
+    let page =
+        PageInfo::new(request.page().session(), request.page().doc_seq()).map_err(invalid)?;
+    let mut expect = ActExpect::new(request.tag()).map_err(invalid)?;
+    if let Some(v) = request.id() {
+        expect = expect.with_id(v).map_err(invalid)?;
+    }
+    if let Some(v) = request.name() {
+        expect = expect.with_name(v).map_err(invalid)?;
+    }
+    if let Some(v) = request.type_attr() {
+        expect = expect.with_type(v).map_err(invalid)?;
+    }
+    let action = match request.action() {
+        ActAction::Click => Action::Click,
+        ActAction::Fill { text, sensitive } => Action::fill(text, *sensitive).map_err(invalid)?,
+        _ => return Err(RenderError::InvalidParams),
+    };
+    ActParams::new(page, request.snapshot(), request.node(), expect, action).map_err(invalid)
 }
 
 #[cfg(test)]
