@@ -154,8 +154,9 @@ fn fixed_preferences(proxy: Option<LoopbackProxy>) -> Preferences {
 /// 入らない、ページは `navigator` の個体を上書きできる、Worker では未定義、getter の `toString()` が見える。
 /// また Servo は登録した定義を `head` 要素が文書に入った時点で走らせるため、`head` の無い XML の文書
 /// （`application/xhtml+xml` 等。HTML と違いパーサーが `head` を補わない）では主フレームでも未定義になる
-/// （2026-11-19 に実ホストで確認。`head` があれば最初のスクリプトから `true`）。これは SEC-5 の既知の制約に
-/// 含まれず、扱いは判断待ち（#1609）。
+/// （2026-11-19 に実ホストで確認。`head` があれば最初のスクリプトから `true`）。操作モードでは、`load` の後と
+/// `dom_snapshot` のたびに主フレームで `true` かを確かめ、満たさなければ `unsupported` で断る（SEC-5。
+/// 2026-11-19 の判断。#1609。`page::CurrentPage::check_webdriver`）。撮影では断らず、未定義のまま撮る。
 pub(crate) const NAVIGATOR_WEBDRIVER_SCRIPT: &str = "Object.defineProperty(Navigator.prototype,\"webdriver\",{get:function(){return true},configurable:false,enumerable:true});";
 
 /// Servo とソフトウェア描画コンテキストの組。`Drop` で Servo を停止してから解放する。
