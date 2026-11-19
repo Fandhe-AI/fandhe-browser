@@ -46,6 +46,13 @@ impl SyncTracker {
     pub fn new() -> Self {
         Self::default()
     }
+
+    /// `generation` のページをいま取得した、と記録する（`POST /ai/navigate` が読み込みと同時に DOM を
+    /// 取得したとき。直後の `/ai/snapshot` で取り直さない。TASK-127）。
+    pub fn record(&self, generation: NavigationGeneration) {
+        *self.last.lock().unwrap_or_else(PoisonError::into_inner) =
+            Some((generation, Instant::now()));
+    }
 }
 
 /// 最後の同期 `last` に対し、`generation` のページを `now` に取り直すべきか。
@@ -70,6 +77,9 @@ pub enum SyncFailure {
     RenderingDisabled,
     /// 同期の間に新しい navigate が始まった、または確定結果が操作モードでなくなった。
     Stale,
+    /// ページが操作モードの条件を満たさなくなった（主フレームの `navigator.webdriver` が `true` でない。
+    /// SEC-5・#1609）。`interactive_unavailable` で返す（TASK-127。2026-11-19 のオーナー判断）。
+    Unavailable,
     /// ホストの応答の検査・取得に失敗した。
     Failed,
 }
@@ -80,6 +90,7 @@ impl SyncFailure {
             RenderError::SessionLost => Self::SessionLost,
             RenderError::RenderingDisabled => Self::RenderingDisabled,
             RenderError::PageNotLoaded => Self::Stale,
+            RenderError::Unsupported | RenderError::InteractiveUnavailable => Self::Unavailable,
             // `dom_snapshot` の時間切れは render の `HostRenderer` がホストを破棄して `SessionLost` で返す
             // （設計 §14.6・TASK-123）。ここへ `Timeout` などが来たら同期の失敗として扱う。
             _ => Self::Failed,

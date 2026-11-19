@@ -93,9 +93,11 @@
 //!   [`plugin_api::PluginRegistry`]・[`plugin_api::AiState`]）。登録エンドポイント `POST /ai/plugins/register` は実装済み（TASK-92.3・Issue #355）。一覧 `GET /ai/plugins` も実装済み（TASK-92.4・Issue #356。[`api::router_with_state`]）。`PLUG-3` 目標の適用判定（公式サポート判定）も実装済み（TASK-98.2・Issue #390・`PLUG-6`。[`plugin_api::SupportTier`]）。2 ルートとレジストリ保持は `plugin-registry` feature（既定 on）で切り替えられ、off では 404 になる（`PERF-7`・TASK-104・Issue #822）
 
 pub mod api;
+mod blocking;
 pub mod compress_table;
 pub mod data_leaf;
 pub mod interactive;
+pub mod navigate;
 pub mod plugin_api;
 pub mod retention;
 pub mod snapshot;

@@ -21,9 +21,15 @@
 //!   古い内容を返さない（`AISNAP-20`・`AISNAP-21`）。`stale` 以外では確定結果を無効にし、新しい navigate まで
 //!   `session_lost` を返す。エラー名とステータスは 2026-11-19 のオーナー判断で spec の AISNAP-20 に足した
 //!   （Fandhe-AI/fandhe-browser-spec#52）
-//! - 操作モードの同期（最大で `dom_snapshot` の 30 秒＋余裕 5 秒）は async のハンドラの中で同期的に呼ぶ。
-//!   core は async の呼び出し元に `spawn_blocking` 等を求めており、操作モードを本番で立てられるようにする
-//!   前（TASK-127・TASK-131）に直す。今は操作モードに入る経路がテストの入口だけ
+//! - 操作モードの同期（最大で `dom_snapshot` の 30 秒＋余裕 5 秒）と読み込みは、専用のスレッドへ移して
+//!   待つ（[`crate::blocking`]。サーバーは current_thread のため、直接呼ぶとその間すべての要求が止まる。TASK-127）
+//! - `POST /ai/navigate`（TASK-127・`AISNAP-16`）は操作モードだけ。`mode` の省略・`static` は 501
+//!   `not_implemented`（2026-11-19 のオーナー判断）。本文の検査と失敗の写像は [`crate::navigate`]。前段の検査は
+//!   register と同じ（Host → `Origin` 付きは 403 → `Content-Type` が JSON でなければ 415）。成功は
+//!   `{"ok": true, "url", "generation", "mode": "interactive"}`。操作モードへ入れるのはテストの入口
+//!   （`allow_interactive_for_tests`）だけで、設定キーは TASK-131
+//! - 同期の失敗のうち、ホストの `navigator.webdriver` の確認の失敗（SEC-5・#1609）は `interactive_unavailable`
+//!   （409）で返す（2026-11-19 のオーナー判断）
 //! - 未ナビゲート時は 409 と `{"code":"no_navigation","message":...}` を返す（成功を装わない。
 //!   TASK-19.2・Issue #224・`AISNAP-14`）。spec 上 `AISNAP-14` の形式・ステータスは検討中で、
 //!   spec の例示形に合わせた暫定確定。エラー本文は全 variant で `code` と `message` の 2 キー
@@ -62,7 +68,9 @@ use fandhe_browser_core::state::PageMode;
 use fandhe_browser_core::{AppState, NavigationGeneration, NavigationState};
 use serde_json::{Map, Value, json};
 
+use crate::blocking::run_blocking;
 use crate::interactive::{SyncFailure, sync_interactive};
+use crate::navigate::{NavigateError, navigate};
 use crate::plugin_api::AiState;
 #[cfg(feature = "plugin-registry")]
 use crate::plugin_api::{ManifestError, PluginManifest, PluginRegistry, RegistryError};
@@ -97,6 +105,9 @@ impl fmt::Display for ApiError {
             ApiError::Sync(SyncFailure::SessionLost) => "rendering host session was lost",
             ApiError::Sync(SyncFailure::RenderingDisabled) => "rendering is disabled",
             ApiError::Sync(SyncFailure::Stale) => "page changed during synchronization",
+            ApiError::Sync(SyncFailure::Unavailable) => {
+                "page does not meet interactive mode requirements"
+            }
             ApiError::Sync(_) => "failed to synchronize interactive page",
         })
     }
@@ -122,25 +133,55 @@ pub fn router(app: Arc<AppState>) -> Router {
 /// 静的な初期化処理ではない。
 pub fn router_with_state(state: Arc<AiState>) -> Router {
     let snapshot_state = Arc::clone(&state);
+    let navigate_state = Arc::clone(&state);
     #[cfg(feature = "plugin-registry")]
     let plugins_state = Arc::clone(&state);
     #[cfg(feature = "plugin-registry")]
     let register_state = state;
-    let router = Router::new().route("GET", "/ai/snapshot", move |head, _body| {
-        // DNS rebinding 対策: cdp の `/json/*` と同じ Host 検証（core の `host` モジュール）を
-        // 応答前に行い、不正な Host には snapshot（直近ページの URL・内容）を渡さない。
-        if let Err(e) = Authority::from_host_header(head.header("host")) {
-            return host_error_response(e);
-        }
-        // 操作モードなら先にホストの DOM を取り直す。失敗したら古い内容を返さない（`AISNAP-20`・TASK-125）。
-        if let Err(e) = sync_interactive(snapshot_state.app(), snapshot_state.sync_tracker()) {
-            return error_response(ApiError::Sync(e));
-        }
-        match snapshot_body(snapshot_state.app().navigation()) {
-            Ok(body) => Response::new(200, body).with_content_type(JSON_CONTENT_TYPE),
-            Err(e) => error_response(e),
-        }
-    });
+    let router = Router::new()
+        .route_async("GET", "/ai/snapshot", move |head, _body| {
+            // DNS rebinding 対策: cdp の `/json/*` と同じ Host 検証（core の `host` モジュール）を
+            // 応答前に行い、不正な Host には snapshot（直近ページの URL・内容）を渡さない。
+            let host = Authority::from_host_header(head.header("host")).map(|_| ());
+            let state = Arc::clone(&snapshot_state);
+            async move {
+                if let Err(e) = host {
+                    return host_error_response(e);
+                }
+                // 操作モードの同期はブロッキングするため、スレッドへ移して待つ（`crate::blocking`）。
+                run_blocking(move || snapshot_response(&state))
+                    .await
+                    .unwrap_or_else(internal_error_response)
+            }
+        })
+        .route_async("POST", "/ai/navigate", move |head, body| {
+            // 検査順は register と同じ: Host -> Origin -> Content-Type -> 本文。前段で拒否した要求は
+            // 本文をパースせず、状態を変えない（TASK-127・`AISNAP-16`）。
+            let pre = post_precheck(head);
+            let body = body.to_vec();
+            let state = Arc::clone(&navigate_state);
+            async move {
+                if let Err(r) = pre {
+                    return r;
+                }
+                match run_blocking(move || navigate(state.app(), state.sync_tracker(), &body)).await
+                {
+                    Some(Ok(ok)) => {
+                        let body = json!({
+                            "ok": true,
+                            "url": ok.url(),
+                            "generation": ok.generation().get(),
+                            "mode": "interactive",
+                        })
+                        .to_string()
+                        .into_bytes();
+                        Response::new(200, body).with_content_type(JSON_CONTENT_TYPE)
+                    }
+                    Some(Err(e)) => navigate_error_response(e),
+                    None => internal_error_response(),
+                }
+            }
+        });
     #[cfg(feature = "plugin-registry")]
     let router = router
         .route("GET", "/ai/plugins", move |head, _body| {
@@ -154,18 +195,8 @@ pub fn router_with_state(state: Arc<AiState>) -> Router {
         .route("POST", "/ai/plugins/register", move |head, body| {
             // 検査順: Host -> Origin -> Content-Type -> 本文検証 -> 登録。前段で拒否した要求は
             // 本文をパースしない。
-            if let Err(e) = Authority::from_host_header(head.header("host")) {
-                return host_error_response(e);
-            }
-            if head.header("origin").is_some() {
-                return fixed_error_response(403, "origin_not_allowed", "origin is not allowed");
-            }
-            if !is_json_content_type(head.header("content-type")) {
-                return fixed_error_response(
-                    415,
-                    "unsupported_media_type",
-                    "content type must be application/json",
-                );
+            if let Err(r) = post_precheck(head) {
+                return r;
             }
             match register_plugin(register_state.plugins(), body) {
                 Ok(result) => {
@@ -275,8 +306,53 @@ fn register_error_response(e: RegisterError) -> Response {
     fixed_error_response(status, code, &e.to_string())
 }
 
+/// 状態を変える POST の前段の検査（Host → Origin 付きは 403 → Content-Type JSON 以外は 415）。
+/// cross-site からの要求を防ぐため `Origin` 付きを一律に拒否し、CORS 許可ヘッダは付けない。
+fn post_precheck(head: &fandhe_backend_http::request::RequestHead) -> Result<(), Response> {
+    if let Err(e) = Authority::from_host_header(head.header("host")) {
+        return Err(host_error_response(e));
+    }
+    if head.header("origin").is_some() {
+        return Err(fixed_error_response(
+            403,
+            "origin_not_allowed",
+            "origin is not allowed",
+        ));
+    }
+    if !is_json_content_type(head.header("content-type")) {
+        return Err(fixed_error_response(
+            415,
+            "unsupported_media_type",
+            "content type must be application/json",
+        ));
+    }
+    Ok(())
+}
+
+/// `/ai/snapshot` の応答（操作モードの同期を含む。ブロッキングする）。
+fn snapshot_response(state: &AiState) -> Response {
+    // 操作モードなら先にホストの DOM を取り直す。失敗したら古い内容を返さない（`AISNAP-20`・TASK-125）。
+    if let Err(e) = sync_interactive(state.app(), state.sync_tracker()) {
+        return error_response(ApiError::Sync(e));
+    }
+    match snapshot_body(state.app().navigation()) {
+        Ok(body) => Response::new(200, body).with_content_type(JSON_CONTENT_TYPE),
+        Err(e) => error_response(e),
+    }
+}
+
+/// `POST /ai/navigate` の失敗の応答（2026-11-19 のオーナー判断の表。本文は `{"code","message"}`）。
+fn navigate_error_response(e: NavigateError) -> Response {
+    let (status, code) = e.status_and_code();
+    fixed_error_response(status, code, &e.to_string())
+}
+
+/// ブロッキングの処理を動かせなかった（スレッドを作れない・処理の panic）。
+fn internal_error_response() -> Response {
+    fixed_error_response(500, "internal_error", "internal error")
+}
+
 /// `{"code","message"}` の固定内容エラー応答。
-#[cfg(feature = "plugin-registry")]
 fn fixed_error_response(status: u16, code: &str, message: &str) -> Response {
     let body = json!({ "code": code, "message": message })
         .to_string()
@@ -285,7 +361,6 @@ fn fixed_error_response(status: u16, code: &str, message: &str) -> Response {
 }
 
 /// `Content-Type` が `application/json`（パラメータ・大文字小文字は不問）か。ヘッダ欠落は偽。
-#[cfg(feature = "plugin-registry")]
 fn is_json_content_type(value: Option<&str>) -> bool {
     value
         .and_then(|v| v.split(';').next())
@@ -314,6 +389,8 @@ fn error_response(e: ApiError) -> Response {
         ApiError::Sync(SyncFailure::SessionLost) => (409, "session_lost"),
         ApiError::Sync(SyncFailure::RenderingDisabled) => (409, "rendering_disabled"),
         ApiError::Sync(SyncFailure::Stale) => (409, "stale"),
+        // `navigator.webdriver` の確認の失敗など（SEC-5・#1609。2026-11-19 のオーナー判断）。
+        ApiError::Sync(SyncFailure::Unavailable) => (409, "interactive_unavailable"),
         ApiError::Sync(_) => (502, "sync_failed"),
     };
     let body = json!({ "code": code, "message": e.to_string() })
