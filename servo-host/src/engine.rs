@@ -14,7 +14,8 @@
 //! - 起動構成は [`fixed_opts`]・[`fixed_preferences`] のコード内固定値だけで作る。
 //!   argv からは `args` が検証した loopback ポートだけが [`LoopbackProxy`] として proxy pref に入る。
 //!   環境変数・ファイルから Servo の設定へ流す経路は持たない（SEC-2・RENDER-3・#1435）。
-//!   ビューポートも定数 [`VIEWPORT`] で、API にしない。
+//!   ビューポートも定数 [`VIEWPORT`] で、API にしない。起動時に、全ページの文書の最初に走らせる固定の定義
+//!   （[`NAVIGATOR_WEBDRIVER_SCRIPT`]。SEC-5・TASK-119）を登録する
 //! - 標準出力へは書かない（将来 stdout はフレーム専用になる。設計 §2.1）。
 
 use std::fmt;
@@ -151,6 +152,9 @@ fn fixed_preferences(proxy: Option<LoopbackProxy>) -> Preferences {
 /// なので再定義は `TypeError`、`delete` は `false` になる）。他の `navigator` の項目は変えない。値を消す・
 /// `false` にする経路は作らない（設定・引数・API から変えられない）。既知の制約: iframe の子文書には
 /// 入らない、ページは `navigator` の個体を上書きできる、Worker では未定義、getter の `toString()` が見える。
+/// また Servo は登録した定義を `head` 要素が文書に入った時点で走らせるため、`head` の無い XML の文書
+/// （`application/xhtml+xml` 等。HTML と違いパーサーが `head` を補わない）では主フレームでも未定義になる
+/// （2026-11-19 に実ホストで確認。`head` があれば最初のスクリプトから `true`）。
 pub(crate) const NAVIGATOR_WEBDRIVER_SCRIPT: &str = "Object.defineProperty(Navigator.prototype,\"webdriver\",{get:function(){return true},configurable:false,enumerable:true});";
 
 /// Servo とソフトウェア描画コンテキストの組。`Drop` で Servo を停止してから解放する。
@@ -158,7 +162,8 @@ pub(crate) struct Engine {
     // フィールドの宣言順が drop 順になる。Servo の `Drop` はイベントループを回して
     // constellation の終了を待つ間もレンダリングコンテキストを必要とするため、
     // servo を context より先に宣言する。順序を入れ替えないこと。
-    // `UserContentManager` の `Drop` は constellation へ破棄を送るため、servo より先に落とす。
+    // `UserContentManager` は Servo の複製を持ち、最後の複製が落ちた時点で Servo の停止が走る。
+    // context の解放より前に停止させるため、context より前に宣言する。
     user_content: Rc<UserContentManager>,
     servo: Servo,
     context: Rc<SoftwareRenderingContext>,

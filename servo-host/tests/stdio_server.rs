@@ -4,7 +4,7 @@
 //! フレーム（u32 LE 長さ接頭辞 + UTF-8 JSON）を対話的に読み書きし、hello・`load`（ループバック
 //! HTTP サーバー相手。外部ネットワークへ出ない）・`screenshot`（PNG の復号と上下の色。#232）・
 //! 未実装メソッドの `unsupported`・`shutdown`・プロトコル違反時の終了コード・stdout の純粋性・
-//! ログの秘匿・IntersectionObserver の公開とコールバック（#1294・#1297）・ページから始まる遷移の scheme 制限（`RENDER-10`・#1581）を確かめる。このテストバイナリ自体は Servo をリンクしない（`image` は PNG の復号のみ）。
+//! ログの秘匿・IntersectionObserver の公開とコールバック（#1294・#1297）・ページから始まる遷移の scheme 制限（`RENDER-10`・#1581）・`navigator.webdriver` の定義（`SEC-5`・TASK-119）を確かめる。このテストバイナリ自体は Servo をリンクしない（`image` は PNG の復号のみ）。
 
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -2016,9 +2016,9 @@ fn interactive_dom_snapshot_rejects_oversized_html() {
 
 // ---- navigator.webdriver の定義（SEC-5・TASK-119） ----
 
-/// SEC-5: head 内の最初のインラインスクリプトの時点で `navigator.webdriver` が `true` に見え、
-/// 再定義（`TypeError`）・`delete`（`false`）で消えない。定義は `Navigator.prototype` の getter だけで、
-/// 個体には置かない。すべて満たすとき、スクリプトが要素の id を `wd-ok` に書き換える。
+/// SEC-5: head 内の最初のインラインスクリプトの時点の検査結果を、`#wd` の `data-wd` に書く。
+/// 順に: 値が `true`・再定義が `TypeError`・`delete` が `false`・記述子が getter だけ（setter なし・
+/// `configurable: false`・`enumerable: true`）・個体に自前の項目なし・最後にもう一度 `true`。
 const WEBDRIVER_PAGE: &str = concat!(
     "<!doctype html><html><head><script>",
     "var r=[navigator.webdriver===true];",
@@ -2026,15 +2026,18 @@ const WEBDRIVER_PAGE: &str = concat!(
     "catch(e){r.push(e instanceof TypeError)}",
     "r.push(delete Navigator.prototype.webdriver===false);",
     "var d=Object.getOwnPropertyDescriptor(Navigator.prototype,'webdriver');",
-    "r.push(!!d&&typeof d.get==='function'&&d.configurable===false);",
+    "r.push(!!d&&typeof d.get==='function'&&d.set===undefined&&d.configurable===false&&d.enumerable===true);",
     "r.push(!Object.prototype.hasOwnProperty.call(navigator,'webdriver'));",
     "r.push(navigator.webdriver===true);",
     "window.__wd=r.join(',');",
     "</script></head><body>",
     "<div id=wd style=\"width:20px;height:20px;background:#0f0\"></div>",
-    "<script>if(window.__wd==='true,true,true,true,true,true')document.getElementById('wd').id='wd-ok';</script>",
+    "<script>document.getElementById('wd').setAttribute('data-wd',window.__wd);</script>",
     "</body></html>"
 );
+
+/// `WEBDRIVER_PAGE` の検査がすべて成り立つときの `data-wd`。
+const WEBDRIVER_ALL_TRUE: &str = "true,true,true,true,true,true";
 
 /// SEC-5・TASK-119: 撮影（静的モード）と操作モードの両方のホストで、定義が最初のスクリプトから効き、消えない。
 #[test]
@@ -2048,13 +2051,14 @@ fn navigator_webdriver_is_true_from_first_script_in_both_modes() {
     let _stop = serve_routes(l, std::sync::Arc::new(m));
     let url = format!("http://127.0.0.1:{port}/wd");
 
-    // 撮影（静的モード）: 可視性の判定で、書き換えた id の要素が見えることを確かめる。
+    // 撮影（静的モード）: 検査結果を書いた要素が、可視性の判定で見つかる。
     let mut h = spawn(&["--stdio"]);
     let _hello = h.recv();
     let mut id = 1;
     load_page(&mut h, &mut id, &url);
+    id += 1;
     h.send(&format!(
-        r##"{{"v":1,"id":{id},"method":"visibility","params":{{"selector":"#wd-ok"}}}}"##
+        r##"{{"v":1,"id":{id},"method":"visibility","params":{{"selector":"#wd[data-wd='{WEBDRIVER_ALL_TRUE}']"}}}}"##
     ));
     assert_eq!(
         h.recv(),
@@ -2062,7 +2066,7 @@ fn navigator_webdriver_is_true_from_first_script_in_both_modes() {
     );
     finish_host(h, id + 1);
 
-    // 操作モード: DOM の取得に、書き換えた id が出る。
+    // 操作モード: DOM の取得に検査結果が出る。
     let (proxy, _pstop) = serve_forwarding_proxy();
     let (mut h, _hello) = spawn_interactive(proxy);
     h.send(&load_req(1, &url, 20_000));
@@ -2070,6 +2074,9 @@ fn navigator_webdriver_is_true_from_first_script_in_both_modes() {
     assert!(r["result"].is_object(), "{r}");
     let snap = request(&mut h, 2, "dom_snapshot");
     let html = snap["result"]["html"].as_str().unwrap();
-    assert!(html.contains("id=\"wd-ok\""), "{html}");
+    assert!(
+        html.contains(&format!("data-wd=\"{WEBDRIVER_ALL_TRUE}\"")),
+        "{html}"
+    );
     finish_host(h, 3);
 }
