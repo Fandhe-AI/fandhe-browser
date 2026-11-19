@@ -79,7 +79,7 @@ SEC-3 は「本項は実測対象の選定基準であり、ブラウザ本体�
   - iframe（同一オリジンの `src`・`srcdoc`）の子文書には定義が入らない（`undefined`）
   - ページは `navigator` の個体を上書きできる
   - Worker の `navigator.webdriver` は未定義のまま
-- **`head` の無い XML の文書**: Servo 0.7.0 は定義を `head` 要素が文書に入った時点で走らせるため、`head` の無い XML の文書（`application/xhtml+xml` 等）では主フレームでも未定義になる。SEC-5 の既知の制約には足さず、操作モードでは `load` の後と `dom_snapshot` のたびにホストが主フレームの `navigator.webdriver === true` を確かめ、満たさなければ `unsupported` で断る（2026-11-19 のオーナー判断。#1609 の案 2。設計 `servo-host-design.md` §14.3）。撮影では断らず、該当文書は未定義のまま撮る（撮影の既知の制約。SEC-5 に記載）
+- **`head` の無い XML の文書**: Servo 0.7.0 は定義を `head` 要素が文書に入った時点で走らせるため、`head` の無い XML の文書（`application/xhtml+xml` 等）では主フレームでも未定義になる。操作モードでは SEC-5 の既知の制約に足さず、`load` の後と `dom_snapshot` のたびにホストが主フレームの `navigator.webdriver === true` を確かめ、満たさなければ `unsupported` で断る（2026-11-19 のオーナー判断。#1609 の案 2。設計 `servo-host-design.md` §14.3）。撮影では断らず、該当文書は未定義のまま撮る（撮影の既知の制約。SEC-5 に記載）
 - **後付けであることが見える**: getter の `toString()` が `function(){return true}` と見え、後から登録した定義だとページから見分けられる。自動操作であることを隠す方向の性質ではないため受け入れる
 - **画面サイズ**: 実描画に効く幅・高さの指定に限って受け付け（`RENDER-8`）、UA・言語・タイムゾーンの変更は引き続き断る（2026-11-14 の判断。#1041・#249。SEC-2 の追記 (1)。実装は TASK-133）
 
@@ -98,4 +98,4 @@ SEC-3 は「本項は実測対象の選定基準であり、ブラウザ本体�
 | 2026-10-31 | #1357: Runtime.evaluate が `userGesture`（bool のみ）を効果なしで受理（Puppeteer の puppeteerUtil 注入用）。値は保持も評価への受け渡しもせず、メソッドの成功を一律に返すものではない（評価・エラー応答は従来どおり）。非 bool は -32602、他の未知キー（timeout・uniqueContextId・objectGroup 等）も -32602 のまま。UA・ヘッダ・navigator・画面・TLS・locale・ユーザー活性化に触れない。security-auditor の事後レビュー済み（2026-10-31・633e0100。許可キーの追加は `userGesture` のみ、値は評価・状態に渡らず、指摘なし） | 偽装機能なし |
 | 2026-10-31 | #1364: `Network.enable` 済みセッションに、`Page.navigate` が実際に取得した文書の Network.requestWillBeSent・responseReceived・loadingFinished を送出。request.headers は実際に送った User-Agent 定数（`fandhe-browser/<版>`）のみ、response.headers は観測した Content-Type のみ（長さ上限・制御文字検査つき）で、status・URL・本文長は core の取得結果そのもの。about:blank・取得失敗・ブラウザレベル遷移では送らず、リダイレクトは最終 URL と最終ステータスの組だけ。観測していない値（statusText・他ヘッダ・IP・タイミング）は出さない。UA・ヘッダ・navigator・画面・TLS・locale に触れず、fetch の挙動も変えない。security-auditor の事後レビュー済み（2026-10-31・6540f9ce。P0・P1 なし。request.headers は送信ヘッダの全体ではなく UA だけの一部である旨をコメントで明確化） | 偽装機能なし |
 | 2026-11-19 | TASK-118（#1587）: Servo ホストのページの操作（操作モード）と撮影の SEC-2 の判断を記録（上の「Servo ホストのページの操作」節）。入力の `isTrusted = true` と、`navigator.webdriver` の定義が後付けだと見えることを受け入れ、iframe・個体の上書き・Worker の制約は SEC-5 の既知の制約として記録。人の操作に見せる処理は入れない。オーナー判断 | 偽装機能なし |
-| 2026-11-19 | #1609: `head` の無い XML の文書では主フレームの `navigator.webdriver` が未定義になる件。SEC-5 の既知の制約には足さず、操作モードではホストが `load` の後と `dom_snapshot` のたびに `navigator.webdriver === true` を確かめ、満たさなければ `unsupported` で断る（案 2）。SEC-5 は緩めない。オーナー判断 | 偽装機能なし |
+| 2026-11-19 | #1609: `head` の無い XML の文書では主フレームの `navigator.webdriver` が未定義になる件。操作モードでは SEC-5 の既知の制約に足さず、ホストが `load` の後と `dom_snapshot` のたびに `navigator.webdriver === true` を確かめ、満たさなければ `unsupported` で断る（案 2）。撮影では断らず、未定義のまま撮ることを撮影の既知の制約として受け入れる。SEC-5 は緩めない。オーナー判断 | 偽装機能なし |
