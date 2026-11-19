@@ -38,8 +38,8 @@ use fandhe_browser_profile::Profile;
 use crate::interactive::{HostDomSnapshot, InteractiveDocument, InteractiveSync};
 use crate::page_actor::PageScriptHandle;
 use crate::render::{
-    BoundingBox, DisabledRenderer, ElementRef, ElementVisibility, PageRef, RenderError, Renderer,
-    Screenshot, ScreenshotOptions,
+    BoundingBox, DisabledRenderer, ElementRef, ElementVisibility, InteractivePageLoad, PageRef,
+    RenderError, Renderer, Screenshot, ScreenshotOptions,
 };
 use crate::script_context::ScriptContextHandle;
 
@@ -535,7 +535,60 @@ impl RenderGate {
         }
         f(self.renderer.as_ref())
     }
+
+    /// 操作モードでページを読み込み、続けて DOM を取得する（TASK-127・`AISNAP-16`）。
+    ///
+    /// 描画系と同じロックの中で、`generation` が最新かを確かめてから `load_interactive`・`dom_snapshot` を
+    /// 呼ぶ。追い越された navigate がホストのページを差し替えて、勝った世代の確定結果へ別のページが
+    /// 入ることを防ぐ（後から始まった navigate は、このロックを待ってから自分のページを読む）。
+    /// 静的モードの読み込みの記録は捨てる（ホストの静的なページは、この読み込みで無くなるため）。
+    fn load_interactive(
+        &self,
+        nav: &NavigationState,
+        generation: NavigationGeneration,
+        page: &PageRef,
+    ) -> Result<(InteractivePageLoad, HostDomSnapshot), InteractiveLoadError> {
+        let mut loaded = self.loaded.lock().unwrap_or_else(PoisonError::into_inner);
+        *loaded = None;
+        let current = nav.current_generation();
+        if generation != current {
+            return Err(InteractiveLoadError::Superseded);
+        }
+        let load = self
+            .renderer
+            .load_interactive(page)
+            .map_err(InteractiveLoadError::Render)?;
+        let snapshot = self
+            .renderer
+            .dom_snapshot()
+            .map_err(InteractiveLoadError::Render)?;
+        Ok((load, snapshot))
+    }
 }
+
+/// 操作モードの読み込み（[`AppState::load_interactive`]）の失敗（TASK-127・`AISNAP-16`・`AISNAP-21`）。
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum InteractiveLoadError {
+    /// 操作モードが許されていない（設定キーは TASK-131 まで受理しない）。ホストを起動しない。
+    NotAllowed,
+    /// 読み込みの前に、後から新しい navigate が始まった。ホストへ要求を送っていない。
+    Superseded,
+    /// 描画実装の失敗。
+    Render(RenderError),
+}
+
+impl fmt::Display for InteractiveLoadError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotAllowed => f.write_str("interactive mode is not allowed"),
+            Self::Superseded => f.write_str("navigation superseded by a newer navigation"),
+            Self::Render(e) => e.fmt(f),
+        }
+    }
+}
+
+impl std::error::Error for InteractiveLoadError {}
 
 /// CDP ルータと AI API ルータが共有する共通状態（`CDP-1`・`AISNAP-6`）。
 ///
@@ -694,6 +747,29 @@ impl AppState {
     pub fn dom_snapshot(&self) -> Result<HostDomSnapshot, RenderError> {
         self.render
             .with_page(&self.navigation, |r| r.dom_snapshot())
+    }
+
+    /// 操作モードでページを読み込み、DOM を取得する（TASK-127・`AISNAP-16`）。
+    ///
+    /// 呼び出し元は ai の `POST /ai/navigate`。`generation` は呼び出し元が [`NavigationState::begin_navigation`]
+    /// で払い出したもの。結果は保存しない（呼び出し元が [`crate::interactive::build_interactive_document`] で
+    /// 検査して [`Self::commit_interactive`] で保存する）。操作モードが許されていなければホストを起動せずに
+    /// [`InteractiveLoadError::NotAllowed`]。ブロッキングの注意は [`Self::capture_screenshot`] と同じ。
+    pub fn load_interactive(
+        &self,
+        generation: NavigationGeneration,
+        page: &PageRef,
+    ) -> Result<(InteractivePageLoad, HostDomSnapshot), InteractiveLoadError> {
+        if !self.interactive_allowed {
+            return Err(InteractiveLoadError::NotAllowed);
+        }
+        self.render
+            .load_interactive(&self.navigation, generation, page)
+    }
+
+    /// 操作モードが許されているか（設定キーは TASK-131 まで受理しない。今はテストの入口だけが立てる）。
+    pub fn interactive_allowed(&self) -> bool {
+        self.interactive_allowed
     }
 
     /// ナビゲート状態を返す。
@@ -1030,6 +1106,78 @@ mod tests {
             self.renders.fetch_add(1, Ordering::SeqCst);
             Ok(BoundingBox::new(1.0, 2.0, 3.0, 4.0))
         }
+        fn load_interactive(&self, page: &PageRef) -> Result<InteractivePageLoad, RenderError> {
+            self.loads.fetch_add(1, Ordering::SeqCst);
+            self.urls.lock().unwrap().push(page.url().to_string());
+            Ok(InteractivePageLoad::new(
+                crate::render::PageLoad::new(page.url()),
+                crate::interactive::InteractivePageId::new("s", 0).unwrap(),
+            ))
+        }
+        fn dom_snapshot(&self) -> Result<HostDomSnapshot, RenderError> {
+            self.renders.fetch_add(1, Ordering::SeqCst);
+            Ok(HostDomSnapshot::new(
+                crate::interactive::InteractivePageId::new("s", 0).unwrap(),
+                "https://a.example/",
+                r#"<p data-fandhe-n="0">a</p>"#.to_owned(),
+                1,
+                "snap",
+            )
+            .unwrap())
+        }
+    }
+
+    /// TASK-127・`AISNAP-16`: 追い越された世代ではホストへ要求を送らない。読み込んだら静的な読み込みの
+    /// 記録を捨て、次の静的なページの描画で読み直す。
+    #[test]
+    fn aisnap16_gate_load_interactive_checks_generation_and_resets_static_load() {
+        let r = CountingRenderer::new();
+        let gate = RenderGate::new(r.clone());
+        let nav = NavigationState::new();
+        navigate(&nav, "https://a.example/");
+        shot(&gate, &nav).unwrap();
+        assert_eq!(r.loads(), 1);
+
+        let old = nav.begin_navigation().unwrap();
+        let new = nav.begin_navigation().unwrap();
+        let page = PageRef::new("https://b.example/");
+        assert!(matches!(
+            gate.load_interactive(&nav, old, &page),
+            Err(InteractiveLoadError::Superseded)
+        ));
+        assert_eq!((r.loads(), r.renders()), (1, 1));
+
+        let (load, snap) = gate.load_interactive(&nav, new, &page).unwrap();
+        assert_eq!(load.load().final_url(), "https://b.example/");
+        assert!(crate::interactive::build_interactive_document(snap).is_ok());
+        assert_eq!((r.loads(), r.renders()), (2, 2));
+
+        navigate(&nav, "https://a.example/");
+        shot(&gate, &nav).unwrap();
+        assert_eq!(
+            r.loads(),
+            3,
+            "static page is reloaded after an interactive load"
+        );
+    }
+
+    /// TASK-127: 操作モードが許されていなければ、描画実装を呼ばない。
+    #[test]
+    fn aisnap16_app_load_interactive_requires_permission() {
+        let r = CountingRenderer::new();
+        let dir = fandhe_browser_profile::test_base_dir().join(format!(
+            "fandhe-core-load-interactive-{}",
+            std::process::id()
+        ));
+        let profile = Arc::new(Profile::open(&dir).expect("profile"));
+        let app = AppState::new(profile, r.clone());
+        let g = app.navigation().begin_navigation().unwrap();
+        assert!(matches!(
+            app.load_interactive(g, &PageRef::new("https://b.example/")),
+            Err(InteractiveLoadError::NotAllowed)
+        ));
+        assert_eq!(r.loads(), 0);
+        assert!(!app.interactive_allowed());
     }
 
     fn navigate(nav: &NavigationState, url: &str) {
