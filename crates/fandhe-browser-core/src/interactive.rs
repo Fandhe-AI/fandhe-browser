@@ -213,6 +213,9 @@ pub struct InteractiveSync {
     pub(crate) url: String,
     pub(crate) html: String,
     pub(crate) document: InteractiveDocument,
+    /// すべての入力欄の値を消したか（[`build_interactive_document_with`] の `redact_all`、または
+    /// 伏せる対象を判定できなかった場合）。`sensitive` の操作があった世代の差し替えに要る（`AISNAP-17`）。
+    pub(crate) all_redacted: bool,
 }
 
 impl fmt::Debug for InteractiveSync {
@@ -242,6 +245,17 @@ impl InteractiveSync {
 
 /// ホストの取得結果を検査し、番号を外した文書と対応表を作る（§14.3・確定条件 1・4）。
 pub fn build_interactive_document(snapshot: HostDomSnapshot) -> Result<InteractiveSync, SyncError> {
+    build_interactive_document_with(snapshot, false)
+}
+
+/// [`build_interactive_document`] に、すべての入力欄の値を消すかを足したもの（`AISNAP-17`・TASK-128）。
+///
+/// `sensitive` の操作があった世代では `redact_all` を真にする（2026-11-19 のオーナー判断。ホストの番号は
+/// 取得ごとに変わり、次の取得で同じ要素を特定できないため、その世代の間はすべて消す）。呼び出し元は ai の同期。
+pub fn build_interactive_document_with(
+    snapshot: HostDomSnapshot,
+    redact_all: bool,
+) -> Result<InteractiveSync, SyncError> {
     let options = ParseOptions::default().with_scripting_enabled(true);
     let mut document = parse_document(&snapshot.html, &options)
         .map_err(|_| SyncError::Malformed)?
@@ -288,7 +302,8 @@ pub fn build_interactive_document(snapshot: HostDomSnapshot) -> Result<Interacti
             .remove_attribute(id, NUMBER_ATTR)
             .map_err(|_| SyncError::Malformed)?;
     }
-    redact_values(&mut document, &elements).map_err(|_| SyncError::Malformed)?;
+    let all_redacted =
+        redact_values(&mut document, &elements, redact_all).map_err(|_| SyncError::Malformed)?;
     let html = document
         .serialize_html()
         .map_err(|_| SyncError::Malformed)?
@@ -303,7 +318,22 @@ pub fn build_interactive_document(snapshot: HostDomSnapshot) -> Result<Interacti
             document,
             numbers,
         },
+        all_redacted,
     })
+}
+
+/// 写しの要素が、伏せる値の第 2 層の対象か（`input`・`textarea`・`select` で、`type=password`・`autocomplete` の
+/// 該当値、または判定できない長さ）。`/ai/act` が、解決した時点で伏せる対象だった要素を操作したかを判定する
+/// （`AISNAP-17`・TASK-128）。
+pub fn is_redaction_target(doc: &InteractiveDocument, node: NodeId) -> bool {
+    let document = doc.document();
+    let name = match document.local_name(node) {
+        Some("input") => "input",
+        Some("textarea") => "textarea",
+        Some("select") => "select",
+        _ => return false,
+    };
+    sensitivity(document, node, name) != Sensitivity::Plain
 }
 
 /// 入力欄の伏せる区分。
@@ -351,7 +381,13 @@ fn sensitivity(document: &Document, id: NodeId, name: &str) -> Sensitivity {
 /// 伏せる値の第 2 層（モジュールの doc）。`input` は `value`・`checked`、`textarea` は中身、`select` は配下の
 /// `option` の `selected` を消す。名前空間は問わない（ホストより広く消す側に倒す）。SVG・MathML の中の
 /// `textarea` は子要素ごと外れるが、外れた要素は木から辿れないため対応表に残っても使われない。
-fn redact_values(document: &mut Document, elements: &[NodeId]) -> crate::error::Result<()> {
+///
+/// `force_all` が真ならすべて消す。すべて消したかを返す。
+fn redact_values(
+    document: &mut Document,
+    elements: &[NodeId],
+    force_all: bool,
+) -> crate::error::Result<bool> {
     let fields: Vec<(NodeId, &'static str)> = elements
         .iter()
         .filter_map(|&id| {
@@ -368,7 +404,7 @@ fn redact_values(document: &mut Document, elements: &[NodeId]) -> crate::error::
         .iter()
         .map(|&(id, name)| sensitivity(document, id, name))
         .collect();
-    let all = kinds.contains(&Sensitivity::Unknown);
+    let all = force_all || kinds.contains(&Sensitivity::Unknown);
     for (&(id, name), kind) in fields.iter().zip(kinds) {
         if !all && kind == Sensitivity::Plain {
             continue;
@@ -392,7 +428,7 @@ fn redact_values(document: &mut Document, elements: &[NodeId]) -> crate::error::
             }
         }
     }
-    Ok(())
+    Ok(all)
 }
 
 /// 先頭 0 なしの十進（`"0"` は可）で、`element_count` 未満の番号。
@@ -538,6 +574,36 @@ mod tests {
         assert!(build_interactive_document(snap(&ok, 0)).is_ok());
         let s = build_interactive_document(snap("<p>secret-text</p>", 0)).unwrap();
         assert!(!format!("{s:?}").contains("secret-text"));
+    }
+
+    /// AISNAP-17・TASK-128: `sensitive` の操作があった世代では、すべての入力欄の値を消す（2026-11-19 の判断）。
+    /// 伏せる対象かの判定は第 2 層と同じ条件。
+    #[test]
+    fn aisnap17_redact_all_clears_every_field_and_reports_it() {
+        let html = concat!(
+            "<input id=q value=plain-value>",
+            "<input id=pw type=password value=x>",
+            "<textarea id=tb>plain-text</textarea>",
+            "<select id=ln><option value=x selected>Ja</option></select>",
+        );
+        let plain = build_interactive_document(snap(html, 0)).unwrap();
+        assert!(!plain.all_redacted);
+        assert!(plain.html.contains("plain-value"));
+        let all = build_interactive_document_with(snap(html, 0), true).unwrap();
+        assert!(all.all_redacted);
+        for v in ["plain-value", "plain-text", "selected"] {
+            assert!(!all.html.contains(v), "{v}: {}", all.html);
+        }
+        let d = all.document();
+        let by_id = |id: &str| {
+            d.document()
+                .descendants(d.document().root())
+                .find(|&n| d.document().attribute(n, "id") == Some(id))
+                .unwrap()
+        };
+        assert!(is_redaction_target(d, by_id("pw")));
+        assert!(!is_redaction_target(d, by_id("q")));
+        assert!(!is_redaction_target(d, by_id("tb")));
     }
 
     /// AISNAP-20・TASK-125: ホストが伏せずに返した値を、保存する文書と HTML の両方から消す（第 2 層）。
