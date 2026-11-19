@@ -79,7 +79,7 @@ SEC-3 は「本項は実測対象の選定基準であり、ブラウザ本体�
   - iframe（同一オリジンの `src`・`srcdoc`）の子文書には定義が入らない（`undefined`）
   - ページは `navigator` の個体を上書きできる
   - Worker の `navigator.webdriver` は未定義のまま
-- **`head` の無い XML の文書**: Servo 0.7.0 は定義を `head` 要素が文書に入った時点で走らせるため、`head` の無い XML の文書（`application/xhtml+xml` 等）では主フレームでも未定義になる。SEC-5 の既知の制約には足さず、操作モードでは `load` の後と `dom_snapshot` のたびにホストが主フレームの `navigator.webdriver === true` を確かめ、満たさなければ `unsupported` で断る（2026-11-19 のオーナー判断。#1609 の案 2。設計 `servo-host-design.md` §14.3）。撮影では登録を続ける
+- **`head` の無い XML の文書**: Servo 0.7.0 は定義を `head` 要素が文書に入った時点で走らせるため、`head` の無い XML の文書（`application/xhtml+xml` 等）では主フレームでも未定義になる。SEC-5 の既知の制約には足さず、操作モードでは `load` の後と `dom_snapshot` のたびにホストが主フレームの `navigator.webdriver === true` を確かめ、満たさなければ `unsupported` で断る（2026-11-19 のオーナー判断。#1609 の案 2。設計 `servo-host-design.md` §14.3）。撮影では断らず、該当文書は未定義のまま撮る（撮影の既知の制約。SEC-5 に記載）
 - **後付けであることが見える**: getter の `toString()` が `function(){return true}` と見え、後から登録した定義だとページから見分けられる。自動操作であることを隠す方向の性質ではないため受け入れる
 - **画面サイズ**: 実描画に効く幅・高さの指定に限って受け付け（`RENDER-8`）、UA・言語・タイムゾーンの変更は引き続き断る（2026-11-14 の判断。#1041・#249。SEC-2 の追記 (1)。実装は TASK-133）
 
