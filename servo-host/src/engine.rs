@@ -156,7 +156,7 @@ fn fixed_preferences(proxy: Option<LoopbackProxy>) -> Preferences {
 /// （`application/xhtml+xml` 等。HTML と違いパーサーが `head` を補わない）では主フレームでも未定義になる
 /// （2026-11-19 に実ホストで確認。`head` があれば最初のスクリプトから `true`）。操作モードでは、`load` の後と
 /// `dom_snapshot` のたびに主フレームで `true` かを確かめ、満たさなければ `unsupported` で断る（SEC-5。
-/// 2026-11-19 の判断。#1609。`page::CurrentPage::check_webdriver`）。撮影では登録を続ける。
+/// 2026-11-19 の判断。#1609。`page::CurrentPage::check_webdriver`）。撮影では断らず、未定義のまま撮る。
 pub(crate) const NAVIGATOR_WEBDRIVER_SCRIPT: &str = "Object.defineProperty(Navigator.prototype,\"webdriver\",{get:function(){return true},configurable:false,enumerable:true});";
 
 /// Servo とソフトウェア描画コンテキストの組。`Drop` で Servo を停止してから解放する。

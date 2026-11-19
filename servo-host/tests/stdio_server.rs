@@ -2117,6 +2117,10 @@ fn interactive_mode_rejects_documents_without_navigator_webdriver() {
         (XHTML, b"<html xmlns=\"http://www.w3.org/1999/xhtml\"><head><title>h</title></head><body><p>x</p></body></html>".to_vec()),
     );
     m.insert(
+        "/override".to_owned(),
+        ("text/html", b"<!doctype html><head><script>Object.defineProperty(navigator,'webdriver',{value:false})</script></head><p>x</p>".to_vec()),
+    );
+    m.insert(
         "/from".to_owned(),
         ("text/html", b"<!doctype html><a id=go href=\"/nohead\" style=\"display:block;width:200px;height:30px\">go</a>".to_vec()),
     );
@@ -2165,11 +2169,27 @@ fn interactive_mode_rejects_documents_without_navigator_webdriver() {
     ));
     let w: serde_json::Value = serde_json::from_str(&h.recv()).unwrap();
     assert!(w["result"].is_object(), "{w}");
-    let r = request(&mut h, 9, "dom_snapshot");
-    assert_eq!(r["error"]["kind"], "unsupported", "{r}");
+    // 遷移の前の取得の要素へは、新しい page と組んでも操作を届けない（確かめていない文書）。
+    let mut old = snap.clone();
+    old["page"] = r["result"]["page"].clone();
+    let a = act_req(
+        &mut h,
+        9,
+        &old,
+        node_of(&html, "go"),
+        r#"{"tag":"a","id":"go"}"#,
+        r#"{"kind":"click"}"#,
+    );
+    assert_eq!(a["error"]["kind"], "stale", "{a}");
     let r = request(&mut h, 10, "dom_snapshot");
+    assert_eq!(r["error"]["kind"], "unsupported", "{r}");
+    let r = request(&mut h, 11, "dom_snapshot");
     assert_eq!(r["error"]["kind"], "not_loaded", "{r}");
-    finish_host(h, 11);
+    // ページが navigator の個体を上書きして true でなくした文書も断る。
+    h.send(&load_req(12, &url("/override"), 20_000));
+    let r: serde_json::Value = serde_json::from_str(&h.recv()).unwrap();
+    assert_eq!(r["error"]["kind"], "unsupported", "{r}");
+    finish_host(h, 13);
 }
 
 // ---- 操作モードの操作（act）と待機（wait）（RENDER-10・AISNAP-18・TASK-126） ----

@@ -382,6 +382,9 @@ pub(crate) struct ServoHandler {
 struct Snapshot {
     /// `act` の `snapshot` と照合する識別子。
     id: String,
+    /// 取得した文書の番号。`act` は現在の番号と違えば `stale`（取得の後に遷移・URL の変更があった。
+    /// 確かめていない文書へ操作を届けない。SEC-5・#1609）。
+    doc_seq: u64,
     /// 番号の順の要素 ID（`JSValue::Element`）。`act` が照合と WebDriver の命令に使う。
     element_ids: Vec<String>,
 }
@@ -526,7 +529,8 @@ impl Handler for ServoHandler {
         let (s, url, doc_seq) = loop {
             let before = self.doc_seq.get();
             current_url().ok_or(HandlerError(ErrorKind::InvalidState))?;
-            // 遷移した先の文書も操作の対象になる前に確かめる（`act` は最新の取得を経由する）。
+            // 遷移した先の文書も操作の対象になる前に確かめる（`act` は、取得した文書の番号が現在と同じ
+            // 最新の取得の要素だけを操作する。`Snapshot::doc_seq`）。
             let value = match page
                 .check_webdriver(engine, deadline)
                 .and_then(|()| page.evaluate(engine, dom::serialize_script(), deadline))
@@ -559,6 +563,7 @@ impl Handler for ServoHandler {
         let element_count = s.element_ids.len() as u64;
         self.snapshot = Some(Snapshot {
             id: id.clone(),
+            doc_seq,
             element_ids: s.element_ids,
         });
         Ok(DomSnapshotResult {
@@ -606,7 +611,7 @@ impl Handler for ServoHandler {
         let element = self
             .snapshot
             .as_ref()
-            .filter(|s| s.id == p.snapshot)
+            .filter(|s| s.id == p.snapshot && s.doc_seq == start)
             .and_then(|s| s.element_ids.get(p.node))
             .ok_or(HandlerError(ErrorKind::Stale))?
             .clone();
@@ -1053,6 +1058,7 @@ mod tests {
         assert_eq!(PageError::Capture.kind(), ErrorKind::Internal);
         assert_eq!(PageError::Script.kind(), ErrorKind::Internal);
         assert_eq!(PageError::DocumentGone.kind(), ErrorKind::NotLoaded);
+        assert_eq!(PageError::WebdriverUnset.kind(), ErrorKind::Unsupported);
     }
 
     /// RENDER-4: 来ないフレーム・コールバックを待ち続けず、期限で Timeout を返す。
