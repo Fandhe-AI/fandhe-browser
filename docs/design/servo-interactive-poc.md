@@ -42,7 +42,7 @@
 
 - `getBoundingClientRect()` の中心（360, 270）へ `MouseMove` → `MouseButton` の Down / Up を送ると、`mousedown`・`click` のリスナーが走る
 - 出力: `log=["mousedown trusted=true","click trusted=true"]`。完了通知 `notify_input_event_handled` も 3 件（Move・Down・Up）届く
-- `isTrusted` が `true` になる点は SEC-2 の判断対象（TASK-118）
+- `isTrusted` が `true` になる点は SEC-2 の判断対象（TASK-118）。2026-11-19 に受け入れると判断した（[anti-bot-review.md](./anti-bot-review.md)）
 
 ### 文字入力
 
@@ -232,7 +232,7 @@ release（macOS arm64）で 1 回測った。同じエンジンで 1 MiB を先�
 
 残っていること:
 
-- ★1 の制約（iframe には注入されない・インスタンス側の上書きは止められない）を既知の制約として TASK-118 の判断記録に載せるか
+- ★1 の制約（iframe には注入されない・インスタンス側の上書きは止められない）は、既知の制約として TASK-118 の判断記録に載せた（2026-11-19。[anti-bot-review.md](./anti-bot-review.md)「Servo ホストのページの操作」節）
 
 ## 再現方法
 
