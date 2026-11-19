@@ -1230,6 +1230,18 @@ fn t_renderer_interactive_requires_isolation() {
         r.load_interactive(&PageRef::new("https://example.com/a")),
         Err(RenderError::InteractiveUnavailable)
     ));
+    // `required` で隔離が成立しない場合も `InteractiveUnavailable`（`HostUnavailable` にしない）。
+    let r = HostRenderer::new(HostRendererConfig::new(
+        root.config(base_timeouts())
+            .with_egress_isolation(EgressIsolationMode::Required)
+            .with_isolation_probe(IsolationProbe::Unavailable(
+                EgressIsolationUnavailable::SandboxToolNotFound,
+            )),
+    ));
+    assert!(matches!(
+        r.load_interactive(&PageRef::new("https://example.com/a")),
+        Err(RenderError::InteractiveUnavailable)
+    ));
     assert_eq!(count(&root.0, "spawns"), 0, "must not spawn");
 }
 

@@ -354,7 +354,14 @@ impl Renderer for HostRenderer {
         let result = inner
             .interactive
             .load(&params, generation)
-            .map_err(map_host_error)?;
+            .map_err(|e| match e {
+                // `required` で隔離が成立しない場合も、操作モードを始められない（`AISNAP-21` の
+                // `interactive_unavailable`。静的モードの `HostUnavailable` にしない）。
+                HostProcessError::EgressIsolationUnavailable(_) => {
+                    RenderError::InteractiveUnavailable
+                }
+                e => map_host_error(e),
+            })?;
         let final_url = validate_final_url(result.final_url(), self.allow_private_network_access)
             .map_err(|_| internal("final url rejected"))?;
         let info = result.page().ok_or(RenderError::ProtocolMismatch)?;
