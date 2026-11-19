@@ -2013,3 +2013,63 @@ fn interactive_dom_snapshot_rejects_oversized_html() {
     assert_eq!(code, Some(0));
     assert_eq!(rest, 0);
 }
+
+// ---- navigator.webdriver の定義（SEC-5・TASK-119） ----
+
+/// SEC-5: head 内の最初のインラインスクリプトの時点で `navigator.webdriver` が `true` に見え、
+/// 再定義（`TypeError`）・`delete`（`false`）で消えない。定義は `Navigator.prototype` の getter だけで、
+/// 個体には置かない。すべて満たすとき、スクリプトが要素の id を `wd-ok` に書き換える。
+const WEBDRIVER_PAGE: &str = concat!(
+    "<!doctype html><html><head><script>",
+    "var r=[navigator.webdriver===true];",
+    "try{Object.defineProperty(Navigator.prototype,'webdriver',{get:function(){return false}});r.push(false)}",
+    "catch(e){r.push(e instanceof TypeError)}",
+    "r.push(delete Navigator.prototype.webdriver===false);",
+    "var d=Object.getOwnPropertyDescriptor(Navigator.prototype,'webdriver');",
+    "r.push(!!d&&typeof d.get==='function'&&d.configurable===false);",
+    "r.push(!Object.prototype.hasOwnProperty.call(navigator,'webdriver'));",
+    "r.push(navigator.webdriver===true);",
+    "window.__wd=r.join(',');",
+    "</script></head><body>",
+    "<div id=wd style=\"width:20px;height:20px;background:#0f0\"></div>",
+    "<script>if(window.__wd==='true,true,true,true,true,true')document.getElementById('wd').id='wd-ok';</script>",
+    "</body></html>"
+);
+
+/// SEC-5・TASK-119: 撮影（静的モード）と操作モードの両方のホストで、定義が最初のスクリプトから効き、消えない。
+#[test]
+fn navigator_webdriver_is_true_from_first_script_in_both_modes() {
+    let (l, port) = bind_loopback();
+    let mut m = std::collections::HashMap::new();
+    m.insert(
+        "/wd".to_owned(),
+        ("text/html", WEBDRIVER_PAGE.as_bytes().to_vec()),
+    );
+    let _stop = serve_routes(l, std::sync::Arc::new(m));
+    let url = format!("http://127.0.0.1:{port}/wd");
+
+    // 撮影（静的モード）: 可視性の判定で、書き換えた id の要素が見えることを確かめる。
+    let mut h = spawn(&["--stdio"]);
+    let _hello = h.recv();
+    let mut id = 1;
+    load_page(&mut h, &mut id, &url);
+    h.send(&format!(
+        r##"{{"v":1,"id":{id},"method":"visibility","params":{{"selector":"#wd-ok"}}}}"##
+    ));
+    assert_eq!(
+        h.recv(),
+        format!(r#"{{"v":1,"id":{id},"result":{{"visible":true}}}}"#)
+    );
+    finish_host(h, id + 1);
+
+    // 操作モード: DOM の取得に、書き換えた id が出る。
+    let (proxy, _pstop) = serve_forwarding_proxy();
+    let (mut h, _hello) = spawn_interactive(proxy);
+    h.send(&load_req(1, &url, 20_000));
+    let r: serde_json::Value = serde_json::from_str(&h.recv()).unwrap();
+    assert!(r["result"].is_object(), "{r}");
+    let snap = request(&mut h, 2, "dom_snapshot");
+    let html = snap["result"]["html"].as_str().unwrap();
+    assert!(html.contains("id=\"wd-ok\""), "{html}");
+    finish_host(h, 3);
+}
