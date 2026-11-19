@@ -2097,6 +2097,81 @@ fn navigator_webdriver_is_true_from_first_script_in_both_modes() {
     finish_host(h, 3);
 }
 
+/// SEC-5・#1609（2026-11-19 の判断。案 2）: 操作モードでは、主フレームで `navigator.webdriver` が `true` でない
+/// 文書（`head` の無い XHTML）を `load`・`dom_snapshot` で `unsupported` として断り、ページを捨てる。遷移した
+/// 先の文書も `dom_snapshot` で断る。撮影（静的モード）では読み込める。
+#[test]
+fn interactive_mode_rejects_documents_without_navigator_webdriver() {
+    const XHTML: &str = "application/xhtml+xml";
+    let (l, port) = bind_loopback();
+    let mut m = std::collections::HashMap::new();
+    m.insert(
+        "/nohead".to_owned(),
+        (
+            XHTML,
+            b"<html xmlns=\"http://www.w3.org/1999/xhtml\"><body><p>x</p></body></html>".to_vec(),
+        ),
+    );
+    m.insert(
+        "/head".to_owned(),
+        (XHTML, b"<html xmlns=\"http://www.w3.org/1999/xhtml\"><head><title>h</title></head><body><p>x</p></body></html>".to_vec()),
+    );
+    m.insert(
+        "/from".to_owned(),
+        ("text/html", b"<!doctype html><a id=go href=\"/nohead\" style=\"display:block;width:200px;height:30px\">go</a>".to_vec()),
+    );
+    let _stop = serve_routes(l, std::sync::Arc::new(m));
+    let url = |path: &str| format!("http://127.0.0.1:{port}{path}");
+
+    // 撮影（静的モード）: 断らない。
+    let mut h = spawn(&["--stdio"]);
+    let _hello = h.recv();
+    let mut id = 0;
+    load_page(&mut h, &mut id, &url("/nohead"));
+    finish_host(h, id + 1);
+
+    let (proxy, _pstop) = serve_forwarding_proxy();
+    let (mut h, _hello) = spawn_interactive(proxy);
+    // head の無い XHTML は load で断り、ページを捨てる。
+    h.send(&load_req(1, &url("/nohead"), 20_000));
+    let r: serde_json::Value = serde_json::from_str(&h.recv()).unwrap();
+    assert_eq!(r["error"]["kind"], "unsupported", "{r}");
+    let r = request(&mut h, 2, "dom_snapshot");
+    assert_eq!(r["error"]["kind"], "not_loaded", "{r}");
+    // head のある XHTML は使える。
+    h.send(&load_req(3, &url("/head"), 20_000));
+    let r: serde_json::Value = serde_json::from_str(&h.recv()).unwrap();
+    assert!(r["result"].is_object(), "{r}");
+    let r = request(&mut h, 4, "dom_snapshot");
+    assert!(r["result"].is_object(), "{r}");
+    // 遷移した先が head の無い XHTML なら、dom_snapshot で断ってページを捨てる。
+    h.send(&load_req(5, &url("/from"), 20_000));
+    let r: serde_json::Value = serde_json::from_str(&h.recv()).unwrap();
+    assert!(r["result"].is_object(), "{r}");
+    let snap = request(&mut h, 6, "dom_snapshot")["result"].clone();
+    let html = snap["html"].as_str().unwrap().to_owned();
+    let r = act_req(
+        &mut h,
+        7,
+        &snap,
+        node_of(&html, "go"),
+        r#"{"tag":"a","id":"go"}"#,
+        r#"{"kind":"click"}"#,
+    );
+    assert_eq!(r["result"]["navigated"], true, "{r}");
+    let new_page = r["result"]["page"].to_string();
+    h.send(&format!(
+        r#"{{"v":1,"id":8,"method":"wait","params":{{"page":{new_page},"condition":{{"kind":"load_complete"}},"timeout_ms":5000}}}}"#
+    ));
+    let w: serde_json::Value = serde_json::from_str(&h.recv()).unwrap();
+    assert!(w["result"].is_object(), "{w}");
+    let r = request(&mut h, 9, "dom_snapshot");
+    assert_eq!(r["error"]["kind"], "unsupported", "{r}");
+    let r = request(&mut h, 10, "dom_snapshot");
+    assert_eq!(r["error"]["kind"], "not_loaded", "{r}");
+    finish_host(h, 11);
+}
+
 // ---- 操作モードの操作（act）と待機（wait）（RENDER-10・AISNAP-18・TASK-126） ----
 
 /// 操作の試験ページ。結果は `#out` の文字列に書く（`dom_snapshot` で読む）。

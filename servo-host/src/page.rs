@@ -80,6 +80,8 @@ pub(crate) enum PageError {
     Script,
     /// 評価対象の文書が既に無い（ページを破棄する）。
     DocumentGone,
+    /// 操作モードで、主フレームの `navigator.webdriver` が `true` でない（SEC-5。ページを破棄する。#1609）。
+    WebdriverUnset,
 }
 
 impl PageError {
@@ -90,6 +92,7 @@ impl PageError {
             Self::LoadFailed | Self::Crashed => ErrorKind::LoadFailed,
             Self::Engine | Self::Capture | Self::Script => ErrorKind::Internal,
             Self::DocumentGone => ErrorKind::NotLoaded,
+            Self::WebdriverUnset => ErrorKind::Unsupported,
         }
     }
 }
@@ -241,6 +244,19 @@ impl CurrentPage {
             ScreenshotCaptureError::WebViewDoesNotExist => PageError::Crashed,
             _ => PageError::Capture,
         })
+    }
+
+    /// 操作モードの条件の確認（SEC-5・TASK-127・#1609 の案 2。2026-11-19 の判断）: 主フレームで
+    /// `navigator.webdriver === true` でなければ [`PageError::WebdriverUnset`]。
+    ///
+    /// 文書の最初に走らせる定義（`engine::NAVIGATOR_WEBDRIVER_SCRIPT`）は、Servo では `head` 要素が文書に
+    /// 入った時点で走るため、`head` の無い XML の文書には入らない。そうした文書では操作モードを使わせない。
+    /// ページが `navigator` の個体を上書きした場合も同じく断る（偽る方向には働かない）。
+    fn check_webdriver(&self, engine: &Engine, deadline: Instant) -> Result<(), PageError> {
+        match self.evaluate(engine, "navigator.webdriver===true".to_owned(), deadline)? {
+            JSValue::Boolean(true) => Ok(()),
+            _ => Err(PageError::WebdriverUnset),
+        }
     }
 
     /// 読み取り専用スクリプトを `deadline` まで待って評価する（`evaluate_javascript`。TASK-38.4）。
@@ -447,6 +463,9 @@ impl ServoHandler {
         if !is_valid_url(&final_url) {
             return Err(PageError::LoadFailed);
         }
+        if self.interactive {
+            page.check_webdriver(engine, deadline)?;
+        }
         self.page = Some(page);
         Ok(PageLoad {
             final_url,
@@ -507,10 +526,17 @@ impl Handler for ServoHandler {
         let (s, url, doc_seq) = loop {
             let before = self.doc_seq.get();
             current_url().ok_or(HandlerError(ErrorKind::InvalidState))?;
-            let value = match page.evaluate(engine, dom::serialize_script(), deadline) {
+            // 遷移した先の文書も操作の対象になる前に確かめる（`act` は最新の取得を経由する）。
+            let value = match page
+                .check_webdriver(engine, deadline)
+                .and_then(|()| page.evaluate(engine, dom::serialize_script(), deadline))
+            {
                 Ok(v) => v,
                 Err(e) => {
-                    if matches!(e, PageError::Crashed | PageError::DocumentGone) {
+                    if matches!(
+                        e,
+                        PageError::Crashed | PageError::DocumentGone | PageError::WebdriverUnset
+                    ) {
                         self.page = None;
                     }
                     return Err(HandlerError(e.kind()));
