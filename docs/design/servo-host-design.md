@@ -499,8 +499,10 @@ AGENTS.md の変更はレビュー基準の変更として AI レビューで P0
 - セレクタはホストへ渡さない。本体が同期済みの写しの上で解決し、番号で送る（確定条件 8・spec の判断 3）
 - 検査の順: 現在の URL（http / https でなければ `invalid_state`）→ `page`（`stale`）→ `snapshot`（`stale`）→ 番号から要素を引き直す（消えていれば `stale`）→ 照合値（`stale`）→ 操作できるか（`not_actionable`）→ 操作 → `fill` は入力の前後でフォーカスが対象にあるか（外れていたら `not_actionable`）
 - `not_actionable`: 不可視・`disabled`・他の要素に隠れている・クリック点が iframe 等の上・スクロールしても画面に入らない（スクロールのやり直しは 3 回まで）
-- 自己申告の扱い（確定条件 2）: JS から取る矩形・可視判定・クリック点の要素は、ページが prototype を書き換えて偽れる。ホストはこれらを操作してよいかの判定にだけ使い、偽られた場合に起きるのは「別の座標をクリックする」ことに限る（入力値は入力イベントで渡すため、偽装で値が別の経路へ漏れない）。試作 (4) で、`Servo::execute_webdriver_command` の WebDriver の命令を使えば、ページが書き換えられない矩形とヒットテスト（隠れていれば `ElementClickIntercepted`）を Rust 側で取れると分かった。使うには `servo-base =0.7.0` の直接依存が要るため、採るかどうかは TASK-126 の着手時に承認を求める。プロトコルはどちらでも変わらない
-- `unsupported`: 新しいウィンドウ（`request_create_new`）・ファイル選択（`FilePicker`）・ダウンロード。delegate の要求は応答せずに捨てても操作は止まらない（試作 (8)）。ダイアログの扱いは TASK-126 で決める（§14.9）
+- 自己申告の扱い（確定条件 2）: JS から取る矩形・可視判定・クリック点の要素は、ページが prototype を書き換えて偽れる。ホストはこれらを操作してよいかの判定にだけ使い、偽られた場合に起きるのは「別の座標をクリックする」ことに限る（入力値は入力イベントで渡すため、偽装で値が別の経路へ漏れない）。試作 (4) で、`Servo::execute_webdriver_command` の WebDriver の命令を使えば、ページが書き換えられない矩形とヒットテスト（隠れていれば `ElementClickIntercepted`）を Rust 側で取れると分かった。2026-11-19 のオーナー判断で `servo-base =0.7.0` の直接依存を承認し、TASK-126 で採った
+- クリック（TASK-126）: WebDriver の `ElementClick` で、要素を画面に入れ、他の要素（iframe を含む）に隠れていないことを確かめる（隠れていれば `ElementClickIntercepted` で `not_actionable`）。続けて `ScrollAndGetBoundingClientRect` の矩形の中心へ、マウスの入力イベント（移動・押す・離す）を送る。中心が画面の外なら `not_actionable`。判定と入力の送信は別の手順のため、その間にページが要素を動かすと別の座標を押しうる（試作 (4) の限界）。`fill` は WebDriver の `ElementClear` で値を消してからクリックでフォーカスを移し、1 文字ずつキーの入力イベントで渡す。`press` はフォーカスが無ければクリックしてから送る。照合値と `disabled` は `window.webdriverElement(id)` で引き直した要素で調べる（自己申告）
+- `select`（TASK-126）: Servo 0.7.0 の `ElementClick` は、単一選択の `select` の `option` を押しても選択を変えない（`servo-script` の `handle_element_click` の Step 8.6.3 は `multiple` のときだけ切り替える）。そこで選択肢はスクリプトで設定し、`input`・`change` を出す。このイベントは `isTrusted` が `false` になる（既知の制約）。複数選択は `values` の選択肢だけを選んだ状態にし、単一選択に 2 つ以上を渡すと `not_actionable`
+- `unsupported`: 新しいウィンドウ（`request_create_new`）・ファイル選択（`FilePicker`）・ダウンロード。delegate の要求は応答せずに捨てても操作は止まらない（試作 (8)）。ダイアログは Servo の既定のまま（`alert` は捨てる・`confirm` は `false`・`prompt` は `null`。操作は止まらない。2026-11-19 の判断。#1592）。`alert()` の文字列が stdout に書かれる件は #1597 で直した（§2.1）
 - 入力文字は入力イベント（`notify_input_event`）で渡し、評価する JS へ連結しない。`text` と `press` の値、遷移先の URL のクエリを、ログ・エラー・応答に出さない（応答は `page` と `navigated` だけ）
 - 人の操作に見せるための遅延・軌跡・乱数は入れない（`SEC-2`）
 
@@ -525,7 +527,7 @@ AGENTS.md の変更はレビュー基準の変更として AI レビューで P0
 | `wait` の条件の文字列 | 1024 バイト | spec `AISNAP-18` |
 | 読み取り契機の同期の最小間隔 | 1 秒 | 直前の同期から 1 秒未満で、その間に `act`・`wait` が無ければ取り直さない（TASK-125） |
 
-- 時間切れでの破棄（確定条件 6・`AISNAP-17`）: `dom_snapshot` と `act` は、本体が上の時間に 5 秒の余裕を足した期限で待ち、過ぎたらホストを破棄して `session_lost` を返す。ホストは `act` に `timeout` を返さない。`dom_snapshot` はホスト側の 30 秒の期限でも `timeout` を返し、本体は同じく破棄する（TASK-122）。破棄の後は自動で読み直さない（§14.2）
+- 時間切れでの破棄（確定条件 6・`AISNAP-17`）: `dom_snapshot` と `act` は、本体が上の時間に 5 秒の余裕を足した期限で待ち、過ぎたらホストを破棄して `session_lost` を返す。ホストは `act` の時間（10 秒）を過ぎたら `timeout` を返し、本体は `act` の `timeout` もホストの破棄と `session_lost` にする（TASK-123・TASK-126）。`dom_snapshot` はホスト側の 30 秒の期限でも `timeout` を返し、本体は同じく破棄する（TASK-122）。破棄の後は自動で読み直さない（§14.2）
 - メモリの見積もり（多重のコピー込み。8 MiB・ASCII の最悪の場合）: ホストは、番号の対応（要素の ID。20 万件で約 6.4 MB と `Vec` の分）に加えて、ページの DOM が試作 (10) で約 1.2 GB（8 MiB のページで読み込み前から +1.18 GB）、直列化の間にさらに約 130 MB（JS の文字列〔UTF-16 で 16 MiB〕・Rust の `String` 8 MiB・符号化したフレーム 12 MiB とその途中の確保）。§2.7 の RSS 上限の既定（2 GiB）の内側だが余裕は小さく、上限を超えたらホストは破棄される。本体は、受信フレーム 12 MiB・JSON から取り出した `String` 8 MiB・番号を外した保存用の HTML 8 MiB・core の DOM（倍率は未測定）を同時に持ちうる。core の DOM の倍率と Linux での時間は TASK-138 で測り直す
 
 ### 14.7 エラー kind
@@ -537,7 +539,7 @@ AGENTS.md の変更はレビュー基準の変更として AI レビューで P0
 | `not_actionable` | ホスト | §14.4 |
 | `too_large` | ホスト | §14.3 の上限超過（切り詰めない） |
 | `unsupported` | ホスト | 未対応のメソッド、新しいウィンドウ・ファイル選択・ダウンロード |
-| `timeout` | ホスト | `wait`、`dom_snapshot` の時間切れ（`dom_snapshot` では本体がホストを破棄して `session_lost` にする） |
+| `timeout` | ホスト | `wait`、`dom_snapshot`・`act` の時間切れ（`dom_snapshot`・`act` では本体がホストを破棄して `session_lost` にする） |
 | `session_lost`・`busy` | 本体（render） | ホストの破棄・再起動の後、同時実行の超過 |
 | `not_interactive`・`rendering_disabled`・`interactive_unavailable` | 本体（ai） | `AISNAP-21` |
 
@@ -547,13 +549,13 @@ AGENTS.md の変更はレビュー基準の変更として AI レビューで P0
 ### 14.8 契約 fixture
 
 - 操作モードの fixture は `crates/fandhe-browser-render/tests/fixtures/protocol/interactive/` に置く（32 件。各メソッドの正常・不正な要求、結果、`--interactive` の `hello`、ホストが返す新しい kind）。`tests/protocol_fixtures.rs` がスキーマとの整合と網羅を検証する
-- ホスト側（`servo-host/src/server/tests.rs`）とクライアント側（`tests/client_contract.rs`）の契約テストは直下の fixture だけを読む。`interactive/` は別のテストに配線した: ホスト側は TASK-122 で `dom_snapshot` の要求（`interactive_dom_snapshot_fixtures_match_host_behavior`）、クライアント側は TASK-123 で正常な要求の JSON・応答・hello・新しい kind（`render10_interactive_requests_match_fixtures`・`render11_interactive_responses_match_fixtures`）。直下へ移すのは、ホストが `act`・`wait` を実装する TASK-126 のとき（両側の既存の契約テストが全件を読むため）。`expected_response` は移す時に足す
+- ホスト側（`servo-host/src/server/tests.rs`）とクライアント側（`tests/client_contract.rs`）の契約テストは直下の fixture だけを読む。`interactive/` は別のテストに配線した: ホスト側は TASK-122 で `dom_snapshot` の要求（`interactive_dom_snapshot_fixtures_match_host_behavior`）、クライアント側は TASK-123 で正常な要求の JSON・応答・hello・新しい kind（`render10_interactive_requests_match_fixtures`・`render11_interactive_responses_match_fixtures`）。直下へ移すのは、ホストが `act`・`wait` を実装する TASK-126 のとき（両側の既存の契約テストが全件を読むため）。`expected_response` は移す時に足す TASK-126 では、ホスト側の `interactive_request_fixtures_match_host_behavior` を `act`・`wait` の要求に広げ、操作モードの hello を `interactive_hello_matches_fixture` で照合した。直下への移動と `expected_response` は後続（#1592 の残り）
 
 ### 14.9 残る判断
 
-- WebDriver の命令（§14.4）を使うための `servo-base =0.7.0` の直接依存: TASK-126 の着手時に承認を求める
+- WebDriver の命令（§14.4）を使うための `servo-base =0.7.0` の直接依存: 2026-11-19 のオーナー判断で承認し、TASK-126 で採った
 - 8 MiB 級の DOM の Linux での時間・本体のメモリ: TASK-138 で測り、§14.6 の値を見直す
-- ページのダイアログ（`alert()`・`confirm()`・`prompt()`）の扱い: TASK-126 で決める
+- ページのダイアログ（`alert()`・`confirm()`・`prompt()`）の扱い: Servo の既定のままにした（TASK-126・2026-11-19。§14.4）
 - `pushState` を繰り返すページでは `act` が毎回 `stale` になりうる。本体が取り直して再試行する回数の上限を TASK-124・TASK-126 で決める
 - `window.webdriverElement` は Servo が「公開すべきでないが当面公開している」と注記している拡張で、版の更新で消えうる。消えたら要素の同一性（§14.4）を WebDriver の命令（`servo-base` の依存が要る）で取り直す。servo の版を上げるときに確かめる
 

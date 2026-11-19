@@ -11,7 +11,7 @@
 //! 応答を返してから次を読む同期ループ。対応ビヘイビア: `RENDER-3`・`RENDER-4`・`PLUG-1`・`SEC-2`
 //! （関連 `REPAIR-3`・`REPAIR-4`。設計 `docs/design/servo-host-design.md` §2.1〜§2.5）。
 //!
-//! 操作モードのメソッド（dom_snapshot。TASK-122・設計 §14）は、ハンドラの `capabilities` に載るときだけ受け付け、
+//! 操作モードのメソッド（dom_snapshot は TASK-122、act・wait は TASK-126。設計 §14）は、ハンドラの `capabilities` に載るときだけ受け付け、
 //! 載らなければ実装の有無にかかわらず `unsupported` を返す。dom_snapshot の応答フレームは 12 MiB までで、
 //! 超えたら切り詰めずに `too_large` を返す（`RENDER-11`）。
 //!
@@ -26,7 +26,10 @@ use std::time::Instant;
 use serde_json::{Value, json};
 
 pub(crate) use request::is_valid_url;
-pub(crate) use request::{LoadParams, ScreenshotParams, SelectorParams};
+pub(crate) use request::{
+    ActExpect, ActParams, Action, LoadParams, ScreenshotParams, SelectorParams, WaitCondition,
+    WaitParams,
+};
 use request::{Request, parse_request};
 
 /// 要求フレームの上限（バイト）。長さ接頭辞の段階で確保前に検証する。
@@ -56,6 +59,25 @@ pub(crate) const MAX_DOM_SNAPSHOT_HTML_BYTES: usize = 8_388_608;
 pub(crate) const MAX_DOM_SNAPSHOT_FRAME_BYTES: usize = 12_582_912;
 /// `dom_snapshot` の待機上限（ミリ秒。30 秒。設計 §14.6）。
 pub(crate) const DOM_SNAPSHOT_TIMEOUT_MS: u64 = 30_000;
+/// `act` の時間切れ（設計 §14.6。ホストは `timeout` を返さず、本体が 5 秒の余裕を足した期限で破棄する）。
+pub(crate) const ACT_TIMEOUT_MS: u64 = 10_000;
+/// `wait` の `timeout_ms` の上限（`AISNAP-18`）。
+pub(crate) const WAIT_TIMEOUT_MAX_MS: u64 = 60_000;
+/// `fill` の `text` の上限（バイト）。
+pub(crate) const MAX_FILL_TEXT_BYTES: usize = 8192;
+/// `wait` の `selector`・`text` の上限（バイト）。
+pub(crate) const MAX_WAIT_CONDITION_BYTES: usize = 1024;
+/// `select` の `values` の件数と各値の上限。
+pub(crate) const MAX_SELECT_VALUES: usize = 32;
+pub(crate) const MAX_SELECT_VALUE_BYTES: usize = 512;
+/// `press` の `key` の上限（バイト）。
+pub(crate) const MAX_KEY_BYTES: usize = 32;
+/// `act` の照合値（`id`・`name`・`type`）と `tag` の上限（バイト）。
+pub(crate) const MAX_EXPECT_VALUE_BYTES: usize = 256;
+/// `act` の `node` の上限（`dom_snapshot` の要素数の上限 200,000 未満）。
+pub(crate) const MAX_NODE: u64 = 199_999;
+/// `snapshot` の識別子の上限（バイト）。
+pub(crate) const MAX_SNAPSHOT_ID_BYTES: usize = 64;
 
 /// 同梱する Servo の版。`servo` crate は版の定数を公開しないため手で持ち、
 /// `Cargo.toml` の pin との一致をテストで検証する。
@@ -70,6 +92,10 @@ pub(crate) enum Method {
     BoundingBox,
     /// 操作モードだけ（`--interactive`。設計 §14.3）。
     DomSnapshot,
+    /// 操作モードだけ（設計 §14.4。TASK-126）。
+    Act,
+    /// 操作モードだけ（設計 §14.5。TASK-126）。
+    Wait,
     Shutdown,
 }
 
@@ -81,6 +107,8 @@ impl Method {
             Self::Visibility => "visibility",
             Self::BoundingBox => "bounding_box",
             Self::DomSnapshot => "dom_snapshot",
+            Self::Act => "act",
+            Self::Wait => "wait",
             Self::Shutdown => "shutdown",
         }
     }
@@ -93,6 +121,8 @@ impl Method {
             Self::Visibility,
             Self::BoundingBox,
             Self::DomSnapshot,
+            Self::Act,
+            Self::Wait,
             Self::Shutdown,
         ]
         .into_iter()
@@ -115,6 +145,10 @@ pub(crate) enum ErrorKind {
     InvalidState,
     /// 上限を超えた（切り詰めない。操作モード）。
     TooLarge,
+    /// `page`・`snapshot`・番号・照合値が現在と違う、要素が消えた、待機中に文書が変わった（設計 §14.7）。
+    Stale,
+    /// 不可視・`disabled`・他の要素に隠れている・画面に入らない・フォーカスが外れた（設計 §14.4）。
+    NotActionable,
 }
 
 impl ErrorKind {
@@ -130,6 +164,8 @@ impl ErrorKind {
             Self::Internal => "internal",
             Self::InvalidState => "invalid_state",
             Self::TooLarge => "too_large",
+            Self::Stale => "stale",
+            Self::NotActionable => "not_actionable",
         }
     }
 
@@ -146,6 +182,8 @@ impl ErrorKind {
             Self::Internal => "Internal host error.",
             Self::InvalidState => "Current document is not an http(s) page.",
             Self::TooLarge => "Result exceeds the size limit.",
+            Self::Stale => "The page or element is stale.",
+            Self::NotActionable => "The element is not actionable.",
         }
     }
 }
@@ -190,6 +228,17 @@ pub(crate) struct DomSnapshotResult {
     pub redacted: u64,
 }
 
+/// `act` の結果（設計 §14.4）。`page` は処理の後の値、`navigated` は文書が変わったか。
+pub(crate) struct ActResult {
+    pub page: PageInfo,
+    pub navigated: bool,
+}
+
+/// `wait` の結果（設計 §14.5）。
+pub(crate) struct WaitResult {
+    pub page: PageInfo,
+}
+
 /// `screenshot` の結果（`format` は常に `png` でサーバーが付ける。PNG と base64 の生成は `screenshot` モジュール。#232）。
 pub(crate) struct ScreenshotResult {
     pub width: u32,
@@ -222,6 +271,14 @@ pub(crate) trait Handler {
     /// 主フレームの DOM の取得（操作モードだけ。設計 §14.3）。`capabilities` に載せない
     /// ハンドラへはサーバーが渡さないため、既定は `unsupported`。
     fn dom_snapshot(&mut self) -> Result<DomSnapshotResult, HandlerError> {
+        Err(HandlerError(ErrorKind::Unsupported))
+    }
+    /// 操作（操作モードだけ。設計 §14.4）。既定は `unsupported`。
+    fn act(&mut self, _p: &ActParams) -> Result<ActResult, HandlerError> {
+        Err(HandlerError(ErrorKind::Unsupported))
+    }
+    /// 待機（操作モードだけ。設計 §14.5）。既定は `unsupported`。
+    fn wait(&mut self, _p: &WaitParams) -> Result<WaitResult, HandlerError> {
         Err(HandlerError(ErrorKind::Unsupported))
     }
 }
@@ -346,6 +403,19 @@ fn hello_message(caps: &[Method]) -> Value {
             DOM_SNAPSHOT_TIMEOUT_MS.into(),
         );
     }
+    if caps.contains(&Method::Act)
+        && let Some(limits) = msg
+            .pointer_mut("/data/limits")
+            .and_then(Value::as_object_mut)
+    {
+        limits.insert("act_timeout_ms".into(), ACT_TIMEOUT_MS.into());
+        limits.insert("wait_timeout_max_ms".into(), WAIT_TIMEOUT_MAX_MS.into());
+        limits.insert("fill_text_bytes".into(), MAX_FILL_TEXT_BYTES.into());
+        limits.insert(
+            "wait_condition_bytes".into(),
+            MAX_WAIT_CONDITION_BYTES.into(),
+        );
+    }
     msg
 }
 
@@ -426,6 +496,10 @@ fn dispatch<H: Handler>(h: &mut H, id: u64, req: &Request) -> (Value, &'static s
                 "redacted": r.redacted,
             })
         }),
+        Request::Act(p) => h
+            .act(p)
+            .map(|r| json!({ "page": r.page.to_json(), "navigated": r.navigated })),
+        Request::Wait(p) => h.wait(p).map(|r| json!({ "page": r.page.to_json() })),
         // shutdown は serve が処理する。ここへ来た場合は成功を装わず内部エラーにする。
         Request::Shutdown => Err(HandlerError(ErrorKind::Internal)),
     };

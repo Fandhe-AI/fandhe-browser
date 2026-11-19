@@ -46,6 +46,12 @@ image = { version = "=0.25.10", default-features = false, features = ["png"] }
 # Cargo.lock に servo 経由で同版が既にあり、新しい crate は増えない。servo の版を上げるときは、servo が使う
 # `url` の版に合わせて同時に上げる（型が一致しないとトレイトを実装できない）。
 url = "=2.5.8"
+# WebDriver の命令（`Servo::execute_webdriver_command`）の答えの受け口（`generic_channel::channel`）と、閲覧文脈の
+# ID（`id::BrowsingContextId`）を作るためだけに使う。servo が再エクスポートしないため直接依存にする（操作モードの
+# クリックを、ページが偽れない Rust 側の判定〔画面に入るか・他の要素に隠れていないか〕で確かめる。TASK-126・
+# 設計 §14.4・試作 (4)。オーナー承認 2026-11-19）。Cargo.lock に servo 経由で同版が既にあり、新しい crate は増えない
+# （MPL-2.0。servo-host の workspace だけ）。servo の版を上げるときは同じ版へ同時に上げる。
+servo-base = "=0.7.0"
 
 # Windows のみ ANGLE（mozangle）を既定にする `no-wgl` を足す（#999・オーナー承認 2026-10-16）。
 # 既定の WGL バックエンドは GPU の無い環境で WGL_NV_DX_interop が無く software rendering context を
