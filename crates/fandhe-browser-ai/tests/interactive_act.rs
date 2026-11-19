@@ -327,6 +327,9 @@ async fn aisnap17_sensitive_redacts_all_values_for_the_generation() {
         }
         let res = post(&s, "/ai/act", &act_body(g, target, action)).await;
         assert_eq!(res.status, if fail { 409 } else { 200 }, "{target}");
+        // 次の取得を待たずに、直前の取り直しで保存した値も伏せられている（CDP は保存済みの結果を読む）。
+        let body = saved_html(&s);
+        assert!(!body.contains("visible-value"), "{target}: {body}");
         assert_eq!(snapshot(&s).await.status, 200);
         let body = saved_html(&s);
         assert!(!body.contains("visible-value"), "{target}: {body}");
@@ -466,6 +469,10 @@ async fn aisnap17_busy_while_acting() {
     };
     entered_rx.recv().unwrap();
     assert_eq!(code(&snapshot(&s).await), (409, "busy".into()));
+    // 実行中に新しい navigate が確定結果を消していても、`/ai/snapshot` は排他を見て `busy`。
+    let nav = s.app().navigation();
+    let _ = nav.begin_navigation().unwrap();
+    assert_eq!(code(&snapshot(&s).await), (409, "busy".into()));
     let res = post(
         &s,
         "/ai/act",
@@ -475,6 +482,7 @@ async fn aisnap17_busy_while_acting() {
     assert_eq!(code(&res), (409, "busy".into()));
     release_tx.send(()).unwrap();
     assert!(running.join().unwrap().is_ok());
-    assert_eq!(snapshot(&s).await.status, 200);
+    // 操作が終われば `busy` ではない（確定結果は上の navigate で消えている）。
+    assert_ne!(code(&snapshot(&s).await).1, "busy");
     assert_eq!(host.acts().len(), 1);
 }

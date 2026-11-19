@@ -358,24 +358,16 @@ fn post_precheck(head: &fandhe_backend_http::request::RequestHead) -> Result<(),
 
 /// `/ai/snapshot` の応答（操作モードの同期を含む。ブロッキングする）。
 ///
-/// 確定結果が操作モードなら、操作の排他を読み取りで `try_read` し、`/ai/act` の実行中なら待たせずに `busy`（409）を
-/// 返す（確定結果は無効にしない。`AISNAP-20`・2026-11-19 のオーナー判断）。静的モード・未ナビゲートでは見ない。
+/// 操作の排他を読み取りで `try_read` し、`/ai/act` の実行中なら待たせずに `busy`（409）を返す（確定結果は無効に
+/// しない。`AISNAP-20`・2026-11-19 のオーナー判断）。確定結果のモードによらず取る（先にモードを見て省くと、
+/// 見た後に操作モードの結果が確定した場合に排他の外で同期し、`/ai/act` を同期のロックで待たせてしまう）。
 fn snapshot_response(state: &AiState) -> Response {
-    let interactive = state
-        .app()
-        .navigation()
-        .latest()
-        .is_some_and(|r| r.mode() == PageMode::Interactive);
-    let _guard = if interactive {
-        match state.operation_lock().try_read() {
-            Ok(g) => Some(g),
-            Err(std::sync::TryLockError::WouldBlock) => {
-                return act_error_response(ActError::Busy);
-            }
-            Err(std::sync::TryLockError::Poisoned(p)) => Some(p.into_inner()),
+    let _guard = match state.operation_lock().try_read() {
+        Ok(g) => g,
+        Err(std::sync::TryLockError::WouldBlock) => {
+            return act_error_response(ActError::Busy);
         }
-    } else {
-        None
+        Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
     };
     // 操作モードなら先にホストの DOM を取り直す。失敗したら古い内容を返さない（`AISNAP-20`・TASK-125）。
     if let Err(e) = sync_interactive(state.app(), state.sync_tracker()) {
