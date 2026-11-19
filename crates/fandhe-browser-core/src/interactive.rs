@@ -180,6 +180,34 @@ impl fmt::Debug for InteractiveDocument {
 }
 
 impl InteractiveDocument {
+    /// すべての入力欄の値を伏せた写しと、その HTML を作る（ノード ID・番号・取得の識別子・版は保つ）。
+    /// core の `NavigationState::mark_redact_all` が、印と同じロックの中で保存済みの結果を置き換えるのに使う
+    /// （`AISNAP-17`・TASK-128）。
+    pub(crate) fn redacted_all(&self, url: &str) -> Result<InteractiveSync, SyncError> {
+        let mut document = self.document.duplicate();
+        let elements: Vec<NodeId> = document
+            .descendants(document.root())
+            .filter(|id| document.local_name(*id).is_some())
+            .collect();
+        redact_values(&mut document, &elements, true).map_err(|_| SyncError::Malformed)?;
+        let html = document
+            .serialize_html()
+            .map_err(|_| SyncError::Malformed)?
+            .into_html();
+        Ok(InteractiveSync {
+            url: url.to_owned(),
+            html,
+            document: InteractiveDocument {
+                page: self.page.clone(),
+                revision: self.revision,
+                snapshot: self.snapshot.clone(),
+                document,
+                numbers: self.numbers.clone(),
+            },
+            all_redacted: true,
+        })
+    }
+
     /// 取得した時点のページ識別子。
     pub fn page(&self) -> &InteractivePageId {
         &self.page

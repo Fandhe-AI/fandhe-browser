@@ -449,14 +449,37 @@ impl NavigationState {
     /// （`AISNAP-17`・TASK-128。2026-11-19 のオーナー判断）。呼び出し元は `/ai/act` で、`sensitive` の操作か、
     /// 伏せる対象だった要素への操作を、ホストへ送る前に付ける。新しい navigate で外れる（世代が進むため）。
     /// 世代が最新でなければ [`StateError::Superseded`]。
+    ///
+    /// 保存済みの操作モードの結果も、同じロックの中で値を全部伏せた写しへ置き換える（版を 1 上げる）。CDP は
+    /// 保存済みの結果を直接読むため、次の同期を待つと直前の同期で保存した値が見えてしまう。写しを作れなければ
+    /// 印を付けず [`StateError::RedactionRequired`]（呼び出し元は操作を送らない）。
     pub fn mark_redact_all(&self, generation: NavigationGeneration) -> Result<(), StateError> {
-        let _guard = self.lock();
+        let mut guard = self.lock();
         let current = self.current_generation();
         if generation != current {
             return Err(StateError::Superseded {
                 attempted: generation,
                 current,
             });
+        }
+        let redacted = match guard.as_ref() {
+            Some(record) => match record.interactive.as_ref() {
+                Some(doc) => {
+                    let sync = doc
+                        .redacted_all(&record.url)
+                        .map_err(|_| StateError::RedactionRequired)?;
+                    let revision = doc
+                        .revision()
+                        .checked_add(1)
+                        .ok_or(StateError::GenerationExhausted)?;
+                    Some(Arc::new(NavigationResult::from_sync(sync, revision)))
+                }
+                None => None,
+            },
+            None => None,
+        };
+        if let Some(r) = redacted {
+            *guard = Some(r);
         }
         self.redact_all_generation
             .store(generation.get(), Ordering::SeqCst);
@@ -1315,8 +1338,22 @@ mod tests {
         nav.commit_interactive(g, sync("s", 1, "<p></p>")).unwrap();
         assert!(!nav.redacts_all(g));
         nav.replace_interactive(g, built(false)).unwrap();
+        assert!(nav.latest().unwrap().html().contains("value=\"v\""));
+        let before = nav.latest().unwrap().interactive().unwrap().revision();
         nav.mark_redact_all(g).unwrap();
         assert!(nav.redacts_all(g));
+        // 印と同時に、保存済みの結果も値を全部伏せた写しへ置き換わる（次の同期を待たない）。
+        let latest = nav.latest().unwrap();
+        assert!(!latest.html().contains("value=\"v\""), "{}", latest.html());
+        let doc = latest.interactive().unwrap();
+        assert_eq!(doc.revision(), before + 1);
+        let input = doc
+            .document()
+            .descendants(doc.document().root())
+            .find(|&n| doc.document().local_name(n) == Some("input"))
+            .unwrap();
+        assert_eq!(doc.document().attribute(input, "value"), None);
+        assert_eq!(doc.host_number(input), Some(0), "numbers are kept");
         assert_eq!(
             nav.replace_interactive(g, built(false)),
             Err(StateError::RedactionRequired)
