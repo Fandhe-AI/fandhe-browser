@@ -1167,7 +1167,7 @@ fn interactive_renderer(
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn t_renderer_interactive_roundtrip() {
     use fandhe_browser_core::render::{PageRef, RenderError, Renderer, ScreenshotOptions};
-    let Some((root, r)) = interactive_renderer("rint-ok", "ok") else {
+    let Some((_root, r)) = interactive_renderer("rint-ok", "ok") else {
         return;
     };
     assert!(matches!(r.dom_snapshot(), Err(RenderError::NotInteractive)));
@@ -1179,20 +1179,18 @@ fn t_renderer_interactive_roundtrip() {
     let snap = r.dom_snapshot().expect("dom_snapshot");
     let doc = fandhe_browser_core::interactive::build_interactive_document(snap).expect("doc");
     assert_eq!(doc.page().doc_seq(), 1);
-    // 読み取りだけの描画要求は、読み直さず操作モードのホストへ送る。
+    // 読み取りだけの描画要求は、読み直さず操作モードのホストへ送る（静的モードの経路なら現在のページが
+    // 無く `PageNotLoaded`）。隔離下（Linux の bwrap）の偽ホストは記録を WorkDir に書き、`HostRenderer`
+    // の外から数えられないため、起動・読み込みの回数ではなく振る舞いで確かめる。
     let shot = r
         .capture_screenshot(&ScreenshotOptions::new())
         .expect("screenshot on interactive page");
     assert_eq!((shot.width, shot.height), (1280, 800));
-    assert_eq!(count(&root.0, "spawns"), 1);
-    assert_eq!(
-        count(&root.0, "loads"),
-        1,
-        "interactive page is not reloaded"
-    );
+    let snap = r.dom_snapshot().expect("dom_snapshot after screenshot");
+    let doc = fandhe_browser_core::interactive::build_interactive_document(snap).expect("doc");
+    assert_eq!(doc.page().doc_seq(), 1, "interactive page is not reloaded");
     r.load(&PageRef::new("https://example.com/b"))
         .expect("static load");
-    assert_eq!(count(&root.0, "spawns"), 2, "static mode uses another host");
     assert!(matches!(r.dom_snapshot(), Err(RenderError::NotInteractive)));
 }
 
@@ -1222,7 +1220,7 @@ fn t_renderer_interactive_errors() {
         .expect("load_interactive");
     assert!(matches!(r.dom_snapshot(), Err(RenderError::SessionLost)));
     // 読み取りだけの描画要求の `timeout` 応答では、操作モードのホストを破棄しない。
-    let Some((root, r)) = interactive_renderer("rint-sto", "int-shot-timeout") else {
+    let Some((_root, r)) = interactive_renderer("rint-sto", "int-shot-timeout") else {
         return;
     };
     r.load_interactive(&PageRef::new("https://example.com/a"))
@@ -1231,9 +1229,9 @@ fn t_renderer_interactive_errors() {
         r.capture_screenshot(&ScreenshotOptions::new()),
         Err(RenderError::Timeout)
     ));
+    // 破棄していれば `SessionLost`（読み直さない）。
     r.dom_snapshot()
         .expect("session kept after screenshot timeout");
-    assert_eq!(count(&root.0, "spawns"), 1);
     // 内部アドレスは送る前に拒否する（SSRF。静的の `load` と同じ検査）。
     assert!(matches!(
         r.load_interactive(&PageRef::new("http://127.0.0.1/")),

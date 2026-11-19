@@ -106,6 +106,7 @@ fn variant(e: &RenderError) -> &'static str {
         RenderError::ProtocolMismatch => "ProtocolMismatch",
         RenderError::PageNotLoaded => "PageNotLoaded",
         RenderError::Internal(_) => "Internal",
+        RenderError::Unsupported => "Unsupported",
         _ => "Other",
     }
 }
@@ -606,11 +607,11 @@ fn render3_real_host_roundtrip() {
         "bottom {bottom:?}"
     );
 
-    // 未対応の full_page は成功を装わない。
+    // 未対応の full_page は成功を装わない（ホストの `unsupported` は `Unsupported`。TASK-127）。
     let e = r
         .capture_screenshot(&ScreenshotOptions::new().with_full_page(true))
         .expect_err("full_page");
-    assert_eq!(variant(&e), "Internal");
+    assert_eq!(variant(&e), "Unsupported");
 
     r.load(&PageRef::new(srv.url("/vis"))).expect("load vis");
     for (s, expected) in [
