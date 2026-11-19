@@ -1166,7 +1166,7 @@ fn interactive_renderer(
 /// DOM を返す。静的モードの読み込みで操作モードのホストを止め、以後の `dom_snapshot` は `NotInteractive`。
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn t_renderer_interactive_roundtrip() {
-    use fandhe_browser_core::render::{PageRef, RenderError, Renderer};
+    use fandhe_browser_core::render::{PageRef, RenderError, Renderer, ScreenshotOptions};
     let Some((root, r)) = interactive_renderer("rint-ok", "ok") else {
         return;
     };
@@ -1179,7 +1179,17 @@ fn t_renderer_interactive_roundtrip() {
     let snap = r.dom_snapshot().expect("dom_snapshot");
     let doc = fandhe_browser_core::interactive::build_interactive_document(snap).expect("doc");
     assert_eq!(doc.page().doc_seq(), 1);
+    // 読み取りだけの描画要求は、読み直さず操作モードのホストへ送る。
+    let shot = r
+        .capture_screenshot(&ScreenshotOptions::new())
+        .expect("screenshot on interactive page");
+    assert_eq!((shot.width, shot.height), (1280, 800));
     assert_eq!(count(&root.0, "spawns"), 1);
+    assert_eq!(
+        count(&root.0, "loads"),
+        1,
+        "interactive page is not reloaded"
+    );
     r.load(&PageRef::new("https://example.com/b"))
         .expect("static load");
     assert_eq!(count(&root.0, "spawns"), 2, "static mode uses another host");

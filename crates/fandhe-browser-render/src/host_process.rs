@@ -875,6 +875,8 @@ impl HostProcess {
     }
 
     /// 操作モードの要求（`dom_snapshot`・`act`・`wait`）を、読み込み済みのページに送る（TASK-123・設計 §14）。
+    /// 読み取りだけの描画要求（`screenshot`・`visibility`・`bounding_box`）も同じページへ送る（TASK-127。
+    /// 操作モードのホストは `capabilities` に載せている。§14.3）。
     ///
     /// ホストを起動せず、ページを読み直さない。ページを読み込んだホストが居なくなっていれば
     /// [`HostProcessError::SessionLost`]。時間切れ・クラッシュ・プロトコル違反はホストを破棄して
@@ -885,7 +887,15 @@ impl HostProcess {
             return Err(HostProcessError::NotInteractive);
         }
         let method = request.method();
-        if !matches!(method, Method::DomSnapshot | Method::Act | Method::Wait) {
+        if !matches!(
+            method,
+            Method::DomSnapshot
+                | Method::Act
+                | Method::Wait
+                | Method::Screenshot
+                | Method::Visibility
+                | Method::BoundingBox
+        ) {
             return Err(HostProcessError::InvalidRequest);
         }
         self.ensure_interactive_session()?;

@@ -154,6 +154,14 @@ impl HostRenderer {
     /// 不許可なら描画要求を送らず、現在のページを無効化する（以降は `PageNotLoaded`）。
     fn call(&self, request: Request) -> Result<MethodResult, RenderError> {
         let mut inner = self.lock()?;
+        // 操作モードで読んだページはホストが保っており、core の `RenderGate` は読み直さない。
+        // 同じホストへ送る（読み直すと入力・遷移の状態が失われる。TASK-127）。
+        if inner.interactive_loaded {
+            return inner
+                .interactive
+                .call_interactive(request)
+                .map_err(map_host_error);
+        }
         let Inner {
             process,
             nav_generation,
