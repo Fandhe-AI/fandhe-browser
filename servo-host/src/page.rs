@@ -945,6 +945,8 @@ impl CurrentPage {
                 if !self.focused(engine, element, deadline)? {
                     return Err(ErrorKind::NotActionable);
                 }
+                // 文字はまとめて送る。途中でページがフォーカスを移すと残りは移った先へ入りうる（既知の制約。
+                // 1 文字ごとに確かめる形は期限に届くため採らない。2026-11-19 の判断 B。設計 §14.4）。
                 for ch in text.chars() {
                     self.press(&Key::Character(ch.to_string()));
                 }
