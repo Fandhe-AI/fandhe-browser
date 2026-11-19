@@ -90,6 +90,9 @@ pub const MAX_FILL_TEXT_BYTES: usize = 8192;
 /// 照合値（`id`・`name`・`type`）の上限（バイト）。超える値は送らない（送ったものだけを照合する。設計 §14.4）。
 pub const MAX_EXPECT_VALUE_BYTES: usize = 256;
 
+/// 照合値の要素名の上限（バイト。ホストの照合値 `tag` の上限と同じ。設計 §14.4）。
+pub const MAX_ACT_TAG_BYTES: usize = 64;
+
 /// 操作の種類（`AISNAP-17`。2026-11-19 のオーナー判断で、最初は `click`・`fill` だけを入れる。
 /// `select`・`press` は後続）。`Debug` は入力文字列を出さない。
 #[derive(Clone, PartialEq, Eq)]
@@ -134,8 +137,11 @@ pub struct ActRequest {
 }
 
 impl ActRequest {
-    /// 作る。`tag` は空でない小文字のローカル名、`fill` の文字列は [`MAX_FILL_TEXT_BYTES`] 以下（超えれば
-    /// [`RenderError::InvalidParams`]）。`id`・`name`・`type` は [`MAX_EXPECT_VALUE_BYTES`] を超えれば送らない。
+    /// 作る。`fill` の文字列は [`MAX_FILL_TEXT_BYTES`] 以下（超えれば [`RenderError::InvalidParams`]）。
+    /// `tag` は写しのローカル名をそのまま渡す（ホストは `localName` と厳密に比べるため、SVG の
+    /// `foreignObject` のような大小混じりを変えない）。空か [`MAX_ACT_TAG_BYTES`] を超える要素は照合値を
+    /// 作れないため [`RenderError::NotActionable`]。`id`・`name`・`type` は [`MAX_EXPECT_VALUE_BYTES`] を
+    /// 超えれば送らない。
     pub fn new(
         page: InteractivePageId,
         snapshot: &str,
@@ -144,8 +150,8 @@ impl ActRequest {
         attrs: [Option<&str>; 3],
         action: ActAction,
     ) -> Result<Self, RenderError> {
-        if tag.is_empty() || tag.len() > MAX_EXPECT_VALUE_BYTES {
-            return Err(RenderError::InvalidParams);
+        if tag.is_empty() || tag.len() > MAX_ACT_TAG_BYTES {
+            return Err(RenderError::NotActionable);
         }
         if let ActAction::Fill { text, .. } = &action
             && text.len() > MAX_FILL_TEXT_BYTES
@@ -161,7 +167,7 @@ impl ActRequest {
             page,
             snapshot: snapshot.to_owned(),
             node,
-            tag: tag.to_ascii_lowercase(),
+            tag: tag.to_owned(),
             id: keep(id),
             name: keep(name),
             type_: keep(type_),
@@ -895,16 +901,29 @@ mod tests {
             ),
             Err(RenderError::InvalidParams)
         ));
-        assert!(matches!(
-            ActRequest::new(page(), "snap", 3, "", [None; 3], ActAction::Click),
-            Err(RenderError::InvalidParams)
-        ));
+        for tag in [String::new(), "x".repeat(MAX_ACT_TAG_BYTES + 1)] {
+            assert!(matches!(
+                ActRequest::new(page(), "snap", 3, &tag, [None; 3], ActAction::Click),
+                Err(RenderError::NotActionable)
+            ));
+        }
+        // 要素名は大小を変えずに渡す（SVG の `foreignObject` 等。ホストは厳密に比べる）。
+        let r = ActRequest::new(
+            page(),
+            "snap",
+            3,
+            "foreignObject",
+            [None; 3],
+            ActAction::Click,
+        )
+        .unwrap();
+        assert_eq!(r.tag(), "foreignObject");
         let long = "i".repeat(MAX_EXPECT_VALUE_BYTES + 1);
         let r = ActRequest::new(
             page(),
             "snap",
             3,
-            "INPUT",
+            "input",
             [Some(long.as_str()), Some("n"), Some("text")],
             ActAction::Click,
         )

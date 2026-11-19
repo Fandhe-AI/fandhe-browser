@@ -461,6 +461,16 @@ mod tests {
     use crate::protocol::{Method, Response};
     use serde_json::json;
 
+    /// TASK-128: core が照合値の要素名を検査する上限は、protocol の上限と同じ（食い違うと正しい要求が
+    /// 送る直前に `invalid_params` で断られる）。
+    #[test]
+    fn task128_act_tag_limit_matches_protocol() {
+        assert_eq!(
+            fandhe_browser_core::render::MAX_ACT_TAG_BYTES,
+            crate::protocol::MAX_EXPECT_TAG_BYTES
+        );
+    }
+
     fn host_error(kind: &str) -> HostProcessError {
         let v = json!({"v": 1, "id": 1, "error": {"kind": kind, "message": "https://secret.example/?t=1"}});
         let r = Response::from_json(&v, Method::Screenshot).expect("response");
