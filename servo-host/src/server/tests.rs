@@ -674,6 +674,60 @@ fn dom_snapshot_is_unsupported_without_interactive() {
     );
 }
 
+/// RENDER-10・AISNAP-18・TASK-126: `--interactive` でないホストは act・wait を unsupported で返し、ハンドラを呼ばず、
+/// capabilities と limits にも載せない。
+#[test]
+fn act_and_wait_are_unsupported_without_interactive() {
+    let page = json!({"session":"s","doc_seq":1});
+    let input = [
+        jframe(&json!({"v":1,"id":5,"method":"act","params":{"page":page,"snapshot":"s1","node":0,"expect":{"tag":"button"},"action":{"kind":"click"}}})),
+        jframe(&json!({"v":1,"id":6,"method":"wait","params":{"page":page,"condition":{"kind":"load_complete"},"timeout_ms":100}})),
+    ]
+    .concat();
+    let (r, calls) = run(input);
+    for (i, id) in [(1, 5), (2, 6)] {
+        assert_eq!(
+            r.frames[i],
+            json!({"v":1,"id":id,"error":{"kind":"unsupported","message":"Method is not supported."}})
+        );
+    }
+    assert!(calls.is_empty());
+    let caps = r.frames[0]["data"]["capabilities"].as_array().unwrap();
+    assert!(!caps.contains(&json!("act")) && !caps.contains(&json!("wait")));
+    assert!(
+        r.frames[0]["data"]["limits"]
+            .get("act_timeout_ms")
+            .is_none()
+    );
+}
+
+/// RENDER-10・TASK-126: `fill` の `text`・`wait` の条件の上限はバイトで数える（本体と同じ）。多バイトで上限を超える
+/// 要求は invalid_params で、ハンドラを呼ばない。
+#[test]
+fn interactive_byte_limits_count_utf8_bytes() {
+    let page = json!({"session":"s","doc_seq":1});
+    let (mut h, calls) = interactive();
+    let input = [
+        jframe(&json!({"v":1,"id":1,"method":"act","params":{"page":page,"snapshot":"s1","node":0,"expect":{"tag":"input"},"action":{"kind":"fill","text":"あ".repeat(2731)}}})),
+        jframe(&json!({"v":1,"id":2,"method":"act","params":{"page":page,"snapshot":"s1","node":0,"expect":{"tag":"input"},"action":{"kind":"fill","text":"あ".repeat(2730)}}})),
+        jframe(&json!({"v":1,"id":3,"method":"wait","params":{"page":page,"condition":{"kind":"text_present","text":"あ".repeat(342)},"timeout_ms":100}})),
+    ]
+    .concat();
+    let r = run_with(&mut h, input);
+    assert_eq!(
+        r.frames[1]["error"]["kind"], "invalid_params",
+        "{}",
+        r.frames[1]
+    );
+    assert!(r.frames[2]["result"].is_object(), "{}", r.frames[2]);
+    assert_eq!(
+        r.frames[3]["error"]["kind"], "invalid_params",
+        "{}",
+        r.frames[3]
+    );
+    assert_eq!(calls.borrow().clone(), vec!["act"]);
+}
+
 /// RENDER-11・TASK-122: 操作モードのホストは dom_snapshot を載せ、上限を申告し、結果をスキーマの形で返す。
 #[test]
 fn interactive_host_serves_dom_snapshot() {

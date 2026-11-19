@@ -2111,6 +2111,10 @@ const ACT_PAGE: &str = concat!(
     "<div style=\"position:absolute;left:0;top:0;width:200px;height:30px;background:#fff\"></div></div>",
     "<div style=\"position:relative;width:200px;height:30px\"><button id=ifr onclick=\"document.getElementById('out').textContent='ifr'\">I</button>",
     "<iframe srcdoc=\"<p>x</p>\" style=\"position:absolute;left:0;top:0;width:200px;height:30px;border:0\"></iframe></div>",
+    "<div style=\"position:relative;width:200px;height:30px\"><input id=covq value=keep>",
+    "<div style=\"position:absolute;left:0;top:0;width:200px;height:30px;background:#fff\"></div></div>",
+    "<select id=hid style=\"display:none\"><option value=a>A</option></select>",
+    "<button id=edge style=\"position:fixed;left:300px;top:790px\" onclick=\"document.getElementById('out').textContent='edge'\">E</button>",
     "<button id=far style=\"margin-top:3000px\" onclick=\"document.getElementById('out').textContent='far'\">F</button>",
     "<script>setTimeout(function(){var d=document.createElement('div');d.id='late';document.body.appendChild(d);},300);</script>",
     "</body></html>"
@@ -2271,6 +2275,67 @@ fn interactive_act_operates_elements_and_rejects_unsafe_targets() {
     }
     id += 1;
 
+    // 選択: 一致する選択肢が無い・単一選択に 2 つ・表示されていない select は選ばない。
+    for (target, values, want) in [
+        ("s", r#"["zz"]"#, "not_actionable"),
+        ("s", r#"["a","b"]"#, "invalid_params"),
+        ("hid", r#"["a"]"#, "not_actionable"),
+    ] {
+        let r = act_req(
+            &mut h,
+            id,
+            &snap,
+            node_of(&html, target),
+            r#"{"tag":"select"}"#,
+            &format!(r#"{{"kind":"select","values":{values}}}"#),
+        );
+        assert_eq!(kind(&r), want, "{target} {values}: {r}");
+        id += 1;
+    }
+
+    // 隠れた入力欄は、値を消す前に断る（既存の値が残る）。
+    let r = act_req(
+        &mut h,
+        id,
+        &snap,
+        node_of(&html, "covq"),
+        r#"{"tag":"input"}"#,
+        r#"{"kind":"fill","text":"zz"}"#,
+    );
+    assert_eq!(kind(&r), "not_actionable", "{r}");
+    id += 1;
+    {
+        let (_, s2) = out_text(&mut h, id);
+        snap = s2;
+        assert!(
+            snap["html"]
+                .as_str()
+                .unwrap()
+                .contains(r#"id="covq" value="keep""#),
+            "{}",
+            snap["html"]
+        );
+    }
+    id += 1;
+
+    // 画面の下端にまたがる要素は、画面の中に入っている部分の中心を押す（判定した点と同じ点）。
+    let r = act_req(
+        &mut h,
+        id,
+        &snap,
+        node_of(&html, "edge"),
+        r#"{"tag":"button"}"#,
+        r#"{"kind":"click"}"#,
+    );
+    ok(&r);
+    id += 1;
+    {
+        let (t, s2) = out_text(&mut h, id);
+        snap = s2;
+        assert_eq!(t, "edge");
+    }
+    id += 1;
+
     // 画面の外の要素はスクロールして押す。
     let r = act_req(
         &mut h,
@@ -2403,12 +2468,12 @@ fn interactive_act_operates_elements_and_rejects_unsafe_targets() {
     assert_eq!(code, Some(0), "stderr: {stderr}");
     assert_eq!(rest, 0);
     assert!(
-        !stderr.contains("hi あ"),
+        !stderr.contains('あ'),
         "input text leaked to the log: {stderr}"
     );
 }
 
-/// TASK-126: 操作モードで Cookie（永続の `max-age`）を作って操作しても、ホストの終了後にその値を含むファイルが
+/// `RENDER-10`・TASK-126: 操作モードで Cookie（永続の `max-age`）を作って操作しても、ホストの終了後にその値を含むファイルが
 /// ホームや一時ディレクトリに残らない（`temporary_storage`。操作モードでは永続 Cookie を使わない。
 /// `rendering-layer.md` の判断 5）。HOME・TMPDIR・XDG の各ディレクトリを空の場所へ向けて確かめる。
 #[test]
@@ -2508,7 +2573,14 @@ fn interactive_act_reports_navigation() {
         r["result"]["page"]["doc_seq"].as_u64().unwrap() > before,
         "{r}"
     );
-    // 遷移の後は前の page で待てない。
+    // 遷移の後は、返った page で待てる。前の page では待てない。
+    let new_page = r["result"]["page"].to_string();
+    h.send(&format!(
+        r#"{{"v":1,"id":{},"method":"wait","params":{{"page":{new_page},"condition":{{"kind":"load_complete"}},"timeout_ms":5000}}}}"#,
+        id + 10
+    ));
+    let w: serde_json::Value = serde_json::from_str(&h.recv()).unwrap();
+    assert!(w["result"]["page"].is_object(), "{w}");
     let page = snap["page"].to_string();
     h.send(&format!(
         r#"{{"v":1,"id":{},"method":"wait","params":{{"page":{page},"condition":{{"kind":"load_complete"}},"timeout_ms":5000}}}}"#,

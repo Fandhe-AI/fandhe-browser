@@ -59,7 +59,8 @@ pub(crate) const MAX_DOM_SNAPSHOT_HTML_BYTES: usize = 8_388_608;
 pub(crate) const MAX_DOM_SNAPSHOT_FRAME_BYTES: usize = 12_582_912;
 /// `dom_snapshot` の待機上限（ミリ秒。30 秒。設計 §14.6）。
 pub(crate) const DOM_SNAPSHOT_TIMEOUT_MS: u64 = 30_000;
-/// `act` の時間切れ（設計 §14.6。ホストは `timeout` を返さず、本体が 5 秒の余裕を足した期限で破棄する）。
+/// `act` の時間切れ（設計 §14.6）。過ぎたらホストは `timeout` を返し、本体はホストを破棄して `session_lost` にする
+/// （本体は 5 秒の余裕を足した期限でも破棄する）。
 pub(crate) const ACT_TIMEOUT_MS: u64 = 10_000;
 /// `wait` の `timeout_ms` の上限（`AISNAP-18`）。
 pub(crate) const WAIT_TIMEOUT_MAX_MS: u64 = 60_000;

@@ -35,7 +35,7 @@ use servo::{
     RgbaImage, ScreenshotCaptureError, ServoUrl, WebDriverCommandMsg, WebDriverScriptCommand,
     WebView, WebViewBuilder, WebViewDelegate, WebViewPoint,
 };
-use servo_base::generic_channel::channel;
+use servo_base::generic_channel::{TryReceiveError, channel, oneshot};
 use servo_base::id::BrowsingContextId;
 
 use crate::act::{self, ConditionOutcome, ExpectOutcome};
@@ -136,6 +136,8 @@ struct PageDelegate {
     doc_seq: Rc<Cell<u64>>,
     /// 送ったがまだ処理の済んでいない入力イベント（`act` が処理の完了を待つ。TASK-126）。
     pending_inputs: RefCell<HashSet<InputEventId>>,
+    /// `act` の間に、ページから始まる遷移を許可したか（`navigated` の判定で読み込みの開始まで待つ。TASK-126）。
+    navigation_requested: Cell<bool>,
 }
 
 impl PageDelegate {
@@ -160,6 +162,7 @@ impl WebViewDelegate for PageDelegate {
         // ページから始まる遷移の scheme を絞る（RENDER-10・TASK-120）。既定（drop）は許可になるため、
         // 許可・拒否を必ず明示する（fail-closed）。
         if crate::guard::navigation_allowed(request.url.as_str()) {
+            self.navigation_requested.set(true);
             request.allow();
         } else {
             request.deny();
@@ -567,12 +570,24 @@ impl Handler for ServoHandler {
             .ok_or(HandlerError(ErrorKind::Stale))?
             .clone();
         let deadline = Instant::now() + Duration::from_millis(ACT_TIMEOUT_MS);
-        let result = page.perform(engine, &element, p, key.as_ref(), deadline);
+        let result = page.perform(engine, &element, p, key.as_ref(), deadline, start);
         if page.delegate.crashed.get() {
             self.page = None;
             return Err(HandlerError(ErrorKind::LoadFailed));
         }
-        result.map_err(HandlerError)?;
+        match result {
+            Ok(()) => {}
+            // 評価の途中で文書が消えた。遷移と重なったなら stale、そうでなければページを捨てて not_loaded
+            // （`run_query` と同じ扱い）。
+            Err(ErrorKind::NotLoaded) if self.doc_seq.get() != start => {
+                return Err(HandlerError(ErrorKind::Stale));
+            }
+            Err(ErrorKind::NotLoaded) => {
+                self.page = None;
+                return Err(HandlerError(ErrorKind::NotLoaded));
+            }
+            Err(e) => return Err(HandlerError(e)),
+        }
         Ok(ActResult {
             page: self.page_info(),
             navigated: self.doc_seq.get() != start,
@@ -594,6 +609,10 @@ impl Handler for ServoHandler {
         let deadline = Instant::now() + p.timeout;
         let script = act::condition_script(&p.condition);
         loop {
+            if page.delegate.crashed.get() {
+                self.page = None;
+                return Err(HandlerError(ErrorKind::LoadFailed));
+            }
             let met = match &script {
                 None => page.webview.load_status() == LoadStatus::Complete,
                 Some(s) => {
@@ -686,8 +705,18 @@ impl Handler for ServoHandler {
 
 /// 待機の間にイベントループを回す間隔（`wait` の条件を調べ直す間隔でもある）。
 const WAIT_POLL: Duration = Duration::from_millis(50);
-/// 入力イベントの処理が済んでから、遷移の開始の通知を受け取るために回す時間。
+/// 入力イベントの処理が済んでから、遷移の要求の通知を受け取るために回す時間。
 const ACT_SETTLE: Duration = Duration::from_millis(100);
+
+/// WebDriver の命令の答えを 1 回受け取る。まだ来ていなければ `None`、受け口が切れていれば `stale`
+/// （閲覧文脈が入れ替わって命令が捨てられた。遷移と重なった場合）。
+fn reply<T>(r: Result<T, TryReceiveError>) -> Option<Result<T, ErrorKind>> {
+    match r {
+        Ok(v) => Some(Ok(v)),
+        Err(TryReceiveError::Empty) => None,
+        Err(_) => Some(Err(ErrorKind::Stale)),
+    }
+}
 
 impl CurrentPage {
     /// WebDriver の命令（ページの JS を通らない Rust 側の判定）を送り、`deadline` まで答えを待つ。受け口は
@@ -698,8 +727,8 @@ impl CurrentPage {
         engine: &Engine,
         deadline: Instant,
         command: WebDriverScriptCommand,
-        recv: impl FnMut() -> Option<R>,
-    ) -> Result<R, PageError> {
+        recv: impl FnMut() -> Option<Result<R, ErrorKind>>,
+    ) -> Result<R, ErrorKind> {
         engine
             .servo()
             .execute_webdriver_command(WebDriverCommandMsg::ScriptCommand(
@@ -715,6 +744,7 @@ impl CurrentPage {
                 std::thread::sleep(POLL_INTERVAL);
             },
         )
+        .map_err(PageError::kind)?
     }
 
     /// 入力イベントを送り、処理が済んだかを [`PageDelegate::pending_inputs`] で追えるように記録する。
@@ -723,8 +753,13 @@ impl CurrentPage {
         self.delegate.pending_inputs.borrow_mut().insert(id);
     }
 
-    /// 送った入力イベントの処理がすべて済むまで待ち、その後に遷移の開始の通知を受け取る分だけ回す。
-    fn settle(&self, engine: &Engine, deadline: Instant) -> Result<(), PageError> {
+    /// 送った入力イベントの処理がすべて済むまで待つ。その後、遷移の要求が来ていれば新しい文書の読み込みの
+    /// 開始（文書番号の更新）まで待ち、来ていなければ要求の通知を受け取る分だけ回す（`navigated` の判定）。
+    fn settle(&self, engine: &Engine, deadline: Instant, start: u64) -> Result<(), ErrorKind> {
+        let spin = || {
+            engine.servo().spin_event_loop();
+            std::thread::sleep(POLL_INTERVAL);
+        };
         wait_until(
             deadline,
             || {
@@ -735,57 +770,77 @@ impl CurrentPage {
                     .then_some(())
             },
             || self.delegate.crashed.get(),
-            || {
-                engine.servo().spin_event_loop();
-                std::thread::sleep(POLL_INTERVAL);
-            },
-        )?;
-        let until = Instant::now() + ACT_SETTLE;
-        while Instant::now() < until.min(deadline) {
-            engine.servo().spin_event_loop();
-            std::thread::sleep(POLL_INTERVAL);
+            spin,
+        )
+        .map_err(PageError::kind)?;
+        let until = (Instant::now() + ACT_SETTLE).min(deadline);
+        while Instant::now() < until && !self.delegate.navigation_requested.get() {
+            spin();
+        }
+        if self.delegate.navigation_requested.get() {
+            wait_until(
+                deadline,
+                || (self.delegate.doc_seq.get() != start).then_some(()),
+                || self.delegate.crashed.get(),
+                spin,
+            )
+            .map_err(PageError::kind)?;
         }
         Ok(())
     }
 
-    /// 要素をクリックする（設計 §14.4）。WebDriver の `ElementClick` で、画面に入れたうえで他の要素
-    /// （iframe を含む）に隠れていないことをページが偽れない形で確かめ、`ScrollAndGetBoundingClientRect` の
-    /// 中心へマウスの入力イベントを送る。どちらかが失敗した、または中心が画面の外なら `not_actionable`。
+    /// クリックしてよいかを WebDriver の `ElementClick` で確かめる（要素を画面に入れ、他の要素〔iframe を含む〕に
+    /// 隠れていないことをページが偽れない形で調べる。`option` 以外では副作用はスクロールだけ）。`option` は Servo が
+    /// 選択とイベントまで済ませてしまうため `not_actionable`（`select` を使う）。
+    fn check_clickable(
+        &self,
+        engine: &Engine,
+        element: &str,
+        deadline: Instant,
+    ) -> Result<(), ErrorKind> {
+        let (tx, rx) = channel().ok_or(ErrorKind::Internal)?;
+        let r = self.webdriver(
+            engine,
+            deadline,
+            WebDriverScriptCommand::ElementClick(element.to_owned(), tx),
+            || reply(rx.try_recv()),
+        )?;
+        match r {
+            Ok(Some(_)) => Ok(()),
+            _ => Err(ErrorKind::NotActionable),
+        }
+    }
+
+    /// 要素をクリックする（設計 §14.4）。[`Self::check_clickable`] と同じ点（WebDriver の
+    /// `GetElementInViewCenterPoint`。最初の矩形を画面で切り取った中心）へ、マウスの入力イベントを送る。
     fn click(&self, engine: &Engine, element: &str, deadline: Instant) -> Result<(), ErrorKind> {
-        let id = element.to_owned();
-        let clicked = {
-            let (tx, rx) = channel().ok_or(ErrorKind::Internal)?;
-            self.webdriver(
-                engine,
-                deadline,
-                WebDriverScriptCommand::ElementClick(id, tx),
-                || rx.try_recv().ok(),
-            )
-        }
-        .map_err(PageError::kind)?;
-        clicked.map_err(|_| ErrorKind::NotActionable)?;
-        let id = element.to_owned();
-        let rect = {
-            let (tx, rx) = channel().ok_or(ErrorKind::Internal)?;
-            self.webdriver(
-                engine,
-                deadline,
-                WebDriverScriptCommand::ScrollAndGetBoundingClientRect(id, tx),
-                || rx.try_recv().ok(),
-            )
-        }
-        .map_err(PageError::kind)?
-        .map_err(|_| ErrorKind::NotActionable)?;
-        let c = rect.center();
-        let (w, h) = (VIEWPORT.0 as f32, VIEWPORT.1 as f32);
-        if !(c.x.is_finite()
-            && c.y.is_finite()
-            && (0.0..w).contains(&c.x)
-            && (0.0..h).contains(&c.y))
-        {
+        self.check_clickable(engine, element, deadline)?;
+        // 一回限りの受け口は待ち時間つきで受け取れないため、別のスレッドで受けて渡す。
+        let (tx, rx) = oneshot().ok_or(ErrorKind::Internal)?;
+        let (done, got) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = done.send(rx.recv().ok());
+        });
+        let point = self.webdriver(
+            engine,
+            deadline,
+            WebDriverScriptCommand::GetElementInViewCenterPoint(element.to_owned(), tx),
+            || match got.try_recv() {
+                Ok(Some(v)) => Some(Ok(v)),
+                Ok(None) | Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    Some(Err(ErrorKind::Stale))
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => None,
+            },
+        )?;
+        let Ok(Some((x, y))) = point else {
+            return Err(ErrorKind::NotActionable);
+        };
+        if !(0..i64::from(VIEWPORT.0)).contains(&x) || !(0..i64::from(VIEWPORT.1)).contains(&y) {
             return Err(ErrorKind::NotActionable);
         }
-        let point = WebViewPoint::Page(c.cast_unit());
+        // CSS px の点（`Point2D<f32, CSSPixel>`。euclid は再輸出されないため、再輸出された型から単位を付け替える）。
+        let point = WebViewPoint::Page(servo::DevicePoint::new(x as f32, y as f32).cast_unit());
         self.send_input(InputEvent::MouseMove(MouseMoveEvent::new(point)));
         for action in [MouseButtonAction::Down, MouseButtonAction::Up] {
             self.send_input(InputEvent::MouseButton(MouseButtonEvent::new(
@@ -797,17 +852,21 @@ impl CurrentPage {
         Ok(())
     }
 
-    /// 要素にフォーカスがあるか（自己申告。設計 §14.4 の「入力の前後でフォーカスが対象にあるか」）。
+    /// 要素にフォーカスがあるか（WebDriver の `GetActiveElement`。ページの JS を通らない）。
     fn focused(
         &self,
         engine: &Engine,
         element: &str,
         deadline: Instant,
     ) -> Result<bool, ErrorKind> {
-        let v = self
-            .evaluate(engine, act::focus_script(element), deadline)
-            .map_err(PageError::kind)?;
-        Ok(matches!(v, JSValue::Boolean(true)))
+        let (tx, rx) = channel().ok_or(ErrorKind::Internal)?;
+        let active = self.webdriver(
+            engine,
+            deadline,
+            WebDriverScriptCommand::GetActiveElement(tx),
+            || reply(rx.try_recv()),
+        )?;
+        Ok(active.as_deref() == Some(element))
     }
 
     /// キーを 1 回押して離す（入力イベント。JS へ連結しない）。
@@ -820,7 +879,8 @@ impl CurrentPage {
         }
     }
 
-    /// `act` の操作の本体。照合 → 操作 → 入力の処理が済むまで待つ（設計 §14.4 の検査の順）。
+    /// `act` の操作の本体。照合 → 操作してよいかの検査 → 操作 → 入力の処理が済むまで待つ（設計 §14.4 の検査の順）。
+    /// 副作用（値の消去・選択）は、操作してよいかを確かめてから行う。
     fn perform(
         &self,
         engine: &Engine,
@@ -828,6 +888,7 @@ impl CurrentPage {
         p: &ActParams,
         key: Option<&Key>,
         deadline: Instant,
+        start: u64,
     ) -> Result<(), ErrorKind> {
         let v = self
             .evaluate(engine, act::expect_script(element, &p.expect), deadline)
@@ -837,51 +898,54 @@ impl CurrentPage {
             ExpectOutcome::Stale => return Err(ErrorKind::Stale),
             ExpectOutcome::Disabled => return Err(ErrorKind::NotActionable),
         }
+        self.delegate.navigation_requested.set(false);
         match &p.action {
             Action::Click => self.click(engine, element, deadline)?,
             Action::Fill { text } => {
-                // 既存の値を消してからフォーカスを移し、1 文字ずつキーの入力イベントで渡す（JS へ連結しない）。
-                let id = element.to_owned();
-                {
-                    let (tx, rx) = channel().ok_or(ErrorKind::Internal)?;
-                    self.webdriver(
-                        engine,
-                        deadline,
-                        WebDriverScriptCommand::ElementClear(id, tx),
-                        || rx.try_recv().ok(),
-                    )
-                }
-                .map_err(PageError::kind)?
+                // 操作してよいかを確かめてから既存の値を消し（WebDriver の `ElementClear`。フォーカスが外れる）、
+                // クリックでフォーカスを移して 1 文字ずつキーの入力イベントで渡す（JS へ連結しない）。
+                self.check_clickable(engine, element, deadline)?;
+                let (tx, rx) = channel().ok_or(ErrorKind::Internal)?;
+                self.webdriver(
+                    engine,
+                    deadline,
+                    WebDriverScriptCommand::ElementClear(element.to_owned(), tx),
+                    || reply(rx.try_recv()),
+                )?
                 .map_err(|_| ErrorKind::NotActionable)?;
                 self.click(engine, element, deadline)?;
-                self.settle(engine, deadline).map_err(PageError::kind)?;
+                self.settle(engine, deadline, start)?;
                 if !self.focused(engine, element, deadline)? {
                     return Err(ErrorKind::NotActionable);
                 }
                 for ch in text.chars() {
                     self.press(&Key::Character(ch.to_string()));
                 }
-                self.settle(engine, deadline).map_err(PageError::kind)?;
+                self.settle(engine, deadline, start)?;
                 if !self.focused(engine, element, deadline)? {
                     return Err(ErrorKind::NotActionable);
                 }
             }
             Action::Select { values } => {
-                // 単一選択の `select` は WebDriver の命令では選べないため、スクリプトで設定する（`act::select_script`）。
+                // 操作してよいかを確かめてから、スクリプトで選択肢を設定する（単一選択の `select` は WebDriver の
+                // 命令では選べない。`act::select_script`）。
+                self.check_clickable(engine, element, deadline)?;
                 let v = self
                     .evaluate(engine, act::select_script(element, values), deadline)
                     .map_err(PageError::kind)?;
                 match v {
                     JSValue::String(s) if s == "ok" => {}
                     JSValue::String(s) if s == "stale" => return Err(ErrorKind::Stale),
+                    JSValue::String(s) if s == "multi" => return Err(ErrorKind::InvalidParams),
                     _ => return Err(ErrorKind::NotActionable),
                 }
             }
             Action::Press { .. } => {
+                // フォーカスが無ければクリックで移す（リンクの遷移・チェックボックスの反転などクリックの副作用も起きる）。
                 let key = key.ok_or(ErrorKind::InvalidParams)?;
                 if !self.focused(engine, element, deadline)? {
                     self.click(engine, element, deadline)?;
-                    self.settle(engine, deadline).map_err(PageError::kind)?;
+                    self.settle(engine, deadline, start)?;
                     if !self.focused(engine, element, deadline)? {
                         return Err(ErrorKind::NotActionable);
                     }
@@ -889,7 +953,7 @@ impl CurrentPage {
                 self.press(key);
             }
         }
-        self.settle(engine, deadline).map_err(PageError::kind)
+        self.settle(engine, deadline, start)
     }
 }
 

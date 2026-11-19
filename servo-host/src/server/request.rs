@@ -209,6 +209,13 @@ fn parse_params(method: Method, p: &Map<String, Value>) -> Result<Request, Error
     }
 }
 
+/// バイト数が `min..=max` の文字列（設計 §14.6・hello の `*_bytes` の上限。本体と同じくバイトで数える。
+/// バイトで収まればスキーマの `maxLength`〔文字数〕も満たす）。
+fn bytes_in(v: Option<&Value>, min: usize, max: usize) -> Option<&str> {
+    let s = v?.as_str()?;
+    (min..=max).contains(&s.len()).then_some(s)
+}
+
 /// 文字数（JSON Schema の `maxLength` と同じく Unicode のスカラー値で数える）が `min..=max` の文字列。
 fn str_in(v: Option<&Value>, min: usize, max: usize) -> Option<&str> {
     let s = v?.as_str()?;
@@ -259,7 +266,7 @@ fn parse_act(p: &Map<String, Value>) -> Option<ActParams> {
                 return None;
             }
             Action::Fill {
-                text: str_in(a.get("text"), 0, MAX_FILL_TEXT_BYTES)?.to_owned(),
+                text: bytes_in(a.get("text"), 0, MAX_FILL_TEXT_BYTES)?.to_owned(),
             }
         }
         "select" if has_only_keys(a, &["kind", "values"]) => {
@@ -269,7 +276,7 @@ fn parse_act(p: &Map<String, Value>) -> Option<ActParams> {
             }
             let values = vs
                 .iter()
-                .map(|v| str_in(Some(v), 0, MAX_SELECT_VALUE_BYTES).map(str::to_owned))
+                .map(|v| bytes_in(Some(v), 0, MAX_SELECT_VALUE_BYTES).map(str::to_owned))
                 .collect::<Option<Vec<_>>>()?;
             Action::Select { values }
         }
@@ -294,7 +301,7 @@ fn parse_wait(p: &Map<String, Value>) -> Option<WaitParams> {
     let page = parse_page(p.get("page"))?;
     let ms = as_uint(p.get("timeout_ms")?, WAIT_TIMEOUT_MAX_MS).filter(|ms| *ms >= 1)?;
     let c = p.get("condition")?.as_object()?;
-    let text = |k: &str| str_in(c.get(k), 1, MAX_WAIT_CONDITION_BYTES).map(str::to_owned);
+    let text = |k: &str| bytes_in(c.get(k), 1, MAX_WAIT_CONDITION_BYTES).map(str::to_owned);
     let condition = match c.get("kind")?.as_str()? {
         "selector_present" if has_only_keys(c, &["kind", "selector"]) => {
             WaitCondition::SelectorPresent(text("selector")?)
