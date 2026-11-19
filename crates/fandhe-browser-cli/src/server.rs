@@ -1018,6 +1018,56 @@ pub(crate) mod tests {
         }
     }
 
+    /// SEC-4・TASK-127 の受け入れ条件: `bind` は loopback 以外のアドレスを bind の前に拒否する（`/ai/navigate`
+    /// を足しても、外のインターフェースへ出す経路を作らない）。
+    #[tokio::test]
+    async fn sec4_bind_rejects_non_loopback() {
+        let dir = support::TempDir::new();
+        let app = open_app_state(&support::FixedStore(dir.path.clone())).unwrap();
+        for addr in ["0.0.0.0:0", "[::]:0"] {
+            match bind(&app, addr.parse().unwrap(), default_router_factories()).await {
+                Err(StartupError::NonLoopbackAddr) => {}
+                Err(e) => panic!("{addr}: unexpected error: {e}"),
+                Ok(_) => panic!("{addr}: must not bind"),
+            }
+        }
+    }
+
+    /// 定例の撮影用の内部の入口（TASK-127・#1616。2026-11-19 のオーナー判断で、cli の `#[ignore]` テストにした。
+    /// 公開しない。操作モードの設定キーは TASK-131 まで受理しない）。
+    ///
+    /// 実ホスト（`FANDHE_BROWSER_RENDER_HOST`）を egress 隔離つき（`required`）でつなぎ、操作モードを許した
+    /// 本体を loopback に立てて、止められるまで待つ。bind 先は `127.0.0.1` 固定で、ポートは
+    /// `FANDHE_INTERACTIVE_DEMO_PORT`（省略時は OS の割り当て）。手順は issue と PR に書き、README には書かない。
+    #[tokio::test]
+    #[ignore = "manual: interactive demo server (TASK-127). Needs FANDHE_BROWSER_RENDER_HOST"]
+    async fn interactive_demo_server() {
+        use fandhe_browser_core::EgressIsolationMode;
+        use fandhe_browser_profile::ProfileStore;
+        let renderer =
+            crate::render_host::renderer_from_process(None, EgressIsolationMode::Required)
+                .expect("render host (set FANDHE_BROWSER_RENDER_HOST)");
+        let dir = support::TempDir::new();
+        let profile = support::FixedStore(dir.path.clone())
+            .open_or_create()
+            .expect("profile");
+        let app =
+            Arc::new(AppState::new(Arc::new(profile), renderer).allow_interactive_for_tests());
+        let port: u16 = std::env::var("FANDHE_INTERACTIVE_DEMO_PORT")
+            .ok()
+            .and_then(|p| p.parse().ok())
+            .unwrap_or(0);
+        let addr = SocketAddr::from(([127, 0, 0, 1], port));
+        let (bound, _cdp) = bind(&app, addr, default_router_factories())
+            .await
+            .expect("bind");
+        eprintln!(
+            "interactive demo listening on http://{}",
+            bound.local_addr().expect("addr")
+        );
+        bound.run().await.expect("serve");
+    }
+
     pub(crate) mod support {
         use std::path::PathBuf;
         use std::sync::atomic::{AtomicUsize, Ordering};
