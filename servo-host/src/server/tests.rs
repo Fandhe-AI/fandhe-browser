@@ -52,6 +52,8 @@ impl Handler for FakeHandler {
                 Method::Visibility,
                 Method::BoundingBox,
                 Method::DomSnapshot,
+                Method::Act,
+                Method::Wait,
                 Method::Shutdown,
             ]
         } else {
@@ -84,6 +86,17 @@ impl Handler for FakeHandler {
             shadow_roots: 0,
             redacted: 1,
         })
+    }
+    fn act(&mut self, _p: &ActParams) -> Result<ActResult, HandlerError> {
+        self.record("act")?;
+        Ok(ActResult {
+            page: page_info(),
+            navigated: false,
+        })
+    }
+    fn wait(&mut self, _p: &WaitParams) -> Result<WaitResult, HandlerError> {
+        self.record("wait")?;
+        Ok(WaitResult { page: page_info() })
     }
     fn screenshot(&mut self, _p: &ScreenshotParams) -> Result<ScreenshotResult, HandlerError> {
         self.record("screenshot")?;
@@ -661,6 +674,60 @@ fn dom_snapshot_is_unsupported_without_interactive() {
     );
 }
 
+/// RENDER-10・AISNAP-18・TASK-126: `--interactive` でないホストは act・wait を unsupported で返し、ハンドラを呼ばず、
+/// capabilities と limits にも載せない。
+#[test]
+fn act_and_wait_are_unsupported_without_interactive() {
+    let page = json!({"session":"s","doc_seq":1});
+    let input = [
+        jframe(&json!({"v":1,"id":5,"method":"act","params":{"page":page,"snapshot":"s1","node":0,"expect":{"tag":"button"},"action":{"kind":"click"}}})),
+        jframe(&json!({"v":1,"id":6,"method":"wait","params":{"page":page,"condition":{"kind":"load_complete"},"timeout_ms":100}})),
+    ]
+    .concat();
+    let (r, calls) = run(input);
+    for (i, id) in [(1, 5), (2, 6)] {
+        assert_eq!(
+            r.frames[i],
+            json!({"v":1,"id":id,"error":{"kind":"unsupported","message":"Method is not supported."}})
+        );
+    }
+    assert!(calls.is_empty());
+    let caps = r.frames[0]["data"]["capabilities"].as_array().unwrap();
+    assert!(!caps.contains(&json!("act")) && !caps.contains(&json!("wait")));
+    assert!(
+        r.frames[0]["data"]["limits"]
+            .get("act_timeout_ms")
+            .is_none()
+    );
+}
+
+/// RENDER-10・TASK-126: `fill` の `text`・`wait` の条件の上限はバイトで数える（本体と同じ）。多バイトで上限を超える
+/// 要求は invalid_params で、ハンドラを呼ばない。
+#[test]
+fn interactive_byte_limits_count_utf8_bytes() {
+    let page = json!({"session":"s","doc_seq":1});
+    let (mut h, calls) = interactive();
+    let input = [
+        jframe(&json!({"v":1,"id":1,"method":"act","params":{"page":page,"snapshot":"s1","node":0,"expect":{"tag":"input"},"action":{"kind":"fill","text":"あ".repeat(2731)}}})),
+        jframe(&json!({"v":1,"id":2,"method":"act","params":{"page":page,"snapshot":"s1","node":0,"expect":{"tag":"input"},"action":{"kind":"fill","text":"あ".repeat(2730)}}})),
+        jframe(&json!({"v":1,"id":3,"method":"wait","params":{"page":page,"condition":{"kind":"text_present","text":"あ".repeat(342)},"timeout_ms":100}})),
+    ]
+    .concat();
+    let r = run_with(&mut h, input);
+    assert_eq!(
+        r.frames[1]["error"]["kind"], "invalid_params",
+        "{}",
+        r.frames[1]
+    );
+    assert!(r.frames[2]["result"].is_object(), "{}", r.frames[2]);
+    assert_eq!(
+        r.frames[3]["error"]["kind"], "invalid_params",
+        "{}",
+        r.frames[3]
+    );
+    assert_eq!(calls.borrow().clone(), vec!["act"]);
+}
+
 /// RENDER-11・TASK-122: 操作モードのホストは dom_snapshot を載せ、上限を申告し、結果をスキーマの形で返す。
 #[test]
 fn interactive_host_serves_dom_snapshot() {
@@ -723,21 +790,25 @@ fn dom_snapshot_over_frame_limit_is_too_large() {
     assert_eq!(r.frames[2]["result"]["visible"], true);
 }
 
-/// TASK-121・TASK-122: 操作モードの契約 fixture（`interactive/` の dom_snapshot の要求）をホストへ通す。
-/// 正常な要求はハンドラを呼び、不正な要求は invalid_params で返す。
+/// TASK-121・TASK-122・TASK-126: 操作モードの契約 fixture（`interactive/` の dom_snapshot・act・wait の要求）を
+/// ホストへ通す。正常な要求は対応するハンドラを呼び、不正な要求は invalid_params で返してハンドラを呼ばない。
 #[test]
-fn interactive_dom_snapshot_fixtures_match_host_behavior() {
+fn interactive_request_fixtures_match_host_behavior() {
     let dir = fixture_dir().join("interactive");
-    let mut seen = 0;
+    let mut seen = std::collections::BTreeMap::new();
     for e in std::fs::read_dir(&dir).unwrap() {
         let path = e.unwrap().path();
         let name = path.file_name().unwrap().to_str().unwrap().to_owned();
-        if !name.starts_with("request-dom-snapshot-") {
+        let Some(method) = ["dom-snapshot", "act", "wait"]
+            .into_iter()
+            .find(|m| name.starts_with(&format!("request-{m}-")))
+        else {
             continue;
-        }
+        };
         let fx: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         let (mut h, calls) = interactive();
         let r = run_with(&mut h, jframe(&fx["message"]));
+        let call = method.replace('-', "_");
         match fx["expect"].as_str().unwrap() {
             "valid" => {
                 assert!(
@@ -745,14 +816,40 @@ fn interactive_dom_snapshot_fixtures_match_host_behavior() {
                     "{name}: {}",
                     r.frames[1]
                 );
-                assert_eq!(calls.borrow().clone(), vec!["dom_snapshot"], "{name}");
+                assert_eq!(calls.borrow().clone(), vec![call.as_str()], "{name}");
             }
             _ => {
                 assert_eq!(r.frames[1]["error"]["kind"], "invalid_params", "{name}");
                 assert!(calls.borrow().is_empty(), "{name}");
             }
         }
-        seen += 1;
+        *seen.entry(method).or_insert(0) += 1;
     }
-    assert!(seen >= 2, "too few dom_snapshot fixtures: {seen}");
+    assert!(seen.get("dom-snapshot") >= Some(&2), "{seen:?}");
+    assert!(seen.get("act") >= Some(&10), "{seen:?}");
+    assert!(seen.get("wait") >= Some(&6), "{seen:?}");
+}
+
+/// TASK-126: 操作モードのホストの hello は、fixture `hello-interactive-ok` と同じ capabilities・limits を申告する。
+#[test]
+fn interactive_hello_matches_fixture() {
+    let (mut h, _calls) = interactive();
+    let r = run_with(&mut h, Vec::new());
+    let fx = load_fixture("interactive/hello-interactive-ok.json");
+    // capabilities は集合として比べる（並びは契約に含めない）。
+    let set = |v: &Value| {
+        v.as_array()
+            .unwrap()
+            .iter()
+            .map(|x| x.as_str().unwrap().to_owned())
+            .collect::<std::collections::BTreeSet<_>>()
+    };
+    assert_eq!(
+        set(&r.frames[0]["data"]["capabilities"]),
+        set(&fx["message"]["data"]["capabilities"])
+    );
+    assert_eq!(
+        r.frames[0]["data"]["limits"],
+        fx["message"]["data"]["limits"]
+    );
 }

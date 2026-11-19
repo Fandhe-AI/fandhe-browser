@@ -10,6 +10,8 @@
 //! 操作モード（`--interactive`。TASK-122・設計 §14）では、DOM の取得（`dom_snapshot`）も同じ経路で行い
 //! （直列化のスクリプトと結果の解釈は `dom`）、ページ識別子（起動ごとの `session` と文書番号 `doc_seq`）を持つ。
 //! `doc_seq` は `load`・URL 変更の通知・新しい文書の読み込みの開始で上げる（#1582 の判断 A）。
+//! 操作（`act`）と待機（`wait`）も同じ現在ページの上で行う（TASK-126。スクリプトは `act`、クリックの判定は
+//! WebDriver の命令〔`servo-base` の受け口〕。設計 §14.4・§14.5）。
 //!
 //! 待機の方針（PoC-13 の失敗の再発防止）: 条件は「`LoadStatus::Complete` かつ受信フレーム数が 1 以上」。
 //! Complete より前に届いたフレームも数え、「Complete より後の新しいフレーム」は要求しない
@@ -22,23 +24,32 @@
 //! （固定値で成功を装わない。`REPAIR-3`・`REPAIR-4`）。標準出力へは書かず、ログに URL・タイトル・
 //! クラッシュ理由を出さない（機密を含みうる。設計 §2.1）。
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
+use std::collections::HashSet;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use servo::{
-    JSValue, JavaScriptEvaluationError, LoadStatus, RgbaImage, ScreenshotCaptureError, ServoUrl,
-    WebView, WebViewBuilder, WebViewDelegate,
+    InputEvent, InputEventId, InputEventResult, JSValue, JavaScriptEvaluationError, Key, KeyState,
+    KeyboardEvent, LoadStatus, MouseButton, MouseButtonAction, MouseButtonEvent, MouseMoveEvent,
+    RgbaImage, ScreenshotCaptureError, ServoUrl, WebDriverCommandMsg, WebDriverScriptCommand,
+    WebView, WebViewBuilder, WebViewDelegate, WebViewPoint,
 };
+use servo_base::generic_channel::{TryReceiveError, channel, oneshot};
+use servo_base::id::BrowsingContextId;
+
+use crate::act::{self, ConditionOutcome, ExpectOutcome};
+use crate::engine::VIEWPORT;
 
 use crate::dom;
 use crate::engine::{Engine, LoopbackProxy};
 use crate::layout;
 use crate::screenshot::{self, SCREENSHOT_TIMEOUT};
 use crate::server::{
-    BoundingBoxResult, DOM_SNAPSHOT_TIMEOUT_MS, DomSnapshotResult, ErrorKind, Handler,
-    HandlerError, LoadParams, LoadResult, MAX_URL_BYTES, Method, PageInfo, ScreenshotParams,
-    ScreenshotResult, SelectorParams, VisibilityResult, is_valid_url,
+    ACT_TIMEOUT_MS, ActParams, ActResult, Action, BoundingBoxResult, DOM_SNAPSHOT_TIMEOUT_MS,
+    DomSnapshotResult, ErrorKind, Handler, HandlerError, LoadParams, LoadResult, MAX_URL_BYTES,
+    Method, PageInfo, ScreenshotParams, ScreenshotResult, SelectorParams, VisibilityResult,
+    WaitCondition, WaitParams, WaitResult, is_valid_url,
 };
 
 /// イベントループのポーリング間隔（ビジーループにしない）。
@@ -123,6 +134,12 @@ struct PageDelegate {
     crashed: Cell<bool>,
     /// 文書番号（`doc_seq`）。[`ServoHandler`] と共有し、WebView を作り直しても続けて数える（設計 §14.2）。
     doc_seq: Rc<Cell<u64>>,
+    /// 送ったがまだ処理の済んでいない入力イベント（`act` が処理の完了を待つ。TASK-126）。
+    pending_inputs: RefCell<HashSet<InputEventId>>,
+    /// `act` の間に、ページから始まる遷移を許可したか（`navigated` の判定で読み込みの開始まで待つ。TASK-126）。
+    navigation_requested: Cell<bool>,
+    /// `act` の間に、扱わない要求（新しいウィンドウ・ファイル選択）が来たか（`unsupported` で返す。設計 §14.4）。
+    unsupported_requested: Cell<bool>,
 }
 
 impl PageDelegate {
@@ -147,6 +164,7 @@ impl WebViewDelegate for PageDelegate {
         // ページから始まる遷移の scheme を絞る（RENDER-10・TASK-120）。既定（drop）は許可になるため、
         // 許可・拒否を必ず明示する（fail-closed）。
         if crate::guard::navigation_allowed(request.url.as_str()) {
+            self.navigation_requested.set(true);
             request.allow();
         } else {
             request.deny();
@@ -164,6 +182,28 @@ impl WebViewDelegate for PageDelegate {
         if status == LoadStatus::Started {
             self.bump_doc_seq();
         }
+    }
+
+    fn request_create_new(&self, _parent: WebView, _request: servo::CreateNewWebViewRequest) {
+        // 新しいウィンドウは作らない（要求は捨てると拒否になる。ページから見ると `window.open` が `null`）。
+        self.unsupported_requested.set(true);
+    }
+
+    fn show_embedder_control(&self, _webview: WebView, control: servo::EmbedderControl) {
+        // ファイル選択は扱わない（捨てると「選ばなかった」になる）。`select` の選択肢・IME・ダイアログは既定の
+        // まま捨てる（ダイアログは 2026-11-19 の判断。#1592）。
+        if matches!(control, servo::EmbedderControl::FilePicker(_)) {
+            self.unsupported_requested.set(true);
+        }
+    }
+
+    fn notify_input_event_handled(
+        &self,
+        _webview: WebView,
+        event_id: InputEventId,
+        _result: InputEventResult,
+    ) {
+        self.pending_inputs.borrow_mut().remove(&event_id);
     }
 
     fn notify_crashed(&self, _webview: WebView, _reason: String, _backtrace: Option<String>) {
@@ -324,11 +364,9 @@ pub(crate) struct ServoHandler {
 
 /// `dom_snapshot` 1 回分の対応。ホストは最新の 1 件だけを持つ（設計 §14.4）。
 struct Snapshot {
-    // ponytail: act（TASK-126）が `id` と照合し、`element_ids` を `window.webdriverElement` で引き直す。
-    // それまでは保持だけで読まない。
-    #[allow(dead_code)]
+    /// `act` の `snapshot` と照合する識別子。
     id: String,
-    #[allow(dead_code)]
+    /// 番号の順の要素 ID（`JSValue::Element`）。`act` が照合と WebDriver の命令に使う。
     element_ids: Vec<String>,
 }
 
@@ -426,6 +464,8 @@ impl Handler for ServoHandler {
                 Method::Visibility,
                 Method::BoundingBox,
                 Method::DomSnapshot,
+                Method::Act,
+                Method::Wait,
             ]
         } else {
             &[
@@ -510,6 +550,127 @@ impl Handler for ServoHandler {
         })
     }
 
+    /// 要素を操作する（`RENDER-10`・TASK-126。設計 §14.4）。
+    ///
+    /// 検査の順: キーの解釈（`invalid_params`）→ 現在の URL（`invalid_state`）→ `page`・`snapshot`・番号（`stale`）
+    /// → 照合値（`stale`）・`disabled`（`not_actionable`）→ 操作 → 入力の処理の完了。入力文字・キーはログ・エラー・
+    /// 応答に出さない（応答は `page` と `navigated` だけ）。人の操作に見せる遅延・軌跡・乱数は入れない（`SEC-2`）。
+    /// 期限（[`ACT_TIMEOUT_MS`]）を過ぎたら `timeout`（本体はホストを破棄して `session_lost` にする。§14.6）。
+    fn act(&mut self, p: &ActParams) -> Result<ActResult, HandlerError> {
+        let key = match &p.action {
+            Action::Press { key } => {
+                Some(act::parse_key(key).ok_or(HandlerError(ErrorKind::InvalidParams))?)
+            }
+            _ => None,
+        };
+        let (Some(page), Some(engine)) = (self.page.as_ref(), self.engine.as_ref()) else {
+            return Err(HandlerError(ErrorKind::NotLoaded));
+        };
+        if page
+            .webview
+            .url()
+            .is_none_or(|u| !matches!(u.scheme(), "http" | "https"))
+        {
+            return Err(HandlerError(ErrorKind::InvalidState));
+        }
+        let start = self.doc_seq.get();
+        if p.page.session != self.session || p.page.doc_seq != start {
+            return Err(HandlerError(ErrorKind::Stale));
+        }
+        let element = self
+            .snapshot
+            .as_ref()
+            .filter(|s| s.id == p.snapshot)
+            .and_then(|s| s.element_ids.get(p.node))
+            .ok_or(HandlerError(ErrorKind::Stale))?
+            .clone();
+        let deadline = Instant::now() + Duration::from_millis(ACT_TIMEOUT_MS);
+        let result = page.perform(engine, &element, p, key.as_ref(), deadline, start);
+        if page.delegate.crashed.get() {
+            self.page = None;
+            return Err(HandlerError(ErrorKind::LoadFailed));
+        }
+        match result {
+            Ok(()) => {}
+            // 評価の途中で文書が消えた。遷移と重なったなら stale、そうでなければページを捨てて not_loaded
+            // （`run_query` と同じ扱い）。
+            Err(ErrorKind::NotLoaded) if self.doc_seq.get() != start => {
+                return Err(HandlerError(ErrorKind::Stale));
+            }
+            Err(ErrorKind::NotLoaded) => {
+                self.page = None;
+                return Err(HandlerError(ErrorKind::NotLoaded));
+            }
+            Err(e) => return Err(HandlerError(e)),
+        }
+        Ok(ActResult {
+            page: self.page_info(),
+            navigated: self.doc_seq.get() != start,
+        })
+    }
+
+    /// 条件の成立を待つ（`AISNAP-18`・TASK-126。設計 §14.5）。
+    ///
+    /// 成立すれば `page`、`timeout_ms` までに成立しなければ `timeout`（ホストは破棄しない）。待機中に文書が
+    /// 変わったら `stale`（`load_complete` を除く）。セレクタの構文が不正なら `invalid_params`。
+    fn wait(&mut self, p: &WaitParams) -> Result<WaitResult, HandlerError> {
+        let (Some(page), Some(engine)) = (self.page.as_ref(), self.engine.as_ref()) else {
+            return Err(HandlerError(ErrorKind::NotLoaded));
+        };
+        let start = self.doc_seq.get();
+        if p.page.session != self.session || p.page.doc_seq != start {
+            return Err(HandlerError(ErrorKind::Stale));
+        }
+        let deadline = Instant::now() + p.timeout;
+        let script = act::condition_script(&p.condition);
+        loop {
+            if page.delegate.crashed.get() {
+                self.page = None;
+                return Err(HandlerError(ErrorKind::LoadFailed));
+            }
+            let met = match &script {
+                None => page.webview.load_status() == LoadStatus::Complete,
+                Some(s) => {
+                    let until = deadline.min(Instant::now() + layout::QUERY_TIMEOUT);
+                    match page.evaluate(engine, s.clone(), until) {
+                        Ok(v) => match act::parse_condition(&v) {
+                            ConditionOutcome::Met => true,
+                            ConditionOutcome::NotYet => false,
+                            ConditionOutcome::Invalid => {
+                                return Err(HandlerError(ErrorKind::InvalidParams));
+                            }
+                        },
+                        // 文書の入れ替えの途中は評価できないことがある。文書番号の検査に任せる。
+                        Err(PageError::DocumentGone | PageError::Script) => false,
+                        Err(PageError::Timeout) => false,
+                        Err(e) => {
+                            if e == PageError::Crashed {
+                                self.page = None;
+                            }
+                            return Err(HandlerError(e.kind()));
+                        }
+                    }
+                }
+            };
+            if !matches!(p.condition, WaitCondition::LoadComplete) && self.doc_seq.get() != start {
+                return Err(HandlerError(ErrorKind::Stale));
+            }
+            if met {
+                return Ok(WaitResult {
+                    page: self.page_info(),
+                });
+            }
+            if Instant::now() >= deadline {
+                return Err(HandlerError(ErrorKind::Timeout));
+            }
+            let until = (Instant::now() + WAIT_POLL).min(deadline);
+            while Instant::now() < until {
+                engine.servo().spin_event_loop();
+                std::thread::sleep(POLL_INTERVAL);
+            }
+        }
+    }
+
     /// 現在ページのビューポート（固定 1280x800）を PNG の base64 で返す（`RENDER-3`・TASK-38.3）。
     ///
     /// 将来仕様: `full_page=true` は文書の高さに合わせた撮影が要り、固定ビューポート（設計 §2.3・
@@ -554,6 +715,280 @@ impl Handler for ServoHandler {
             layout::bounding_box_script(&p.selector).map_err(|e| HandlerError(e.kind()))?;
         let value = self.run_query(script)?;
         layout::parse_bounding_box(value).map_err(|e| HandlerError(e.kind()))
+    }
+}
+
+/// 待機の間にイベントループを回す間隔（`wait` の条件を調べ直す間隔でもある）。
+const WAIT_POLL: Duration = Duration::from_millis(50);
+/// 入力イベントの処理が済んでから、遷移の要求の通知を受け取るために回す時間。
+const ACT_SETTLE: Duration = Duration::from_millis(100);
+/// 遷移の要求を許可した後、新しい文書の読み込みの開始を待つ上限。`act` は読み込みを待たない（設計 §14.6）ため
+/// 短く切り、過ぎたらその時点の文書番号で `navigated` を返す（最善努力。応答の遅い遷移・iframe の遷移・
+/// 文書のできない応答では偽になりうる）。
+const ACT_NAVIGATION_WAIT: Duration = Duration::from_secs(2);
+
+/// WebDriver の命令の答えを 1 回受け取る。まだ来ていなければ `None`、受け口が切れていれば `stale`
+/// （閲覧文脈が入れ替わって命令が捨てられた。遷移と重なった場合）。
+fn reply<T>(r: Result<T, TryReceiveError>) -> Option<Result<T, ErrorKind>> {
+    match r {
+        Ok(v) => Some(Ok(v)),
+        Err(TryReceiveError::Empty) => None,
+        Err(_) => Some(Err(ErrorKind::Stale)),
+    }
+}
+
+impl CurrentPage {
+    /// WebDriver の命令（ページの JS を通らない Rust 側の判定）を送り、`deadline` まで答えを待つ。受け口は
+    /// 呼び出し側が `servo-base` の `channel()` で作る（答えの型を命令から推論させ、`ErrorStatus` を名指ししない
+    /// ため `webdriver` crate の依存が要らない）。
+    fn webdriver<R>(
+        &self,
+        engine: &Engine,
+        deadline: Instant,
+        command: WebDriverScriptCommand,
+        recv: impl FnMut() -> Option<Result<R, ErrorKind>>,
+    ) -> Result<R, ErrorKind> {
+        engine
+            .servo()
+            .execute_webdriver_command(WebDriverCommandMsg::ScriptCommand(
+                BrowsingContextId::from(self.webview.id()),
+                command,
+            ));
+        wait_until(
+            deadline,
+            recv,
+            || self.delegate.crashed.get(),
+            || {
+                engine.servo().spin_event_loop();
+                std::thread::sleep(POLL_INTERVAL);
+            },
+        )
+        .map_err(PageError::kind)?
+    }
+
+    /// 入力イベントを送り、処理が済んだかを [`PageDelegate::pending_inputs`] で追えるように記録する。
+    fn send_input(&self, event: InputEvent) {
+        let id = self.webview.notify_input_event(event);
+        self.delegate.pending_inputs.borrow_mut().insert(id);
+    }
+
+    /// 送った入力イベントの処理がすべて済むまで待つ。その後、遷移の要求が来ていれば新しい文書の読み込みの
+    /// 開始（文書番号の更新）まで待ち、来ていなければ要求の通知を受け取る分だけ回す（`navigated` の判定）。
+    fn settle(&self, engine: &Engine, deadline: Instant, start: u64) -> Result<(), ErrorKind> {
+        let spin = || {
+            engine.servo().spin_event_loop();
+            std::thread::sleep(POLL_INTERVAL);
+        };
+        wait_until(
+            deadline,
+            || {
+                self.delegate
+                    .pending_inputs
+                    .borrow()
+                    .is_empty()
+                    .then_some(())
+            },
+            || self.delegate.crashed.get(),
+            spin,
+        )
+        .map_err(PageError::kind)?;
+        let until = (Instant::now() + ACT_SETTLE).min(deadline);
+        while Instant::now() < until && !self.delegate.navigation_requested.get() {
+            spin();
+        }
+        if self.delegate.navigation_requested.replace(false) {
+            let until = (Instant::now() + ACT_NAVIGATION_WAIT).min(deadline);
+            while Instant::now() < until
+                && self.delegate.doc_seq.get() == start
+                && !self.delegate.crashed.get()
+            {
+                spin();
+            }
+        }
+        Ok(())
+    }
+
+    /// クリックしてよいかを WebDriver の `ElementClick` で確かめる（要素を画面に入れ、他の要素〔iframe を含む〕に
+    /// 隠れていないことをページが偽れない形で調べる。`option` 以外では副作用はスクロールだけ）。`option` は Servo が
+    /// 選択とイベントまで済ませてしまうため `not_actionable`（`select` を使う）。
+    fn check_clickable(
+        &self,
+        engine: &Engine,
+        element: &str,
+        deadline: Instant,
+    ) -> Result<(), ErrorKind> {
+        let (tx, rx) = channel().ok_or(ErrorKind::Internal)?;
+        let r = self.webdriver(
+            engine,
+            deadline,
+            WebDriverScriptCommand::ElementClick(element.to_owned(), tx),
+            || reply(rx.try_recv()),
+        )?;
+        match r {
+            Ok(Some(_)) => Ok(()),
+            _ => Err(ErrorKind::NotActionable),
+        }
+    }
+
+    /// 要素をクリックする（設計 §14.4）。[`Self::check_clickable`] と同じ点（WebDriver の
+    /// `GetElementInViewCenterPoint`。最初の矩形を画面で切り取った中心）へ、マウスの入力イベントを送る。
+    fn click(&self, engine: &Engine, element: &str, deadline: Instant) -> Result<(), ErrorKind> {
+        self.check_clickable(engine, element, deadline)?;
+        // 一回限りの受け口は待ち時間つきで受け取れないため、別のスレッドで受けて渡す。
+        let (tx, rx) = oneshot().ok_or(ErrorKind::Internal)?;
+        let (done, got) = std::sync::mpsc::channel();
+        std::thread::Builder::new()
+            .spawn(move || {
+                let _ = done.send(rx.recv().ok());
+            })
+            .map_err(|_| ErrorKind::Internal)?;
+        let point = self.webdriver(
+            engine,
+            deadline,
+            WebDriverScriptCommand::GetElementInViewCenterPoint(element.to_owned(), tx),
+            || match got.try_recv() {
+                Ok(Some(v)) => Some(Ok(v)),
+                Ok(None) | Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    Some(Err(ErrorKind::Stale))
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => None,
+            },
+        )?;
+        let Ok(Some((x, y))) = point else {
+            return Err(ErrorKind::NotActionable);
+        };
+        if !(0..i64::from(VIEWPORT.0)).contains(&x) || !(0..i64::from(VIEWPORT.1)).contains(&y) {
+            return Err(ErrorKind::NotActionable);
+        }
+        // CSS px の点（`Point2D<f32, CSSPixel>`。euclid は再輸出されないため、再輸出された型から単位を付け替える）。
+        let point = WebViewPoint::Page(servo::DevicePoint::new(x as f32, y as f32).cast_unit());
+        self.send_input(InputEvent::MouseMove(MouseMoveEvent::new(point)));
+        for action in [MouseButtonAction::Down, MouseButtonAction::Up] {
+            self.send_input(InputEvent::MouseButton(MouseButtonEvent::new(
+                action,
+                MouseButton::Primary,
+                point,
+            )));
+        }
+        Ok(())
+    }
+
+    /// 要素にフォーカスがあるか（WebDriver の `GetActiveElement`。ページの JS を通らない）。
+    fn focused(
+        &self,
+        engine: &Engine,
+        element: &str,
+        deadline: Instant,
+    ) -> Result<bool, ErrorKind> {
+        let (tx, rx) = channel().ok_or(ErrorKind::Internal)?;
+        let active = self.webdriver(
+            engine,
+            deadline,
+            WebDriverScriptCommand::GetActiveElement(tx),
+            || reply(rx.try_recv()),
+        )?;
+        Ok(active.as_deref() == Some(element))
+    }
+
+    /// キーを 1 回押して離す（入力イベント。JS へ連結しない）。
+    fn press(&self, key: &Key) {
+        for state in [KeyState::Down, KeyState::Up] {
+            self.send_input(InputEvent::Keyboard(KeyboardEvent::from_state_and_key(
+                state,
+                key.clone(),
+            )));
+        }
+    }
+
+    /// `act` の操作の本体。照合 → 操作してよいかの検査 → 操作 → 入力の処理が済むまで待つ（設計 §14.4 の検査の順）。
+    /// 副作用（値の消去・選択）は、操作してよいかを確かめてから行う。
+    fn perform(
+        &self,
+        engine: &Engine,
+        element: &str,
+        p: &ActParams,
+        key: Option<&Key>,
+        deadline: Instant,
+        start: u64,
+    ) -> Result<(), ErrorKind> {
+        let v = self
+            .evaluate(engine, act::expect_script(element, &p.expect), deadline)
+            .map_err(PageError::kind)?;
+        match act::parse_expect(&v) {
+            ExpectOutcome::Ok => {}
+            ExpectOutcome::Stale => return Err(ErrorKind::Stale),
+            ExpectOutcome::Disabled => return Err(ErrorKind::NotActionable),
+        }
+        self.delegate.navigation_requested.set(false);
+        self.delegate.unsupported_requested.set(false);
+        // `option` は WebDriver の `ElementClick` が選択とイベントまで行うため、命令を送る前に断る（`select` は
+        // `select` 要素を対象にする）。
+        if p.expect.tag == "option" {
+            return Err(ErrorKind::NotActionable);
+        }
+        match &p.action {
+            Action::Click => self.click(engine, element, deadline)?,
+            Action::Fill { text } => {
+                // 操作してよいかを確かめてから既存の値を消し（WebDriver の `ElementClear`。フォーカスが外れる）、
+                // クリックでフォーカスを移して 1 文字ずつキーの入力イベントで渡す（JS へ連結しない）。
+                self.check_clickable(engine, element, deadline)?;
+                let (tx, rx) = channel().ok_or(ErrorKind::Internal)?;
+                self.webdriver(
+                    engine,
+                    deadline,
+                    WebDriverScriptCommand::ElementClear(element.to_owned(), tx),
+                    || reply(rx.try_recv()),
+                )?
+                .map_err(|_| ErrorKind::NotActionable)?;
+                self.click(engine, element, deadline)?;
+                self.settle(engine, deadline, start)?;
+                if !self.focused(engine, element, deadline)? {
+                    return Err(ErrorKind::NotActionable);
+                }
+                // 文字はまとめて送る。途中でページがフォーカスを移すと残りは移った先へ入りうる（既知の制約。
+                // 1 文字ごとに確かめる形は期限に届くため採らない。2026-11-19 の判断 B。設計 §14.4）。
+                for ch in text.chars() {
+                    self.press(&Key::Character(ch.to_string()));
+                }
+                self.settle(engine, deadline, start)?;
+                if !self.focused(engine, element, deadline)? {
+                    return Err(ErrorKind::NotActionable);
+                }
+            }
+            Action::Select { values } => {
+                // 操作してよいかを確かめてから、スクリプトで選択肢を設定する（単一選択の `select` は WebDriver の
+                // 命令では選べない。`act::select_script`）。
+                self.check_clickable(engine, element, deadline)?;
+                let v = self
+                    .evaluate(engine, act::select_script(element, values), deadline)
+                    .map_err(PageError::kind)?;
+                match v {
+                    JSValue::String(s) if s == "ok" => {}
+                    JSValue::String(s) if s == "stale" => return Err(ErrorKind::Stale),
+                    JSValue::String(s) if s == "multi" => return Err(ErrorKind::InvalidParams),
+                    _ => return Err(ErrorKind::NotActionable),
+                }
+            }
+            Action::Press { .. } => {
+                // フォーカスがあっても、隠れた要素へは送らない（操作してよいかを先に確かめる）。フォーカスが無ければ
+                // クリックで移す（リンクの遷移・チェックボックスの反転などクリックの副作用も起きる）。
+                let key = key.ok_or(ErrorKind::InvalidParams)?;
+                self.check_clickable(engine, element, deadline)?;
+                if !self.focused(engine, element, deadline)? {
+                    self.click(engine, element, deadline)?;
+                    self.settle(engine, deadline, start)?;
+                    if !self.focused(engine, element, deadline)? {
+                        return Err(ErrorKind::NotActionable);
+                    }
+                }
+                self.press(key);
+            }
+        }
+        self.settle(engine, deadline, start)?;
+        if self.delegate.unsupported_requested.get() {
+            return Err(ErrorKind::Unsupported);
+        }
+        Ok(())
     }
 }
 
