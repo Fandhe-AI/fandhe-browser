@@ -20,7 +20,7 @@ use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use fandhe_browser_core::dom::NodeId;
-use fandhe_browser_core::interactive::{InteractiveDocument, build_interactive_document};
+use fandhe_browser_core::interactive::{InteractiveDocument, build_interactive_document_with};
 use fandhe_browser_core::render::RenderError;
 use fandhe_browser_core::state::PageMode;
 use fandhe_browser_core::{AppState, NavigationGeneration, StateError, query_selector_all_str};
@@ -52,6 +52,11 @@ impl SyncTracker {
     pub fn record(&self, generation: NavigationGeneration) {
         *self.last.lock().unwrap_or_else(PoisonError::into_inner) =
             Some((generation, Instant::now()));
+    }
+
+    /// 記録を消す。次の `/ai/snapshot` は最小間隔によらず取り直す（`act` の後。設計 §14.6。TASK-128）。
+    pub fn clear(&self) {
+        *self.last.lock().unwrap_or_else(PoisonError::into_inner) = None;
     }
 }
 
@@ -116,6 +121,16 @@ impl SyncFailure {
 /// 後の要求は前の同期の完了を待ち、その記録を見て取り直さない。ロックの順は「同期 → 描画ゲート →
 /// ナビゲーション」で、描画ゲートを持ったまま同期のロックを取る経路は無い。
 pub fn sync_interactive(app: &AppState, tracker: &SyncTracker) -> Result<(), SyncFailure> {
+    sync_inner(app, tracker, false)
+}
+
+/// [`sync_interactive`] を最小間隔によらず行う（`POST /ai/act` の直前の取り直し。`AISNAP-17`・TASK-128）。
+/// 失敗の扱い（無効化・エラー）は [`sync_interactive`] と同じ。
+pub fn sync_interactive_now(app: &AppState, tracker: &SyncTracker) -> Result<(), SyncFailure> {
+    sync_inner(app, tracker, true)
+}
+
+fn sync_inner(app: &AppState, tracker: &SyncTracker, force: bool) -> Result<(), SyncFailure> {
     let mut last = tracker.last.lock().unwrap_or_else(PoisonError::into_inner);
     let nav = app.navigation();
     let Some((generation, latest)) = nav.latest_with_generation() else {
@@ -126,13 +141,18 @@ pub fn sync_interactive(app: &AppState, tracker: &SyncTracker) -> Result<(), Syn
             Ok(())
         };
     };
-    if latest.mode() != PageMode::Interactive || !due(*last, generation, Instant::now()) {
+    if latest.mode() != PageMode::Interactive || !(force || due(*last, generation, Instant::now()))
+    {
         return Ok(());
     }
     let result = app
         .dom_snapshot()
         .map_err(|e| SyncFailure::from_render(&e))
-        .and_then(|snapshot| build_interactive_document(snapshot).map_err(|_| SyncFailure::Failed))
+        .and_then(|snapshot| {
+            // `sensitive` の操作があった世代では、すべての入力欄の値を消して組み立てる（`AISNAP-17`）。
+            build_interactive_document_with(snapshot, nav.redacts_all(generation))
+                .map_err(|_| SyncFailure::Failed)
+        })
         .and_then(|sync| {
             app.replace_interactive(generation, sync)
                 .map_err(|e| SyncFailure::from_state(&e))
@@ -244,7 +264,9 @@ fn check_len(s: &str) -> Result<(), ResolveError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fandhe_browser_core::interactive::{HostDomSnapshot, InteractivePageId};
+    use fandhe_browser_core::interactive::{
+        HostDomSnapshot, InteractivePageId, build_interactive_document,
+    };
 
     fn doc(html: &str) -> fandhe_browser_core::interactive::InteractiveSync {
         let snap = HostDomSnapshot::new(
