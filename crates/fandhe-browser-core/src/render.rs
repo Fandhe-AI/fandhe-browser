@@ -58,8 +58,8 @@ pub trait Renderer: Send + Sync {
     /// 操作モードでページを読み込む（TASK-124・`AISNAP-16`。設計 §14.1・§14.2）。
     ///
     /// 既定実装は [`RenderError::InteractiveUnavailable`]（成功を装わない。REPAIR-3）。実装は
-    /// render crate の `HostRenderer`（後続のタスク）。操作モードのページは [`crate::state::AppState`] の
-    /// 描画ゲートから読み直されない（ホストの状態が失われるため）。
+    /// render crate の `HostRenderer`（TASK-127）。呼び出し元は [`crate::state::AppState::load_interactive`]。
+    /// 操作モードのページは [`crate::state::AppState`] の描画ゲートから読み直されない（ホストの状態が失われるため）。
     fn load_interactive(&self, page: &PageRef) -> Result<InteractivePageLoad, RenderError> {
         let _ = page;
         Err(RenderError::InteractiveUnavailable)
@@ -405,6 +405,10 @@ pub enum RenderError {
     InvalidState,
     /// 上限を超えた（切り詰めない。`RENDER-11` の `too_large`）。
     TooLarge,
+    /// ホストが要求を受け付けなかった（ホストの kind `unsupported`）。操作モードの `load`・`dom_snapshot` では、
+    /// 主フレームの `navigator.webdriver` が `true` でない文書を断ったことを表す（SEC-5・#1609。設計 §14.3）。
+    /// ai はこれを `interactive_unavailable` で返す（TASK-127。2026-11-19 のオーナー判断）。
+    Unsupported,
     /// 上記に分類できない内部エラー。
     ///
     /// `message` はファイルパス等の内部実装詳細を含みうるため、`Display` と `Debug`
@@ -431,6 +435,7 @@ impl std::fmt::Debug for RenderError {
             Self::InteractiveUnavailable => f.write_str("InteractiveUnavailable"),
             Self::InvalidState => f.write_str("InvalidState"),
             Self::TooLarge => f.write_str("TooLarge"),
+            Self::Unsupported => f.write_str("Unsupported"),
             // 内部詳細（ファイルパス等）を含みうるため、variant 名のみを出力し
             // メッセージ本体は伏せる。詳細取得は `internal_detail()` を使うこと。
             Self::Internal(_) => f.write_str("Internal(..)"),
@@ -469,6 +474,7 @@ impl std::fmt::Display for RenderError {
             Self::InteractiveUnavailable => write!(f, "interactive mode is unavailable"),
             Self::InvalidState => write!(f, "current document is not an http(s) page"),
             Self::TooLarge => write!(f, "render result exceeds the size limit"),
+            Self::Unsupported => write!(f, "render host does not support the request"),
             Self::Internal(_) => write!(f, "internal render error"),
         }
     }
@@ -687,6 +693,11 @@ mod tests {
             RenderError::PageNotLoaded.to_string(),
             "no page is loaded for rendering"
         );
+        assert_eq!(
+            RenderError::Unsupported.to_string(),
+            "render host does not support the request"
+        );
+        assert_eq!(format!("{:?}", RenderError::Unsupported), "Unsupported");
     }
 
     /// RENDER-3: 新 variant の `Debug` は variant 名のみ。

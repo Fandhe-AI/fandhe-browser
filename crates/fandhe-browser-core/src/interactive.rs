@@ -230,6 +230,10 @@ impl InteractiveSync {
     pub fn page(&self) -> &InteractivePageId {
         self.document.page()
     }
+    /// 取得した時点の URL（保存される URL と同じ）。
+    pub fn url(&self) -> &str {
+        &self.url
+    }
     /// 保存される写し（差し替えの前に ref・セレクタを試すときに使う。TASK-125）。
     pub fn document(&self) -> &InteractiveDocument {
         &self.document

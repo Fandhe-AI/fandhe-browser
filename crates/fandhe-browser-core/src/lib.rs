@@ -204,5 +204,6 @@ pub use script_context::{
     ScriptEvalOutput, UnavailableReason,
 };
 pub use state::{
-    AppState, NavigationGeneration, NavigationResult, NavigationScope, NavigationState, StateError,
+    AppState, InteractiveLoadError, NavigationGeneration, NavigationResult, NavigationScope,
+    NavigationState, StateError,
 };

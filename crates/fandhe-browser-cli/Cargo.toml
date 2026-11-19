@@ -58,6 +58,10 @@ js-boa = ["fandhe-browser-core/js-boa"]
 serde_json = { workspace = true }
 # テストの追加ルータ（ai ルータ相当）が返す Response 型
 fandhe-backend-http = { workspace = true }
+# 定例の撮影用の内部の入口（`server.rs` の `#[ignore]` テスト `interactive_demo_server`。TASK-127）が
+# core のテスト専用の許可 `AppState::allow_interactive_for_tests` を使う。既存の path 依存に feature を
+# 足すだけで新しい依存は無い。dev-dependencies なので、公開する crate と配布物のビルドには入らない。
+fandhe-browser-core = { workspace = true, features = ["test-support"] }
 
 # TASK-84.3（Issue #460・ビヘイビア PERF-1・PERF-3・PERF-6・AISNAP-1・MS-3）:
 # Lightpanda 比較ベンチのホスト。TASK-84.1（Issue #211）では実ビルドを持つ member が
