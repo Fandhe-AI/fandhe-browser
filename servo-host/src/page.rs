@@ -968,8 +968,10 @@ impl CurrentPage {
                 }
             }
             Action::Press { .. } => {
-                // フォーカスが無ければクリックで移す（リンクの遷移・チェックボックスの反転などクリックの副作用も起きる）。
+                // フォーカスがあっても、隠れた要素へは送らない（操作してよいかを先に確かめる）。フォーカスが無ければ
+                // クリックで移す（リンクの遷移・チェックボックスの反転などクリックの副作用も起きる）。
                 let key = key.ok_or(ErrorKind::InvalidParams)?;
+                self.check_clickable(engine, element, deadline)?;
                 if !self.focused(engine, element, deadline)? {
                     self.click(engine, element, deadline)?;
                     self.settle(engine, deadline, start)?;

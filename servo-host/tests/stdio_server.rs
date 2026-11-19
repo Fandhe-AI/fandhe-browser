@@ -2107,6 +2107,8 @@ const ACT_PAGE: &str = concat!(
     "<input id=q name=q value=old onkeydown=\"if(event.key==='Enter')document.getElementById('out').textContent='enter:'+this.value\">",
     "<select id=s name=s onchange=\"document.getElementById('out').textContent='sel:'+this.value\"><option value=a selected>A</option><option value=b>B</option><option value=c disabled>C</option></select>",
     "<button id=pop onclick=\"window.open('/x')\">P</button>",
+    "<div style=\"position:relative;width:200px;height:30px\"><input id=fq onkeydown=\"document.getElementById('out').textContent='fq'\"></div>",
+    "<button id=coverfq onclick=\"var f=document.getElementById('fq');var d=document.createElement('div');d.style.cssText='position:absolute;left:0;top:0;width:200px;height:30px;background:#fff';f.parentNode.appendChild(d);f.focus()\">V</button>",
     "<iframe id=fr srcdoc=\"<p>f</p>\" style=\"width:100px;height:30px\"></iframe>",
     "<button id=frnav onclick=\"document.getElementById('fr').src='/act?frame';document.getElementById('out').textContent='frnav'\">N</button>",
     "<button id=dis disabled onclick=\"document.getElementById('out').textContent='dis'\">D</button>",
@@ -2333,6 +2335,36 @@ fn interactive_act_operates_elements_and_rejects_unsafe_targets() {
         assert_eq!(t, "frnav");
     }
     id += 1;
+
+    // フォーカスがあっても、覆われた入力欄へはキーを送らない（覆ってからフォーカスを戻すボタンで作る）。
+    let r = act_req(
+        &mut h,
+        id,
+        &snap,
+        node_of(&html, "coverfq"),
+        r#"{"tag":"button"}"#,
+        r#"{"kind":"click"}"#,
+    );
+    ok(&r);
+    id += 1;
+    let r = act_req(
+        &mut h,
+        id,
+        &snap,
+        node_of(&html, "fq"),
+        r#"{"tag":"input"}"#,
+        r#"{"kind":"press","key":"Enter"}"#,
+    );
+    assert_eq!(kind(&r), "not_actionable", "{r}");
+    id += 1;
+    {
+        let (t, s2) = out_text(&mut h, id);
+        snap = s2;
+        assert_ne!(t, "fq", "a key reached a covered input");
+    }
+    id += 1;
+    // 覆いの要素が増えて番号がずれたため、以後は取り直した HTML から番号を引く。
+    let html = snap["html"].as_str().unwrap().to_owned();
 
     // 隠れた入力欄は、値を消す前に断る（既存の値が残る）。
     let r = act_req(
