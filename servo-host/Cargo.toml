@@ -47,6 +47,13 @@ image = { version = "=0.25.10", default-features = false, features = ["png"] }
 # `url` の版に合わせて同時に上げる（型が一致しないとトレイトを実装できない）。
 url = "=2.5.8"
 
+# Unix のみ。Servo 0.7.0 は `alert()` の文字列をプロセスの stdout へ無条件に書く（`servo-script` の
+# `Window::Alert`）。stdout はフレーム専用のため、起動直後に fd 1 を捨てる先（/dev/null）へ付け替え、フレームは
+# 複製した fd へ書く（#1597・設計 §2.1）。`dup2_stdout` は safe な関数で、自前の `unsafe` は足さない。
+# Cargo.lock に servo 経由で同版が既にあり、新しい crate は増えない（MIT / Apache 系。オーナー承認 2026-11-19）。
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "=1.1.5", default-features = false, features = ["std", "stdio"] }
+
 # Windows のみ ANGLE（mozangle）を既定にする `no-wgl` を足す（#999・オーナー承認 2026-10-16）。
 # 既定の WGL バックエンドは GPU の無い環境で WGL_NV_DX_interop が無く software rendering context を
 # 作れない。ANGLE なら D3D11 WARP で動く。feature は上の `servo` と統合され、Linux・macOS は変わらない。
