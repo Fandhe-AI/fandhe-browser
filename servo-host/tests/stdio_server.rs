@@ -2122,7 +2122,7 @@ fn interactive_mode_rejects_documents_without_navigator_webdriver() {
     );
     m.insert(
         "/from".to_owned(),
-        ("text/html", b"<!doctype html><a id=go href=\"/nohead\" style=\"display:block;width:200px;height:30px\">go</a>".to_vec()),
+        ("text/html", b"<!doctype html><button id=ps onclick=\"history.pushState(null,'','/from?x')\" style=\"display:block;width:200px;height:30px\">P</button><a id=go href=\"/nohead\" style=\"display:block;width:200px;height:30px\">go</a>".to_vec()),
     );
     let _stop = serve_routes(l, std::sync::Arc::new(m));
     let url = |path: &str| format!("http://127.0.0.1:{port}{path}");
@@ -2154,6 +2154,29 @@ fn interactive_mode_rejects_documents_without_navigator_webdriver() {
     assert!(r["result"].is_object(), "{r}");
     let snap = request(&mut h, 6, "dom_snapshot")["result"].clone();
     let html = snap["html"].as_str().unwrap().to_owned();
+    // 同じ文書の中の URL の変更の後も、前の取得の要素へは操作を届けない（取得した文書の番号の照合）。
+    let r = act_req(
+        &mut h,
+        20,
+        &snap,
+        node_of(&html, "ps"),
+        r#"{"tag":"button","id":"ps"}"#,
+        r#"{"kind":"click"}"#,
+    );
+    assert!(r["result"].is_object(), "{r}");
+    let mut old = snap.clone();
+    old["page"] = r["result"]["page"].clone();
+    let a = act_req(
+        &mut h,
+        21,
+        &old,
+        node_of(&html, "ps"),
+        r#"{"tag":"button","id":"ps"}"#,
+        r#"{"kind":"click"}"#,
+    );
+    assert_eq!(a["error"]["kind"], "stale", "{a}");
+    let snap = request(&mut h, 22, "dom_snapshot")["result"].clone();
+    let html = snap["html"].as_str().unwrap().to_owned();
     let r = act_req(
         &mut h,
         7,
@@ -2171,7 +2194,7 @@ fn interactive_mode_rejects_documents_without_navigator_webdriver() {
     assert!(w["result"].is_object(), "{w}");
     // 遷移の前の取得の要素へは、新しい page と組んでも操作を届けない（確かめていない文書）。
     let mut old = snap.clone();
-    old["page"] = r["result"]["page"].clone();
+    old["page"] = w["result"]["page"].clone();
     let a = act_req(
         &mut h,
         9,
