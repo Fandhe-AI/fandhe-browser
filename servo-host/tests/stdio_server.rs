@@ -2016,7 +2016,7 @@ fn interactive_dom_snapshot_rejects_oversized_html() {
 
 // ---- ページの alert()（#1597） ----
 
-/// #1597・設計 §2.1: ページが `alert()` を呼んでも読み込みは止まらず、Servo が書く文字列はフレームの流れにも
+/// `RENDER-3`・`RENDER-4`・#1597・設計 §2.1: ページが `alert()` を呼んでも読み込みは止まらず、Servo が書く文字列はフレームの流れにも
 /// ログにも出ない（stdout はフレーム専用のまま）。Windows は付け替えないため対象外（既知の制約）。
 #[cfg(unix)]
 #[test]
@@ -2044,4 +2044,5 @@ fn page_alert_does_not_block_load_or_pollute_stdout() {
     assert_eq!(code, Some(0), "stderr: {stderr}");
     assert_eq!(rest, 0, "stdout must contain frames only");
     assert!(!stderr.contains("ALERT_MARKER_1597"), "{stderr}");
+    assert!(!stderr.contains("SECOND_ALERT_1597"), "{stderr}");
 }

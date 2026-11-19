@@ -141,14 +141,15 @@ fn run_stdio(egress: Egress, interactive: bool) -> ExitCode {
     };
     // `handler` が `Engine` を持つ。Windows では drop の前に `finish` で終了する（#1413）。
     let mut handler = page::ServoHandler::new(proxy, interactive);
-    // stderr はロックを持ち続けない。Servo の `alert()` は stderr をロックしてから stdout に書くため、
+    // Unix: stderr はロックを持ち続けない。Servo の `alert()` は stderr をロックしてから stdout に書くため、
     // 持ち続けるとページのスクリプトが止まる（#1597）。
-    let outcome = server::serve(
-        std::io::stdin().lock(),
-        frames,
-        &mut handler,
-        &mut std::io::stderr(),
-    );
+    // Windows: stdout を付け替えずロックを持ち続けるので、stderr も従来どおりロックを持つ。stderr だけ外すと、
+    // スクリプトが stderr を持ったまま stdout で止まり、ログを書こうとしたホストごと止まる（時間切れで済まない）。
+    #[cfg(unix)]
+    let mut log = std::io::stderr();
+    #[cfg(not(unix))]
+    let mut log = std::io::stderr().lock();
+    let outcome = server::serve(std::io::stdin().lock(), frames, &mut handler, &mut log);
     let code = match outcome {
         ServeOutcome::Shutdown | ServeOutcome::InputClosed => 0,
         ServeOutcome::ProtocolViolation(_) => EXIT_PROTOCOL_VIOLATION,
