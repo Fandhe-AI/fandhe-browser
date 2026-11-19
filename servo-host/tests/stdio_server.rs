@@ -2518,3 +2518,36 @@ fn interactive_act_reports_navigation() {
     assert_eq!(w["error"]["kind"], "stale", "{w}");
     finish_host(h, id + 2);
 }
+
+// ---- ページの alert()（#1597） ----
+
+/// `RENDER-3`・`RENDER-4`・#1597・設計 §2.1: ページが `alert()` を呼んでも読み込みは止まらず、Servo が書く文字列はフレームの流れにも
+/// ログにも出ない（stdout はフレーム専用のまま）。Windows は付け替えないため対象外（既知の制約）。
+#[cfg(unix)]
+#[test]
+fn page_alert_does_not_block_load_or_pollute_stdout() {
+    let (l, port) = bind_loopback();
+    let mut m = std::collections::HashMap::new();
+    let page = concat!(
+        "<!doctype html><html><head><script>alert('ALERT_MARKER_1597')</script></head>",
+        "<body style=\"margin:0;background:#00ff00\"><script>alert('SECOND_ALERT_1597')</script></body></html>"
+    );
+    m.insert("/alert".to_owned(), ("text/html", page.as_bytes().to_vec()));
+    let _stop = serve_routes(l, std::sync::Arc::new(m));
+    let mut h = spawn(&["--stdio"]);
+    let _hello = h.recv();
+    let mut id = 1;
+    load_page(&mut h, &mut id, &format!("http://127.0.0.1:{port}/alert"));
+    let img = shoot(&mut h, &mut id);
+    assert!(fraction(&img, 0, img.width(), is_green) > 0.9);
+    // 同じホストで続けて読み込める。
+    load_page(&mut h, &mut id, &format!("http://127.0.0.1:{port}/alert"));
+    id += 1;
+    h.send(&format!(r#"{{"v":1,"id":{id},"method":"shutdown"}}"#));
+    assert_eq!(h.recv(), format!(r#"{{"v":1,"id":{id},"result":{{}}}}"#));
+    let (code, rest, stderr) = h.finish();
+    assert_eq!(code, Some(0), "stderr: {stderr}");
+    assert_eq!(rest, 0, "stdout must contain frames only");
+    assert!(!stderr.contains("ALERT_MARKER_1597"), "{stderr}");
+    assert!(!stderr.contains("SECOND_ALERT_1597"), "{stderr}");
+}

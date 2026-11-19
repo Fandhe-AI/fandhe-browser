@@ -132,20 +132,52 @@ fn run_stdio(egress: Egress, interactive: bool) -> ExitCode {
             }
         },
     };
+    // Servo を作る前に stdout をフレーム専用の fd へ移す（#1597）。
+    let frames = match frame_output() {
+        Ok(w) => w,
+        Err(e) => {
+            eprintln!("error: cannot prepare frame output: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
     // `handler` が `Engine` を持つ。Windows では drop の前に `finish` で終了する（#1413）。
     let mut handler = page::ServoHandler::new(proxy, interactive);
-    let outcome = server::serve(
-        std::io::stdin().lock(),
-        std::io::stdout().lock(),
-        &mut handler,
-        &mut std::io::stderr().lock(),
-    );
+    // Unix: stderr はロックを持ち続けない。Servo の `alert()` は stderr をロックしてから stdout に書くため、
+    // 持ち続けるとページのスクリプトが止まる（#1597）。
+    // Windows: stdout を付け替えずロックを持ち続けるので、stderr も従来どおりロックを持つ。stderr だけ外すと、
+    // スクリプトが stderr を持ったまま stdout で止まり、ログを書こうとしたホストごと止まる（時間切れで済まない）。
+    #[cfg(unix)]
+    let mut log = std::io::stderr();
+    #[cfg(not(unix))]
+    let mut log = std::io::stderr().lock();
+    let outcome = server::serve(std::io::stdin().lock(), frames, &mut handler, &mut log);
     let code = match outcome {
         ServeOutcome::Shutdown | ServeOutcome::InputClosed => 0,
         ServeOutcome::ProtocolViolation(_) => EXIT_PROTOCOL_VIOLATION,
         ServeOutcome::Io(_) => 1,
     };
     finish(code)
+}
+
+/// フレームを書く先を用意する（#1597・設計 §2.1）。
+///
+/// Unix: fd 1 を複製してフレーム専用にし、fd 1 自体は `/dev/null` へ付け替える。Servo 0.7.0 は `alert()` の
+/// 文字列（ページ由来）を stdout へ無条件に書くため、付け替えないとフレームの流れに混ざる。捨てる先にするのは、
+/// ページ由来の文字列をログにも残さないため。Servo を作る前（最初の `load` より前）に 1 回だけ呼ぶ。
+/// Windows: 付け替えず stdout のままにする（既知の制約。`alert()` を呼ぶページは読み込みが時間切れになりうる）。
+fn frame_output() -> std::io::Result<Box<dyn std::io::Write>> {
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsFd;
+        let frames = std::io::stdout().as_fd().try_clone_to_owned()?;
+        let sink = std::fs::OpenOptions::new().write(true).open("/dev/null")?;
+        rustix::stdio::dup2_stdout(&sink)?;
+        Ok(Box::new(std::fs::File::from(frames)))
+    }
+    #[cfg(not(unix))]
+    {
+        Ok(Box::new(std::io::stdout().lock()))
+    }
 }
 
 /// `--selftest` の進行段階を stderr に 1 行出す（#1413）。
