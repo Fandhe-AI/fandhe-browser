@@ -12,6 +12,13 @@
 //! | `capture_screenshot` | `screenshot` |
 //! | `element_visibility` | `visibility` |
 //! | `bounding_box` | `bounding_box` |
+//! | `load_interactive` | 操作モードのホスト（`--interactive`）の `load` |
+//! | `dom_snapshot` | 操作モードのホストの `dom_snapshot` |
+//!
+//! 操作モード（TASK-127・`AISNAP-16`・設計 §14.1）は、静的モードとは別の [`HostProcess`]
+//! （[`HostProcessConfig::with_interactive`]）で扱う。同時に動かすホストは 1 つにする（片方を読み込むときに
+//! もう片方を止める。RSS の上限をホスト 2 つ分にしない）。隔離が成立しない・内部アドレスを許す設定では、
+//! `HostProcess` が [`RenderError::InteractiveUnavailable`] を返し、静的モードへ落とさない。
 //!
 //! # 方針
 //!
@@ -42,9 +49,10 @@ use std::fmt;
 use std::sync::Mutex;
 
 use fandhe_browser_core::check_network_target_url;
+use fandhe_browser_core::interactive::{HostDomSnapshot, InteractivePageId};
 use fandhe_browser_core::render::{
-    BoundingBox, ElementRef, ElementVisibility, ImageFormat, PageLoad, PageRef, RenderError,
-    Renderer, Screenshot, ScreenshotOptions,
+    BoundingBox, ElementRef, ElementVisibility, ImageFormat, InteractivePageLoad, PageLoad,
+    PageRef, RenderError, Renderer, Screenshot, ScreenshotOptions,
 };
 
 use crate::host_process::{HostProcess, HostProcessConfig, HostProcessError};
@@ -92,6 +100,10 @@ impl HostRendererConfig {
 
 struct Inner {
     process: HostProcess,
+    /// 操作モードのホスト（`--interactive`。TASK-127）。静的モードの `process` と同時には動かさない。
+    interactive: HostProcess,
+    /// 操作モードのページを読み込んだか（失敗した読み込み・静的モードの読み込みで偽に戻す）。
+    interactive_loaded: bool,
     /// ナビゲーション世代。成功・失敗を問わず `load` のたびに増やす。
     nav_generation: u64,
     /// 直近に成功した `load` の URL。`None` なら描画系は `PageNotLoaded`。
@@ -114,9 +126,12 @@ impl HostRenderer {
         // 食い違うと片方だけが許す経路ができる）。
         let mut process = config.process;
         process.allow_private_network_access = config.allow_private_network_access;
+        let interactive = process.clone().with_interactive(true);
         Self {
             inner: Mutex::new(Inner {
                 process: HostProcess::new(process),
+                interactive: HostProcess::new(interactive),
+                interactive_loaded: false,
                 nav_generation: 0,
                 current: None,
             }),
@@ -143,6 +158,7 @@ impl HostRenderer {
             process,
             nav_generation,
             current,
+            ..
         } = &mut *inner;
         let page = current.as_ref().ok_or(RenderError::PageNotLoaded)?;
         let allow = self.allow_private_network_access;
@@ -225,11 +241,12 @@ fn map_host_error(err: HostProcessError) -> RenderError {
             HostErrorKind::Timeout => RenderError::Timeout,
             HostErrorKind::InvalidState => RenderError::InvalidState,
             HostErrorKind::TooLarge => RenderError::TooLarge,
+            // 操作モードの `load`・`dom_snapshot` では、`navigator.webdriver` の確認の失敗（SEC-5・#1609）。
+            HostErrorKind::Unsupported => RenderError::Unsupported,
             _ => internal("render host reported an error"),
         },
         HostProcessError::InvalidRequest => internal("invalid render host request"),
-        // 操作モード（TASK-123・TASK-124）。`HostRenderer` は静的モードで使うため、操作モードの呼び出しを
-        // 実装する後続のタスクまで通常は届かない。
+        // 操作モード（TASK-123・TASK-124・TASK-127）。
         HostProcessError::NotInteractive => RenderError::NotInteractive,
         HostProcessError::InteractiveUnavailable(_) => RenderError::InteractiveUnavailable,
         HostProcessError::SessionLost => RenderError::SessionLost,
@@ -250,6 +267,9 @@ impl Renderer for HostRenderer {
         // ロックを取って現在のページを捨てる（RenderGate と同じ fail-closed）。
         let mut inner = self.lock()?;
         inner.current = None;
+        // 操作モードのホストは止める（同時に動かすホストは 1 つ。CDP の navigate は静的モードへ戻す）。
+        inner.interactive.shutdown();
+        inner.interactive_loaded = false;
         inner.nav_generation = inner
             .nav_generation
             .checked_add(1)
@@ -313,6 +333,62 @@ impl Renderer for HostRenderer {
             }
             _ => Err(RenderError::ProtocolMismatch),
         }
+    }
+
+    fn load_interactive(&self, page: &PageRef) -> Result<InteractivePageLoad, RenderError> {
+        // 静的の `load` と同じく、検証より前に現在のページを捨てる（fail-closed）。静的モードのホストは止める。
+        let mut inner = self.lock()?;
+        inner.current = None;
+        inner.interactive_loaded = false;
+        inner.process.shutdown();
+        inner.nav_generation = inner
+            .nav_generation
+            .checked_add(1)
+            .ok_or_else(|| internal("navigation generation overflow"))?;
+        let generation = inner.nav_generation;
+
+        let url = check_network_target_url(page.url(), self.allow_private_network_access)
+            .map_err(|_| internal("url rejected"))?;
+        let params = LoadParams::new(&url, self.load_timeout_ms)
+            .map_err(|_| internal("invalid load parameters"))?;
+        let result = inner
+            .interactive
+            .load(&params, generation)
+            .map_err(map_host_error)?;
+        let final_url = validate_final_url(result.final_url(), self.allow_private_network_access)
+            .map_err(|_| internal("final url rejected"))?;
+        let info = result.page().ok_or(RenderError::ProtocolMismatch)?;
+        let id = InteractivePageId::new(info.session(), info.doc_seq())
+            .map_err(|_| RenderError::ProtocolMismatch)?;
+        inner.interactive_loaded = true;
+        Ok(InteractivePageLoad::new(PageLoad::new(final_url), id))
+    }
+
+    fn dom_snapshot(&self) -> Result<HostDomSnapshot, RenderError> {
+        let mut inner = self.lock()?;
+        if !inner.interactive_loaded {
+            return Err(RenderError::NotInteractive);
+        }
+        let result = inner
+            .interactive
+            .call_interactive(Request::DomSnapshot)
+            .map_err(map_host_error);
+        let MethodResult::DomSnapshot(d) = result? else {
+            return Err(RenderError::ProtocolMismatch);
+        };
+        // 現在の URL も `load` の最終 URL と同じ検査にかける（要約・CDP に出るため。userinfo を拒否する）。
+        let url = validate_final_url(d.url(), self.allow_private_network_access)
+            .map_err(|_| internal("snapshot url rejected"))?;
+        let id = InteractivePageId::new(d.page().session(), d.page().doc_seq())
+            .map_err(|_| RenderError::ProtocolMismatch)?;
+        HostDomSnapshot::new(
+            id,
+            &url,
+            d.html().to_owned(),
+            d.element_count(),
+            d.snapshot(),
+        )
+        .map_err(|_| RenderError::ProtocolMismatch)
     }
 }
 

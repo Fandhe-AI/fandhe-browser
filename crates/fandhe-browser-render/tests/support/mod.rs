@@ -325,6 +325,27 @@ pub fn fake_host() -> ! {
                 continue;
             }
             ("int-hang-dom", "dom_snapshot") => std::thread::sleep(Duration::from_secs(60)),
+            // `navigator.webdriver` の確認の失敗（SEC-5・#1609）を装う（TASK-127）。
+            ("int-unsupported", "load") if interactive => {
+                send_error(&mut stdout, id, "unsupported");
+                continue;
+            }
+            // 現在の URL に userinfo を入れて返す（本体が拒否すること。TASK-127）。
+            ("int-userinfo", "dom_snapshot") => {
+                send(
+                    &mut stdout,
+                    id,
+                    json!({
+                        "page": page_of(count(&root, "loads")),
+                        "url": "https://u:p@example.com/",
+                        "html": "<html data-fandhe-n=\"0\"></html>",
+                        "element_count": 1,
+                        "snapshot": "s1",
+                        "excluded": {"iframes": 0, "shadow_roots": 0}
+                    }),
+                );
+                continue;
+            }
             ("rss", _) => {
                 let mut mem = vec![0u8; 96 * 1024 * 1024];
                 for i in (0..mem.len()).step_by(4096) {

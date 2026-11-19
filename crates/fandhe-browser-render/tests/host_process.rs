@@ -1148,6 +1148,91 @@ fn t_interactive_requires_host_support() {
     assert_eq!(h.pid(), None);
 }
 
+/// `HostRenderer` を操作モードを使える設定（実際の隔離つき）で作る（TASK-127）。使えない環境では `None`。
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn interactive_renderer(
+    tag: &str,
+    scenario: &str,
+) -> Option<(Root, fandhe_browser_render::host_renderer::HostRenderer)> {
+    use fandhe_browser_render::host_renderer::{HostRenderer, HostRendererConfig};
+    let (root, _) = interactive_host(tag, scenario, base_timeouts())?;
+    let config = root
+        .config_system(base_timeouts())
+        .with_egress_isolation(EgressIsolationMode::Required);
+    Some((root, HostRenderer::new(HostRendererConfig::new(config))))
+}
+
+/// TASK-127・`AISNAP-16`: `HostRenderer` は操作モードのホスト（`--interactive`）で読み込み、ページ識別子と
+/// DOM を返す。静的モードの読み込みで操作モードのホストを止め、以後の `dom_snapshot` は `NotInteractive`。
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn t_renderer_interactive_roundtrip() {
+    use fandhe_browser_core::render::{PageRef, RenderError, Renderer};
+    let Some((root, r)) = interactive_renderer("rint-ok", "ok") else {
+        return;
+    };
+    assert!(matches!(r.dom_snapshot(), Err(RenderError::NotInteractive)));
+    let loaded = r
+        .load_interactive(&PageRef::new("https://example.com/a"))
+        .expect("load_interactive");
+    assert_eq!(loaded.load().final_url(), "https://example.com/a");
+    assert_eq!(loaded.page().doc_seq(), 1);
+    let snap = r.dom_snapshot().expect("dom_snapshot");
+    let doc = fandhe_browser_core::interactive::build_interactive_document(snap).expect("doc");
+    assert_eq!(doc.page().doc_seq(), 1);
+    assert_eq!(count(&root.0, "spawns"), 1);
+    r.load(&PageRef::new("https://example.com/b"))
+        .expect("static load");
+    assert_eq!(count(&root.0, "spawns"), 2, "static mode uses another host");
+    assert!(matches!(r.dom_snapshot(), Err(RenderError::NotInteractive)));
+}
+
+/// TASK-127: ホストの `unsupported`（`navigator.webdriver` の確認の失敗。SEC-5）は `RenderError::Unsupported`。
+/// `dom_snapshot` の URL も最終 URL と同じ検査にかけ、userinfo を含めば拒否する。
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn t_renderer_interactive_errors() {
+    use fandhe_browser_core::render::{PageRef, RenderError, Renderer};
+    let Some((_root, r)) = interactive_renderer("rint-uns", "int-unsupported") else {
+        return;
+    };
+    assert!(matches!(
+        r.load_interactive(&PageRef::new("https://example.com/a")),
+        Err(RenderError::Unsupported)
+    ));
+    assert!(matches!(r.dom_snapshot(), Err(RenderError::NotInteractive)));
+    let Some((_root, r)) = interactive_renderer("rint-ui", "int-userinfo") else {
+        return;
+    };
+    r.load_interactive(&PageRef::new("https://example.com/a"))
+        .expect("load_interactive");
+    assert!(matches!(r.dom_snapshot(), Err(RenderError::Internal(_))));
+    let Some((_root, r)) = interactive_renderer("rint-to", "int-dom-timeout") else {
+        return;
+    };
+    r.load_interactive(&PageRef::new("https://example.com/a"))
+        .expect("load_interactive");
+    assert!(matches!(r.dom_snapshot(), Err(RenderError::SessionLost)));
+    // 内部アドレスは送る前に拒否する（SSRF。静的の `load` と同じ検査）。
+    assert!(matches!(
+        r.load_interactive(&PageRef::new("http://127.0.0.1/")),
+        Err(RenderError::Internal(_))
+    ));
+}
+
+/// TASK-127: 隔離が成立しない設定では、操作モードのホストを起動せず `InteractiveUnavailable`
+/// （静的モードのホストへ落とさない。確定条件 7）。
+#[cfg(unix)]
+fn t_renderer_interactive_requires_isolation() {
+    use fandhe_browser_core::render::{PageRef, RenderError, Renderer};
+    use fandhe_browser_render::host_renderer::{HostRenderer, HostRendererConfig};
+    let root = Root::new("rint-refuse", "ok");
+    let r = HostRenderer::new(HostRendererConfig::new(root.config(base_timeouts())));
+    assert!(matches!(
+        r.load_interactive(&PageRef::new("https://example.com/a")),
+        Err(RenderError::InteractiveUnavailable)
+    ));
+    assert_eq!(count(&root.0, "spawns"), 0, "must not spawn");
+}
+
 // Windows は隔離なしの起動を拒否するため、偽ホストを起動する試験は unix だけで動かす。
 // Windows で動くのは起動拒否の試験と、起動しない試験（`required`）のみ。
 #[cfg(windows)]
@@ -1230,6 +1315,10 @@ fn main() {
         t_interactive_requires_isolation,
     ));
     tests.push((
+        "renderer_interactive_requires_isolation",
+        t_renderer_interactive_requires_isolation,
+    ));
+    tests.push((
         "static_reloads_after_host_died_between_calls",
         t_static_reloads_after_host_died_between_calls,
     ));
@@ -1259,6 +1348,11 @@ fn main() {
             "interactive_requires_host_support",
             t_interactive_requires_host_support,
         ));
+        tests.push((
+            "renderer_interactive_roundtrip",
+            t_renderer_interactive_roundtrip,
+        ));
+        tests.push(("renderer_interactive_errors", t_renderer_interactive_errors));
     }
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     tests.push(("rss_limit", t_rss_limit));
