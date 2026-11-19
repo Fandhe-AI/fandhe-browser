@@ -2105,7 +2105,10 @@ const ACT_PAGE: &str = concat!(
     "<p id=out>none</p>",
     "<button id=b onclick=\"document.getElementById('out').textContent='clicked:'+event.isTrusted\">B</button>",
     "<input id=q name=q value=old onkeydown=\"if(event.key==='Enter')document.getElementById('out').textContent='enter:'+this.value\">",
-    "<select id=s name=s onchange=\"document.getElementById('out').textContent='sel:'+this.value\"><option value=a selected>A</option><option value=b>B</option></select>",
+    "<select id=s name=s onchange=\"document.getElementById('out').textContent='sel:'+this.value\"><option value=a selected>A</option><option value=b>B</option><option value=c disabled>C</option></select>",
+    "<button id=pop onclick=\"window.open('/x')\">P</button>",
+    "<iframe id=fr srcdoc=\"<p>f</p>\" style=\"width:100px;height:30px\"></iframe>",
+    "<button id=frnav onclick=\"document.getElementById('fr').src='/act?frame';document.getElementById('out').textContent='frnav'\">N</button>",
     "<button id=dis disabled onclick=\"document.getElementById('out').textContent='dis'\">D</button>",
     "<div style=\"position:relative;width:200px;height:30px\"><button id=cov onclick=\"document.getElementById('out').textContent='cov'\">C</button>",
     "<div style=\"position:absolute;left:0;top:0;width:200px;height:30px;background:#fff\"></div></div>",
@@ -2278,6 +2281,7 @@ fn interactive_act_operates_elements_and_rejects_unsafe_targets() {
     // 選択: 一致する選択肢が無い・単一選択に 2 つ・表示されていない select は選ばない。
     for (target, values, want) in [
         ("s", r#"["zz"]"#, "not_actionable"),
+        ("s", r#"["c"]"#, "not_actionable"),
         ("s", r#"["a","b"]"#, "invalid_params"),
         ("hid", r#"["a"]"#, "not_actionable"),
     ] {
@@ -2292,6 +2296,43 @@ fn interactive_act_operates_elements_and_rejects_unsafe_targets() {
         assert_eq!(kind(&r), want, "{target} {values}: {r}");
         id += 1;
     }
+
+    // 新しいウィンドウは開かず unsupported。
+    let r = act_req(
+        &mut h,
+        id,
+        &snap,
+        node_of(&html, "pop"),
+        r#"{"tag":"button"}"#,
+        r#"{"kind":"click"}"#,
+    );
+    assert_eq!(kind(&r), "unsupported", "{r}");
+    id += 1;
+
+    // iframe の遷移を許可しても、読み込みを待ち続けない（期限までに返る）。ホストの文書番号はフレームを区別せず
+    // 上がるため、navigated は真になりうる（取り直して続ける）。
+    let started = std::time::Instant::now();
+    let r = act_req(
+        &mut h,
+        id,
+        &snap,
+        node_of(&html, "frnav"),
+        r#"{"tag":"button"}"#,
+        r#"{"kind":"click"}"#,
+    );
+    assert!(r["result"]["page"].is_object(), "{r}");
+    assert!(
+        started.elapsed() < Duration::from_secs(8),
+        "{:?}",
+        started.elapsed()
+    );
+    id += 1;
+    {
+        let (t, s2) = out_text(&mut h, id);
+        snap = s2;
+        assert_eq!(t, "frnav");
+    }
+    id += 1;
 
     // 隠れた入力欄は、値を消す前に断る（既存の値が残る）。
     let r = act_req(

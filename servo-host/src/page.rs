@@ -138,6 +138,8 @@ struct PageDelegate {
     pending_inputs: RefCell<HashSet<InputEventId>>,
     /// `act` の間に、ページから始まる遷移を許可したか（`navigated` の判定で読み込みの開始まで待つ。TASK-126）。
     navigation_requested: Cell<bool>,
+    /// `act` の間に、扱わない要求（新しいウィンドウ・ファイル選択）が来たか（`unsupported` で返す。設計 §14.4）。
+    unsupported_requested: Cell<bool>,
 }
 
 impl PageDelegate {
@@ -179,6 +181,19 @@ impl WebViewDelegate for PageDelegate {
         // 来ないため、`ServoHandler::load_page` が別に上げる。
         if status == LoadStatus::Started {
             self.bump_doc_seq();
+        }
+    }
+
+    fn request_create_new(&self, _parent: WebView, _request: servo::CreateNewWebViewRequest) {
+        // 新しいウィンドウは作らない（要求は捨てると拒否になる。ページから見ると `window.open` が `null`）。
+        self.unsupported_requested.set(true);
+    }
+
+    fn show_embedder_control(&self, _webview: WebView, control: servo::EmbedderControl) {
+        // ファイル選択は扱わない（捨てると「選ばなかった」になる）。`select` の選択肢・IME・ダイアログは既定の
+        // まま捨てる（ダイアログは 2026-11-19 の判断。#1592）。
+        if matches!(control, servo::EmbedderControl::FilePicker(_)) {
+            self.unsupported_requested.set(true);
         }
     }
 
@@ -707,6 +722,10 @@ impl Handler for ServoHandler {
 const WAIT_POLL: Duration = Duration::from_millis(50);
 /// 入力イベントの処理が済んでから、遷移の要求の通知を受け取るために回す時間。
 const ACT_SETTLE: Duration = Duration::from_millis(100);
+/// 遷移の要求を許可した後、新しい文書の読み込みの開始を待つ上限。`act` は読み込みを待たない（設計 §14.6）ため
+/// 短く切り、過ぎたらその時点の文書番号で `navigated` を返す（最善努力。応答の遅い遷移・iframe の遷移・
+/// 文書のできない応答では偽になりうる）。
+const ACT_NAVIGATION_WAIT: Duration = Duration::from_secs(2);
 
 /// WebDriver の命令の答えを 1 回受け取る。まだ来ていなければ `None`、受け口が切れていれば `stale`
 /// （閲覧文脈が入れ替わって命令が捨てられた。遷移と重なった場合）。
@@ -778,13 +797,13 @@ impl CurrentPage {
             spin();
         }
         if self.delegate.navigation_requested.get() {
-            wait_until(
-                deadline,
-                || (self.delegate.doc_seq.get() != start).then_some(()),
-                || self.delegate.crashed.get(),
-                spin,
-            )
-            .map_err(PageError::kind)?;
+            let until = (Instant::now() + ACT_NAVIGATION_WAIT).min(deadline);
+            while Instant::now() < until
+                && self.delegate.doc_seq.get() == start
+                && !self.delegate.crashed.get()
+            {
+                spin();
+            }
         }
         Ok(())
     }
@@ -818,9 +837,11 @@ impl CurrentPage {
         // 一回限りの受け口は待ち時間つきで受け取れないため、別のスレッドで受けて渡す。
         let (tx, rx) = oneshot().ok_or(ErrorKind::Internal)?;
         let (done, got) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let _ = done.send(rx.recv().ok());
-        });
+        std::thread::Builder::new()
+            .spawn(move || {
+                let _ = done.send(rx.recv().ok());
+            })
+            .map_err(|_| ErrorKind::Internal)?;
         let point = self.webdriver(
             engine,
             deadline,
@@ -899,6 +920,11 @@ impl CurrentPage {
             ExpectOutcome::Disabled => return Err(ErrorKind::NotActionable),
         }
         self.delegate.navigation_requested.set(false);
+        self.delegate.unsupported_requested.set(false);
+        // `option` は WebDriver の `ElementClick` が選択とイベントまで行うため、命令を送る前に断る（`select` を使う）。
+        if p.expect.tag == "option" && !matches!(p.action, Action::Select { .. }) {
+            return Err(ErrorKind::NotActionable);
+        }
         match &p.action {
             Action::Click => self.click(engine, element, deadline)?,
             Action::Fill { text } => {
@@ -953,7 +979,11 @@ impl CurrentPage {
                 self.press(key);
             }
         }
-        self.settle(engine, deadline, start)
+        self.settle(engine, deadline, start)?;
+        if self.delegate.unsupported_requested.get() {
+            return Err(ErrorKind::Unsupported);
+        }
+        Ok(())
     }
 }
 

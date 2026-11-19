@@ -55,7 +55,7 @@ pub(crate) fn parse_expect(v: &JSValue) -> ExpectOutcome {
 }
 
 /// `select` の選択肢を `values` にするスクリプト。結果は `ok`・`stale`（要素が無い）・`not_select`（`select` でない）・
-/// `missing`（一致する選択肢が無い）・`multi`（単一選択に 2 つ以上）。
+/// `missing`（一致する選択肢が無い）・`disabled`（選ぶ選択肢が `:disabled`）・`multi`（単一選択に 2 つ以上）。
 ///
 /// Servo 0.7.0 の WebDriver の `ElementClick` は、単一選択の `select` の `option` を押しても選択を変えない
 /// （`servo-script` の `handle_element_click` の Step 8.6.3 は `multiple` のときだけ切り替える）。そこで選択肢は
@@ -68,6 +68,7 @@ if(!el)return 'stale';if(el.localName!=='select')return 'not_select';\
 if(!el.multiple&&vs.length!==1)return 'multi';\
 var o=el.options,has=function(v){{for(var i=0;i<o.length;i++){{if(o[i].value===v)return true;}}return false;}};\
 for(var j=0;j<vs.length;j++){{if(!has(vs[j]))return 'missing';}}\
+for(var d=0;d<o.length;d++){{if(vs.indexOf(o[d].value)>=0&&o[d].matches(':disabled'))return 'disabled';}}\
 if(el.multiple){{for(var k=0;k<o.length;k++){{o[k].selected=vs.indexOf(o[k].value)>=0;}}}}\
 else{{for(var m=0;m<o.length;m++){{if(o[m].value===vs[0]){{o[m].selected=true;break;}}}}}}\
 el.dispatchEvent(new Event('input',{{bubbles:true}}));el.dispatchEvent(new Event('change',{{bubbles:true}}));\
@@ -137,7 +138,7 @@ pub(crate) fn parse_key(key: &str) -> Option<Key> {
     }
     let mut chars = key.chars();
     match (chars.next(), chars.next()) {
-        (Some(c), None) => Some(Key::Character(c.to_string())),
+        (Some(c), None) if !c.is_control() => Some(Key::Character(c.to_string())),
         _ => None,
     }
 }
@@ -203,6 +204,7 @@ mod tests {
         assert_eq!(parse_key("ab"), None);
         assert_eq!(parse_key("Unidentified"), None);
         assert_eq!(parse_key("F1"), None);
+        assert_eq!(parse_key("\u{7}"), None);
         assert_eq!(parse_key("Tab"), Some(Key::Named(servo::NamedKey::Tab)));
         assert_eq!(parse_key("NotAKey"), None);
     }
