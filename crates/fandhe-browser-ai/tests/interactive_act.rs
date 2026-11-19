@@ -8,8 +8,8 @@
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use fandhe_backend_http::request::{ParseOutcome, parse_request_head};
 use fandhe_backend_http::response::Response;
@@ -60,7 +60,9 @@ struct FakeHost {
     snapshots: AtomicUsize,
     acts: Mutex<Vec<Seen>>,
     act_error: Mutex<Option<RenderError>>,
-    act_delay: Mutex<Duration>,
+    snapshot_error: Mutex<Option<RenderError>>,
+    /// 置くと、次の `act` は入ったことを知らせ、解放されるまで止まる（sleep に頼らず実行中を作る）。
+    act_gate: Mutex<Option<(SyncSender<()>, Receiver<()>)>>,
 }
 
 impl FakeHost {
@@ -101,6 +103,9 @@ impl Renderer for FakeHost {
     }
     fn dom_snapshot(&self) -> Result<HostDomSnapshot, RenderError> {
         self.snapshots.fetch_add(1, Ordering::SeqCst);
+        if let Some(e) = self.snapshot_error.lock().unwrap().take() {
+            return Err(e);
+        }
         let mut q = self.bodies.lock().unwrap();
         let body = if q.len() > 1 {
             q.pop_front().unwrap()
@@ -117,7 +122,11 @@ impl Renderer for FakeHost {
         .unwrap())
     }
     fn act(&self, request: &ActRequest) -> Result<ActOutcome, RenderError> {
-        std::thread::sleep(*self.act_delay.lock().unwrap());
+        let gate = self.act_gate.lock().unwrap().take();
+        if let Some((entered, release)) = gate {
+            entered.send(()).unwrap();
+            release.recv().unwrap();
+        }
         self.acts.lock().unwrap().push(Seen {
             node: request.node(),
             tag: request.tag().to_owned(),
@@ -285,14 +294,22 @@ fn find_ref(v: &Value, name: &str) -> Option<String> {
 /// すべての入力値を要約に出さない。新しい navigate で外れる。
 #[tokio::test]
 async fn aisnap17_sensitive_redacts_all_values_for_the_generation() {
-    for (target, action) in [
+    // 3 件目: ホストへの操作が失敗しても、印は送る前に付いているので伏せる（印の順序の確認）。
+    for (target, action, fail) in [
         (
             r##""selector":"#q""##,
             r#"{"type":"fill","text":"s3cret","sensitive":true}"#,
+            false,
         ),
         (
             r##""selector":"#pw""##,
             r#"{"type":"fill","text":"s3cret"}"#,
+            false,
+        ),
+        (
+            r##""selector":"#q""##,
+            r#"{"type":"fill","text":"s3cret","sensitive":true}"#,
+            true,
         ),
     ] {
         let dir = TempDir::new();
@@ -305,8 +322,11 @@ async fn aisnap17_sensitive_redacts_all_values_for_the_generation() {
         host.push(PAGE);
         host.push(&filled);
         let g = navigate(&s).await;
+        if fail {
+            *host.act_error.lock().unwrap() = Some(RenderError::NotActionable);
+        }
         let res = post(&s, "/ai/act", &act_body(g, target, action)).await;
-        assert_eq!(res.status, 200, "{target}");
+        assert_eq!(res.status, if fail { 409 } else { 200 }, "{target}");
         assert_eq!(snapshot(&s).await.status, 200);
         let body = saved_html(&s);
         assert!(!body.contains("visible-value"), "{target}: {body}");
@@ -361,7 +381,26 @@ async fn aisnap21_act_error_mapping() {
         let res = post(&s, "/ai/act", &body).await;
         assert_eq!(code(&res), (want.0, want.1.into()), "{body}");
     }
+    // 受け口の検査（Origin 付き・Content-Type 違い）は本文を見る前に断る。
+    let body = act_body(g, r##""selector":"#go""##, click);
+    for (extra, ct, status) in [
+        ("Origin: https://evil.example\r\n", "application/json", 403),
+        ("", "text/plain", 415),
+    ] {
+        let head = format!(
+            "POST /ai/act HTTP/1.1\r\nHost: 127.0.0.1:9222\r\n{extra}Content-Type: {ct}\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        );
+        assert_eq!(send(&s, &head, &body).await.status, status, "{extra}{ct}");
+    }
     assert!(host.acts().is_empty());
+
+    // 直前の取り直しで操作モードの条件を満たさなくなったら `interactive_unavailable`。操作は送らない。
+    *host.snapshot_error.lock().unwrap() = Some(RenderError::Unsupported);
+    let res = post(&s, "/ai/act", &body).await;
+    assert_eq!(code(&res), (409, "interactive_unavailable".into()));
+    assert!(host.acts().is_empty());
+    let g = navigate(&s).await;
 
     for (e, want) in [
         (RenderError::NotActionable, (409, "not_actionable")),
@@ -417,13 +456,15 @@ async fn aisnap17_busy_while_acting() {
     let host = Arc::new(FakeHost::default());
     let s = state(&dir, Arc::clone(&host));
     let g = navigate(&s).await;
-    *host.act_delay.lock().unwrap() = Duration::from_millis(800);
+    let (entered_tx, entered_rx) = sync_channel(1);
+    let (release_tx, release_rx) = sync_channel(1);
+    *host.act_gate.lock().unwrap() = Some((entered_tx, release_rx));
     let running = {
         let s = Arc::clone(&s);
         let body = act_body(g, r##""selector":"#go""##, r#"{"type":"click"}"#);
         std::thread::spawn(move || fandhe_browser_ai::act::act(&s, body.as_bytes()))
     };
-    std::thread::sleep(Duration::from_millis(300));
+    entered_rx.recv().unwrap();
     assert_eq!(code(&snapshot(&s).await), (409, "busy".into()));
     let res = post(
         &s,
@@ -432,6 +473,7 @@ async fn aisnap17_busy_while_acting() {
     )
     .await;
     assert_eq!(code(&res), (409, "busy".into()));
+    release_tx.send(()).unwrap();
     assert!(running.join().unwrap().is_ok());
     assert_eq!(snapshot(&s).await.status, 200);
     assert_eq!(host.acts().len(), 1);
