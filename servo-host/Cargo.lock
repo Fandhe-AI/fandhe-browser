@@ -1491,6 +1491,7 @@ dependencies = [
  "rustix",
  "serde_json",
  "servo",
+ "servo-base",
  "url",
 ]
 

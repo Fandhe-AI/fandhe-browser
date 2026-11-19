@@ -27,6 +27,7 @@
 //!
 //! 可視性判定・境界ボックス取得のスクリプト生成と結果解釈は Servo 非依存の `layout` が担う（RENDER-3・#233・#234）。
 
+mod act;
 mod args;
 mod dom;
 mod engine;

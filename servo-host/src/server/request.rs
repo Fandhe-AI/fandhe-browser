@@ -11,8 +11,10 @@ use std::time::Duration;
 use serde_json::{Map, Value};
 
 use super::{
-    ErrorKind, LOAD_TIMEOUT_DEFAULT_MS, LOAD_TIMEOUT_MAX_MS, MAX_METHOD_BYTES, MAX_REQUEST_ID,
-    MAX_SELECTOR_BYTES, MAX_URL_BYTES, Method,
+    ErrorKind, LOAD_TIMEOUT_DEFAULT_MS, LOAD_TIMEOUT_MAX_MS, MAX_EXPECT_VALUE_BYTES,
+    MAX_FILL_TEXT_BYTES, MAX_KEY_BYTES, MAX_METHOD_BYTES, MAX_NODE, MAX_REQUEST_ID,
+    MAX_SELECT_VALUE_BYTES, MAX_SELECT_VALUES, MAX_SELECTOR_BYTES, MAX_SNAPSHOT_ID_BYTES,
+    MAX_URL_BYTES, MAX_WAIT_CONDITION_BYTES, Method, PageInfo, WAIT_TIMEOUT_MAX_MS,
 };
 
 /// `load` のパラメータ。UA・ヘッダ等の識別面を持たない（`SEC-2`）。
@@ -34,6 +36,53 @@ pub(crate) struct SelectorParams {
     pub selector: String,
 }
 
+/// `act` の照合値（設計 §14.4）。`tag` は必須、他は送られたものだけを照合する。値は自己申告として扱う。
+pub(crate) struct ActExpect {
+    pub tag: String,
+    pub id: Option<String>,
+    pub name: Option<String>,
+    pub r#type: Option<String>,
+}
+
+/// `act` の操作。入力文字・キーはログ・エラー・応答に出さない（設計 §14.4）。
+pub(crate) enum Action {
+    Click,
+    /// `sensitive` はホストでは使わない（第 1 層の伏せる対象は `dom_snapshot` が決める。本体が世代の間覚える）。
+    Fill {
+        text: String,
+    },
+    Select {
+        values: Vec<String>,
+    },
+    Press {
+        key: String,
+    },
+}
+
+/// `act` のパラメータ（設計 §14.4）。`node` は `dom_snapshot` の番号。
+pub(crate) struct ActParams {
+    pub page: PageInfo,
+    pub snapshot: String,
+    pub node: usize,
+    pub expect: ActExpect,
+    pub action: Action,
+}
+
+/// `wait` の条件（設計 §14.5）。文字列は長さだけ検証した値で、JSON の文字列リテラルにしてからスクリプトへ渡す。
+pub(crate) enum WaitCondition {
+    SelectorPresent(String),
+    SelectorAbsent(String),
+    TextPresent(String),
+    LoadComplete,
+}
+
+/// `wait` のパラメータ（設計 §14.5）。
+pub(crate) struct WaitParams {
+    pub page: PageInfo,
+    pub condition: WaitCondition,
+    pub timeout: Duration,
+}
+
 /// 検証済みの要求。
 pub(crate) enum Request {
     Load(LoadParams),
@@ -42,6 +91,8 @@ pub(crate) enum Request {
     BoundingBox(SelectorParams),
     /// params を持たない（`page` を照合しない。設計 §14.2・§14.3）。
     DomSnapshot,
+    Act(ActParams),
+    Wait(WaitParams),
     Shutdown,
 }
 
@@ -143,6 +194,8 @@ fn parse_params(method: Method, p: &Map<String, Value>) -> Result<Request, Error
                 Request::BoundingBox(params)
             })
         }
+        Method::Act => parse_act(p).map(Request::Act).ok_or(invalid),
+        Method::Wait => parse_wait(p).map(Request::Wait).ok_or(invalid),
         Method::DomSnapshot | Method::Shutdown => {
             if !p.is_empty() {
                 return Err(invalid);
@@ -154,6 +207,119 @@ fn parse_params(method: Method, p: &Map<String, Value>) -> Result<Request, Error
             })
         }
     }
+}
+
+/// バイト数が `min..=max` の文字列（設計 §14.6・hello の `*_bytes` の上限。本体と同じくバイトで数える。
+/// バイトで収まればスキーマの `maxLength`〔文字数〕も満たす）。
+fn bytes_in(v: Option<&Value>, min: usize, max: usize) -> Option<&str> {
+    let s = v?.as_str()?;
+    (min..=max).contains(&s.len()).then_some(s)
+}
+
+/// 文字数（JSON Schema の `maxLength` と同じく Unicode のスカラー値で数える）が `min..=max` の文字列。
+fn str_in(v: Option<&Value>, min: usize, max: usize) -> Option<&str> {
+    let s = v?.as_str()?;
+    let n = s.chars().count();
+    (min..=max).contains(&n).then_some(s)
+}
+
+/// `PageRef`（`session` は 1〜64 文字、`doc_seq` は整数。未知キーは拒否）。
+fn parse_page(v: Option<&Value>) -> Option<PageInfo> {
+    let m = v?.as_object()?;
+    if !has_only_keys(m, &["session", "doc_seq"]) {
+        return None;
+    }
+    Some(PageInfo {
+        session: str_in(m.get("session"), 1, 64)?.to_owned(),
+        doc_seq: as_uint(m.get("doc_seq")?, MAX_REQUEST_ID)?,
+    })
+}
+
+fn parse_act(p: &Map<String, Value>) -> Option<ActParams> {
+    if !has_only_keys(p, &["page", "snapshot", "node", "expect", "action"]) {
+        return None;
+    }
+    let page = parse_page(p.get("page"))?;
+    let snapshot = str_in(p.get("snapshot"), 1, MAX_SNAPSHOT_ID_BYTES)?.to_owned();
+    let node = usize::try_from(as_uint(p.get("node")?, MAX_NODE)?).ok()?;
+    let e = p.get("expect")?.as_object()?;
+    if !has_only_keys(e, &["tag", "id", "name", "type"]) {
+        return None;
+    }
+    let opt = |k: &str| -> Option<Option<String>> {
+        match e.get(k) {
+            None => Some(None),
+            v => str_in(v, 0, MAX_EXPECT_VALUE_BYTES).map(|s| Some(s.to_owned())),
+        }
+    };
+    let expect = ActExpect {
+        tag: str_in(e.get("tag"), 1, 64)?.to_owned(),
+        id: opt("id")?,
+        name: opt("name")?,
+        r#type: opt("type")?,
+    };
+    let a = p.get("action")?.as_object()?;
+    let action = match a.get("kind")?.as_str()? {
+        "click" if has_only_keys(a, &["kind"]) => Action::Click,
+        "fill" if has_only_keys(a, &["kind", "text", "sensitive"]) => {
+            if !matches!(a.get("sensitive"), None | Some(Value::Bool(_))) {
+                return None;
+            }
+            Action::Fill {
+                text: bytes_in(a.get("text"), 0, MAX_FILL_TEXT_BYTES)?.to_owned(),
+            }
+        }
+        "select" if has_only_keys(a, &["kind", "values"]) => {
+            let vs = a.get("values")?.as_array()?;
+            if vs.is_empty() || vs.len() > MAX_SELECT_VALUES {
+                return None;
+            }
+            let values = vs
+                .iter()
+                .map(|v| bytes_in(Some(v), 0, MAX_SELECT_VALUE_BYTES).map(str::to_owned))
+                .collect::<Option<Vec<_>>>()?;
+            Action::Select { values }
+        }
+        "press" if has_only_keys(a, &["kind", "key"]) => Action::Press {
+            key: str_in(a.get("key"), 1, MAX_KEY_BYTES)?.to_owned(),
+        },
+        _ => return None,
+    };
+    Some(ActParams {
+        page,
+        snapshot,
+        node,
+        expect,
+        action,
+    })
+}
+
+fn parse_wait(p: &Map<String, Value>) -> Option<WaitParams> {
+    if !has_only_keys(p, &["page", "condition", "timeout_ms"]) {
+        return None;
+    }
+    let page = parse_page(p.get("page"))?;
+    let ms = as_uint(p.get("timeout_ms")?, WAIT_TIMEOUT_MAX_MS).filter(|ms| *ms >= 1)?;
+    let c = p.get("condition")?.as_object()?;
+    let text = |k: &str| bytes_in(c.get(k), 1, MAX_WAIT_CONDITION_BYTES).map(str::to_owned);
+    let condition = match c.get("kind")?.as_str()? {
+        "selector_present" if has_only_keys(c, &["kind", "selector"]) => {
+            WaitCondition::SelectorPresent(text("selector")?)
+        }
+        "selector_absent" if has_only_keys(c, &["kind", "selector"]) => {
+            WaitCondition::SelectorAbsent(text("selector")?)
+        }
+        "text_present" if has_only_keys(c, &["kind", "text"]) => {
+            WaitCondition::TextPresent(text("text")?)
+        }
+        "load_complete" if has_only_keys(c, &["kind"]) => WaitCondition::LoadComplete,
+        _ => return None,
+    };
+    Some(WaitParams {
+        page,
+        condition,
+        timeout: Duration::from_millis(ms),
+    })
 }
 
 /// すべてのキーが許可リストに含まれるか（未知キーは識別面を含めて拒否する。fail-closed）。

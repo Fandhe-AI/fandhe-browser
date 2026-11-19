@@ -23,8 +23,14 @@ struct Host {
 }
 
 fn spawn(args: &[&str]) -> Host {
+    spawn_with_env(args, &[])
+}
+
+/// 環境変数を足して起動する（Cookie が一時領域の外に残らないことの検査で、HOME などを空の場所へ向ける）。
+fn spawn_with_env(args: &[&str], envs: &[(&str, &std::path::Path)]) -> Host {
     let mut child = Command::new(env!("CARGO_BIN_EXE_fandhe-browser-servo-host"))
         .args(args)
+        .envs(envs.iter().map(|(k, v)| (*k, *v)))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1770,8 +1776,18 @@ fn serve_forwarding_proxy() -> (u16, mpsc::Sender<()>) {
 
 /// 操作モードのホストを起動し、hello を読む。
 fn spawn_interactive(proxy_port: u16) -> (Host, serde_json::Value) {
+    spawn_interactive_with_env(proxy_port, &[])
+}
+
+fn spawn_interactive_with_env(
+    proxy_port: u16,
+    envs: &[(&str, &std::path::Path)],
+) -> (Host, serde_json::Value) {
     let port = proxy_port.to_string();
-    let mut h = spawn(&["--stdio", "--interactive", "--egress-proxy-port", &port]);
+    let mut h = spawn_with_env(
+        &["--stdio", "--interactive", "--egress-proxy-port", &port],
+        envs,
+    );
     let hello: serde_json::Value = serde_json::from_str(&h.recv()).unwrap();
     (h, hello)
 }
@@ -2079,6 +2095,597 @@ fn navigator_webdriver_is_true_from_first_script_in_both_modes() {
         "{html}"
     );
     finish_host(h, 3);
+}
+
+// ---- 操作モードの操作（act）と待機（wait）（RENDER-10・AISNAP-18・TASK-126） ----
+
+/// 操作の試験ページ。結果は `#out` の文字列に書く（`dom_snapshot` で読む）。
+const ACT_PAGE: &str = concat!(
+    "<!doctype html><html><head><title>act</title><style>body{margin:0}button,input,select{display:block;width:200px;height:30px}</style></head><body>",
+    "<p id=out>none</p>",
+    "<button id=b onclick=\"document.getElementById('out').textContent='clicked:'+event.isTrusted\">B</button>",
+    "<input id=q name=q value=old onkeydown=\"if(event.key==='Enter')document.getElementById('out').textContent='enter:'+this.value\">",
+    "<input id=jump oninput=\"document.getElementById('out').textContent='jump:'+this.value;document.getElementById('sink').focus()\">",
+    "<input id=sink oninput=\"document.getElementById('out').textContent='sink:'+this.value\">",
+    "<select id=s name=s onchange=\"document.getElementById('out').textContent='sel:'+this.value\"><option value=a selected>A</option><option value=b>B</option><option value=c disabled>C</option></select>",
+    "<button id=pop onclick=\"window.open('/x')\">P</button>",
+    "<div style=\"position:relative;width:200px;height:30px\"><input id=fq onkeydown=\"document.getElementById('out').textContent='fq'\"></div>",
+    "<button id=coverfq onclick=\"var f=document.getElementById('fq');var d=document.createElement('div');d.style.cssText='position:absolute;left:0;top:0;width:200px;height:30px;background:#fff';f.parentNode.appendChild(d);f.focus()\">V</button>",
+    "<iframe id=fr srcdoc=\"<p>f</p>\" style=\"width:100px;height:30px\"></iframe>",
+    "<button id=frnav onclick=\"document.getElementById('fr').src='/act?frame';document.getElementById('out').textContent='frnav'\">N</button>",
+    "<button id=dis disabled onclick=\"document.getElementById('out').textContent='dis'\">D</button>",
+    "<div style=\"position:relative;width:200px;height:30px\"><button id=cov onclick=\"document.getElementById('out').textContent='cov'\">C</button>",
+    "<div style=\"position:absolute;left:0;top:0;width:200px;height:30px;background:#fff\"></div></div>",
+    "<div style=\"position:relative;width:200px;height:30px\"><button id=ifr onclick=\"document.getElementById('out').textContent='ifr'\">I</button>",
+    "<iframe srcdoc=\"<p>x</p>\" style=\"position:absolute;left:0;top:0;width:200px;height:30px;border:0\"></iframe></div>",
+    "<div style=\"position:relative;width:200px;height:30px\"><input id=covq value=keep>",
+    "<div style=\"position:absolute;left:0;top:0;width:200px;height:30px;background:#fff\"></div></div>",
+    "<select id=hid style=\"display:none\"><option value=a>A</option></select>",
+    "<button id=edge style=\"position:fixed;left:300px;top:790px\" onclick=\"document.getElementById('out').textContent='edge'\">E</button>",
+    "<button id=far style=\"margin-top:3000px\" onclick=\"document.getElementById('out').textContent='far'\">F</button>",
+    "<script>setTimeout(function(){var d=document.createElement('div');d.id='late';document.body.appendChild(d);},300);</script>",
+    "</body></html>"
+);
+
+/// `dom_snapshot` の HTML から、属性 `id="<id>"` を持つ要素の番号を引く。
+fn node_of(html: &str, id: &str) -> u64 {
+    let needle = format!(" id=\"{id}\"");
+    html.split('<')
+        .find(|tag| tag.split('>').next().is_some_and(|t| t.contains(&needle)))
+        .and_then(|tag| tag.split("data-fandhe-n=\"").nth(1))
+        .and_then(|rest| rest.split('"').next())
+        .and_then(|n| n.parse().ok())
+        .unwrap_or_else(|| panic!("no element with id {id}: {html}"))
+}
+
+/// 操作モードのホストでページを読み込み、`dom_snapshot` を取る。戻り値は (ホスト, 次の id, 取得結果)。
+fn interactive_page(url: &str, proxy: u16) -> (Host, u64, serde_json::Value) {
+    let (mut h, hello) = spawn_interactive(proxy);
+    let caps = hello["data"]["capabilities"].as_array().unwrap();
+    assert!(caps.contains(&serde_json::json!("act")), "{hello}");
+    assert!(caps.contains(&serde_json::json!("wait")), "{hello}");
+    assert_eq!(hello["data"]["limits"]["act_timeout_ms"], 10_000);
+    h.send(&load_req(1, url, 20_000));
+    let r: serde_json::Value = serde_json::from_str(&h.recv()).unwrap();
+    assert!(r["result"].is_object(), "{r}");
+    let snap = request(&mut h, 2, "dom_snapshot");
+    (h, 3, snap["result"].clone())
+}
+
+/// `act` を送って応答を返す。
+fn act_req(
+    h: &mut Host,
+    id: u64,
+    snap: &serde_json::Value,
+    node: u64,
+    expect: &str,
+    action: &str,
+) -> serde_json::Value {
+    let page = snap["page"].to_string();
+    let s = snap["snapshot"].as_str().unwrap();
+    h.send(&format!(
+        r#"{{"v":1,"id":{id},"method":"act","params":{{"page":{page},"snapshot":"{s}","node":{node},"expect":{expect},"action":{action}}}}}"#
+    ));
+    let r: serde_json::Value = serde_json::from_str(&h.recv()).unwrap();
+    assert_eq!(r["id"], id, "{r}");
+    r
+}
+
+fn out_text(h: &mut Host, id: u64) -> (String, serde_json::Value) {
+    let snap = request(h, id, "dom_snapshot");
+    let html = snap["result"]["html"].as_str().unwrap().to_owned();
+    let start = html
+        .find(" id=\"out\">")
+        .map(|i| i + " id=\"out\">".len())
+        .unwrap();
+    let text = html[start..].split('<').next().unwrap().to_owned();
+    (text, snap["result"].clone())
+}
+
+/// RENDER-10・TASK-126: クリック・文字入力・選択・キーを入力イベント（`isTrusted`）で渡し、照合値・`page`・
+/// `snapshot` が違えば `stale`、`disabled`・他の要素や iframe に隠れた要素は `not_actionable`。画面の外の要素は
+/// スクロールして押す。
+#[test]
+fn interactive_act_operates_elements_and_rejects_unsafe_targets() {
+    let (l, port) = bind_loopback();
+    let mut m = std::collections::HashMap::new();
+    m.insert(
+        "/act".to_owned(),
+        ("text/html", ACT_PAGE.as_bytes().to_vec()),
+    );
+    let _stop = serve_routes(l, std::sync::Arc::new(m));
+    let (proxy, _pstop) = serve_forwarding_proxy();
+    let (mut h, mut id, mut snap) =
+        interactive_page(&format!("http://127.0.0.1:{port}/act"), proxy);
+    let html = snap["html"].as_str().unwrap().to_owned();
+    let ok = |r: &serde_json::Value| {
+        assert!(r["result"]["page"].is_object(), "{r}");
+        assert_eq!(r["result"]["navigated"], false, "{r}");
+    };
+    let kind = |r: &serde_json::Value| r["error"]["kind"].as_str().unwrap_or("").to_owned();
+
+    // クリック（入力イベントなので isTrusted は true）。
+    let r = act_req(
+        &mut h,
+        id,
+        &snap,
+        node_of(&html, "b"),
+        r#"{"tag":"button","id":"b"}"#,
+        r#"{"kind":"click"}"#,
+    );
+    ok(&r);
+    id += 1;
+    let old = snap.clone();
+    {
+        let (t, s2) = out_text(&mut h, id);
+        snap = s2;
+        assert_eq!(t, "clicked:true");
+    }
+    id += 1;
+
+    // 取り直した後は、前の取得の snapshot では stale。
+    let r = act_req(
+        &mut h,
+        id,
+        &old,
+        node_of(&html, "b"),
+        r#"{"tag":"button"}"#,
+        r#"{"kind":"click"}"#,
+    );
+    assert_eq!(kind(&r), "stale", "{r}");
+    id += 1;
+
+    // 文字入力（既存の値を消してから入れる）→ Enter。
+    let q = node_of(&html, "q");
+    let r = act_req(
+        &mut h,
+        id,
+        &snap,
+        q,
+        r#"{"tag":"input","name":"q"}"#,
+        r#"{"kind":"fill","text":"hi あ","sensitive":false}"#,
+    );
+    ok(&r);
+    id += 1;
+    let r = act_req(
+        &mut h,
+        id,
+        &snap,
+        q,
+        r#"{"tag":"input"}"#,
+        r#"{"kind":"press","key":"Enter"}"#,
+    );
+    ok(&r);
+    id += 1;
+    {
+        let (t, s2) = out_text(&mut h, id);
+        snap = s2;
+        assert_eq!(t, "enter:hi あ");
+    }
+    id += 1;
+
+    // 文字入力の途中でページがフォーカスを移すと、残りの文字は移った先へ入りうる（既知の制約。設計 §14.4。
+    // どちらへ入るかは入力の処理の時機による）。最後のフォーカスの確認で外れたことを `not_actionable` で返す。
+    let r = act_req(
+        &mut h,
+        id,
+        &snap,
+        node_of(&html, "jump"),
+        r#"{"tag":"input"}"#,
+        r#"{"kind":"fill","text":"abc"}"#,
+    );
+    assert_eq!(kind(&r), "not_actionable", "{r}");
+    id += 1;
+    {
+        let (t, s2) = out_text(&mut h, id);
+        snap = s2;
+        assert!(
+            matches!(t.as_str(), "jump:abc" | "sink:bc" | "sink:c"),
+            "{t}"
+        );
+    }
+    id += 1;
+
+    // 選択。
+    let r = act_req(
+        &mut h,
+        id,
+        &snap,
+        node_of(&html, "s"),
+        r#"{"tag":"select"}"#,
+        r#"{"kind":"select","values":["b"]}"#,
+    );
+    ok(&r);
+    id += 1;
+    {
+        let (t, s2) = out_text(&mut h, id);
+        snap = s2;
+        assert_eq!(t, "sel:b");
+    }
+    id += 1;
+
+    // 選択: 一致する選択肢が無い・単一選択に 2 つ・表示されていない select は選ばない。
+    for (target, values, want) in [
+        ("s", r#"["zz"]"#, "not_actionable"),
+        ("s", r#"["c"]"#, "not_actionable"),
+        ("s", r#"["a","b"]"#, "invalid_params"),
+        ("hid", r#"["a"]"#, "not_actionable"),
+    ] {
+        let r = act_req(
+            &mut h,
+            id,
+            &snap,
+            node_of(&html, target),
+            r#"{"tag":"select"}"#,
+            &format!(r#"{{"kind":"select","values":{values}}}"#),
+        );
+        assert_eq!(kind(&r), want, "{target} {values}: {r}");
+        id += 1;
+    }
+
+    // 新しいウィンドウは開かず unsupported。
+    let r = act_req(
+        &mut h,
+        id,
+        &snap,
+        node_of(&html, "pop"),
+        r#"{"tag":"button"}"#,
+        r#"{"kind":"click"}"#,
+    );
+    assert_eq!(kind(&r), "unsupported", "{r}");
+    id += 1;
+
+    // iframe の遷移を許可しても、読み込みを待ち続けない（期限までに返る）。ホストの文書番号はフレームを区別せず
+    // 上がるため、navigated は真になりうる（取り直して続ける）。
+    let started = std::time::Instant::now();
+    let r = act_req(
+        &mut h,
+        id,
+        &snap,
+        node_of(&html, "frnav"),
+        r#"{"tag":"button"}"#,
+        r#"{"kind":"click"}"#,
+    );
+    assert!(r["result"]["page"].is_object(), "{r}");
+    assert!(
+        started.elapsed() < Duration::from_secs(8),
+        "{:?}",
+        started.elapsed()
+    );
+    id += 1;
+    {
+        let (t, s2) = out_text(&mut h, id);
+        snap = s2;
+        assert_eq!(t, "frnav");
+    }
+    id += 1;
+
+    // フォーカスがあっても、覆われた入力欄へはキーを送らない（覆ってからフォーカスを戻すボタンで作る）。
+    let r = act_req(
+        &mut h,
+        id,
+        &snap,
+        node_of(&html, "coverfq"),
+        r#"{"tag":"button"}"#,
+        r#"{"kind":"click"}"#,
+    );
+    ok(&r);
+    id += 1;
+    let r = act_req(
+        &mut h,
+        id,
+        &snap,
+        node_of(&html, "fq"),
+        r#"{"tag":"input"}"#,
+        r#"{"kind":"press","key":"Enter"}"#,
+    );
+    assert_eq!(kind(&r), "not_actionable", "{r}");
+    id += 1;
+    {
+        let (t, s2) = out_text(&mut h, id);
+        snap = s2;
+        assert_ne!(t, "fq", "a key reached a covered input");
+    }
+    id += 1;
+    // 覆いの要素が増えて番号がずれたため、以後は取り直した HTML から番号を引く。
+    let html = snap["html"].as_str().unwrap().to_owned();
+
+    // 隠れた入力欄は、値を消す前に断る（既存の値が残る）。
+    let r = act_req(
+        &mut h,
+        id,
+        &snap,
+        node_of(&html, "covq"),
+        r#"{"tag":"input"}"#,
+        r#"{"kind":"fill","text":"zz"}"#,
+    );
+    assert_eq!(kind(&r), "not_actionable", "{r}");
+    id += 1;
+    {
+        let (_, s2) = out_text(&mut h, id);
+        snap = s2;
+        assert!(
+            snap["html"]
+                .as_str()
+                .unwrap()
+                .contains(r#"id="covq" value="keep""#),
+            "{}",
+            snap["html"]
+        );
+    }
+    id += 1;
+
+    // 画面の下端にまたがる要素は、画面の中に入っている部分の中心を押す（判定した点と同じ点）。
+    let r = act_req(
+        &mut h,
+        id,
+        &snap,
+        node_of(&html, "edge"),
+        r#"{"tag":"button"}"#,
+        r#"{"kind":"click"}"#,
+    );
+    ok(&r);
+    id += 1;
+    {
+        let (t, s2) = out_text(&mut h, id);
+        snap = s2;
+        assert_eq!(t, "edge");
+    }
+    id += 1;
+
+    // 画面の外の要素はスクロールして押す。
+    let r = act_req(
+        &mut h,
+        id,
+        &snap,
+        node_of(&html, "far"),
+        r#"{"tag":"button"}"#,
+        r#"{"kind":"click"}"#,
+    );
+    ok(&r);
+    id += 1;
+    {
+        let (t, s2) = out_text(&mut h, id);
+        snap = s2;
+        assert_eq!(t, "far");
+    }
+    id += 1;
+
+    // 押さない: disabled・他の要素に隠れている・iframe に隠れている。
+    for (target, want) in [
+        ("dis", "not_actionable"),
+        ("cov", "not_actionable"),
+        ("ifr", "not_actionable"),
+    ] {
+        let r = act_req(
+            &mut h,
+            id,
+            &snap,
+            node_of(&html, target),
+            r#"{"tag":"button"}"#,
+            r#"{"kind":"click"}"#,
+        );
+        assert_eq!(kind(&r), want, "{target}: {r}");
+        id += 1;
+    }
+    assert_eq!(
+        out_text(&mut h, id).0,
+        "far",
+        "a rejected target must not be clicked"
+    );
+    id += 1;
+
+    // stale: 照合値の違い・番号の範囲外・page の違い。
+    let r = act_req(
+        &mut h,
+        id,
+        &snap,
+        node_of(&html, "b"),
+        r#"{"tag":"input"}"#,
+        r#"{"kind":"click"}"#,
+    );
+    assert_eq!(kind(&r), "stale", "{r}");
+    id += 1;
+    let r = act_req(
+        &mut h,
+        id,
+        &snap,
+        199_999,
+        r#"{"tag":"button"}"#,
+        r#"{"kind":"click"}"#,
+    );
+    assert_eq!(kind(&r), "stale", "{r}");
+    id += 1;
+    let mut other = snap.clone();
+    other["page"]["doc_seq"] = 999.into();
+    let r = act_req(
+        &mut h,
+        id,
+        &other,
+        node_of(&html, "b"),
+        r#"{"tag":"button"}"#,
+        r#"{"kind":"click"}"#,
+    );
+    assert_eq!(kind(&r), "stale", "{r}");
+    id += 1;
+    // 解釈できないキーは invalid_params。
+    let r = act_req(
+        &mut h,
+        id,
+        &snap,
+        q,
+        r#"{"tag":"input"}"#,
+        r#"{"kind":"press","key":"NotAKey"}"#,
+    );
+    assert_eq!(kind(&r), "invalid_params", "{r}");
+    id += 1;
+
+    // 待機: 遅れて現れる要素・すでに成立している条件・時間切れ・不正なセレクタ。
+    let page = snap["page"].to_string();
+    let wait = |h: &mut Host, id: u64, cond: &str, ms: u64| -> serde_json::Value {
+        h.send(&format!(
+            r#"{{"v":1,"id":{id},"method":"wait","params":{{"page":{page},"condition":{cond},"timeout_ms":{ms}}}}}"#
+        ));
+        serde_json::from_str(&h.recv()).unwrap()
+    };
+    let r = wait(
+        &mut h,
+        id,
+        r##"{"kind":"selector_present","selector":"#late"}"##,
+        5000,
+    );
+    assert!(r["result"]["page"].is_object(), "{r}");
+    id += 1;
+    let r = wait(&mut h, id, r#"{"kind":"text_present","text":"far"}"#, 1000);
+    assert!(r["result"]["page"].is_object(), "{r}");
+    id += 1;
+    let r = wait(&mut h, id, r#"{"kind":"load_complete"}"#, 1000);
+    assert!(r["result"]["page"].is_object(), "{r}");
+    id += 1;
+    let r = wait(
+        &mut h,
+        id,
+        r##"{"kind":"selector_absent","selector":"#late"}"##,
+        300,
+    );
+    assert_eq!(kind(&r), "timeout", "{r}");
+    id += 1;
+    let r = wait(
+        &mut h,
+        id,
+        r#"{"kind":"selector_present","selector":"[["}"#,
+        1000,
+    );
+    assert_eq!(kind(&r), "invalid_params", "{r}");
+    id += 1;
+
+    h.send(&format!(r#"{{"v":1,"id":{id},"method":"shutdown"}}"#));
+    let _ = h.recv();
+    let (code, rest, stderr) = h.finish();
+    assert_eq!(code, Some(0), "stderr: {stderr}");
+    assert_eq!(rest, 0);
+    assert!(
+        !stderr.contains('あ'),
+        "input text leaked to the log: {stderr}"
+    );
+}
+
+/// `RENDER-10`・TASK-126: 操作モードで Cookie（永続の `max-age`）を作って操作しても、ホストの終了後にその値を含むファイルが
+/// ホームや一時ディレクトリに残らない（`temporary_storage`。操作モードでは永続 Cookie を使わない。
+/// `rendering-layer.md` の判断 5）。HOME・TMPDIR・XDG の各ディレクトリを空の場所へ向けて確かめる。
+#[test]
+fn interactive_cookies_do_not_outlive_the_host() {
+    let marker = format!("cookie-marker-{}", std::process::id());
+    let root = std::env::temp_dir().join(format!("fandhe-host-cookie-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let dirs: Vec<(&str, std::path::PathBuf)> = [
+        "HOME",
+        "TMPDIR",
+        "XDG_CONFIG_HOME",
+        "XDG_DATA_HOME",
+        "XDG_CACHE_HOME",
+    ]
+    .into_iter()
+    .map(|k| (k, root.join(k.to_ascii_lowercase())))
+    .collect();
+    for (_, d) in &dirs {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    let page = format!(
+        "<!doctype html><html><body><script>document.cookie='k={marker}; max-age=3600; path=/';</script>\
+<input id=q name=q style=\"display:block;width:200px;height:30px\"></body></html>"
+    );
+    let (l, port) = bind_loopback();
+    let mut m = std::collections::HashMap::new();
+    m.insert("/c".to_owned(), ("text/html", page.into_bytes()));
+    let _stop = serve_routes(l, std::sync::Arc::new(m));
+    let (proxy, _pstop) = serve_forwarding_proxy();
+    let envs: Vec<(&str, &std::path::Path)> = dirs.iter().map(|(k, d)| (*k, d.as_path())).collect();
+    let (mut h, _hello) = spawn_interactive_with_env(proxy, &envs);
+    h.send(&load_req(1, &format!("http://127.0.0.1:{port}/c"), 20_000));
+    let r: serde_json::Value = serde_json::from_str(&h.recv()).unwrap();
+    assert!(r["result"].is_object(), "{r}");
+    let snap = request(&mut h, 2, "dom_snapshot")["result"].clone();
+    let html = snap["html"].as_str().unwrap().to_owned();
+    let r = act_req(
+        &mut h,
+        3,
+        &snap,
+        node_of(&html, "q"),
+        r#"{"tag":"input"}"#,
+        r#"{"kind":"fill","text":"x"}"#,
+    );
+    assert!(r["result"].is_object(), "{r}");
+    finish_host(h, 4);
+
+    fn scan(dir: &std::path::Path, marker: &str, hits: &mut Vec<std::path::PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                scan(&p, marker, hits);
+            } else if std::fs::read(&p)
+                .is_ok_and(|b| b.windows(marker.len()).any(|w| w == marker.as_bytes()))
+            {
+                hits.push(p);
+            }
+        }
+    }
+    let mut hits = Vec::new();
+    scan(&root, &marker, &mut hits);
+    let _ = std::fs::remove_dir_all(&root);
+    assert!(hits.is_empty(), "cookie value persisted: {hits:?}");
+}
+
+/// RENDER-10・TASK-126: クリックで遷移したら `navigated` が真になり、`page` の `doc_seq` が進む。
+#[test]
+fn interactive_act_reports_navigation() {
+    let (l, port) = bind_loopback();
+    let mut m = std::collections::HashMap::new();
+    m.insert(
+        "/from".to_owned(),
+        ("text/html", b"<!doctype html><a id=go href=\"/to\" style=\"display:block;width:200px;height:30px\">go</a>".to_vec()),
+    );
+    m.insert(
+        "/to".to_owned(),
+        ("text/html", b"<!doctype html><p id=arrived>ok</p>".to_vec()),
+    );
+    let _stop = serve_routes(l, std::sync::Arc::new(m));
+    let (proxy, _pstop) = serve_forwarding_proxy();
+    let (mut h, id, snap) = interactive_page(&format!("http://127.0.0.1:{port}/from"), proxy);
+    let html = snap["html"].as_str().unwrap().to_owned();
+    let r = act_req(
+        &mut h,
+        id,
+        &snap,
+        node_of(&html, "go"),
+        r#"{"tag":"a","id":"go"}"#,
+        r#"{"kind":"click"}"#,
+    );
+    assert_eq!(r["result"]["navigated"], true, "{r}");
+    let before = snap["page"]["doc_seq"].as_u64().unwrap();
+    assert!(
+        r["result"]["page"]["doc_seq"].as_u64().unwrap() > before,
+        "{r}"
+    );
+    // 遷移の後は、返った page で待てる。前の page では待てない。
+    let new_page = r["result"]["page"].to_string();
+    h.send(&format!(
+        r#"{{"v":1,"id":{},"method":"wait","params":{{"page":{new_page},"condition":{{"kind":"load_complete"}},"timeout_ms":5000}}}}"#,
+        id + 10
+    ));
+    let w: serde_json::Value = serde_json::from_str(&h.recv()).unwrap();
+    assert!(w["result"]["page"].is_object(), "{w}");
+    let page = snap["page"].to_string();
+    h.send(&format!(
+        r#"{{"v":1,"id":{},"method":"wait","params":{{"page":{page},"condition":{{"kind":"load_complete"}},"timeout_ms":5000}}}}"#,
+        id + 1
+    ));
+    let w: serde_json::Value = serde_json::from_str(&h.recv()).unwrap();
+    assert_eq!(w["error"]["kind"], "stale", "{w}");
+    finish_host(h, id + 2);
 }
 
 // ---- ページの alert()（#1597） ----
