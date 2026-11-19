@@ -3,8 +3,9 @@
 //! `server.rs` の navigate ハンドラから呼ばれる純関数群。ホストへの送信は `host.rs` が担う。
 //!
 //! 将来仕様（REPAIR-3）: ホストの `POST /ai/navigate` は PoC-15 の契約（要求 `{"url"}`・
-//! 応答 `{"ok","url"}`）に基づく想定で、本リポのホスト（ai crate）には未実装。ホスト側の
-//! エンドポイントとスキーマが確定した時点で応答解釈を合わせる。URL の最終的な SSRF・内部
+//! 応答 `{"ok","url"}`）に基づく想定。ai crate は TASK-127 で操作モード（`"mode": "interactive"`）だけを
+//! 実装し、`mode` の省略（本ツールの要求）は `not_implemented`（501）を返す（2026-11-19 のオーナー判断。
+//! 静的モードは別 issue）。MCP の操作ツール（TASK-132）でエンドポイントとスキーマに応答解釈を合わせる。URL の最終的な SSRF・内部
 //! アドレス判定はホストの `Fetcher` の責務で、ここは scheme 許可リストによる早期拒否に留める。
 
 use rmcp::serde_json::{self, Value, json};
