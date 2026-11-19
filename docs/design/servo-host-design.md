@@ -540,6 +540,7 @@ AGENTS.md の変更はレビュー基準の変更として AI レビューで P0
 | `timeout` | ホスト | `wait`、`dom_snapshot` の時間切れ（`dom_snapshot` では本体がホストを破棄して `session_lost` にする） |
 | `session_lost`・`busy` | 本体（render） | ホストの破棄・再起動の後、同時実行の超過 |
 | `not_interactive`・`rendering_disabled`・`interactive_unavailable` | 本体（ai） | `AISNAP-21` |
+| `stale`・`sync_failed`（409・502） | 本体（ai） | `/ai/snapshot` の同期の失敗。`stale` は同期の途中で新しい navigate が始まった、`sync_failed` はそれ以外の取得・検査の失敗。`stale` 以外では確定結果を無効にする（`AISNAP-20`。2026-11-19 のオーナー判断・TASK-125） |
 
 - ホストが返す kind はスキーマの `Error.kind` に足した。本体側の kind はホストとの間を流れないため、スキーマに載せない
 - エラーの `message` は固定の英語で、入力値・URL・セレクタを含めない（§2.2 と同じ）
