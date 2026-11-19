@@ -2105,6 +2105,8 @@ const ACT_PAGE: &str = concat!(
     "<p id=out>none</p>",
     "<button id=b onclick=\"document.getElementById('out').textContent='clicked:'+event.isTrusted\">B</button>",
     "<input id=q name=q value=old onkeydown=\"if(event.key==='Enter')document.getElementById('out').textContent='enter:'+this.value\">",
+    "<input id=jump oninput=\"document.getElementById('out').textContent='jump:'+this.value;document.getElementById('sink').focus()\">",
+    "<input id=sink oninput=\"document.getElementById('out').textContent='sink:'+this.value\">",
     "<select id=s name=s onchange=\"document.getElementById('out').textContent='sel:'+this.value\"><option value=a selected>A</option><option value=b>B</option><option value=c disabled>C</option></select>",
     "<button id=pop onclick=\"window.open('/x')\">P</button>",
     "<div style=\"position:relative;width:200px;height:30px\"><input id=fq onkeydown=\"document.getElementById('out').textContent='fq'\"></div>",
@@ -2259,6 +2261,24 @@ fn interactive_act_operates_elements_and_rejects_unsafe_targets() {
         let (t, s2) = out_text(&mut h, id);
         snap = s2;
         assert_eq!(t, "enter:hi あ");
+    }
+    id += 1;
+
+    // 文字入力の途中でページがフォーカスを移したら、残りの文字を送らない。
+    let r = act_req(
+        &mut h,
+        id,
+        &snap,
+        node_of(&html, "jump"),
+        r#"{"tag":"input"}"#,
+        r#"{"kind":"fill","text":"abc"}"#,
+    );
+    assert_eq!(kind(&r), "not_actionable", "{r}");
+    id += 1;
+    {
+        let (t, s2) = out_text(&mut h, id);
+        snap = s2;
+        assert_eq!(t, "jump:a");
     }
     id += 1;
 
