@@ -796,7 +796,7 @@ impl CurrentPage {
         while Instant::now() < until && !self.delegate.navigation_requested.get() {
             spin();
         }
-        if self.delegate.navigation_requested.get() {
+        if self.delegate.navigation_requested.replace(false) {
             let until = (Instant::now() + ACT_NAVIGATION_WAIT).min(deadline);
             while Instant::now() < until
                 && self.delegate.doc_seq.get() == start
@@ -921,8 +921,9 @@ impl CurrentPage {
         }
         self.delegate.navigation_requested.set(false);
         self.delegate.unsupported_requested.set(false);
-        // `option` は WebDriver の `ElementClick` が選択とイベントまで行うため、命令を送る前に断る（`select` を使う）。
-        if p.expect.tag == "option" && !matches!(p.action, Action::Select { .. }) {
+        // `option` は WebDriver の `ElementClick` が選択とイベントまで行うため、命令を送る前に断る（`select` は
+        // `select` 要素を対象にする）。
+        if p.expect.tag == "option" {
             return Err(ErrorKind::NotActionable);
         }
         match &p.action {
