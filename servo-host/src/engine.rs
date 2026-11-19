@@ -14,7 +14,8 @@
 //! - 起動構成は [`fixed_opts`]・[`fixed_preferences`] のコード内固定値だけで作る。
 //!   argv からは `args` が検証した loopback ポートだけが [`LoopbackProxy`] として proxy pref に入る。
 //!   環境変数・ファイルから Servo の設定へ流す経路は持たない（SEC-2・RENDER-3・#1435）。
-//!   ビューポートも定数 [`VIEWPORT`] で、API にしない。
+//!   ビューポートも定数 [`VIEWPORT`] で、API にしない。起動時に、全ページの文書の最初に走らせる固定の定義
+//!   （[`NAVIGATOR_WEBDRIVER_SCRIPT`]。SEC-5・TASK-119）を登録する
 //! - 標準出力へは書かない（将来 stdout はフレーム専用になる。設計 §2.1）。
 
 use std::fmt;
@@ -22,7 +23,10 @@ use std::num::NonZeroU16;
 use std::rc::{Rc, Weak};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use servo::{Opts, Preferences, RenderingContext, Servo, ServoBuilder, SoftwareRenderingContext};
+use servo::{
+    Opts, Preferences, RenderingContext, Servo, ServoBuilder, SoftwareRenderingContext,
+    UserContentManager, UserScript,
+};
 
 /// 描画ビューポート（幅, 高さ。px）。設計 §2.3 の固定値で、引数や設定にしない（SEC-2）。
 pub(crate) const VIEWPORT: (u32, u32) = (1280, 800);
@@ -142,11 +146,26 @@ fn fixed_preferences(proxy: Option<LoopbackProxy>) -> Preferences {
     }
 }
 
+/// 全ページの文書の最初に走らせる定義（SEC-5・TASK-119。判断の記録は `docs/design/anti-bot-review.md`）。
+///
+/// `navigator.webdriver` を `Navigator.prototype` の getter として `true` に固定する（`configurable: false`
+/// なので再定義は `TypeError`、`delete` は `false` になる）。他の `navigator` の項目は変えない。値を消す・
+/// `false` にする経路は作らない（設定・引数・API から変えられない）。既知の制約: iframe の子文書には
+/// 入らない、ページは `navigator` の個体を上書きできる、Worker では未定義、getter の `toString()` が見える。
+/// また Servo は登録した定義を `head` 要素が文書に入った時点で走らせるため、`head` の無い XML の文書
+/// （`application/xhtml+xml` 等。HTML と違いパーサーが `head` を補わない）では主フレームでも未定義になる
+/// （2026-11-19 に実ホストで確認。`head` があれば最初のスクリプトから `true`）。これは SEC-5 の既知の制約に
+/// 含まれず、扱いは判断待ち（#1609）。
+pub(crate) const NAVIGATOR_WEBDRIVER_SCRIPT: &str = "Object.defineProperty(Navigator.prototype,\"webdriver\",{get:function(){return true},configurable:false,enumerable:true});";
+
 /// Servo とソフトウェア描画コンテキストの組。`Drop` で Servo を停止してから解放する。
 pub(crate) struct Engine {
     // フィールドの宣言順が drop 順になる。Servo の `Drop` はイベントループを回して
     // constellation の終了を待つ間もレンダリングコンテキストを必要とするため、
     // servo を context より先に宣言する。順序を入れ替えないこと。
+    // `UserContentManager` は Servo の複製を持ち、最後の複製が落ちた時点で Servo の停止が走る。
+    // context の解放より前に停止させるため、context より前に宣言する。
+    user_content: Rc<UserContentManager>,
     servo: Servo,
     context: Rc<SoftwareRenderingContext>,
 }
@@ -174,7 +193,15 @@ impl Engine {
             .build();
         // WebView に紐づかない読み込み（Worker 等）の検査。最初の WebView より前に設定する（RENDER-3）。
         servo.set_delegate(crate::guard::GuardDelegate::new());
+        // 全 WebView が共有する。登録は最初の WebView より前に行う（後からの追加は再読み込みまで効かない）。
+        // 撮影（静的モード）と操作モードの両方で同じものを使う（SEC-5）。
+        let user_content = Rc::new(UserContentManager::new(&servo));
+        user_content.add_script(Rc::new(UserScript::new(
+            NAVIGATOR_WEBDRIVER_SCRIPT.to_owned(),
+            None,
+        )));
         Ok(Self {
+            user_content,
             servo,
             context: Rc::new(context),
         })
@@ -183,6 +210,11 @@ impl Engine {
     /// WebView 生成・イベントループ駆動用の Servo 参照（#231 が使う）。
     pub(crate) fn servo(&self) -> &Servo {
         &self.servo
+    }
+
+    /// WebView 生成用の、文書の最初に走らせる定義の組（[`NAVIGATOR_WEBDRIVER_SCRIPT`]）。
+    pub(crate) fn user_content_manager(&self) -> Rc<UserContentManager> {
+        self.user_content.clone()
     }
 
     /// WebView 生成用の描画コンテキスト。複製した `Rc` は WebView の寿命内だけで持つ契約。

@@ -250,6 +250,7 @@ pub(crate) fn navigate(
     });
     let webview = WebViewBuilder::new(engine.servo(), engine.rendering_context())
         .delegate(delegate.clone())
+        .user_content_manager(engine.user_content_manager())
         .url(url.into_url())
         .build();
 

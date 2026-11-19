@@ -69,6 +69,19 @@ SEC-3 は「本項は実測対象の選定基準であり、ブラウザ本体�
 
 補足（#1325・2026-10-30 オーナー判断）: `Page.addScriptToEvaluateOnNewDocument` は空 `source` に加え、`//# sourceURL=<ASCII 印字可能 1 文字以上>` の 1 行（256 バイト以下）だけの `source`（Puppeteer の `newPage()` が送る `//# sourceURL=pptr:internal`）も no-op で受理してよい。実行経路は無く値も保持しない。実行内容を 1 文字でも含む `source`（改行・LS/PS・空白・非 ASCII・旧形式 `//@`・長さ超過を含む）は `-32602` のまま。受理する形を広げる変更は改めて SEC-2 の観点でレビューする。
 
+## Servo ホストのページの操作（TASK-118・SEC-2・SEC-5）
+
+2026-11-19 のオーナー判断（#1587）。操作モード（ホストのページでクリック・入力を行う。`RENDER-10`）と撮影で、次を偽装に当たらないものとして受け入れる。根拠は試作（[servo-interactive-poc.md](./servo-interactive-poc.md)・#1578）。
+
+- **入力の `isTrusted`**: Servo の入力イベント（`notify_input_event`）で送った入力は、ページから `isTrusted = true` に見える（スクリプトが作ったイベントではなく、ブラウザに届いた入力として扱われる）。Servo の入力の仕組みそのもので、避けると操作モードが成り立たない。自動操作であることは `navigator.webdriver = true` で示し、人の操作に見せる処理（遅延・軌跡・乱数）は入れない（SEC-2 の追記 (2)）
+- **`navigator.webdriver` の定義**: ホストの起動時に、値を `true` に固定する getter を `Navigator.prototype` に `configurable: false` で登録する（SEC-5。実装は TASK-119）。主フレームでは head 内の最初のインラインスクリプトから `true` が見えることを試作で確かめた。値を消す経路・`false` にする経路は作らない
+- **既知の制約（記録のみ）**: 次は SEC-5 が既に既知の制約として許しているもの。試作で確かめたのは前の 2 つで、Worker は SEC-5 の記載どおりとし試作では確かめていない
+  - iframe（同一オリジンの `src`・`srcdoc`）の子文書には定義が入らない（`undefined`）
+  - ページは `navigator` の個体を上書きできる
+  - Worker の `navigator.webdriver` は未定義のまま
+- **後付けであることが見える**: getter の `toString()` が `function(){return true}` と見え、後から登録した定義だとページから見分けられる。自動操作であることを隠す方向の性質ではないため受け入れる
+- **画面サイズ**: 実描画に効く幅・高さの指定に限って受け付け（`RENDER-8`）、UA・言語・タイムゾーンの変更は引き続き断る（2026-11-14 の判断。#1041・#249。SEC-2 の追記 (1)。実装は TASK-133）
+
 ## 確認記録
 
 | 日付 | 確認内容 | 結果 |
@@ -83,3 +96,4 @@ SEC-3 は「本項は実測対象の選定基準であり、ブラウザ本体�
 | 2026-10-30 | #1325: Page.addScriptToEvaluateOnNewDocument が `//# sourceURL=<ASCII 印字可能 1 文字以上>` の 1 行（256 バイト以下）だけの source を空 source と同じ no-op で受理（Puppeteer の newPage 用）。実行経路なし・値は保持せず、改行・LS/PS・空白・非 ASCII・旧形式・長さ超過は -32602。UA・ヘッダ・navigator・画面・TLS・locale に触れない。security-auditor のレビュー済み（2026-10-30、迂回経路なし） | 偽装機能なし |
 | 2026-10-31 | #1357: Runtime.evaluate が `userGesture`（bool のみ）を効果なしで受理（Puppeteer の puppeteerUtil 注入用）。値は保持も評価への受け渡しもせず、メソッドの成功を一律に返すものではない（評価・エラー応答は従来どおり）。非 bool は -32602、他の未知キー（timeout・uniqueContextId・objectGroup 等）も -32602 のまま。UA・ヘッダ・navigator・画面・TLS・locale・ユーザー活性化に触れない。security-auditor の事後レビュー済み（2026-10-31・633e0100。許可キーの追加は `userGesture` のみ、値は評価・状態に渡らず、指摘なし） | 偽装機能なし |
 | 2026-10-31 | #1364: `Network.enable` 済みセッションに、`Page.navigate` が実際に取得した文書の Network.requestWillBeSent・responseReceived・loadingFinished を送出。request.headers は実際に送った User-Agent 定数（`fandhe-browser/<版>`）のみ、response.headers は観測した Content-Type のみ（長さ上限・制御文字検査つき）で、status・URL・本文長は core の取得結果そのもの。about:blank・取得失敗・ブラウザレベル遷移では送らず、リダイレクトは最終 URL と最終ステータスの組だけ。観測していない値（statusText・他ヘッダ・IP・タイミング）は出さない。UA・ヘッダ・navigator・画面・TLS・locale に触れず、fetch の挙動も変えない。security-auditor の事後レビュー済み（2026-10-31・6540f9ce。P0・P1 なし。request.headers は送信ヘッダの全体ではなく UA だけの一部である旨をコメントで明確化） | 偽装機能なし |
+| 2026-11-19 | TASK-118（#1587）: Servo ホストのページの操作（操作モード）と撮影の SEC-2 の判断を記録（上の「Servo ホストのページの操作」節）。入力の `isTrusted = true` と、`navigator.webdriver` の定義が後付けだと見えることを受け入れ、iframe・個体の上書き・Worker の制約は SEC-5 の既知の制約として記録。人の操作に見せる処理は入れない。オーナー判断 | 偽装機能なし |
