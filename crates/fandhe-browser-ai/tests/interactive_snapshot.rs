@@ -200,6 +200,39 @@ async fn aisnap21_sync_failure_invalidates_and_does_not_return_old_content() {
     }
 }
 
+/// `AISNAP-20`・`AISNAP-21`: 検査の失敗（番号の重複）は `sync_failed`、同じ世代でホストに現在のページが無い
+/// （`PageNotLoaded`）は `session_lost` で、どちらも確定結果を無効にする。新しい navigate の後は 200 に戻る。
+#[tokio::test]
+async fn aisnap21_bad_snapshot_and_lost_page_invalidate_until_next_navigation() {
+    let dup = concat!(
+        r#"<p data-fandhe-n="4">a</p>"#,
+        r#"<p data-fandhe-n="4">b</p>"#
+    );
+    for (reply, status, code) in [
+        (Ok(host_snapshot("s1", 2, dup)), 502, "sync_failed"),
+        (Err(RenderError::PageNotLoaded), 409, "session_lost"),
+    ] {
+        let dir = TempDir::new();
+        let host = Arc::new(FakeHost::default());
+        host.push(reply);
+        let state = interactive_state(&dir, Arc::clone(&host));
+        let res = get_snapshot(&state).await;
+        assert_eq!(
+            (res.status, json(&res)["code"].clone()),
+            (status, code.into())
+        );
+        assert!(state.app().navigation().latest().is_none());
+
+        let nav = state.app().navigation();
+        let g = nav.begin_navigation().unwrap();
+        nav.commit_navigation(g, NavigationResult::new("https://a.example/", "<p>x</p>"))
+            .unwrap();
+        let back = get_snapshot(&state).await;
+        assert_eq!(back.status, 200);
+        assert_eq!(json(&back)["mode"], "static");
+    }
+}
+
 /// `AISNAP-20`: 伏せないホストが入力欄の値を返しても、要約と、CDP の `DOM.*` が読む保存済みの HTML に出ない
 /// （第 2 層。core が保存の前に消す）。伏せる対象でない入力欄の状態は残る。
 #[tokio::test]

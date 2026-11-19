@@ -433,9 +433,9 @@ impl NavigationState {
     /// 現在の世代の操作モードの確定結果を [`Self::invalidate_interactive`] で無効にしたか。新しい navigate で
     /// `false` に戻る（世代が進むため）。
     pub fn interactive_lost(&self) -> bool {
-        let _guard = self.lock();
+        let guard = self.lock();
         let lost = self.lost_generation.load(Ordering::SeqCst);
-        lost != 0 && lost == self.current_generation().get()
+        guard.is_none() && lost != 0 && lost == self.current_generation().get()
     }
 
     fn replace_if_current(

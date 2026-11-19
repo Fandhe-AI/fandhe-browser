@@ -325,13 +325,18 @@ fn sensitivity(document: &Document, id: NodeId, name: &str) -> Sensitivity {
     if ac.len() > MAX_AUTOCOMPLETE_BYTES {
         return Sensitivity::Unknown;
     }
-    let hit = ac.split_ascii_whitespace().any(|t| {
-        let t = t.to_ascii_lowercase();
-        t == "current-password"
-            || t == "new-password"
-            || t == "one-time-code"
-            || t.starts_with("cc-")
-    });
+    // ホストの第 1 層は JS の `/\s+/` で分ける。`char::is_whitespace` に U+FEFF を足すと、その上位集合になる
+    // （U+00A0・U+3000 などの区切りでも伏せる）。
+    let hit = ac
+        .split(|c: char| c.is_whitespace() || c == '\u{feff}')
+        .filter(|t| !t.is_empty())
+        .any(|t| {
+            let t = t.to_ascii_lowercase();
+            t == "current-password"
+                || t == "new-password"
+                || t == "one-time-code"
+                || t.starts_with("cc-")
+        });
     if hit {
         Sensitivity::Sensitive
     } else {
@@ -340,7 +345,8 @@ fn sensitivity(document: &Document, id: NodeId, name: &str) -> Sensitivity {
 }
 
 /// 伏せる値の第 2 層（モジュールの doc）。`input` は `value`・`checked`、`textarea` は中身、`select` は配下の
-/// `option` の `selected` を消す。名前空間は問わない（ホストより広く消す側に倒す）。
+/// `option` の `selected` を消す。名前空間は問わない（ホストより広く消す側に倒す）。SVG・MathML の中の
+/// `textarea` は子要素ごと外れるが、外れた要素は木から辿れないため対応表に残っても使われない。
 fn redact_values(document: &mut Document, elements: &[NodeId]) -> crate::error::Result<()> {
     let fields: Vec<(NodeId, &'static str)> = elements
         .iter()
@@ -575,6 +581,37 @@ mod tests {
                 .count()
         };
         assert_eq!((selected("ex"), selected("ln")), (0, 1));
+    }
+
+    /// AISNAP-20・TASK-125: `autocomplete` の区切りはホストの `/\s+/` と同じく ASCII 以外の空白も認める
+    /// （U+00A0・U+000B・U+3000・U+FEFF）。伏せた欄も対応表には残る（操作の対象にできる）。
+    #[test]
+    fn aisnap20_autocomplete_separators_match_host() {
+        for sep in ["&nbsp;", "\u{a0}", "\u{b}", "\u{3000}", "\u{feff}", "\t"] {
+            let html = format!(
+                "<input data-fandhe-n=\"0\" autocomplete=\"section-a{sep}current-password\" value=sep-secret>"
+            );
+            let s = build_interactive_document(snap(&html, 1)).unwrap();
+            assert!(!s.html.contains("sep-secret"), "{sep:?}: {}", s.html);
+            let d = &s.document.document;
+            let input = d
+                .descendants(d.root())
+                .find(|&n| d.local_name(n) == Some("input"))
+                .unwrap();
+            assert_eq!(s.document.host_number(input), Some(0));
+        }
+    }
+
+    /// TASK-125: 判定の上限ちょうど（1024 バイト）は判定し、超えたら（1025 バイト）すべての入力欄の値を消す。
+    #[test]
+    fn aisnap20_autocomplete_length_boundary() {
+        let field = |len: usize| {
+            let ac = "a".repeat(len);
+            let html = format!("<input value=plain-value><input autocomplete=\"{ac}\" value=v2>");
+            build_interactive_document(snap(&html, 0)).unwrap().html
+        };
+        assert!(field(MAX_AUTOCOMPLETE_BYTES).contains("plain-value"));
+        assert!(!field(MAX_AUTOCOMPLETE_BYTES + 1).contains("plain-value"));
     }
 
     /// AISNAP-20・TASK-125: 伏せる対象を特定できない（`autocomplete` が上限を超える）ときは、すべての入力欄の値を消す。

@@ -5,8 +5,8 @@
 //!   差し替える。直前の同期から [`MIN_SYNC_INTERVAL`] 未満なら取り直さない（設計 `servo-host-design.md` §14.6）。
 //!   失敗したら古い内容を返さず [`SyncFailure`] を返し、core の確定結果を無効にする（`AISNAP-20`・`AISNAP-21`。
 //!   2026-11-19 のオーナー判断）。無効にした後は新しい navigate まで `/ai/snapshot` は [`SyncFailure::SessionLost`]、
-//!   CDP は文書なしになる。同期の途中で新しい navigate が始まった場合（[`SyncFailure::Stale`]）は無効にしない
-//!   （新しい navigate を壊さないため）。混雑で後回しにした場合（TASK-128・TASK-129 の `busy`）も無効にしない形で足す
+//!   CDP は文書なしになる。同期の途中で新しい navigate が始まった場合（[`SyncFailure::Stale`]）は、core が世代を
+//!   見て無効化を拒否する（新しい navigate を壊さないため）。混雑で後回しにした場合（TASK-128・TASK-129 の `busy`）も無効にしない形で足す
 //! - 伏せる値の第 2 層は core が保存の前に行う（`fandhe_browser_core::interactive` の doc）
 //! - 解決: [`resolve_target`] が同期済みの写しの上で ref かセレクタを一意に解決し、ホストの番号を返す。
 //!   セレクタはホストへ渡さない（設計 §14.4）。呼び出し元は `POST /ai/act`（TASK-128）
@@ -127,11 +127,15 @@ pub fn sync_interactive(app: &AppState, tracker: &SyncTracker) -> Result<(), Syn
                 .map_err(|e| SyncFailure::from_state(&e))
         });
     if let Err(e) = result {
-        if e != SyncFailure::Stale {
-            // 世代が変わっていれば core が拒否する（新しい navigate の結果は消さない）。
-            let _ = nav.invalidate_interactive(generation);
-        }
-        return Err(e);
+        // 新しい navigate が始まっていれば core が世代とモードを見て拒否する（その結果は消さない）。
+        // `PageNotLoaded` は同じ世代でも出る（ホストに現在のページが無い）ため、`Stale` でも無効化を試み、
+        // 無効にできたら新しい navigate ではなくページが失われたとして `SessionLost` を返す。
+        let invalidated = nav.invalidate_interactive(generation).is_ok();
+        return Err(if invalidated && e == SyncFailure::Stale {
+            SyncFailure::SessionLost
+        } else {
+            e
+        });
     }
     *last = Some((generation, Instant::now()));
     Ok(())
