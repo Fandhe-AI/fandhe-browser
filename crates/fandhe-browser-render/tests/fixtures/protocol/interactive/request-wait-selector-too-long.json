@@ -19,5 +19,13 @@
       "timeout_ms": 1000
     }
   },
+  "expected_response": {
+    "v": 1,
+    "id": 1,
+    "error": {
+      "kind": "invalid_params",
+      "message": "Invalid parameters."
+    }
+  },
   "note": "条件の文字列は 1024 以下"
 }

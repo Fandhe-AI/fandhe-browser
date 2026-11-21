@@ -23,5 +23,13 @@
       }
     }
   },
+  "expected_response": {
+    "v": 1,
+    "id": 1,
+    "error": {
+      "kind": "invalid_params",
+      "message": "Invalid parameters."
+    }
+  },
   "note": "node があってもセレクタは渡せない。本体が写しの上で解決して番号で送る（確定条件 8）"
 }

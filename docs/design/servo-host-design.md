@@ -524,12 +524,13 @@ AGENTS.md の変更はレビュー基準の変更として AI レビューで P0
 | `dom_snapshot` の時間切れ | 30 秒 | 試作 (10) の 8 MiB で 13.9 秒（release・macOS arm64。`outerHTML`）。遅い環境の分を見込んで 2 倍強。TASK-122 の直列化器（番号付き）では、7.6 MB・11.8 万要素の HTML で 1.0〜1.2 秒、上限超過の打ち切りは 1.1 秒（同じ環境）。`outerHTML` より速いが、遅い環境と要素数の多いページの分を見込んで 30 秒のままにする |
 | `act` の時間切れ | 10 秒 | 入力イベントの完了通知を待つだけで、読み込みは待たない |
 | `wait` の上限時間 | 最大 60 秒 | spec `AISNAP-18`（`load` の上限と同じ） |
-| `fill` の `text` | 8192 バイト | 要求フレーム 64 KiB に収める |
+| `fill` の `text` | 8192 バイト | 要求フレーム 64 KiB に収める。release ビルド（macOS arm64）で 8192 バイトの ASCII は 4.1 秒、2730 文字の「あ」（8190 バイト）は 2.0〜2.1 秒で `act` の期限内に入る（#1592。文字数に対して線形より速く伸びる。debug ビルドでは 4000 文字で期限に届く） |
 | `select` の `values` | 32 件・各 512 バイト | 同上（通常は封筒を含めて 64 KiB に収まる。制御文字が多く符号化後に 64 KiB を超える要求は、本体が送らずに `invalid_params` にする） |
 | `wait` の条件の文字列 | 1024 バイト | spec `AISNAP-18` |
 | 読み取り契機の同期の最小間隔 | 1 秒 | 直前の同期から 1 秒未満で、その間に `act`・`wait` が無ければ取り直さない（TASK-125） |
 
 - 時間切れでの破棄（確定条件 6・`AISNAP-17`）: `dom_snapshot` と `act` は、本体が上の時間に 5 秒の余裕を足した期限で待ち、過ぎたらホストを破棄して `session_lost` を返す。ホストは `act` の時間（10 秒）を過ぎたら `timeout` を返し、本体は `act` の `timeout` もホストの破棄と `session_lost` にする（TASK-123・TASK-126）。`dom_snapshot` はホスト側の 30 秒の期限でも `timeout` を返し、本体は同じく破棄する（TASK-122）。破棄の後は自動で読み直さない（§14.2）
+- `fill` が時間切れになった後のホストは、送り済みのキーの入力イベントを処理し終えるまで stdin の終わりに応じないことがある（debug ビルドで、閉じてから終わるまで 5〜30 秒、60 秒を超えた例も 1 件。#1592）。本体は `act` の `timeout` を受けるとホストを stdin を閉じずにそのまま kill して破棄する（render の `host_process` の `discard`）ため、残り続けない
 - メモリの見積もり（多重のコピー込み。8 MiB・ASCII の最悪の場合）: ホストは、番号の対応（要素の ID。20 万件で約 6.4 MB と `Vec` の分）に加えて、ページの DOM が試作 (10) で約 1.2 GB（8 MiB のページで読み込み前から +1.18 GB）、直列化の間にさらに約 130 MB（JS の文字列〔UTF-16 で 16 MiB〕・Rust の `String` 8 MiB・符号化したフレーム 12 MiB とその途中の確保）。§2.7 の RSS 上限の既定（2 GiB）の内側だが余裕は小さく、上限を超えたらホストは破棄される。本体は、受信フレーム 12 MiB・JSON から取り出した `String` 8 MiB・番号を外した保存用の HTML 8 MiB・core の DOM（倍率は未測定）を同時に持ちうる。core の DOM の倍率と Linux での時間は TASK-138 で測り直す
 
 ### 14.7 エラー kind
@@ -552,7 +553,7 @@ AGENTS.md の変更はレビュー基準の変更として AI レビューで P0
 ### 14.8 契約 fixture
 
 - 操作モードの fixture は `crates/fandhe-browser-render/tests/fixtures/protocol/interactive/` に置く（32 件。各メソッドの正常・不正な要求、結果、`--interactive` の `hello`、ホストが返す新しい kind）。`tests/protocol_fixtures.rs` がスキーマとの整合と網羅を検証する
-- ホスト側（`servo-host/src/server/tests.rs`）とクライアント側（`tests/client_contract.rs`）の契約テストは直下の fixture だけを読む。`interactive/` は別のテストに配線した: ホスト側は TASK-122 で `dom_snapshot` の要求（`interactive_dom_snapshot_fixtures_match_host_behavior`）、クライアント側は TASK-123 で正常な要求の JSON・応答・hello・新しい kind（`render10_interactive_requests_match_fixtures`・`render11_interactive_responses_match_fixtures`）。直下への移動と `expected_response` は、両側の既存の契約テストが全件を読むため本体側の結線と合わせて行う（#1592 の残り）。TASK-126 では、ホスト側の `interactive_request_fixtures_match_host_behavior` を `act`・`wait` の要求に広げ、操作モードの hello を `interactive_hello_matches_fixture` で照合した。
+- ホスト側（`servo-host/src/server/tests.rs`）とクライアント側（`tests/client_contract.rs`）の契約テストは直下の fixture だけを読む。`interactive/` は別のテストに配線した: ホスト側は TASK-122 で `dom_snapshot` の要求（`interactive_dom_snapshot_fixtures_match_host_behavior`）、クライアント側は TASK-123 で正常な要求の JSON・応答・hello・新しい kind（`render10_interactive_requests_match_fixtures`・`render11_interactive_responses_match_fixtures`）。TASK-126 では、ホスト側の `interactive_request_fixtures_match_host_behavior` を `act`・`wait` の要求に広げ、操作モードの hello を `interactive_hello_matches_fixture` で照合した。直下の fixture を読む既存の契約テストは操作モードでないホストを前提にする（`act` 等は `unsupported`）ため、直下へは移さず `interactive/` のままにする（#1592）。不正な要求の fixture には `expected_response` を足し、ホスト側はそれと完全に一致する応答を返すことを確かめる
 
 ### 14.9 残る判断
 
@@ -560,6 +561,7 @@ AGENTS.md の変更はレビュー基準の変更として AI レビューで P0
 - 8 MiB 級の DOM の Linux での時間・本体のメモリ: TASK-138 で測り、§14.6 の値を見直す
 - ページのダイアログ（`alert()`・`confirm()`・`prompt()`）の扱い: Servo の既定のままにした（TASK-126・2026-11-19。§14.4）
 - `pushState` を繰り返すページでは `act` が毎回 `stale` になりうる。本体が取り直して再試行する回数の上限を TASK-124・TASK-126 で決める
+- `doc_seq` は iframe の遷移でも上がる（フレームを区別しない。#1611 の結合テストで観測）。iframe が自分で遷移し続けるページでは、`pushState` と同じく `act`・`wait` が繰り返し `stale` になりうる。主フレームの文書だけで数える形へ絞るかは、上の再試行の上限と合わせて決める（#1592）
 - `window.webdriverElement` は Servo が「公開すべきでないが当面公開している」と注記している拡張で、版の更新で消えうる。消えたら要素の同一性（§14.4）を WebDriver の命令（`servo-base` の依存が要る）で取り直す。servo の版を上げるときに確かめる
 
 ## 付録 A. 依存追加の承認提示雛形

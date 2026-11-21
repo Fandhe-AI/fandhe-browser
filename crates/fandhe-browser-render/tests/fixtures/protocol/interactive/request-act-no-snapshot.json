@@ -22,5 +22,13 @@
       }
     }
   },
+  "expected_response": {
+    "v": 1,
+    "id": 1,
+    "error": {
+      "kind": "invalid_params",
+      "message": "Invalid parameters."
+    }
+  },
   "note": "snapshot は必須（どの取得の番号かを示す。設計 §14.4）"
 }

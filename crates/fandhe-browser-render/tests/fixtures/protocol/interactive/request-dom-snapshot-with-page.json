@@ -14,5 +14,13 @@
       }
     }
   },
+  "expected_response": {
+    "v": 1,
+    "id": 1,
+    "error": {
+      "kind": "invalid_params",
+      "message": "Invalid parameters."
+    }
+  },
   "note": "dom_snapshot は page を取らない（未知の params は拒否する）"
 }

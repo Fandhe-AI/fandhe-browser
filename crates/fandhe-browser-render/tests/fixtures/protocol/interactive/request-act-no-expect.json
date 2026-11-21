@@ -19,5 +19,13 @@
       }
     }
   },
+  "expected_response": {
+    "v": 1,
+    "id": 1,
+    "error": {
+      "kind": "invalid_params",
+      "message": "Invalid parameters."
+    }
+  },
   "note": "照合値は必須（一致しなければ stale）"
 }

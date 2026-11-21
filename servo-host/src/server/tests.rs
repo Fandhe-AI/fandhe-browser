@@ -701,7 +701,7 @@ fn act_and_wait_are_unsupported_without_interactive() {
     );
 }
 
-/// RENDER-10・TASK-126: `fill` の `text`・`wait` の条件の上限はバイトで数える（本体と同じ）。多バイトで上限を超える
+/// RENDER-10・TASK-126: `fill` の `text`・`wait` の条件・`select` の値の上限はバイトで数える（本体と同じ）。多バイトで上限を超える
 /// 要求は invalid_params で、ハンドラを呼ばない。
 #[test]
 fn interactive_byte_limits_count_utf8_bytes() {
@@ -711,6 +711,9 @@ fn interactive_byte_limits_count_utf8_bytes() {
         jframe(&json!({"v":1,"id":1,"method":"act","params":{"page":page,"snapshot":"s1","node":0,"expect":{"tag":"input"},"action":{"kind":"fill","text":"あ".repeat(2731)}}})),
         jframe(&json!({"v":1,"id":2,"method":"act","params":{"page":page,"snapshot":"s1","node":0,"expect":{"tag":"input"},"action":{"kind":"fill","text":"あ".repeat(2730)}}})),
         jframe(&json!({"v":1,"id":3,"method":"wait","params":{"page":page,"condition":{"kind":"text_present","text":"あ".repeat(342)},"timeout_ms":100}})),
+        // select の値は 1 件ずつ 512 バイトまで（多バイトの境界をまたぐ 512 は受理、513 は拒否）。
+        jframe(&json!({"v":1,"id":4,"method":"act","params":{"page":page,"snapshot":"s1","node":0,"expect":{"tag":"select"},"action":{"kind":"select","values":[format!("ab{}", "あ".repeat(170))]}}})),
+        jframe(&json!({"v":1,"id":5,"method":"act","params":{"page":page,"snapshot":"s1","node":0,"expect":{"tag":"select"},"action":{"kind":"select","values":["a", format!("abc{}", "あ".repeat(170))]}}})),
     ]
     .concat();
     let r = run_with(&mut h, input);
@@ -725,7 +728,13 @@ fn interactive_byte_limits_count_utf8_bytes() {
         "{}",
         r.frames[3]
     );
-    assert_eq!(calls.borrow().clone(), vec!["act"]);
+    assert!(r.frames[4]["result"].is_object(), "{}", r.frames[4]);
+    assert_eq!(
+        r.frames[5]["error"]["kind"], "invalid_params",
+        "{}",
+        r.frames[5]
+    );
+    assert_eq!(calls.borrow().clone(), vec!["act", "act"]);
 }
 
 /// RENDER-11・TASK-122: 操作モードのホストは dom_snapshot を載せ、上限を申告し、結果をスキーマの形で返す。
@@ -791,7 +800,7 @@ fn dom_snapshot_over_frame_limit_is_too_large() {
 }
 
 /// TASK-121・TASK-122・TASK-126: 操作モードの契約 fixture（`interactive/` の dom_snapshot・act・wait の要求）を
-/// ホストへ通す。正常な要求は対応するハンドラを呼び、不正な要求は invalid_params で返してハンドラを呼ばない。
+/// ホストへ通す。正常な要求は対応するハンドラを呼び、不正な要求は `expected_response`（invalid_params）を返してハンドラを呼ばない。
 #[test]
 fn interactive_request_fixtures_match_host_behavior() {
     let dir = fixture_dir().join("interactive");
@@ -819,7 +828,11 @@ fn interactive_request_fixtures_match_host_behavior() {
                 assert_eq!(calls.borrow().clone(), vec![call.as_str()], "{name}");
             }
             _ => {
-                assert_eq!(r.frames[1]["error"]["kind"], "invalid_params", "{name}");
+                // 不正な要求の応答は fixture の `expected_response` と一致させる（kind だけでなく message・id まで）。
+                let expected = fx
+                    .get("expected_response")
+                    .unwrap_or_else(|| panic!("{name}: invalid fixture without expected_response"));
+                assert_eq!(r.frames.get(1), Some(expected), "{name}");
                 assert!(calls.borrow().is_empty(), "{name}");
             }
         }

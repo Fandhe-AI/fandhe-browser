@@ -12,10 +12,12 @@
 
 ## 操作モードの fixture（`interactive/`）
 
-操作モードのメソッド（`dom_snapshot`・`act`・`wait`。TASK-121・`RENDER-10`・`RENDER-11`）は設計を確定した段階で、
-ホスト・クライアントとも未実装。その fixture は `interactive/` に置き、`tests/protocol_fixtures.rs` だけが
-スキーマとの整合と網羅を検証する。ホスト側・クライアント側の契約テストは本ディレクトリの直下だけを読む。
-実装（TASK-122・TASK-123・TASK-126）で直下へ移し、両側の契約テストに配線する（設計 `servo-host-design.md` §14.8）。
+操作モードのメソッド（`dom_snapshot`・`act`・`wait`。TASK-121・`RENDER-10`・`RENDER-11`）の fixture は `interactive/` に置く。
+`tests/protocol_fixtures.rs` がスキーマとの整合と網羅を検証し、ホスト側（`servo-host/src/server/tests.rs` の
+`interactive_request_fixtures_match_host_behavior`・`interactive_hello_matches_fixture`）とクライアント側
+（`tests/client_contract.rs` の `render10_*`・`render11_*`）の契約テストが読む。直下の fixture を読む既存の契約テストは
+操作モードでないホストを前提にするため、ディレクトリを分けたままにする（#1592。設計 `servo-host-design.md` §14.8）。
+不正な要求の fixture は `expected_response` を持ち、ホストはそれと同じ応答を返す。
 
 ## 封筒（envelope）
 

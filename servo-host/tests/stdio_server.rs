@@ -958,6 +958,9 @@ fn serve_routes(listener: TcpListener, routes: Routes) -> mpsc::Sender<()> {
                             .get(path)
                             .cloned()
                             .unwrap_or(("text/plain", b"nf".to_vec()));
+                        if ct == SLOW_HTML {
+                            std::thread::sleep(SLOW_DELAY);
+                        }
                         let to = String::from_utf8_lossy(&body);
                         let (head, body) = match ct {
                             REDIRECT => (
@@ -974,7 +977,8 @@ fn serve_routes(listener: TcpListener, routes: Routes) -> mpsc::Sender<()> {
                             ),
                             _ => (
                                 format!(
-                                    "HTTP/1.1 200 OK\r\nContent-Type: {ct}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                    "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                    if ct == SLOW_HTML { "text/html" } else { ct },
                                     body.len()
                                 ),
                                 body,
@@ -995,6 +999,9 @@ fn serve_routes(listener: TcpListener, routes: Routes) -> mpsc::Sender<()> {
 const REDIRECT: &str = "redirect";
 /// [`serve_routes`] の擬似種別: `Refresh` ヘッダで本文の URL へ移す。
 const REFRESH: &str = "refresh";
+/// [`serve_routes`] の擬似種別: [`SLOW_DELAY`] 待ってから本文を `text/html` で返す（`act` の遷移の待ちの打ち切りの試験用）。
+const SLOW_HTML: &str = "slow-html";
+const SLOW_DELAY: Duration = Duration::from_secs(4);
 const RED_HTML: &str = "<body style=\"margin:0;background:#f00\">";
 const RED_SVG: &str = "<svg xmlns='http://www.w3.org/2000/svg' width='200' height='200'><rect width='200' height='200' fill='red'/></svg>";
 const RED_CSS: &str = "#t{background:#f00}";
@@ -2804,6 +2811,139 @@ fn interactive_act_reports_navigation() {
     let w: serde_json::Value = serde_json::from_str(&h.recv()).unwrap();
     assert_eq!(w["error"]["kind"], "stale", "{w}");
     finish_host(h, id + 2);
+}
+
+/// RENDER-10・TASK-126（#1592 の残り）: フォーカスの無い欄への `press` はクリックしてから送る、折り返したリンクは
+/// 最初の行を押す、遷移先の応答が 2 秒以上来なければ待ちを打ち切って `navigated` を偽で返す、主フレームが
+/// `about:blank` へ移った後の `act` は `invalid_state`。
+#[test]
+fn interactive_act_edge_paths() {
+    let (l, port) = bind_loopback();
+    let out = "document.getElementById('out').textContent";
+    let page = format!(
+        "<!doctype html><html><head><style>body{{margin:0}}input,button{{display:block;width:200px;height:30px}}</style></head><body>\
+<p id=out>none</p>\
+<input id=nf onkeydown=\"{out}='nf:'+event.key+':'+(document.activeElement===this)\">\
+<div style=\"width:90px;font:16px monospace\">xxxxx <a id=wrap href=\"#\" onclick=\"{out}='wrap';return false\">aaa bbb</a></div>\
+<a id=slow href=\"/slow\" style=\"display:block;width:200px;height:30px\">slow</a>\
+</body></html>"
+    );
+    let mut m = std::collections::HashMap::new();
+    m.insert("/edge".to_owned(), ("text/html", page.into_bytes()));
+    m.insert(
+        "/slow".to_owned(),
+        (
+            SLOW_HTML,
+            b"<!doctype html><button id=blank style=\"display:block;width:200px;height:30px\" onclick=\"location='about:blank'\">B</button>".to_vec(),
+        ),
+    );
+    let _stop = serve_routes(l, std::sync::Arc::new(m));
+    let (proxy, _pstop) = serve_forwarding_proxy();
+    let (mut h, mut id, mut snap) =
+        interactive_page(&format!("http://127.0.0.1:{port}/edge"), proxy);
+    let html = snap["html"].as_str().unwrap().to_owned();
+
+    // フォーカスが無ければクリックでフォーカスを移してからキーを送る。
+    let r = act_req(
+        &mut h,
+        id,
+        &snap,
+        node_of(&html, "nf"),
+        r#"{"tag":"input"}"#,
+        r#"{"kind":"press","key":"a"}"#,
+    );
+    assert_eq!(r["result"]["navigated"], false, "{r}");
+    id += 1;
+    {
+        let (t, s2) = out_text(&mut h, id);
+        snap = s2;
+        assert_eq!(t, "nf:a:true");
+    }
+    id += 1;
+
+    // 行の途中から始まって折り返したリンク（外接矩形の中心はリンクの文字から外れる）も、最初の行の矩形の中心で押せる。
+    let r = act_req(
+        &mut h,
+        id,
+        &snap,
+        node_of(&html, "wrap"),
+        r#"{"tag":"a","id":"wrap"}"#,
+        r#"{"kind":"click"}"#,
+    );
+    assert!(r["result"]["page"].is_object(), "{r}");
+    id += 1;
+    {
+        let (t, s2) = out_text(&mut h, id);
+        snap = s2;
+        assert_eq!(t, "wrap");
+    }
+    id += 1;
+
+    // 遷移先の応答が遅い: 2 秒で待ちを打ち切り、navigated は偽（文書番号はまだ変わっていない）。
+    let started = std::time::Instant::now();
+    let r = act_req(
+        &mut h,
+        id,
+        &snap,
+        node_of(&html, "slow"),
+        r#"{"tag":"a","id":"slow"}"#,
+        r#"{"kind":"click"}"#,
+    );
+    let took = started.elapsed();
+    assert_eq!(r["result"]["navigated"], false, "{r}");
+    assert_eq!(r["result"]["page"], snap["page"], "{r}");
+    assert!(
+        took >= Duration::from_secs(2) && took < SLOW_DELAY,
+        "{took:?}"
+    );
+    id += 1;
+
+    // 遅れて届いた文書へ移ったら、その文書で about:blank へ移らせる。
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    let slow = loop {
+        let s = request(&mut h, id, "dom_snapshot");
+        id += 1;
+        if s["result"]["url"]
+            .as_str()
+            .is_some_and(|u| u.ends_with("/slow"))
+        {
+            break s["result"].clone();
+        }
+        assert!(std::time::Instant::now() < deadline, "{s}");
+        std::thread::sleep(Duration::from_millis(200));
+    };
+    let shtml = slow["html"].as_str().unwrap().to_owned();
+    let r = act_req(
+        &mut h,
+        id,
+        &slow,
+        node_of(&shtml, "blank"),
+        r#"{"tag":"button","id":"blank"}"#,
+        r#"{"kind":"click"}"#,
+    );
+    assert!(r["result"]["page"].is_object(), "{r}");
+    id += 1;
+    // about:blank の上では操作しない（page の照合より先に断る）。
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let r = act_req(
+            &mut h,
+            id,
+            &slow,
+            node_of(&shtml, "blank"),
+            r#"{"tag":"button"}"#,
+            r#"{"kind":"click"}"#,
+        );
+        id += 1;
+        if r["error"]["kind"] == "invalid_state" {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "{r}");
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let r = request(&mut h, id, "dom_snapshot");
+    assert_eq!(r["error"]["kind"], "invalid_state", "{r}");
+    finish_host(h, id + 1);
 }
 
 // ---- ページの alert()（#1597） ----

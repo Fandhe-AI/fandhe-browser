@@ -7,10 +7,10 @@
 //! プロトコル型・コーデックの実装は #989（クライアント）・#993（ホスト）の範囲で、
 //! 本テストは外部入力の経路ではないため `expect` / `panic!` を使う。
 //!
-//! 操作モードのメソッド（`dom_snapshot`・`act`・`wait`。TASK-121・`RENDER-10`・`RENDER-11`）は
-//! 設計を確定した段階で、ホスト・クライアントは未実装。その fixture は `tests/fixtures/protocol/interactive/`
-//! に置き、本テストだけがスキーマとの整合を検証する（ホスト側・クライアント側の契約テストは直下だけを読む）。
-//! 実装（TASK-122・TASK-123・TASK-126）で直下へ移し、両側の契約テストに配線する。
+//! 操作モードのメソッド（`dom_snapshot`・`act`・`wait`。TASK-121・`RENDER-10`・`RENDER-11`）の fixture は
+//! `tests/fixtures/protocol/interactive/` に置く。本テストはスキーマとの整合と網羅を検証し、ホスト側・クライアント側の
+//! 操作モードの契約テストが同じ fixture を読む（直下を読む既存の契約テストは操作モードでないホストが前提のため分けたまま。
+//! 設計 `servo-host-design.md` §14.8・#1592）。
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
