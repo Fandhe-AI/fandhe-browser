@@ -412,3 +412,22 @@ async fn aisnap18_wait_gate_rejects_static_page_committed_after_check() {
     assert!(matches!(s.app().wait(g2, &req), Err(RenderError::Stale)));
     assert!(host.waits().is_empty());
 }
+
+/// `AISNAP-18`・TASK-129・MS-11: 待つ前の取り直しは要求の世代に固定する。最新の世代が違えば取り直さず `Stale` で、
+/// 最新のページを無効にしない。
+#[tokio::test]
+async fn aisnap18_presync_is_pinned_to_requested_generation() {
+    let dir = TempDir::new();
+    let host = Arc::new(FakeHost::default());
+    let s = state(&dir, Arc::clone(&host));
+    navigate(&s).await;
+    let old = s.app().navigation().latest_with_generation().unwrap().0;
+    navigate(&s).await;
+    let before = host.snapshots();
+    assert_eq!(
+        fandhe_browser_ai::interactive::sync_interactive_now_at(s.app(), s.sync_tracker(), old),
+        Err(fandhe_browser_ai::interactive::SyncFailure::Stale)
+    );
+    assert_eq!(host.snapshots(), before, "did not re-sync");
+    assert_eq!(snapshot(&s).await.status, 200, "latest page stays valid");
+}

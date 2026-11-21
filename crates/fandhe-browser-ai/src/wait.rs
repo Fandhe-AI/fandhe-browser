@@ -35,7 +35,7 @@ use fandhe_browser_core::render::{
 use serde_json::{Map, Value};
 
 use crate::act::{ActError, check_current};
-use crate::interactive::sync_interactive_now;
+use crate::interactive::sync_interactive_now_at;
 use crate::plugin_api::AiState;
 
 /// 本文の上限（バイト）。条件の文字列（1024 バイト。JSON のエスケープで最大 6 倍）に余裕を足す。
@@ -221,7 +221,7 @@ pub fn wait(state: &AiState, body: &[u8]) -> Result<WaitOk, WaitError> {
     let app = state.app();
     let nav = app.navigation();
     let generation = check_current(state, request.generation)?;
-    sync_interactive_now(app, state.sync_tracker())
+    sync_interactive_now_at(app, state.sync_tracker(), generation)
         .map_err(|e| WaitError::from(ActError::from_sync(e)))?;
     let (g, latest) = nav.latest_with_generation().ok_or(WaitError::Stale)?;
     if g != generation {

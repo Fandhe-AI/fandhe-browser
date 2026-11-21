@@ -121,16 +121,32 @@ impl SyncFailure {
 /// 後の要求は前の同期の完了を待ち、その記録を見て取り直さない。ロックの順は「同期 → 描画ゲート →
 /// ナビゲーション」で、描画ゲートを持ったまま同期のロックを取る経路は無い。
 pub fn sync_interactive(app: &AppState, tracker: &SyncTracker) -> Result<(), SyncFailure> {
-    sync_inner(app, tracker, false)
+    sync_inner(app, tracker, false, None)
 }
 
 /// [`sync_interactive`] を最小間隔によらず行う（`POST /ai/act` の直前の取り直し。`AISNAP-17`・TASK-128）。
 /// 失敗の扱い（無効化・エラー）は [`sync_interactive`] と同じ。
 pub fn sync_interactive_now(app: &AppState, tracker: &SyncTracker) -> Result<(), SyncFailure> {
-    sync_inner(app, tracker, true)
+    sync_inner(app, tracker, true, None)
 }
 
-fn sync_inner(app: &AppState, tracker: &SyncTracker, force: bool) -> Result<(), SyncFailure> {
+/// [`sync_interactive_now`] を、要求が見た世代 `expected` に固定して行う（`POST /ai/wait`。`AISNAP-18`・TASK-129・MS-11）。
+/// 最新の世代が違えば取り直さずに [`SyncFailure::Stale`]（古い要求が新しいページを取り直し、失敗でそのページを
+/// 無効にしない）。
+pub fn sync_interactive_now_at(
+    app: &AppState,
+    tracker: &SyncTracker,
+    expected: NavigationGeneration,
+) -> Result<(), SyncFailure> {
+    sync_inner(app, tracker, true, Some(expected))
+}
+
+fn sync_inner(
+    app: &AppState,
+    tracker: &SyncTracker,
+    force: bool,
+    expected: Option<NavigationGeneration>,
+) -> Result<(), SyncFailure> {
     let mut last = tracker.last.lock().unwrap_or_else(PoisonError::into_inner);
     let nav = app.navigation();
     let Some((generation, latest)) = nav.latest_with_generation() else {
@@ -141,6 +157,9 @@ fn sync_inner(app: &AppState, tracker: &SyncTracker, force: bool) -> Result<(), 
             Ok(())
         };
     };
+    if expected.is_some_and(|e| e != generation) {
+        return Err(SyncFailure::Stale);
+    }
     if latest.mode() != PageMode::Interactive || !(force || due(*last, generation, Instant::now()))
     {
         return Ok(());
