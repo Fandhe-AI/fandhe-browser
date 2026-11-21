@@ -2826,7 +2826,7 @@ fn interactive_act_reports_navigation() {
     finish_host(h, id + 2);
 }
 
-/// RENDER-10・TASK-126（#1592 の残り）: フォーカスの無い欄への `press` はクリックしてから送る、折り返したリンクは
+/// RENDER-10・TASK-126・MS-11（#1592 の残り）: フォーカスの無い欄への `press` はクリックしてから送る、折り返したリンクは
 /// 最初の行を押す、遷移先の応答が 2 秒以上来なければ待ちを打ち切って `navigated` を偽で返す、主フレームが
 /// `about:blank` へ移った後の `act` は `invalid_state`。
 #[test]
@@ -2837,7 +2837,7 @@ fn interactive_act_edge_paths() {
         "<!doctype html><html><head><style>body{{margin:0}}input,button{{display:block;width:200px;height:30px}}</style></head><body>\
 <p id=out>none</p>\
 <input id=nf onkeydown=\"{out}='nf:'+event.key+':'+(document.activeElement===this)\">\
-<div style=\"width:90px;font:16px monospace\">xxxxx <a id=wrap href=\"#\" onclick=\"var r=this.getClientRects();{out}='wrap:'+r.length+':'+(event.clientY>=r[0].top&&event.clientY<r[0].bottom);return false\">aaa bbb</a></div>\
+<div style=\"width:9.5ch;font:16px monospace\">xxxxx <a id=wrap href=\"#\" onclick=\"var r=this.getClientRects();{out}='wrap:'+r.length+':'+(event.clientY>=r[0].top&&event.clientY<r[0].bottom);return false\">aaa bbb</a></div>\
 <a id=slow href=\"/slow\" style=\"display:block;width:200px;height:30px\">slow</a>\
 </body></html>"
     );
@@ -2912,11 +2912,11 @@ fn interactive_act_edge_paths() {
         .elapsed();
     assert_eq!(r["result"]["navigated"], false, "{r}");
     assert_eq!(r["result"]["page"], snap["page"], "{r}");
-    // 上下限とも、遷移の要求が届いてから応答までの同じ区間で測る（クリックの処理を外す）。ホストは要求を許可した
-    // 時点から 2 秒待ち、要求はその直後に届くため、区間は 2 秒をわずかに下回る。下限は打ち切りが短くなる回帰、
-    // 上限は延びる回帰を拾う（どちらも IPC のばらつきの余裕を持たせる）。
+    // 下限: 待ちはこの `act` の中で 2 秒続くため、全体は必ず 2 秒以上。上限: 遷移の要求が届いてから応答までを測り
+    // （クリックの処理を外す）、2 秒の打ち切りにプロキシと IPC の余裕を足した 4 秒未満（打ち切りが延びる回帰を拾う）。
+    assert!(took >= Duration::from_secs(2), "{took:?}");
     assert!(
-        since_request >= Duration::from_millis(1500) && since_request < Duration::from_millis(3500),
+        since_request < Duration::from_secs(4),
         "{since_request:?} (total {took:?})"
     );
     SLOW_RELEASE.store(true, std::sync::atomic::Ordering::SeqCst);

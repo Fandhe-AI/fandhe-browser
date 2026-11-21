@@ -7,7 +7,7 @@
 //! プロトコル型・コーデックの実装は #989（クライアント）・#993（ホスト）の範囲で、
 //! 本テストは外部入力の経路ではないため `expect` / `panic!` を使う。
 //!
-//! 操作モードのメソッド（`dom_snapshot`・`act`・`wait`。TASK-121・`RENDER-10`・`RENDER-11`）の fixture は
+//! 操作モードのメソッド（`dom_snapshot`・`act`・`wait`。TASK-121・`RENDER-10`・`RENDER-11`・MS-10）の fixture は
 //! `tests/fixtures/protocol/interactive/` に置く。本テストはスキーマとの整合と網羅を検証し、ホスト側・クライアント側の
 //! 操作モードの契約テストが同じ fixture を読む（直下を読む既存の契約テストは操作モードでないホストが前提のため分けたまま。
 //! 設計 `servo-host-design.md` §14.8・#1592）。

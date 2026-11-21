@@ -701,7 +701,7 @@ fn act_and_wait_are_unsupported_without_interactive() {
     );
 }
 
-/// RENDER-10・TASK-126: `fill` の `text`・`wait` の条件・`select` の値の上限はバイトで数える（本体と同じ）。多バイトで上限を超える
+/// RENDER-10・TASK-126・MS-11: `fill` の `text`・`wait` の条件・`select` の値の上限はバイトで数える（本体と同じ）。多バイトで上限を超える
 /// 要求は invalid_params で、ハンドラを呼ばない。
 #[test]
 fn interactive_byte_limits_count_utf8_bytes() {
