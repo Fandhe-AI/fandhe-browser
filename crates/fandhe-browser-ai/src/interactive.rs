@@ -94,7 +94,8 @@ impl SyncFailure {
         match e {
             RenderError::SessionLost => Self::SessionLost,
             RenderError::RenderingDisabled => Self::RenderingDisabled,
-            RenderError::PageNotLoaded => Self::Stale,
+            // `Stale` は描画ゲートの中で別の世代・静的ページに変わっていた（`AppState::dom_snapshot_at`）。
+            RenderError::PageNotLoaded | RenderError::Stale => Self::Stale,
             RenderError::Unsupported | RenderError::InteractiveUnavailable => Self::Unavailable,
             // `dom_snapshot` の時間切れは render の `HostRenderer` がホストを破棄して `SessionLost` で返す
             // （設計 §14.6・TASK-123）。ここへ `Timeout` などが来たら同期の失敗として扱う。
@@ -298,6 +299,24 @@ mod tests {
         )
         .unwrap();
         build_interactive_document(snap).unwrap()
+    }
+
+    /// `AISNAP-20`・`AISNAP-18`・MS-11: 描画ゲートの中で別の世代に変わっていた取得（`Stale`）は同期の `Stale`
+    /// （失敗の `Failed` にしない。`wait_failed`・`act_failed` と区別する）。
+    #[test]
+    fn aisnap20_render_stale_is_sync_stale() {
+        assert_eq!(
+            SyncFailure::from_render(&RenderError::Stale),
+            SyncFailure::Stale
+        );
+        assert_eq!(
+            SyncFailure::from_render(&RenderError::PageNotLoaded),
+            SyncFailure::Stale
+        );
+        assert_eq!(
+            SyncFailure::from_render(&RenderError::Timeout),
+            SyncFailure::Failed
+        );
     }
 
     /// `AISNAP-17`: セレクタは一意のときだけ番号へ解決し、複数一致・不一致・番号なしは失敗にする。

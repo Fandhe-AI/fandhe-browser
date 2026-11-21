@@ -78,19 +78,25 @@ return 'ok';}})({},{})",
     )
 }
 
+/// 文書に伏せる対象の入力欄（`dom_snapshot` の第 1 層と同じ判定。`autocomplete` が 1024 文字を超える欄も含める）が
+/// あれば `'refused'` を返す JS の文。selector 系の条件を評価するたびに先に走らせる（`AISNAP-18`・TASK-130 の
+/// 指摘 S-8・MS-11。待機中に欄が増えた・変わった場合も断る）。
+const REFUSE_IF_REDACTED: &str = "var f=document.querySelectorAll('input,textarea,select');for(var i=0;i<f.length;i++){var e=f[i];if(e.localName==='input'&&String(e.type).toLowerCase()==='password')return 'refused';var a=String(e.getAttribute('autocomplete')||'');if(a.length>1024)return 'refused';var t=a.toLowerCase().split(/\\s+/);for(var j=0;j<t.length;j++){var k=t[j];if(k==='current-password'||k==='new-password'||k==='one-time-code'||k.indexOf('cc-')===0)return 'refused';}}";
+
 /// 待機の条件を 1 回調べるスクリプト（真偽値を返す。`load_complete` は `page` が読み込みの状態で判定する）。
+/// `text_present` は `body` の `innerText` だけを見る（フォームの値を含めない。S-8）。
 pub(crate) fn condition_script(c: &WaitCondition) -> Option<String> {
     Some(match c {
         WaitCondition::SelectorPresent(s) => format!(
-            "(function(s){{try{{return document.querySelector(s)!==null;}}catch(e){{return 'invalid';}}}})({})",
+            "(function(s){{try{{{REFUSE_IF_REDACTED}return document.querySelector(s)!==null;}}catch(e){{return 'invalid';}}}})({})",
             Value::from(s.as_str())
         ),
         WaitCondition::SelectorAbsent(s) => format!(
-            "(function(s){{try{{return document.querySelector(s)===null;}}catch(e){{return 'invalid';}}}})({})",
+            "(function(s){{try{{{REFUSE_IF_REDACTED}return document.querySelector(s)===null;}}catch(e){{return 'invalid';}}}})({})",
             Value::from(s.as_str())
         ),
         WaitCondition::TextPresent(t) => format!(
-            "(function(t){{var b=document.body||document.documentElement;return !!b&&String(b.innerText||b.textContent||'').indexOf(t)>=0;}})({})",
+            "(function(t){{var b=document.body;return !!b&&String(b.innerText||'').indexOf(t)>=0;}})({})",
             Value::from(t.as_str())
         ),
         WaitCondition::LoadComplete => return None,
@@ -104,12 +110,15 @@ pub(crate) enum ConditionOutcome {
     NotYet,
     /// セレクタの構文が不正（`invalid_params`）。
     Invalid,
+    /// 伏せる対象の入力欄がある文書（`unsupported`。S-8）。
+    Refused,
 }
 
 pub(crate) fn parse_condition(v: &JSValue) -> ConditionOutcome {
     match v {
         JSValue::Boolean(true) => ConditionOutcome::Met,
         JSValue::String(s) if s == "invalid" => ConditionOutcome::Invalid,
+        JSValue::String(s) if s == "refused" => ConditionOutcome::Refused,
         _ => ConditionOutcome::NotYet,
     }
 }
@@ -188,6 +197,10 @@ mod tests {
         assert_eq!(
             parse_condition(&JSValue::Boolean(false)),
             ConditionOutcome::NotYet
+        );
+        assert_eq!(
+            parse_condition(&JSValue::String("refused".into())),
+            ConditionOutcome::Refused
         );
         assert_eq!(
             parse_condition(&JSValue::String("invalid".into())),

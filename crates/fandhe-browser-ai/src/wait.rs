@@ -111,6 +111,8 @@ impl WaitError {
         match e {
             RenderError::Stale | RenderError::PageNotLoaded => Self::Stale,
             RenderError::Timeout => Self::Timeout,
+            // ホストが評価の時点で伏せる対象の欄を見つけて断った（S-8）。
+            RenderError::Unsupported => Self::Unsupported,
             RenderError::InvalidParams => Self::InvalidParams,
             RenderError::SessionLost => Self::SessionLost,
             RenderError::RenderingDisabled => Self::RenderingDisabled,

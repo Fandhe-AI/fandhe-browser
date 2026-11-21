@@ -448,7 +448,21 @@ impl Renderer for HostRenderer {
         };
         let id = InteractivePageId::new(w.page().session(), w.page().doc_seq())
             .map_err(|_| RenderError::ProtocolMismatch)?;
+        check_wait_page(request, &id)?;
         Ok(WaitOutcome::new(id))
+    }
+}
+
+/// 待機の成功応答のページが要求と合うかを確かめる（`AISNAP-18`・MS-11）。セッションは常に同じ、文書番号は
+/// `load_complete` 以外では同じ（ホストは文書が変わったら `stale` を返す契約）。違えば応答の不正。
+fn check_wait_page(request: &WaitRequest, got: &InteractivePageId) -> Result<(), RenderError> {
+    let want = request.page();
+    let same_doc = matches!(request.condition(), CoreWaitCondition::LoadComplete)
+        || got.doc_seq() == want.doc_seq();
+    if got.session() == want.session() && same_doc {
+        Ok(())
+    } else {
+        Err(RenderError::ProtocolMismatch)
     }
 }
 
@@ -498,6 +512,29 @@ mod tests {
     use crate::host_process::{InvalidBinaryReason, TimeoutPhase};
     use crate::protocol::{Method, Response};
     use serde_json::json;
+
+    /// `AISNAP-18`・TASK-129・MS-11: 待機の成功応答は、要求と同じセッションで、`load_complete` 以外は同じ文書番号。
+    #[test]
+    fn aisnap18_wait_response_page_must_match_request() {
+        let page = |s: &str, d: u64| InteractivePageId::new(s, d).unwrap();
+        let req = |c: CoreWaitCondition| WaitRequest::new(page("s1", 2), c, 100).unwrap();
+        let sel = || CoreWaitCondition::SelectorPresent("#a".into());
+        assert!(check_wait_page(&req(sel()), &page("s1", 2)).is_ok());
+        assert!(matches!(
+            check_wait_page(&req(sel()), &page("s1", 3)),
+            Err(RenderError::ProtocolMismatch)
+        ));
+        assert!(matches!(
+            check_wait_page(&req(sel()), &page("s2", 2)),
+            Err(RenderError::ProtocolMismatch)
+        ));
+        let load = || CoreWaitCondition::LoadComplete;
+        assert!(check_wait_page(&req(load()), &page("s1", 5)).is_ok());
+        assert!(matches!(
+            check_wait_page(&req(load()), &page("s2", 5)),
+            Err(RenderError::ProtocolMismatch)
+        ));
+    }
 
     /// `AISNAP-18`・TASK-129: core が検査する待機の上限は protocol の上限と同じ（食い違うと正しい要求が送る直前に断られる）。
     #[test]
