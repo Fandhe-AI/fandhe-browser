@@ -2901,7 +2901,11 @@ fn interactive_act_edge_paths() {
     let took = started.elapsed();
     assert_eq!(r["result"]["navigated"], false, "{r}");
     assert_eq!(r["result"]["page"], snap["page"], "{r}");
-    assert!(took >= Duration::from_secs(2), "{took:?}");
+    // 下限は待ちの打ち切り（2 秒）そのもの、上限はクリックと IPC のばらつきを見込んだ余裕（打ち切りが延びる回帰を拾う）。
+    assert!(
+        took >= Duration::from_secs(2) && took < Duration::from_millis(4500),
+        "{took:?}"
+    );
     SLOW_RELEASE.store(true, std::sync::atomic::Ordering::SeqCst);
     id += 1;
 

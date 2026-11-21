@@ -832,6 +832,10 @@ fn interactive_request_fixtures_match_host_behavior() {
                 let expected = fx
                     .get("expected_response")
                     .unwrap_or_else(|| panic!("{name}: invalid fixture without expected_response"));
+                assert_eq!(
+                    expected["error"]["kind"], "invalid_params",
+                    "{name}: fixture must expect invalid_params"
+                );
                 assert_eq!(r.frames.get(1), Some(expected), "{name}");
                 assert!(calls.borrow().is_empty(), "{name}");
             }
