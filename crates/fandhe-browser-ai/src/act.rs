@@ -127,7 +127,8 @@ impl ActError {
         }
     }
 
-    fn from_sync(e: SyncFailure) -> Self {
+    /// 同期の失敗を写す（[`crate::wait`] も使う）。
+    pub(crate) fn from_sync(e: SyncFailure) -> Self {
         match e {
             SyncFailure::SessionLost => Self::SessionLost,
             SyncFailure::RenderingDisabled => Self::RenderingDisabled,
@@ -319,8 +320,11 @@ pub fn act(state: &AiState, body: &[u8]) -> Result<ActOk, ActError> {
     })
 }
 
-/// 確定結果が操作モードで、要求の世代が最新かを確かめる。
-fn check_current(state: &AiState, requested: u64) -> Result<NavigationGeneration, ActError> {
+/// 確定結果が操作モードで、要求の世代が最新かを確かめる（[`crate::wait`] も使う）。
+pub(crate) fn check_current(
+    state: &AiState,
+    requested: u64,
+) -> Result<NavigationGeneration, ActError> {
     let nav = state.app().navigation();
     let Some((generation, latest)) = nav.latest_with_generation() else {
         return Err(if nav.interactive_lost() {

@@ -102,6 +102,7 @@ pub mod navigate;
 pub mod plugin_api;
 pub mod retention;
 pub mod snapshot;
+pub mod wait;
 
 #[cfg(test)]
 mod reference_stability;
