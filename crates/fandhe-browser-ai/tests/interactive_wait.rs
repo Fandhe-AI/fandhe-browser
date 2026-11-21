@@ -1,5 +1,5 @@
 //! `POST /ai/wait`（操作モードの待機）を、偽の描画ホストで HTTP の層から確かめる結合テスト（TASK-129・`AISNAP-18`・
-//! `AISNAP-21`）。
+//! `AISNAP-21`・MS-11）。
 //!
 //! 偽ホストは `dom_snapshot` で固定の HTML と設定した文書番号を返し、`wait` の要求を記録する。操作モードの許可は core の
 //! `test-support`（dev-dependencies で有効にする）の入口だけで立てる。
@@ -352,4 +352,31 @@ async fn aisnap18_busy_while_waiting() {
     release_tx.send(()).unwrap();
     assert!(running.join().unwrap().is_ok());
     assert_eq!(host.waits().len(), 1);
+}
+
+/// `AISNAP-18`・`AISNAP-20`: 待機の間に新しい navigate が始まったら（navigate は待機の排他を取らない）、古いページで
+/// 条件が成立しても無効になった世代で成功を返さず `stale`。
+#[tokio::test]
+async fn aisnap18_wait_superseded_by_navigation_is_stale() {
+    let dir = TempDir::new();
+    let host = Arc::new(FakeHost::default());
+    let s = state(&dir, Arc::clone(&host));
+    let g = navigate(&s).await;
+    let (entered_tx, entered_rx) = sync_channel(1);
+    let (release_tx, release_rx) = sync_channel(1);
+    *host.wait_gate.lock().unwrap() = Some((entered_tx, release_rx));
+    let running = {
+        let s = Arc::clone(&s);
+        let body = wait_body(g, PRESENT, 60_000);
+        std::thread::spawn(move || fandhe_browser_ai::wait::wait(&s, body.as_bytes()))
+    };
+    entered_rx.recv().unwrap();
+    // navigate は描画層のゲートより前に世代を進める。その順序をここで再現する。
+    let _ = s.app().navigation().begin_navigation().unwrap();
+    release_tx.send(()).unwrap();
+    assert_eq!(
+        running.join().unwrap(),
+        Err(fandhe_browser_ai::wait::WaitError::Stale)
+    );
+    assert_eq!(host.waits().len(), 1, "the host did run the wait");
 }

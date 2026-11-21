@@ -212,7 +212,7 @@ pub fn router_with_state(state: Arc<AiState>) -> Router {
             }
         })
         .route_async("POST", "/ai/wait", move |head, body| {
-            // 前段の検査は navigate と同じ（TASK-129・`AISNAP-18`）。
+            // 前段の検査は navigate と同じ（TASK-129・`AISNAP-18`・MS-11）。
             let pre = post_precheck(head);
             let body = body.to_vec();
             let state = Arc::clone(&wait_state);

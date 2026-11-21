@@ -83,7 +83,7 @@ pub trait Renderer: Send + Sync {
         Err(RenderError::NotInteractive)
     }
 
-    /// 操作モードのページで条件の成立を待つ（TASK-129・`AISNAP-18`。設計 §14.5）。
+    /// 操作モードのページで条件の成立を待つ（TASK-129・`AISNAP-18`・MS-11。設計 §14.5）。
     ///
     /// 既定実装は [`RenderError::NotInteractive`]。上限時間までに成立しなければ [`RenderError::Timeout`]（ホストは
     /// 保つ）、待機中に文書が変わったら [`RenderError::Stale`]（`load_complete` を除く）。ホストが応答しなければ

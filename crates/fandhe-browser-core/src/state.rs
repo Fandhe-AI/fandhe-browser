@@ -838,7 +838,7 @@ impl AppState {
         self.render.with_page(&self.navigation, |r| r.act(request))
     }
 
-    /// 操作モードのページで条件の成立を待つ（TASK-129・`AISNAP-18`）。描画系と同じゲートを通す（待機中はホストを
+    /// 操作モードのページで条件の成立を待つ（TASK-129・`AISNAP-18`・MS-11）。描画系と同じゲートを通す（待機中はホストを
     /// 占有する。最大 [`crate::render::MAX_WAIT_TIMEOUT_MS`] に応答待ちの余裕を足した時間ブロッキングする）。呼び出し元は
     /// ai の `POST /ai/wait`（操作の排他を取り、直前に同期してから呼ぶ）。
     pub fn wait(&self, request: &WaitRequest) -> Result<WaitOutcome, RenderError> {

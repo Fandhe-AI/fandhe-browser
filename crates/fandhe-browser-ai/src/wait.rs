@@ -1,4 +1,4 @@
-//! `POST /ai/wait` の本体（TASK-129・`AISNAP-18`・`AISNAP-21`）。
+//! `POST /ai/wait` の本体（TASK-129・`AISNAP-18`・`AISNAP-21`・MS-11）。
 //!
 //! HTTP の受け口（Host・Origin・Content-Type の検査と応答）は [`crate::api`]。本モジュールは本文の検査と、
 //! 待機（操作の排他 → 直前の取り直し → ホストへの `wait`）を行う。ブロッキングする（最大 60 秒と応答待ちの余裕）ため、
@@ -21,7 +21,8 @@
 //!
 //! # 既知の制約
 //!
-//! - 待機中の `/ai/navigate` は `busy` にならず、描画層のゲートで待機の終わりまで待つ（最大で上限時間と応答待ちの余裕）
+//! - 待機中の `/ai/navigate` は `busy` にならず、描画層のゲートで待機の終わりまで待つ（最大で上限時間と応答待ちの余裕）。
+//!   その間に古いページで条件が成立しても、世代が進んでいれば `stale` で返す
 //! - 要求が固定するのはナビゲーション世代だけ（`/ai/act` と同じ）。待機の開始の文書は直前の取り直しで決まる
 
 use std::fmt;
@@ -239,7 +240,13 @@ pub fn wait(state: &AiState, body: &[u8]) -> Result<WaitOk, WaitError> {
     });
     // 成否によらず、次の `/ai/snapshot` で取り直させる（待機の間にページが変わりうるため。設計 §14.6）。
     state.sync_tracker().clear();
-    out.map(|_| WaitOk { generation })
+    out?;
+    // 待機の間に新しい navigate が始まっていたら（navigate はこの排他を取らない）、成立したのは古いページの条件。
+    // 無効になった世代で成功を返さない。
+    if nav.latest_with_generation().map(|(g, _)| g) != Some(generation) {
+        return Err(WaitError::Stale);
+    }
+    Ok(WaitOk { generation })
 }
 
 #[cfg(test)]

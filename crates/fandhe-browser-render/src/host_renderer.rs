@@ -430,7 +430,7 @@ impl Renderer for HostRenderer {
         Ok(ActOutcome::new(id, a.navigated()))
     }
 
-    /// 操作モードのホストへ `wait` を送る（TASK-129・`AISNAP-18`）。ホストの `timeout` は [`RenderError::Timeout`]
+    /// 操作モードのホストへ `wait` を送る（TASK-129・`AISNAP-18`・MS-11）。ホストの `timeout` は [`RenderError::Timeout`]
     /// でホストを保ち、応答が来なければ `host_process` がホストを破棄して [`RenderError::SessionLost`] にする。
     /// 待機の間はロックを持ち続ける（ホストを占有する。呼び出し元の ai が `busy` を返して他の要求を待たせない）。
     fn wait(&self, request: &WaitRequest) -> Result<WaitOutcome, RenderError> {
