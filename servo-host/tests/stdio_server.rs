@@ -959,7 +959,13 @@ fn serve_routes(listener: TcpListener, routes: Routes) -> mpsc::Sender<()> {
                             .cloned()
                             .unwrap_or(("text/plain", b"nf".to_vec()));
                         if ct == SLOW_HTML {
-                            std::thread::sleep(SLOW_DELAY);
+                            // テストが解放するまで応答しない（上限つき。解放し忘れでスレッドを残さない）。
+                            let until = std::time::Instant::now() + Duration::from_secs(30);
+                            while !SLOW_RELEASE.load(std::sync::atomic::Ordering::SeqCst)
+                                && std::time::Instant::now() < until
+                            {
+                                std::thread::sleep(Duration::from_millis(20));
+                            }
                         }
                         let to = String::from_utf8_lossy(&body);
                         let (head, body) = match ct {
@@ -999,9 +1005,11 @@ fn serve_routes(listener: TcpListener, routes: Routes) -> mpsc::Sender<()> {
 const REDIRECT: &str = "redirect";
 /// [`serve_routes`] の擬似種別: `Refresh` ヘッダで本文の URL へ移す。
 const REFRESH: &str = "refresh";
-/// [`serve_routes`] の擬似種別: [`SLOW_DELAY`] 待ってから本文を `text/html` で返す（`act` の遷移の待ちの打ち切りの試験用）。
+/// [`serve_routes`] の擬似種別: [`SLOW_RELEASE`] が立つまで応答を止め、その後に本文を `text/html` で返す（`act` の遷移の
+/// 待ちの打ち切りの試験用。実時間の差に頼らず「遷移の完了前に `act` が戻る」ことを確かめる）。
 const SLOW_HTML: &str = "slow-html";
-const SLOW_DELAY: Duration = Duration::from_secs(4);
+/// [`SLOW_HTML`] の応答を解放する。使うのは `interactive_act_edge_paths` だけ。
+static SLOW_RELEASE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 const RED_HTML: &str = "<body style=\"margin:0;background:#f00\">";
 const RED_SVG: &str = "<svg xmlns='http://www.w3.org/2000/svg' width='200' height='200'><rect width='200' height='200' fill='red'/></svg>";
 const RED_CSS: &str = "#t{background:#f00}";
@@ -2879,7 +2887,8 @@ fn interactive_act_edge_paths() {
     }
     id += 1;
 
-    // 遷移先の応答が遅い: 2 秒で待ちを打ち切り、navigated は偽（文書番号はまだ変わっていない）。
+    // 遷移先の応答が来ない: 2 秒で待ちを打ち切り、navigated は偽（文書番号はまだ変わっていない）。応答は `act` が
+    // 戻ってから解放する。
     let started = std::time::Instant::now();
     let r = act_req(
         &mut h,
@@ -2892,10 +2901,8 @@ fn interactive_act_edge_paths() {
     let took = started.elapsed();
     assert_eq!(r["result"]["navigated"], false, "{r}");
     assert_eq!(r["result"]["page"], snap["page"], "{r}");
-    assert!(
-        took >= Duration::from_secs(2) && took < SLOW_DELAY,
-        "{took:?}"
-    );
+    assert!(took >= Duration::from_secs(2), "{took:?}");
+    SLOW_RELEASE.store(true, std::sync::atomic::Ordering::SeqCst);
     id += 1;
 
     // 遅れて届いた文書へ移ったら、その文書で about:blank へ移らせる。
@@ -2923,17 +2930,10 @@ fn interactive_act_edge_paths() {
     );
     assert!(r["result"]["page"].is_object(), "{r}");
     id += 1;
-    // about:blank の上では操作しない（page の照合より先に断る）。
+    // クリックは 1 回だけ。about:blank へ移ったことは読み取りだけの dom_snapshot で待つ。
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     loop {
-        let r = act_req(
-            &mut h,
-            id,
-            &slow,
-            node_of(&shtml, "blank"),
-            r#"{"tag":"button"}"#,
-            r#"{"kind":"click"}"#,
-        );
+        let r = request(&mut h, id, "dom_snapshot");
         id += 1;
         if r["error"]["kind"] == "invalid_state" {
             break;
@@ -2941,7 +2941,15 @@ fn interactive_act_edge_paths() {
         assert!(std::time::Instant::now() < deadline, "{r}");
         std::thread::sleep(Duration::from_millis(200));
     }
-    let r = request(&mut h, id, "dom_snapshot");
+    // about:blank の上では操作しない（前の取得の page・snapshot のままでも、照合より先に invalid_state で断る）。
+    let r = act_req(
+        &mut h,
+        id,
+        &slow,
+        node_of(&shtml, "blank"),
+        r#"{"tag":"button"}"#,
+        r#"{"kind":"click"}"#,
+    );
     assert_eq!(r["error"]["kind"], "invalid_state", "{r}");
     finish_host(h, id + 1);
 }
