@@ -714,6 +714,8 @@ fn interactive_byte_limits_count_utf8_bytes() {
         // select の値は 1 件ずつ 512 バイトまで（多バイトの境界をまたぐ 512 は受理、513 は拒否）。
         jframe(&json!({"v":1,"id":4,"method":"act","params":{"page":page,"snapshot":"s1","node":0,"expect":{"tag":"select"},"action":{"kind":"select","values":[format!("ab{}", "あ".repeat(170))]}}})),
         jframe(&json!({"v":1,"id":5,"method":"act","params":{"page":page,"snapshot":"s1","node":0,"expect":{"tag":"select"},"action":{"kind":"select","values":["a", format!("abc{}", "あ".repeat(170))]}}})),
+        // 上限は値 1 件ごと（合計ではない）。512 バイトの値 2 件は受理する。
+        jframe(&json!({"v":1,"id":6,"method":"act","params":{"page":page,"snapshot":"s1","node":0,"expect":{"tag":"select"},"action":{"kind":"select","values":[format!("ab{}", "あ".repeat(170)), format!("cd{}", "あ".repeat(170))]}}})),
     ]
     .concat();
     let r = run_with(&mut h, input);
@@ -734,7 +736,8 @@ fn interactive_byte_limits_count_utf8_bytes() {
         "{}",
         r.frames[5]
     );
-    assert_eq!(calls.borrow().clone(), vec!["act", "act"]);
+    assert!(r.frames[6]["result"].is_object(), "{}", r.frames[6]);
+    assert_eq!(calls.borrow().clone(), vec!["act", "act", "act"]);
 }
 
 /// RENDER-11・TASK-122: 操作モードのホストは dom_snapshot を載せ、上限を申告し、結果をスキーマの形で返す。

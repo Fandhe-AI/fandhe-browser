@@ -959,6 +959,9 @@ fn serve_routes(listener: TcpListener, routes: Routes) -> mpsc::Sender<()> {
                             .cloned()
                             .unwrap_or(("text/plain", b"nf".to_vec()));
                         if ct == SLOW_HTML {
+                            if let Ok(mut at) = SLOW_ARRIVED.lock() {
+                                at.get_or_insert_with(std::time::Instant::now);
+                            }
                             // テストが解放するまで応答しない（上限つき。解放し忘れでスレッドを残さない）。
                             let until = std::time::Instant::now() + Duration::from_secs(30);
                             while !SLOW_RELEASE.load(std::sync::atomic::Ordering::SeqCst)
@@ -1010,6 +1013,8 @@ const REFRESH: &str = "refresh";
 const SLOW_HTML: &str = "slow-html";
 /// [`SLOW_HTML`] の応答を解放する。使うのは `interactive_act_edge_paths` だけ。
 static SLOW_RELEASE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// [`SLOW_HTML`] の要求が最初に届いた時刻（遷移が始まった時刻の近似。クリックの処理の時間を測定から外す）。
+static SLOW_ARRIVED: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
 const RED_HTML: &str = "<body style=\"margin:0;background:#f00\">";
 const RED_SVG: &str = "<svg xmlns='http://www.w3.org/2000/svg' width='200' height='200'><rect width='200' height='200' fill='red'/></svg>";
 const RED_CSS: &str = "#t{background:#f00}";
@@ -2832,7 +2837,7 @@ fn interactive_act_edge_paths() {
         "<!doctype html><html><head><style>body{{margin:0}}input,button{{display:block;width:200px;height:30px}}</style></head><body>\
 <p id=out>none</p>\
 <input id=nf onkeydown=\"{out}='nf:'+event.key+':'+(document.activeElement===this)\">\
-<div style=\"width:90px;font:16px monospace\">xxxxx <a id=wrap href=\"#\" onclick=\"{out}='wrap';return false\">aaa bbb</a></div>\
+<div style=\"width:90px;font:16px monospace\">xxxxx <a id=wrap href=\"#\" onclick=\"var r=this.getClientRects();{out}='wrap:'+r.length+':'+(event.clientY>=r[0].top&&event.clientY<r[0].bottom);return false\">aaa bbb</a></div>\
 <a id=slow href=\"/slow\" style=\"display:block;width:200px;height:30px\">slow</a>\
 </body></html>"
     );
@@ -2883,7 +2888,8 @@ fn interactive_act_edge_paths() {
     {
         let (t, s2) = out_text(&mut h, id);
         snap = s2;
-        assert_eq!(t, "wrap");
+        // 2 行に折り返していて、押した点は最初の行の矩形の中。
+        assert_eq!(t, "wrap:2:true");
     }
     id += 1;
 
@@ -2899,12 +2905,19 @@ fn interactive_act_edge_paths() {
         r#"{"kind":"click"}"#,
     );
     let took = started.elapsed();
+    let since_request = SLOW_ARRIVED
+        .lock()
+        .unwrap()
+        .expect("navigation request reached the server")
+        .elapsed();
     assert_eq!(r["result"]["navigated"], false, "{r}");
     assert_eq!(r["result"]["page"], snap["page"], "{r}");
-    // 下限は待ちの打ち切り（2 秒）そのもの、上限はクリックと IPC のばらつきを見込んだ余裕（打ち切りが延びる回帰を拾う）。
+    // 下限: 全体で待ちの打ち切り（2 秒）以上。上限: 遷移の要求が届いてから応答までを測り（クリックの処理を外す）、
+    // 打ち切りの 2 秒に応答の IPC の余裕を足した値未満（打ち切りが延びる回帰を拾う）。
+    assert!(took >= Duration::from_secs(2), "{took:?}");
     assert!(
-        took >= Duration::from_secs(2) && took < Duration::from_millis(4500),
-        "{took:?}"
+        since_request < Duration::from_millis(3500),
+        "{since_request:?} (total {took:?})"
     );
     SLOW_RELEASE.store(true, std::sync::atomic::Ordering::SeqCst);
     id += 1;

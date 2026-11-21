@@ -553,7 +553,7 @@ AGENTS.md の変更はレビュー基準の変更として AI レビューで P0
 ### 14.8 契約 fixture
 
 - 操作モードの fixture は `crates/fandhe-browser-render/tests/fixtures/protocol/interactive/` に置く（32 件。各メソッドの正常・不正な要求、結果、`--interactive` の `hello`、ホストが返す新しい kind）。`tests/protocol_fixtures.rs` がスキーマとの整合と網羅を検証する
-- ホスト側（`servo-host/src/server/tests.rs`）とクライアント側（`tests/client_contract.rs`）の契約テストは直下の fixture だけを読む。`interactive/` は別のテストに配線した: ホスト側は TASK-122 で `dom_snapshot` の要求（`interactive_dom_snapshot_fixtures_match_host_behavior`）、クライアント側は TASK-123 で正常な要求の JSON・応答・hello・新しい kind（`render10_interactive_requests_match_fixtures`・`render11_interactive_responses_match_fixtures`）。TASK-126 では、ホスト側の `interactive_request_fixtures_match_host_behavior` を `act`・`wait` の要求に広げ、操作モードの hello を `interactive_hello_matches_fixture` で照合した。直下の fixture を読む既存の契約テストは操作モードでないホストを前提にする（`act` 等は `unsupported`）ため、直下へは移さず `interactive/` のままにする（#1592）。不正な要求の fixture には `expected_response` を足し、ホスト側はそれと完全に一致する応答を返すことを確かめる
+- ホスト側（`servo-host/src/server/tests.rs`）とクライアント側（`tests/client_contract.rs`）で直下の fixture を全件読む既存の契約テスト（`request_fixtures_match_host_behavior`・`render3_*`）は、直下だけを読む。`interactive/` は操作モード用の別のテストに配線した: ホスト側は TASK-122 で `dom_snapshot` の要求（`interactive_dom_snapshot_fixtures_match_host_behavior`）、クライアント側は TASK-123 で正常な要求の JSON・応答・hello・新しい kind（`render10_interactive_requests_match_fixtures`・`render11_interactive_responses_match_fixtures`）。TASK-126 では、ホスト側の `interactive_request_fixtures_match_host_behavior` を `act`・`wait` の要求に広げ、操作モードの hello を `interactive_hello_matches_fixture` で照合した。直下の fixture を読む既存の契約テストは操作モードでないホストを前提にする（`act` 等は `unsupported`）ため、直下へは移さず `interactive/` のままにする（#1592）。不正な要求の fixture には `expected_response` を足し、ホスト側はそれと完全に一致する応答を返すことを確かめる
 
 ### 14.9 残る判断
 
