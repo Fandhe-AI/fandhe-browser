@@ -49,6 +49,9 @@ struct FakeHost {
     snapshot_error: Mutex<Option<RenderError>>,
     loads: AtomicUsize,
     snapshots: AtomicUsize,
+    /// 立てると `dom_snapshot` が番号の重なった HTML を返す（本体の検査で失敗させる）。
+    bad_numbers: std::sync::atomic::AtomicBool,
+    releases: AtomicUsize,
 }
 
 impl FakeHost {
@@ -87,14 +90,22 @@ impl Renderer for FakeHost {
         if let Some(e) = self.snapshot_error.lock().unwrap().take() {
             return Err(e);
         }
+        let html = if self.bad_numbers.load(Ordering::SeqCst) {
+            HTML.replace("data-fandhe-n=\"4\"", "data-fandhe-n=\"3\"")
+        } else {
+            HTML.to_owned()
+        };
         Ok(HostDomSnapshot::new(
             InteractivePageId::new("s1", 1).unwrap(),
             "https://a.example/form",
-            HTML.to_owned(),
+            html,
             5,
             "snap",
         )
         .unwrap())
+    }
+    fn release_interactive(&self) {
+        self.releases.fetch_add(1, Ordering::SeqCst);
     }
 }
 
@@ -340,4 +351,22 @@ async fn aisnap20_sync_unsupported_is_interactive_unavailable() {
         (res.status, json(&res)["code"].as_str()),
         (409, Some("session_lost"))
     );
+}
+
+/// TASK-130 の指摘 S-1・`AISNAP-16`・`AISNAP-20`・MS-11・#1638: 操作モードの読み込みの途中・後で navigate が失敗したら、操作モードのホストを残さない。
+/// 成功した navigate では止めない。
+#[tokio::test]
+async fn s1_failed_navigate_releases_interactive_host() {
+    let dir = TempDir::new();
+    let host = Arc::new(FakeHost::default());
+    let s = state(&dir, Arc::clone(&host), true);
+    let body = r#"{"url":"https://a.example/form","mode":"interactive"}"#;
+    assert_eq!(navigate(&s, body).await.status, 200);
+    assert_eq!(host.releases.load(Ordering::SeqCst), 0);
+    *host.snapshot_error.lock().unwrap() = Some(RenderError::Unsupported);
+    assert_eq!(navigate(&s, body).await.status, 409);
+    assert_eq!(host.releases.load(Ordering::SeqCst), 1, "load failure");
+    host.bad_numbers.store(true, Ordering::SeqCst);
+    assert_eq!(navigate(&s, body).await.status, 502);
+    assert_eq!(host.releases.load(Ordering::SeqCst), 2, "check failure");
 }

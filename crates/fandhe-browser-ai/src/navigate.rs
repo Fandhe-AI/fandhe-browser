@@ -159,28 +159,37 @@ pub fn navigate(
         return Err(NavigateError::Unavailable);
     }
     let nav = app.navigation();
+    // 操作モード同士の navigate はホストを使い続ける（止めない開始。失敗したら下で止める。#1638）。
     let generation = nav
-        .begin_navigation()
+        .begin_interactive_navigation()
         .map_err(|_| NavigateError::LoadFailed)?;
     // 前のページの JS 実行・評価コンテキストを打ち切る（CDP の `Page.navigate` と同じ。`JS-4`・`JS-6`）。
     // 評価コンテキストを失効できなければ、CDP と同じく読み込まずに失敗にする（fail-closed）。
+    // 開始の後の失敗では、操作モードのホストを残さない（TASK-130 の指摘 S-1・`AISNAP-16`・`AISNAP-20`・MS-11・#1638）。
+    let release = || app.release_interactive_if_current(generation);
     app.page_scripts().begin_generation(nav.scope(), generation);
     app.script_contexts()
         .begin_generation(nav.scope(), generation)
+        .inspect_err(|_| release())
         .map_err(|_| NavigateError::LoadFailed)?;
     let (_load, snapshot) = app
         .load_interactive(generation, &PageRef::new(&request.url))
+        .inspect_err(|_| release())
         .map_err(|e| match e {
             InteractiveLoadError::NotAllowed => NavigateError::Unavailable,
             InteractiveLoadError::Superseded => NavigateError::Stale,
             InteractiveLoadError::Render(r) => from_render(&r),
             _ => NavigateError::LoadFailed,
         })?;
-    let sync = build_interactive_document(snapshot).map_err(|_| NavigateError::LoadFailed)?;
+    let sync = build_interactive_document(snapshot).map_err(|_| {
+        release();
+        NavigateError::LoadFailed
+    })?;
     // 応答の URL は保存する文書と同じ取得時の URL にする（読み込みから取得までにページが自分で
     // 遷移しても `/ai/snapshot` と食い違わない）。保存後に共有状態を読み直すと別の navigate と競合する。
     let url = sync.url().to_owned();
     app.commit_interactive(generation, sync)
+        .inspect_err(|_| release())
         .map_err(|e| match e {
             StateError::Superseded { .. } => NavigateError::Stale,
             StateError::InteractiveNotAllowed => NavigateError::Unavailable,

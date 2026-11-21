@@ -348,6 +348,29 @@ impl Renderer for HostRenderer {
         }
     }
 
+    /// 操作モードの Servo ホストを止める（TASK-130 の指摘 S-1・`AISNAP-16`・`AISNAP-20`・MS-11・#1638）。core の描画ゲートが、確定結果が操作モードで
+    /// なくなったときに呼ぶ。止めた後の操作モードの要求は `NotInteractive`。
+    fn release_interactive(&self) {
+        // poison 時は状態が不整合でありうるが、止める向きの操作なので回復して行う。
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        inner.interactive_loaded = false;
+        if !inner.interactive.is_running() {
+            return;
+        }
+        // 止める処理（`shutdown` の猶予つき）で呼び出し元（CDP の navigate の開始など）を待たせないよう、動いている
+        // ホストを新しい値と差し替え、古いほうは別のスレッドで落とす（`Drop` が `shutdown` する）。スレッドを作れ
+        // なければクロージャごとその場で落ちるため、同期で止まる。
+        let fresh = inner.interactive.fresh();
+        let old = std::mem::replace(&mut inner.interactive, fresh);
+        drop(inner);
+        let _ = std::thread::Builder::new()
+            .name("fandhe-release-interactive".to_owned())
+            .spawn(move || drop(old));
+    }
+
     fn load_interactive(&self, page: &PageRef) -> Result<InteractivePageLoad, RenderError> {
         // 静的の `load` と同じく、検証より前に現在のページを捨てる（fail-closed）。静的モードのホストは止める。
         let mut inner = self.lock()?;
