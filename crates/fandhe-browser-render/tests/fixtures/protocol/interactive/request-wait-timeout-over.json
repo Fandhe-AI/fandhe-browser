@@ -18,5 +18,13 @@
       "timeout_ms": 60001
     }
   },
+  "expected_response": {
+    "v": 1,
+    "id": 1,
+    "error": {
+      "kind": "invalid_params",
+      "message": "Invalid parameters."
+    }
+  },
   "note": "上限時間は最大 60 秒"
 }
