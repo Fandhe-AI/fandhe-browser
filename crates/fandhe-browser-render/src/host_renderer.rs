@@ -54,12 +54,13 @@ use fandhe_browser_core::interactive::{HostDomSnapshot, InteractivePageId};
 use fandhe_browser_core::render::{
     ActAction, ActOutcome, ActRequest, BoundingBox, ElementRef, ElementVisibility, ImageFormat,
     InteractivePageLoad, PageLoad, PageRef, RenderError, Renderer, Screenshot, ScreenshotOptions,
+    WaitCondition as CoreWaitCondition, WaitOutcome, WaitRequest,
 };
 
 use crate::host_process::{HostProcess, HostProcessConfig, HostProcessError};
 use crate::protocol::{
     ActExpect, ActParams, Action, BoundingBoxParams, HostErrorKind, LoadParams, MethodResult,
-    PageInfo, Request, ScreenshotParams, VisibilityParams,
+    PageInfo, Request, ScreenshotParams, VisibilityParams, WaitCondition, WaitParams,
 };
 
 /// PNG ファイルの先頭 8 バイト。
@@ -428,6 +429,57 @@ impl Renderer for HostRenderer {
             .map_err(|_| RenderError::ProtocolMismatch)?;
         Ok(ActOutcome::new(id, a.navigated()))
     }
+
+    /// 操作モードのホストへ `wait` を送る（TASK-129・`AISNAP-18`・MS-11）。ホストの `timeout` は [`RenderError::Timeout`]
+    /// でホストを保ち、応答が来なければ `host_process` がホストを破棄して [`RenderError::SessionLost`] にする。
+    /// 待機の間はロックを持ち続ける（ホストを占有する。呼び出し元の ai が `busy` を返して他の要求を待たせない）。
+    fn wait(&self, request: &WaitRequest) -> Result<WaitOutcome, RenderError> {
+        let params = wait_params(request)?;
+        let mut inner = self.lock()?;
+        if !inner.interactive_loaded {
+            return Err(RenderError::NotInteractive);
+        }
+        let result = inner
+            .interactive
+            .call_interactive(Request::Wait(params))
+            .map_err(map_host_error);
+        let MethodResult::Wait(w) = result? else {
+            return Err(RenderError::ProtocolMismatch);
+        };
+        let id = InteractivePageId::new(w.page().session(), w.page().doc_seq())
+            .map_err(|_| RenderError::ProtocolMismatch)?;
+        check_wait_page(request, &id)?;
+        Ok(WaitOutcome::new(id))
+    }
+}
+
+/// 待機の成功応答のページが要求と合うかを確かめる（`AISNAP-18`・MS-11）。セッションは常に同じ、文書番号は
+/// `load_complete` 以外では同じ（ホストは文書が変わったら `stale` を返す契約）。違えば応答の不正。
+fn check_wait_page(request: &WaitRequest, got: &InteractivePageId) -> Result<(), RenderError> {
+    let want = request.page();
+    let same_doc = matches!(request.condition(), CoreWaitCondition::LoadComplete)
+        || got.doc_seq() == want.doc_seq();
+    if got.session() == want.session() && same_doc {
+        Ok(())
+    } else {
+        Err(RenderError::ProtocolMismatch)
+    }
+}
+
+/// core の待機の要求をプロトコルの `wait` のパラメータにする。検査に通らなければ [`RenderError::InvalidParams`]
+/// （ホストへ送らない）。条件の文字列はエラーに含めない。
+fn wait_params(request: &WaitRequest) -> Result<WaitParams, RenderError> {
+    let invalid = |_| RenderError::InvalidParams;
+    let page =
+        PageInfo::new(request.page().session(), request.page().doc_seq()).map_err(invalid)?;
+    let condition = match request.condition() {
+        CoreWaitCondition::SelectorPresent(s) => WaitCondition::SelectorPresent(s.clone()),
+        CoreWaitCondition::SelectorAbsent(s) => WaitCondition::SelectorAbsent(s.clone()),
+        CoreWaitCondition::TextPresent(t) => WaitCondition::TextPresent(t.clone()),
+        CoreWaitCondition::LoadComplete => WaitCondition::LoadComplete,
+        _ => return Err(RenderError::InvalidParams),
+    };
+    WaitParams::new(page, condition, request.timeout_ms()).map_err(invalid)
 }
 
 /// core の操作の要求をプロトコルの `act` のパラメータにする。検査に通らなければ [`RenderError::InvalidParams`]
@@ -460,6 +512,40 @@ mod tests {
     use crate::host_process::{InvalidBinaryReason, TimeoutPhase};
     use crate::protocol::{Method, Response};
     use serde_json::json;
+
+    /// `AISNAP-18`・TASK-129・MS-11: 待機の成功応答は、要求と同じセッションで、`load_complete` 以外は同じ文書番号。
+    #[test]
+    fn aisnap18_wait_response_page_must_match_request() {
+        let page = |s: &str, d: u64| InteractivePageId::new(s, d).unwrap();
+        let req = |c: CoreWaitCondition| WaitRequest::new(page("s1", 2), c, 100).unwrap();
+        let sel = || CoreWaitCondition::SelectorPresent("#a".into());
+        assert!(check_wait_page(&req(sel()), &page("s1", 2)).is_ok());
+        assert!(matches!(
+            check_wait_page(&req(sel()), &page("s1", 3)),
+            Err(RenderError::ProtocolMismatch)
+        ));
+        assert!(matches!(
+            check_wait_page(&req(sel()), &page("s2", 2)),
+            Err(RenderError::ProtocolMismatch)
+        ));
+        let load = || CoreWaitCondition::LoadComplete;
+        assert!(check_wait_page(&req(load()), &page("s1", 5)).is_ok());
+        assert!(matches!(
+            check_wait_page(&req(load()), &page("s2", 5)),
+            Err(RenderError::ProtocolMismatch)
+        ));
+    }
+
+    /// `AISNAP-18`・TASK-129: core が検査する待機の上限は protocol の上限と同じ（食い違うと正しい要求が送る直前に断られる）。
+    #[test]
+    fn task129_wait_limits_match_protocol() {
+        use fandhe_browser_core::render::{MAX_WAIT_CONDITION_BYTES, MAX_WAIT_TIMEOUT_MS};
+        assert_eq!(
+            MAX_WAIT_CONDITION_BYTES,
+            crate::protocol::MAX_WAIT_CONDITION_BYTES
+        );
+        assert_eq!(MAX_WAIT_TIMEOUT_MS, crate::protocol::MAX_WAIT_TIMEOUT_MS);
+    }
 
     /// TASK-128: core が照合値の要素名を検査する上限は、protocol の上限と同じ（食い違うと正しい要求が
     /// 送る直前に `invalid_params` で断られる）。

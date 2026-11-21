@@ -670,6 +670,9 @@ impl Handler for ServoHandler {
                             ConditionOutcome::Invalid => {
                                 return Err(HandlerError(ErrorKind::InvalidParams));
                             }
+                            ConditionOutcome::Refused => {
+                                return Err(HandlerError(ErrorKind::Unsupported));
+                            }
                         },
                         // 文書の入れ替えの途中は評価できないことがある。文書番号の検査に任せる。
                         Err(PageError::DocumentGone | PageError::Script) => false,

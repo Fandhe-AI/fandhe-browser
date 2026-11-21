@@ -364,6 +364,15 @@ pub fn is_redaction_target(doc: &InteractiveDocument, node: NodeId) -> bool {
     sensitivity(document, node, name) != Sensitivity::Plain
 }
 
+/// 文書に伏せる対象の入力欄（[`is_redaction_target`]）が 1 つでもあるか（`AISNAP-18`・TASK-129・TASK-130 の
+/// 指摘 S-8・MS-11）。ai の `POST /ai/wait` が、ホストの生の DOM で評価する条件を許すかの判定に使う。
+pub fn has_redaction_target(doc: &InteractiveDocument) -> bool {
+    let document = doc.document();
+    document
+        .descendants(document.root())
+        .any(|id| is_redaction_target(doc, id))
+}
+
 /// 入力欄の伏せる区分。
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Sensitivity {
@@ -487,6 +496,31 @@ mod tests {
             "s1",
         )
         .unwrap()
+    }
+
+    /// `AISNAP-18`・TASK-130 の指摘 S-8・MS-11: 伏せる対象の入力欄が 1 つでもあれば真。値を消した後の文書でも
+    /// （`type` 等の属性で）判定できる。
+    #[test]
+    fn s8_has_redaction_target() {
+        let page = |body: &str| {
+            build_interactive_document(snap(
+                &format!(
+                    r#"<html data-fandhe-n="0"><head data-fandhe-n="1"></head><body data-fandhe-n="2">{body}</body></html>"#
+                ),
+                4,
+            ))
+            .unwrap()
+            .document
+        };
+        assert!(!has_redaction_target(&page(
+            r#"<input data-fandhe-n="3" name="q" value="x">"#
+        )));
+        assert!(has_redaction_target(&page(
+            r#"<input data-fandhe-n="3" type="password" value="x">"#
+        )));
+        assert!(has_redaction_target(&page(
+            r#"<input data-fandhe-n="3" autocomplete="cc-number">"#
+        )));
     }
 
     /// AISNAP-20・確定条件 1: 番号を外した HTML を保存し、要素 → 番号の対応表を作る。番号の無い要素は載らない。

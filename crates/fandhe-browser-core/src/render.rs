@@ -82,6 +82,113 @@ pub trait Renderer: Send + Sync {
         let _ = request;
         Err(RenderError::NotInteractive)
     }
+
+    /// 操作モードのページで条件の成立を待つ（TASK-129・`AISNAP-18`・MS-11。設計 §14.5）。
+    ///
+    /// 既定実装は [`RenderError::NotInteractive`]。上限時間までに成立しなければ [`RenderError::Timeout`]（ホストは
+    /// 保つ）、待機中に文書が変わったら [`RenderError::Stale`]（`load_complete` を除く）。ホストが応答しなければ
+    /// 実装がホストを破棄して [`RenderError::SessionLost`] にする。
+    fn wait(&self, request: &WaitRequest) -> Result<WaitOutcome, RenderError> {
+        let _ = request;
+        Err(RenderError::NotInteractive)
+    }
+}
+
+/// 待機の上限時間の最大（ミリ秒。ホストの `wait_timeout_max_ms` と同じ。`AISNAP-18`）。
+pub const MAX_WAIT_TIMEOUT_MS: u32 = 60_000;
+
+/// 待機の条件の文字列（セレクタ・テキスト）の上限（バイト。ホストの `wait_condition_bytes` と同じ。`AISNAP-18`）。
+pub const MAX_WAIT_CONDITION_BYTES: usize = 1024;
+
+/// 待機の条件（`AISNAP-18`・TASK-129・MS-11。設計 §14.5）。`ref` での待機は後続。`Debug` は文字列を出さない。
+#[derive(Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum WaitCondition {
+    /// セレクタに一致する要素が現れる。
+    SelectorPresent(String),
+    /// セレクタに一致する要素が無くなる。
+    SelectorAbsent(String),
+    /// 文書のテキストに文字列が現れる。
+    TextPresent(String),
+    /// 読み込みが終わる（待機中の文書の入れ替わりを失敗にしない）。
+    LoadComplete,
+}
+
+impl std::fmt::Debug for WaitCondition {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (name, len) = match self {
+            Self::SelectorPresent(s) => ("SelectorPresent", s.len()),
+            Self::SelectorAbsent(s) => ("SelectorAbsent", s.len()),
+            Self::TextPresent(s) => ("TextPresent", s.len()),
+            Self::LoadComplete => return f.write_str("LoadComplete"),
+        };
+        f.debug_struct(name).field("len", &len).finish()
+    }
+}
+
+/// 待機の要求（`AISNAP-18`）。ページ識別子は直前に取り直した文書のもの。
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct WaitRequest {
+    page: InteractivePageId,
+    condition: WaitCondition,
+    timeout_ms: u32,
+}
+
+impl WaitRequest {
+    /// 作る。上限時間は 1〜[`MAX_WAIT_TIMEOUT_MS`]、条件の文字列は 1〜[`MAX_WAIT_CONDITION_BYTES`] バイト
+    /// （外れれば [`RenderError::InvalidParams`]）。
+    pub fn new(
+        page: InteractivePageId,
+        condition: WaitCondition,
+        timeout_ms: u32,
+    ) -> Result<Self, RenderError> {
+        if timeout_ms == 0 || timeout_ms > MAX_WAIT_TIMEOUT_MS {
+            return Err(RenderError::InvalidParams);
+        }
+        if let WaitCondition::SelectorPresent(s)
+        | WaitCondition::SelectorAbsent(s)
+        | WaitCondition::TextPresent(s) = &condition
+            && (s.is_empty() || s.len() > MAX_WAIT_CONDITION_BYTES)
+        {
+            return Err(RenderError::InvalidParams);
+        }
+        Ok(Self {
+            page,
+            condition,
+            timeout_ms,
+        })
+    }
+    /// 待機を始める文書のページ識別子。
+    pub fn page(&self) -> &InteractivePageId {
+        &self.page
+    }
+    /// 条件。
+    pub fn condition(&self) -> &WaitCondition {
+        &self.condition
+    }
+    /// 上限時間（ミリ秒）。
+    pub fn timeout_ms(&self) -> u32 {
+        self.timeout_ms
+    }
+}
+
+/// 待機の結果（条件が成立した時点のページ識別子）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct WaitOutcome {
+    page: InteractivePageId,
+}
+
+impl WaitOutcome {
+    /// 作る（`HostRenderer` が成功結果を作る経路）。
+    pub fn new(page: InteractivePageId) -> Self {
+        Self { page }
+    }
+    /// 成立した時点のページ識別子。
+    pub fn page(&self) -> &InteractivePageId {
+        &self.page
+    }
 }
 
 /// `fill` の文字列の上限（バイト。ホストの `fill_text_bytes` と同じ。設計 §14.6）。
@@ -868,6 +975,40 @@ mod tests {
             "render host does not support the request"
         );
         assert_eq!(format!("{:?}", RenderError::Unsupported), "Unsupported");
+    }
+
+    /// AISNAP-18・TASK-129: 待機の要求の検査。上限時間は 1〜60,000 ms、条件の文字列は 1〜1024 バイト（多バイトは
+    /// バイトで数える）。`Debug` は条件の文字列を出さない。
+    #[test]
+    fn aisnap18_wait_request_validation() {
+        let page = || InteractivePageId::new("s", 1).unwrap();
+        let req = |c: WaitCondition, ms: u32| WaitRequest::new(page(), c, ms);
+        assert!(req(WaitCondition::LoadComplete, 1).is_ok());
+        assert!(req(WaitCondition::LoadComplete, MAX_WAIT_TIMEOUT_MS).is_ok());
+        for ms in [0, MAX_WAIT_TIMEOUT_MS + 1] {
+            assert!(matches!(
+                req(WaitCondition::LoadComplete, ms),
+                Err(RenderError::InvalidParams)
+            ));
+        }
+        // 3 バイトの文字 341 個と 1 バイトで 1024 バイト（受理）、もう 1 バイトで超過。
+        let at_limit = format!("a{}", "あ".repeat(341));
+        assert_eq!(at_limit.len(), MAX_WAIT_CONDITION_BYTES);
+        for make in [
+            WaitCondition::SelectorPresent as fn(String) -> WaitCondition,
+            WaitCondition::SelectorAbsent,
+            WaitCondition::TextPresent,
+        ] {
+            assert!(req(make(at_limit.clone()), 100).is_ok());
+            for bad in [String::new(), format!("{at_limit}a")] {
+                assert!(matches!(
+                    req(make(bad), 100),
+                    Err(RenderError::InvalidParams)
+                ));
+            }
+        }
+        let r = req(WaitCondition::TextPresent("hunter2".into()), 100).unwrap();
+        assert!(!format!("{r:?}").contains("hunter2"), "{r:?}");
     }
 
     /// AISNAP-17・TASK-128: 操作の要求の検査。`fill` の文字列の上限、照合値の長さ（超えた値は送らない）、

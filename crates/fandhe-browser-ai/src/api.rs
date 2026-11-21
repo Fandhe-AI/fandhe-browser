@@ -76,6 +76,7 @@ use crate::plugin_api::AiState;
 #[cfg(feature = "plugin-registry")]
 use crate::plugin_api::{ManifestError, PluginManifest, PluginRegistry, RegistryError};
 use crate::snapshot::{CheckedState, DataLeafKind, Node, Snapshot, TableSummary, build_snapshot};
+use crate::wait::{MAX_WAIT_BODY_BYTES, WaitError, wait};
 
 const JSON_CONTENT_TYPE: &str = "application/json; charset=UTF-8";
 
@@ -136,6 +137,7 @@ pub fn router_with_state(state: Arc<AiState>) -> Router {
     let snapshot_state = Arc::clone(&state);
     let navigate_state = Arc::clone(&state);
     let act_state = Arc::clone(&state);
+    let wait_state = Arc::clone(&state);
     #[cfg(feature = "plugin-registry")]
     let plugins_state = Arc::clone(&state);
     #[cfg(feature = "plugin-registry")]
@@ -205,6 +207,33 @@ pub fn router_with_state(state: Arc<AiState>) -> Router {
                         Response::new(200, body).with_content_type(JSON_CONTENT_TYPE)
                     }
                     Some(Err(e)) => act_error_response(e),
+                    None => internal_error_response(),
+                }
+            }
+        })
+        .route_async("POST", "/ai/wait", move |head, body| {
+            // 前段の検査は navigate と同じ（TASK-129・`AISNAP-18`・MS-11）。断る要求と上限を超える本文は複製しない。
+            let pre = post_precheck(head).and_then(|()| {
+                if body.len() > MAX_WAIT_BODY_BYTES {
+                    Err(wait_error_response(WaitError::InvalidParams))
+                } else {
+                    Ok(body.to_vec())
+                }
+            });
+            let state = Arc::clone(&wait_state);
+            async move {
+                let body = match pre {
+                    Ok(b) => b,
+                    Err(r) => return r,
+                };
+                match run_blocking(move || wait(&state, &body)).await {
+                    Some(Ok(ok)) => {
+                        let body = json!({ "ok": true, "generation": ok.generation().get() })
+                            .to_string()
+                            .into_bytes();
+                        Response::new(200, body).with_content_type(JSON_CONTENT_TYPE)
+                    }
+                    Some(Err(e)) => wait_error_response(e),
                     None => internal_error_response(),
                 }
             }
@@ -387,6 +416,12 @@ fn navigate_error_response(e: NavigateError) -> Response {
 
 /// `POST /ai/act` の失敗の応答（2026-11-19 のオーナー判断の表。本文は `{"code","message"}`）。
 fn act_error_response(e: ActError) -> Response {
+    let (status, code) = e.status_and_code();
+    fixed_error_response(status, code, &e.to_string())
+}
+
+/// `POST /ai/wait` の失敗の応答（本文は `{"code","message"}`）。
+fn wait_error_response(e: WaitError) -> Response {
     let (status, code) = e.status_and_code();
     fixed_error_response(status, code, &e.to_string())
 }

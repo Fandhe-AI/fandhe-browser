@@ -2838,3 +2838,53 @@ fn page_alert_does_not_block_load_or_pollute_stdout() {
     assert!(!stderr.contains("ALERT_MARKER_1597"), "{stderr}");
     assert!(!stderr.contains("SECOND_ALERT_1597"), "{stderr}");
 }
+
+/// `AISNAP-18`・TASK-130 の指摘 S-8・MS-11: 伏せる対象の入力欄がある文書では、selector 系の待機の条件を評価するたびに
+/// 断る（`unsupported`）。待機中に欄が増えた場合も時間切れを待たずに断る。`text_present` は本文の表示テキストで判定する。
+#[test]
+fn interactive_wait_refuses_selector_conditions_on_redacted_documents() {
+    let (l, port) = bind_loopback();
+    let mut m = std::collections::HashMap::new();
+    m.insert(
+        "/w".to_owned(),
+        (
+            "text/html",
+            b"<!doctype html><p id=t>hello</p><script>setTimeout(function(){var i=document.createElement('input');i.type='password';document.body.appendChild(i);},500);</script>".to_vec(),
+        ),
+    );
+    let _stop = serve_routes(l, std::sync::Arc::new(m));
+    let (proxy, _pstop) = serve_forwarding_proxy();
+    let (mut h, mut id, snap) = interactive_page(&format!("http://127.0.0.1:{port}/w"), proxy);
+    let page = snap["page"].to_string();
+    let mut wait = |h: &mut Host, cond: &str, ms: u64| -> serde_json::Value {
+        id += 1;
+        h.send(&format!(
+            r#"{{"v":1,"id":{id},"method":"wait","params":{{"page":{page},"condition":{cond},"timeout_ms":{ms}}}}}"#
+        ));
+        serde_json::from_str(&h.recv()).unwrap()
+    };
+    let r = wait(&mut h, r#"{"kind":"text_present","text":"hello"}"#, 1000);
+    assert!(r["result"]["page"].is_object(), "{r}");
+    // 欄が加わる前に始めた待機も、加わった時点で断る（5 秒の時間切れを待たない）。
+    let started = std::time::Instant::now();
+    let r = wait(
+        &mut h,
+        r##"{"kind":"selector_present","selector":"#never"}"##,
+        5000,
+    );
+    assert_eq!(r["error"]["kind"], "unsupported", "{r}");
+    assert!(
+        started.elapsed() < Duration::from_secs(4),
+        "{:?}",
+        started.elapsed()
+    );
+    let r = wait(
+        &mut h,
+        r##"{"kind":"selector_absent","selector":"#t"}"##,
+        300,
+    );
+    assert_eq!(r["error"]["kind"], "unsupported", "{r}");
+    let r = wait(&mut h, r#"{"kind":"text_present","text":"hello"}"#, 1000);
+    assert!(r["result"]["page"].is_object(), "{r}");
+    finish_host(h, id + 1);
+}

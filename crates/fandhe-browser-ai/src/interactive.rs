@@ -94,7 +94,8 @@ impl SyncFailure {
         match e {
             RenderError::SessionLost => Self::SessionLost,
             RenderError::RenderingDisabled => Self::RenderingDisabled,
-            RenderError::PageNotLoaded => Self::Stale,
+            // `Stale` は描画ゲートの中で別の世代・静的ページに変わっていた（`AppState::dom_snapshot_at`）。
+            RenderError::PageNotLoaded | RenderError::Stale => Self::Stale,
             RenderError::Unsupported | RenderError::InteractiveUnavailable => Self::Unavailable,
             // `dom_snapshot` の時間切れは render の `HostRenderer` がホストを破棄して `SessionLost` で返す
             // （設計 §14.6・TASK-123）。ここへ `Timeout` などが来たら同期の失敗として扱う。
@@ -121,16 +122,32 @@ impl SyncFailure {
 /// 後の要求は前の同期の完了を待ち、その記録を見て取り直さない。ロックの順は「同期 → 描画ゲート →
 /// ナビゲーション」で、描画ゲートを持ったまま同期のロックを取る経路は無い。
 pub fn sync_interactive(app: &AppState, tracker: &SyncTracker) -> Result<(), SyncFailure> {
-    sync_inner(app, tracker, false)
+    sync_inner(app, tracker, false, None)
 }
 
 /// [`sync_interactive`] を最小間隔によらず行う（`POST /ai/act` の直前の取り直し。`AISNAP-17`・TASK-128）。
 /// 失敗の扱い（無効化・エラー）は [`sync_interactive`] と同じ。
 pub fn sync_interactive_now(app: &AppState, tracker: &SyncTracker) -> Result<(), SyncFailure> {
-    sync_inner(app, tracker, true)
+    sync_inner(app, tracker, true, None)
 }
 
-fn sync_inner(app: &AppState, tracker: &SyncTracker, force: bool) -> Result<(), SyncFailure> {
+/// [`sync_interactive_now`] を、要求が見た世代 `expected` に固定して行う（`POST /ai/wait`。`AISNAP-18`・TASK-129・MS-11）。
+/// 最新の世代が違えば取り直さずに [`SyncFailure::Stale`]（古い要求が新しいページを取り直し、失敗でそのページを
+/// 無効にしない）。
+pub fn sync_interactive_now_at(
+    app: &AppState,
+    tracker: &SyncTracker,
+    expected: NavigationGeneration,
+) -> Result<(), SyncFailure> {
+    sync_inner(app, tracker, true, Some(expected))
+}
+
+fn sync_inner(
+    app: &AppState,
+    tracker: &SyncTracker,
+    force: bool,
+    expected: Option<NavigationGeneration>,
+) -> Result<(), SyncFailure> {
     let mut last = tracker.last.lock().unwrap_or_else(PoisonError::into_inner);
     let nav = app.navigation();
     let Some((generation, latest)) = nav.latest_with_generation() else {
@@ -141,12 +158,16 @@ fn sync_inner(app: &AppState, tracker: &SyncTracker, force: bool) -> Result<(), 
             Ok(())
         };
     };
+    if expected.is_some_and(|e| e != generation) {
+        return Err(SyncFailure::Stale);
+    }
     if latest.mode() != PageMode::Interactive || !(force || due(*last, generation, Instant::now()))
     {
         return Ok(());
     }
+    // 取得は描画ゲートの中でも同じ世代の操作モードに固定する（確認の後に別のページが確定していれば取り直さない）。
     let result = app
-        .dom_snapshot()
+        .dom_snapshot_at(generation)
         .map_err(|e| SyncFailure::from_render(&e))
         .and_then(|snapshot| {
             // `sensitive` の操作があった世代では、すべての入力欄の値を消して組み立てる（`AISNAP-17`）。
@@ -278,6 +299,24 @@ mod tests {
         )
         .unwrap();
         build_interactive_document(snap).unwrap()
+    }
+
+    /// `AISNAP-20`・`AISNAP-18`・MS-11: 描画ゲートの中で別の世代に変わっていた取得（`Stale`）は同期の `Stale`
+    /// （失敗の `Failed` にしない。`wait_failed`・`act_failed` と区別する）。
+    #[test]
+    fn aisnap20_render_stale_is_sync_stale() {
+        assert_eq!(
+            SyncFailure::from_render(&RenderError::Stale),
+            SyncFailure::Stale
+        );
+        assert_eq!(
+            SyncFailure::from_render(&RenderError::PageNotLoaded),
+            SyncFailure::Stale
+        );
+        assert_eq!(
+            SyncFailure::from_render(&RenderError::Timeout),
+            SyncFailure::Failed
+        );
     }
 
     /// `AISNAP-17`: セレクタは一意のときだけ番号へ解決し、複数一致・不一致・番号なしは失敗にする。
