@@ -55,6 +55,8 @@ struct FakeHost {
     wait_gate: Mutex<Gate>,
     acts: AtomicUsize,
     act_gate: Mutex<Gate>,
+    /// 立てると `dom_snapshot` の文書にパスワード欄（伏せる対象）を足す。
+    password: std::sync::atomic::AtomicBool,
 }
 
 impl Default for FakeHost {
@@ -67,6 +69,7 @@ impl Default for FakeHost {
             wait_gate: Mutex::new(None),
             acts: AtomicUsize::new(0),
             act_gate: Mutex::new(None),
+            password: Default::default(),
         }
     }
 }
@@ -111,14 +114,18 @@ impl Renderer for FakeHost {
     }
     fn dom_snapshot(&self) -> Result<HostDomSnapshot, RenderError> {
         self.snapshots.fetch_add(1, Ordering::SeqCst);
-        Ok(HostDomSnapshot::new(
-            self.page(),
-            "https://a.example/",
-            HTML.to_owned(),
-            4,
-            "snap",
-        )
-        .unwrap())
+        let (html, count) = if self.password.load(Ordering::SeqCst) {
+            (
+                HTML.replace(
+                    "</button>",
+                    r#"</button><input type="password" value="pw" data-fandhe-n="4">"#,
+                ),
+                5,
+            )
+        } else {
+            (HTML.to_owned(), 4)
+        };
+        Ok(HostDomSnapshot::new(self.page(), "https://a.example/", html, count, "snap").unwrap())
     }
     fn act(&self, _: &ActRequest) -> Result<ActOutcome, RenderError> {
         pass_gate(&self.act_gate);
@@ -275,7 +282,6 @@ async fn aisnap21_wait_error_mapping() {
         (RenderError::Timeout, (409, "timeout")),
         (RenderError::Stale, (409, "stale")),
         (RenderError::InvalidParams, (400, "invalid_params")),
-        (RenderError::ProtocolMismatch, (502, "wait_failed")),
     ] {
         *host.wait_error.lock().unwrap() = Some(e);
         let res = post(&s, "/ai/wait", &wait_body(g, secret, 100)).await;
@@ -289,6 +295,14 @@ async fn aisnap21_wait_error_mapping() {
             .status,
         200
     );
+
+    // 待機の途中でホストがページを捨てた等の失敗（`wait_failed`）も、確定結果を無効にする。
+    *host.wait_error.lock().unwrap() = Some(RenderError::ProtocolMismatch);
+    let res = post(&s, "/ai/wait", &wait_body(g, secret, 100)).await;
+    assert_eq!(code(&res), (502, "wait_failed".into()));
+    assert!(!String::from_utf8_lossy(&res.body).contains("tok-secret"));
+    assert_eq!(code(&snapshot(&s).await), (409, "session_lost".into()));
+    let g = navigate(&s).await;
 
     // ホストが失われたら確定結果を無効にし、以後は新しい navigate まで `session_lost`。
     *host.wait_error.lock().unwrap() = Some(RenderError::SessionLost);
@@ -430,4 +444,48 @@ async fn aisnap18_presync_is_pinned_to_requested_generation() {
     );
     assert_eq!(host.snapshots(), before, "did not re-sync");
     assert_eq!(snapshot(&s).await.status, 200, "latest page stays valid");
+}
+
+/// `AISNAP-18`・TASK-130 の指摘 S-8・MS-11（2026-11-21 の利用者の判断）: 伏せる対象の入力欄がある文書、または全部伏せた
+/// 世代では、selector 系の条件を `unsupported`（409）で断り、ホストへ送らない。`load_complete`・`text_present` は通す。
+#[tokio::test]
+async fn s8_selector_conditions_are_refused_on_pages_with_redacted_fields() {
+    let dir = TempDir::new();
+    let host = Arc::new(FakeHost::default());
+    host.password.store(true, Ordering::SeqCst);
+    let s = state(&dir, Arc::clone(&host));
+    let g = navigate(&s).await;
+    for cond in [
+        PRESENT,
+        r##"{"type":"selector_absent","selector":"#done"}"##,
+    ] {
+        let res = post(&s, "/ai/wait", &wait_body(g, cond, 100)).await;
+        assert_eq!(code(&res), (409, "unsupported".into()), "{cond}");
+    }
+    assert!(host.waits().is_empty());
+    for cond in [
+        r#"{"type":"load_complete"}"#,
+        r#"{"type":"text_present","text":"Go"}"#,
+    ] {
+        assert_eq!(
+            post(&s, "/ai/wait", &wait_body(g, cond, 100)).await.status,
+            200,
+            "{cond}"
+        );
+    }
+
+    // 伏せる対象の欄が無い文書でも、全部伏せた世代（`sensitive` の入力の後）では断る。
+    host.password.store(false, Ordering::SeqCst);
+    let g = navigate(&s).await;
+    assert_eq!(
+        post(&s, "/ai/wait", &wait_body(g, PRESENT, 100))
+            .await
+            .status,
+        200
+    );
+    let nav = s.app().navigation();
+    nav.mark_redact_all(nav.latest_with_generation().unwrap().0)
+        .unwrap();
+    let res = post(&s, "/ai/wait", &wait_body(g, PRESENT, 100)).await;
+    assert_eq!(code(&res), (409, "unsupported".into()));
 }

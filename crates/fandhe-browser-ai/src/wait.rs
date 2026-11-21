@@ -1,8 +1,9 @@
 //! `POST /ai/wait` の本体（TASK-129・`AISNAP-18`・`AISNAP-21`・MS-11）。
 //!
 //! HTTP の受け口（Host・Origin・Content-Type の検査と応答）は [`crate::api`]。本モジュールは本文の検査と、
-//! 待機（操作の排他 → 直前の取り直し → ホストへの `wait`）を行う。ブロッキングする（最大 60 秒と応答待ちの余裕）ため、
-//! 呼び出し元はスレッドへ移して呼ぶ（[`crate::blocking`]）。
+//! 待機（操作の排他 → 直前の取り直し → ホストへの `wait`）を行う。ブロッキングするため、呼び出し元はスレッドへ移して
+//! 呼ぶ（[`crate::blocking`]）。`timeout_ms` はホストでの条件の待機だけに効き、API 全体はそれに直前の取り直し
+//! （DOM の取得。既定で最大 35 秒）と描画ゲートの待ち・応答待ちの余裕（既定 5 秒）がかかる。呼び出し元の期限はその分を見込む。
 //!
 //! # spec に未記載の挙動（spec へは後追いで足す）
 //!
@@ -11,6 +12,8 @@
 //!   `{"type": "load_complete"}`（`/ai/act` の `action` と同じく `type` で選ぶ）
 //! - 成功応答は `{"ok": true, "generation"}`。上限時間までに成立しなければ `timeout`（409。状態によるものと同じ扱い。
 //!   ホストは保つ）、取り直し・ホストへの待機の失敗は `wait_failed`（502）
+//! - 伏せる対象の入力欄がある文書・全部伏せた世代では、selector 系の条件を `unsupported`（409）で断る
+//!   （TASK-130 の指摘 S-8。2026-11-21 の利用者の判断。`load_complete`・`text_present` は通す）
 //! - 待つ前に DOM を取り直す（最小間隔によらない）。直前の `/ai/act` で遷移していても、いまの文書から待てるようにするため
 //!   （ホストは要求の文書番号が現在と違えば `stale` で断る）
 //!
@@ -29,6 +32,7 @@ use std::fmt;
 use std::sync::TryLockError;
 
 use fandhe_browser_core::NavigationGeneration;
+use fandhe_browser_core::interactive::has_redaction_target;
 use fandhe_browser_core::render::{
     MAX_WAIT_CONDITION_BYTES, MAX_WAIT_TIMEOUT_MS, RenderError, WaitCondition, WaitRequest,
 };
@@ -72,6 +76,9 @@ pub enum WaitError {
     Stale,
     /// 上限時間までに条件が成立しなかった（ホストは保つ）。
     Timeout,
+    /// このページでは使えない条件（伏せる対象の入力欄がある文書・全部伏せた世代での selector 系の条件。TASK-130 の
+    /// 指摘 S-8。2026-11-21 の利用者の判断）。
+    Unsupported,
     /// 描画層が無効。
     RenderingDisabled,
     /// ホストが破棄・再起動された（新しい navigate まで戻らない）。
@@ -92,6 +99,7 @@ impl WaitError {
             Self::NotInteractive => (409, "not_interactive"),
             Self::Stale => (409, "stale"),
             Self::Timeout => (409, "timeout"),
+            Self::Unsupported => (409, "unsupported"),
             Self::RenderingDisabled => (409, "rendering_disabled"),
             Self::SessionLost => (409, "session_lost"),
             Self::Unavailable => (409, "interactive_unavailable"),
@@ -136,6 +144,7 @@ impl fmt::Display for WaitError {
             Self::NotInteractive => "page is not in interactive mode",
             Self::Stale => "page changed since the snapshot",
             Self::Timeout => "condition was not met within the timeout",
+            Self::Unsupported => "condition is not supported on this page",
             Self::RenderingDisabled => "rendering is disabled",
             Self::SessionLost => "rendering host session was lost",
             Self::Unavailable => "page does not meet interactive mode requirements",
@@ -228,12 +237,23 @@ pub fn wait(state: &AiState, body: &[u8]) -> Result<WaitOk, WaitError> {
         return Err(WaitError::Stale);
     }
     let doc = latest.interactive().ok_or(WaitError::Stale)?;
+    // 伏せる対象の入力欄がある文書・全部伏せた世代では、ホストの生の DOM で評価する selector 系の条件を断る
+    // （`AISNAP-18`・TASK-130 の指摘 S-8・2026-11-21 の利用者の判断。`load_complete`・`text_present` は通す）。
+    if matches!(
+        request.condition,
+        WaitCondition::SelectorPresent(_) | WaitCondition::SelectorAbsent(_)
+    ) && (nav.redacts_all(generation) || has_redaction_target(doc))
+    {
+        return Err(WaitError::Unsupported);
+    }
     let req = WaitRequest::new(doc.page().clone(), request.condition, request.timeout_ms)
         .map_err(|e| WaitError::from_render(&e))?;
     let out = app.wait(generation, &req).map_err(|e| {
         let err = WaitError::from_render(&e);
-        if err == WaitError::SessionLost {
-            // ホストが失われた。古い内容を今のページと取り違えないよう確定結果を無効にする（`AISNAP-20`）。
+        if matches!(err, WaitError::SessionLost | WaitError::Failed) {
+            // ホストが失われた・待機の途中でホストがページを捨てた（クラッシュ等）。古い内容を今のページと
+            // 取り違えないよう確定結果を無効にする（`AISNAP-20`・`AISNAP-21`。失敗の種類を区別できないため
+            // 安全側に倒す）。
             let _ = nav.invalidate_interactive(generation);
         }
         err
@@ -330,6 +350,7 @@ mod tests {
         assert_eq!(Failed.status_and_code(), (502, "wait_failed"));
         for e in [
             Busy,
+            Unsupported,
             NoNavigation,
             NotInteractive,
             Stale,

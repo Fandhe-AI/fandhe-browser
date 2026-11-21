@@ -164,8 +164,9 @@ fn sync_inner(
     {
         return Ok(());
     }
+    // 取得は描画ゲートの中でも同じ世代の操作モードに固定する（確認の後に別のページが確定していれば取り直さない）。
     let result = app
-        .dom_snapshot()
+        .dom_snapshot_at(generation)
         .map_err(|e| SyncFailure::from_render(&e))
         .and_then(|snapshot| {
             // `sensitive` の操作があった世代では、すべての入力欄の値を消して組み立てる（`AISNAP-17`）。

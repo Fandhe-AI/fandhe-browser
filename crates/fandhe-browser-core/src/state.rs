@@ -830,6 +830,17 @@ impl AppState {
             .with_page(&self.navigation, |r| r.dom_snapshot())
     }
 
+    /// [`Self::dom_snapshot`] を、描画ゲートの中で最新の確定結果が `generation` の操作モードのときだけ行う
+    /// （`AISNAP-20`・`AISNAP-18`・TASK-129・MS-11）。違えば静的ページを読み込まず、ホストへ送らずに
+    /// [`RenderError::Stale`]。呼び出し元は ai の操作モードの同期（世代を確かめてから取り直す経路）。
+    pub fn dom_snapshot_at(
+        &self,
+        generation: NavigationGeneration,
+    ) -> Result<HostDomSnapshot, RenderError> {
+        self.render
+            .with_interactive(&self.navigation, generation, |r| r.dom_snapshot())
+    }
+
     /// 操作モードでページを読み込み、DOM を取得する（TASK-127・`AISNAP-16`）。
     ///
     /// 呼び出し元は ai の `POST /ai/navigate`。`generation` は呼び出し元が [`NavigationState::begin_navigation`]
