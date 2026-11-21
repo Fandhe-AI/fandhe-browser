@@ -357,7 +357,18 @@ impl Renderer for HostRenderer {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         inner.interactive_loaded = false;
-        inner.interactive.shutdown();
+        if !inner.interactive.is_running() {
+            return;
+        }
+        // 止める処理（`shutdown` の猶予つき）で呼び出し元（CDP の navigate の開始など）を待たせないよう、動いている
+        // ホストを新しい値と差し替え、古いほうは別のスレッドで落とす（`Drop` が `shutdown` する）。スレッドを作れ
+        // なければクロージャごとその場で落ちるため、同期で止まる。
+        let fresh = inner.interactive.fresh();
+        let old = std::mem::replace(&mut inner.interactive, fresh);
+        drop(inner);
+        let _ = std::thread::Builder::new()
+            .name("fandhe-release-interactive".to_owned())
+            .spawn(move || drop(old));
     }
 
     fn load_interactive(&self, page: &PageRef) -> Result<InteractivePageLoad, RenderError> {

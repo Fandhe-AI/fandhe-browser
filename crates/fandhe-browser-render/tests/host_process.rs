@@ -1199,6 +1199,10 @@ fn t_renderer_interactive_roundtrip() {
     r.dom_snapshot().expect("dom_snapshot before release");
     r.release_interactive();
     assert!(matches!(r.dom_snapshot(), Err(RenderError::NotInteractive)));
+    // 止めた後も、次の操作モードの読み込みはできる（新しいホストを起動する）。
+    r.load_interactive(&PageRef::new("https://example.com/d"))
+        .expect("load_interactive after release");
+    r.dom_snapshot().expect("dom_snapshot after reload");
 }
 
 /// TASK-127: ホストの `unsupported`（`navigator.webdriver` の確認の失敗。SEC-5）は `RenderError::Unsupported`。

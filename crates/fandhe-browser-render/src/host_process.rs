@@ -937,6 +937,17 @@ impl HostProcess {
         Err(HostProcessError::SessionLost)
     }
 
+    /// 子プロセスが動いているか（止める対象があるか。`HostRenderer::release_interactive` が使う。#1638）。
+    pub fn is_running(&self) -> bool {
+        self.running.is_some()
+    }
+
+    /// 同じ設定で、まだ起動していない新しい値を作る（動いている値を止める処理を別のスレッドへ渡し、その場を
+    /// 差し替えるため。`HostRenderer::release_interactive`・#1638）。連続失敗の記録は引き継がない。
+    pub fn fresh(&self) -> Self {
+        Self::new(self.config.clone())
+    }
+
     /// `shutdown` 要求 → 猶予 → kill → wait → 一時ディレクトリ削除。何度呼んでもよい。
     pub fn shutdown(&mut self) {
         if let Some(r) = self.running.as_ref() {

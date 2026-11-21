@@ -165,12 +165,13 @@ pub fn navigate(
         .map_err(|_| NavigateError::LoadFailed)?;
     // 前のページの JS 実行・評価コンテキストを打ち切る（CDP の `Page.navigate` と同じ。`JS-4`・`JS-6`）。
     // 評価コンテキストを失効できなければ、CDP と同じく読み込まずに失敗にする（fail-closed）。
+    // 開始の後の失敗では、操作モードのホストを残さない（TASK-130 の指摘 S-1・`AISNAP-16`・`AISNAP-20`・MS-11・#1638）。
+    let release = || app.release_interactive_if_current(generation);
     app.page_scripts().begin_generation(nav.scope(), generation);
     app.script_contexts()
         .begin_generation(nav.scope(), generation)
+        .inspect_err(|_| release())
         .map_err(|_| NavigateError::LoadFailed)?;
-    // 読み込みの途中・後の失敗では、操作モードのホストを残さない（TASK-130 の指摘 S-1・`AISNAP-16`・`AISNAP-20`・MS-11・#1638）。
-    let release = || app.release_interactive_if_current(generation);
     let (_load, snapshot) = app
         .load_interactive(generation, &PageRef::new(&request.url))
         .inspect_err(|_| release())
