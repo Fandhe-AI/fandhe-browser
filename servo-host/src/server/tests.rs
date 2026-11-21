@@ -802,7 +802,7 @@ fn dom_snapshot_over_frame_limit_is_too_large() {
     assert_eq!(r.frames[2]["result"]["visible"], true);
 }
 
-/// TASK-121・TASK-122・TASK-126: 操作モードの契約 fixture（`interactive/` の dom_snapshot・act・wait の要求）を
+/// `RENDER-10`・`RENDER-11`・`AISNAP-18`・TASK-121・TASK-122・TASK-126・MS-10・MS-11: 操作モードの契約 fixture（`interactive/` の dom_snapshot・act・wait の要求）を
 /// ホストへ通す。正常な要求は対応するハンドラを呼び、不正な要求は `expected_response`（invalid_params）を返してハンドラを呼ばない。
 #[test]
 fn interactive_request_fixtures_match_host_behavior() {

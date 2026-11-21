@@ -12,7 +12,7 @@
 
 ## 操作モードの fixture（`interactive/`）
 
-操作モードのメソッド（`dom_snapshot`・`act`・`wait`。TASK-121・`RENDER-10`・`RENDER-11`）の fixture は `interactive/` に置く。
+操作モードのメソッド（`dom_snapshot`・`act`・`wait`。TASK-121・`RENDER-10`・`RENDER-11`・MS-10）の fixture は `interactive/` に置く。
 `tests/protocol_fixtures.rs` がスキーマとの整合と網羅を検証し、ホスト側（`servo-host/src/server/tests.rs` の
 `interactive_request_fixtures_match_host_behavior`・`interactive_hello_matches_fixture`）とクライアント側
 （`tests/client_contract.rs` の `render10_*`・`render11_*`）の契約テストが読む。直下の fixture を読む既存の契約テストは
