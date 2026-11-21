@@ -599,6 +599,24 @@ impl RenderGate {
         f(self.renderer.as_ref())
     }
 
+    /// 操作モードのページだけに `f` を実行する（TASK-129・`AISNAP-18`・MS-11）。描画系と同じロックの中で、最新の
+    /// 確定結果が `generation` の操作モードのものかを確かめ、違えば描画層を呼ばずに [`RenderError::Stale`]
+    /// （確認の後に静的な navigate が確定しても、その静的ページを読み込んで古い文書向けの要求を送らない）。
+    fn with_interactive<T>(
+        &self,
+        nav: &NavigationState,
+        generation: NavigationGeneration,
+        f: impl FnOnce(&dyn Renderer) -> Result<T, RenderError>,
+    ) -> Result<T, RenderError> {
+        let _loaded = self.loaded.lock().unwrap_or_else(PoisonError::into_inner);
+        match nav.snapshot() {
+            (g, Some(latest)) if g == generation && latest.mode() == PageMode::Interactive => {
+                f(self.renderer.as_ref())
+            }
+            _ => Err(RenderError::Stale),
+        }
+    }
+
     /// 操作モードでページを読み込み、続けて DOM を取得する（TASK-127・`AISNAP-16`）。
     ///
     /// 描画系と同じロックの中で、`generation` が最新かを確かめてから `load_interactive`・`dom_snapshot` を
@@ -839,10 +857,16 @@ impl AppState {
     }
 
     /// 操作モードのページで条件の成立を待つ（TASK-129・`AISNAP-18`・MS-11）。描画系と同じゲートを通す（待機中はホストを
-    /// 占有する。最大 [`crate::render::MAX_WAIT_TIMEOUT_MS`] に応答待ちの余裕を足した時間ブロッキングする）。呼び出し元は
+    /// 占有する。最大 [`crate::render::MAX_WAIT_TIMEOUT_MS`] に応答待ちの余裕を足した時間ブロッキングする）。ゲートの中で
+    /// 最新の確定結果が `generation` の操作モードでなければ、ホストへ送らずに [`RenderError::Stale`]。呼び出し元は
     /// ai の `POST /ai/wait`（操作の排他を取り、直前に同期してから呼ぶ）。
-    pub fn wait(&self, request: &WaitRequest) -> Result<WaitOutcome, RenderError> {
-        self.render.with_page(&self.navigation, |r| r.wait(request))
+    pub fn wait(
+        &self,
+        generation: NavigationGeneration,
+        request: &WaitRequest,
+    ) -> Result<WaitOutcome, RenderError> {
+        self.render
+            .with_interactive(&self.navigation, generation, |r| r.wait(request))
     }
 
     /// 操作モードが許されているか（設定キーは TASK-131 まで受理しない。今はテストの入口だけが立てる）。

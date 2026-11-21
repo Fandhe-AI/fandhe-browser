@@ -242,6 +242,11 @@ async fn aisnap21_wait_error_mapping() {
     for (body, want) in [
         (wait_body(g + 1, PRESENT, 100), (409, "stale")),
         (wait_body(g, PRESENT, 60_001), (400, "invalid_params")),
+        // 本文の上限（8 KiB）を超える本文は複製する前に断る。
+        (
+            " ".repeat(fandhe_browser_ai::wait::MAX_WAIT_BODY_BYTES + 1),
+            (400, "invalid_params"),
+        ),
         (
             wait_body(g, r#"{"type":"load_complete","x":1}"#, 100),
             (400, "invalid_params"),
@@ -320,7 +325,9 @@ async fn aisnap18_busy_while_waiting() {
         let body = wait_body(g, PRESENT, 60_000);
         std::thread::spawn(move || fandhe_browser_ai::wait::wait(&s, body.as_bytes()))
     };
-    entered_rx.recv().unwrap();
+    entered_rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("the operation did not reach the host");
     assert_eq!(
         code(&post(&s, "/ai/wait", &wait_body(g, PRESENT, 100)).await),
         (409, "busy".into())
@@ -344,7 +351,9 @@ async fn aisnap18_busy_while_waiting() {
         let s = Arc::clone(&s);
         std::thread::spawn(move || fandhe_browser_ai::act::act(&s, click.as_bytes()))
     };
-    entered_rx.recv().unwrap();
+    entered_rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("the operation did not reach the host");
     assert_eq!(
         code(&post(&s, "/ai/wait", &wait_body(g, PRESENT, 100)).await),
         (409, "busy".into())
@@ -370,7 +379,9 @@ async fn aisnap18_wait_superseded_by_navigation_is_stale() {
         let body = wait_body(g, PRESENT, 60_000);
         std::thread::spawn(move || fandhe_browser_ai::wait::wait(&s, body.as_bytes()))
     };
-    entered_rx.recv().unwrap();
+    entered_rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("the operation did not reach the host");
     // navigate は描画層のゲートより前に世代を進める。その順序をここで再現する。
     let _ = s.app().navigation().begin_navigation().unwrap();
     release_tx.send(()).unwrap();
@@ -379,4 +390,25 @@ async fn aisnap18_wait_superseded_by_navigation_is_stale() {
         Err(fandhe_browser_ai::wait::WaitError::Stale)
     );
     assert_eq!(host.waits().len(), 1, "the host did run the wait");
+}
+
+/// `AISNAP-18`・TASK-129・MS-11: ai が世代を確かめた後に静的な navigate が確定していたら、描画層のゲートの中で
+/// 気づき、静的ページを読み込まず、ホストへ待機を送らずに `Stale`。
+#[tokio::test]
+async fn aisnap18_wait_gate_rejects_static_page_committed_after_check() {
+    let dir = TempDir::new();
+    let host = Arc::new(FakeHost::default());
+    let s = state(&dir, Arc::clone(&host));
+    let g = navigate(&s).await;
+    let req = WaitRequest::new(host.page(), WaitCondition::LoadComplete, 100).unwrap();
+    let old = s.app().navigation().latest_with_generation().unwrap().0;
+    assert_eq!(old.get(), g);
+    let nav = s.app().navigation();
+    let g2 = nav.begin_navigation().unwrap();
+    nav.commit_navigation(g2, NavigationResult::new("https://a.example/", "<p>x</p>"))
+        .unwrap();
+    assert!(matches!(s.app().wait(old, &req), Err(RenderError::Stale)));
+    // 新しい世代でも静的モードなら送らない。
+    assert!(matches!(s.app().wait(g2, &req), Err(RenderError::Stale)));
+    assert!(host.waits().is_empty());
 }

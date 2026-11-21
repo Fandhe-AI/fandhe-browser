@@ -76,7 +76,7 @@ use crate::plugin_api::AiState;
 #[cfg(feature = "plugin-registry")]
 use crate::plugin_api::{ManifestError, PluginManifest, PluginRegistry, RegistryError};
 use crate::snapshot::{CheckedState, DataLeafKind, Node, Snapshot, TableSummary, build_snapshot};
-use crate::wait::{WaitError, wait};
+use crate::wait::{MAX_WAIT_BODY_BYTES, WaitError, wait};
 
 const JSON_CONTENT_TYPE: &str = "application/json; charset=UTF-8";
 
@@ -212,14 +212,20 @@ pub fn router_with_state(state: Arc<AiState>) -> Router {
             }
         })
         .route_async("POST", "/ai/wait", move |head, body| {
-            // 前段の検査は navigate と同じ（TASK-129・`AISNAP-18`・MS-11）。
-            let pre = post_precheck(head);
-            let body = body.to_vec();
+            // 前段の検査は navigate と同じ（TASK-129・`AISNAP-18`・MS-11）。断る要求と上限を超える本文は複製しない。
+            let pre = post_precheck(head).and_then(|()| {
+                if body.len() > MAX_WAIT_BODY_BYTES {
+                    Err(wait_error_response(WaitError::InvalidParams))
+                } else {
+                    Ok(body.to_vec())
+                }
+            });
             let state = Arc::clone(&wait_state);
             async move {
-                if let Err(r) = pre {
-                    return r;
-                }
+                let body = match pre {
+                    Ok(b) => b,
+                    Err(r) => return r,
+                };
                 match run_blocking(move || wait(&state, &body)).await {
                     Some(Ok(ok)) => {
                         let body = json!({ "ok": true, "generation": ok.generation().get() })

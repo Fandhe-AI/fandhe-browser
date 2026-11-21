@@ -499,7 +499,7 @@ mod tests {
     use crate::protocol::{Method, Response};
     use serde_json::json;
 
-    /// TASK-129: core が検査する待機の上限は protocol の上限と同じ（食い違うと正しい要求が送る直前に断られる）。
+    /// `AISNAP-18`・TASK-129: core が検査する待機の上限は protocol の上限と同じ（食い違うと正しい要求が送る直前に断られる）。
     #[test]
     fn task129_wait_limits_match_protocol() {
         use fandhe_browser_core::render::{MAX_WAIT_CONDITION_BYTES, MAX_WAIT_TIMEOUT_MS};

@@ -100,7 +100,7 @@ pub const MAX_WAIT_TIMEOUT_MS: u32 = 60_000;
 /// 待機の条件の文字列（セレクタ・テキスト）の上限（バイト。ホストの `wait_condition_bytes` と同じ。`AISNAP-18`）。
 pub const MAX_WAIT_CONDITION_BYTES: usize = 1024;
 
-/// 待機の条件（`AISNAP-18`。設計 §14.5）。`ref` での待機は後続。`Debug` は文字列を出さない。
+/// 待機の条件（`AISNAP-18`・TASK-129・MS-11。設計 §14.5）。`ref` での待機は後続。`Debug` は文字列を出さない。
 #[derive(Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum WaitCondition {

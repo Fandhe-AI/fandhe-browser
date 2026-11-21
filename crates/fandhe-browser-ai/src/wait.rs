@@ -230,7 +230,7 @@ pub fn wait(state: &AiState, body: &[u8]) -> Result<WaitOk, WaitError> {
     let doc = latest.interactive().ok_or(WaitError::Stale)?;
     let req = WaitRequest::new(doc.page().clone(), request.condition, request.timeout_ms)
         .map_err(|e| WaitError::from_render(&e))?;
-    let out = app.wait(&req).map_err(|e| {
+    let out = app.wait(generation, &req).map_err(|e| {
         let err = WaitError::from_render(&e);
         if err == WaitError::SessionLost {
             // ホストが失われた。古い内容を今のページと取り違えないよう確定結果を無効にする（`AISNAP-20`）。
@@ -238,7 +238,8 @@ pub fn wait(state: &AiState, body: &[u8]) -> Result<WaitOk, WaitError> {
         }
         err
     });
-    // 成否によらず、次の `/ai/snapshot` で取り直させる（待機の間にページが変わりうるため。設計 §14.6）。
+    // 成否によらず、次の `/ai/snapshot` で取り直させる（待機の間にページが変わりうるため。`AISNAP-18`・TASK-129・MS-11。
+    // 設計 §14.6）。
     state.sync_tracker().clear();
     out?;
     // 待機の間に新しい navigate が始まっていたら（navigate はこの排他を取らない）、成立したのは古いページの条件。
@@ -320,7 +321,7 @@ mod tests {
         );
     }
 
-    /// 写像の表（`timeout`・状態は 409、`invalid_params` 400、失敗は 502）。
+    /// `AISNAP-18`・`AISNAP-21`: 写像の表（`timeout`・状態は 409、`invalid_params` 400、失敗は 502）。
     #[test]
     fn aisnap18_status_table() {
         use WaitError::*;
