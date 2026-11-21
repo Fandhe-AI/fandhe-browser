@@ -235,7 +235,14 @@ pub struct NavigationState {
     /// `sensitive` の操作があった世代（0 は無し。[`NavigationState::mark_redact_all`]）。
     redact_all_generation: AtomicU64,
     scope: NavigationScope,
+    /// 確定結果が操作モードでなくなったときに呼ぶ（静的な確定・操作モードの無効化。引数はその時点の世代）。
+    /// [`AppState::new`] が描画層のゲートへつなぎ、操作モードの Servo ホストを止める（TASK-130 の指摘 S-1・#1638）。
+    /// ロックの外で呼ぶ。
+    left_interactive: std::sync::OnceLock<LeftInteractiveHook>,
 }
+
+/// [`NavigationState`] の `left_interactive` の型。
+type LeftInteractiveHook = Box<dyn Fn(&NavigationState, NavigationGeneration) + Send + Sync>;
 
 impl Default for NavigationState {
     fn default() -> Self {
@@ -272,6 +279,14 @@ impl NavigationState {
             redact_all_generation: AtomicU64::new(0),
             // wrap は実用上起こらない（u64）。起きても scope が重なるだけで安全側（打ち切り過多）。
             scope: NavigationScope(NEXT_NAVIGATION_SCOPE.fetch_add(1, Ordering::Relaxed)),
+            left_interactive: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// 確定結果が操作モードでなくなったことを知らせる（フックが無ければ何もしない）。ロックの外で呼ぶこと。
+    fn notify_left_interactive(&self, generation: NavigationGeneration) {
+        if let Some(hook) = self.left_interactive.get() {
+            hook(self, generation);
         }
     }
 
@@ -442,6 +457,8 @@ impl NavigationState {
         *guard = None;
         self.lost_generation
             .store(generation.get(), Ordering::SeqCst);
+        drop(guard);
+        self.notify_left_interactive(generation);
         Ok(())
     }
 
@@ -524,7 +541,13 @@ impl NavigationState {
                 .try_update(Ordering::SeqCst, Ordering::SeqCst, |v| v.checked_add(1))
                 .map_err(|_| StateError::GenerationExhausted)?;
         }
+        let left = value.mode() != PageMode::Interactive;
         *guard = Some(value);
+        let now = self.current_generation();
+        drop(guard);
+        if left {
+            self.notify_left_interactive(now);
+        }
         Ok(())
     }
 
@@ -560,6 +583,9 @@ struct RenderGate {
     renderer: Arc<dyn Renderer>,
     /// 最後に `load` が成功した世代。
     loaded: Mutex<Option<NavigationGeneration>>,
+    /// ゲートの使用中に確定結果が操作モードでなくなった世代（0 は無し）。使い終わった側が
+    /// [`Self::drain_released`] で操作モードのホストを止める（操作・待機の実行中に CDP の navigate を待たせない）。
+    release_pending: AtomicU64,
 }
 
 impl RenderGate {
@@ -567,15 +593,54 @@ impl RenderGate {
         Self {
             renderer,
             loaded: Mutex::new(None),
+            release_pending: AtomicU64::new(0),
         }
     }
 
-    /// 必要なら `load` を呼んでから `f` を実行する。
+    /// 確定結果が操作モードでなくなった（TASK-130 の指摘 S-1・#1638）。ゲートが空いていればすぐ、使用中なら
+    /// 使い終わった時点で、操作モードの Servo ホストを止める（[`Renderer::release_interactive`]）。
+    /// [`NavigationState`] のフックから、そのロックの外で呼ばれる。
+    fn release_left_interactive(&self, nav: &NavigationState, generation: NavigationGeneration) {
+        self.release_pending
+            .fetch_max(generation.get(), Ordering::SeqCst);
+        self.drain_released(nav);
+    }
+
+    /// 保留中の停止を、ゲートを取れれば実行する。取れなければ、いまの使用者が使い終わった後に実行する。
+    /// ゲートの中で世代とモードを確かめるため、後から始まった操作モードの読み込み（ゲートを待つ）を止めない。
+    fn drain_released(&self, nav: &NavigationState) {
+        while self.release_pending.load(Ordering::SeqCst) != 0 {
+            let _gate = match self.loaded.try_lock() {
+                Ok(g) => g,
+                Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
+                Err(std::sync::TryLockError::WouldBlock) => return,
+            };
+            let pending = self.release_pending.swap(0, Ordering::SeqCst);
+            let (current, latest) = nav.snapshot();
+            if pending == current.get() && latest.is_none_or(|r| r.mode() != PageMode::Interactive)
+            {
+                self.renderer.release_interactive();
+            }
+        }
+    }
+
+    /// 必要なら `load` を呼んでから `f` を実行する。使い終わったら保留中の停止を行う。
+    fn with_page<T>(
+        &self,
+        nav: &NavigationState,
+        f: impl FnOnce(&dyn Renderer) -> Result<T, RenderError>,
+    ) -> Result<T, RenderError> {
+        let r = self.with_page_locked(nav, f);
+        self.drain_released(nav);
+        r
+    }
+
+    /// 必要なら `load` を呼んでから `f` を実行する（ゲートを持つ間の本体）。
     ///
     /// ページが無い（結果が `None`）ときは [`RenderError::PageNotLoaded`] を返し、前のページの
     /// 描画を返さない（fail-closed）。`load` が失敗したら世代を記録せず、そのエラーを返す
     /// （次の呼び出しで再試行する）。
-    fn with_page<T>(
+    fn with_page_locked<T>(
         &self,
         nav: &NavigationState,
         f: impl FnOnce(&dyn Renderer) -> Result<T, RenderError>,
@@ -605,6 +670,17 @@ impl RenderGate {
     /// 入ることを防ぐ（後から始まった navigate は、このロックを待ってから自分のページを読む）。
     /// 静的モードの読み込みの記録は捨てる（ホストの静的なページは、この読み込みで無くなるため）。
     fn load_interactive(
+        &self,
+        nav: &NavigationState,
+        generation: NavigationGeneration,
+        page: &PageRef,
+    ) -> Result<(InteractivePageLoad, HostDomSnapshot), InteractiveLoadError> {
+        let r = self.load_interactive_locked(nav, generation, page);
+        self.drain_released(nav);
+        r
+    }
+
+    fn load_interactive_locked(
         &self,
         nav: &NavigationState,
         generation: NavigationGeneration,
@@ -663,7 +739,7 @@ pub struct AppState {
     /// 今はテストの入口 [`AppState::allow_interactive_for_tests`] だけが立てる。TASK-124）。
     interactive_allowed: bool,
     profile: Arc<Profile>,
-    render: RenderGate,
+    render: Arc<RenderGate>,
     page_scripts: PageScriptHandle,
     script_contexts: ScriptContextHandle,
 }
@@ -672,11 +748,18 @@ impl AppState {
     /// プロファイルと描画ハンドルから構築する。cli が feature `rendering` 有効時に
     /// TASK-38 で cli が具象実装を注入する予定の経路（`RENDER-1`。現状 cli は `with_disabled_renderer` を使う）。
     pub fn new(profile: Arc<Profile>, renderer: Arc<dyn Renderer>) -> Self {
+        let render = Arc::new(RenderGate::new(renderer));
+        let navigation = NavigationState::new();
+        let gate = Arc::clone(&render);
+        // 新しく作った状態のため、フックは未設定（失敗しない）。
+        let _ = navigation.left_interactive.set(Box::new(move |nav, g| {
+            gate.release_left_interactive(nav, g)
+        }));
         Self {
-            navigation: NavigationState::new(),
+            navigation,
             interactive_allowed: false,
             profile,
-            render: RenderGate::new(renderer),
+            render,
             // 既定は無効（スレッドも子プロセスも作らない。`JS-1`）。有効化は `with_page_scripts`。
             page_scripts: PageScriptHandle::disabled(),
             // 既定は無効（スレッドも子プロセスも作らない。`PERF-7`）。有効化は `with_script_contexts`。
@@ -707,6 +790,14 @@ impl AppState {
             return Err(StateError::InteractiveNotAllowed);
         }
         self.navigation.commit_interactive(generation, sync)
+    }
+
+    /// 操作モードの読み込みの後の検査・保存に失敗したときに呼ぶ（TASK-130 の指摘 S-1・#1638）。`generation` が
+    /// まだ最新で確定結果が操作モードでなければ、操作モードの Servo ホストを止める（後から始まった navigate の
+    /// ホストは止めない）。呼び出し元は ai の `POST /ai/navigate`。
+    pub fn release_interactive_if_current(&self, generation: NavigationGeneration) {
+        self.render
+            .release_left_interactive(&self.navigation, generation);
     }
 
     /// 操作モードの確定結果を同期の結果で差し替える（スクリプトを実行しない専用の入口。`AISNAP-20`）。
@@ -1125,6 +1216,7 @@ mod tests {
         renders: std::sync::atomic::AtomicUsize,
         urls: Mutex<Vec<String>>,
         load_error: Mutex<Option<RenderError>>,
+        releases: std::sync::atomic::AtomicUsize,
     }
 
     impl CountingRenderer {
@@ -1134,6 +1226,7 @@ mod tests {
                 renders: Default::default(),
                 urls: Mutex::new(Vec::new()),
                 load_error: Mutex::new(None),
+                releases: Default::default(),
             })
         }
         fn loads(&self) -> usize {
@@ -1147,6 +1240,9 @@ mod tests {
         }
         fn fail_load_with(&self, e: Option<RenderError>) {
             *self.load_error.lock().unwrap() = e;
+        }
+        fn releases(&self) -> usize {
+            self.releases.load(Ordering::SeqCst)
         }
     }
 
@@ -1195,6 +1291,71 @@ mod tests {
             )
             .unwrap())
         }
+        fn release_interactive(&self) {
+            self.releases.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    fn interactive_app(r: Arc<CountingRenderer>, name: &str) -> AppState {
+        let dir = fandhe_browser_profile::test_base_dir()
+            .join(format!("fandhe-core-{name}-{}", std::process::id()));
+        let profile = Arc::new(Profile::open(&dir).expect("profile"));
+        AppState::new(profile, r).allow_interactive_for_tests()
+    }
+
+    /// 操作モードの確定結果まで進める（読み込み → 検査 → 保存）。
+    fn commit_interactive_page(app: &AppState) -> NavigationGeneration {
+        let g = app.navigation().begin_navigation().unwrap();
+        let (_, snap) = app
+            .load_interactive(g, &PageRef::new("https://b.example/"))
+            .unwrap();
+        let sync = crate::interactive::build_interactive_document(snap).unwrap();
+        app.commit_interactive(g, sync).unwrap();
+        g
+    }
+
+    /// TASK-130 の指摘 S-1・#1638: 確定結果が操作モードでなくなったら（静的な確定・無効化・読み込みの後の失敗）、
+    /// 操作モードのホストを止める。操作モードの確定では止めない。後から始まった navigate のホストは止めない。
+    #[test]
+    fn s1_interactive_host_is_released_when_leaving_interactive() {
+        let r = CountingRenderer::new();
+        let app = interactive_app(r.clone(), "release");
+        commit_interactive_page(&app);
+        assert_eq!(r.releases(), 0, "interactive commit keeps the host");
+        navigate(app.navigation(), "https://a.example/");
+        assert_eq!(r.releases(), 1, "static commit releases the host");
+
+        let g = commit_interactive_page(&app);
+        app.navigation().invalidate_interactive(g).unwrap();
+        assert_eq!(r.releases(), 2, "invalidation releases the host");
+
+        // 読み込みの後の失敗: 世代が最新なら止め、追い越されていれば止めない。
+        let g = app.navigation().begin_navigation().unwrap();
+        app.release_interactive_if_current(g);
+        assert_eq!(r.releases(), 3);
+        let old = app.navigation().begin_navigation().unwrap();
+        let _new = app.navigation().begin_navigation().unwrap();
+        app.release_interactive_if_current(old);
+        assert_eq!(r.releases(), 3, "a newer navigation keeps its host");
+    }
+
+    /// TASK-130 の指摘 S-1・#1638: 描画ゲートの使用中（操作・待機の実行中）に静的な確定が起きたら、待たずに戻り、
+    /// ゲートを使い終わった時点で止める。
+    #[test]
+    fn s1_release_is_deferred_while_the_gate_is_busy() {
+        let r = CountingRenderer::new();
+        let app = interactive_app(r.clone(), "release-deferred");
+        commit_interactive_page(&app);
+        let busy = app.render.loaded.lock().unwrap();
+        navigate(app.navigation(), "https://a.example/");
+        assert_eq!(r.releases(), 0, "deferred while the gate is held");
+        drop(busy);
+        app.capture_screenshot(&ScreenshotOptions::default())
+            .unwrap();
+        assert_eq!(r.releases(), 1, "released when the gate user finishes");
+        app.capture_screenshot(&ScreenshotOptions::default())
+            .unwrap();
+        assert_eq!(r.releases(), 1, "released only once");
     }
 
     /// TASK-127・`AISNAP-16`: 追い越された世代ではホストへ要求を送らない。読み込んだら静的な読み込みの

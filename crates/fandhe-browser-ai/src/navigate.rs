@@ -168,19 +168,26 @@ pub fn navigate(
     app.script_contexts()
         .begin_generation(nav.scope(), generation)
         .map_err(|_| NavigateError::LoadFailed)?;
+    // 読み込みの途中・後の失敗では、操作モードのホストを残さない（TASK-130 の指摘 S-1・#1638）。
+    let release = || app.release_interactive_if_current(generation);
     let (_load, snapshot) = app
         .load_interactive(generation, &PageRef::new(&request.url))
+        .inspect_err(|_| release())
         .map_err(|e| match e {
             InteractiveLoadError::NotAllowed => NavigateError::Unavailable,
             InteractiveLoadError::Superseded => NavigateError::Stale,
             InteractiveLoadError::Render(r) => from_render(&r),
             _ => NavigateError::LoadFailed,
         })?;
-    let sync = build_interactive_document(snapshot).map_err(|_| NavigateError::LoadFailed)?;
+    let sync = build_interactive_document(snapshot).map_err(|_| {
+        release();
+        NavigateError::LoadFailed
+    })?;
     // 応答の URL は保存する文書と同じ取得時の URL にする（読み込みから取得までにページが自分で
     // 遷移しても `/ai/snapshot` と食い違わない）。保存後に共有状態を読み直すと別の navigate と競合する。
     let url = sync.url().to_owned();
     app.commit_interactive(generation, sync)
+        .inspect_err(|_| release())
         .map_err(|e| match e {
             StateError::Superseded { .. } => NavigateError::Stale,
             StateError::InteractiveNotAllowed => NavigateError::Unavailable,

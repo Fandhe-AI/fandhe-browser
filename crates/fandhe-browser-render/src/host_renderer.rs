@@ -348,6 +348,18 @@ impl Renderer for HostRenderer {
         }
     }
 
+    /// 操作モードの Servo ホストを止める（TASK-130 の指摘 S-1・#1638）。core の描画ゲートが、確定結果が操作モードで
+    /// なくなったときに呼ぶ。止めた後の操作モードの要求は `NotInteractive`。
+    fn release_interactive(&self) {
+        // poison 時は状態が不整合でありうるが、止める向きの操作なので回復して行う。
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        inner.interactive_loaded = false;
+        inner.interactive.shutdown();
+    }
+
     fn load_interactive(&self, page: &PageRef) -> Result<InteractivePageLoad, RenderError> {
         // 静的の `load` と同じく、検証より前に現在のページを捨てる（fail-closed）。静的モードのホストは止める。
         let mut inner = self.lock()?;
