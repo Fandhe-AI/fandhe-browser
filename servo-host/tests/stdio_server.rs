@@ -2912,11 +2912,11 @@ fn interactive_act_edge_paths() {
         .elapsed();
     assert_eq!(r["result"]["navigated"], false, "{r}");
     assert_eq!(r["result"]["page"], snap["page"], "{r}");
-    // 下限: 全体で待ちの打ち切り（2 秒）以上。上限: 遷移の要求が届いてから応答までを測り（クリックの処理を外す）、
-    // 打ち切りの 2 秒に応答の IPC の余裕を足した値未満（打ち切りが延びる回帰を拾う）。
-    assert!(took >= Duration::from_secs(2), "{took:?}");
+    // 上下限とも、遷移の要求が届いてから応答までの同じ区間で測る（クリックの処理を外す）。ホストは要求を許可した
+    // 時点から 2 秒待ち、要求はその直後に届くため、区間は 2 秒をわずかに下回る。下限は打ち切りが短くなる回帰、
+    // 上限は延びる回帰を拾う（どちらも IPC のばらつきの余裕を持たせる）。
     assert!(
-        since_request < Duration::from_millis(3500),
+        since_request >= Duration::from_millis(1500) && since_request < Duration::from_millis(3500),
         "{since_request:?} (total {took:?})"
     );
     SLOW_RELEASE.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -2927,9 +2927,13 @@ fn interactive_act_edge_paths() {
     let slow = loop {
         let s = request(&mut h, id, "dom_snapshot");
         id += 1;
+        // URL が変わっただけでは本文の解析が済んでいないことがあるため、操作する要素が現れるまで待つ。
         if s["result"]["url"]
             .as_str()
             .is_some_and(|u| u.ends_with("/slow"))
+            && s["result"]["html"]
+                .as_str()
+                .is_some_and(|h| h.contains(r#"id="blank""#))
         {
             break s["result"].clone();
         }
