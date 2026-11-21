@@ -1163,7 +1163,8 @@ fn interactive_renderer(
 }
 
 /// TASK-127・`AISNAP-16`: `HostRenderer` は操作モードのホスト（`--interactive`）で読み込み、ページ識別子と
-/// DOM を返す。静的モードの読み込みで操作モードのホストを止め、以後の `dom_snapshot` は `NotInteractive`。
+/// DOM を返す。静的モードの読み込み・`release_interactive` で操作モードのホストを止め、以後の `dom_snapshot` は
+/// `NotInteractive`。
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn t_renderer_interactive_roundtrip() {
     use fandhe_browser_core::render::{PageRef, RenderError, Renderer, ScreenshotOptions};
@@ -1191,6 +1192,12 @@ fn t_renderer_interactive_roundtrip() {
     assert_eq!(doc.page().doc_seq(), 1, "interactive page is not reloaded");
     r.load(&PageRef::new("https://example.com/b"))
         .expect("static load");
+    assert!(matches!(r.dom_snapshot(), Err(RenderError::NotInteractive)));
+    // TASK-130 の指摘 S-1・`AISNAP-16`・`AISNAP-20`・MS-11・#1638: 描画の要求を待たずに止める入口でも、以後は `NotInteractive`。
+    r.load_interactive(&PageRef::new("https://example.com/c"))
+        .expect("load_interactive again");
+    r.dom_snapshot().expect("dom_snapshot before release");
+    r.release_interactive();
     assert!(matches!(r.dom_snapshot(), Err(RenderError::NotInteractive)));
 }
 

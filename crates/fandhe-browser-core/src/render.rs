@@ -82,6 +82,10 @@ pub trait Renderer: Send + Sync {
         let _ = request;
         Err(RenderError::NotInteractive)
     }
+
+    /// 操作モードのページとホストを捨てる（TASK-130 の指摘 S-1・`AISNAP-16`・`AISNAP-20`・MS-11・#1638）。確定結果が操作モードでなくなったときに
+    /// [`crate::state::AppState`] の描画ゲートから呼ばれる。既定実装は何もしない（操作モードを持たない実装）。
+    fn release_interactive(&self) {}
 }
 
 /// `fill` の文字列の上限（バイト。ホストの `fill_text_bytes` と同じ。設計 §14.6）。
